@@ -27,8 +27,8 @@ internal class PhaseFourLocalRepair
     {
         var result = new RepairResult();
 
-        // 构建已排程任务的资源占用图
-        var resourceOccupancy = BuildResourceOccupancy(scheduleResult.ScheduledTasks);
+        // 构建已排程任务的资源占用图（P0-06修复：包含ExternalDomain ResourceBlocks）
+        var resourceOccupancy = BuildResourceOccupancy(scheduleResult.ScheduledTasks, constraints);
 
         // ═══════════════════════════════════════════════
         // 1. 对未排程需求尝试修复
@@ -84,8 +84,11 @@ internal class PhaseFourLocalRepair
 
     /// <summary>
     /// 构建资源占用图
+    /// P0-06修复：重建occupancy时也要加入ExternalDomain ResourceBlocks
     /// </summary>
-    private Dictionary<int, List<TimeWindow>> BuildResourceOccupancy(List<FinalTaskDraft> tasks)
+    private Dictionary<int, List<TimeWindow>> BuildResourceOccupancy(
+        List<FinalTaskDraft> tasks,
+        ConstraintContext constraints)
     {
         var occupancy = new Dictionary<int, List<TimeWindow>>();
 
@@ -98,6 +101,21 @@ internal class PhaseFourLocalRepair
 
             occupancy[task.ResourceId].Add(
                 new TimeWindow(task.PlannedStartTime, task.PlannedEndTime));
+        }
+
+        // P0-06修复：加入ExternalDomain ResourceBlocks阻挡
+        foreach (var kvp in constraints.ResourceBlocks)
+        {
+            int resourceId = kvp.Key;
+            if (!occupancy.ContainsKey(resourceId))
+            {
+                occupancy[resourceId] = new List<TimeWindow>();
+            }
+
+            foreach (var block in kvp.Value)
+            {
+                occupancy[resourceId].Add(new TimeWindow(block.StartTime, block.EndTime));
+            }
         }
 
         return occupancy;
@@ -128,8 +146,19 @@ internal class PhaseFourLocalRepair
             .ToList();
 
         var tasks = new List<FinalTaskDraft>();
-        // P0-05修复：传入所需数量，根据累计可用量确定启动时间
-        var earliestStart = GetMaterialEarliestTime(demand.AllocationSequence, demand.NetOutputQty, constraints, request.PlanningStart);
+        // P0-05修复：传入所需数量，根据累计可用量确定启动时间，并验证总量是否足够
+        var earliestStart = GetMaterialEarliestTime(
+            demand.AllocationSequence,
+            demand.NetOutputQty,
+            constraints,
+            request.PlanningStart,
+            out bool isMaterialSufficient);
+
+        // P0-05修复：物料总量不足时，标记为业务Unscheduled（不是技术失败）
+        if (!isMaterialSufficient)
+        {
+            return new List<FinalTaskDraft>(); // 物料总量不足
+        }
 
         // 对每道工序尝试找资源
         foreach (var operation in operations)
@@ -182,14 +211,17 @@ internal class PhaseFourLocalRepair
     /// <summary>
     /// 获取物料最早可用时间
     /// 文档：§四 4.6、§十二 Stage overlap
-    /// P0-05修复：支持多段Quantity-Time，根据所需数量确定可用时间
+    /// P0-05修复：支持多段Quantity-Time，根据所需数量确定可用时间，并验证总量是否足够
     /// </summary>
     private DateTime GetMaterialEarliestTime(
         long allocationSequence,
         decimal requiredQuantity,
         ConstraintContext constraints,
-        DateTime planningStart)
+        DateTime planningStart,
+        out bool isSufficient)
     {
+        isSufficient = true;
+
         if (constraints.MaterialAvailability.TryGetValue(allocationSequence, out var segments) && segments.Count > 0)
         {
             // P0-05修复：累计可用数量，找到满足需求数量的最早时间
@@ -203,7 +235,9 @@ internal class PhaseFourLocalRepair
                     return segment.AvailableTime;
                 }
             }
-            // 所有段累计仍不足，返回最后一段时间（排程可能失败）
+
+            // P0-05修复：所有段累计仍不足需求量，标记不足并返回最后一段时间
+            isSufficient = false;
             return segments.Max(s => s.AvailableTime);
         }
         return planningStart;
@@ -307,20 +341,25 @@ internal class PhaseFourLocalRepair
         // UNLOCATED、无PI等作为独立标识/来源事实，不增加新TaskType
         string taskType = "PRODUCTION";
 
-        // TODO P0-04: PlannedProcessQty字段需要Core.Dto.FinalTaskDraft添加该字段后才能赋值
-        // Duration计算也需要调整：StandardDuration × PlannedProcessQty ÷ CapacityFactor
+        // P0-04修复：补齐FinalTaskDraft必需字段
+        // TODO: Duration计算需调整为 StandardDuration × PlannedProcessQty ÷ CapacityFactor
+        // TODO: 当前Duration仍使用StandardDuration，需要获取CapacityFactor后调整
 
         return new FinalTaskDraft
         {
             FinalDraftId = Guid.NewGuid().ToString(),
             SourceDraftId = demand.LogicalDemandKey,
             MaterialId = demand.MaterialId,
+            FactoryId = demand.FactoryId,
             StageCode = operation.StageCode ?? string.Empty,
             OperationCode = operation.OperationCode,
             TaskType = taskType,
             ResourceId = resourceId,
             ResourceCode = string.Empty, // TODO: 从Resources查找ResourceCode
+            RouteCode = null, // TODO: 从Routing获取RouteCode
+            PathId = null, // TODO: 从Routing获取PathId
             Quantity = demand.NetOutputQty,
+            PlannedProcessQty = demand.PlannedProcessQty,
             UOM = string.Empty,
             PlannedStartTime = start,
             PlannedEndTime = end,

@@ -48,14 +48,23 @@ internal class PhaseTwoInitialScheduler
             {
                 FinalDraftId = Guid.NewGuid().ToString(),
                 SourceDraftId = lockedTask.DraftId,
+                MaterialId = demand?.MaterialId ?? 0,
+                FactoryId = demand?.FactoryId ?? 0,
+                StageCode = string.Empty, // TODO: 从ExecutionConstraint获取Stage信息
+                OperationCode = string.Empty, // TODO: 从ExecutionConstraint获取Operation信息
+                TaskType = "PRODUCTION", // P0-16修复：锁定任务仍是生产Task，不是ConstraintType
                 ResourceId = lockedTask.ResourceId,
+                ResourceCode = string.Empty,
+                RouteCode = null,
+                PathId = null,
+                Quantity = demand?.NetOutputQty ?? 0m,
+                PlannedProcessQty = demand?.PlannedProcessQty ?? 0m,
+                UOM = string.Empty,
                 PlannedStartTime = lockedTask.LockedStart,
                 PlannedEndTime = lockedTask.LockedEnd,
-                Quantity = demand?.NetOutputQty ?? 0m,
-                StageCode = string.Empty,
-                OperationCode = string.Empty,
-                MaterialId = demand?.MaterialId ?? 0,
-                TaskType = lockedTask.ConstraintType // Execution/Firm/Frozen
+                Priority = demand?.DemandSequence ?? 0,
+                IsVirtual = false,
+                ExecutionLockId = null // TODO: 关联ExecutionConstraint.Id
             };
             result.ScheduledTasks.Add(inheritedTask);
         }
@@ -93,8 +102,10 @@ internal class PhaseTwoInitialScheduler
 
             if (operationsToSchedule.Count == 0)
             {
-                result.UnscheduledDemandKeys.Add(demand.LogicalDemandKey);
-                continue;
+                // P0-03修复：Routing有环或非法，属于技术失败
+                result.TechnicalFailure = true;
+                result.TechnicalFailureReason = $"Routing图非法或存在环：MaterialId={demand.MaterialId}, RouteCode=DEFAULT";
+                return result;
             }
 
             // 排程该需求的所有工序
@@ -235,6 +246,16 @@ internal class PhaseTwoInitialScheduler
         {
             // 找到StartStageCode对应的第一个工序位置
             var startIndex = result.FindIndex(op => op.StageCode == startStageCode);
+
+            if (startIndex == -1)
+            {
+                // StartStageCode在Routing中不存在
+                // 这可能是PI Position数据问题或Routing更新后Stage定义变化
+                // 保守处理：返回整条Routing，由排程阶段的时间约束自然过滤已完成工序
+                // 不作为技术失败，因为这是输入数据不一致，不是Solver算法错误
+                return result;
+            }
+
             if (startIndex > 0)
             {
                 // 裁剪掉前面已完成的Stage
@@ -284,6 +305,7 @@ internal class PhaseTwoInitialScheduler
 
     /// <summary>
     /// 倒排：从 RequiredAvailableTime 往前推
+    /// P0-05修复：倒排也必须服从物料时间约束，Task不能早于Material AvailableTime
     /// </summary>
     private List<FinalTaskDraft> ScheduleBackward(
         LogicalProductionDemand demand,
@@ -296,6 +318,20 @@ internal class PhaseTwoInitialScheduler
         var tasks = new List<FinalTaskDraft>();
         var currentEndTime = demand.RequiredAvailableTime;
 
+        // P0-05修复：获取物料最早可用时间，作为倒排的硬约束下界
+        var materialEarliestTime = GetMaterialEarliestTime(
+            demand.AllocationSequence,
+            demand.NetOutputQty,
+            constraints,
+            planningStart,
+            out bool isMaterialSufficient);
+
+        // P0-05修复：物料总量不足时，标记为业务Unscheduled（不是技术失败）
+        if (!isMaterialSufficient)
+        {
+            return new List<FinalTaskDraft>(); // 物料总量不足
+        }
+
         // 从最后一道工序往前倒推
         for (int i = operations.Count - 1; i >= 0; i--)
         {
@@ -304,6 +340,12 @@ internal class PhaseTwoInitialScheduler
 
             // 计算候选开始时间
             var candidateStart = currentEndTime - duration;
+
+            // P0-05修复：倒排Task不能早于物料可用时间
+            if (candidateStart < materialEarliestTime)
+            {
+                return new List<FinalTaskDraft>(); // 物料约束冲突
+            }
 
             // 检查是否早于计划期起点
             if (candidateStart < planningStart)
@@ -369,8 +411,19 @@ internal class PhaseTwoInitialScheduler
         var tasks = new List<FinalTaskDraft>();
 
         // 获取物料最早可用时间
-        // P0-05修复：传入所需数量，根据累计可用量确定启动时间
-        var earliestStart = GetMaterialEarliestTime(demand.AllocationSequence, demand.NetOutputQty, constraints, planningStart);
+        // P0-05修复：传入所需数量，根据累计可用量确定启动时间，并验证总量是否足够
+        var earliestStart = GetMaterialEarliestTime(
+            demand.AllocationSequence,
+            demand.NetOutputQty,
+            constraints,
+            planningStart,
+            out bool isMaterialSufficient);
+
+        // P0-05修复：物料总量不足时，标记为业务Unscheduled（不是技术失败）
+        if (!isMaterialSufficient)
+        {
+            return new List<FinalTaskDraft>(); // 物料总量不足
+        }
 
         // 从第一道工序往后推
         // TODO P7: Stage overlap / 阈值启动
@@ -422,14 +475,17 @@ internal class PhaseTwoInitialScheduler
     /// <summary>
     /// 获取物料最早可用时间
     /// 文档：§四 4.6、§十二 Stage overlap
-    /// P0-05修复：支持多段Quantity-Time，根据所需数量确定可用时间
+    /// P0-05修复：支持多段Quantity-Time，根据所需数量确定可用时间，并验证总量是否足够
     /// </summary>
     private DateTime GetMaterialEarliestTime(
         long allocationSequence,
         decimal requiredQuantity,
         ConstraintContext constraints,
-        DateTime planningStart)
+        DateTime planningStart,
+        out bool isSufficient)
     {
+        isSufficient = true;
+
         if (constraints.MaterialAvailability.TryGetValue(allocationSequence, out var segments) && segments.Count > 0)
         {
             // P0-05修复：累计可用数量，找到满足需求数量的最早时间
@@ -443,7 +499,9 @@ internal class PhaseTwoInitialScheduler
                     return segment.AvailableTime;
                 }
             }
-            // 所有段累计仍不足，返回最后一段时间（排程可能失败）
+
+            // P0-05修复：所有段累计仍不足需求量，标记不足并返回最后一段时间
+            isSufficient = false;
             return segments.Max(s => s.AvailableTime);
         }
         return planningStart;
@@ -619,20 +677,25 @@ internal class PhaseTwoInitialScheduler
         // UNLOCATED、无PI等作为独立标识/来源事实，不增加新TaskType
         string taskType = "PRODUCTION";
 
-        // TODO P0-04: PlannedProcessQty字段需要Core.Dto.FinalTaskDraft添加该字段后才能赋值
-        // Duration计算也需要调整：StandardDuration × PlannedProcessQty ÷ CapacityFactor
+        // P0-04修复：补齐FinalTaskDraft必需字段
+        // TODO: Duration计算需调整为 StandardDuration × PlannedProcessQty ÷ CapacityFactor
+        // TODO: 当前Duration仍使用StandardDuration，需要获取CapacityFactor后调整
 
         return new FinalTaskDraft
         {
             FinalDraftId = Guid.NewGuid().ToString(),
             SourceDraftId = demand.LogicalDemandKey,
             MaterialId = demand.MaterialId,
+            FactoryId = demand.FactoryId,
             StageCode = operation.StageCode ?? string.Empty,
             OperationCode = operation.OperationCode,
             TaskType = taskType,
             ResourceId = resourceId,
             ResourceCode = string.Empty, // TODO: 从Resources查找ResourceCode
+            RouteCode = null, // TODO: 从Routing获取RouteCode
+            PathId = null, // TODO: 从Routing获取PathId
             Quantity = demand.NetOutputQty,
+            PlannedProcessQty = demand.PlannedProcessQty,
             UOM = string.Empty,
             PlannedStartTime = start,
             PlannedEndTime = end,
@@ -649,4 +712,10 @@ internal class InitialScheduleResult
 {
     public List<FinalTaskDraft> ScheduledTasks { get; set; } = new();
     public List<string> UnscheduledDemandKeys { get; set; } = new();
+
+    /// <summary>
+    /// P0-03+P0-15修复：技术失败标记（Routing非法、数据结构错误等）
+    /// </summary>
+    public bool TechnicalFailure { get; set; } = false;
+    public string? TechnicalFailureReason { get; set; }
 }

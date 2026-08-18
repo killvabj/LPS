@@ -44,7 +44,7 @@ internal class PhaseFiveCompression
         // - 尽量保持计划稳定
 
         // 生成 AllocationTaskShare（追溯 Allocation → Task 的份额）
-        var allocationShares = GenerateAllocationShares(allScheduledTasks, request);
+        var allocationShares = GenerateAllocationShares(allScheduledTasks, request, constraints);
 
         // P0-13修复：生成 TaskDependency（基于 Routing 工序依赖关系）
         var taskDependencies = GenerateTaskDependencies(allScheduledTasks, request, constraints);
@@ -75,13 +75,16 @@ internal class PhaseFiveCompression
             });
         }
 
-        // P0-15修复：构建最终结果，Success表示Solver执行成功，业务Unscheduled不影响Success
+        // P0-03+P0-15修复：区分技术失败与业务Unscheduled
+        // 技术失败：Routing非法、数量闭合错误、硬资源约束破坏 → Success=false
+        // 业务结果：产能不足、物料太晚、DueDate无法满足 → Success=true + Unscheduled
+        bool technicalFailure = scheduleResult.TechnicalFailure;
+        string? errorMessage = technicalFailure ? scheduleResult.TechnicalFailureReason : null;
+
         return new DomainSolveResult
         {
-            // P0-15修复：Solver成功执行，即使有业务无法排程的需求也返回Success=true
-            // 算法异常、Routing非法、数量丢失等才返回Failure
-            Success = true,
-            ErrorMessage = null,
+            Success = !technicalFailure,
+            ErrorMessage = errorMessage,
             IsRoughCut = false,
             FinalTasks = allScheduledTasks,
             AllocationShares = allocationShares,
@@ -103,15 +106,51 @@ internal class PhaseFiveCompression
     /// <summary>
     /// 生成 AllocationTaskShare（追溯机制）
     /// 文档：§五 5.2
+    /// P0-14修复（0号位严重Bug反馈）：只有末端Task记录净产出份额，串行前序通过TaskDependency追溯
     /// 闭合检查：Σ ShareQty = 该Allocation需制造的NetOutputQty
     /// </summary>
     private List<AllocationTaskShare> GenerateAllocationShares(
         List<FinalTaskDraft> tasks,
-        DomainSolveRequest request)
+        DomainSolveRequest request,
+        ConstraintContext constraints)
     {
         var shares = new List<AllocationTaskShare>();
 
-        // 按 AllocationSequence 分组任务
+        // 按 SourceDraftId（需求）分组任务
+        var tasksByDemand = tasks
+            .GroupBy(t => t.SourceDraftId)
+            .ToDictionary(g => g.Key, g => g.OrderBy(t => t.PlannedStartTime).ToList());
+
+        // 构建TaskDependency，用于识别末端Task
+        var downstreamTasks = new HashSet<string>();
+        foreach (var demandGroup in tasksByDemand)
+        {
+            var demand = request.LogicalProductionDemands
+                .FirstOrDefault(d => d.LogicalDemandKey == demandGroup.Key);
+            if (demand == null) continue;
+
+            // 获取工艺路线依赖关系
+            if (!constraints.RoutingGraphs.TryGetValue(demand.MaterialId, out var routeGraphs))
+                continue;
+            if (!routeGraphs.TryGetValue("DEFAULT", out var routingGraph))
+                continue;
+
+            // 标记所有有downstream的Task（非末端）
+            foreach (var depList in routingGraph.Dependencies.Values)
+            {
+                foreach (var dep in depList)
+                {
+                    var upstreamTask = demandGroup.Value
+                        .FirstOrDefault(t => t.OperationCode == dep.FromOperationCode);
+                    if (upstreamTask != null)
+                    {
+                        downstreamTasks.Add(upstreamTask.FinalDraftId);
+                    }
+                }
+            }
+        }
+
+        // 为每个Allocation生成Share，只记录末端Task
         var tasksByAllocation = tasks
             .Select(task =>
             {
@@ -122,41 +161,75 @@ internal class PhaseFiveCompression
             .Where(x => x.Demand != null)
             .GroupBy(x => x.Demand!.AllocationSequence);
 
-        // 为每个 Allocation 生成 TaskShare
         foreach (var group in tasksByAllocation)
         {
             var allocationSeq = group.Key;
-            var allocationTasks = group.ToList();
-            var expectedQty = allocationTasks.First().Demand!.NetOutputQty;
+            var expectedQty = group.First().Demand!.NetOutputQty;
 
-            // P0-14修复：严格闭合检查，调整最后一个Task的份额数量以保证Σ ShareQty = NetOutputQty
-            for (int i = 0; i < allocationTasks.Count; i++)
+            // 只为末端Task（没有downstream的Task）记录Share
+            var endTasks = group
+                .Where(x => !downstreamTasks.Contains(x.Task.FinalDraftId))
+                .Select(x => x.Task)
+                .ToList();
+
+            if (endTasks.Count == 0)
             {
-                var item = allocationTasks[i];
-                var task = item.Task;
-                var isLastTask = (i == allocationTasks.Count - 1);
-
-                decimal shareQty;
-                if (isLastTask)
-                {
-                    // 最后一个Task用 (期望总量 - 已分配量) 来闭合
-                    var alreadyAllocated = shares
-                        .Where(s => s.AllocationSequence == allocationSeq)
-                        .Sum(s => s.ComponentQty);
-                    shareQty = expectedQty - alreadyAllocated;
-                }
-                else
-                {
-                    // 非最后一个Task使用原始数量
-                    shareQty = task.Quantity;
-                }
-
+                // 没有末端Task（可能是单工序或全部Task都是中间工序）
+                // 兜底：取最后一个Task
+                var lastTask = group.OrderByDescending(x => x.Task.PlannedEndTime).First().Task;
                 shares.Add(new AllocationTaskShare
                 {
-                    FinalDraftId = task.FinalDraftId,
+                    FinalDraftId = lastTask.FinalDraftId,
                     AllocationSequence = allocationSeq,
-                    ComponentQty = shareQty
+                    ComponentQty = expectedQty
                 });
+            }
+            else if (endTasks.Count == 1)
+            {
+                // 单个末端Task：直接记录全量
+                shares.Add(new AllocationTaskShare
+                {
+                    FinalDraftId = endTasks[0].FinalDraftId,
+                    AllocationSequence = allocationSeq,
+                    ComponentQty = expectedQty
+                });
+            }
+            else
+            {
+                // 多个末端Task（可能是拆批、并行工艺等）
+                // 按Task.Quantity比例分配，最后一个Task补差
+                decimal totalTaskQty = endTasks.Sum(t => t.Quantity);
+                for (int i = 0; i < endTasks.Count; i++)
+                {
+                    var task = endTasks[i];
+                    decimal shareQty;
+
+                    if (i == endTasks.Count - 1)
+                    {
+                        // 最后一个Task：补差闭合
+                        var alreadyAllocated = shares
+                            .Where(s => s.AllocationSequence == allocationSeq)
+                            .Sum(s => s.ComponentQty);
+                        shareQty = expectedQty - alreadyAllocated;
+                    }
+                    else if (totalTaskQty > 0)
+                    {
+                        // 按比例分配
+                        shareQty = Math.Round(expectedQty * task.Quantity / totalTaskQty, 3);
+                    }
+                    else
+                    {
+                        // 异常：总数量为0，平均分配
+                        shareQty = expectedQty / endTasks.Count;
+                    }
+
+                    shares.Add(new AllocationTaskShare
+                    {
+                        FinalDraftId = task.FinalDraftId,
+                        AllocationSequence = allocationSeq,
+                        ComponentQty = shareQty
+                    });
+                }
             }
         }
 
@@ -214,7 +287,9 @@ internal class PhaseFiveCompression
                             DownstreamMaterialId = demand.MaterialId,
                             Quantity = demand.NetOutputQty,
                             UOM = string.Empty,
-                            InheritedPriority = demand.DemandSequence
+                            InheritedPriority = demand.DemandSequence,
+                            DependencyType = dep.DependencyType,
+                            LagTime = dep.LagTime
                         });
                     }
                 }
