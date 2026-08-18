@@ -136,8 +136,9 @@ internal class PhaseOneConstraintBuilder
     private void BuildOperationResourceEligibility(DomainSolveRequest request, ConstraintContext context)
     {
         // 按 (MaterialId, RouteCode, OperationCode) → ResourceId 列表（按 Priority 排序）
-        var eligibilityGroups = request.ResourceEligibility
-            .GroupBy(e => $"{e.RouteKey}::{e.OperationCode}")
+        // P0-01修复：使用冻结接口 OperationResourceEligibility，不再使用旧的 ResourceEligibility
+        var eligibilityGroups = request.OperationResourceEligibility
+            .GroupBy(e => $"{e.RouteCode}::{e.OperationCode}")
             .ToDictionary(
                 g => g.Key,
                 g => g.OrderBy(e => e.Priority)

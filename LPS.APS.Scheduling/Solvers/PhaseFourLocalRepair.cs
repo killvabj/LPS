@@ -128,7 +128,8 @@ internal class PhaseFourLocalRepair
             .ToList();
 
         var tasks = new List<FinalTaskDraft>();
-        var earliestStart = GetMaterialEarliestTime(demand.AllocationSequence, constraints, request.PlanningStart);
+        // P0-05修复：传入所需数量，根据累计可用量确定启动时间
+        var earliestStart = GetMaterialEarliestTime(demand.AllocationSequence, demand.NetOutputQty, constraints, request.PlanningStart);
 
         // 对每道工序尝试找资源
         foreach (var operation in operations)
@@ -181,17 +182,29 @@ internal class PhaseFourLocalRepair
     /// <summary>
     /// 获取物料最早可用时间
     /// 文档：§四 4.6、§十二 Stage overlap
-    /// 支持多段Quantity-Time，不能压平为单一时间
+    /// P0-05修复：支持多段Quantity-Time，根据所需数量确定可用时间
     /// </summary>
     private DateTime GetMaterialEarliestTime(
         long allocationSequence,
+        decimal requiredQuantity,
         ConstraintContext constraints,
         DateTime planningStart)
     {
         if (constraints.MaterialAvailability.TryGetValue(allocationSequence, out var segments) && segments.Count > 0)
         {
-            // 返回最早的一段可用时间（不压平多段）
-            return segments.Min(s => s.AvailableTime);
+            // P0-05修复：累计可用数量，找到满足需求数量的最早时间
+            decimal accumulated = 0m;
+            foreach (var segment in segments.OrderBy(s => s.AvailableTime))
+            {
+                accumulated += segment.Quantity;
+                if (accumulated >= requiredQuantity)
+                {
+                    // 累计数量满足需求，返回该段时间
+                    return segment.AvailableTime;
+                }
+            }
+            // 所有段累计仍不足，返回最后一段时间（排程可能失败）
+            return segments.Max(s => s.AvailableTime);
         }
         return planningStart;
     }
@@ -290,16 +303,12 @@ internal class PhaseFourLocalRepair
         DateTime start,
         DateTime end)
     {
-        // 根据 ProductionInstructionNo 确定 TaskType
-        string taskType;
-        if (!string.IsNullOrEmpty(demand.ProductionInstructionNo))
-        {
-            taskType = "NEW_REQUIREMENT";
-        }
-        else
-        {
-            taskType = demand.IsUnlocated ? "UNLOCATED" : "PLANNING_ONLY";
-        }
+        // P0-16修复：V1新生成的都是生产Task，统一使用PRODUCTION
+        // UNLOCATED、无PI等作为独立标识/来源事实，不增加新TaskType
+        string taskType = "PRODUCTION";
+
+        // TODO P0-04: PlannedProcessQty字段需要Core.Dto.FinalTaskDraft添加该字段后才能赋值
+        // Duration计算也需要调整：StandardDuration × PlannedProcessQty ÷ CapacityFactor
 
         return new FinalTaskDraft
         {
@@ -310,7 +319,7 @@ internal class PhaseFourLocalRepair
             OperationCode = operation.OperationCode,
             TaskType = taskType,
             ResourceId = resourceId,
-            ResourceCode = string.Empty,
+            ResourceCode = string.Empty, // TODO: 从Resources查找ResourceCode
             Quantity = demand.NetOutputQty,
             UOM = string.Empty,
             PlannedStartTime = start,

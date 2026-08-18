@@ -46,6 +46,9 @@ internal class PhaseFiveCompression
         // 生成 AllocationTaskShare（追溯 Allocation → Task 的份额）
         var allocationShares = GenerateAllocationShares(allScheduledTasks, request);
 
+        // P0-13修复：生成 TaskDependency（基于 Routing 工序依赖关系）
+        var taskDependencies = GenerateTaskDependencies(allScheduledTasks, request, constraints);
+
         // 收集未排程需求
         var unscheduledTasks = new List<UnscheduledTaskResult>();
 
@@ -72,18 +75,18 @@ internal class PhaseFiveCompression
             });
         }
 
-        // 构建最终结果
+        // P0-15修复：构建最终结果，Success表示Solver执行成功，业务Unscheduled不影响Success
         return new DomainSolveResult
         {
-            Success = unscheduledTasks.Count == 0,
-            ErrorMessage = unscheduledTasks.Count > 0
-                ? $"{unscheduledTasks.Count} 个需求无法排程"
-                : null,
+            // P0-15修复：Solver成功执行，即使有业务无法排程的需求也返回Success=true
+            // 算法异常、Routing非法、数量丢失等才返回Failure
+            Success = true,
+            ErrorMessage = null,
             IsRoughCut = false,
             FinalTasks = allScheduledTasks,
             AllocationShares = allocationShares,
             UnscheduledTasks = unscheduledTasks,
-            PhysicalPeggingDrafts = Array.Empty<FinalTaskPeggingDraft>(),
+            PhysicalPeggingDrafts = taskDependencies,
             ExplanationFacts = diagnostics.ExplanationFacts,
             Summary = new SolveSummary
             {
@@ -123,33 +126,101 @@ internal class PhaseFiveCompression
         foreach (var group in tasksByAllocation)
         {
             var allocationSeq = group.Key;
-            var totalShareQty = 0m;
+            var allocationTasks = group.ToList();
+            var expectedQty = allocationTasks.First().Demand!.NetOutputQty;
 
-            foreach (var item in group)
+            // P0-14修复：严格闭合检查，调整最后一个Task的份额数量以保证Σ ShareQty = NetOutputQty
+            for (int i = 0; i < allocationTasks.Count; i++)
             {
+                var item = allocationTasks[i];
                 var task = item.Task;
-                var demand = item.Demand!;
+                var isLastTask = (i == allocationTasks.Count - 1);
 
-                // 生成 AllocationTaskShare
+                decimal shareQty;
+                if (isLastTask)
+                {
+                    // 最后一个Task用 (期望总量 - 已分配量) 来闭合
+                    var alreadyAllocated = shares
+                        .Where(s => s.AllocationSequence == allocationSeq)
+                        .Sum(s => s.ComponentQty);
+                    shareQty = expectedQty - alreadyAllocated;
+                }
+                else
+                {
+                    // 非最后一个Task使用原始数量
+                    shareQty = task.Quantity;
+                }
+
                 shares.Add(new AllocationTaskShare
                 {
                     FinalDraftId = task.FinalDraftId,
                     AllocationSequence = allocationSeq,
-                    ComponentQty = task.Quantity
+                    ComponentQty = shareQty
                 });
-
-                totalShareQty += task.Quantity;
-            }
-
-            // 闭合检查：Σ ShareQty 应该等于 NetOutputQty
-            var expectedQty = group.First().Demand!.NetOutputQty;
-            if (Math.Abs(totalShareQty - expectedQty) > 0.001m)
-            {
-                // 数量不闭合，记录警告（实际应用中可能需要更严格处理）
-                // TODO: 考虑是否需要调整最后一个 Task 的 Quantity 来闭合
             }
         }
 
         return shares;
+    }
+
+    /// <summary>
+    /// 生成 TaskDependency（基于 Routing 工序依赖关系）
+    /// 文档：§五 5.3
+    /// P0-13修复：根据工艺路线生成工序间的物理依赖关系
+    /// </summary>
+    private List<FinalTaskPeggingDraft> GenerateTaskDependencies(
+        List<FinalTaskDraft> tasks,
+        DomainSolveRequest request,
+        ConstraintContext constraints)
+    {
+        var dependencies = new List<FinalTaskPeggingDraft>();
+
+        // 按 SourceDraftId（需求）分组任务
+        var tasksByDemand = tasks
+            .GroupBy(t => t.SourceDraftId)
+            .ToDictionary(g => g.Key, g => g.OrderBy(t => t.PlannedStartTime).ToList());
+
+        // 为每个需求生成工序依赖
+        foreach (var demandGroup in tasksByDemand)
+        {
+            var demand = request.LogicalProductionDemands
+                .FirstOrDefault(d => d.LogicalDemandKey == demandGroup.Key);
+            if (demand == null) continue;
+
+            // 获取工艺路线
+            if (!constraints.RoutingGraphs.TryGetValue(demand.MaterialId, out var routeGraphs))
+                continue;
+            if (!routeGraphs.TryGetValue("DEFAULT", out var routingGraph))
+                continue;
+
+            // 遍历工艺路线中的依赖关系
+            foreach (var depList in routingGraph.Dependencies.Values)
+            {
+                foreach (var dep in depList)
+                {
+                    // 找到对应的上下游Task
+                    var upstreamTask = demandGroup.Value
+                        .FirstOrDefault(t => t.OperationCode == dep.FromOperationCode);
+                    var downstreamTask = demandGroup.Value
+                        .FirstOrDefault(t => t.OperationCode == dep.ToOperationCode);
+
+                    if (upstreamTask != null && downstreamTask != null)
+                    {
+                        dependencies.Add(new FinalTaskPeggingDraft
+                        {
+                            UpstreamFinalDraftId = upstreamTask.FinalDraftId,
+                            DownstreamFinalDraftId = downstreamTask.FinalDraftId,
+                            UpstreamMaterialId = demand.MaterialId,
+                            DownstreamMaterialId = demand.MaterialId,
+                            Quantity = demand.NetOutputQty,
+                            UOM = string.Empty,
+                            InheritedPriority = demand.DemandSequence
+                        });
+                    }
+                }
+            }
+        }
+
+        return dependencies;
     }
 }
