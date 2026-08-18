@@ -1,0 +1,12 @@
+D:\WorkSpace_LocalLib\Windsurf WorkSpace\LPS_SVN\LPS.APS.Shared\bin\Debug\net8.0\LPS.APS.Shared.deps.json
+D:\WorkSpace_LocalLib\Windsurf WorkSpace\LPS_SVN\LPS.APS.Shared\bin\Debug\net8.0\LPS.APS.Shared.dll
+D:\WorkSpace_LocalLib\Windsurf WorkSpace\LPS_SVN\LPS.APS.Shared\bin\Debug\net8.0\LPS.APS.Shared.pdb
+D:\WorkSpace_LocalLib\Windsurf WorkSpace\LPS_SVN\LPS.APS.Shared\obj\Debug\net8.0\LPS.APS.Shared.csproj.AssemblyReference.cache
+D:\WorkSpace_LocalLib\Windsurf WorkSpace\LPS_SVN\LPS.APS.Shared\obj\Debug\net8.0\LPS.APS.Shared.GeneratedMSBuildEditorConfig.editorconfig
+D:\WorkSpace_LocalLib\Windsurf WorkSpace\LPS_SVN\LPS.APS.Shared\obj\Debug\net8.0\LPS.APS.Shared.AssemblyInfoInputs.cache
+D:\WorkSpace_LocalLib\Windsurf WorkSpace\LPS_SVN\LPS.APS.Shared\obj\Debug\net8.0\LPS.APS.Shared.AssemblyInfo.cs
+D:\WorkSpace_LocalLib\Windsurf WorkSpace\LPS_SVN\LPS.APS.Shared\obj\Debug\net8.0\LPS.APS.Shared.csproj.CoreCompileInputs.cache
+D:\WorkSpace_LocalLib\Windsurf WorkSpace\LPS_SVN\LPS.APS.Shared\obj\Debug\net8.0\LPS.APS.Shared.dll
+D:\WorkSpace_LocalLib\Windsurf WorkSpace\LPS_SVN\LPS.APS.Shared\obj\Debug\net8.0\refint\LPS.APS.Shared.dll
+D:\WorkSpace_LocalLib\Windsurf WorkSpace\LPS_SVN\LPS.APS.Shared\obj\Debug\net8.0\LPS.APS.Shared.pdb
+D:\WorkSpace_LocalLib\Windsurf WorkSpace\LPS_SVN\LPS.APS.Shared\obj\Debug\net8.0\ref\LPS.APS.Shared.dll
