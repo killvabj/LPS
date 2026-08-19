@@ -112,6 +112,7 @@ internal class PhaseTwoInitialScheduler
             var demandTasks = ScheduleDemandOperations(
                 demand,
                 operationsToSchedule,
+                routingGraph,
                 direction,
                 constraints,
                 resourceOccupancy,
@@ -273,6 +274,7 @@ internal class PhaseTwoInitialScheduler
     private List<FinalTaskDraft> ScheduleDemandOperations(
         LogicalProductionDemand demand,
         List<OperationNode> operations,
+        RoutingGraph routingGraph,
         string direction,
         ConstraintContext constraints,
         Dictionary<int, List<TimeWindow>> resourceOccupancy,
@@ -284,19 +286,19 @@ internal class PhaseTwoInitialScheduler
         // 根据排程方向选择策略
         if (direction == "BACKWARD")
         {
-            tasks = ScheduleBackward(demand, operations, constraints, resourceOccupancy, planningStart, planningEnd);
+            tasks = ScheduleBackward(demand, operations, routingGraph, constraints, resourceOccupancy, planningStart, planningEnd);
         }
         else if (direction == "FORWARD")
         {
-            tasks = ScheduleForward(demand, operations, constraints, resourceOccupancy, planningStart, planningEnd);
+            tasks = ScheduleForward(demand, operations, routingGraph, constraints, resourceOccupancy, planningStart, planningEnd);
         }
         else // MIXED 或其他
         {
             // 先尝试倒排，失败则转正排（§八 8.3 Mixed模式）
-            tasks = ScheduleBackward(demand, operations, constraints, resourceOccupancy, planningStart, planningEnd);
+            tasks = ScheduleBackward(demand, operations, routingGraph, constraints, resourceOccupancy, planningStart, planningEnd);
             if (tasks.Count == 0)
             {
-                tasks = ScheduleForward(demand, operations, constraints, resourceOccupancy, planningStart, planningEnd);
+                tasks = ScheduleForward(demand, operations, routingGraph, constraints, resourceOccupancy, planningStart, planningEnd);
             }
         }
 
@@ -310,6 +312,7 @@ internal class PhaseTwoInitialScheduler
     private List<FinalTaskDraft> ScheduleBackward(
         LogicalProductionDemand demand,
         List<OperationNode> operations,
+        RoutingGraph routingGraph,
         ConstraintContext constraints,
         Dictionary<int, List<TimeWindow>> resourceOccupancy,
         DateTime planningStart,
@@ -336,22 +339,6 @@ internal class PhaseTwoInitialScheduler
         for (int i = operations.Count - 1; i >= 0; i--)
         {
             var operation = operations[i];
-            var duration = TimeSpan.FromMinutes((double)operation.StandardDuration);
-
-            // 计算候选开始时间
-            var candidateStart = currentEndTime - duration;
-
-            // P0-05修复：倒排Task不能早于物料可用时间
-            if (candidateStart < materialEarliestTime)
-            {
-                return new List<FinalTaskDraft>(); // 物料约束冲突
-            }
-
-            // 检查是否早于计划期起点
-            if (candidateStart < planningStart)
-            {
-                return new List<FinalTaskDraft>(); // 倒排失败
-            }
 
             // 查找合格资源
             var eligibleResources = GetEligibleResources(demand.MaterialId, operation.OperationCode, constraints);
@@ -364,6 +351,26 @@ internal class PhaseTwoInitialScheduler
             FinalTaskDraft? scheduledTask = null;
             foreach (var resourceId in eligibleResources)
             {
+                // P0-04修复：Duration = StandardDuration × PlannedProcessQty ÷ CapacityFactor
+                var capacityFactor = GetCapacityFactor(operation.OperationCode, resourceId, constraints);
+                var adjustedDuration = operation.StandardDuration * demand.PlannedProcessQty / capacityFactor;
+                var duration = TimeSpan.FromMinutes((double)adjustedDuration);
+
+                // 计算候选开始时间
+                var candidateStart = currentEndTime - duration;
+
+                // P0-05修复：倒排Task不能早于物料可用时间
+                if (candidateStart < materialEarliestTime)
+                {
+                    continue; // 尝试下一个资源
+                }
+
+                // 检查是否早于计划期起点
+                if (candidateStart < planningStart)
+                {
+                    continue; // 尝试下一个资源
+                }
+
                 var slot = FindBackwardSlot(
                     candidateStart,
                     currentEndTime,
@@ -380,8 +387,14 @@ internal class PhaseTwoInitialScheduler
                     // 更新资源占用
                     resourceOccupancy[resourceId].Add(new TimeWindow(slot.Value.Start, slot.Value.End));
 
-                    // 更新前驱工序的结束时间
+                    // P0-17修复：应用Routing LagTime到前序工序的结束时间约束
                     currentEndTime = slot.Value.Start;
+                    if (i > 0)
+                    {
+                        var prevOperation = operations[i - 1];
+                        var lagTime = GetLagTime(prevOperation.OperationCode, operation.OperationCode, routingGraph);
+                        currentEndTime = currentEndTime.AddMinutes(-(double)lagTime);
+                    }
                     break;
                 }
             }
@@ -399,10 +412,12 @@ internal class PhaseTwoInitialScheduler
 
     /// <summary>
     /// 正排：从物料可用时间往后推
+    /// P0-17修复：应用Routing LagTime到工序间时间依赖
     /// </summary>
     private List<FinalTaskDraft> ScheduleForward(
         LogicalProductionDemand demand,
         List<OperationNode> operations,
+        RoutingGraph routingGraph,
         ConstraintContext constraints,
         Dictionary<int, List<TimeWindow>> resourceOccupancy,
         DateTime planningStart,
@@ -429,9 +444,9 @@ internal class PhaseTwoInitialScheduler
         // TODO P7: Stage overlap / 阈值启动
         // 文档§十二：如果配置了阈值数量，上游完成达到阈值后下游即可开始，无需等待整批全部完成
         // 这是保留 40件/60件 分段 AvailableTime 的重要原因
-        foreach (var operation in operations)
+        for (int i = 0; i < operations.Count; i++)
         {
-            var duration = TimeSpan.FromMinutes((double)operation.StandardDuration);
+            var operation = operations[i];
 
             // 查找合格资源
             var eligibleResources = GetEligibleResources(demand.MaterialId, operation.OperationCode, constraints);
@@ -444,6 +459,11 @@ internal class PhaseTwoInitialScheduler
             FinalTaskDraft? scheduledTask = null;
             foreach (var resourceId in eligibleResources)
             {
+                // P0-04修复：Duration = StandardDuration × PlannedProcessQty ÷ CapacityFactor
+                var capacityFactor = GetCapacityFactor(operation.OperationCode, resourceId, constraints);
+                var adjustedDuration = operation.StandardDuration * demand.PlannedProcessQty / capacityFactor;
+                var duration = TimeSpan.FromMinutes((double)adjustedDuration);
+
                 var slot = FindForwardSlot(
                     earliestStart,
                     duration,
@@ -456,7 +476,16 @@ internal class PhaseTwoInitialScheduler
                 {
                     scheduledTask = CreateTask(demand, operation, resourceId, slot.Value.Start, slot.Value.End);
                     resourceOccupancy[resourceId].Add(new TimeWindow(slot.Value.Start, slot.Value.End));
-                    earliestStart = slot.Value.End; // 下道工序从此时间开始
+
+                    // P0-17修复：应用Routing LagTime到下道工序的最早开始时间
+                    earliestStart = slot.Value.End;
+                    if (i < operations.Count - 1)
+                    {
+                        var nextOperation = operations[i + 1];
+                        var lagTime = GetLagTime(operation.OperationCode, nextOperation.OperationCode, routingGraph);
+                        earliestStart = earliestStart.AddMinutes((double)lagTime);
+                    }
+
                     break;
                 }
             }
@@ -677,9 +706,7 @@ internal class PhaseTwoInitialScheduler
         // UNLOCATED、无PI等作为独立标识/来源事实，不增加新TaskType
         string taskType = "PRODUCTION";
 
-        // P0-04修复：补齐FinalTaskDraft必需字段
-        // TODO: Duration计算需调整为 StandardDuration × PlannedProcessQty ÷ CapacityFactor
-        // TODO: 当前Duration仍使用StandardDuration，需要获取CapacityFactor后调整
+        // P0-04修复：补齐FinalTaskDraft必需字段，Duration已使用 StandardDuration × PlannedProcessQty ÷ CapacityFactor
 
         return new FinalTaskDraft
         {
@@ -702,6 +729,41 @@ internal class PhaseTwoInitialScheduler
             Priority = demand.DemandSequence,
             IsVirtual = false
         };
+    }
+
+    /// <summary>
+    /// P0-04修复：获取资源产能系数
+    /// </summary>
+    private decimal GetCapacityFactor(string operationCode, int resourceId, ConstraintContext constraints)
+    {
+        var key = $"DEFAULT::{operationCode}"; // V1固定DEFAULT路径
+        if (constraints.ResourceCapacityFactors.TryGetValue(key, out var resourceFactors))
+        {
+            if (resourceFactors.TryGetValue(resourceId, out var capacityFactor))
+            {
+                return capacityFactor;
+            }
+        }
+        return 1.0m; // 默认产能系数为1.0
+    }
+
+    /// <summary>
+    /// P0-17修复：获取工序间的Lag时间（分钟）
+    /// 应用Routing LagTime到工序间时间依赖
+    /// </summary>
+    private decimal GetLagTime(string fromOperationCode, string toOperationCode, RoutingGraph routingGraph)
+    {
+        // 查找fromOperation的所有依赖边
+        if (routingGraph.Dependencies.TryGetValue(fromOperationCode, out var edges))
+        {
+            // 找到指向toOperation的边
+            var edge = edges.FirstOrDefault(e => e.ToOperationCode == toOperationCode);
+            if (edge != null)
+            {
+                return edge.LagTime;
+            }
+        }
+        return 0m; // 默认无延迟
     }
 }
 

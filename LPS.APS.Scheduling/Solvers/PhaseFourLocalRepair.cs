@@ -160,10 +160,10 @@ internal class PhaseFourLocalRepair
             return new List<FinalTaskDraft>(); // 物料总量不足
         }
 
-        // 对每道工序尝试找资源
-        foreach (var operation in operations)
+        // P0-17修复：改为for循环以便访问下一道工序，应用Routing LagTime
+        for (int i = 0; i < operations.Count; i++)
         {
-            var duration = TimeSpan.FromMinutes((double)operation.StandardDuration);
+            var operation = operations[i];
 
             // 获取合格资源列表
             var eligibleResources = GetEligibleResources(demand.MaterialId, operation.OperationCode, constraints);
@@ -173,6 +173,11 @@ internal class PhaseFourLocalRepair
             // 遍历合格资源，找第一个可用的
             foreach (var resourceId in eligibleResources)
             {
+                // P0-04修复：Duration = StandardDuration × PlannedProcessQty ÷ CapacityFactor
+                var capacityFactor = GetCapacityFactor(operation.OperationCode, resourceId, constraints);
+                var adjustedDuration = operation.StandardDuration * demand.PlannedProcessQty / capacityFactor;
+                var duration = TimeSpan.FromMinutes((double)adjustedDuration);
+
                 var slot = FindForwardSlot(
                     earliestStart,
                     duration,
@@ -192,7 +197,14 @@ internal class PhaseFourLocalRepair
                     }
                     resourceOccupancy[resourceId].Add(slot.Value);
 
+                    // P0-17修复：应用Routing LagTime到下道工序的最早开始时间
                     earliestStart = slot.Value.End;
+                    if (i < operations.Count - 1)
+                    {
+                        var nextOperation = operations[i + 1];
+                        var lagTime = GetLagTime(operation.OperationCode, nextOperation.OperationCode, routingGraph);
+                        earliestStart = earliestStart.AddMinutes((double)lagTime);
+                    }
                     break;
                 }
             }
@@ -341,9 +353,7 @@ internal class PhaseFourLocalRepair
         // UNLOCATED、无PI等作为独立标识/来源事实，不增加新TaskType
         string taskType = "PRODUCTION";
 
-        // P0-04修复：补齐FinalTaskDraft必需字段
-        // TODO: Duration计算需调整为 StandardDuration × PlannedProcessQty ÷ CapacityFactor
-        // TODO: 当前Duration仍使用StandardDuration，需要获取CapacityFactor后调整
+        // P0-04修复：补齐FinalTaskDraft必需字段，Duration已使用 StandardDuration × PlannedProcessQty ÷ CapacityFactor
 
         return new FinalTaskDraft
         {
@@ -366,6 +376,41 @@ internal class PhaseFourLocalRepair
             Priority = demand.DemandSequence,
             IsVirtual = false
         };
+    }
+
+    /// <summary>
+    /// P0-04修复：获取资源产能系数
+    /// </summary>
+    private decimal GetCapacityFactor(string operationCode, int resourceId, ConstraintContext constraints)
+    {
+        var key = $"DEFAULT::{operationCode}"; // V1固定DEFAULT路径
+        if (constraints.ResourceCapacityFactors.TryGetValue(key, out var resourceFactors))
+        {
+            if (resourceFactors.TryGetValue(resourceId, out var capacityFactor))
+            {
+                return capacityFactor;
+            }
+        }
+        return 1.0m; // 默认产能系数为1.0
+    }
+
+    /// <summary>
+    /// P0-17修复：获取工序间的Lag时间（分钟）
+    /// 应用Routing LagTime到工序间时间依赖
+    /// </summary>
+    private decimal GetLagTime(string fromOperationCode, string toOperationCode, RoutingGraph routingGraph)
+    {
+        // 查找fromOperation的所有依赖边
+        if (routingGraph.Dependencies.TryGetValue(fromOperationCode, out var edges))
+        {
+            // 找到指向toOperation的边
+            var edge = edges.FirstOrDefault(e => e.ToOperationCode == toOperationCode);
+            if (edge != null)
+            {
+                return edge.LagTime;
+            }
+        }
+        return 0m; // 默认无延迟
     }
 }
 

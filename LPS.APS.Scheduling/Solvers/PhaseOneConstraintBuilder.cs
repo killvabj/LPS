@@ -147,6 +147,20 @@ internal class PhaseOneConstraintBuilder
             );
 
         context.OperationResourceEligibility = eligibilityGroups;
+
+        // P0-04修复：同时构建 ResourceCapacityFactors 映射
+        // (RouteCode::OperationCode, ResourceId) → CapacityFactor
+        var capacityFactors = request.OperationResourceEligibility
+            .GroupBy(e => $"{e.RouteCode}::{e.OperationCode}")
+            .ToDictionary(
+                g => g.Key,
+                g => g.ToDictionary(
+                    e => e.ResourceId,
+                    e => e.CapacityFactor
+                )
+            );
+
+        context.ResourceCapacityFactors = capacityFactors;
     }
 
     /// <summary>
@@ -253,6 +267,12 @@ internal class ConstraintContext
     /// 工序资源资格：(MaterialId, RouteCode, OperationCode) → 合法 ResourceId 列表（按优先级排序）
     /// </summary>
     public Dictionary<string, List<int>> OperationResourceEligibility { get; set; } = new();
+
+    /// <summary>
+    /// P0-04修复：工序资源产能系数映射：(RouteCode::OperationCode, ResourceId) → CapacityFactor
+    /// 用于Duration计算：StandardDuration × PlannedProcessQty ÷ CapacityFactor
+    /// </summary>
+    public Dictionary<string, Dictionary<int, decimal>> ResourceCapacityFactors { get; set; } = new();
 
     /// <summary>
     /// 资源日历：ResourceId → 可用时间窗列表（已排序）
