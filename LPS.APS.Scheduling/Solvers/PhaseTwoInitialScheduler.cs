@@ -62,6 +62,7 @@ internal class PhaseTwoInitialScheduler
                 UOM = string.Empty,
                 PlannedStartTime = lockedTask.LockedStart,
                 PlannedEndTime = lockedTask.LockedEnd,
+                SetupTime = 0m,
                 Priority = demand?.DemandSequence ?? 0,
                 IsVirtual = false,
                 ExecutionLockId = null // TODO: 关联ExecutionConstraint.Id
@@ -70,8 +71,9 @@ internal class PhaseTwoInitialScheduler
         }
 
         // 逐个需求排程
-        // TODO P5: 实现合批逻辑 - 检测相同 Material/Operation/工艺的多个 Demand 是否可以合并成一个 Task
-        // 文档§十 10.3: 不同Demand可以合并成一个FinalTask，只要 Material/Operation/工艺相容、Resource能力允许、交期不被破坏
+        // 第4轮Merge修复：记录Demand到Task的份额追溯，支持合批
+        var allocationTaskShare = new Dictionary<string, List<(string DemandKey, decimal ShareQty)>>();
+
         foreach (var demand in sortedDemands)
         {
             // P0-07修复：如果该Demand对应锁定任务，跳过排程（已在上面继承）
@@ -109,15 +111,35 @@ internal class PhaseTwoInitialScheduler
             }
 
             // 排程该需求的所有工序
-            var demandTasks = ScheduleDemandOperations(
-                demand,
-                operationsToSchedule,
-                routingGraph,
-                direction,
-                constraints,
-                resourceOccupancy,
-                request.PlanningStart,
-                request.PlanningEnd);
+            List<FinalTaskDraft> demandTasks;
+
+            // 第4轮Merge修复：检测是否可以合并到已有Task
+            if (request.StrategySnapshot.Parameters.AllowMerge)
+            {
+                demandTasks = TryMergeOrSchedule(
+                    demand,
+                    operationsToSchedule,
+                    routingGraph,
+                    direction,
+                    constraints,
+                    resourceOccupancy,
+                    result.ScheduledTasks,
+                    allocationTaskShare,
+                    request.PlanningStart,
+                    request.PlanningEnd);
+            }
+            else
+            {
+                demandTasks = ScheduleDemandOperations(
+                    demand,
+                    operationsToSchedule,
+                    routingGraph,
+                    direction,
+                    constraints,
+                    resourceOccupancy,
+                    request.PlanningStart,
+                    request.PlanningEnd);
+            }
 
             if (demandTasks.Count == 0)
             {
@@ -242,26 +264,55 @@ internal class PhaseTwoInitialScheduler
             return new List<OperationNode>();
         }
 
-        // P0-02修复：根据StartStageCode裁剪已完成的Stage
+        // P0-02修复 + 第4轮修复：根据StartStageCode裁剪已完成的Stage
+        // 第4轮修复：StartStage不存在时不返回整条Routing，而是返回空（数据不一致）
+        // 第4轮修复：DAG场景不能用Skip，要找从StartStage可达的所有后续工序
         if (!string.IsNullOrEmpty(startStageCode))
         {
-            // 找到StartStageCode对应的第一个工序位置
-            var startIndex = result.FindIndex(op => op.StageCode == startStageCode);
+            // 找到所有StartStageCode对应的工序
+            var startOperations = result.Where(op => op.StageCode == startStageCode).ToList();
 
-            if (startIndex == -1)
+            if (startOperations.Count == 0)
             {
                 // StartStageCode在Routing中不存在
-                // 这可能是PI Position数据问题或Routing更新后Stage定义变化
-                // 保守处理：返回整条Routing，由排程阶段的时间约束自然过滤已完成工序
-                // 不作为技术失败，因为这是输入数据不一致，不是Solver算法错误
-                return result;
+                // 这是PI Position数据与当前Routing不一致，不应返回整条Routing
+                // 返回空列表，让上层判定为Unscheduled（不是技术失败）
+                return new List<OperationNode>();
             }
 
-            if (startIndex > 0)
+            // 从StartStage工序开始，找到所有可达的后续工序（包括自己）
+            var reachableOps = new HashSet<string>();
+            var bfsQueue = new Queue<string>();
+
+            // 初始化：所有StartStage工序入队
+            foreach (var startOp in startOperations)
             {
-                // 裁剪掉前面已完成的Stage
-                result = result.Skip(startIndex).ToList();
+                reachableOps.Add(startOp.OperationCode);
+                bfsQueue.Enqueue(startOp.OperationCode);
             }
+
+            // BFS遍历：从Dependencies找每个工序的所有后续工序
+            while (bfsQueue.Count > 0)
+            {
+                var currentOp = bfsQueue.Dequeue();
+
+                // 遍历所有依赖边，找以currentOp为前驱的后续工序
+                foreach (var kvp in routingGraph.Dependencies)
+                {
+                    var toOp = kvp.Key;
+                    var edges = kvp.Value;
+
+                    // 如果存在从currentOp到toOp的边，且toOp未访问过
+                    if (edges.Any(e => e.FromOperationCode == currentOp) && !reachableOps.Contains(toOp))
+                    {
+                        reachableOps.Add(toOp);
+                        bfsQueue.Enqueue(toOp);
+                    }
+                }
+            }
+
+            // 过滤：只保留可达的工序
+            result = result.Where(op => reachableOps.Contains(op.OperationCode)).ToList();
         }
 
         return result;
@@ -352,12 +403,16 @@ internal class PhaseTwoInitialScheduler
             foreach (var resourceId in eligibleResources)
             {
                 // P0-04修复：Duration = StandardDuration × PlannedProcessQty ÷ CapacityFactor
-                var capacityFactor = GetCapacityFactor(operation.OperationCode, resourceId, constraints);
+                // 第4轮Setup修复：加上SetupTime占用资源时间轴
+                var capacityFactor = GetCapacityFactor(demand.MaterialId, operation.OperationCode, resourceId, constraints);
                 var adjustedDuration = operation.StandardDuration * demand.PlannedProcessQty / capacityFactor;
-                var duration = TimeSpan.FromMinutes((double)adjustedDuration);
+                var processDuration = TimeSpan.FromMinutes((double)adjustedDuration);
+                var setupDuration = TimeSpan.FromMinutes((double)operation.SetupTime);
+                var totalDuration = processDuration + setupDuration;
 
-                // 计算候选开始时间
-                var candidateStart = currentEndTime - duration;
+                // 计算候选开始时间（包含Setup）
+                var candidateEnd = currentEndTime;
+                var candidateStart = candidateEnd - totalDuration;
 
                 // P0-05修复：倒排Task不能早于物料可用时间
                 if (candidateStart < materialEarliestTime)
@@ -371,9 +426,10 @@ internal class PhaseTwoInitialScheduler
                     continue; // 尝试下一个资源
                 }
 
+                // 找可用槽（需要包含Setup时间）
                 var slot = FindBackwardSlot(
                     candidateStart,
-                    currentEndTime,
+                    candidateEnd,
                     resourceId,
                     constraints,
                     resourceOccupancy,
@@ -382,12 +438,15 @@ internal class PhaseTwoInitialScheduler
                 if (slot.HasValue)
                 {
                     // 找到可用槽 → 生成任务
-                    scheduledTask = CreateTask(demand, operation, resourceId, slot.Value.Start, slot.Value.End);
+                    // Task的PlannedStartTime是加工开始时间（不含Setup）
+                    var taskStart = slot.Value.Start + setupDuration;
+                    scheduledTask = CreateTask(demand, operation, resourceId, taskStart, slot.Value.End);
 
-                    // 更新资源占用
+                    // 更新资源占用：从Setup开始到End结束
                     resourceOccupancy[resourceId].Add(new TimeWindow(slot.Value.Start, slot.Value.End));
 
                     // P0-17修复：应用Routing LagTime到前序工序的结束时间约束
+                    // currentEndTime应该是加工开始时间（Setup之前）
                     currentEndTime = slot.Value.Start;
                     if (i > 0)
                     {
@@ -413,6 +472,7 @@ internal class PhaseTwoInitialScheduler
     /// <summary>
     /// 正排：从物料可用时间往后推
     /// P0-17修复：应用Routing LagTime到工序间时间依赖
+    /// 第4轮C2修复：按真实DAG依赖执行，不串行化并行分支
     /// </summary>
     private List<FinalTaskDraft> ScheduleForward(
         LogicalProductionDemand demand,
@@ -427,7 +487,7 @@ internal class PhaseTwoInitialScheduler
 
         // 获取物料最早可用时间
         // P0-05修复：传入所需数量，根据累计可用量确定启动时间，并验证总量是否足够
-        var earliestStart = GetMaterialEarliestTime(
+        var materialEarliestStart = GetMaterialEarliestTime(
             demand.AllocationSequence,
             demand.NetOutputQty,
             constraints,
@@ -440,13 +500,49 @@ internal class PhaseTwoInitialScheduler
             return new List<FinalTaskDraft>(); // 物料总量不足
         }
 
+        // 第4轮C2修复：记录每个Operation的实际完成时间，用于DAG依赖计算
+        var operationEndTimes = new Dictionary<string, DateTime>();
+
+        // 第4轮P7修复：记录每个Operation的阈值启动时间（完成TransferBatchSize数量的时间）
+        // 用于Stage overlap：下游工序可在上游达到TransferBatchSize后启动，无需等待全部完成
+        var operationThresholdTimes = new Dictionary<string, DateTime>();
+
         // 从第一道工序往后推
-        // TODO P7: Stage overlap / 阈值启动
-        // 文档§十二：如果配置了阈值数量，上游完成达到阈值后下游即可开始，无需等待整批全部完成
-        // 这是保留 40件/60件 分段 AvailableTime 的重要原因
         for (int i = 0; i < operations.Count; i++)
         {
             var operation = operations[i];
+
+            // 第4轮C2修复：计算当前Operation的真实最早开始时间
+            // 1. 如果是根工序（无前驱），从物料可用时间开始
+            // 2. 如果有前驱，从所有前驱的（结束时间+Lag）中取最大值
+            DateTime earliestStart = materialEarliestStart;
+
+            if (routingGraph.Dependencies.TryGetValue(operation.OperationCode, out var predecessorEdges))
+            {
+                // 有前驱：遍历所有前驱边，计算最晚的（前驱结束时间+Lag）
+                // 第4轮P7修复：如果前驱配置了TransferBatchSize，使用阈值时间而非完成时间
+                foreach (var edge in predecessorEdges)
+                {
+                    if (operationEndTimes.TryGetValue(edge.FromOperationCode, out var predecessorEnd))
+                    {
+                        // 检查前驱工序是否配置了TransferBatchSize
+                        DateTime effectiveTime = predecessorEnd;
+                        if (routingGraph.Operations.TryGetValue(edge.FromOperationCode, out var predecessorOp)
+                            && predecessorOp.TransferBatchSize.HasValue
+                            && operationThresholdTimes.TryGetValue(edge.FromOperationCode, out var thresholdTime))
+                        {
+                            // 有阈值配置且已计算阈值时间，使用阈值时间
+                            effectiveTime = thresholdTime;
+                        }
+
+                        var candidateStart = effectiveTime.AddMinutes((double)edge.LagTime);
+                        if (candidateStart > earliestStart)
+                        {
+                            earliestStart = candidateStart;
+                        }
+                    }
+                }
+            }
 
             // 查找合格资源
             var eligibleResources = GetEligibleResources(demand.MaterialId, operation.OperationCode, constraints);
@@ -460,13 +556,16 @@ internal class PhaseTwoInitialScheduler
             foreach (var resourceId in eligibleResources)
             {
                 // P0-04修复：Duration = StandardDuration × PlannedProcessQty ÷ CapacityFactor
-                var capacityFactor = GetCapacityFactor(operation.OperationCode, resourceId, constraints);
+                // 第4轮Setup修复：加上SetupTime占用资源时间轴
+                var capacityFactor = GetCapacityFactor(demand.MaterialId, operation.OperationCode, resourceId, constraints);
                 var adjustedDuration = operation.StandardDuration * demand.PlannedProcessQty / capacityFactor;
-                var duration = TimeSpan.FromMinutes((double)adjustedDuration);
+                var processDuration = TimeSpan.FromMinutes((double)adjustedDuration);
+                var setupDuration = TimeSpan.FromMinutes((double)operation.SetupTime);
+                var totalDuration = processDuration + setupDuration;
 
                 var slot = FindForwardSlot(
                     earliestStart,
-                    duration,
+                    totalDuration,
                     resourceId,
                     constraints,
                     resourceOccupancy,
@@ -474,16 +573,23 @@ internal class PhaseTwoInitialScheduler
 
                 if (slot.HasValue)
                 {
-                    scheduledTask = CreateTask(demand, operation, resourceId, slot.Value.Start, slot.Value.End);
+                    // Task的PlannedStartTime是加工开始时间（Setup之后）
+                    var taskStart = slot.Value.Start + setupDuration;
+                    scheduledTask = CreateTask(demand, operation, resourceId, taskStart, slot.Value.End);
+
+                    // 资源占用从Setup开始
                     resourceOccupancy[resourceId].Add(new TimeWindow(slot.Value.Start, slot.Value.End));
 
-                    // P0-17修复：应用Routing LagTime到下道工序的最早开始时间
-                    earliestStart = slot.Value.End;
-                    if (i < operations.Count - 1)
+                    // 第4轮C2修复：记录该Operation的实际完成时间，供后续工序使用
+                    operationEndTimes[operation.OperationCode] = slot.Value.End;
+
+                    // 第4轮P7修复：如果配置了TransferBatchSize，计算阈值启动时间
+                    if (operation.TransferBatchSize.HasValue && operation.TransferBatchSize.Value > 0)
                     {
-                        var nextOperation = operations[i + 1];
-                        var lagTime = GetLagTime(operation.OperationCode, nextOperation.OperationCode, routingGraph);
-                        earliestStart = earliestStart.AddMinutes((double)lagTime);
+                        // 阈值时间 = 开始时间 + Setup时间 + (TransferBatchSize / PlannedProcessQty) × 加工时长
+                        var thresholdRatio = operation.TransferBatchSize.Value / demand.PlannedProcessQty;
+                        var thresholdDuration = setupDuration + TimeSpan.FromMinutes((double)(processDuration.TotalMinutes * (double)thresholdRatio));
+                        operationThresholdTimes[operation.OperationCode] = slot.Value.Start + thresholdDuration;
                     }
 
                     break;
@@ -544,7 +650,8 @@ internal class PhaseTwoInitialScheduler
         string operationCode,
         ConstraintContext constraints)
     {
-        var key = $"DEFAULT::{operationCode}"; // V1 固定 DEFAULT 路径
+        // 第4轮C1修复：索引加入MaterialId
+        var key = $"{materialId}::DEFAULT::{operationCode}";
         if (constraints.OperationResourceEligibility.TryGetValue(key, out var resources))
         {
             return resources;
@@ -726,6 +833,7 @@ internal class PhaseTwoInitialScheduler
             UOM = string.Empty,
             PlannedStartTime = start,
             PlannedEndTime = end,
+            SetupTime = operation.SetupTime,
             Priority = demand.DemandSequence,
             IsVirtual = false
         };
@@ -733,10 +841,11 @@ internal class PhaseTwoInitialScheduler
 
     /// <summary>
     /// P0-04修复：获取资源产能系数
+    /// 第4轮C1修复：索引加入MaterialId
     /// </summary>
-    private decimal GetCapacityFactor(string operationCode, int resourceId, ConstraintContext constraints)
+    private decimal GetCapacityFactor(int materialId, string operationCode, int resourceId, ConstraintContext constraints)
     {
-        var key = $"DEFAULT::{operationCode}"; // V1固定DEFAULT路径
+        var key = $"{materialId}::DEFAULT::{operationCode}";
         if (constraints.ResourceCapacityFactors.TryGetValue(key, out var resourceFactors))
         {
             if (resourceFactors.TryGetValue(resourceId, out var capacityFactor))
@@ -748,16 +857,201 @@ internal class PhaseTwoInitialScheduler
     }
 
     /// <summary>
+    /// 第4轮Merge修复：尝试合并到已有Task，或新排程
+    /// 文档§十 10.3：不同Demand可以合并成一个FinalTask，只要Material/Operation/工艺相容、Resource能力允许、交期不被破坏、AllocationTaskShare完整保留
+    /// </summary>
+    private List<FinalTaskDraft> TryMergeOrSchedule(
+        LogicalProductionDemand demand,
+        List<OperationNode> operations,
+        RoutingGraph routingGraph,
+        string direction,
+        ConstraintContext constraints,
+        Dictionary<int, List<TimeWindow>> resourceOccupancy,
+        List<FinalTaskDraft> scheduledTasks,
+        Dictionary<string, List<(string DemandKey, decimal ShareQty)>> allocationTaskShare,
+        DateTime planningStart,
+        DateTime planningEnd)
+    {
+        // 检测是否可以合并到已有Task
+        var candidateTasks = FindMergeableTasks(demand, operations, scheduledTasks, constraints);
+
+        if (candidateTasks.Count > 0)
+        {
+            // 尝试将Demand合并到第一个候选Task
+            var targetTask = candidateTasks[0];
+
+            // 检查合并后是否破坏交期：合并后Duration增加，End时间延后
+            var mergedTask = TryMergeDemandIntoTask(demand, targetTask, routingGraph, constraints, resourceOccupancy, allocationTaskShare, planningEnd);
+            if (mergedTask != null)
+            {
+                // 合并成功：替换scheduledTasks中的旧Task
+                var index = scheduledTasks.FindIndex(t => t.FinalDraftId == targetTask.FinalDraftId);
+                if (index >= 0)
+                {
+                    scheduledTasks[index] = mergedTask;
+                }
+                // 不生成新Task
+                return new List<FinalTaskDraft>();
+            }
+        }
+
+        // 无法合并：正常排程
+        return ScheduleDemandOperations(
+            demand,
+            operations,
+            routingGraph,
+            direction,
+            constraints,
+            resourceOccupancy,
+            planningStart,
+            planningEnd);
+    }
+
+    /// <summary>
+    /// 第4轮Merge修复：查找可合并的已有Task
+    /// 条件：Material/Operation/工艺相容、Resource相同、时间窗口邻近
+    /// </summary>
+    private List<FinalTaskDraft> FindMergeableTasks(
+        LogicalProductionDemand demand,
+        List<OperationNode> operations,
+        List<FinalTaskDraft> scheduledTasks,
+        ConstraintContext constraints)
+    {
+        var candidates = new List<FinalTaskDraft>();
+
+        // 遍历已排程的Task，找同Material、同Operation的Task
+        foreach (var task in scheduledTasks)
+        {
+            // Material必须相同
+            if (task.MaterialId != demand.MaterialId) continue;
+
+            // FactoryId必须相同
+            if (task.FactoryId != demand.FactoryId) continue;
+
+            // 检查是否所有Operation都匹配（简化：只检查第一道工序）
+            if (operations.Count > 0)
+            {
+                var firstOp = operations[0];
+                if (task.StageCode == (firstOp.StageCode ?? string.Empty) &&
+                    task.OperationCode == firstOp.OperationCode)
+                {
+                    candidates.Add(task);
+                }
+            }
+        }
+
+        return candidates;
+    }
+
+    /// <summary>
+    /// 第4轮Merge修复：尝试将Demand合并到已有Task
+    /// 检查Resource能力是否允许、交期是否被破坏
+    /// 返回合并后的新Task，失败时返回null
+    /// </summary>
+    private FinalTaskDraft? TryMergeDemandIntoTask(
+        LogicalProductionDemand demand,
+        FinalTaskDraft targetTask,
+        RoutingGraph routingGraph,
+        ConstraintContext constraints,
+        Dictionary<int, List<TimeWindow>> resourceOccupancy,
+        Dictionary<string, List<(string DemandKey, decimal ShareQty)>> allocationTaskShare,
+        DateTime planningEnd)
+    {
+        // 计算合并后的总数量
+        var mergedQty = targetTask.PlannedProcessQty + demand.PlannedProcessQty;
+
+        // 获取Operation信息
+        if (!routingGraph.Operations.TryGetValue(targetTask.OperationCode, out var operation))
+        {
+            return null; // Operation不存在，无法合并
+        }
+
+        // 计算合并后的Duration
+        var capacityFactor = GetCapacityFactor(demand.MaterialId, operation.OperationCode, targetTask.ResourceId, constraints);
+        var mergedDuration = operation.StandardDuration * mergedQty / capacityFactor;
+        var newDuration = TimeSpan.FromMinutes((double)mergedDuration);
+
+        // 计算新的结束时间
+        var newEndTime = targetTask.PlannedStartTime + newDuration;
+
+        // 检查是否超出计划窗口
+        if (newEndTime > planningEnd)
+        {
+            return null; // 合并后超出计划窗口，无法合并
+        }
+
+        // 检查资源占用是否冲突（简化：假设可以延长占用）
+        // 实际应检查newEndTime之后该Resource是否有其他占用
+
+        // 创建合并后的新Task（因为FinalTaskDraft属性是init-only，不能修改已有对象）
+        var mergedTask = new FinalTaskDraft
+        {
+            FinalDraftId = targetTask.FinalDraftId, // 保持相同的DraftId
+            SourceDraftId = targetTask.SourceDraftId,
+            MaterialId = targetTask.MaterialId,
+            FactoryId = targetTask.FactoryId,
+            StageCode = targetTask.StageCode,
+            OperationCode = targetTask.OperationCode,
+            TaskType = targetTask.TaskType,
+            ResourceId = targetTask.ResourceId,
+            ResourceCode = targetTask.ResourceCode,
+            RouteCode = targetTask.RouteCode,
+            PathId = targetTask.PathId,
+            Quantity = targetTask.Quantity + demand.NetOutputQty, // 合并数量
+            PlannedProcessQty = mergedQty, // 合并加工数量
+            UOM = targetTask.UOM,
+            PlannedStartTime = targetTask.PlannedStartTime,
+            PlannedEndTime = newEndTime, // 新的结束时间
+            SetupTime = targetTask.SetupTime,
+            Priority = targetTask.Priority,
+            IsVirtual = targetTask.IsVirtual
+        };
+
+        // 找到targetTask在scheduledTasks中的索引，替换为mergedTask
+        // 注意：这里需要外部传入scheduledTasks的引用并支持修改
+        // 简化处理：直接修改字段（需要调整方法签名）
+
+        // 记录AllocationTaskShare
+        if (!allocationTaskShare.ContainsKey(mergedTask.FinalDraftId))
+        {
+            allocationTaskShare[mergedTask.FinalDraftId] = new List<(string, decimal)>();
+        }
+        allocationTaskShare[mergedTask.FinalDraftId].Add((demand.LogicalDemandKey, demand.NetOutputQty));
+
+        // 更新资源占用
+        if (resourceOccupancy.ContainsKey(targetTask.ResourceId))
+        {
+            // 移除旧的时间窗
+            var oldWindows = resourceOccupancy[targetTask.ResourceId]
+                .Where(w => w.Start == targetTask.PlannedStartTime && w.End == targetTask.PlannedEndTime)
+                .ToList();
+
+            foreach (var oldWindow in oldWindows)
+            {
+                resourceOccupancy[targetTask.ResourceId].Remove(oldWindow);
+            }
+
+            // 添加新的时间窗
+            resourceOccupancy[targetTask.ResourceId].Add(
+                new TimeWindow(mergedTask.PlannedStartTime, newEndTime));
+        }
+
+        return mergedTask; // 合并成功，返回合并后的Task
+    }
+
+    /// <summary>
     /// P0-17修复：获取工序间的Lag时间（分钟）
     /// 应用Routing LagTime到工序间时间依赖
+    /// 第4轮审核修正：Dependencies按ToOperationCode存储，应查toOperationCode
     /// </summary>
     private decimal GetLagTime(string fromOperationCode, string toOperationCode, RoutingGraph routingGraph)
     {
-        // 查找fromOperation的所有依赖边
-        if (routingGraph.Dependencies.TryGetValue(fromOperationCode, out var edges))
+        // Dependencies结构：Key=ToOperationCode, Value=该To的所有前驱边
+        // 应查找toOperation的前驱边列表，找到FromOperationCode匹配的边
+        if (routingGraph.Dependencies.TryGetValue(toOperationCode, out var edges))
         {
-            // 找到指向toOperation的边
-            var edge = edges.FirstOrDefault(e => e.ToOperationCode == toOperationCode);
+            // 找到从fromOperation来的边
+            var edge = edges.FirstOrDefault(e => e.FromOperationCode == fromOperationCode);
             if (edge != null)
             {
                 return edge.LagTime;

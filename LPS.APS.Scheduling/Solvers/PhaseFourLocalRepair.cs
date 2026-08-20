@@ -31,16 +31,46 @@ internal class PhaseFourLocalRepair
         var resourceOccupancy = BuildResourceOccupancy(scheduleResult.ScheduledTasks, constraints);
 
         // ═══════════════════════════════════════════════
-        // 1. 对未排程需求尝试修复
+        // 1. 识别Candidate Run中受ChangeSeed影响的Demand
         // ═══════════════════════════════════════════════
-        // TODO P9: Candidate局部重排传播（§十三 13.2）
-        // Seed → 找到直接受影响Task → 做最小修改 → 只有Resource/Start/End/Qty真正变化才继续传播 → 直到稳定
-        // 影响可以沿：前序/后序、物料Quantity-Time、共享Resource时间轴、Setup邻居传播
+        var priorityDemandKeys = new HashSet<string>();
+        if (request.CandidateContext?.ChangeSeedKeys != null && request.CandidateContext.ChangeSeedKeys.Count > 0)
+        {
+            // ChangeSeedKeys可能是DemandKey或AllocationSequence的字符串形式
+            // 映射到当前未排程的LogicalDemandKey
+            foreach (var seedKey in request.CandidateContext.ChangeSeedKeys)
+            {
+                var matchedDemands = request.LogicalProductionDemands
+                    .Where(d => scheduleResult.UnscheduledDemandKeys.Contains(d.LogicalDemandKey) &&
+                               (d.DemandKey == seedKey ||
+                                d.AllocationSequence.ToString() == seedKey ||
+                                d.LogicalDemandKey == seedKey))
+                    .Select(d => d.LogicalDemandKey);
+
+                foreach (var key in matchedDemands)
+                {
+                    priorityDemandKeys.Add(key);
+                }
+            }
+        }
+
+        // ═══════════════════════════════════════════════
+        // 2. 优先修复受ChangeSeed影响的Demand，然后修复其他未排Demand
+        // ═══════════════════════════════════════════════
+        // P9部分实现：消费ChangeSeedKeys，优先修复受影响Demand
+        // 完整传播逻辑需要：调整已排Task、沿依赖/资源/物料传播、检测稳定性
+        // TODO P9延续：实现已排Task的重新评估和连锁传播机制
         //
         // TODO P12: Phase 4 fallback（§十三 13.5）
         // 局部修复超限后：使用同一Solver对本Domain全部可移动Task重新求解
         // 仍固定：Execution、Firm、Frozen、Protection、其它不可逆事实、外Domain共享资源阻挡
-        foreach (var demandKey in scheduleResult.UnscheduledDemandKeys)
+
+        // 先处理优先级Demand（受ChangeSeed影响的），然后处理其他未排Demand
+        var orderedDemandKeys = priorityDemandKeys
+            .Concat(scheduleResult.UnscheduledDemandKeys.Except(priorityDemandKeys))
+            .ToList();
+
+        foreach (var demandKey in orderedDemandKeys)
         {
             var demand = request.LogicalProductionDemands
                 .FirstOrDefault(d => d.LogicalDemandKey == demandKey);
@@ -99,8 +129,10 @@ internal class PhaseFourLocalRepair
                 occupancy[task.ResourceId] = new List<TimeWindow>();
             }
 
+            // 第4轮Setup修复：PlannedStartTime是加工开始时间（Setup之后），资源占用需从Setup开始
+            var occupancyStart = task.PlannedStartTime.AddMinutes(-(double)task.SetupTime);
             occupancy[task.ResourceId].Add(
-                new TimeWindow(task.PlannedStartTime, task.PlannedEndTime));
+                new TimeWindow(occupancyStart, task.PlannedEndTime));
         }
 
         // P0-06修复：加入ExternalDomain ResourceBlocks阻挡
@@ -174,13 +206,16 @@ internal class PhaseFourLocalRepair
             foreach (var resourceId in eligibleResources)
             {
                 // P0-04修复：Duration = StandardDuration × PlannedProcessQty ÷ CapacityFactor
-                var capacityFactor = GetCapacityFactor(operation.OperationCode, resourceId, constraints);
+                // 第4轮Setup修复：加上SetupTime占用资源时间轴
+                var capacityFactor = GetCapacityFactor(demand.MaterialId, operation.OperationCode, resourceId, constraints);
                 var adjustedDuration = operation.StandardDuration * demand.PlannedProcessQty / capacityFactor;
-                var duration = TimeSpan.FromMinutes((double)adjustedDuration);
+                var processDuration = TimeSpan.FromMinutes((double)adjustedDuration);
+                var setupDuration = TimeSpan.FromMinutes((double)operation.SetupTime);
+                var totalDuration = processDuration + setupDuration;
 
                 var slot = FindForwardSlot(
                     earliestStart,
-                    duration,
+                    totalDuration,
                     resourceId,
                     constraints,
                     resourceOccupancy,
@@ -188,9 +223,11 @@ internal class PhaseFourLocalRepair
 
                 if (slot.HasValue)
                 {
-                    scheduledTask = CreateTask(demand, operation, resourceId, slot.Value.Start, slot.Value.End);
+                    // Task的PlannedStartTime是加工开始时间（Setup之后）
+                    var taskStart = slot.Value.Start + setupDuration;
+                    scheduledTask = CreateTask(demand, operation, resourceId, taskStart, slot.Value.End);
 
-                    // 临时占用
+                    // 临时占用：从Setup开始
                     if (!resourceOccupancy.ContainsKey(resourceId))
                     {
                         resourceOccupancy[resourceId] = new List<TimeWindow>();
@@ -211,7 +248,47 @@ internal class PhaseFourLocalRepair
 
             if (scheduledTask == null)
             {
-                return new List<FinalTaskDraft>(); // 修复失败
+                // 第4轮Split修复：当前工序无法在任何资源找到完整时间槽时，尝试有限Split
+                if (request.StrategySnapshot.Parameters.AllowSplit && demand.PlannedProcessQty > 1.0m)
+                {
+                    var splitTasks = TrySplitOperation(
+                        demand,
+                        operation,
+                        eligibleResources,
+                        earliestStart,
+                        constraints,
+                        resourceOccupancy,
+                        request.PlanningEnd);
+
+                    if (splitTasks.Count > 0)
+                    {
+                        // Split成功：更新资源占用，推进下道工序最早开始时间
+                        foreach (var splitTask in splitTasks)
+                        {
+                            if (!resourceOccupancy.ContainsKey(splitTask.ResourceId))
+                            {
+                                resourceOccupancy[splitTask.ResourceId] = new List<TimeWindow>();
+                            }
+                            resourceOccupancy[splitTask.ResourceId].Add(
+                                new TimeWindow(splitTask.PlannedStartTime, splitTask.PlannedEndTime));
+                        }
+
+                        tasks.AddRange(splitTasks);
+
+                        // 更新earliestStart为所有Split Task的最晚结束时间
+                        earliestStart = splitTasks.Max(t => t.PlannedEndTime);
+                        if (i < operations.Count - 1)
+                        {
+                            var nextOperation = operations[i + 1];
+                            var lagTime = GetLagTime(operation.OperationCode, nextOperation.OperationCode, routingGraph);
+                            earliestStart = earliestStart.AddMinutes((double)lagTime);
+                        }
+                        continue; // Split成功，继续下一道工序
+                    }
+                }
+
+                // Split失败或不允许Split：修复失败
+                return new List<FinalTaskDraft>();
             }
 
             tasks.Add(scheduledTask);
@@ -263,7 +340,8 @@ internal class PhaseFourLocalRepair
         string operationCode,
         ConstraintContext constraints)
     {
-        var key = $"DEFAULT::{operationCode}";
+        // 第4轮C1修复：索引加入MaterialId
+        var key = $"{materialId}::DEFAULT::{operationCode}";
         if (constraints.OperationResourceEligibility.TryGetValue(key, out var resources))
         {
             return resources;
@@ -373,6 +451,7 @@ internal class PhaseFourLocalRepair
             UOM = string.Empty,
             PlannedStartTime = start,
             PlannedEndTime = end,
+            SetupTime = operation.SetupTime,
             Priority = demand.DemandSequence,
             IsVirtual = false
         };
@@ -380,10 +459,11 @@ internal class PhaseFourLocalRepair
 
     /// <summary>
     /// P0-04修复：获取资源产能系数
+    /// 第4轮C1修复：索引加入MaterialId
     /// </summary>
-    private decimal GetCapacityFactor(string operationCode, int resourceId, ConstraintContext constraints)
+    private decimal GetCapacityFactor(int materialId, string operationCode, int resourceId, ConstraintContext constraints)
     {
-        var key = $"DEFAULT::{operationCode}"; // V1固定DEFAULT路径
+        var key = $"{materialId}::DEFAULT::{operationCode}";
         if (constraints.ResourceCapacityFactors.TryGetValue(key, out var resourceFactors))
         {
             if (resourceFactors.TryGetValue(resourceId, out var capacityFactor))
@@ -397,20 +477,148 @@ internal class PhaseFourLocalRepair
     /// <summary>
     /// P0-17修复：获取工序间的Lag时间（分钟）
     /// 应用Routing LagTime到工序间时间依赖
+    /// 第4轮审核修正：Dependencies按ToOperationCode存储，应查toOperationCode
     /// </summary>
     private decimal GetLagTime(string fromOperationCode, string toOperationCode, RoutingGraph routingGraph)
     {
-        // 查找fromOperation的所有依赖边
-        if (routingGraph.Dependencies.TryGetValue(fromOperationCode, out var edges))
+        // Dependencies结构：Key=ToOperationCode, Value=该To的所有前驱边
+        // 应查找toOperation的前驱边列表，找到FromOperationCode匹配的边
+        if (routingGraph.Dependencies.TryGetValue(toOperationCode, out var edges))
         {
-            // 找到指向toOperation的边
-            var edge = edges.FirstOrDefault(e => e.ToOperationCode == toOperationCode);
+            // 找到从fromOperation来的边
+            var edge = edges.FirstOrDefault(e => e.FromOperationCode == fromOperationCode);
             if (edge != null)
             {
                 return edge.LagTime;
             }
         }
         return 0m; // 默认无延迟
+    }
+
+    /// <summary>
+    /// 第4轮Split修复：尝试将工序拆分成多个小批次
+    /// 文档§十三 13.3第6项：有限Split，Guardrail参数Split候选≤3
+    /// </summary>
+    private List<FinalTaskDraft> TrySplitOperation(
+        LogicalProductionDemand demand,
+        OperationNode operation,
+        List<int> eligibleResources,
+        DateTime earliestStart,
+        ConstraintContext constraints,
+        Dictionary<int, List<TimeWindow>> resourceOccupancy,
+        DateTime planningEnd)
+    {
+        var splitTasks = new List<FinalTaskDraft>();
+
+        // Guardrail：Split候选≤3，尝试2分和3分
+        var splitCandidates = new[] { 2, 3 };
+
+        foreach (var splitCount in splitCandidates)
+        {
+            // 计算每份数量（PlannedProcessQty）
+            var qtyPerSplit = demand.PlannedProcessQty / splitCount;
+            if (qtyPerSplit < 0.1m) continue; // 拆分后数量过小，跳过
+
+            var candidateTasks = new List<FinalTaskDraft>();
+            var candidateStart = earliestStart;
+            bool allSplitsScheduled = true;
+
+            // 尝试为每个Split找到时间槽
+            for (int i = 0; i < splitCount; i++)
+            {
+                FinalTaskDraft? splitTask = null;
+
+                // 遍历合格资源
+                foreach (var resourceId in eligibleResources)
+                {
+                    // 计算Split Task的Duration
+                    // 第4轮Setup修复：Split任务也需要Setup时间
+                    var capacityFactor = GetCapacityFactor(demand.MaterialId, operation.OperationCode, resourceId, constraints);
+                    var adjustedDuration = operation.StandardDuration * qtyPerSplit / capacityFactor;
+                    var processDuration = TimeSpan.FromMinutes((double)adjustedDuration);
+                    var setupDuration = TimeSpan.FromMinutes((double)operation.SetupTime);
+                    var totalDuration = processDuration + setupDuration;
+
+                    var slot = FindForwardSlot(
+                        candidateStart,
+                        totalDuration,
+                        resourceId,
+                        constraints,
+                        resourceOccupancy,
+                        planningEnd);
+
+                    if (slot.HasValue)
+                    {
+                        // 创建Split Task：Quantity按比例拆分
+                        // Task的PlannedStartTime是加工开始时间（Setup之后）
+                        var taskStart = slot.Value.Start + setupDuration;
+                        var splitQuantity = demand.NetOutputQty / splitCount;
+                        splitTask = CreateSplitTask(demand, operation, resourceId, taskStart, slot.Value.End, qtyPerSplit, splitQuantity);
+
+                        candidateTasks.Add(splitTask);
+
+                        // 临时占用该槽（模拟，不真正修改resourceOccupancy）
+                        candidateStart = slot.Value.End; // 下一个Split从当前结束时间开始
+                        break;
+                    }
+                }
+
+                if (splitTask == null)
+                {
+                    // 某个Split无法调度，该splitCount方案失败
+                    allSplitsScheduled = false;
+                    break;
+                }
+            }
+
+            // 如果所有Split都成功调度，返回该方案
+            if (allSplitsScheduled && candidateTasks.Count == splitCount)
+            {
+                return candidateTasks;
+            }
+        }
+
+        // 所有Split方案都失败
+        return new List<FinalTaskDraft>();
+    }
+
+    /// <summary>
+    /// 第4轮Split修复：创建Split子任务
+    /// </summary>
+    private FinalTaskDraft CreateSplitTask(
+        LogicalProductionDemand demand,
+        OperationNode operation,
+        int resourceId,
+        DateTime start,
+        DateTime end,
+        decimal plannedProcessQty,
+        decimal quantity)
+    {
+        // P0-16修复：V1新生成的都是生产Task，统一使用PRODUCTION
+        string taskType = "PRODUCTION";
+
+        return new FinalTaskDraft
+        {
+            FinalDraftId = Guid.NewGuid().ToString(),
+            SourceDraftId = demand.LogicalDemandKey,
+            MaterialId = demand.MaterialId,
+            FactoryId = demand.FactoryId,
+            StageCode = operation.StageCode ?? string.Empty,
+            OperationCode = operation.OperationCode,
+            TaskType = taskType,
+            ResourceId = resourceId,
+            ResourceCode = string.Empty,
+            RouteCode = null,
+            PathId = null,
+            Quantity = quantity, // Split后的净产出
+            PlannedProcessQty = plannedProcessQty, // Split后的加工数量
+            UOM = string.Empty,
+            PlannedStartTime = start,
+            PlannedEndTime = end,
+            SetupTime = operation.SetupTime,
+            Priority = demand.DemandSequence,
+            IsVirtual = false
+        };
     }
 }
 

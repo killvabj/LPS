@@ -92,7 +92,8 @@ internal class PhaseOneConstraintBuilder
                         ProcessType = op.ProcessType,
                         StageCode = op.StageCode,
                         StandardDuration = op.StandardDuration,
-                        SetupTime = op.SetupTime
+                        SetupTime = op.SetupTime,
+                        TransferBatchSize = op.TransferBatchSize
                     };
                 }
 
@@ -137,8 +138,9 @@ internal class PhaseOneConstraintBuilder
     {
         // 按 (MaterialId, RouteCode, OperationCode) → ResourceId 列表（按 Priority 排序）
         // P0-01修复：使用冻结接口 OperationResourceEligibility，不再使用旧的 ResourceEligibility
+        // 第4轮C1修复：索引加入MaterialId，避免不同物料共享资源资格
         var eligibilityGroups = request.OperationResourceEligibility
-            .GroupBy(e => $"{e.RouteCode}::{e.OperationCode}")
+            .GroupBy(e => $"{e.MaterialId}::{e.RouteCode}::{e.OperationCode}")
             .ToDictionary(
                 g => g.Key,
                 g => g.OrderBy(e => e.Priority)
@@ -149,9 +151,10 @@ internal class PhaseOneConstraintBuilder
         context.OperationResourceEligibility = eligibilityGroups;
 
         // P0-04修复：同时构建 ResourceCapacityFactors 映射
-        // (RouteCode::OperationCode, ResourceId) → CapacityFactor
+        // 第4轮C1修复：索引加入MaterialId
+        // (MaterialId::RouteCode::OperationCode, ResourceId) → CapacityFactor
         var capacityFactors = request.OperationResourceEligibility
-            .GroupBy(e => $"{e.RouteCode}::{e.OperationCode}")
+            .GroupBy(e => $"{e.MaterialId}::{e.RouteCode}::{e.OperationCode}")
             .ToDictionary(
                 g => g.Key,
                 g => g.ToDictionary(
@@ -327,6 +330,7 @@ internal class OperationNode
     public string? StageCode { get; set; }
     public decimal StandardDuration { get; set; }
     public decimal SetupTime { get; set; }
+    public decimal? TransferBatchSize { get; set; }
 }
 
 /// <summary>

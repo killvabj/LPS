@@ -46,6 +46,32 @@ internal class PhaseFiveCompression
         // 生成 AllocationTaskShare（追溯 Allocation → Task 的份额）
         var allocationShares = GenerateAllocationShares(allScheduledTasks, request, constraints);
 
+        // 第4轮Item 10：Phase5最终硬约束校验（§十一）
+        var validationResult = ValidateHardResult(allScheduledTasks, allocationShares, request, constraints);
+        if (!validationResult.IsValid)
+        {
+            return new DomainSolveResult
+            {
+                Success = false,
+                ErrorMessage = $"Phase5硬约束校验失败: {validationResult.ErrorMessage}",
+                IsRoughCut = false,
+                FinalTasks = Array.Empty<FinalTaskDraft>(),
+                AllocationShares = Array.Empty<AllocationTaskShare>(),
+                UnscheduledTasks = Array.Empty<UnscheduledTaskResult>(),
+                PhysicalPeggingDrafts = Array.Empty<FinalTaskPeggingDraft>(),
+                ExplanationFacts = Array.Empty<ScheduleExplanationFact>(),
+                Summary = new SolveSummary
+                {
+                    TotalDrafts = 0,
+                    ScheduledCount = 0,
+                    UnscheduledCount = 0,
+                    ElapsedMs = 0,
+                    IssueCount = 0,
+                    UsedRoughCut = false
+                }
+            };
+        }
+
         // P0-13修复：生成 TaskDependency（基于 Routing 工序依赖关系）
         var taskDependencies = GenerateTaskDependencies(allScheduledTasks, request, constraints);
 
@@ -297,5 +323,154 @@ internal class PhaseFiveCompression
         }
 
         return dependencies;
+    }
+
+    /// <summary>
+    /// 第4轮Item 10：Phase5最终硬约束校验（§十一）
+    /// 验证FinalTask结果是否违反硬约束
+    /// </summary>
+    private ValidationResult ValidateHardResult(
+        List<FinalTaskDraft> tasks,
+        List<AllocationTaskShare> allocationShares,
+        DomainSolveRequest request,
+        ConstraintContext constraints)
+    {
+        // 1. 验证每个Allocation的ΣShareQty == NetOutputQty
+        var sharesByAllocation = allocationShares
+            .GroupBy(s => s.AllocationSequence)
+            .ToDictionary(g => g.Key, g => g.ToList());
+
+        foreach (var demand in request.LogicalProductionDemands)
+        {
+            if (!sharesByAllocation.TryGetValue(demand.AllocationSequence, out var shares))
+            {
+                // 如果该Demand未排程，会在UnscheduledTasks中体现，不算硬约束失败
+                continue;
+            }
+
+            decimal totalShare = shares.Sum(s => s.ComponentQty);
+            if (Math.Abs(totalShare - demand.NetOutputQty) > 0.001m)
+            {
+                return new ValidationResult
+                {
+                    IsValid = false,
+                    ErrorMessage = $"Allocation {demand.AllocationSequence} 数量闭合失败: ΣShareQty={totalShare}, NetOutputQty={demand.NetOutputQty}"
+                };
+            }
+
+            // 2. 验证每个ShareQty > 0
+            foreach (var share in shares)
+            {
+                if (share.ComponentQty <= 0)
+                {
+                    return new ValidationResult
+                    {
+                        IsValid = false,
+                        ErrorMessage = $"Task {share.FinalDraftId} 的 ShareQty <= 0: {share.ComponentQty}"
+                    };
+                }
+            }
+        }
+
+        // 3. 验证每个FinalTask的ΣShare不超过Task.Quantity
+        var sharesByTask = allocationShares
+            .GroupBy(s => s.FinalDraftId)
+            .ToDictionary(g => g.Key, g => g.Sum(s => s.ComponentQty));
+
+        foreach (var task in tasks)
+        {
+            if (sharesByTask.TryGetValue(task.FinalDraftId, out var totalTaskShare))
+            {
+                if (totalTaskShare > task.Quantity + 0.001m)
+                {
+                    return new ValidationResult
+                    {
+                        IsValid = false,
+                        ErrorMessage = $"Task {task.FinalDraftId} 的 ΣShare={totalTaskShare} 超过 Quantity={task.Quantity}"
+                    };
+                }
+            }
+        }
+
+        // 4. 验证FinalTask Resource硬互斥（同一资源上的时间段不重叠）
+        var tasksByResource = tasks
+            .GroupBy(t => t.ResourceId)
+            .ToDictionary(g => g.Key, g => g.OrderBy(t => t.PlannedStartTime).ToList());
+
+        foreach (var resourceGroup in tasksByResource.Values)
+        {
+            for (int i = 0; i < resourceGroup.Count - 1; i++)
+            {
+                var current = resourceGroup[i];
+                var next = resourceGroup[i + 1];
+
+                // 当前Task的结束时间（包括Setup）必须 <= 下一个Task的开始时间（Setup之前）
+                var currentOccupancyStart = current.PlannedStartTime.AddMinutes(-(double)current.SetupTime);
+                var nextOccupancyStart = next.PlannedStartTime.AddMinutes(-(double)next.SetupTime);
+
+                if (current.PlannedEndTime > nextOccupancyStart)
+                {
+                    return new ValidationResult
+                    {
+                        IsValid = false,
+                        ErrorMessage = $"Resource {current.ResourceId} 时间冲突: Task {current.FinalDraftId} [{currentOccupancyStart:HH:mm:ss}-{current.PlannedEndTime:HH:mm:ss}] 与 Task {next.FinalDraftId} [{nextOccupancyStart:HH:mm:ss}-{next.PlannedEndTime:HH:mm:ss}] 重叠"
+                    };
+                }
+            }
+        }
+
+        // 5. 验证Task不早于Material AvailableTime
+        foreach (var task in tasks)
+        {
+            var demand = request.LogicalProductionDemands
+                .FirstOrDefault(d => d.LogicalDemandKey == task.SourceDraftId);
+            if (demand == null) continue;
+
+            if (constraints.MaterialAvailability.TryGetValue(demand.AllocationSequence, out var segments) && segments.Count > 0)
+            {
+                var earliestAvailable = segments.OrderBy(s => s.AvailableTime).First().AvailableTime;
+                if (task.PlannedStartTime < earliestAvailable)
+                {
+                    return new ValidationResult
+                    {
+                        IsValid = false,
+                        ErrorMessage = $"Task {task.FinalDraftId} 开始时间 {task.PlannedStartTime:yyyy-MM-dd HH:mm:ss} 早于物料可用时间 {earliestAvailable:yyyy-MM-dd HH:mm:ss}"
+                    };
+                }
+            }
+        }
+
+        // 6. 验证Locked Anchor是否保持原地
+        foreach (var lockedTask in constraints.LockedTasks.Values)
+        {
+            var correspondingTask = tasks
+                .FirstOrDefault(t => t.SourceDraftId == lockedTask.DraftId &&
+                                    t.ResourceId == lockedTask.ResourceId);
+
+            if (correspondingTask != null)
+            {
+                // 验证时间是否与锁定时间一致
+                if (Math.Abs((correspondingTask.PlannedStartTime - lockedTask.LockedStart).TotalSeconds) > 1 ||
+                    Math.Abs((correspondingTask.PlannedEndTime - lockedTask.LockedEnd).TotalSeconds) > 1)
+                {
+                    return new ValidationResult
+                    {
+                        IsValid = false,
+                        ErrorMessage = $"Locked Task {lockedTask.DraftId} 时间未保持原地: 期望[{lockedTask.LockedStart:HH:mm:ss}-{lockedTask.LockedEnd:HH:mm:ss}], 实际[{correspondingTask.PlannedStartTime:HH:mm:ss}-{correspondingTask.PlannedEndTime:HH:mm:ss}]"
+                    };
+                }
+            }
+        }
+
+        return new ValidationResult { IsValid = true };
+    }
+
+    /// <summary>
+    /// 验证结果
+    /// </summary>
+    private class ValidationResult
+    {
+        public bool IsValid { get; set; }
+        public string ErrorMessage { get; set; } = string.Empty;
     }
 }
