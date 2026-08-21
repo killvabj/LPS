@@ -207,8 +207,13 @@ internal class PhaseFourLocalRepair
             {
                 // P0-04修复：Duration = StandardDuration × PlannedProcessQty ÷ CapacityFactor
                 // 第4轮Setup修复：加上SetupTime占用资源时间轴
+                // 第5轮修复：CapacityFactor缺失或非法时跳过该资源
                 var capacityFactor = GetCapacityFactor(demand.MaterialId, operation.OperationCode, resourceId, constraints);
-                var adjustedDuration = operation.StandardDuration * demand.PlannedProcessQty / capacityFactor;
+                if (capacityFactor == null || capacityFactor <= 0)
+                {
+                    continue; // CapacityFactor缺失/非法，跳过该资源
+                }
+                var adjustedDuration = operation.StandardDuration * demand.PlannedProcessQty / capacityFactor.Value;
                 var processDuration = TimeSpan.FromMinutes((double)adjustedDuration);
                 var setupDuration = TimeSpan.FromMinutes((double)operation.SetupTime);
                 var totalDuration = processDuration + setupDuration;
@@ -263,14 +268,18 @@ internal class PhaseFourLocalRepair
                     if (splitTasks.Count > 0)
                     {
                         // Split成功：更新资源占用，推进下道工序最早开始时间
+                        // 第5轮修复：Split Task的资源占用必须包含Setup时间
                         foreach (var splitTask in splitTasks)
                         {
                             if (!resourceOccupancy.ContainsKey(splitTask.ResourceId))
                             {
                                 resourceOccupancy[splitTask.ResourceId] = new List<TimeWindow>();
                             }
+                            // PlannedStartTime是Setup后的加工开始时间，资源占用要从Setup开始算
+                            var setupDuration = TimeSpan.FromMinutes((double)splitTask.SetupTime);
+                            var resourceStart = splitTask.PlannedStartTime - setupDuration;
                             resourceOccupancy[splitTask.ResourceId].Add(
-                                new TimeWindow(splitTask.PlannedStartTime, splitTask.PlannedEndTime));
+                                new TimeWindow(resourceStart, splitTask.PlannedEndTime));
                         }
 
                         tasks.AddRange(splitTasks);
@@ -461,7 +470,7 @@ internal class PhaseFourLocalRepair
     /// P0-04修复：获取资源产能系数
     /// 第4轮C1修复：索引加入MaterialId
     /// </summary>
-    private decimal GetCapacityFactor(int materialId, string operationCode, int resourceId, ConstraintContext constraints)
+    private decimal? GetCapacityFactor(int materialId, string operationCode, int resourceId, ConstraintContext constraints)
     {
         var key = $"{materialId}::DEFAULT::{operationCode}";
         if (constraints.ResourceCapacityFactors.TryGetValue(key, out var resourceFactors))
@@ -471,7 +480,8 @@ internal class PhaseFourLocalRepair
                 return capacityFactor;
             }
         }
-        return 1.0m; // 默认产能系数为1.0
+        // 第5轮修复：CapacityFactor查不到时返回null，不静默使用1.0
+        return null;
     }
 
     /// <summary>
@@ -533,8 +543,13 @@ internal class PhaseFourLocalRepair
                 {
                     // 计算Split Task的Duration
                     // 第4轮Setup修复：Split任务也需要Setup时间
+                    // 第5轮修复：CapacityFactor缺失或非法时跳过该资源
                     var capacityFactor = GetCapacityFactor(demand.MaterialId, operation.OperationCode, resourceId, constraints);
-                    var adjustedDuration = operation.StandardDuration * qtyPerSplit / capacityFactor;
+                    if (capacityFactor == null || capacityFactor <= 0)
+                    {
+                        continue; // CapacityFactor缺失/非法，跳过该资源
+                    }
+                    var adjustedDuration = operation.StandardDuration * qtyPerSplit / capacityFactor.Value;
                     var processDuration = TimeSpan.FromMinutes((double)adjustedDuration);
                     var setupDuration = TimeSpan.FromMinutes((double)operation.SetupTime);
                     var totalDuration = processDuration + setupDuration;

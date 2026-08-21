@@ -156,6 +156,16 @@ public sealed class ExecutionConstraint
     public DateTime LockedStart { get; init; }
     public DateTime LockedEnd { get; init; }
     public string ConstraintType { get; init; } = string.Empty;
+
+    // 第4轮Anchor补充：Stage/Operation信息，用于原地继承锁定Task
+    public string? StageCode { get; init; }
+    public string? OperationCode { get; init; }
+
+    // 第4轮Anchor补充：锁定数量，原地继承该份额，只排剩余可移动份额
+    public decimal? LockedQuantity { get; init; }
+
+    // 第4轮Anchor补充：稳定TaskKey，用于跨轮次识别同一Task
+    public string? TaskKey { get; init; }
 }
 
 public sealed class FiniteCapacityParameters

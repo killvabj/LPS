@@ -141,9 +141,17 @@ internal class PhaseTwoInitialScheduler
                     request.PlanningEnd);
             }
 
+            // 第5轮Merge修复：Merge成功时返回空List，但Demand已进入TaskShare，不应标记为Unscheduled
             if (demandTasks.Count == 0)
             {
-                result.UnscheduledDemandKeys.Add(demand.LogicalDemandKey);
+                // 检查该Demand是否已通过Merge进入TaskShare
+                bool isMerged = allocationTaskShare.Values.Any(shares =>
+                    shares.Any(s => s.DemandKey == demand.DemandKey || s.DemandKey == demand.LogicalDemandKey));
+
+                if (!isMerged)
+                {
+                    result.UnscheduledDemandKeys.Add(demand.LogicalDemandKey);
+                }
             }
             else
             {
@@ -404,8 +412,13 @@ internal class PhaseTwoInitialScheduler
             {
                 // P0-04修复：Duration = StandardDuration × PlannedProcessQty ÷ CapacityFactor
                 // 第4轮Setup修复：加上SetupTime占用资源时间轴
+                // 第5轮修复：CapacityFactor缺失或非法时不能继续
                 var capacityFactor = GetCapacityFactor(demand.MaterialId, operation.OperationCode, resourceId, constraints);
-                var adjustedDuration = operation.StandardDuration * demand.PlannedProcessQty / capacityFactor;
+                if (capacityFactor == null || capacityFactor <= 0)
+                {
+                    return new List<FinalTaskDraft>(); // CapacityFactor缺失/非法，无法计算Duration
+                }
+                var adjustedDuration = operation.StandardDuration * demand.PlannedProcessQty / capacityFactor.Value;
                 var processDuration = TimeSpan.FromMinutes((double)adjustedDuration);
                 var setupDuration = TimeSpan.FromMinutes((double)operation.SetupTime);
                 var totalDuration = processDuration + setupDuration;
@@ -557,8 +570,13 @@ internal class PhaseTwoInitialScheduler
             {
                 // P0-04修复：Duration = StandardDuration × PlannedProcessQty ÷ CapacityFactor
                 // 第4轮Setup修复：加上SetupTime占用资源时间轴
+                // 第5轮修复：CapacityFactor缺失或非法时不能继续
                 var capacityFactor = GetCapacityFactor(demand.MaterialId, operation.OperationCode, resourceId, constraints);
-                var adjustedDuration = operation.StandardDuration * demand.PlannedProcessQty / capacityFactor;
+                if (capacityFactor == null || capacityFactor <= 0)
+                {
+                    return new List<FinalTaskDraft>(); // CapacityFactor缺失/非法，无法计算Duration
+                }
+                var adjustedDuration = operation.StandardDuration * demand.PlannedProcessQty / capacityFactor.Value;
                 var processDuration = TimeSpan.FromMinutes((double)adjustedDuration);
                 var setupDuration = TimeSpan.FromMinutes((double)operation.SetupTime);
                 var totalDuration = processDuration + setupDuration;
@@ -843,7 +861,7 @@ internal class PhaseTwoInitialScheduler
     /// P0-04修复：获取资源产能系数
     /// 第4轮C1修复：索引加入MaterialId
     /// </summary>
-    private decimal GetCapacityFactor(int materialId, string operationCode, int resourceId, ConstraintContext constraints)
+    private decimal? GetCapacityFactor(int materialId, string operationCode, int resourceId, ConstraintContext constraints)
     {
         var key = $"{materialId}::DEFAULT::{operationCode}";
         if (constraints.ResourceCapacityFactors.TryGetValue(key, out var resourceFactors))
@@ -853,7 +871,8 @@ internal class PhaseTwoInitialScheduler
                 return capacityFactor;
             }
         }
-        return 1.0m; // 默认产能系数为1.0
+        // 第5轮修复：CapacityFactor查不到时返回null，不静默使用1.0
+        return null;
     }
 
     /// <summary>
@@ -910,6 +929,7 @@ internal class PhaseTwoInitialScheduler
     /// <summary>
     /// 第4轮Merge修复：查找可合并的已有Task
     /// 条件：Material/Operation/工艺相容、Resource相同、时间窗口邻近
+    /// 第5轮修复：多工序Demand必须检查完整Routing兼容性
     /// </summary>
     private List<FinalTaskDraft> FindMergeableTasks(
         LogicalProductionDemand demand,
@@ -918,6 +938,15 @@ internal class PhaseTwoInitialScheduler
         ConstraintContext constraints)
     {
         var candidates = new List<FinalTaskDraft>();
+
+        // 第5轮修复：多工序场景不能Merge到单一Task
+        // Merge只适用于单工序Demand，多工序必须独立排程保证DAG完整性
+        if (operations.Count != 1)
+        {
+            return candidates; // 多工序不支持Merge
+        }
+
+        var targetOp = operations[0];
 
         // 遍历已排程的Task，找同Material、同Operation的Task
         foreach (var task in scheduledTasks)
@@ -928,16 +957,11 @@ internal class PhaseTwoInitialScheduler
             // FactoryId必须相同
             if (task.FactoryId != demand.FactoryId) continue;
 
-            // 检查是否所有Operation都匹配（简化：只检查第一道工序）
-            if (operations.Count > 0)
-            {
-                var firstOp = operations[0];
-                if (task.StageCode == (firstOp.StageCode ?? string.Empty) &&
-                    task.OperationCode == firstOp.OperationCode)
-                {
-                    candidates.Add(task);
-                }
-            }
+            // Stage和Operation必须完全匹配
+            if (task.StageCode != (targetOp.StageCode ?? string.Empty)) continue;
+            if (task.OperationCode != targetOp.OperationCode) continue;
+
+            candidates.Add(task);
         }
 
         return candidates;
@@ -967,8 +991,13 @@ internal class PhaseTwoInitialScheduler
         }
 
         // 计算合并后的Duration
+        // 第5轮修复：CapacityFactor缺失或非法时不能继续
         var capacityFactor = GetCapacityFactor(demand.MaterialId, operation.OperationCode, targetTask.ResourceId, constraints);
-        var mergedDuration = operation.StandardDuration * mergedQty / capacityFactor;
+        if (capacityFactor == null || capacityFactor <= 0)
+        {
+            return null; // CapacityFactor缺失/非法，无法计算合并后Duration
+        }
+        var mergedDuration = operation.StandardDuration * mergedQty / capacityFactor.Value;
         var newDuration = TimeSpan.FromMinutes((double)mergedDuration);
 
         // 计算新的结束时间
@@ -980,8 +1009,25 @@ internal class PhaseTwoInitialScheduler
             return null; // 合并后超出计划窗口，无法合并
         }
 
-        // 检查资源占用是否冲突（简化：假设可以延长占用）
-        // 实际应检查newEndTime之后该Resource是否有其他占用
+        // 第5轮修复：检查延长Task后是否与同资源的后续Task冲突
+        if (resourceOccupancy.ContainsKey(targetTask.ResourceId))
+        {
+            var occupancies = resourceOccupancy[targetTask.ResourceId];
+            foreach (var window in occupancies)
+            {
+                // 跳过当前Task自己的占用窗口
+                if (window.Start == targetTask.PlannedStartTime && window.End == targetTask.PlannedEndTime)
+                {
+                    continue;
+                }
+
+                // 检查延长后的结束时间是否侵入其他占用窗口
+                if (newEndTime > window.Start && targetTask.PlannedStartTime < window.End)
+                {
+                    return null; // 延长后与资源上其他Task冲突，无法合并
+                }
+            }
+        }
 
         // 创建合并后的新Task（因为FinalTaskDraft属性是init-only，不能修改已有对象）
         var mergedTask = new FinalTaskDraft

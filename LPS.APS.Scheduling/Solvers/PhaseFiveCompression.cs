@@ -46,8 +46,12 @@ internal class PhaseFiveCompression
         // 生成 AllocationTaskShare（追溯 Allocation → Task 的份额）
         var allocationShares = GenerateAllocationShares(allScheduledTasks, request, constraints);
 
+        // 第5轮修复：TaskDependency必须在硬校验之前生成，以便校验Dependency约束
+        // P0-13修复：生成 TaskDependency（基于 Routing 工序依赖关系）
+        var taskDependencies = GenerateTaskDependencies(allScheduledTasks, request, constraints);
+
         // 第4轮Item 10：Phase5最终硬约束校验（§十一）
-        var validationResult = ValidateHardResult(allScheduledTasks, allocationShares, request, constraints);
+        var validationResult = ValidateHardResult(allScheduledTasks, allocationShares, taskDependencies, request, constraints);
         if (!validationResult.IsValid)
         {
             return new DomainSolveResult
@@ -71,9 +75,6 @@ internal class PhaseFiveCompression
                 }
             };
         }
-
-        // P0-13修复：生成 TaskDependency（基于 Routing 工序依赖关系）
-        var taskDependencies = GenerateTaskDependencies(allScheduledTasks, request, constraints);
 
         // 收集未排程需求
         var unscheduledTasks = new List<UnscheduledTaskResult>();
@@ -293,30 +294,37 @@ internal class PhaseFiveCompression
                 continue;
 
             // 遍历工艺路线中的依赖关系
+            // 第5轮修复：Split场景下，一个Operation可能对应多个Task，必须为所有组合建立Dependency
             foreach (var depList in routingGraph.Dependencies.Values)
             {
                 foreach (var dep in depList)
                 {
-                    // 找到对应的上下游Task
-                    var upstreamTask = demandGroup.Value
-                        .FirstOrDefault(t => t.OperationCode == dep.FromOperationCode);
-                    var downstreamTask = demandGroup.Value
-                        .FirstOrDefault(t => t.OperationCode == dep.ToOperationCode);
+                    // 找到对应的所有上游Task和下游Task
+                    var upstreamTasks = demandGroup.Value
+                        .Where(t => t.OperationCode == dep.FromOperationCode)
+                        .ToList();
+                    var downstreamTasks = demandGroup.Value
+                        .Where(t => t.OperationCode == dep.ToOperationCode)
+                        .ToList();
 
-                    if (upstreamTask != null && downstreamTask != null)
+                    // 为所有上下游Task组合建立Dependency
+                    foreach (var upstreamTask in upstreamTasks)
                     {
-                        dependencies.Add(new FinalTaskPeggingDraft
+                        foreach (var downstreamTask in downstreamTasks)
                         {
-                            UpstreamFinalDraftId = upstreamTask.FinalDraftId,
-                            DownstreamFinalDraftId = downstreamTask.FinalDraftId,
-                            UpstreamMaterialId = demand.MaterialId,
-                            DownstreamMaterialId = demand.MaterialId,
-                            Quantity = demand.NetOutputQty,
-                            UOM = string.Empty,
-                            InheritedPriority = demand.DemandSequence,
-                            DependencyType = dep.DependencyType,
-                            LagTime = dep.LagTime
-                        });
+                            dependencies.Add(new FinalTaskPeggingDraft
+                            {
+                                UpstreamFinalDraftId = upstreamTask.FinalDraftId,
+                                DownstreamFinalDraftId = downstreamTask.FinalDraftId,
+                                UpstreamMaterialId = demand.MaterialId,
+                                DownstreamMaterialId = demand.MaterialId,
+                                Quantity = demand.NetOutputQty,
+                                UOM = string.Empty,
+                                InheritedPriority = demand.DemandSequence,
+                                DependencyType = dep.DependencyType,
+                                LagTime = dep.LagTime
+                            });
+                        }
                     }
                 }
             }
@@ -328,10 +336,12 @@ internal class PhaseFiveCompression
     /// <summary>
     /// 第4轮Item 10：Phase5最终硬约束校验（§十一）
     /// 验证FinalTask结果是否违反硬约束
+    /// 第5轮修复：增加TaskDependency校验
     /// </summary>
     private ValidationResult ValidateHardResult(
         List<FinalTaskDraft> tasks,
         List<AllocationTaskShare> allocationShares,
+        List<FinalTaskPeggingDraft> taskDependencies,
         DomainSolveRequest request,
         ConstraintContext constraints)
     {
@@ -420,6 +430,7 @@ internal class PhaseFiveCompression
         }
 
         // 5. 验证Task不早于Material AvailableTime
+        // 第5轮修复：必须按累计数量达到Task所需Qty，取真正Material Ready Time
         foreach (var task in tasks)
         {
             var demand = request.LogicalProductionDemands
@@ -428,13 +439,36 @@ internal class PhaseFiveCompression
 
             if (constraints.MaterialAvailability.TryGetValue(demand.AllocationSequence, out var segments) && segments.Count > 0)
             {
-                var earliestAvailable = segments.OrderBy(s => s.AvailableTime).First().AvailableTime;
-                if (task.PlannedStartTime < earliestAvailable)
+                // 按时间排序Segments，累计数量直到满足Task需求
+                var sortedSegments = segments.OrderBy(s => s.AvailableTime).ToList();
+                decimal cumulativeQty = 0m;
+                DateTime? materialReadyTime = null;
+
+                // Task所需的物料数量（取PlannedProcessQty，因为这是实际加工需要的数量）
+                var requiredQty = task.PlannedProcessQty;
+
+                foreach (var segment in sortedSegments)
+                {
+                    cumulativeQty += segment.Quantity;
+                    if (cumulativeQty >= requiredQty)
+                    {
+                        materialReadyTime = segment.AvailableTime;
+                        break;
+                    }
+                }
+
+                // 如果累计数量仍不足，取最后一个Segment的时间（物料始终不足）
+                if (materialReadyTime == null && sortedSegments.Count > 0)
+                {
+                    materialReadyTime = sortedSegments.Last().AvailableTime;
+                }
+
+                if (materialReadyTime.HasValue && task.PlannedStartTime < materialReadyTime.Value)
                 {
                     return new ValidationResult
                     {
                         IsValid = false,
-                        ErrorMessage = $"Task {task.FinalDraftId} 开始时间 {task.PlannedStartTime:yyyy-MM-dd HH:mm:ss} 早于物料可用时间 {earliestAvailable:yyyy-MM-dd HH:mm:ss}"
+                        ErrorMessage = $"Task {task.FinalDraftId} 开始时间 {task.PlannedStartTime:yyyy-MM-dd HH:mm:ss} 早于物料累计可用时间 {materialReadyTime.Value:yyyy-MM-dd HH:mm:ss}"
                     };
                 }
             }
@@ -459,6 +493,43 @@ internal class PhaseFiveCompression
                         ErrorMessage = $"Locked Task {lockedTask.DraftId} 时间未保持原地: 期望[{lockedTask.LockedStart:HH:mm:ss}-{lockedTask.LockedEnd:HH:mm:ss}], 实际[{correspondingTask.PlannedStartTime:HH:mm:ss}-{correspondingTask.PlannedEndTime:HH:mm:ss}]"
                     };
                 }
+            }
+        }
+
+        // 7. 第5轮修复：验证TaskDependency硬约束
+        var taskDict = tasks.ToDictionary(t => t.FinalDraftId);
+        foreach (var dep in taskDependencies)
+        {
+            // 检查上游Task是否存在
+            if (!taskDict.TryGetValue(dep.UpstreamFinalDraftId, out var upstreamTask))
+            {
+                return new ValidationResult
+                {
+                    IsValid = false,
+                    ErrorMessage = $"TaskDependency引用的上游Task {dep.UpstreamFinalDraftId} 不存在"
+                };
+            }
+
+            // 检查下游Task是否存在
+            if (!taskDict.TryGetValue(dep.DownstreamFinalDraftId, out var downstreamTask))
+            {
+                return new ValidationResult
+                {
+                    IsValid = false,
+                    ErrorMessage = $"TaskDependency引用的下游Task {dep.DownstreamFinalDraftId} 不存在"
+                };
+            }
+
+            // 检查时间约束：下游开始时间必须 >= 上游结束时间 + Lag
+            var lagTime = TimeSpan.FromMinutes((double)dep.LagTime);
+            var earliestDownstreamStart = upstreamTask.PlannedEndTime + lagTime;
+            if (downstreamTask.PlannedStartTime < earliestDownstreamStart)
+            {
+                return new ValidationResult
+                {
+                    IsValid = false,
+                    ErrorMessage = $"TaskDependency违反时间约束: 下游Task {downstreamTask.FinalDraftId} 开始时间 {downstreamTask.PlannedStartTime:yyyy-MM-dd HH:mm:ss} 早于上游Task {upstreamTask.FinalDraftId} 结束时间 {upstreamTask.PlannedEndTime:yyyy-MM-dd HH:mm:ss} + Lag {dep.LagTime}分钟"
+                };
             }
         }
 

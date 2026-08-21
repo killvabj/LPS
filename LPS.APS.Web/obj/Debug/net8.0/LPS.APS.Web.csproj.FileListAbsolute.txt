@@ -200,7 +200,6 @@ D:\WorkSpace_LocalLib\Windsurf WorkSpace\LPS_SVN\LPS.APS.Web\obj\Debug\net8.0\st
 D:\WorkSpace_LocalLib\Windsurf WorkSpace\LPS_SVN\LPS.APS.Web\obj\Debug\net8.0\staticwebassets.development.json
 D:\WorkSpace_LocalLib\Windsurf WorkSpace\LPS_SVN\LPS.APS.Web\obj\Debug\net8.0\staticwebassets.build.endpoints.json
 D:\WorkSpace_LocalLib\Windsurf WorkSpace\LPS_SVN\LPS.APS.Web\obj\Debug\net8.0\swae.build.ex.cache
-D:\WorkSpace_LocalLib\Windsurf WorkSpace\LPS_SVN\LPS.APS.Web\obj\Debug\net8.0\staticwebassets.upToDateCheck.txt
 D:\WorkSpace_LocalLib\Windsurf WorkSpace\LPS_SVN\LPS.APS.Web\obj\Debug\net8.0\LPS.APS..89607BFC.Up2Date
 D:\WorkSpace_LocalLib\Windsurf WorkSpace\LPS_SVN\LPS.APS.Web\obj\Debug\net8.0\LPS.APS.Web.dll
 D:\WorkSpace_LocalLib\Windsurf WorkSpace\LPS_SVN\LPS.APS.Web\obj\Debug\net8.0\refint\LPS.APS.Web.dll
@@ -208,3 +207,4 @@ D:\WorkSpace_LocalLib\Windsurf WorkSpace\LPS_SVN\LPS.APS.Web\obj\Debug\net8.0\LP
 D:\WorkSpace_LocalLib\Windsurf WorkSpace\LPS_SVN\LPS.APS.Web\obj\Debug\net8.0\LPS.APS.Web.pdb
 D:\WorkSpace_LocalLib\Windsurf WorkSpace\LPS_SVN\LPS.APS.Web\obj\Debug\net8.0\LPS.APS.Web.genruntimeconfig.cache
 D:\WorkSpace_LocalLib\Windsurf WorkSpace\LPS_SVN\LPS.APS.Web\obj\Debug\net8.0\ref\LPS.APS.Web.dll
+D:\WorkSpace_LocalLib\Windsurf WorkSpace\LPS_SVN\LPS.APS.Web\obj\Debug\net8.0\staticwebassets.upToDateCheck.txt

@@ -52,6 +52,7 @@ public sealed class FinalTaskDraft
     public string UOM { get; init; } = string.Empty;
     public DateTime PlannedStartTime { get; init; }
     public DateTime PlannedEndTime { get; init; }
+    public decimal SetupTime { get; init; }
     public int Priority { get; init; }
     public bool IsVirtual { get; init; }
     public string? StageExecutionBatchDraftKey { get; init; }
