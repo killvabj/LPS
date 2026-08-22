@@ -209,6 +209,7 @@ internal class PhaseOneConstraintBuilder
 
     /// <summary>
     /// 构建锁定任务约束
+    /// 第8轮P0-01修复：完整传递ExecutionConstraint的StageCode/OperationCode/LockedQuantity/TaskKey
     /// </summary>
     private void BuildLockedTasks(DomainSolveRequest request, ConstraintContext context)
     {
@@ -221,7 +222,11 @@ internal class PhaseOneConstraintBuilder
                     ResourceId = ec.ResourceId,
                     LockedStart = ec.LockedStart,
                     LockedEnd = ec.LockedEnd,
-                    ConstraintType = ec.ConstraintType
+                    ConstraintType = ec.ConstraintType,
+                    StageCode = ec.StageCode,
+                    OperationCode = ec.OperationCode,
+                    LockedQuantity = ec.LockedQuantity,
+                    TaskKey = ec.TaskKey
                 }
             );
 
@@ -365,6 +370,12 @@ internal class LockedTaskConstraint
     public DateTime LockedStart { get; set; }
     public DateTime LockedEnd { get; set; }
     public string ConstraintType { get; set; } = string.Empty;
+
+    // 第8轮P0-01修复：Anchor部分数量和工序信息闭环
+    public string? StageCode { get; set; }
+    public string? OperationCode { get; set; }
+    public decimal? LockedQuantity { get; set; }
+    public string? TaskKey { get; set; }
 }
 
 /// <summary>
