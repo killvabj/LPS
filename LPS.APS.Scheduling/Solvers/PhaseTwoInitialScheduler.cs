@@ -1057,14 +1057,16 @@ internal class PhaseTwoInitialScheduler
         // 注意：这里需要外部传入scheduledTasks的引用并支持修改
         // 简化处理：直接修改字段（需要调整方法签名）
 
-        // 记录AllocationTaskShare
+        // 第6轮Merge修复：记录AllocationTaskShare时保留原Task的历史Demand
+        // 原Task可能已经服务于其他Demand，不能覆盖
         if (!allocationTaskShare.ContainsKey(mergedTask.FinalDraftId))
         {
             allocationTaskShare[mergedTask.FinalDraftId] = new List<(string, decimal)>();
         }
+        // 追加当前Demand的份额（原Task的份额已在之前记录）
         allocationTaskShare[mergedTask.FinalDraftId].Add((demand.LogicalDemandKey, demand.NetOutputQty));
 
-        // 更新资源占用
+        // 第6轮Merge修复：更新资源占用，包含Setup时间
         if (resourceOccupancy.ContainsKey(targetTask.ResourceId))
         {
             // 移除旧的时间窗
@@ -1077,9 +1079,11 @@ internal class PhaseTwoInitialScheduler
                 resourceOccupancy[targetTask.ResourceId].Remove(oldWindow);
             }
 
-            // 添加新的时间窗
+            // 添加新的时间窗：Setup时间也占用资源
+            var setupDuration = TimeSpan.FromMinutes((double)mergedTask.SetupTime);
+            var resourceStart = mergedTask.PlannedStartTime - setupDuration;
             resourceOccupancy[targetTask.ResourceId].Add(
-                new TimeWindow(mergedTask.PlannedStartTime, newEndTime));
+                new TimeWindow(resourceStart, newEndTime));
         }
 
         return mergedTask; // 合并成功，返回合并后的Task
