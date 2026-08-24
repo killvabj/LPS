@@ -78,9 +78,12 @@ internal class PhaseTwoInitialScheduler
         foreach (var demand in sortedDemands)
         {
             // 第8轮P0-01修复：部分数量冻结处理
+            // 第9轮P0-01完整闭环：真正减掉锁定数量，只排剩余份额
             // 如果该Demand有锁定任务，检查锁定数量：
             // - 锁定数量 >= Demand总量：完全锁定，跳过
-            // - 锁定数量 < Demand总量：部分锁定，剩余部分继续排程
+            // - 锁定数量 < Demand总量：部分锁定，只排剩余部分
+            LogicalProductionDemand actualDemand = demand;
+
             if (lockedDraftIds.Contains(demand.LogicalDemandKey))
             {
                 var lockedTask = constraints.LockedTasks[demand.LogicalDemandKey];
@@ -92,31 +95,51 @@ internal class PhaseTwoInitialScheduler
                     continue;
                 }
 
-                // 部分锁定：剩余数量继续排程
-                // 创建一个临时需求对象，数量为剩余可移动部分
-                // 注意：这里需要调整demand的数量，但demand是foreach遍历的只读引用
-                // 实际实现中，排程方法内部应该检查已锁定数量并只排剩余部分
-                // 当前简化：如果部分锁定，仍然继续排程，但排程方法需要考虑已占用的资源
-                // TODO: 完整实现需要在ScheduleDemandOperations内部处理部分锁定的数量调整
+                // 部分锁定：计算剩余数量，创建剩余需求对象
+                var remainingNetOutputQty = demand.NetOutputQty - lockedQty;
+
+                // 按比例调整PlannedProcessQty
+                var ratio = remainingNetOutputQty / demand.NetOutputQty;
+                var remainingPlannedProcessQty = demand.PlannedProcessQty * ratio;
+
+                // 创建剩余需求对象（只排这部分）
+                actualDemand = new LogicalProductionDemand
+                {
+                    LogicalDemandKey = demand.LogicalDemandKey,
+                    PlanVersionId = demand.PlanVersionId,
+                    DomainKey = demand.DomainKey,
+                    AllocationSequence = demand.AllocationSequence,
+                    DemandKey = demand.DemandKey,
+                    OrderId = demand.OrderId,
+                    MaterialId = demand.MaterialId,
+                    FactoryId = demand.FactoryId,
+                    StartStageCode = demand.StartStageCode,
+                    NetOutputQty = remainingNetOutputQty,
+                    PlannedProcessQty = remainingPlannedProcessQty,
+                    RequiredAvailableTime = demand.RequiredAvailableTime,
+                    DemandSequence = demand.DemandSequence,
+                    ProductionInstructionNo = demand.ProductionInstructionNo,
+                    IsUnlocated = demand.IsUnlocated
+                };
             }
-            // 获取该需求的工艺路线
-            if (!constraints.RoutingGraphs.TryGetValue(demand.MaterialId, out var routeGraphs))
+            // 获取该需求的工艺路线（使用actualDemand）
+            if (!constraints.RoutingGraphs.TryGetValue(actualDemand.MaterialId, out var routeGraphs))
             {
                 // 无工艺路线 → 无法排程
-                result.UnscheduledDemandKeys.Add(demand.LogicalDemandKey);
+                result.UnscheduledDemandKeys.Add(actualDemand.LogicalDemandKey);
                 continue;
             }
 
             // V1 固定使用 DEFAULT 路径
             if (!routeGraphs.TryGetValue("DEFAULT", out var routingGraph))
             {
-                result.UnscheduledDemandKeys.Add(demand.LogicalDemandKey);
+                result.UnscheduledDemandKeys.Add(actualDemand.LogicalDemandKey);
                 continue;
             }
 
-            // 从 StartStageCode 开始的工序列表
+            // 从 StartStageCode 开始的工序列表（使用actualDemand）
             var operationsToSchedule = GetOperationsFromStage(
-                demand.StartStageCode,
+                actualDemand.StartStageCode,
                 routingGraph,
                 constraints);
 
@@ -128,14 +151,14 @@ internal class PhaseTwoInitialScheduler
                 return result;
             }
 
-            // 排程该需求的所有工序
+            // 排程该需求的所有工序（使用actualDemand）
             List<FinalTaskDraft> demandTasks;
 
             // 第4轮Merge修复：检测是否可以合并到已有Task
             if (request.StrategySnapshot.Parameters.AllowMerge)
             {
                 demandTasks = TryMergeOrSchedule(
-                    demand,
+                    actualDemand,
                     operationsToSchedule,
                     routingGraph,
                     direction,
@@ -149,7 +172,7 @@ internal class PhaseTwoInitialScheduler
             else
             {
                 demandTasks = ScheduleDemandOperations(
-                    demand,
+                    actualDemand,
                     operationsToSchedule,
                     routingGraph,
                     direction,

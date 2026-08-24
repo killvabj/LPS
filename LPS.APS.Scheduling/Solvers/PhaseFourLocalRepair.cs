@@ -145,21 +145,169 @@ internal class PhaseFourLocalRepair
 
             var nextRoundAffected = new HashSet<string>();
 
-            // 第8轮P0-02.1修复：实现真实传播逻辑
+            // 第9轮P0-02.1修复：先尝试重排受影响Task，让它们真实变化
             foreach (var affectedTaskId in currentRoundAffected)
             {
                 var task = scheduleResult.ScheduledTasks.FirstOrDefault(t => t.FinalDraftId == affectedTaskId);
                 if (task == null) continue;
 
-                // 检查1: 工艺前后工序依赖
-                // 找到该任务对应的Demand和Routing
+                // 核心修复：真正重新安排Task位置
+                // 1. 从resourceOccupancy中移除当前Task占用
+                if (resourceOccupancy.TryGetValue(task.ResourceId, out var occupiedWindows))
+                {
+                    occupiedWindows.RemoveAll(w =>
+                        w.Start == task.PlannedStartTime && w.End == task.PlannedEndTime);
+                }
+
+                // 2. 计算该Task的工序约束时间窗
                 var demand = request.LogicalProductionDemands
                     .FirstOrDefault(d => d.LogicalDemandKey == task.SourceDraftId);
+
+                DateTime earliestStart = task.PlannedStartTime; // 默认保持原位置
+                DateTime latestEnd = task.PlannedEndTime;
+
                 if (demand != null && constraints.RoutingGraphs.TryGetValue(demand.MaterialId, out var routeGraphs))
                 {
                     if (routeGraphs.TryGetValue("DEFAULT", out var graph))
                     {
-                        // 检查后继工序：如果当前任务时间变化，后继工序可能受影响
+                        // 检查前驱约束：必须在所有前驱完成后开始
+                        if (graph.Dependencies.TryGetValue(task.OperationCode, out var predecessors))
+                        {
+                            foreach (var pred in predecessors)
+                            {
+                                var predecessorTask = scheduleResult.ScheduledTasks
+                                    .FirstOrDefault(t => t.SourceDraftId == task.SourceDraftId &&
+                                                        t.OperationCode == pred.FromOperationCode);
+                                if (predecessorTask != null)
+                                {
+                                    var predEnd = predecessorTask.PlannedEndTime.AddMinutes((double)pred.LagTime);
+                                    if (predEnd > earliestStart)
+                                    {
+                                        earliestStart = predEnd;
+                                    }
+                                }
+                            }
+                        }
+
+                        // 检查后继约束：必须在所有后继开始前完成
+                        var successors = graph.Dependencies
+                            .Where(kvp => kvp.Value.Any(dep => dep.FromOperationCode == task.OperationCode))
+                            .SelectMany(kvp => kvp.Value.Where(dep => dep.FromOperationCode == task.OperationCode)
+                                .Select(dep => new { ToOpCode = kvp.Key, LagMinutes = dep.LagTime }));
+
+                        foreach (var succ in successors)
+                        {
+                            var successorTask = scheduleResult.ScheduledTasks
+                                .FirstOrDefault(t => t.SourceDraftId == task.SourceDraftId &&
+                                                    t.OperationCode == succ.ToOpCode);
+                            if (successorTask != null)
+                            {
+                                var succStart = successorTask.PlannedStartTime.AddMinutes(-(double)succ.LagMinutes);
+                                if (succStart < latestEnd)
+                                {
+                                    latestEnd = succStart;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // 3. 在资源上寻找可用时间窗（简化实现：尝试向前或向后移动）
+                var duration = task.PlannedEndTime - task.PlannedStartTime;
+                DateTime newStart = earliestStart;
+                DateTime newEnd = earliestStart + duration;
+
+                // 检查资源占用冲突，尝试找到无冲突的时间段
+                bool foundSlot = false;
+                if (resourceOccupancy.TryGetValue(task.ResourceId, out var windows))
+                {
+                    var sortedWindows = windows.OrderBy(w => w.Start).ToList();
+
+                    // 尝试在现有占用窗口之间插入
+                    for (int i = 0; i <= sortedWindows.Count; i++)
+                    {
+                        DateTime slotStart = (i == 0) ? earliestStart : sortedWindows[i - 1].End;
+                        DateTime slotEnd = (i == sortedWindows.Count) ? latestEnd : sortedWindows[i].Start;
+
+                        if (slotStart + duration <= slotEnd && slotStart + duration <= latestEnd)
+                        {
+                            newStart = slotStart;
+                            newEnd = slotStart + duration;
+                            foundSlot = true;
+                            break;
+                        }
+                    }
+                }
+                else
+                {
+                    foundSlot = true; // 资源空闲
+                }
+
+                // 4. 如果找到新位置且与原位置不同，创建新FinalTaskDraft替换
+                if (foundSlot && (newStart != task.PlannedStartTime || newEnd != task.PlannedEndTime))
+                {
+                    // 创建新FinalTaskDraft对象（init-only属性需要重新构造）
+                    var updatedTask = new FinalTaskDraft
+                    {
+                        FinalDraftId = task.FinalDraftId,
+                        SourceDraftId = task.SourceDraftId,
+                        MaterialId = task.MaterialId,
+                        FactoryId = task.FactoryId,
+                        StageCode = task.StageCode,
+                        OperationCode = task.OperationCode,
+                        TaskType = task.TaskType,
+                        ResourceId = task.ResourceId,
+                        ResourceCode = task.ResourceCode,
+                        RouteCode = task.RouteCode,
+                        PathId = task.PathId,
+                        Quantity = task.Quantity,
+                        PlannedProcessQty = task.PlannedProcessQty,
+                        UOM = task.UOM,
+                        PlannedStartTime = newStart,  // 新位置
+                        PlannedEndTime = newEnd,      // 新位置
+                        SetupTime = task.SetupTime,
+                        Priority = task.Priority,
+                        IsVirtual = task.IsVirtual,
+                        StageExecutionBatchDraftKey = task.StageExecutionBatchDraftKey,
+                        StageExecutionBatchQty = task.StageExecutionBatchQty,
+                        ExistingMESPlanReleaseId = task.ExistingMESPlanReleaseId,
+                        ExecutionLockId = task.ExecutionLockId
+                    };
+
+                    // 在scheduleResult中替换原Task
+                    var taskIndex = scheduleResult.ScheduledTasks.IndexOf(task);
+                    if (taskIndex >= 0)
+                    {
+                        scheduleResult.ScheduledTasks[taskIndex] = updatedTask;
+                    }
+
+                    // 5. 更新resourceOccupancy
+                    if (!resourceOccupancy.ContainsKey(task.ResourceId))
+                    {
+                        resourceOccupancy[task.ResourceId] = new List<TimeWindow>();
+                    }
+                    resourceOccupancy[task.ResourceId].Add(new TimeWindow(newStart, newEnd));
+                }
+                else if (foundSlot)
+                {
+                    // 位置未变，但需要重新加回resourceOccupancy
+                    if (!resourceOccupancy.ContainsKey(task.ResourceId))
+                    {
+                        resourceOccupancy[task.ResourceId] = new List<TimeWindow>();
+                    }
+                    resourceOccupancy[task.ResourceId].Add(new TimeWindow(task.PlannedStartTime, task.PlannedEndTime));
+                }
+
+
+                // 检查1: 工艺前后工序依赖
+                // 找到该任务对应的Demand和Routing
+                var taskDemand = request.LogicalProductionDemands
+                    .FirstOrDefault(d => d.LogicalDemandKey == task.SourceDraftId);
+                if (taskDemand != null && constraints.RoutingGraphs.TryGetValue(taskDemand.MaterialId, out var taskRouteGraphs))
+                {
+                    if (taskRouteGraphs.TryGetValue("DEFAULT", out var graph))
+                    {
+                        // 1.1 前序传播：找当前工序的前驱
                         if (graph.Dependencies.TryGetValue(task.OperationCode, out var predecessors))
                         {
                             foreach (var pred in predecessors)
@@ -172,6 +320,19 @@ internal class PhaseFourLocalRepair
                                     nextRoundAffected.Add(predecessorTask.FinalDraftId);
                                 }
                             }
+                        }
+
+                        // 1.2 后序传播：找到以当前Operation作为FromOperationCode的所有后继
+                        var successors = graph.Dependencies
+                            .Where(kvp => kvp.Value.Any(dep => dep.FromOperationCode == task.OperationCode))
+                            .SelectMany(kvp => scheduleResult.ScheduledTasks
+                                .Where(t => t.SourceDraftId == task.SourceDraftId &&
+                                           t.OperationCode == kvp.Key &&
+                                           !immovableTasks.Contains(t.FinalDraftId)));
+
+                        foreach (var successorTask in successors)
+                        {
+                            nextRoundAffected.Add(successorTask.FinalDraftId);
                         }
                     }
                 }
@@ -193,14 +354,84 @@ internal class PhaseFourLocalRepair
                     }
                 }
 
-                // 检查3: Setup换型邻居（简化实现：同资源相邻任务）
-                // 完整实现需要检查ProductFamily/SKU切换
-                // 当前版本：同资源邻近任务已在检查2中覆盖
+                // 检查3: Setup换型邻居传播（P0-02.3完整实现）
+                // 当Task被重排到新位置时，需要检查：
+                // - 原位置的前驱/后继（Setup邻居发生变化）
+                // - 新位置的前驱/后继（需要重新计算Setup时间）
+                if (taskSnapshots.TryGetValue(affectedTaskId, out var taskSnapshot))
+                {
+                    var currentTask = scheduleResult.ScheduledTasks.FirstOrDefault(t => t.FinalDraftId == affectedTaskId);
+                    if (currentTask != null && currentTask.ResourceId == taskSnapshot.ResourceId)
+                    {
+                        // 如果Task在同一资源上移动了时间位置
+                        if (currentTask.PlannedStartTime != taskSnapshot.PlannedStartTime)
+                        {
+                            var sameResourceNeighbors = scheduleResult.ScheduledTasks
+                                .Where(t => t.ResourceId == currentTask.ResourceId &&
+                                           t.FinalDraftId != affectedTaskId &&
+                                           !immovableTasks.Contains(t.FinalDraftId))
+                                .OrderBy(t => t.PlannedStartTime)
+                                .ToList();
 
-                // 检查4: 物料Quantity-Time消费者
-                // 如果该任务产出的物料被其他任务消费，消费者可能受影响
-                // 简化实现：通过AllocationSequence关联的后续需求
-                // 完整实现需要MaterialAvailability时间段检查
+                            // 找到原时间位置的邻居
+                            var oldPredecessor = sameResourceNeighbors
+                                .LastOrDefault(t => t.PlannedEndTime <= taskSnapshot.PlannedStartTime);
+                            var oldSuccessor = sameResourceNeighbors
+                                .FirstOrDefault(t => t.PlannedStartTime >= taskSnapshot.PlannedEndTime);
+
+                            // 找到新时间位置的邻居
+                            var newPredecessor = sameResourceNeighbors
+                                .LastOrDefault(t => t.PlannedEndTime <= currentTask.PlannedStartTime);
+                            var newSuccessor = sameResourceNeighbors
+                                .FirstOrDefault(t => t.PlannedStartTime >= currentTask.PlannedEndTime);
+
+                            // 原邻居和新邻居的Setup时间可能需要重新计算
+                            if (oldPredecessor != null && oldPredecessor.FinalDraftId != newPredecessor?.FinalDraftId)
+                                nextRoundAffected.Add(oldPredecessor.FinalDraftId);
+                            if (oldSuccessor != null && oldSuccessor.FinalDraftId != newSuccessor?.FinalDraftId)
+                                nextRoundAffected.Add(oldSuccessor.FinalDraftId);
+                            if (newPredecessor != null && newPredecessor.FinalDraftId != oldPredecessor?.FinalDraftId)
+                                nextRoundAffected.Add(newPredecessor.FinalDraftId);
+                            if (newSuccessor != null && newSuccessor.FinalDraftId != oldSuccessor?.FinalDraftId)
+                                nextRoundAffected.Add(newSuccessor.FinalDraftId);
+                        }
+                    }
+                }
+
+                // 检查4: 物料Quantity-Time消费者传播（P0-02.4完整实现）
+                // 当Task产出时间或数量变化，消费该物料的后续Task可能受影响
+                var currentTaskForMaterial = scheduleResult.ScheduledTasks.FirstOrDefault(t => t.FinalDraftId == affectedTaskId);
+                if (currentTaskForMaterial != null)
+                {
+                    // 找到所有可能消费该Task产出物料的后续Task
+                    // 通过StageExecutionBatchDraftKey关联同一批次的后续工序
+                    var materialConsumers = scheduleResult.ScheduledTasks
+                        .Where(t => t.SourceDraftId == currentTaskForMaterial.SourceDraftId &&
+                                   t.MaterialId == currentTaskForMaterial.MaterialId &&
+                                   t.FinalDraftId != affectedTaskId &&
+                                   !immovableTasks.Contains(t.FinalDraftId))
+                        .ToList();
+
+                    // 如果是同一物料的后续工序，且时间上有依赖关系
+                    foreach (var consumer in materialConsumers)
+                    {
+                        // 检查是否存在工艺依赖关系
+                        if (constraints.RoutingGraphs.TryGetValue(currentTaskForMaterial.MaterialId, out var materialRouteGraphs))
+                        {
+                            if (materialRouteGraphs.TryGetValue("DEFAULT", out var materialGraph))
+                            {
+                                // 检查consumer是否依赖当前Task的工序
+                                if (materialGraph.Dependencies.TryGetValue(consumer.OperationCode, out var consumerPreds))
+                                {
+                                    if (consumerPreds.Any(dep => dep.FromOperationCode == currentTaskForMaterial.OperationCode))
+                                    {
+                                        nextRoundAffected.Add(consumer.FinalDraftId);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
 
             // 第8轮P0-02.2修复：TaskSnapshot前后比较，只在真实变化时继续传播
@@ -250,7 +481,13 @@ internal class PhaseFourLocalRepair
             currentRoundAffected = nextRoundAffected;
         }
 
-        // 4. 第8轮P0-03修复：Fallback兜底 - 调用同一Solver对本Domain全部可移动任务重排
+        // 第9轮P0-03.1修复：轮次耗尽时自动触发Fallback
+        if (propagationRound >= maxPropagationRounds)
+        {
+            shouldTriggerFallback = true;
+        }
+
+        // 4. 第9轮P0-03修复：Fallback兜底 - 调用同一Solver对本Domain全部可移动任务重排
         if (shouldTriggerFallback || affectedTasks.Count > maxAffectedTasks)
         {
             // 构建Fallback重排请求：保留不可移动约束，重排全部可移动任务
@@ -260,7 +497,20 @@ internal class PhaseFourLocalRepair
             // ExternalDomainResourceBlocks也已在resourceOccupancy中预填充
             var fallbackResult = fallbackScheduler.Schedule(request, constraints);
 
-            // 将Fallback结果转换为RepairResult
+            // 第9轮P0-03.2修复：Fallback结果替换语义，不追加到原计划
+            // 从ScheduledTasks中移除所有可移动Task（保留immovableTasks）
+            var immovableScheduledTasks = scheduleResult.ScheduledTasks
+                .Where(t => immovableTasks.Contains(t.FinalDraftId))
+                .ToList();
+
+            // 清空原计划，保留不可移动部分
+            scheduleResult.ScheduledTasks.Clear();
+            scheduleResult.ScheduledTasks.AddRange(immovableScheduledTasks);
+
+            // 用Fallback完整结果替换可移动部分
+            scheduleResult.ScheduledTasks.AddRange(fallbackResult.ScheduledTasks);
+
+            // 将Fallback结果同样体现在RepairResult中（Phase5会合并）
             result.RepairedTasks.AddRange(fallbackResult.ScheduledTasks);
             result.StillUnscheduledKeys.AddRange(fallbackResult.UnscheduledDemandKeys);
 
