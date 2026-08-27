@@ -7,7 +7,6 @@ using LPS.APS.Core.Interfaces;
 using LPS.APS.Core.Models.Scheduling;
 using LPS.APS.Engine.Data;
 using LPS.APS.Scheduling.Algorithms;
-using LPS.APS.Scheduling.Solvers;
 using LPS.APS.Shared.Models;
 using Microsoft.Extensions.Logging;
 
@@ -29,7 +28,6 @@ namespace LPS.APS.Application.Services;
 public class SchedulingOrchestrator : ISchedulingOrchestrator
 {
     private readonly DatabaseConnectionManager _connectionManager;
-    private readonly FiniteCapacitySolver _solver;
     private readonly ISnapshotService _snapshotService;
     private readonly IBatchSplitter _batchSplitter;
     private readonly IPeggingOrchestrator _peggingOrchestrator;
@@ -38,7 +36,6 @@ public class SchedulingOrchestrator : ISchedulingOrchestrator
 
     public SchedulingOrchestrator(
         DatabaseConnectionManager connectionManager,
-        FiniteCapacitySolver solver,
         ISnapshotService snapshotService,
         IBatchSplitter batchSplitter,
         IPeggingOrchestrator peggingOrchestrator,
@@ -46,7 +43,6 @@ public class SchedulingOrchestrator : ISchedulingOrchestrator
         ILogger<SchedulingOrchestrator> logger)
     {
         _connectionManager = connectionManager ?? throw new ArgumentNullException(nameof(connectionManager));
-        _solver = solver ?? throw new ArgumentNullException(nameof(solver));
         _snapshotService = snapshotService ?? throw new ArgumentNullException(nameof(snapshotService));
         _batchSplitter = batchSplitter ?? throw new ArgumentNullException(nameof(batchSplitter));
         _peggingOrchestrator = peggingOrchestrator ?? throw new ArgumentNullException(nameof(peggingOrchestrator));

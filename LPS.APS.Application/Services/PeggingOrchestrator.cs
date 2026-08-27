@@ -22,6 +22,8 @@ public class PeggingOrchestrator : IPeggingOrchestrator
     private readonly DatabaseConnectionManager _connectionManager;
     private readonly ILogger<PeggingOrchestrator> _logger;
     private readonly IFiniteCapacityScheduler _scheduler;
+    private readonly IDemandPriorityExecutor _demandPriorityExecutor;
+    private readonly IDemandPriorityConfigProvider _demandPriorityConfigProvider;
 
     public PeggingOrchestrator(
         IPeggingRuleService peggingRuleService,
@@ -29,7 +31,9 @@ public class PeggingOrchestrator : IPeggingOrchestrator
         IDemandSupplyHardLockRepository lockRepo,
         DatabaseConnectionManager connectionManager,
         ILogger<PeggingOrchestrator> logger,
-        IFiniteCapacityScheduler scheduler)
+        IFiniteCapacityScheduler scheduler,
+        IDemandPriorityExecutor demandPriorityExecutor,
+        IDemandPriorityConfigProvider demandPriorityConfigProvider)
     {
         _peggingRuleService = peggingRuleService ?? throw new ArgumentNullException(nameof(peggingRuleService));
         _allocationRepo     = allocationRepo     ?? throw new ArgumentNullException(nameof(allocationRepo));
@@ -37,6 +41,8 @@ public class PeggingOrchestrator : IPeggingOrchestrator
         _connectionManager  = connectionManager  ?? throw new ArgumentNullException(nameof(connectionManager));
         _logger             = logger             ?? throw new ArgumentNullException(nameof(logger));
         _scheduler          = scheduler          ?? throw new ArgumentNullException(nameof(scheduler));
+        _demandPriorityExecutor = demandPriorityExecutor ?? throw new ArgumentNullException(nameof(demandPriorityExecutor));
+        _demandPriorityConfigProvider = demandPriorityConfigProvider ?? throw new ArgumentNullException(nameof(demandPriorityConfigProvider));
     }
 
     /// <inheritdoc />
@@ -1235,6 +1241,9 @@ public class PeggingOrchestrator : IPeggingOrchestrator
         public string   MaterialCode    { get; set; } = string.Empty;
         public int      FactoryId       { get; set; }
         public string   FactoryCode     { get; set; } = string.Empty;
+        public string?  OrderType       { get; set; }
+        public string?  CustomerTier    { get; set; }
+        public DateTime? IssueDate      { get; set; }
         public decimal  DemandQty       { get; set; }
         public DateTime DueDate         { get; set; }
         public string   UOM             { get; set; } = string.Empty;
@@ -1251,6 +1260,9 @@ public class PeggingOrchestrator : IPeggingOrchestrator
                      m.MaterialCode,
                      o.FactoryId,
                      f.Code        AS FactoryCode,
+                     o.OrderType,
+                     o.CustomerTier,
+                     o.IssueDate,
                      o.Quantity    AS DemandQty,
                      o.CustomerDueDate AS DueDate,
                      o.UOM,
@@ -1282,6 +1294,11 @@ public class PeggingOrchestrator : IPeggingOrchestrator
     {
         var orders = await LoadOrdersForPeggingAsync(request, ct);
 
+        // ── Demand 优先级排序（2号位消费3号位 DemandPriorityConfig）──
+        // 位置：LoadOrdersForPeggingAsync 之后、Pegging 循环之前（PM 冻结口径，不进 SQL 排序）
+        // 结果：OrderId → DemandSequence，决定订单处理顺序，并透传给 LogicalProductionDemand
+        var demandSequenceByOrder = await BuildDemandSequenceMapAsync(orders, ct);
+
         var firstOrder = orders.FirstOrDefault();
         var voucher = new PeggingResultVoucher
         {
@@ -1293,10 +1310,16 @@ public class PeggingOrchestrator : IPeggingOrchestrator
             ExecutedAt       = DateTime.Now
         };
 
-        foreach (var order in orders)
+        // 按 DemandSequence 升序遍历：优先级高的订单先抢供给
+        var orderedOrders = orders
+            .OrderBy(o => demandSequenceByOrder.GetValueOrDefault(o.OrderId, int.MaxValue))
+            .ToList();
+
+        foreach (var order in orderedOrders)
         {
             ct.ThrowIfCancellationRequested();
 
+            var demandSequence = demandSequenceByOrder.GetValueOrDefault(order.OrderId, 0);
             var visited = new HashSet<string>(StringComparer.Ordinal);
             _ = TraverseBomNode(
                 order,
@@ -1306,6 +1329,7 @@ public class PeggingOrchestrator : IPeggingOrchestrator
                 order.FactoryCode,
                 order.DemandQty,
                 bomLevel: 0,
+                demandSequence: demandSequence,
                 bom,
                 supplyPool,
                 voucher,
@@ -1314,6 +1338,40 @@ public class PeggingOrchestrator : IPeggingOrchestrator
 
         voucher.IsFullyAllocated = voucher.ShortageQuantity == 0;
         return voucher;
+    }
+
+    /// <summary>
+    /// 将订单转换为 UpstreamDemand，消费3号位 DemandPriorityConfig 排序，返回 OrderId → DemandSequence 映射。
+    /// </summary>
+    private async Task<Dictionary<long, int>> BuildDemandSequenceMapAsync(
+        IReadOnlyList<OrderPeggingRow> orders,
+        CancellationToken ct)
+    {
+        var demands = orders.Select(o => new UpstreamDemand
+        {
+            DemandKey    = o.OrderId.ToString(),
+            OrderType    = o.OrderType,
+            CustomerTier = o.CustomerTier,
+            DueDate      = o.DueDate,
+            IssueDate    = o.IssueDate,
+            // DelayStatus / ProtectionStatus：Order 表暂无对应列，待5号位事实标准化后接入
+            SourceDemand = o
+        }).ToList();
+
+        // TODO: strategyProfileVersionId 应从 PeggingExecutionRequest/ScheduleRun 透传（当前 Fixture 忽略该参数）
+        var config = await _demandPriorityConfigProvider.GetPriorityConfigAsync(0L, ct);
+        var sorted = _demandPriorityExecutor.ExecutePrioritySort(demands, config);
+
+        var map = new Dictionary<long, int>();
+        foreach (var demand in sorted)
+        {
+            if (long.TryParse(demand.DemandKey, out var orderId))
+            {
+                map[orderId] = demand.DemandSequence;
+            }
+        }
+
+        return map;
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -1581,6 +1639,7 @@ public class PeggingOrchestrator : IPeggingOrchestrator
         string factoryCode,
         decimal demandQty,
         int bomLevel,
+        int demandSequence,
         BomSnapshot bom,
         SupplyPool supplyPool,
         PeggingResultVoucher voucher,
@@ -1607,7 +1666,7 @@ public class PeggingOrchestrator : IPeggingOrchestrator
                 CurrentOrderId = order.OrderId,
                 BomLevel = bomLevel,
                 DueTime = order.DueDate,
-                Priority = bomLevel, // TEST FIXTURE ONLY：临时使用bomLevel，V1验收前必须接入§6 Priority Segment排序
+                Priority = demandSequence, // §6 Priority Segment：订单级需求优先级（由 DemandPriorityExecutor 排序结果透传）
                 ProductFamilyId = 0, // V1.2：暂不使用产品族
                 IsInFrozenZone = false,
                 WorksetId = null
@@ -1645,7 +1704,7 @@ public class PeggingOrchestrator : IPeggingOrchestrator
                         materialId: materialId,
                         factoryId: factoryId,
                         requiredTime: order.DueDate,
-                        demandSequence: bomLevel,
+                        demandSequence: demandSequence,
                         voucher: voucher));
                 }
             }
@@ -1715,7 +1774,7 @@ public class PeggingOrchestrator : IPeggingOrchestrator
                         materialId: materialId,
                         factoryId: factoryId,
                         requiredTime: order.DueDate,
-                        demandSequence: bomLevel,
+                        demandSequence: demandSequence,
                         voucher: voucher));
                 }
 
@@ -1732,6 +1791,7 @@ public class PeggingOrchestrator : IPeggingOrchestrator
                             factoryCode,
                             result.AllocatedQty * edge.Qty,
                             bomLevel + 1,
+                            demandSequence,
                             bom,
                             supplyPool,
                             voucher,

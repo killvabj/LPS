@@ -628,21 +628,28 @@ internal class PhaseFourLocalRepair
         {
             // ExecutionConstraint包含：已执行、Firm、Frozen、锁定资源/时间
             // 当前简化实现：所有ExecutionConstraint标记的任务都视为不可移动
+            // 第13轮P0-02修复：immovable集合统一存放FinalDraftId，不混放DraftId
+            // DraftId 负责关联 SourceDraft/Demand（即 FinalTaskDraft.SourceDraftId）
+            // TaskKey 负责稳定Task键（跨轮次识别同一Task，若等于 FinalDraftId 则精确命中）
+
+            // 1) DraftId → SourceDraftId → FinalDraftId（该Demand对应的全部已排Task）
             if (!string.IsNullOrEmpty(constraint.DraftId))
             {
-                immovable.Add(constraint.DraftId);
+                foreach (var task in scheduledTasks.Where(t => t.SourceDraftId == constraint.DraftId))
+                {
+                    immovable.Add(task.FinalDraftId);
+                }
             }
 
-            // 如果有TaskKey，也可能关联到已排任务
+            // 2) TaskKey → 精确匹配 FinalDraftId
             if (!string.IsNullOrEmpty(constraint.TaskKey))
             {
-                var matchedTask = scheduledTasks.FirstOrDefault(t =>
-                    t.FinalDraftId == constraint.TaskKey ||
-                    t.SourceDraftId == constraint.DraftId);
+                var matchedByTaskKey = scheduledTasks.FirstOrDefault(t =>
+                    t.FinalDraftId == constraint.TaskKey);
 
-                if (matchedTask != null)
+                if (matchedByTaskKey != null)
                 {
-                    immovable.Add(matchedTask.FinalDraftId);
+                    immovable.Add(matchedByTaskKey.FinalDraftId);
                 }
             }
         }
