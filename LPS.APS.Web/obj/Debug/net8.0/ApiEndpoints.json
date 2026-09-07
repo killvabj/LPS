@@ -1,0 +1,2506 @@
+[
+  {
+    "ContainingType": "Program\u002B\u003C\u003Ec",
+    "Method": "\u003C\u003CMain\u003E$\u003Eb__0_10",
+    "RelativePath": "",
+    "HttpMethod": "GET",
+    "IsController": false,
+    "Order": 0,
+    "Parameters": [],
+    "ReturnTypes": [
+      {
+        "Type": "System.Void",
+        "MediaTypes": [],
+        "StatusCode": 200
+      }
+    ]
+  },
+  {
+    "ContainingType": "LPS.APS.Web.Controllers.AuthController",
+    "Method": "Login",
+    "RelativePath": "api/Auth/login",
+    "HttpMethod": "POST",
+    "IsController": true,
+    "Order": 0,
+    "Parameters": [
+      {
+        "Name": "request",
+        "Type": "LPS.APS.Web.Dto.Auth.LoginRequestDto",
+        "IsRequired": true
+      }
+    ],
+    "ReturnTypes": [
+      {
+        "Type": "LPS.APS.Shared.Models.ApiResponse\u00601[[LPS.APS.Web.Dto.Auth.LoginResponseDto, LPS.APS.Web, Version=1.0.0.0, Culture=neutral, PublicKeyToken=null]]",
+        "MediaTypes": [
+          "text/plain",
+          "application/json",
+          "text/json"
+        ],
+        "StatusCode": 200
+      }
+    ]
+  },
+  {
+    "ContainingType": "LPS.APS.Web.Controllers.AuthController",
+    "Method": "Logout",
+    "RelativePath": "api/Auth/logout",
+    "HttpMethod": "POST",
+    "IsController": true,
+    "Order": 0,
+    "Parameters": [],
+    "ReturnTypes": [
+      {
+        "Type": "LPS.APS.Shared.Models.ApiResponse",
+        "MediaTypes": [
+          "text/plain",
+          "application/json",
+          "text/json"
+        ],
+        "StatusCode": 200
+      }
+    ]
+  },
+  {
+    "ContainingType": "LPS.APS.Web.Controllers.AuthController",
+    "Method": "GetCurrentUser",
+    "RelativePath": "api/Auth/me",
+    "HttpMethod": "GET",
+    "IsController": true,
+    "Order": 0,
+    "Parameters": [],
+    "ReturnTypes": [
+      {
+        "Type": "LPS.APS.Shared.Models.ApiResponse\u00601[[LPS.APS.Web.Dto.Auth.UserInfoDto, LPS.APS.Web, Version=1.0.0.0, Culture=neutral, PublicKeyToken=null]]",
+        "MediaTypes": [
+          "text/plain",
+          "application/json",
+          "text/json"
+        ],
+        "StatusCode": 200
+      }
+    ]
+  },
+  {
+    "ContainingType": "LPS.APS.Web.Controllers.AuthController",
+    "Method": "RefreshToken",
+    "RelativePath": "api/Auth/refresh",
+    "HttpMethod": "POST",
+    "IsController": true,
+    "Order": 0,
+    "Parameters": [
+      {
+        "Name": "request",
+        "Type": "LPS.APS.Web.Dto.Auth.RefreshTokenRequestDto",
+        "IsRequired": true
+      }
+    ],
+    "ReturnTypes": [
+      {
+        "Type": "LPS.APS.Shared.Models.ApiResponse\u00601[[LPS.APS.Web.Dto.Auth.LoginResponseDto, LPS.APS.Web, Version=1.0.0.0, Culture=neutral, PublicKeyToken=null]]",
+        "MediaTypes": [
+          "text/plain",
+          "application/json",
+          "text/json"
+        ],
+        "StatusCode": 200
+      }
+    ]
+  },
+  {
+    "ContainingType": "LPS.APS.Web.Controllers.BusinessFactIssueController",
+    "Method": "QueryAll",
+    "RelativePath": "api/business-fact-issues",
+    "HttpMethod": "GET",
+    "IsController": true,
+    "Order": 0,
+    "Parameters": [
+      {
+        "Name": "source",
+        "Type": "System.String",
+        "IsRequired": false
+      },
+      {
+        "Name": "materialCode",
+        "Type": "System.String",
+        "IsRequired": false
+      },
+      {
+        "Name": "factoryCode",
+        "Type": "System.String",
+        "IsRequired": false
+      },
+      {
+        "Name": "severity",
+        "Type": "System.String",
+        "IsRequired": false
+      },
+      {
+        "Name": "reviewStatus",
+        "Type": "System.String",
+        "IsRequired": false
+      },
+      {
+        "Name": "skip",
+        "Type": "System.Int32",
+        "IsRequired": false
+      },
+      {
+        "Name": "take",
+        "Type": "System.Int32",
+        "IsRequired": false
+      }
+    ],
+    "ReturnTypes": [
+      {
+        "Type": "LPS.APS.Shared.Models.ApiResponse\u00601[[System.Collections.Generic.List\u00601[[LPS.APS.Core.Dto.BusinessFactIssueDto, LPS.APS.Core, Version=1.0.0.0, Culture=neutral, PublicKeyToken=null]], System.Private.CoreLib, Version=8.0.0.0, Culture=neutral, PublicKeyToken=7cec85d7bea7798e]]",
+        "MediaTypes": [
+          "text/plain",
+          "application/json",
+          "text/json"
+        ],
+        "StatusCode": 200
+      }
+    ]
+  },
+  {
+    "ContainingType": "LPS.APS.Web.Controllers.DemandProtectionController",
+    "Method": "Query",
+    "RelativePath": "api/demand-protection",
+    "HttpMethod": "GET",
+    "IsController": true,
+    "Order": 0,
+    "Parameters": [
+      {
+        "Name": "demandKey",
+        "Type": "System.String",
+        "IsRequired": false
+      },
+      {
+        "Name": "supplyKey",
+        "Type": "System.String",
+        "IsRequired": false
+      },
+      {
+        "Name": "lockType",
+        "Type": "System.String",
+        "IsRequired": false
+      },
+      {
+        "Name": "status",
+        "Type": "System.String",
+        "IsRequired": false
+      },
+      {
+        "Name": "skip",
+        "Type": "System.Int32",
+        "IsRequired": false
+      },
+      {
+        "Name": "take",
+        "Type": "System.Int32",
+        "IsRequired": false
+      }
+    ],
+    "ReturnTypes": [
+      {
+        "Type": "LPS.APS.Shared.Models.ApiResponse\u00601[[System.Collections.Generic.List\u00601[[LPS.APS.Core.Dto.DemandProtectionDto, LPS.APS.Core, Version=1.0.0.0, Culture=neutral, PublicKeyToken=null]], System.Private.CoreLib, Version=8.0.0.0, Culture=neutral, PublicKeyToken=7cec85d7bea7798e]]",
+        "MediaTypes": [
+          "text/plain",
+          "application/json",
+          "text/json"
+        ],
+        "StatusCode": 200
+      }
+    ]
+  },
+  {
+    "ContainingType": "LPS.APS.Web.Controllers.DemandProtectionController",
+    "Method": "GetSummary",
+    "RelativePath": "api/demand-protection/summary",
+    "HttpMethod": "GET",
+    "IsController": true,
+    "Order": 0,
+    "Parameters": [
+      {
+        "Name": "demandKey",
+        "Type": "System.String",
+        "IsRequired": false
+      }
+    ],
+    "ReturnTypes": [
+      {
+        "Type": "LPS.APS.Shared.Models.ApiResponse\u00601[[LPS.APS.Core.Dto.DemandProtectionSummaryDto, LPS.APS.Core, Version=1.0.0.0, Culture=neutral, PublicKeyToken=null]]",
+        "MediaTypes": [
+          "text/plain",
+          "application/json",
+          "text/json"
+        ],
+        "StatusCode": 200
+      }
+    ]
+  },
+  {
+    "ContainingType": "LPS.APS.Web.Controllers.DomainStatusController",
+    "Method": "GetRunDomainStatus",
+    "RelativePath": "api/domain-status/{scheduleRunId}",
+    "HttpMethod": "GET",
+    "IsController": true,
+    "Order": 0,
+    "Parameters": [
+      {
+        "Name": "scheduleRunId",
+        "Type": "System.Int32",
+        "IsRequired": true
+      }
+    ],
+    "ReturnTypes": [
+      {
+        "Type": "LPS.APS.Shared.Models.ApiResponse\u00601[[System.Collections.Generic.IReadOnlyList\u00601[[LPS.APS.Core.DTOs.Governance.RunDomainStatusDto, LPS.APS.Core, Version=1.0.0.0, Culture=neutral, PublicKeyToken=null]], System.Private.CoreLib, Version=8.0.0.0, Culture=neutral, PublicKeyToken=7cec85d7bea7798e]]",
+        "MediaTypes": [
+          "text/plain",
+          "application/json",
+          "text/json"
+        ],
+        "StatusCode": 200
+      }
+    ]
+  },
+  {
+    "ContainingType": "LPS.APS.Web.Controllers.ExplanationController",
+    "Method": "Query",
+    "RelativePath": "api/explanation",
+    "HttpMethod": "GET",
+    "IsController": true,
+    "Order": 0,
+    "Parameters": [
+      {
+        "Name": "planVersionId",
+        "Type": "System.Int32",
+        "IsRequired": false
+      },
+      {
+        "Name": "objectType",
+        "Type": "System.String",
+        "IsRequired": false
+      },
+      {
+        "Name": "orderId",
+        "Type": "System.Nullable\u00601[[System.Int64, System.Private.CoreLib, Version=8.0.0.0, Culture=neutral, PublicKeyToken=7cec85d7bea7798e]]",
+        "IsRequired": false
+      },
+      {
+        "Name": "taskId",
+        "Type": "System.Nullable\u00601[[System.Int64, System.Private.CoreLib, Version=8.0.0.0, Culture=neutral, PublicKeyToken=7cec85d7bea7798e]]",
+        "IsRequired": false
+      },
+      {
+        "Name": "reasonCode",
+        "Type": "System.String",
+        "IsRequired": false
+      },
+      {
+        "Name": "severity",
+        "Type": "System.String",
+        "IsRequired": false
+      },
+      {
+        "Name": "skip",
+        "Type": "System.Int32",
+        "IsRequired": false
+      },
+      {
+        "Name": "take",
+        "Type": "System.Int32",
+        "IsRequired": false
+      }
+    ],
+    "ReturnTypes": [
+      {
+        "Type": "LPS.APS.Shared.Models.ApiResponse\u00601[[System.Collections.Generic.List\u00601[[LPS.APS.Core.Dto.ExplanationDto, LPS.APS.Core, Version=1.0.0.0, Culture=neutral, PublicKeyToken=null]], System.Private.CoreLib, Version=8.0.0.0, Culture=neutral, PublicKeyToken=7cec85d7bea7798e]]",
+        "MediaTypes": [
+          "text/plain",
+          "application/json",
+          "text/json"
+        ],
+        "StatusCode": 200
+      }
+    ]
+  },
+  {
+    "ContainingType": "LPS.APS.Web.Controllers.ExplanationController",
+    "Method": "GetSummary",
+    "RelativePath": "api/explanation/summary",
+    "HttpMethod": "GET",
+    "IsController": true,
+    "Order": 0,
+    "Parameters": [
+      {
+        "Name": "planVersionId",
+        "Type": "System.Int32",
+        "IsRequired": false
+      }
+    ],
+    "ReturnTypes": [
+      {
+        "Type": "LPS.APS.Shared.Models.ApiResponse\u00601[[LPS.APS.Core.Dto.ExplanationSummaryDto, LPS.APS.Core, Version=1.0.0.0, Culture=neutral, PublicKeyToken=null]]",
+        "MediaTypes": [
+          "text/plain",
+          "application/json",
+          "text/json"
+        ],
+        "StatusCode": 200
+      }
+    ]
+  },
+  {
+    "ContainingType": "LPS.APS.Web.Controllers.GovernanceQueryController",
+    "Method": "GetDomainDependencies",
+    "RelativePath": "api/governance-query/domain-dependencies",
+    "HttpMethod": "GET",
+    "IsController": true,
+    "Order": 0,
+    "Parameters": [
+      {
+        "Name": "domainCode",
+        "Type": "System.String",
+        "IsRequired": false
+      },
+      {
+        "Name": "direction",
+        "Type": "System.String",
+        "IsRequired": false
+      }
+    ],
+    "ReturnTypes": [
+      {
+        "Type": "LPS.APS.Shared.Models.ApiResponse\u00601[[System.Collections.Generic.List\u00601[[LPS.APS.Core.Dto.DomainDependencyDto, LPS.APS.Core, Version=1.0.0.0, Culture=neutral, PublicKeyToken=null]], System.Private.CoreLib, Version=8.0.0.0, Culture=neutral, PublicKeyToken=7cec85d7bea7798e]]",
+        "MediaTypes": [
+          "text/plain",
+          "application/json",
+          "text/json"
+        ],
+        "StatusCode": 200
+      }
+    ]
+  },
+  {
+    "ContainingType": "LPS.APS.Web.Controllers.GovernanceQueryController",
+    "Method": "GetRuns",
+    "RelativePath": "api/governance-query/runs",
+    "HttpMethod": "GET",
+    "IsController": true,
+    "Order": 0,
+    "Parameters": [
+      {
+        "Name": "status",
+        "Type": "System.String",
+        "IsRequired": false
+      },
+      {
+        "Name": "runType",
+        "Type": "System.String",
+        "IsRequired": false
+      },
+      {
+        "Name": "take",
+        "Type": "System.Int32",
+        "IsRequired": false
+      }
+    ],
+    "ReturnTypes": [
+      {
+        "Type": "LPS.APS.Shared.Models.ApiResponse\u00601[[System.Collections.Generic.List\u00601[[LPS.APS.Core.DTOs.Governance.ScheduleRunGov, LPS.APS.Core, Version=1.0.0.0, Culture=neutral, PublicKeyToken=null]], System.Private.CoreLib, Version=8.0.0.0, Culture=neutral, PublicKeyToken=7cec85d7bea7798e]]",
+        "MediaTypes": [
+          "text/plain",
+          "application/json",
+          "text/json"
+        ],
+        "StatusCode": 200
+      }
+    ]
+  },
+  {
+    "ContainingType": "LPS.APS.Web.Controllers.GovernanceController",
+    "Method": "GetAuditLogs",
+    "RelativePath": "api/Governance/audit-logs",
+    "HttpMethod": "GET",
+    "IsController": true,
+    "Order": 0,
+    "Parameters": [
+      {
+        "Name": "entityType",
+        "Type": "System.String",
+        "IsRequired": false
+      },
+      {
+        "Name": "entityId",
+        "Type": "System.Nullable\u00601[[System.Int64, System.Private.CoreLib, Version=8.0.0.0, Culture=neutral, PublicKeyToken=7cec85d7bea7798e]]",
+        "IsRequired": false
+      },
+      {
+        "Name": "from",
+        "Type": "System.Nullable\u00601[[System.DateTime, System.Private.CoreLib, Version=8.0.0.0, Culture=neutral, PublicKeyToken=7cec85d7bea7798e]]",
+        "IsRequired": false
+      },
+      {
+        "Name": "to",
+        "Type": "System.Nullable\u00601[[System.DateTime, System.Private.CoreLib, Version=8.0.0.0, Culture=neutral, PublicKeyToken=7cec85d7bea7798e]]",
+        "IsRequired": false
+      },
+      {
+        "Name": "take",
+        "Type": "System.Nullable\u00601[[System.Int32, System.Private.CoreLib, Version=8.0.0.0, Culture=neutral, PublicKeyToken=7cec85d7bea7798e]]",
+        "IsRequired": false
+      }
+    ],
+    "ReturnTypes": []
+  },
+  {
+    "ContainingType": "LPS.APS.Web.Controllers.GovernanceController",
+    "Method": "GetDomainDefinitions",
+    "RelativePath": "api/Governance/domain-definition",
+    "HttpMethod": "GET",
+    "IsController": true,
+    "Order": 0,
+    "Parameters": [],
+    "ReturnTypes": []
+  },
+  {
+    "ContainingType": "LPS.APS.Web.Controllers.GovernanceController",
+    "Method": "CreateDomainDefinition",
+    "RelativePath": "api/Governance/domain-definition",
+    "HttpMethod": "POST",
+    "IsController": true,
+    "Order": 0,
+    "Parameters": [
+      {
+        "Name": "entity",
+        "Type": "LPS.APS.Core.Entities.APS.DomainDefinition",
+        "IsRequired": true
+      }
+    ],
+    "ReturnTypes": []
+  },
+  {
+    "ContainingType": "LPS.APS.Web.Controllers.GovernanceController",
+    "Method": "GetDomainDefinition",
+    "RelativePath": "api/Governance/domain-definition/{id}",
+    "HttpMethod": "GET",
+    "IsController": true,
+    "Order": 0,
+    "Parameters": [
+      {
+        "Name": "id",
+        "Type": "System.Int32",
+        "IsRequired": true
+      }
+    ],
+    "ReturnTypes": []
+  },
+  {
+    "ContainingType": "LPS.APS.Web.Controllers.GovernanceController",
+    "Method": "UpdateDomainDefinition",
+    "RelativePath": "api/Governance/domain-definition/{id}",
+    "HttpMethod": "PUT",
+    "IsController": true,
+    "Order": 0,
+    "Parameters": [
+      {
+        "Name": "id",
+        "Type": "System.Int32",
+        "IsRequired": true
+      },
+      {
+        "Name": "entity",
+        "Type": "LPS.APS.Core.Entities.APS.DomainDefinition",
+        "IsRequired": true
+      }
+    ],
+    "ReturnTypes": []
+  },
+  {
+    "ContainingType": "LPS.APS.Web.Controllers.GovernanceController",
+    "Method": "DisableDomainDefinition",
+    "RelativePath": "api/Governance/domain-definition/{id}/disable",
+    "HttpMethod": "POST",
+    "IsController": true,
+    "Order": 0,
+    "Parameters": [
+      {
+        "Name": "id",
+        "Type": "System.Int32",
+        "IsRequired": true
+      },
+      {
+        "Name": "operatedBy",
+        "Type": "System.String",
+        "IsRequired": false
+      }
+    ],
+    "ReturnTypes": []
+  },
+  {
+    "ContainingType": "LPS.APS.Web.Controllers.GovernanceController",
+    "Method": "EnableDomainDefinition",
+    "RelativePath": "api/Governance/domain-definition/{id}/enable",
+    "HttpMethod": "POST",
+    "IsController": true,
+    "Order": 0,
+    "Parameters": [
+      {
+        "Name": "id",
+        "Type": "System.Int32",
+        "IsRequired": true
+      },
+      {
+        "Name": "operatedBy",
+        "Type": "System.String",
+        "IsRequired": false
+      }
+    ],
+    "ReturnTypes": []
+  },
+  {
+    "ContainingType": "LPS.APS.Web.Controllers.GovernanceController",
+    "Method": "GetActiveDomainDefinitions",
+    "RelativePath": "api/Governance/domain-definition/active",
+    "HttpMethod": "GET",
+    "IsController": true,
+    "Order": 0,
+    "Parameters": [],
+    "ReturnTypes": []
+  },
+  {
+    "ContainingType": "LPS.APS.Web.Controllers.GovernanceController",
+    "Method": "GetDomainDependencies",
+    "RelativePath": "api/Governance/domain-dependencies",
+    "HttpMethod": "GET",
+    "IsController": true,
+    "Order": 0,
+    "Parameters": [
+      {
+        "Name": "domainCode",
+        "Type": "System.String",
+        "IsRequired": false
+      },
+      {
+        "Name": "direction",
+        "Type": "System.String",
+        "IsRequired": false
+      }
+    ],
+    "ReturnTypes": []
+  },
+  {
+    "ContainingType": "LPS.APS.Web.Controllers.GovernanceController",
+    "Method": "GetPublishedParameterSetVersion",
+    "RelativePath": "api/Governance/parameter-set/{parameterSetId}/published-version",
+    "HttpMethod": "GET",
+    "IsController": true,
+    "Order": 0,
+    "Parameters": [
+      {
+        "Name": "parameterSetId",
+        "Type": "System.Int64",
+        "IsRequired": true
+      }
+    ],
+    "ReturnTypes": []
+  },
+  {
+    "ContainingType": "LPS.APS.Web.Controllers.GovernanceController",
+    "Method": "GetParameterSetVersions",
+    "RelativePath": "api/Governance/parameter-set/{parameterSetId}/versions",
+    "HttpMethod": "GET",
+    "IsController": true,
+    "Order": 0,
+    "Parameters": [
+      {
+        "Name": "parameterSetId",
+        "Type": "System.Int64",
+        "IsRequired": true
+      }
+    ],
+    "ReturnTypes": []
+  },
+  {
+    "ContainingType": "LPS.APS.Web.Controllers.GovernanceController",
+    "Method": "CreateParameterSetVersion",
+    "RelativePath": "api/Governance/parameter-set/version",
+    "HttpMethod": "POST",
+    "IsController": true,
+    "Order": 0,
+    "Parameters": [
+      {
+        "Name": "version",
+        "Type": "LPS.APS.Core.Entities.APS.ParameterSetVersion",
+        "IsRequired": true
+      }
+    ],
+    "ReturnTypes": []
+  },
+  {
+    "ContainingType": "LPS.APS.Web.Controllers.GovernanceController",
+    "Method": "GetParameterSetVersion",
+    "RelativePath": "api/Governance/parameter-set/version/{versionId}",
+    "HttpMethod": "GET",
+    "IsController": true,
+    "Order": 0,
+    "Parameters": [
+      {
+        "Name": "versionId",
+        "Type": "System.Int64",
+        "IsRequired": true
+      }
+    ],
+    "ReturnTypes": []
+  },
+  {
+    "ContainingType": "LPS.APS.Web.Controllers.GovernanceController",
+    "Method": "UpdateParameterSetVersion",
+    "RelativePath": "api/Governance/parameter-set/version/{versionId}",
+    "HttpMethod": "PUT",
+    "IsController": true,
+    "Order": 0,
+    "Parameters": [
+      {
+        "Name": "versionId",
+        "Type": "System.Int64",
+        "IsRequired": true
+      },
+      {
+        "Name": "version",
+        "Type": "LPS.APS.Core.Entities.APS.ParameterSetVersion",
+        "IsRequired": true
+      }
+    ],
+    "ReturnTypes": []
+  },
+  {
+    "ContainingType": "LPS.APS.Web.Controllers.GovernanceController",
+    "Method": "DisableParameterSetVersion",
+    "RelativePath": "api/Governance/parameter-set/version/{versionId}/disable",
+    "HttpMethod": "POST",
+    "IsController": true,
+    "Order": 0,
+    "Parameters": [
+      {
+        "Name": "versionId",
+        "Type": "System.Int64",
+        "IsRequired": true
+      },
+      {
+        "Name": "request",
+        "Type": "LPS.APS.Web.Controllers.DisableRequest",
+        "IsRequired": true
+      }
+    ],
+    "ReturnTypes": []
+  },
+  {
+    "ContainingType": "LPS.APS.Web.Controllers.GovernanceController",
+    "Method": "PublishParameterSetVersion",
+    "RelativePath": "api/Governance/parameter-set/version/{versionId}/publish",
+    "HttpMethod": "POST",
+    "IsController": true,
+    "Order": 0,
+    "Parameters": [
+      {
+        "Name": "versionId",
+        "Type": "System.Int64",
+        "IsRequired": true
+      },
+      {
+        "Name": "request",
+        "Type": "LPS.APS.Web.Controllers.PublishRequest",
+        "IsRequired": true
+      }
+    ],
+    "ReturnTypes": []
+  },
+  {
+    "ContainingType": "LPS.APS.Web.Controllers.GovernanceController",
+    "Method": "ValidateParameterSetVersionForPublish",
+    "RelativePath": "api/Governance/parameter-set/version/{versionId}/validate",
+    "HttpMethod": "GET",
+    "IsController": true,
+    "Order": 0,
+    "Parameters": [
+      {
+        "Name": "versionId",
+        "Type": "System.Int64",
+        "IsRequired": true
+      }
+    ],
+    "ReturnTypes": []
+  },
+  {
+    "ContainingType": "LPS.APS.Web.Controllers.GovernanceController",
+    "Method": "CompareParameterSetVersions",
+    "RelativePath": "api/Governance/parameter-set/version/diff",
+    "HttpMethod": "GET",
+    "IsController": true,
+    "Order": 0,
+    "Parameters": [
+      {
+        "Name": "sourceVersionId",
+        "Type": "System.Int64",
+        "IsRequired": false
+      },
+      {
+        "Name": "targetVersionId",
+        "Type": "System.Int64",
+        "IsRequired": false
+      }
+    ],
+    "ReturnTypes": []
+  },
+  {
+    "ContainingType": "LPS.APS.Web.Controllers.GovernanceController",
+    "Method": "GetParameterSets",
+    "RelativePath": "api/Governance/parameter-sets",
+    "HttpMethod": "GET",
+    "IsController": true,
+    "Order": 0,
+    "Parameters": [
+      {
+        "Name": "activeOnly",
+        "Type": "System.Nullable\u00601[[System.Boolean, System.Private.CoreLib, Version=8.0.0.0, Culture=neutral, PublicKeyToken=7cec85d7bea7798e]]",
+        "IsRequired": false
+      },
+      {
+        "Name": "keyword",
+        "Type": "System.String",
+        "IsRequired": false
+      },
+      {
+        "Name": "page",
+        "Type": "System.Nullable\u00601[[System.Int32, System.Private.CoreLib, Version=8.0.0.0, Culture=neutral, PublicKeyToken=7cec85d7bea7798e]]",
+        "IsRequired": false
+      },
+      {
+        "Name": "pageSize",
+        "Type": "System.Nullable\u00601[[System.Int32, System.Private.CoreLib, Version=8.0.0.0, Culture=neutral, PublicKeyToken=7cec85d7bea7798e]]",
+        "IsRequired": false
+      }
+    ],
+    "ReturnTypes": []
+  },
+  {
+    "ContainingType": "LPS.APS.Web.Controllers.GovernanceController",
+    "Method": "CompareCandidateWithBase",
+    "RelativePath": "api/Governance/plan-version/{candidatePlanVersionId}/compare-with/{basePlanVersionId}",
+    "HttpMethod": "GET",
+    "IsController": true,
+    "Order": 0,
+    "Parameters": [
+      {
+        "Name": "candidatePlanVersionId",
+        "Type": "System.Int32",
+        "IsRequired": true
+      },
+      {
+        "Name": "basePlanVersionId",
+        "Type": "System.Int32",
+        "IsRequired": true
+      }
+    ],
+    "ReturnTypes": []
+  },
+  {
+    "ContainingType": "LPS.APS.Web.Controllers.GovernanceController",
+    "Method": "ActivateCandidate",
+    "RelativePath": "api/Governance/plan-version/{planVersionId}/activate-candidate",
+    "HttpMethod": "POST",
+    "IsController": true,
+    "Order": 0,
+    "Parameters": [
+      {
+        "Name": "planVersionId",
+        "Type": "System.Int32",
+        "IsRequired": true
+      },
+      {
+        "Name": "request",
+        "Type": "LPS.APS.Web.Controllers.ActivateCandidateRequest",
+        "IsRequired": true
+      }
+    ],
+    "ReturnTypes": []
+  },
+  {
+    "ContainingType": "LPS.APS.Web.Controllers.GovernanceController",
+    "Method": "ConfirmCandidate",
+    "RelativePath": "api/Governance/plan-version/{planVersionId}/confirm-candidate",
+    "HttpMethod": "POST",
+    "IsController": true,
+    "Order": 0,
+    "Parameters": [
+      {
+        "Name": "planVersionId",
+        "Type": "System.Int32",
+        "IsRequired": true
+      },
+      {
+        "Name": "request",
+        "Type": "LPS.APS.Web.Controllers.ConfirmCandidateRequest",
+        "IsRequired": true
+      }
+    ],
+    "ReturnTypes": []
+  },
+  {
+    "ContainingType": "LPS.APS.Web.Controllers.GovernanceController",
+    "Method": "GetPublishedRuleSetVersion",
+    "RelativePath": "api/Governance/rule-set/{ruleSetId}/published-version",
+    "HttpMethod": "GET",
+    "IsController": true,
+    "Order": 0,
+    "Parameters": [
+      {
+        "Name": "ruleSetId",
+        "Type": "System.Int64",
+        "IsRequired": true
+      }
+    ],
+    "ReturnTypes": []
+  },
+  {
+    "ContainingType": "LPS.APS.Web.Controllers.GovernanceController",
+    "Method": "GetRuleSetVersions",
+    "RelativePath": "api/Governance/rule-set/{ruleSetId}/versions",
+    "HttpMethod": "GET",
+    "IsController": true,
+    "Order": 0,
+    "Parameters": [
+      {
+        "Name": "ruleSetId",
+        "Type": "System.Int64",
+        "IsRequired": true
+      }
+    ],
+    "ReturnTypes": []
+  },
+  {
+    "ContainingType": "LPS.APS.Web.Controllers.GovernanceController",
+    "Method": "CreateRuleSetVersion",
+    "RelativePath": "api/Governance/rule-set/version",
+    "HttpMethod": "POST",
+    "IsController": true,
+    "Order": 0,
+    "Parameters": [
+      {
+        "Name": "version",
+        "Type": "LPS.APS.Core.Entities.APS.RuleSetVersion",
+        "IsRequired": true
+      }
+    ],
+    "ReturnTypes": []
+  },
+  {
+    "ContainingType": "LPS.APS.Web.Controllers.GovernanceController",
+    "Method": "GetRuleSetVersion",
+    "RelativePath": "api/Governance/rule-set/version/{versionId}",
+    "HttpMethod": "GET",
+    "IsController": true,
+    "Order": 0,
+    "Parameters": [
+      {
+        "Name": "versionId",
+        "Type": "System.Int64",
+        "IsRequired": true
+      }
+    ],
+    "ReturnTypes": []
+  },
+  {
+    "ContainingType": "LPS.APS.Web.Controllers.GovernanceController",
+    "Method": "UpdateRuleSetVersion",
+    "RelativePath": "api/Governance/rule-set/version/{versionId}",
+    "HttpMethod": "PUT",
+    "IsController": true,
+    "Order": 0,
+    "Parameters": [
+      {
+        "Name": "versionId",
+        "Type": "System.Int64",
+        "IsRequired": true
+      },
+      {
+        "Name": "version",
+        "Type": "LPS.APS.Core.Entities.APS.RuleSetVersion",
+        "IsRequired": true
+      }
+    ],
+    "ReturnTypes": []
+  },
+  {
+    "ContainingType": "LPS.APS.Web.Controllers.GovernanceController",
+    "Method": "DisableRuleSetVersion",
+    "RelativePath": "api/Governance/rule-set/version/{versionId}/disable",
+    "HttpMethod": "POST",
+    "IsController": true,
+    "Order": 0,
+    "Parameters": [
+      {
+        "Name": "versionId",
+        "Type": "System.Int64",
+        "IsRequired": true
+      },
+      {
+        "Name": "request",
+        "Type": "LPS.APS.Web.Controllers.DisableRequest",
+        "IsRequired": true
+      }
+    ],
+    "ReturnTypes": []
+  },
+  {
+    "ContainingType": "LPS.APS.Web.Controllers.GovernanceController",
+    "Method": "PublishRuleSetVersion",
+    "RelativePath": "api/Governance/rule-set/version/{versionId}/publish",
+    "HttpMethod": "POST",
+    "IsController": true,
+    "Order": 0,
+    "Parameters": [
+      {
+        "Name": "versionId",
+        "Type": "System.Int64",
+        "IsRequired": true
+      },
+      {
+        "Name": "request",
+        "Type": "LPS.APS.Web.Controllers.PublishRequest",
+        "IsRequired": true
+      }
+    ],
+    "ReturnTypes": []
+  },
+  {
+    "ContainingType": "LPS.APS.Web.Controllers.GovernanceController",
+    "Method": "ValidateRuleSetVersionForPublish",
+    "RelativePath": "api/Governance/rule-set/version/{versionId}/validate",
+    "HttpMethod": "GET",
+    "IsController": true,
+    "Order": 0,
+    "Parameters": [
+      {
+        "Name": "versionId",
+        "Type": "System.Int64",
+        "IsRequired": true
+      }
+    ],
+    "ReturnTypes": []
+  },
+  {
+    "ContainingType": "LPS.APS.Web.Controllers.GovernanceController",
+    "Method": "CompareRuleSetVersions",
+    "RelativePath": "api/Governance/rule-set/version/diff",
+    "HttpMethod": "GET",
+    "IsController": true,
+    "Order": 0,
+    "Parameters": [
+      {
+        "Name": "sourceVersionId",
+        "Type": "System.Int64",
+        "IsRequired": false
+      },
+      {
+        "Name": "targetVersionId",
+        "Type": "System.Int64",
+        "IsRequired": false
+      }
+    ],
+    "ReturnTypes": []
+  },
+  {
+    "ContainingType": "LPS.APS.Web.Controllers.GovernanceController",
+    "Method": "GetRuleSets",
+    "RelativePath": "api/Governance/rule-sets",
+    "HttpMethod": "GET",
+    "IsController": true,
+    "Order": 0,
+    "Parameters": [
+      {
+        "Name": "activeOnly",
+        "Type": "System.Nullable\u00601[[System.Boolean, System.Private.CoreLib, Version=8.0.0.0, Culture=neutral, PublicKeyToken=7cec85d7bea7798e]]",
+        "IsRequired": false
+      },
+      {
+        "Name": "keyword",
+        "Type": "System.String",
+        "IsRequired": false
+      },
+      {
+        "Name": "page",
+        "Type": "System.Nullable\u00601[[System.Int32, System.Private.CoreLib, Version=8.0.0.0, Culture=neutral, PublicKeyToken=7cec85d7bea7798e]]",
+        "IsRequired": false
+      },
+      {
+        "Name": "pageSize",
+        "Type": "System.Nullable\u00601[[System.Int32, System.Private.CoreLib, Version=8.0.0.0, Culture=neutral, PublicKeyToken=7cec85d7bea7798e]]",
+        "IsRequired": false
+      }
+    ],
+    "ReturnTypes": []
+  },
+  {
+    "ContainingType": "LPS.APS.Web.Controllers.GovernanceController",
+    "Method": "RecoverFailedRun",
+    "RelativePath": "api/Governance/run/{failedScheduleRunId}/recover",
+    "HttpMethod": "POST",
+    "IsController": true,
+    "Order": 0,
+    "Parameters": [
+      {
+        "Name": "failedScheduleRunId",
+        "Type": "System.Int32",
+        "IsRequired": true
+      }
+    ],
+    "ReturnTypes": []
+  },
+  {
+    "ContainingType": "LPS.APS.Web.Controllers.GovernanceController",
+    "Method": "GetRunDomainStatus",
+    "RelativePath": "api/Governance/run/{scheduleRunId}/domain-status",
+    "HttpMethod": "GET",
+    "IsController": true,
+    "Order": 0,
+    "Parameters": [
+      {
+        "Name": "scheduleRunId",
+        "Type": "System.Int32",
+        "IsRequired": true
+      }
+    ],
+    "ReturnTypes": []
+  },
+  {
+    "ContainingType": "LPS.APS.Web.Controllers.GovernanceController",
+    "Method": "GetRunReferenceTrace",
+    "RelativePath": "api/Governance/run/{scheduleRunId}/trace",
+    "HttpMethod": "GET",
+    "IsController": true,
+    "Order": 0,
+    "Parameters": [
+      {
+        "Name": "scheduleRunId",
+        "Type": "System.Int32",
+        "IsRequired": true
+      }
+    ],
+    "ReturnTypes": []
+  },
+  {
+    "ContainingType": "LPS.APS.Web.Controllers.GovernanceController",
+    "Method": "ValidateExpectedDomainKeys",
+    "RelativePath": "api/Governance/run/{scheduleRunId}/validate-domain-keys",
+    "HttpMethod": "POST",
+    "IsController": true,
+    "Order": 0,
+    "Parameters": [
+      {
+        "Name": "scheduleRunId",
+        "Type": "System.Int32",
+        "IsRequired": true
+      }
+    ],
+    "ReturnTypes": []
+  },
+  {
+    "ContainingType": "LPS.APS.Web.Controllers.GovernanceController",
+    "Method": "CreateCandidateRun",
+    "RelativePath": "api/Governance/run/candidate",
+    "HttpMethod": "POST",
+    "IsController": true,
+    "Order": 0,
+    "Parameters": [
+      {
+        "Name": "request",
+        "Type": "LPS.APS.Web.Controllers.CreateCandidateRunRequest",
+        "IsRequired": true
+      }
+    ],
+    "ReturnTypes": []
+  },
+  {
+    "ContainingType": "LPS.APS.Web.Controllers.GovernanceController",
+    "Method": "GetRuns",
+    "RelativePath": "api/Governance/runs",
+    "HttpMethod": "GET",
+    "IsController": true,
+    "Order": 0,
+    "Parameters": [
+      {
+        "Name": "take",
+        "Type": "System.Nullable\u00601[[System.Int32, System.Private.CoreLib, Version=8.0.0.0, Culture=neutral, PublicKeyToken=7cec85d7bea7798e]]",
+        "IsRequired": false
+      },
+      {
+        "Name": "status",
+        "Type": "System.String",
+        "IsRequired": false
+      },
+      {
+        "Name": "runType",
+        "Type": "System.String",
+        "IsRequired": false
+      }
+    ],
+    "ReturnTypes": []
+  },
+  {
+    "ContainingType": "LPS.APS.Web.Controllers.GovernanceController",
+    "Method": "GetPublishedStrategyProfileVersion",
+    "RelativePath": "api/Governance/strategy-profile/{strategyProfileId}/published-version",
+    "HttpMethod": "GET",
+    "IsController": true,
+    "Order": 0,
+    "Parameters": [
+      {
+        "Name": "strategyProfileId",
+        "Type": "System.Int64",
+        "IsRequired": true
+      }
+    ],
+    "ReturnTypes": []
+  },
+  {
+    "ContainingType": "LPS.APS.Web.Controllers.GovernanceController",
+    "Method": "GetStrategyProfileVersions",
+    "RelativePath": "api/Governance/strategy-profile/{strategyProfileId}/versions",
+    "HttpMethod": "GET",
+    "IsController": true,
+    "Order": 0,
+    "Parameters": [
+      {
+        "Name": "strategyProfileId",
+        "Type": "System.Int64",
+        "IsRequired": true
+      }
+    ],
+    "ReturnTypes": []
+  },
+  {
+    "ContainingType": "LPS.APS.Web.Controllers.GovernanceController",
+    "Method": "ResolveDefaultStrategyProfile",
+    "RelativePath": "api/Governance/strategy-profile/default",
+    "HttpMethod": "GET",
+    "IsController": true,
+    "Order": 0,
+    "Parameters": [
+      {
+        "Name": "runType",
+        "Type": "System.String",
+        "IsRequired": false
+      },
+      {
+        "Name": "asOf",
+        "Type": "System.Nullable\u00601[[System.DateTime, System.Private.CoreLib, Version=8.0.0.0, Culture=neutral, PublicKeyToken=7cec85d7bea7798e]]",
+        "IsRequired": false
+      }
+    ],
+    "ReturnTypes": []
+  },
+  {
+    "ContainingType": "LPS.APS.Web.Controllers.GovernanceController",
+    "Method": "CreateStrategyProfileVersion",
+    "RelativePath": "api/Governance/strategy-profile/version",
+    "HttpMethod": "POST",
+    "IsController": true,
+    "Order": 0,
+    "Parameters": [
+      {
+        "Name": "version",
+        "Type": "LPS.APS.Core.Entities.APS.StrategyProfileVersion",
+        "IsRequired": true
+      }
+    ],
+    "ReturnTypes": []
+  },
+  {
+    "ContainingType": "LPS.APS.Web.Controllers.GovernanceController",
+    "Method": "GetStrategyProfileVersion",
+    "RelativePath": "api/Governance/strategy-profile/version/{versionId}",
+    "HttpMethod": "GET",
+    "IsController": true,
+    "Order": 0,
+    "Parameters": [
+      {
+        "Name": "versionId",
+        "Type": "System.Int64",
+        "IsRequired": true
+      }
+    ],
+    "ReturnTypes": []
+  },
+  {
+    "ContainingType": "LPS.APS.Web.Controllers.GovernanceController",
+    "Method": "UpdateStrategyProfileVersion",
+    "RelativePath": "api/Governance/strategy-profile/version/{versionId}",
+    "HttpMethod": "PUT",
+    "IsController": true,
+    "Order": 0,
+    "Parameters": [
+      {
+        "Name": "versionId",
+        "Type": "System.Int64",
+        "IsRequired": true
+      },
+      {
+        "Name": "version",
+        "Type": "LPS.APS.Core.Entities.APS.StrategyProfileVersion",
+        "IsRequired": true
+      }
+    ],
+    "ReturnTypes": []
+  },
+  {
+    "ContainingType": "LPS.APS.Web.Controllers.GovernanceController",
+    "Method": "DisableStrategyProfileVersion",
+    "RelativePath": "api/Governance/strategy-profile/version/{versionId}/disable",
+    "HttpMethod": "POST",
+    "IsController": true,
+    "Order": 0,
+    "Parameters": [
+      {
+        "Name": "versionId",
+        "Type": "System.Int64",
+        "IsRequired": true
+      },
+      {
+        "Name": "request",
+        "Type": "LPS.APS.Web.Controllers.DisableRequest",
+        "IsRequired": true
+      }
+    ],
+    "ReturnTypes": []
+  },
+  {
+    "ContainingType": "LPS.APS.Web.Controllers.GovernanceController",
+    "Method": "PublishStrategyProfileVersion",
+    "RelativePath": "api/Governance/strategy-profile/version/{versionId}/publish",
+    "HttpMethod": "POST",
+    "IsController": true,
+    "Order": 0,
+    "Parameters": [
+      {
+        "Name": "versionId",
+        "Type": "System.Int64",
+        "IsRequired": true
+      },
+      {
+        "Name": "request",
+        "Type": "LPS.APS.Web.Controllers.PublishRequest",
+        "IsRequired": true
+      }
+    ],
+    "ReturnTypes": []
+  },
+  {
+    "ContainingType": "LPS.APS.Web.Controllers.GovernanceController",
+    "Method": "GetRunStrategyProfileTrace",
+    "RelativePath": "api/Governance/strategy-profile/version/{versionId}/trace",
+    "HttpMethod": "GET",
+    "IsController": true,
+    "Order": 0,
+    "Parameters": [
+      {
+        "Name": "versionId",
+        "Type": "System.Int64",
+        "IsRequired": true
+      }
+    ],
+    "ReturnTypes": []
+  },
+  {
+    "ContainingType": "LPS.APS.Web.Controllers.GovernanceController",
+    "Method": "ValidateStrategyProfileVersionForPublish",
+    "RelativePath": "api/Governance/strategy-profile/version/{versionId}/validate",
+    "HttpMethod": "GET",
+    "IsController": true,
+    "Order": 0,
+    "Parameters": [
+      {
+        "Name": "versionId",
+        "Type": "System.Int64",
+        "IsRequired": true
+      }
+    ],
+    "ReturnTypes": []
+  },
+  {
+    "ContainingType": "LPS.APS.Web.Controllers.GovernanceController",
+    "Method": "CompareStrategyProfileVersions",
+    "RelativePath": "api/Governance/strategy-profile/version/diff",
+    "HttpMethod": "GET",
+    "IsController": true,
+    "Order": 0,
+    "Parameters": [
+      {
+        "Name": "sourceVersionId",
+        "Type": "System.Int64",
+        "IsRequired": false
+      },
+      {
+        "Name": "targetVersionId",
+        "Type": "System.Int64",
+        "IsRequired": false
+      }
+    ],
+    "ReturnTypes": []
+  },
+  {
+    "ContainingType": "LPS.APS.Web.Controllers.GovernanceController",
+    "Method": "GetStrategyProfiles",
+    "RelativePath": "api/Governance/strategy-profiles",
+    "HttpMethod": "GET",
+    "IsController": true,
+    "Order": 0,
+    "Parameters": [
+      {
+        "Name": "activeOnly",
+        "Type": "System.Nullable\u00601[[System.Boolean, System.Private.CoreLib, Version=8.0.0.0, Culture=neutral, PublicKeyToken=7cec85d7bea7798e]]",
+        "IsRequired": false
+      },
+      {
+        "Name": "keyword",
+        "Type": "System.String",
+        "IsRequired": false
+      },
+      {
+        "Name": "page",
+        "Type": "System.Nullable\u00601[[System.Int32, System.Private.CoreLib, Version=8.0.0.0, Culture=neutral, PublicKeyToken=7cec85d7bea7798e]]",
+        "IsRequired": false
+      },
+      {
+        "Name": "pageSize",
+        "Type": "System.Nullable\u00601[[System.Int32, System.Private.CoreLib, Version=8.0.0.0, Culture=neutral, PublicKeyToken=7cec85d7bea7798e]]",
+        "IsRequired": false
+      }
+    ],
+    "ReturnTypes": []
+  },
+  {
+    "ContainingType": "LPS.APS.Web.Controllers.OrderQueryController",
+    "Method": "QueryOrders",
+    "RelativePath": "api/order-query",
+    "HttpMethod": "GET",
+    "IsController": true,
+    "Order": 0,
+    "Parameters": [
+      {
+        "Name": "planVersionId",
+        "Type": "System.Int32",
+        "IsRequired": false
+      },
+      {
+        "Name": "orderNo",
+        "Type": "System.String",
+        "IsRequired": false
+      },
+      {
+        "Name": "materialCode",
+        "Type": "System.String",
+        "IsRequired": false
+      },
+      {
+        "Name": "customerName",
+        "Type": "System.String",
+        "IsRequired": false
+      },
+      {
+        "Name": "factoryCode",
+        "Type": "System.String",
+        "IsRequired": false
+      },
+      {
+        "Name": "domainKey",
+        "Type": "System.String",
+        "IsRequired": false
+      },
+      {
+        "Name": "delayStatus",
+        "Type": "System.String",
+        "IsRequired": false
+      },
+      {
+        "Name": "status",
+        "Type": "System.String",
+        "IsRequired": false
+      },
+      {
+        "Name": "skip",
+        "Type": "System.Int32",
+        "IsRequired": false
+      },
+      {
+        "Name": "take",
+        "Type": "System.Int32",
+        "IsRequired": false
+      }
+    ],
+    "ReturnTypes": [
+      {
+        "Type": "LPS.APS.Shared.Models.ApiResponse\u00601[[System.Collections.Generic.List\u00601[[LPS.APS.Core.Dto.OrderListItemDto, LPS.APS.Core, Version=1.0.0.0, Culture=neutral, PublicKeyToken=null]], System.Private.CoreLib, Version=8.0.0.0, Culture=neutral, PublicKeyToken=7cec85d7bea7798e]]",
+        "MediaTypes": [
+          "text/plain",
+          "application/json",
+          "text/json"
+        ],
+        "StatusCode": 200
+      }
+    ]
+  },
+  {
+    "ContainingType": "LPS.APS.Web.Controllers.OrderQueryController",
+    "Method": "GetOrderDetail",
+    "RelativePath": "api/order-query/{orderId}",
+    "HttpMethod": "GET",
+    "IsController": true,
+    "Order": 0,
+    "Parameters": [
+      {
+        "Name": "orderId",
+        "Type": "System.Int64",
+        "IsRequired": true
+      },
+      {
+        "Name": "planVersionId",
+        "Type": "System.Int32",
+        "IsRequired": false
+      }
+    ],
+    "ReturnTypes": [
+      {
+        "Type": "LPS.APS.Shared.Models.ApiResponse\u00601[[LPS.APS.Core.Dto.OrderDetailDto, LPS.APS.Core, Version=1.0.0.0, Culture=neutral, PublicKeyToken=null]]",
+        "MediaTypes": [
+          "text/plain",
+          "application/json",
+          "text/json"
+        ],
+        "StatusCode": 200
+      }
+    ]
+  },
+  {
+    "ContainingType": "LPS.APS.Web.Controllers.OverviewController",
+    "Method": "GetActivePlan",
+    "RelativePath": "api/overview/active-plan",
+    "HttpMethod": "GET",
+    "IsController": true,
+    "Order": 0,
+    "Parameters": [
+      {
+        "Name": "domainKey",
+        "Type": "System.String",
+        "IsRequired": false
+      }
+    ],
+    "ReturnTypes": [
+      {
+        "Type": "LPS.APS.Shared.Models.ApiResponse\u00601[[LPS.APS.Core.Dto.OverviewActivePlanDto, LPS.APS.Core, Version=1.0.0.0, Culture=neutral, PublicKeyToken=null]]",
+        "MediaTypes": [
+          "text/plain",
+          "application/json",
+          "text/json"
+        ],
+        "StatusCode": 200
+      }
+    ]
+  },
+  {
+    "ContainingType": "LPS.APS.Web.Controllers.OverviewController",
+    "Method": "GetCandidateSummary",
+    "RelativePath": "api/overview/candidate-summary",
+    "HttpMethod": "GET",
+    "IsController": true,
+    "Order": 0,
+    "Parameters": [],
+    "ReturnTypes": [
+      {
+        "Type": "LPS.APS.Shared.Models.ApiResponse\u00601[[LPS.APS.Core.Dto.OverviewCandidateSummaryDto, LPS.APS.Core, Version=1.0.0.0, Culture=neutral, PublicKeyToken=null]]",
+        "MediaTypes": [
+          "text/plain",
+          "application/json",
+          "text/json"
+        ],
+        "StatusCode": 200
+      }
+    ]
+  },
+  {
+    "ContainingType": "LPS.APS.Web.Controllers.OverviewController",
+    "Method": "GetResourceBottleneck",
+    "RelativePath": "api/overview/resource-bottleneck",
+    "HttpMethod": "GET",
+    "IsController": true,
+    "Order": 0,
+    "Parameters": [
+      {
+        "Name": "planVersionId",
+        "Type": "System.Int32",
+        "IsRequired": false
+      },
+      {
+        "Name": "topN",
+        "Type": "System.Int32",
+        "IsRequired": false
+      }
+    ],
+    "ReturnTypes": [
+      {
+        "Type": "LPS.APS.Shared.Models.ApiResponse\u00601[[System.Collections.Generic.List\u00601[[LPS.APS.Core.Dto.OverviewResourceBottleneckDto, LPS.APS.Core, Version=1.0.0.0, Culture=neutral, PublicKeyToken=null]], System.Private.CoreLib, Version=8.0.0.0, Culture=neutral, PublicKeyToken=7cec85d7bea7798e]]",
+        "MediaTypes": [
+          "text/plain",
+          "application/json",
+          "text/json"
+        ],
+        "StatusCode": 200
+      }
+    ]
+  },
+  {
+    "ContainingType": "LPS.APS.Web.Controllers.OverviewController",
+    "Method": "GetTaskSummary",
+    "RelativePath": "api/overview/task-summary",
+    "HttpMethod": "GET",
+    "IsController": true,
+    "Order": 0,
+    "Parameters": [
+      {
+        "Name": "planVersionId",
+        "Type": "System.Int32",
+        "IsRequired": false
+      }
+    ],
+    "ReturnTypes": [
+      {
+        "Type": "LPS.APS.Shared.Models.ApiResponse\u00601[[LPS.APS.Core.Dto.OverviewTaskSummaryDto, LPS.APS.Core, Version=1.0.0.0, Culture=neutral, PublicKeyToken=null]]",
+        "MediaTypes": [
+          "text/plain",
+          "application/json",
+          "text/json"
+        ],
+        "StatusCode": 200
+      }
+    ]
+  },
+  {
+    "ContainingType": "LPS.APS.Web.Controllers.PeggingTraceController",
+    "Method": "Query",
+    "RelativePath": "api/pegging-trace",
+    "HttpMethod": "GET",
+    "IsController": true,
+    "Order": 0,
+    "Parameters": [
+      {
+        "Name": "planVersionId",
+        "Type": "System.Int32",
+        "IsRequired": false
+      },
+      {
+        "Name": "materialCode",
+        "Type": "System.String",
+        "IsRequired": false
+      },
+      {
+        "Name": "supplyType",
+        "Type": "System.String",
+        "IsRequired": false
+      },
+      {
+        "Name": "commitmentStatus",
+        "Type": "System.String",
+        "IsRequired": false
+      },
+      {
+        "Name": "orderNo",
+        "Type": "System.String",
+        "IsRequired": false
+      },
+      {
+        "Name": "supplyDocumentNo",
+        "Type": "System.String",
+        "IsRequired": false
+      },
+      {
+        "Name": "skip",
+        "Type": "System.Int32",
+        "IsRequired": false
+      },
+      {
+        "Name": "take",
+        "Type": "System.Int32",
+        "IsRequired": false
+      }
+    ],
+    "ReturnTypes": [
+      {
+        "Type": "LPS.APS.Shared.Models.ApiResponse\u00601[[System.Collections.Generic.List\u00601[[LPS.APS.Core.Dto.PeggingTraceDto, LPS.APS.Core, Version=1.0.0.0, Culture=neutral, PublicKeyToken=null]], System.Private.CoreLib, Version=8.0.0.0, Culture=neutral, PublicKeyToken=7cec85d7bea7798e]]",
+        "MediaTypes": [
+          "text/plain",
+          "application/json",
+          "text/json"
+        ],
+        "StatusCode": 200
+      }
+    ]
+  },
+  {
+    "ContainingType": "LPS.APS.Web.Controllers.PeggingTraceController",
+    "Method": "QueryByOrder",
+    "RelativePath": "api/pegging-trace/order/{orderId}",
+    "HttpMethod": "GET",
+    "IsController": true,
+    "Order": 0,
+    "Parameters": [
+      {
+        "Name": "orderId",
+        "Type": "System.Int64",
+        "IsRequired": true
+      },
+      {
+        "Name": "planVersionId",
+        "Type": "System.Int32",
+        "IsRequired": false
+      }
+    ],
+    "ReturnTypes": [
+      {
+        "Type": "LPS.APS.Shared.Models.ApiResponse\u00601[[System.Collections.Generic.List\u00601[[LPS.APS.Core.Dto.PeggingTraceDto, LPS.APS.Core, Version=1.0.0.0, Culture=neutral, PublicKeyToken=null]], System.Private.CoreLib, Version=8.0.0.0, Culture=neutral, PublicKeyToken=7cec85d7bea7798e]]",
+        "MediaTypes": [
+          "text/plain",
+          "application/json",
+          "text/json"
+        ],
+        "StatusCode": 200
+      }
+    ]
+  },
+  {
+    "ContainingType": "LPS.APS.Web.Controllers.PeggingTraceController",
+    "Method": "GetSummary",
+    "RelativePath": "api/pegging-trace/summary",
+    "HttpMethod": "GET",
+    "IsController": true,
+    "Order": 0,
+    "Parameters": [
+      {
+        "Name": "planVersionId",
+        "Type": "System.Int32",
+        "IsRequired": false
+      }
+    ],
+    "ReturnTypes": [
+      {
+        "Type": "LPS.APS.Shared.Models.ApiResponse\u00601[[LPS.APS.Core.Dto.PeggingTraceSummaryDto, LPS.APS.Core, Version=1.0.0.0, Culture=neutral, PublicKeyToken=null]]",
+        "MediaTypes": [
+          "text/plain",
+          "application/json",
+          "text/json"
+        ],
+        "StatusCode": 200
+      }
+    ]
+  },
+  {
+    "ContainingType": "LPS.APS.Web.Controllers.ProcurementManualEtaController",
+    "Method": "Query",
+    "RelativePath": "api/procurement-manual-eta",
+    "HttpMethod": "GET",
+    "IsController": true,
+    "Order": 0,
+    "Parameters": [
+      {
+        "Name": "materialIds",
+        "Type": "System.String",
+        "IsRequired": false
+      },
+      {
+        "Name": "materialCodes",
+        "Type": "System.String",
+        "IsRequired": false
+      },
+      {
+        "Name": "poNos",
+        "Type": "System.String",
+        "IsRequired": false
+      },
+      {
+        "Name": "receivingWarehouses",
+        "Type": "System.String",
+        "IsRequired": false
+      },
+      {
+        "Name": "etaBefore",
+        "Type": "System.Nullable\u00601[[System.DateTime, System.Private.CoreLib, Version=8.0.0.0, Culture=neutral, PublicKeyToken=7cec85d7bea7798e]]",
+        "IsRequired": false
+      },
+      {
+        "Name": "etaAfter",
+        "Type": "System.Nullable\u00601[[System.DateTime, System.Private.CoreLib, Version=8.0.0.0, Culture=neutral, PublicKeyToken=7cec85d7bea7798e]]",
+        "IsRequired": false
+      },
+      {
+        "Name": "updatedAfter",
+        "Type": "System.Nullable\u00601[[System.DateTime, System.Private.CoreLib, Version=8.0.0.0, Culture=neutral, PublicKeyToken=7cec85d7bea7798e]]",
+        "IsRequired": false
+      },
+      {
+        "Name": "activeOnly",
+        "Type": "System.Boolean",
+        "IsRequired": false
+      },
+      {
+        "Name": "skip",
+        "Type": "System.Int32",
+        "IsRequired": false
+      },
+      {
+        "Name": "take",
+        "Type": "System.Int32",
+        "IsRequired": false
+      }
+    ],
+    "ReturnTypes": [
+      {
+        "Type": "LPS.APS.Shared.Models.ApiResponse\u00601[[System.Collections.Generic.List\u00601[[LPS.APS.Core.Dto.ProcurementManualEtaOverride, LPS.APS.Core, Version=1.0.0.0, Culture=neutral, PublicKeyToken=null]], System.Private.CoreLib, Version=8.0.0.0, Culture=neutral, PublicKeyToken=7cec85d7bea7798e]]",
+        "MediaTypes": [
+          "text/plain",
+          "application/json",
+          "text/json"
+        ],
+        "StatusCode": 200
+      }
+    ]
+  },
+  {
+    "ContainingType": "LPS.APS.Web.Controllers.ProcurementManualEtaController",
+    "Method": "Upsert",
+    "RelativePath": "api/procurement-manual-eta",
+    "HttpMethod": "POST",
+    "IsController": true,
+    "Order": 0,
+    "Parameters": [
+      {
+        "Name": "etaOverride",
+        "Type": "LPS.APS.Core.Dto.ProcurementManualEtaOverride",
+        "IsRequired": true
+      }
+    ],
+    "ReturnTypes": [
+      {
+        "Type": "LPS.APS.Shared.Models.ApiResponse\u00601[[LPS.APS.Core.Dto.ProcurementManualEtaOverride, LPS.APS.Core, Version=1.0.0.0, Culture=neutral, PublicKeyToken=null]]",
+        "MediaTypes": [
+          "text/plain",
+          "application/json",
+          "text/json"
+        ],
+        "StatusCode": 200
+      }
+    ]
+  },
+  {
+    "ContainingType": "LPS.APS.Web.Controllers.ProcurementManualEtaController",
+    "Method": "GetByBusinessKey",
+    "RelativePath": "api/procurement-manual-eta/{poNo}/{lineNo}",
+    "HttpMethod": "GET",
+    "IsController": true,
+    "Order": 0,
+    "Parameters": [
+      {
+        "Name": "poNo",
+        "Type": "System.String",
+        "IsRequired": true
+      },
+      {
+        "Name": "lineNo",
+        "Type": "System.Int32",
+        "IsRequired": true
+      },
+      {
+        "Name": "materialId",
+        "Type": "System.Int32",
+        "IsRequired": false
+      },
+      {
+        "Name": "receivingWarehouse",
+        "Type": "System.String",
+        "IsRequired": false
+      }
+    ],
+    "ReturnTypes": [
+      {
+        "Type": "LPS.APS.Shared.Models.ApiResponse\u00601[[LPS.APS.Core.Dto.ProcurementManualEtaOverride, LPS.APS.Core, Version=1.0.0.0, Culture=neutral, PublicKeyToken=null]]",
+        "MediaTypes": [
+          "text/plain",
+          "application/json",
+          "text/json"
+        ],
+        "StatusCode": 200
+      }
+    ]
+  },
+  {
+    "ContainingType": "LPS.APS.Web.Controllers.ProcurementManualEtaController",
+    "Method": "Cancel",
+    "RelativePath": "api/procurement-manual-eta/{poNo}/{lineNo}",
+    "HttpMethod": "DELETE",
+    "IsController": true,
+    "Order": 0,
+    "Parameters": [
+      {
+        "Name": "poNo",
+        "Type": "System.String",
+        "IsRequired": true
+      },
+      {
+        "Name": "lineNo",
+        "Type": "System.Int32",
+        "IsRequired": true
+      },
+      {
+        "Name": "request",
+        "Type": "LPS.APS.Web.Controllers.CancelManualEtaRequest",
+        "IsRequired": true
+      }
+    ],
+    "ReturnTypes": [
+      {
+        "Type": "LPS.APS.Shared.Models.ApiResponse\u00601[[LPS.APS.Web.Controllers.CancelManualEtaResponse, LPS.APS.Web, Version=1.0.0.0, Culture=neutral, PublicKeyToken=null]]",
+        "MediaTypes": [
+          "text/plain",
+          "application/json",
+          "text/json"
+        ],
+        "StatusCode": 200
+      }
+    ]
+  },
+  {
+    "ContainingType": "LPS.APS.Web.Controllers.RbacController",
+    "Method": "GetPermissions",
+    "RelativePath": "api/rbac/permissions",
+    "HttpMethod": "GET",
+    "IsController": true,
+    "Order": 0,
+    "Parameters": [],
+    "ReturnTypes": [
+      {
+        "Type": "LPS.APS.Shared.Models.ApiResponse\u00601[[System.Collections.Generic.IReadOnlyList\u00601[[LPS.APS.Core.Dto.PermissionSummaryDto, LPS.APS.Core, Version=1.0.0.0, Culture=neutral, PublicKeyToken=null]], System.Private.CoreLib, Version=8.0.0.0, Culture=neutral, PublicKeyToken=7cec85d7bea7798e]]",
+        "MediaTypes": [
+          "text/plain",
+          "application/json",
+          "text/json"
+        ],
+        "StatusCode": 200
+      }
+    ]
+  },
+  {
+    "ContainingType": "LPS.APS.Web.Controllers.RbacController",
+    "Method": "CreatePermission",
+    "RelativePath": "api/rbac/permissions",
+    "HttpMethod": "POST",
+    "IsController": true,
+    "Order": 0,
+    "Parameters": [
+      {
+        "Name": "request",
+        "Type": "LPS.APS.Core.Dto.CreatePermissionRequest",
+        "IsRequired": true
+      }
+    ],
+    "ReturnTypes": [
+      {
+        "Type": "LPS.APS.Shared.Models.ApiResponse\u00601[[LPS.APS.Core.Dto.PermissionSummaryDto, LPS.APS.Core, Version=1.0.0.0, Culture=neutral, PublicKeyToken=null]]",
+        "MediaTypes": [
+          "text/plain",
+          "application/json",
+          "text/json"
+        ],
+        "StatusCode": 200
+      }
+    ]
+  },
+  {
+    "ContainingType": "LPS.APS.Web.Controllers.RbacController",
+    "Method": "GetRoles",
+    "RelativePath": "api/rbac/roles",
+    "HttpMethod": "GET",
+    "IsController": true,
+    "Order": 0,
+    "Parameters": [],
+    "ReturnTypes": [
+      {
+        "Type": "LPS.APS.Shared.Models.ApiResponse\u00601[[System.Collections.Generic.IReadOnlyList\u00601[[LPS.APS.Core.Dto.RoleSummaryDto, LPS.APS.Core, Version=1.0.0.0, Culture=neutral, PublicKeyToken=null]], System.Private.CoreLib, Version=8.0.0.0, Culture=neutral, PublicKeyToken=7cec85d7bea7798e]]",
+        "MediaTypes": [
+          "text/plain",
+          "application/json",
+          "text/json"
+        ],
+        "StatusCode": 200
+      }
+    ]
+  },
+  {
+    "ContainingType": "LPS.APS.Web.Controllers.RbacController",
+    "Method": "CreateRole",
+    "RelativePath": "api/rbac/roles",
+    "HttpMethod": "POST",
+    "IsController": true,
+    "Order": 0,
+    "Parameters": [
+      {
+        "Name": "request",
+        "Type": "LPS.APS.Core.Dto.CreateRoleRequest",
+        "IsRequired": true
+      }
+    ],
+    "ReturnTypes": [
+      {
+        "Type": "LPS.APS.Shared.Models.ApiResponse\u00601[[LPS.APS.Core.Dto.RoleSummaryDto, LPS.APS.Core, Version=1.0.0.0, Culture=neutral, PublicKeyToken=null]]",
+        "MediaTypes": [
+          "text/plain",
+          "application/json",
+          "text/json"
+        ],
+        "StatusCode": 200
+      }
+    ]
+  },
+  {
+    "ContainingType": "LPS.APS.Web.Controllers.RbacController",
+    "Method": "UpdateRole",
+    "RelativePath": "api/rbac/roles/{id}",
+    "HttpMethod": "PUT",
+    "IsController": true,
+    "Order": 0,
+    "Parameters": [
+      {
+        "Name": "id",
+        "Type": "System.Int32",
+        "IsRequired": true
+      },
+      {
+        "Name": "request",
+        "Type": "LPS.APS.Core.Dto.UpdateRoleRequest",
+        "IsRequired": true
+      }
+    ],
+    "ReturnTypes": [
+      {
+        "Type": "LPS.APS.Shared.Models.ApiResponse",
+        "MediaTypes": [
+          "text/plain",
+          "application/json",
+          "text/json"
+        ],
+        "StatusCode": 200
+      }
+    ]
+  },
+  {
+    "ContainingType": "LPS.APS.Web.Controllers.RbacController",
+    "Method": "DeleteRole",
+    "RelativePath": "api/rbac/roles/{id}",
+    "HttpMethod": "DELETE",
+    "IsController": true,
+    "Order": 0,
+    "Parameters": [
+      {
+        "Name": "id",
+        "Type": "System.Int32",
+        "IsRequired": true
+      }
+    ],
+    "ReturnTypes": [
+      {
+        "Type": "LPS.APS.Shared.Models.ApiResponse",
+        "MediaTypes": [
+          "text/plain",
+          "application/json",
+          "text/json"
+        ],
+        "StatusCode": 200
+      }
+    ]
+  },
+  {
+    "ContainingType": "LPS.APS.Web.Controllers.RbacController",
+    "Method": "AssignRolePermissions",
+    "RelativePath": "api/rbac/roles/{id}/permissions",
+    "HttpMethod": "PUT",
+    "IsController": true,
+    "Order": 0,
+    "Parameters": [
+      {
+        "Name": "id",
+        "Type": "System.Int32",
+        "IsRequired": true
+      },
+      {
+        "Name": "request",
+        "Type": "LPS.APS.Core.Dto.AssignIdsRequest",
+        "IsRequired": true
+      }
+    ],
+    "ReturnTypes": [
+      {
+        "Type": "LPS.APS.Shared.Models.ApiResponse",
+        "MediaTypes": [
+          "text/plain",
+          "application/json",
+          "text/json"
+        ],
+        "StatusCode": 200
+      }
+    ]
+  },
+  {
+    "ContainingType": "LPS.APS.Web.Controllers.RbacController",
+    "Method": "AssignRoleScopes",
+    "RelativePath": "api/rbac/roles/{id}/scopes",
+    "HttpMethod": "PUT",
+    "IsController": true,
+    "Order": 0,
+    "Parameters": [
+      {
+        "Name": "id",
+        "Type": "System.Int32",
+        "IsRequired": true
+      },
+      {
+        "Name": "request",
+        "Type": "LPS.APS.Core.Dto.AssignIdsRequest",
+        "IsRequired": true
+      }
+    ],
+    "ReturnTypes": [
+      {
+        "Type": "LPS.APS.Shared.Models.ApiResponse",
+        "MediaTypes": [
+          "text/plain",
+          "application/json",
+          "text/json"
+        ],
+        "StatusCode": 200
+      }
+    ]
+  },
+  {
+    "ContainingType": "LPS.APS.Web.Controllers.RbacController",
+    "Method": "GetScopes",
+    "RelativePath": "api/rbac/scopes",
+    "HttpMethod": "GET",
+    "IsController": true,
+    "Order": 0,
+    "Parameters": [],
+    "ReturnTypes": [
+      {
+        "Type": "LPS.APS.Shared.Models.ApiResponse\u00601[[System.Collections.Generic.IReadOnlyList\u00601[[LPS.APS.Core.Dto.DataScopePolicyDto, LPS.APS.Core, Version=1.0.0.0, Culture=neutral, PublicKeyToken=null]], System.Private.CoreLib, Version=8.0.0.0, Culture=neutral, PublicKeyToken=7cec85d7bea7798e]]",
+        "MediaTypes": [
+          "text/plain",
+          "application/json",
+          "text/json"
+        ],
+        "StatusCode": 200
+      }
+    ]
+  },
+  {
+    "ContainingType": "LPS.APS.Web.Controllers.RbacController",
+    "Method": "CreateScope",
+    "RelativePath": "api/rbac/scopes",
+    "HttpMethod": "POST",
+    "IsController": true,
+    "Order": 0,
+    "Parameters": [
+      {
+        "Name": "request",
+        "Type": "LPS.APS.Core.Dto.CreateDataScopePolicyRequest",
+        "IsRequired": true
+      }
+    ],
+    "ReturnTypes": [
+      {
+        "Type": "LPS.APS.Shared.Models.ApiResponse\u00601[[LPS.APS.Core.Dto.DataScopePolicyDto, LPS.APS.Core, Version=1.0.0.0, Culture=neutral, PublicKeyToken=null]]",
+        "MediaTypes": [
+          "text/plain",
+          "application/json",
+          "text/json"
+        ],
+        "StatusCode": 200
+      }
+    ]
+  },
+  {
+    "ContainingType": "LPS.APS.Web.Controllers.RbacController",
+    "Method": "UpdateScope",
+    "RelativePath": "api/rbac/scopes/{id}",
+    "HttpMethod": "PUT",
+    "IsController": true,
+    "Order": 0,
+    "Parameters": [
+      {
+        "Name": "id",
+        "Type": "System.Int32",
+        "IsRequired": true
+      },
+      {
+        "Name": "request",
+        "Type": "LPS.APS.Core.Dto.UpdateDataScopePolicyRequest",
+        "IsRequired": true
+      }
+    ],
+    "ReturnTypes": [
+      {
+        "Type": "LPS.APS.Shared.Models.ApiResponse",
+        "MediaTypes": [
+          "text/plain",
+          "application/json",
+          "text/json"
+        ],
+        "StatusCode": 200
+      }
+    ]
+  },
+  {
+    "ContainingType": "LPS.APS.Web.Controllers.RbacController",
+    "Method": "DeleteScope",
+    "RelativePath": "api/rbac/scopes/{id}",
+    "HttpMethod": "DELETE",
+    "IsController": true,
+    "Order": 0,
+    "Parameters": [
+      {
+        "Name": "id",
+        "Type": "System.Int32",
+        "IsRequired": true
+      }
+    ],
+    "ReturnTypes": [
+      {
+        "Type": "LPS.APS.Shared.Models.ApiResponse",
+        "MediaTypes": [
+          "text/plain",
+          "application/json",
+          "text/json"
+        ],
+        "StatusCode": 200
+      }
+    ]
+  },
+  {
+    "ContainingType": "LPS.APS.Web.Controllers.RbacController",
+    "Method": "GetUsers",
+    "RelativePath": "api/rbac/users",
+    "HttpMethod": "GET",
+    "IsController": true,
+    "Order": 0,
+    "Parameters": [],
+    "ReturnTypes": [
+      {
+        "Type": "LPS.APS.Shared.Models.ApiResponse\u00601[[System.Collections.Generic.IReadOnlyList\u00601[[LPS.APS.Core.Dto.UserSummaryDto, LPS.APS.Core, Version=1.0.0.0, Culture=neutral, PublicKeyToken=null]], System.Private.CoreLib, Version=8.0.0.0, Culture=neutral, PublicKeyToken=7cec85d7bea7798e]]",
+        "MediaTypes": [
+          "text/plain",
+          "application/json",
+          "text/json"
+        ],
+        "StatusCode": 200
+      }
+    ]
+  },
+  {
+    "ContainingType": "LPS.APS.Web.Controllers.RbacController",
+    "Method": "CreateUser",
+    "RelativePath": "api/rbac/users",
+    "HttpMethod": "POST",
+    "IsController": true,
+    "Order": 0,
+    "Parameters": [
+      {
+        "Name": "request",
+        "Type": "LPS.APS.Core.Dto.CreateUserRequest",
+        "IsRequired": true
+      }
+    ],
+    "ReturnTypes": [
+      {
+        "Type": "LPS.APS.Shared.Models.ApiResponse\u00601[[LPS.APS.Core.Dto.UserSummaryDto, LPS.APS.Core, Version=1.0.0.0, Culture=neutral, PublicKeyToken=null]]",
+        "MediaTypes": [
+          "text/plain",
+          "application/json",
+          "text/json"
+        ],
+        "StatusCode": 200
+      }
+    ]
+  },
+  {
+    "ContainingType": "LPS.APS.Web.Controllers.RbacController",
+    "Method": "UpdateUser",
+    "RelativePath": "api/rbac/users/{id}",
+    "HttpMethod": "PUT",
+    "IsController": true,
+    "Order": 0,
+    "Parameters": [
+      {
+        "Name": "id",
+        "Type": "System.Int32",
+        "IsRequired": true
+      },
+      {
+        "Name": "request",
+        "Type": "LPS.APS.Core.Dto.UpdateUserRequest",
+        "IsRequired": true
+      }
+    ],
+    "ReturnTypes": [
+      {
+        "Type": "LPS.APS.Shared.Models.ApiResponse",
+        "MediaTypes": [
+          "text/plain",
+          "application/json",
+          "text/json"
+        ],
+        "StatusCode": 200
+      }
+    ]
+  },
+  {
+    "ContainingType": "LPS.APS.Web.Controllers.RbacController",
+    "Method": "DeleteUser",
+    "RelativePath": "api/rbac/users/{id}",
+    "HttpMethod": "DELETE",
+    "IsController": true,
+    "Order": 0,
+    "Parameters": [
+      {
+        "Name": "id",
+        "Type": "System.Int32",
+        "IsRequired": true
+      }
+    ],
+    "ReturnTypes": [
+      {
+        "Type": "LPS.APS.Shared.Models.ApiResponse",
+        "MediaTypes": [
+          "text/plain",
+          "application/json",
+          "text/json"
+        ],
+        "StatusCode": 200
+      }
+    ]
+  },
+  {
+    "ContainingType": "LPS.APS.Web.Controllers.RbacController",
+    "Method": "AssignUserRoles",
+    "RelativePath": "api/rbac/users/{id}/roles",
+    "HttpMethod": "PUT",
+    "IsController": true,
+    "Order": 0,
+    "Parameters": [
+      {
+        "Name": "id",
+        "Type": "System.Int32",
+        "IsRequired": true
+      },
+      {
+        "Name": "request",
+        "Type": "LPS.APS.Core.Dto.AssignIdsRequest",
+        "IsRequired": true
+      }
+    ],
+    "ReturnTypes": [
+      {
+        "Type": "LPS.APS.Shared.Models.ApiResponse",
+        "MediaTypes": [
+          "text/plain",
+          "application/json",
+          "text/json"
+        ],
+        "StatusCode": 200
+      }
+    ]
+  },
+  {
+    "ContainingType": "LPS.APS.Web.Controllers.RbacController",
+    "Method": "AssignUserScopes",
+    "RelativePath": "api/rbac/users/{id}/scopes",
+    "HttpMethod": "PUT",
+    "IsController": true,
+    "Order": 0,
+    "Parameters": [
+      {
+        "Name": "id",
+        "Type": "System.Int32",
+        "IsRequired": true
+      },
+      {
+        "Name": "request",
+        "Type": "LPS.APS.Core.Dto.AssignIdsRequest",
+        "IsRequired": true
+      }
+    ],
+    "ReturnTypes": [
+      {
+        "Type": "LPS.APS.Shared.Models.ApiResponse",
+        "MediaTypes": [
+          "text/plain",
+          "application/json",
+          "text/json"
+        ],
+        "StatusCode": 200
+      }
+    ]
+  },
+  {
+    "ContainingType": "LPS.APS.Web.Controllers.ScheduleController",
+    "Method": "GetGantt",
+    "RelativePath": "api/Schedule/gantt/{planVersionId}",
+    "HttpMethod": "GET",
+    "IsController": true,
+    "Order": 0,
+    "Parameters": [
+      {
+        "Name": "planVersionId",
+        "Type": "System.Int32",
+        "IsRequired": true
+      }
+    ],
+    "ReturnTypes": [
+      {
+        "Type": "LPS.APS.Shared.Models.ApiResponse\u00601[[LPS.APS.Application.Services.Query.Dto.GanttDataDto, LPS.APS.Application, Version=1.0.0.0, Culture=neutral, PublicKeyToken=null]]",
+        "MediaTypes": [
+          "text/plain",
+          "application/json",
+          "text/json"
+        ],
+        "StatusCode": 200
+      }
+    ]
+  },
+  {
+    "ContainingType": "LPS.APS.Web.Controllers.ScheduleController",
+    "Method": "GetSummary",
+    "RelativePath": "api/Schedule/summary/{planVersionId}",
+    "HttpMethod": "GET",
+    "IsController": true,
+    "Order": 0,
+    "Parameters": [
+      {
+        "Name": "planVersionId",
+        "Type": "System.Int32",
+        "IsRequired": true
+      }
+    ],
+    "ReturnTypes": [
+      {
+        "Type": "LPS.APS.Shared.Models.ApiResponse\u00601[[LPS.APS.Application.Services.Query.Dto.ScheduleSummaryDto, LPS.APS.Application, Version=1.0.0.0, Culture=neutral, PublicKeyToken=null]]",
+        "MediaTypes": [
+          "text/plain",
+          "application/json",
+          "text/json"
+        ],
+        "StatusCode": 200
+      }
+    ]
+  },
+  {
+    "ContainingType": "LPS.APS.Web.Controllers.ScheduleController",
+    "Method": "GetVersions",
+    "RelativePath": "api/Schedule/versions",
+    "HttpMethod": "GET",
+    "IsController": true,
+    "Order": 0,
+    "Parameters": [
+      {
+        "Name": "take",
+        "Type": "System.Int32",
+        "IsRequired": false
+      }
+    ],
+    "ReturnTypes": [
+      {
+        "Type": "LPS.APS.Shared.Models.ApiResponse\u00601[[System.Collections.Generic.IReadOnlyList\u00601[[LPS.APS.Application.Services.Query.Dto.PlanVersionSummaryDto, LPS.APS.Application, Version=1.0.0.0, Culture=neutral, PublicKeyToken=null]], System.Private.CoreLib, Version=8.0.0.0, Culture=neutral, PublicKeyToken=7cec85d7bea7798e]]",
+        "MediaTypes": [
+          "text/plain",
+          "application/json",
+          "text/json"
+        ],
+        "StatusCode": 200
+      }
+    ]
+  },
+  {
+    "ContainingType": "LPS.APS.Web.Controllers.SupplyFactTraceController",
+    "Method": "Query",
+    "RelativePath": "api/supply-fact-trace",
+    "HttpMethod": "GET",
+    "IsController": true,
+    "Order": 0,
+    "Parameters": [
+      {
+        "Name": "sourceType",
+        "Type": "System.String",
+        "IsRequired": false
+      },
+      {
+        "Name": "materialCode",
+        "Type": "System.String",
+        "IsRequired": false
+      },
+      {
+        "Name": "materialId",
+        "Type": "System.Nullable\u00601[[System.Int32, System.Private.CoreLib, Version=8.0.0.0, Culture=neutral, PublicKeyToken=7cec85d7bea7798e]]",
+        "IsRequired": false
+      },
+      {
+        "Name": "factoryCode",
+        "Type": "System.String",
+        "IsRequired": false
+      },
+      {
+        "Name": "supplyType",
+        "Type": "System.String",
+        "IsRequired": false
+      },
+      {
+        "Name": "sourceDocumentNo",
+        "Type": "System.String",
+        "IsRequired": false
+      },
+      {
+        "Name": "activeOnly",
+        "Type": "System.Boolean",
+        "IsRequired": false
+      },
+      {
+        "Name": "skip",
+        "Type": "System.Int32",
+        "IsRequired": false
+      },
+      {
+        "Name": "take",
+        "Type": "System.Int32",
+        "IsRequired": false
+      }
+    ],
+    "ReturnTypes": [
+      {
+        "Type": "LPS.APS.Shared.Models.ApiResponse\u00601[[System.Collections.Generic.List\u00601[[LPS.APS.Core.Dto.SupplyFactTraceDto, LPS.APS.Core, Version=1.0.0.0, Culture=neutral, PublicKeyToken=null]], System.Private.CoreLib, Version=8.0.0.0, Culture=neutral, PublicKeyToken=7cec85d7bea7798e]]",
+        "MediaTypes": [
+          "text/plain",
+          "application/json",
+          "text/json"
+        ],
+        "StatusCode": 200
+      }
+    ]
+  }
+]

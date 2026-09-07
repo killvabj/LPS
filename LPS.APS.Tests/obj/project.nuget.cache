@@ -1,6 +1,6 @@
 {
   "version": 2,
-  "dgSpecHash": "lz01TAGFEj0=",
+  "dgSpecHash": "sPTAP02baTA=",
   "success": true,
   "projectFilePath": "D:\\WorkSpace_LocalLib\\Windsurf WorkSpace\\LPS_SVN\\LPS.APS.Tests\\LPS.APS.Tests.csproj",
   "expectedPackageFiles": [
@@ -164,6 +164,7 @@
     "C:\\Users\\C02525\\.nuget\\packages\\system.threading.timer\\4.3.0\\system.threading.timer.4.3.0.nupkg.sha512",
     "C:\\Users\\C02525\\.nuget\\packages\\system.xml.readerwriter\\4.3.0\\system.xml.readerwriter.4.3.0.nupkg.sha512",
     "C:\\Users\\C02525\\.nuget\\packages\\system.xml.xdocument\\4.3.0\\system.xml.xdocument.4.3.0.nupkg.sha512",
+    "C:\\Users\\C02525\\.nuget\\packages\\validation\\2.4.18\\validation.2.4.18.nupkg.sha512",
     "C:\\Users\\C02525\\.nuget\\packages\\xunit\\2.6.2\\xunit.2.6.2.nupkg.sha512",
     "C:\\Users\\C02525\\.nuget\\packages\\xunit.abstractions\\2.0.3\\xunit.abstractions.2.0.3.nupkg.sha512",
     "C:\\Users\\C02525\\.nuget\\packages\\xunit.analyzers\\1.6.0\\xunit.analyzers.1.6.0.nupkg.sha512",
@@ -171,7 +172,8 @@
     "C:\\Users\\C02525\\.nuget\\packages\\xunit.core\\2.6.2\\xunit.core.2.6.2.nupkg.sha512",
     "C:\\Users\\C02525\\.nuget\\packages\\xunit.extensibility.core\\2.6.2\\xunit.extensibility.core.2.6.2.nupkg.sha512",
     "C:\\Users\\C02525\\.nuget\\packages\\xunit.extensibility.execution\\2.6.2\\xunit.extensibility.execution.2.6.2.nupkg.sha512",
-    "C:\\Users\\C02525\\.nuget\\packages\\xunit.runner.visualstudio\\2.5.4\\xunit.runner.visualstudio.2.5.4.nupkg.sha512"
+    "C:\\Users\\C02525\\.nuget\\packages\\xunit.runner.visualstudio\\2.5.4\\xunit.runner.visualstudio.2.5.4.nupkg.sha512",
+    "C:\\Users\\C02525\\.nuget\\packages\\xunit.skippablefact\\1.4.13\\xunit.skippablefact.1.4.13.nupkg.sha512"
   ],
   "logs": []
 }

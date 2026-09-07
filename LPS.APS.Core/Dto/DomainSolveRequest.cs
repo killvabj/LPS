@@ -31,6 +31,14 @@ public sealed class DomainSolveRequest
     public IReadOnlyList<OperationResourceEligibility> OperationResourceEligibility { get; init; }
         = Array.Empty<OperationResourceEligibility>();
 
+    /// <summary>
+    /// 物料×阶段→默认生产部门 上下文（PM 裁定：最小 B）。
+    /// 2号位裁剪当前 Domain 涉及的 (MaterialId, StageCode) 传入；1号位按 (MaterialId, StageCode)
+    /// 锁 ProductionDepartmentId 后过滤 Routing 三件套，不得重新推导部门。
+    /// </summary>
+    public IReadOnlyList<MaterialStageDepartmentContextDto> MaterialStageDepartmentContexts { get; init; }
+        = Array.Empty<MaterialStageDepartmentContextDto>();
+
     public IReadOnlyList<MaterialAvailabilitySlice> MaterialConstraints { get; init; }
         = Array.Empty<MaterialAvailabilitySlice>();
 
@@ -49,6 +57,14 @@ public sealed class DomainSolveRequest
     public SolverStrategySnapshot StrategySnapshot { get; init; } = new();
 
     public CandidateContext? CandidateContext { get; init; }
+
+    /// <summary>
+    /// 前序 Domain 成功后的共享 Resource 占用块（FULL §9）。
+    /// 1号位将其作为不可用时间窗阻挡后续 Domain 在真实共享 Resource 上重叠占用。
+    /// Candidate 的对应物是 CandidateContext.ExternalDomainResourceBlocks（§11）；本字段 FULL 专用、Candidate 时为 null。
+    /// </summary>
+    public IReadOnlyList<ResourceBlock> UpstreamDomainResourceBlocks { get; init; }
+        = Array.Empty<ResourceBlock>();
 }
 
 /// <summary>
@@ -100,13 +116,23 @@ public sealed class SolverStrategySnapshot
 /// </summary>
 public sealed class CandidateContext
 {
-    public long BaseScheduleRunId { get; init; }
+    /// <summary>
+    /// Base 稳定锚点 = ScheduleRun.BasePlanVersionId（创建 Run 时由 3号位冻结的当前 ACTIVE PlanVersion）。
+    /// PM 2026-09-07 P0-04 2.1：Candidate 前后比较基线，2号位运行期必须始终用此值，不得中途再查「此刻最新 ACTIVE」。
+    /// </summary>
+    public int? BasePlanVersionId { get; init; }
+
+    /// <summary>变化 Seed：Candidate Pegging 相对 Base ACTIVE 发生变化的逻辑生产需求键（DemandKey/AllocationSequence/LogicalDemandKey 之一）</summary>
     public IReadOnlyList<string> ChangeSeedKeys { get; init; } = Array.Empty<string>();
+
+    /// <summary>其它 Domain 当前 ACTIVE 在共享 Resource 上的不可移动占用（PM 0907：不是 Quantity-Time）</summary>
     public IReadOnlyList<ResourceBlock> ExternalDomainResourceBlocks { get; init; } = Array.Empty<ResourceBlock>();
 }
 
 /// <summary>
 /// 其它Domain ACTIVE共享资源占用的不可用时间窗
+/// PM 2026-09-07 P0-04：Candidate 的外部 Domain 阻挡块必须携带来源域/版本/不可移动语义，
+/// 与 FULL 的 UpstreamDomainResourceBlocks 共用本结构（FULL 时 SourceDomainKey/SourcePlanVersionId 可空）。
 /// </summary>
 public sealed class ResourceBlock
 {
@@ -114,6 +140,15 @@ public sealed class ResourceBlock
     public DateTime StartTime { get; init; }
     public DateTime EndTime { get; init; }
     public string Reason { get; init; } = string.Empty;
+
+    /// <summary>来源 DomainKey（外部 ACTIVE 阻挡块的归属域；FULL 前序 Domain 时也有值）</summary>
+    public string? SourceDomainKey { get; init; }
+
+    /// <summary>来源 PlanVersionId（外部 ACTIVE 阻挡块的归属版本）</summary>
+    public int? SourcePlanVersionId { get; init; }
+
+    /// <summary>不可移动标记（PM 0907：Candidate 外 Domain 阻挡块 Immutable=true，1号位不得挤动）</summary>
+    public bool Immutable { get; init; } = true;
 }
 
 /// <summary>Task 间依赖意图（排程前保留，用于排程后生成 PhysicalPeggingDraft）</summary>

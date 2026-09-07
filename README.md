@@ -25,7 +25,8 @@ LPS.APS/
 │   ├── Utilities/                # 工具类（ConsoleHelper）
 │   └── Extensions/               # DI扩展（AddDatabaseServices + Scrutor自动扫描注册）
 ├── LPS.APS.BusinessRules/        # 业务规则层（5号位）
-│   └── (待实现 Pegging、LotSizing、Priority 规则)
+│   ├── Rules/                    # (待实现 Pegging、LotSizing、Priority 规则)
+│   └── Extensions/               # DI扩展（AddBusinessRuleServices + Scrutor自动扫描）
 ├── LPS.APS.Core/                 # 核心领域层（领域实体中心）
 │   ├── Entities/APS/             # APS库领域实体（Material、Order、Task、BOM、Pegging等16个）
 │   ├── Entities/Auth/            # Auth库领域实体（User、Role、Permission等11个）
@@ -38,7 +39,8 @@ LPS.APS/
 │   ├── Models/                   # 排程模型（SchedulingContext沙盘、SchedulingTask、SchedulingResult）
 │   └── Extensions/               # DI注册（AddSchedulingServices）
 ├── LPS.APS.Application/          # 应用服务层（3号位）
-│   └── Services/                 # 用例编排
+│   ├── Services/                 # 用例编排
+│   └── Extensions/               # DI扩展（AddApplicationServices + Scrutor自动扫描）
 └── LPS.APS.Web/                  # Web API层（4号位）
     ├── Controllers/              # API控制器
     ├── Extensions/               # Hangfire配置 + 定时任务注册（UseHangfireJobs）
@@ -57,7 +59,7 @@ LPS.APS/
 | **排程算法** | LPS.APS.Scheduling | 时间槽寻址、换型优化、IntervalTree | **纯内存、零I/O、零数据库依赖** |
 | **数据引擎** | LPS.APS.Engine | 数据库访问、仓储、批量操作 | 不写业务规则 |
 | **业务规则** | LPS.APS.BusinessRules | Pegging、LotSizing、优先级 | 只写规则插件 |
-| **基础设施** | LPS.APS.Shared | 缓存、日志、序列化、配置 | 通用抽象 |
+| **基础设施** | LPS.APS.Shared | 跨层共享模型、配置选项、MemoryCache | 通用抽象 |
 
 ### 三库架构（物理隔离）
 
@@ -194,24 +196,26 @@ docs(readme): 更新架构说明文档
 
 ## 🔧 DI 自动注册（Scrutor）
 
-Engine 层使用 [Scrutor](https://github.com/khellang/Scrutor) 按命名空间自动扫描注册。新增仓储或服务只需：
-1. 在对应命名空间下创建接口 + 实现
-2. **无需手动注册**，Scrutor 自动发现并以 Scoped 生命周期注入
+全部业务层均使用 [Scrutor](https://github.com/khellang/Scrutor) 按命名空间自动扫描注册。  
+**同事开发流程**：在对应命名空间下创建 `IXxxService` 接口 + `XxxService` 实现 → 完。无需手动注册。
 
-```csharp
-// DatabaseServiceExtensions.cs 中的核心配置
-services.Scan(scan => scan
-    .FromAssemblyOf<DatabaseConnectionManager>()
-        .AddClasses(classes => classes.InNamespaces(
-            "LPS.APS.Engine.Repositories.APS",
-            "LPS.APS.Engine.Repositories.Auth"))
-        .AsImplementedInterfaces()
-        .WithScopedLifetime()
-        .AddClasses(classes => classes.InNamespaces(
-            "LPS.APS.Engine.Services.Sync"))
-        .AsImplementedInterfaces()
-        .WithScopedLifetime()
-);
+| 层 | 扩展方法 | 自动扫描命名空间 | 生命周期 |
+|---|---------|----------------|----------|
+| **Engine** | `AddDatabaseServices` | `Repositories.APS`、`Repositories.Auth`、`Services.Sync` | Scoped |
+| **Application** | `AddApplicationServices` | `Application.Services` | Scoped |
+| **BusinessRules** | `AddBusinessRuleServices` | `BusinessRules.Rules` | Scoped |
+| **Scheduling** | `AddSchedulingServices` | 手动注册（Singleton纯算法） | Singleton |
+
+```
+Program.cs 服务注册流水线：
+┌────────────────────────────────────────────────────┐
+│ AddSharedServices         → 配置选项 + MemoryCache │
+│ AddDatabaseServices       → 三库 + Scrutor扫描     │  ← Engine
+│ AddSchedulingServices     → 算法求解器(手动)       │  ← Scheduling
+│ AddBusinessRuleServices   → Scrutor扫描 Rules      │  ← BusinessRules
+│ AddApplicationServices    → Scrutor扫描 Services   │  ← Application
+│ AddHangfireServices       → 定时任务框架           │  ← Web
+└────────────────────────────────────────────────────┘
 ```
 
 ## 🗄️ 已实现功能
@@ -348,5 +352,5 @@ services.Scan(scan => scan
 **最近重构时间**：2026-04-08（死代码清理 + Scrutor自动注册 + 仓储分层 + Hangfire集中管理）  
 **编译状态**：✅ 7个项目 0 错误 0 警告  
 **数据访问**：APS/ODS使用Dapper（性能优先），Auth使用EF Core（关系复杂）  
-**DI注册**：Engine层使用Scrutor按命名空间自动扫描，新服务零配置  
+**DI注册**：Engine/Application/BusinessRules 三层均使用Scrutor自动扫描，新服务零配置  
 **下一步**：各号位按分层职责表开始独立开发

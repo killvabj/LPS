@@ -15,3 +15,5 @@ D:\WorkSpace_LocalLib\Windsurf WorkSpace\LPS_SVN\LPS.APS.BusinessRules\obj\Debug
 D:\WorkSpace_LocalLib\Windsurf WorkSpace\LPS_SVN\LPS.APS.BusinessRules\obj\Debug\net8.0\refint\LPS.APS.BusinessRules.dll
 D:\WorkSpace_LocalLib\Windsurf WorkSpace\LPS_SVN\LPS.APS.BusinessRules\obj\Debug\net8.0\LPS.APS.BusinessRules.pdb
 D:\WorkSpace_LocalLib\Windsurf WorkSpace\LPS_SVN\LPS.APS.BusinessRules\obj\Debug\net8.0\ref\LPS.APS.BusinessRules.dll
+D:\WorkSpace_LocalLib\Windsurf WorkSpace\LPS_SVN\LPS.APS.BusinessRules\bin\Debug\net8.0\LPS.APS.Engine.dll
+D:\WorkSpace_LocalLib\Windsurf WorkSpace\LPS_SVN\LPS.APS.BusinessRules\bin\Debug\net8.0\LPS.APS.Engine.pdb

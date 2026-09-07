@@ -48,9 +48,15 @@ public sealed class LogicalProductionDemand
     public int FactoryId { get; init; }
 
     /// <summary>
-    /// 从哪里开始继续生产（工序代码）
+    /// 从哪里开始继续生产（大工艺阶段码，机加工/氧化级，对应 RoutingOperation.StageCode）
     /// </summary>
     public string StartStageCode { get; init; } = string.Empty;
+
+    /// <summary>
+    /// 续排起点工序码（工序级，比 StartStageCode 更细，对应 5号位 的 NextOperation/StartOperation）
+    /// 2号位 Pegging 不扩展 Operation，此字段由 5号位 按执行进度交付；null = 尚无工序级起点（新单从第一道工序起 / 未接 5号位交付）。
+    /// </summary>
+    public string? StartOperationCode { get; init; }
 
     /// <summary>
     /// 净产出数量

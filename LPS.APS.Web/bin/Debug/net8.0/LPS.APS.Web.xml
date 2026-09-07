@@ -4,6 +4,21 @@
         <name>LPS.APS.Web</name>
     </assembly>
     <members>
+        <member name="T:LPS.APS.Web.Authorization.PermissionRequirement">
+            <summary>功能权限点授权要求（携带目标 PermissionCode）</summary>
+        </member>
+        <member name="P:LPS.APS.Web.Authorization.PermissionRequirement.PermissionCode">
+            <summary>目标权限码</summary>
+        </member>
+        <member name="T:LPS.APS.Web.Authorization.PermissionAuthorizationHandler">
+            <summary>
+            功能权限点授权处理器（F-G3，3号位）
+            从 JWT 取用户 Id，经 IPermissionService 校验目标权限码；缺用户或未命中 → 失败。
+            </summary>
+        </member>
+        <member name="M:LPS.APS.Web.Authorization.PermissionAuthorizationHandler.HandleRequirementAsync(Microsoft.AspNetCore.Authorization.AuthorizationHandlerContext,LPS.APS.Web.Authorization.PermissionRequirement)">
+            <inheritdoc />
+        </member>
         <member name="T:LPS.APS.Web.Controllers.AuthController">
             <summary>
             认证控制器
@@ -30,6 +45,618 @@
             获取当前用户信息（验证Token有效性）
             </summary>
         </member>
+        <member name="T:LPS.APS.Web.Controllers.BusinessFactIssueController">
+             <summary>
+             ODS/复杂事实Issue查询控制器（5号位提供给4号位）
+            
+             用于Explanation辅助、事实异常展示
+             统一聚合来自多个5号位事实源的Issue（BOM Workset / MaterialStageDeptContext等）
+            
+             路由规范：
+               GET /api/business-fact-issues                  - 聚合查询所有Issue
+               GET /api/business-fact-issues/bom-workset      - 查询BOM Workset Issues
+               GET /api/business-fact-issues/material-stage   - 查询MaterialStageDeptContext Issues
+            
+             【职责边界】
+             - 5号位提供ODS/复杂事实Issue查询
+             - 4号位用于Explanation辅助和事实异常展示
+             </summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.BusinessFactIssueController.QueryAll(System.String,System.String,System.String,System.String,System.String,System.Int32,System.Int32,System.Threading.CancellationToken)">
+            <summary>
+            聚合查询所有ODS/复杂事实Issues
+            </summary>
+        </member>
+        <member name="T:LPS.APS.Web.Controllers.DemandProtectionController">
+             <summary>
+             Demand Protection查看控制器（5号位提供给4号位）
+            
+             路由规范：
+               GET /api/demand-protection                      - Demand Protection列表查询
+               GET /api/demand-protection/summary              - Demand Protection汇总
+            
+             【职责边界】
+             - 查看：5号位自己实现（直接查库）
+             - 释放：必须通过2号位Application Service（暂未实现）
+             </summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.DemandProtectionController.Query(System.String,System.String,System.String,System.String,System.Int32,System.Int32,System.Threading.CancellationToken)">
+            <summary>
+            查询Demand Protection列表
+            </summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.DemandProtectionController.GetSummary(System.String,System.Threading.CancellationToken)">
+            <summary>
+            查询Demand Protection汇总
+            </summary>
+        </member>
+        <member name="T:LPS.APS.Web.Controllers.DomainStatusController">
+             <summary>
+             排程域状态查询控制器（G8：5号位中转，3号位真源）
+            
+             职责边界（0号位裁定）：
+             - 5号位提供前端接口接入
+             - 3号位RunLifecycleService提供状态真源
+             - 5号位不自行聚合状态
+            
+             路由规范：
+               GET /api/domain-status/{scheduleRunId}  - 查询排程域状态
+             </summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.DomainStatusController.GetRunDomainStatus(System.Int32,System.Threading.CancellationToken)">
+            <summary>
+            查询排程域状态（G8）
+            </summary>
+            <param name="scheduleRunId">排程运行ID</param>
+            <param name="cancellationToken">取消令牌</param>
+        </member>
+        <member name="T:LPS.APS.Web.Controllers.ExplanationController">
+             <summary>
+             Explanation排程原因解释控制器（5号位提供给4号位）
+            
+             路由规范：
+               GET /api/explanation?planVersionId=           - Explanation列表查询
+               GET /api/explanation/summary?planVersionId=   - Explanation汇总
+            
+             【职责边界】
+             - 5号位提供只读查询接口，直接读取ScheduleExplanationFact表
+             - 不重新裁决延期原因
+             - 数据来源：1号位产出，2号位落盘
+             </summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.ExplanationController.Query(System.Int32,System.String,System.Nullable{System.Int64},System.Nullable{System.Int64},System.String,System.String,System.Int32,System.Int32,System.Threading.CancellationToken)">
+            <summary>
+            查询Explanation列表
+            </summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.ExplanationController.GetSummary(System.Int32,System.Threading.CancellationToken)">
+            <summary>
+            查询Explanation汇总（含按ReasonCode分组统计）
+            </summary>
+        </member>
+        <member name="T:LPS.APS.Web.Controllers.GovernanceController">
+            <summary>
+            治理版本管理 API（阶段 A-9：3号位 Web 层实现）
+            提供 RuleSetVersion / ParameterSetVersion 的 CRUD + 发布接口。
+            红线：发布接口仅接受 DRAFT/SUBMITTED/APPROVED 状态（六态状态机 R01 验收）。
+            </summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.GetCurrentUserId">
+            <summary>解析当前登录用户 Id（无效时返回 0 → 范围解析为拒绝全部，安全默认）</summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.GetRuleSetVersions(System.Int64,System.Threading.CancellationToken)">
+            <summary>获取规则集的所有版本</summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.GetRuleSetVersion(System.Int64,System.Threading.CancellationToken)">
+            <summary>获取规则集版本详情（P0-01：ContentSnapshotJson 投影回 DemandPriorityJson，前端 API 兼容）</summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.CreateRuleSetVersion(LPS.APS.Core.Entities.APS.RuleSetVersion,System.Threading.CancellationToken)">
+            <summary>创建规则集版本（P0-02：Service 强制初始状态 DRAFT——入参 Status 一律被忽略覆盖；内容归一化到 ContentSnapshotJson 持久化）</summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.UpdateRuleSetVersion(System.Int64,LPS.APS.Core.Entities.APS.RuleSetVersion,System.Threading.CancellationToken)">
+            <summary>更新规则集版本（P0-02：状态机约束——已发布/失效/归档拒绝原地修改；Status/治理字段冻结，禁止越权改状态）</summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.GetParameterSetVersions(System.Int64,System.Threading.CancellationToken)">
+            <summary>获取参数集的所有版本</summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.GetParameterSetVersion(System.Int64,System.Threading.CancellationToken)">
+            <summary>获取参数集版本详情（P0-01：ContentSnapshotJson 五子块投影回五主题 JSON，前端 API 兼容）</summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.CreateParameterSetVersion(LPS.APS.Core.Entities.APS.ParameterSetVersion,System.Threading.CancellationToken)">
+            <summary>创建参数集版本（P0-02：Service 强制初始状态 DRAFT——入参 Status 一律被忽略覆盖；五主题 JSON 归一化到 ContentSnapshotJson 持久化）</summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.UpdateParameterSetVersion(System.Int64,LPS.APS.Core.Entities.APS.ParameterSetVersion,System.Threading.CancellationToken)">
+            <summary>更新参数集版本（P0-02：状态机约束——已发布/失效/归档拒绝原地修改；Status/治理字段冻结，禁止越权改状态）</summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.PublishRuleSetVersion(System.Int64,LPS.APS.Web.Controllers.PublishRequest,System.Threading.CancellationToken)">
+            <summary>
+            发布规则集版本（六态状态机 R01 验收）
+            红线：仅 DRAFT/SUBMITTED/APPROVED 可发布；PUBLISHED 拒绝（历史不可覆盖）；A-6 不变量自动处理。
+            </summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.PublishParameterSetVersion(System.Int64,LPS.APS.Web.Controllers.PublishRequest,System.Threading.CancellationToken)">
+            <summary>
+            发布参数集版本（六态状态机 R02 验收）
+            红线：仅 DRAFT/SUBMITTED/APPROVED 可发布；新 Run 可引用新版本、旧 Run 引用不变；A-6 不变量自动处理。
+            </summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.DisableRuleSetVersion(System.Int64,LPS.APS.Web.Controllers.DisableRequest,System.Threading.CancellationToken)">
+            <summary>
+            停用规则集版本（SUBMITTED/APPROVED/PUBLISHED → DISABLED）
+            红线：DRAFT 拒绝（草稿直接编辑/删除）；DISABLED/ARCHIVED 幂等保护拒绝。
+            </summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.DisableParameterSetVersion(System.Int64,LPS.APS.Web.Controllers.DisableRequest,System.Threading.CancellationToken)">
+            <summary>
+            停用参数集版本（SUBMITTED/APPROVED/PUBLISHED → DISABLED）
+            红线：DRAFT 拒绝（草稿直接编辑/删除）；DISABLED/ARCHIVED 幂等保护拒绝。
+            </summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.DisableStrategyProfileVersion(System.Int64,LPS.APS.Web.Controllers.DisableRequest,System.Threading.CancellationToken)">
+            <summary>
+            停用策略包版本（SUBMITTED/APPROVED/PUBLISHED → DISABLED）
+            红线：DRAFT 拒绝；DISABLED/ARCHIVED 幂等保护拒绝。
+            IsDefault=1 停用时自动清默认标志（避免 DISABLED 默认残留于 ResolveDefault 范围）。
+            </summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.CompareRuleSetVersions(System.Int64,System.Int64,System.Threading.CancellationToken)">
+            <summary>对比两个规则集版本的差异（阶段 A-8：版本溯源）</summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.CompareParameterSetVersions(System.Int64,System.Int64,System.Threading.CancellationToken)">
+            <summary>对比两个参数集版本的差异（阶段 A-8：版本溯源）</summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.CompareStrategyProfileVersions(System.Int64,System.Int64,System.Threading.CancellationToken)">
+            <summary>对比两个策略包版本的差异（G5/D3：策略包对比页；裸 DTO，同 D1/D2）</summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.ValidateRuleSetVersionForPublish(System.Int64,System.Threading.CancellationToken)">
+            <summary>校验规则集版本是否可发布（阶段 A-5：发布前完整校验）</summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.ValidateParameterSetVersionForPublish(System.Int64,System.Threading.CancellationToken)">
+            <summary>校验参数集版本是否可发布（阶段 A-5：发布前完整校验）</summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.GetStrategyProfileVersions(System.Int64,System.Threading.CancellationToken)">
+            <summary>获取策略包的所有版本</summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.GetStrategyProfileVersion(System.Int64,System.Threading.CancellationToken)">
+            <summary>获取策略包版本详情</summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.CreateStrategyProfileVersion(LPS.APS.Core.Entities.APS.StrategyProfileVersion,System.Threading.CancellationToken)">
+            <summary>创建策略包版本（P0-02：Service 强制初始状态 DRAFT——入参 Status 一律被忽略覆盖）</summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.UpdateStrategyProfileVersion(System.Int64,LPS.APS.Core.Entities.APS.StrategyProfileVersion,System.Threading.CancellationToken)">
+            <summary>更新策略包版本（P0-02：状态机约束——已发布/失效/归档拒绝原地修改；Status/治理字段/引用字段冻结，禁止越权改状态）</summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.PublishStrategyProfileVersion(System.Int64,LPS.APS.Web.Controllers.PublishRequest,System.Threading.CancellationToken)">
+            <summary>发布策略包版本（P0-06：DRAFT/SUBMITTED/APPROVED → PUBLISHED；发布前强制校验）</summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.ValidateStrategyProfileVersionForPublish(System.Int64,System.Threading.CancellationToken)">
+            <summary>校验策略包版本是否可发布（P0-06）</summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.ResolveDefaultStrategyProfile(System.String,System.Nullable{System.DateTime},System.Threading.CancellationToken)">
+            <summary>解析当前有效默认 PUBLISHED 策略包（P0-06：跨号位冻结语义；歧义报错不随机取）</summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.GetRunStrategyProfileTrace(System.Int64,System.Threading.CancellationToken)">
+            <summary>Run 引用追溯（P0-06：策略包版本 → 父 Profile + 规则集/参数集版本）</summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.ValidateExpectedDomainKeys(System.Int32,System.Threading.CancellationToken)">
+            <summary>校验 ScheduleRun.ExpectedDomainKeysJson 冻结规则（P0-08：FULL≥1 / RESCHEDULE 恰1）</summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.ConfirmCandidate(System.Int32,LPS.APS.Web.Controllers.ConfirmCandidateRequest,System.Threading.CancellationToken)">
+            <summary>Candidate 最小人工确认（P0-08：仅记录 Actor/ConfirmedAt/CandidatePlanVersionId/Remark，不转 ACTIVE）</summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.ActivateCandidate(System.Int32,LPS.APS.Web.Controllers.ActivateCandidateRequest,System.Threading.CancellationToken)">
+            <summary>激活 Candidate（P0-08：CANDIDATE → ACTIVE，每域单一正式采用版本）</summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.CompareCandidateWithBase(System.Int32,System.Int32,System.Threading.CancellationToken)">
+            <summary>候选 vs 基础 计划版本对比复合查询（H1；U10 候选对比页；v1.2 §三）</summary>
+            <remarks>开发者：3号位；estimatedOnlyCount 归 2号位 边界返 null；crossDomain 计数未落盘保守返 0（v1.2 §九-b）；reasons[] 不在 v1.2 返回</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.RecoverFailedRun(System.Int32,System.Threading.CancellationToken)">
+            <summary>FAILED 恢复（P0-08：为 FAILED ScheduleRun 新建一条 RUNNING 重跑，继承基线；旧记录不动）</summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.CreateCandidateRun(LPS.APS.Web.Controllers.CreateCandidateRunRequest,System.Threading.CancellationToken)">
+            <summary>白天候选运行创建（B-1：0号位 2026-08-29 裁决3——4号位 → 3号位 入口；冻结 RunType×Purpose×策略版本，交 2号位 主流程执行收口）</summary>
+            <remarks>开发者：3号位；触发 2号位 主流程留契约接缝（契约草案 §四 方案 A/B/C，待 2号位/0号位 裁定）</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.GetRunReferenceTrace(System.Int32,System.Threading.CancellationToken)">
+            <summary>Run 引用追溯（P0-08：ScheduleRun → 策略包版本 → 规则集/参数集版本 + 关联 PlanVersion 状态）</summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.GetRuleSets(System.Nullable{System.Boolean},System.String,System.Nullable{System.Int32},System.Nullable{System.Int32},System.Threading.CancellationToken)">
+            <summary>规则集主表列表（G1/A1：4号位规则集列表页）</summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.GetParameterSets(System.Nullable{System.Boolean},System.String,System.Nullable{System.Int32},System.Nullable{System.Int32},System.Threading.CancellationToken)">
+            <summary>参数集主表列表（G1/A8：4号位参数集列表页）</summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.GetStrategyProfiles(System.Nullable{System.Boolean},System.String,System.Nullable{System.Int32},System.Nullable{System.Int32},System.Threading.CancellationToken)">
+            <summary>策略包主表列表（G1/A12：4号位策略包列表页）</summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.GetPublishedRuleSetVersion(System.Int64,System.Threading.CancellationToken)">
+            <summary>规则集当前生效 PUBLISHED 版本直达（G3/C2：当前 Published 版本展示；生效窗口过滤；多候选报错）</summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.GetPublishedParameterSetVersion(System.Int64,System.Threading.CancellationToken)">
+            <summary>参数集当前生效 PUBLISHED 版本直达（G3/C2）</summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.GetPublishedStrategyProfileVersion(System.Int64,System.Threading.CancellationToken)">
+            <summary>策略包当前生效 PUBLISHED 版本直达（G3/C2）</summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.GetDomainDependencies(System.String,System.String,System.Threading.CancellationToken)">
+            <summary>域依赖关系查询（G7：4号位失败链 / 域依赖展示；数据源为 2号位 sp_ScanDomainDependency 扫描结果，只读）</summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.GetAuditLogs(System.String,System.Nullable{System.Int64},System.Nullable{System.DateTime},System.Nullable{System.DateTime},System.Nullable{System.Int32},System.Threading.CancellationToken)">
+            <summary>治理审计日志查询（G6：实体类型/实体ID/时间范围 可空组合，按操作时间倒序）</summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.GetRunDomainStatus(System.Int32,System.Threading.CancellationToken)">
+            <summary>Run 域级状态汇总（G8：FULL 失败链 成功/失败/被阻断 区分；3号位文档 §十六）</summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.GetRuns(System.Nullable{System.Int32},System.String,System.String,System.Threading.CancellationToken)">
+            <summary>Run 历史列表查询（G4：0号位 2026-08-29 裁决——3号位 只读 ScheduleRun 运行事实封装查询；状态回填由 2号位 运行收口负责，本端点不修改运行结果语义）</summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.ResolvePaging(System.Nullable{System.Int32},System.Nullable{System.Int32})">
+            <summary>解析 1 基页码到 skip/take（page=1 → skip=0；pageSize 上限 500 防全表拉取）</summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.GetDomainDefinitions(System.Threading.CancellationToken)">
+            <summary>域定义列表（含停用；G-D01）</summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.GetActiveDomainDefinitions(System.Threading.CancellationToken)">
+            <summary>当前有效域集合（G-D09/G-D10：2号位归域执行唯一事实源）</summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.GetDomainDefinition(System.Int32,System.Threading.CancellationToken)">
+            <summary>域定义详情（G-D01）</summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.CreateDomainDefinition(LPS.APS.Core.Entities.APS.DomainDefinition,System.Threading.CancellationToken)">
+            <summary>新建域定义（G-D02：唯一性 / ScopeType / 引用合法性校验 + 审计；新建默认启用）</summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.UpdateDomainDefinition(System.Int32,LPS.APS.Core.Entities.APS.DomainDefinition,System.Threading.CancellationToken)">
+            <summary>编辑域定义（G-D03~G-D05：DomainKey 不可变更 + 校验）</summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.EnableDomainDefinition(System.Int32,System.String,System.Threading.CancellationToken)">
+            <summary>启用域定义（G-D16 反向）</summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.DisableDomainDefinition(System.Int32,System.String,System.Threading.CancellationToken)">
+            <summary>停用域定义</summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="T:LPS.APS.Web.Controllers.PublishRequest">
+            <summary>发布请求 DTO（3号位 Web 层契约）</summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="P:LPS.APS.Web.Controllers.PublishRequest.ChangeReason">
+            <summary>变更原因（G10：发布时写入版本 Remarks，审计可追溯）</summary>
+        </member>
+        <member name="T:LPS.APS.Web.Controllers.DisableRequest">
+            <summary>版本停用请求 DTO（G2：3-4联调）</summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="P:LPS.APS.Web.Controllers.DisableRequest.OperatedBy">
+            <summary>操作人（必填，审计记录）</summary>
+        </member>
+        <member name="P:LPS.APS.Web.Controllers.DisableRequest.Reason">
+            <summary>停用原因（写入版本 Remarks + 审计 Remarks，可空）</summary>
+        </member>
+        <member name="T:LPS.APS.Web.Controllers.ConfirmCandidateRequest">
+            <summary>Candidate 确认请求 DTO（P0-08）</summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="P:LPS.APS.Web.Controllers.ConfirmCandidateRequest.Actor">
+            <summary>确认人（必填）</summary>
+        </member>
+        <member name="P:LPS.APS.Web.Controllers.ConfirmCandidateRequest.Remark">
+            <summary>必要备注（可空）</summary>
+        </member>
+        <member name="T:LPS.APS.Web.Controllers.ActivateCandidateRequest">
+            <summary>Candidate 激活请求 DTO（P0-08）</summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="P:LPS.APS.Web.Controllers.ActivateCandidateRequest.Actor">
+            <summary>激活人（必填）</summary>
+        </member>
+        <member name="T:LPS.APS.Web.Controllers.CreateCandidateRunRequest">
+            <summary>白天候选运行创建请求 DTO（B-1）</summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="P:LPS.APS.Web.Controllers.CreateCandidateRunRequest.RunType">
+            <summary>运行类型（白天候选类：MANUAL_RESCHEDULE / LOCAL_RESCHEDULE / INSERT_ORDER_WHATIF）</summary>
+        </member>
+        <member name="P:LPS.APS.Web.Controllers.CreateCandidateRunRequest.Purpose">
+            <summary>用途（须 ∈ RunType 冻结合法组合：CTP / INSERT_IMPACT_ANALYSIS / INSERT_RESCHEDULE / MANUAL_ADJUSTMENT）</summary>
+        </member>
+        <member name="P:LPS.APS.Web.Controllers.CreateCandidateRunRequest.DomainKey">
+            <summary>目标 Domain（严格单 Domain）</summary>
+        </member>
+        <member name="P:LPS.APS.Web.Controllers.CreateCandidateRunRequest.BasePlanVersionId">
+            <summary>所基于的当前 ACTIVE 计划版本（可选；缺省按 DomainKey 解析当前 ACTIVE）</summary>
+        </member>
+        <member name="P:LPS.APS.Web.Controllers.CreateCandidateRunRequest.DataCutoffTime">
+            <summary>本次运行统一数据切片边界（可选；缺省 now）</summary>
+        </member>
+        <member name="P:LPS.APS.Web.Controllers.CreateCandidateRunRequest.Actor">
+            <summary>操作人（必填）</summary>
+        </member>
+        <member name="P:LPS.APS.Web.Controllers.CreateCandidateRunRequest.Remark">
+            <summary>备注（契约位保留，B-1 本轮不参与业务逻辑）</summary>
+        </member>
+        <member name="T:LPS.APS.Web.Controllers.GovernanceQueryController">
+             <summary>
+             治理查询控制器（G4/G7：5号位中转，直接读取APS事实表）
+            
+             路由规范：
+               GET /api/governance-query/runs                    - 排程运行列表（G4）
+               GET /api/governance-query/domain-dependencies     - 排程域依赖（G7）
+            
+             【职责边界】
+             - 5号位提供只读查询接口
+             - 不修改、不重算业务结果
+             - ScheduleRun状态由2号位/3号位产生，5号位只读展示
+             </summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceQueryController.GetRuns(System.String,System.String,System.Int32,System.Threading.CancellationToken)">
+            <summary>
+            查询排程运行列表（G4）
+            </summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceQueryController.GetDomainDependencies(System.String,System.String,System.Threading.CancellationToken)">
+            <summary>
+            查询排程域依赖（G7）
+            </summary>
+        </member>
+        <member name="T:LPS.APS.Web.Controllers.OrderQueryController">
+             <summary>
+             订单/需求计划查询控制器（5号位提供给4号位）
+            
+             路由规范：
+               GET /api/order-query?planVersionId=             - 订单列表查询
+               GET /api/order-query/{orderId}?planVersionId=   - 订单详情（含Pegging+生产计划）
+            
+             【职责边界】
+             - 5号位提供只读查询接口，直接读取APS事实表
+             - 不重算Pegging，不修改订单状态
+             </summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.OrderQueryController.QueryOrders(System.Int32,System.String,System.String,System.String,System.String,System.String,System.String,System.String,System.Int32,System.Int32,System.Threading.CancellationToken)">
+            <summary>
+            查询订单列表
+            </summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.OrderQueryController.GetOrderDetail(System.Int64,System.Int32,System.Threading.CancellationToken)">
+            <summary>
+            查询订单详情（含Pegging承接+生产计划）
+            </summary>
+        </member>
+        <member name="T:LPS.APS.Web.Controllers.OverviewController">
+             <summary>
+             Overview概览页控制器（5号位提供给4号位）
+            
+             路由规范：
+               GET /api/overview/active-plan           - 当前ACTIVE计划版本信息
+               GET /api/overview/task-summary          - 任务状态摘要
+               GET /api/overview/resource-bottleneck   - 资源负荷/Bottleneck
+               GET /api/overview/candidate-summary     - Candidate待处理摘要
+            
+             【职责边界】
+             - 5号位提供只读查询接口，直接读取APS事实表
+             - 不重算业务结果
+             </summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.OverviewController.GetActivePlan(System.String,System.Threading.CancellationToken)">
+            <summary>
+            查询当前ACTIVE计划版本信息
+            </summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.OverviewController.GetTaskSummary(System.Int32,System.Threading.CancellationToken)">
+            <summary>
+            查询任务状态摘要
+            </summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.OverviewController.GetResourceBottleneck(System.Int32,System.Int32,System.Threading.CancellationToken)">
+            <summary>
+            查询资源负荷/Bottleneck
+            </summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.OverviewController.GetCandidateSummary(System.Threading.CancellationToken)">
+            <summary>
+            查询Candidate待处理摘要
+            </summary>
+        </member>
+        <member name="T:LPS.APS.Web.Controllers.PeggingTraceController">
+             <summary>
+             Supply/Pegging Trace供需追溯控制器（5号位提供给4号位）
+            
+             路由规范：
+               GET /api/pegging-trace?planVersionId=              - Pegging分配列表查询
+               GET /api/pegging-trace/order/{orderId}?planVersionId=  - 按订单查询Pegging分配
+               GET /api/pegging-trace/summary?planVersionId=      - Pegging Trace汇总
+            
+             【职责边界】
+             - 5号位提供只读查询接口，直接读取PeggingSupplyAllocation表
+             - 不重算Allocation，不修改分配结果
+             </summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.PeggingTraceController.Query(System.Int32,System.String,System.String,System.String,System.String,System.String,System.Int32,System.Int32,System.Threading.CancellationToken)">
+            <summary>
+            查询Pegging分配列表
+            </summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.PeggingTraceController.QueryByOrder(System.Int64,System.Int32,System.Threading.CancellationToken)">
+            <summary>
+            按订单查询Pegging分配
+            </summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.PeggingTraceController.GetSummary(System.Int32,System.Threading.CancellationToken)">
+            <summary>
+            查询Pegging Trace汇总
+            </summary>
+        </member>
+        <member name="T:LPS.APS.Web.Controllers.ProcurementManualEtaController">
+             <summary>
+             采购人工ETA维护控制器（5号位提供，供4号位前端调用）
+            
+             路由规范：
+               GET    /api/procurement-manual-eta                  - 查询Manual ETA列表
+               GET    /api/procurement-manual-eta/{poNo}/{lineNo}  - 查询单条记录
+               POST   /api/procurement-manual-eta                  - 新增或更新Manual ETA
+               DELETE /api/procurement-manual-eta/{poNo}/{lineNo}  - 取消Manual ETA
+            
+             【职责边界 - 2026-08-26】
+             - 5号位提供Manual ETA维护API
+             - 2号位消费Manual ETA并计算Effective ETA
+            
+             参考：复审报告P1-01
+             </summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.ProcurementManualEtaController.Query(System.String,System.String,System.String,System.String,System.Nullable{System.DateTime},System.Nullable{System.DateTime},System.Nullable{System.DateTime},System.Boolean,System.Int32,System.Int32,System.Threading.CancellationToken)">
+            <summary>
+            查询Manual ETA列表
+            </summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.ProcurementManualEtaController.GetByBusinessKey(System.String,System.Int32,System.Int32,System.String,System.Threading.CancellationToken)">
+            <summary>
+            根据业务键查询单条Manual ETA记录
+            </summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.ProcurementManualEtaController.Upsert(LPS.APS.Core.Dto.ProcurementManualEtaOverride,System.Threading.CancellationToken)">
+            <summary>
+            新增或更新Manual ETA
+            </summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.ProcurementManualEtaController.Cancel(System.String,System.Int32,LPS.APS.Web.Controllers.CancelManualEtaRequest,System.Threading.CancellationToken)">
+            <summary>
+            取消Manual ETA（设置IsActive=0）
+            </summary>
+        </member>
+        <member name="T:LPS.APS.Web.Controllers.CancelManualEtaRequest">
+            <summary>
+            取消Manual ETA请求体
+            </summary>
+        </member>
+        <member name="T:LPS.APS.Web.Controllers.CancelManualEtaResponse">
+            <summary>
+            取消Manual ETA响应体
+            </summary>
+        </member>
+        <member name="T:LPS.APS.Web.Controllers.RbacController">
+            <summary>
+            RBAC 管理控制器（F-G5，3号位）
+            提供用户/角色/权限/业务范围策略的增删改与分配端点。
+            所有端点要求 auth.manage 功能权限（PermissionAuthorizationHandler 对 DB 权威校验）。
+            </summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.RbacController.GetUsers">
+            <summary>查询用户列表</summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.RbacController.CreateUser(LPS.APS.Core.Dto.CreateUserRequest)">
+            <summary>创建用户</summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.RbacController.UpdateUser(System.Int32,LPS.APS.Core.Dto.UpdateUserRequest)">
+            <summary>更新用户（含启用/停用）</summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.RbacController.DeleteUser(System.Int32)">
+            <summary>删除用户（软删除）</summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.RbacController.AssignUserRoles(System.Int32,LPS.APS.Core.Dto.AssignIdsRequest)">
+            <summary>分配用户角色（覆盖式）</summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.RbacController.AssignUserScopes(System.Int32,LPS.APS.Core.Dto.AssignIdsRequest)">
+            <summary>分配用户业务范围（覆盖式）</summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.RbacController.GetRoles">
+            <summary>查询角色列表</summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.RbacController.CreateRole(LPS.APS.Core.Dto.CreateRoleRequest)">
+            <summary>创建角色</summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.RbacController.UpdateRole(System.Int32,LPS.APS.Core.Dto.UpdateRoleRequest)">
+            <summary>更新角色（含启用/停用）</summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.RbacController.DeleteRole(System.Int32)">
+            <summary>删除角色（软删除）</summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.RbacController.AssignRolePermissions(System.Int32,LPS.APS.Core.Dto.AssignIdsRequest)">
+            <summary>分配角色权限（覆盖式）</summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.RbacController.AssignRoleScopes(System.Int32,LPS.APS.Core.Dto.AssignIdsRequest)">
+            <summary>分配角色业务范围（覆盖式）</summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.RbacController.GetPermissions">
+            <summary>查询权限列表</summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.RbacController.CreatePermission(LPS.APS.Core.Dto.CreatePermissionRequest)">
+            <summary>创建权限</summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.RbacController.GetScopes">
+            <summary>查询业务范围策略列表</summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.RbacController.CreateScope(LPS.APS.Core.Dto.CreateDataScopePolicyRequest)">
+            <summary>创建业务范围策略</summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.RbacController.UpdateScope(System.Int32,LPS.APS.Core.Dto.UpdateDataScopePolicyRequest)">
+            <summary>更新业务范围策略说明</summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.RbacController.DeleteScope(System.Int32)">
+            <summary>删除业务范围策略</summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.RbacController.GetCurrentUserId">
+            <summary>
+            从 JWT 声明解析当前操作用户 Id（用于审计 OperatedBy 与自删保护）。
+            解析失败或非法（≤0）时抛出 <see cref="T:System.InvalidOperationException"/>（fail-closed，避免落 OperatedBy="0" 的脏审计）。
+            </summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.RbacController.GetCurrentUserIdForLog">
+            <summary>仅用于日志显示的当前用户 Id（解析失败返回 0，不抛，避免日志行本身中断）。</summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.RbacController.RunAsync``1(System.Func{System.Threading.Tasks.Task{``0}},System.String)">
+            <summary>统一执行并映射异常到 <see cref="T:LPS.APS.Shared.Models.ApiResponse`1"/>。</summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.RbacController.RunAsync(System.Func{System.Threading.Tasks.Task},System.String)">
+            <summary>统一执行并映射异常到 <see cref="T:LPS.APS.Shared.Models.ApiResponse"/>（无返回数据）。</summary>
+        </member>
         <member name="T:LPS.APS.Web.Controllers.ScheduleController">
              <summary>
              排程结果查询控制器（3号位，供 4号位前端甘特图调用）
@@ -39,22 +666,45 @@
                GET /api/schedule/gantt/{id}        - 指定版本的甘特图数据
                GET /api/schedule/summary/{id}      - 指定版本的排程概要 KPI
             
+             F-G4：以当前登录用户 Id 为入口，由 IScheduleQueryService 内部解析业务范围并过滤（Domain/Factory 维度）。
              V1 不包含：触发重排 / 拖拽调整 / 解冻申请 等写操作（后续阶段铺开）
              </summary>
         </member>
         <member name="M:LPS.APS.Web.Controllers.ScheduleController.GetVersions(System.Int32,System.Threading.CancellationToken)">
             <summary>
-            获取计划版本列表（最新优先，默认 30 条）
+            获取计划版本列表（最新优先，默认 30 条，按当前用户业务范围过滤）
             </summary>
         </member>
         <member name="M:LPS.APS.Web.Controllers.ScheduleController.GetGantt(System.Int32,System.Threading.CancellationToken)">
             <summary>
-            获取指定计划版本的甘特图数据（资源行 + 任务条）
+            获取指定计划版本的甘特图数据（资源行 + 任务条；越权返回空）
             </summary>
         </member>
         <member name="M:LPS.APS.Web.Controllers.ScheduleController.GetSummary(System.Int32,System.Threading.CancellationToken)">
             <summary>
-            获取指定计划版本的排程概要 KPI
+            获取指定计划版本的排程概要 KPI（越权返回空）
+            </summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.ScheduleController.GetCurrentUserId">
+            <summary>解析当前登录用户 Id（无效时返回 0 → 范围解析为拒绝全部，安全默认）</summary>
+        </member>
+        <member name="T:LPS.APS.Web.Controllers.SupplyFactTraceController">
+             <summary>
+             供应事实原始追溯控制器（5号位提供给4号位）
+            
+             用于页面查看Procurement/VMI/Received/Transit原始供应事实
+            
+             路由规范：
+               GET /api/supply-fact-trace                  - 聚合查询所有供应事实
+            
+             【职责边界】
+             - 5号位提供原始供应事实查询
+             - 4号位用于Pegging行源事实查看
+             </summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.SupplyFactTraceController.Query(System.String,System.String,System.Nullable{System.Int32},System.String,System.String,System.String,System.Boolean,System.Int32,System.Int32,System.Threading.CancellationToken)">
+            <summary>
+            聚合查询所有供应事实
             </summary>
         </member>
         <member name="T:LPS.APS.Web.Dto.Auth.LoginRequestDto">
@@ -113,6 +763,18 @@
         </member>
         <member name="P:LPS.APS.Web.Dto.Auth.UserInfoDto.Roles">
             <summary>角色列表</summary>
+        </member>
+        <member name="P:LPS.APS.Web.Dto.Auth.UserInfoDto.Permissions">
+            <summary>功能权限码列表（登录签发时注入 JWT，供前端菜单/按钮渲染）</summary>
+        </member>
+        <member name="T:LPS.APS.Web.Extensions.AuthorizationExtensions">
+            <summary>认证授权扩展（F-G2/F-G3，3号位）</summary>
+        </member>
+        <member name="M:LPS.APS.Web.Extensions.AuthorizationExtensions.AddPermissionAuthorization(Microsoft.Extensions.DependencyInjection.IServiceCollection)">
+            <summary>注册功能权限点授权处理器</summary>
+        </member>
+        <member name="M:LPS.APS.Web.Extensions.AuthorizationExtensions.AddPermissionPolicies(Microsoft.AspNetCore.Authorization.AuthorizationOptions)">
+            <summary>注册 V1 全部功能权限点策略（策略名 = PermissionCode）</summary>
         </member>
         <member name="T:LPS.APS.Web.Extensions.HangfireAuthorizationFilter">
             <summary>

@@ -75,6 +75,9 @@ internal class PhaseTwoInitialScheduler
         // 第4轮Merge修复：记录Demand到Task的份额追溯，支持合批
         var allocationTaskShare = new Dictionary<string, List<(string DemandKey, decimal ShareQty)>>();
 
+        // PI Position 执行起点上下文专项：S29 merge 执行起点一致性校验所需的反查索引
+        var demandByKey = request.LogicalProductionDemands.ToDictionary(d => d.LogicalDemandKey);
+
         foreach (var demand in sortedDemands)
         {
             // 第8轮P0-01修复：部分数量冻结处理
@@ -114,6 +117,7 @@ internal class PhaseTwoInitialScheduler
                     MaterialId = demand.MaterialId,
                     FactoryId = demand.FactoryId,
                     StartStageCode = demand.StartStageCode,
+                    StartOperationCode = demand.StartOperationCode,
                     NetOutputQty = remainingNetOutputQty,
                     PlannedProcessQty = remainingPlannedProcessQty,
                     RequiredAvailableTime = demand.RequiredAvailableTime,
@@ -137,14 +141,23 @@ internal class PhaseTwoInitialScheduler
                 continue;
             }
 
-            // 从 StartStageCode 开始的工序列表（使用actualDemand）
+            // 从 StartStageCode / StartOperationCode 开始的工序列表（使用actualDemand）
             var operationsToSchedule = GetOperationsFromStage(
                 actualDemand.StartStageCode,
+                actualDemand.StartOperationCode,
                 routingGraph,
-                constraints);
+                constraints,
+                out var startFailureReason);
 
             if (operationsToSchedule.Count == 0)
             {
+                if (startFailureReason != null)
+                {
+                    // S26：StartStage/StartOperation 非法，业务 Unscheduled（非技术失败，不静默回退）
+                    result.UnscheduledDemandKeys.Add(actualDemand.LogicalDemandKey);
+                    continue;
+                }
+
                 // P0-03修复：Routing有环或非法，属于技术失败
                 result.TechnicalFailure = true;
                 result.TechnicalFailureReason = $"Routing图非法或存在环：MaterialId={demand.MaterialId}, RouteCode=DEFAULT";
@@ -166,6 +179,7 @@ internal class PhaseTwoInitialScheduler
                     resourceOccupancy,
                     result.ScheduledTasks,
                     allocationTaskShare,
+                    demandByKey,
                     request.PlanningStart,
                     request.PlanningEnd);
             }
@@ -246,14 +260,19 @@ internal class PhaseTwoInitialScheduler
     }
 
     /// <summary>
-    /// 获取从指定阶段开始的工序列表（拓扑排序）
+    /// 获取从指定阶段/工序开始的工序列表（拓扑排序）
     /// 文档：§四 4.4 RoutingDependency，§七 Level 0硬约束
+    /// PI Position 执行起点上下文专项：支持 Operation 粒度裁剪（StartOperationCode）
     /// </summary>
     private List<OperationNode> GetOperationsFromStage(
         string startStageCode,
+        string? startOperationCode,
         RoutingGraph routingGraph,
-        ConstraintContext constraints)
+        ConstraintContext constraints,
+        out string? failureReason)
     {
+        failureReason = null;
+
         // 构建邻接表和入度表
         var adjacency = new Dictionary<string, List<string>>();
         var inDegree = new Dictionary<string, int>();
@@ -310,61 +329,97 @@ internal class PhaseTwoInitialScheduler
         if (result.Count < routingGraph.Operations.Count)
         {
             // Routing图存在环，属于输入数据结构非法
+            // failureReason 保持 null，调用方据此判定为技术失败
             return new List<OperationNode>();
+        }
+
+        // PI Position 执行起点上下文专项：Operation 粒度裁剪优先
+        // S24/S26：从 StartOperationCode 继续，裁掉已完成前序；非法时失败，不静默回退
+        if (!string.IsNullOrEmpty(startOperationCode))
+        {
+            if (!routingGraph.Operations.TryGetValue(startOperationCode, out var startOp))
+            {
+                // S26：StartOperationCode 不存在于 Routing，输入/求解失败
+                failureReason = $"StartOperationCode '{startOperationCode}' 不存在于 Routing";
+                return new List<OperationNode>();
+            }
+
+            // S26：StartOperationCode 与 StartStageCode 明显不一致
+            if (!string.IsNullOrEmpty(startStageCode) &&
+                !string.IsNullOrEmpty(startOp.StageCode) &&
+                !string.Equals(startOp.StageCode, startStageCode, StringComparison.Ordinal))
+            {
+                failureReason = $"StartOperationCode '{startOperationCode}' 的 StageCode '{startOp.StageCode}' 与 StartStageCode '{startStageCode}' 不一致";
+                return new List<OperationNode>();
+            }
+
+            // 从该 Operation 开始，找所有可达后续工序（含自己）
+            return CropToReachable(result, new[] { startOperationCode }, routingGraph);
         }
 
         // P0-02修复 + 第4轮修复：根据StartStageCode裁剪已完成的Stage
         // 第4轮修复：StartStage不存在时不返回整条Routing，而是返回空（数据不一致）
-        // 第4轮修复：DAG场景不能用Skip，要找从StartStage可达的所有后续工序
         if (!string.IsNullOrEmpty(startStageCode))
         {
-            // 找到所有StartStageCode对应的工序
             var startOperations = result.Where(op => op.StageCode == startStageCode).ToList();
 
             if (startOperations.Count == 0)
             {
-                // StartStageCode在Routing中不存在
-                // 这是PI Position数据与当前Routing不一致，不应返回整条Routing
-                // 返回空列表，让上层判定为Unscheduled（不是技术失败）
+                // StartStageCode 在 Routing 中不存在，业务 Unscheduled（非技术失败）
+                failureReason = $"StartStageCode '{startStageCode}' 不存在于 Routing";
                 return new List<OperationNode>();
             }
 
-            // 从StartStage工序开始，找到所有可达的后续工序（包括自己）
-            var reachableOps = new HashSet<string>();
-            var bfsQueue = new Queue<string>();
-
-            // 初始化：所有StartStage工序入队
-            foreach (var startOp in startOperations)
-            {
-                reachableOps.Add(startOp.OperationCode);
-                bfsQueue.Enqueue(startOp.OperationCode);
-            }
-
-            // BFS遍历：从Dependencies找每个工序的所有后续工序
-            while (bfsQueue.Count > 0)
-            {
-                var currentOp = bfsQueue.Dequeue();
-
-                // 遍历所有依赖边，找以currentOp为前驱的后续工序
-                foreach (var kvp in routingGraph.Dependencies)
-                {
-                    var toOp = kvp.Key;
-                    var edges = kvp.Value;
-
-                    // 如果存在从currentOp到toOp的边，且toOp未访问过
-                    if (edges.Any(e => e.FromOperationCode == currentOp) && !reachableOps.Contains(toOp))
-                    {
-                        reachableOps.Add(toOp);
-                        bfsQueue.Enqueue(toOp);
-                    }
-                }
-            }
-
-            // 过滤：只保留可达的工序
-            result = result.Where(op => reachableOps.Contains(op.OperationCode)).ToList();
+            // 从 StartStage 工序开始，找所有可达后续工序（含自己）
+            return CropToReachable(result, startOperations.Select(op => op.OperationCode), routingGraph);
         }
 
+        // 两者都空：返回完整 Routing（S23，从首工序开始）
         return result;
+    }
+
+    /// <summary>
+    /// 从给定起点工序集合出发，裁剪拓扑序为"起点 + 所有可达后续工序"
+    /// PI Position 执行起点上下文专项：Operation/Stage 粒度裁剪共用
+    /// </summary>
+    private List<OperationNode> CropToReachable(
+        List<OperationNode> orderedOperations,
+        IEnumerable<string> startOperationCodes,
+        RoutingGraph routingGraph)
+    {
+        var reachableOps = new HashSet<string>();
+        var bfsQueue = new Queue<string>();
+
+        foreach (var startOpCode in startOperationCodes)
+        {
+            if (reachableOps.Add(startOpCode))
+            {
+                bfsQueue.Enqueue(startOpCode);
+            }
+        }
+
+        // BFS遍历：从Dependencies找每个工序的所有后续工序
+        while (bfsQueue.Count > 0)
+        {
+            var currentOp = bfsQueue.Dequeue();
+
+            // 遍历所有依赖边，找以currentOp为前驱的后续工序
+            foreach (var kvp in routingGraph.Dependencies)
+            {
+                var toOp = kvp.Key;
+                var edges = kvp.Value;
+
+                // 如果存在从currentOp到toOp的边，且toOp未访问过
+                if (edges.Any(e => e.FromOperationCode == currentOp) && !reachableOps.Contains(toOp))
+                {
+                    reachableOps.Add(toOp);
+                    bfsQueue.Enqueue(toOp);
+                }
+            }
+        }
+
+        // 过滤：只保留可达的工序
+        return orderedOperations.Where(op => reachableOps.Contains(op.OperationCode)).ToList();
     }
 
     /// <summary>
@@ -929,11 +984,12 @@ internal class PhaseTwoInitialScheduler
         Dictionary<int, List<TimeWindow>> resourceOccupancy,
         List<FinalTaskDraft> scheduledTasks,
         Dictionary<string, List<(string DemandKey, decimal ShareQty)>> allocationTaskShare,
+        Dictionary<string, LogicalProductionDemand> demandByKey,
         DateTime planningStart,
         DateTime planningEnd)
     {
         // 检测是否可以合并到已有Task
-        var candidateTasks = FindMergeableTasks(demand, operations, scheduledTasks, constraints);
+        var candidateTasks = FindMergeableTasks(demand, operations, scheduledTasks, constraints, demandByKey);
 
         if (candidateTasks.Count > 0)
         {
@@ -976,7 +1032,8 @@ internal class PhaseTwoInitialScheduler
         LogicalProductionDemand demand,
         List<OperationNode> operations,
         List<FinalTaskDraft> scheduledTasks,
-        ConstraintContext constraints)
+        ConstraintContext constraints,
+        Dictionary<string, LogicalProductionDemand> demandByKey)
     {
         var candidates = new List<FinalTaskDraft>();
 
@@ -1001,6 +1058,21 @@ internal class PhaseTwoInitialScheduler
             // Stage和Operation必须完全匹配
             if (task.StageCode != (targetOp.StageCode ?? string.Empty)) continue;
             if (task.OperationCode != targetOp.OperationCode) continue;
+
+            // S29：执行起点一致性校验——不同执行起点不得合批，避免已完成工序被重新排产
+            // 反查候选Task的来源Demand，比较 StartStageCode / StartOperationCode
+            if (!demandByKey.TryGetValue(task.SourceDraftId, out var sourceDemand))
+            {
+                continue; // 无法追溯来源 demand，保守不 merge
+            }
+            if (!string.Equals(demand.StartStageCode, sourceDemand.StartStageCode, StringComparison.Ordinal))
+            {
+                continue; // 不同 StartStage，不 merge
+            }
+            if (!string.Equals(demand.StartOperationCode, sourceDemand.StartOperationCode, StringComparison.Ordinal))
+            {
+                continue; // 不同 StartOperation，不 merge
+            }
 
             candidates.Add(task);
         }

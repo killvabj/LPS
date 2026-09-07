@@ -64,6 +64,12 @@
         "net8.0": {
           "framework": "net8.0",
           "targetAlias": "net8.0",
+          "dependencies": {
+            "Hangfire.Core": {
+              "target": "Package",
+              "version": "[1.8.9, )"
+            }
+          },
           "imports": [
             "net461",
             "net462",
@@ -116,6 +122,9 @@
               "D:\\WorkSpace_LocalLib\\Windsurf WorkSpace\\LPS_SVN\\LPS.APS.Core\\LPS.APS.Core.csproj": {
                 "projectPath": "D:\\WorkSpace_LocalLib\\Windsurf WorkSpace\\LPS_SVN\\LPS.APS.Core\\LPS.APS.Core.csproj"
               },
+              "D:\\WorkSpace_LocalLib\\Windsurf WorkSpace\\LPS_SVN\\LPS.APS.Engine\\LPS.APS.Engine.csproj": {
+                "projectPath": "D:\\WorkSpace_LocalLib\\Windsurf WorkSpace\\LPS_SVN\\LPS.APS.Engine\\LPS.APS.Engine.csproj"
+              },
               "D:\\WorkSpace_LocalLib\\Windsurf WorkSpace\\LPS_SVN\\LPS.APS.Shared\\LPS.APS.Shared.csproj": {
                 "projectPath": "D:\\WorkSpace_LocalLib\\Windsurf WorkSpace\\LPS_SVN\\LPS.APS.Shared\\LPS.APS.Shared.csproj"
               }
@@ -139,6 +148,10 @@
           "framework": "net8.0",
           "targetAlias": "net8.0",
           "dependencies": {
+            "Dapper": {
+              "target": "Package",
+              "version": "[2.1.72, )"
+            },
             "Scrutor": {
               "target": "Package",
               "version": "[4.2.2, )"
