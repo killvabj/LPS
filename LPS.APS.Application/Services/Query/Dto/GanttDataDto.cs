@@ -31,7 +31,7 @@ public class GanttResourceDto
 
     /// <summary>
     /// 资源所属域标识（G2-b 档①；U01 多 Domain 染色分组）
-    /// V1.2：域 = 工厂维度（FACTORY_{FactoryId}，与 LogicalProductionDemand.DomainKey 一致）
+    /// F-G4：域不再以 FACTORY_{id} 命名规则推导，资源域 = 所属 PlanVersion.DomainKey（DomainDefinition 唯一权威源）
     /// </summary>
     public string? DomainKey { get; set; }
 

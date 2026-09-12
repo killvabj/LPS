@@ -1,15 +1,18 @@
 namespace LPS.APS.Core.Dto;
 
 /// <summary>
-/// 生产指示位置结果（5号位职责输出 — PI Position计算结果）
+/// 生产指示位置结果（5号位职责输出 — PI Position计算结果 + NextOperationContext）
 ///
 /// 职责边界：
 /// - 5号位负责计算PI在工厂内的物理位置（Stage/XC/Transit/Waiting/Unlocated）
-/// - 2号位负责消费此结果，参与Pegging主流程
+/// - 5号位负责计算执行起点上下文（NextOperationContext）
+/// - 2号位负责消费此结果，组装LogicalProductionDemand，参与Pegging主流程
 ///
 /// 冻结约束：
 /// - Σ PositionSlice.Quantity = TotalRemainingQty = ERP RemainingQty
 /// - 所有Position必须互斥，同一物理数量不能同时算Stage、XC和Transit
+/// - Σ NextOperationContext.SliceQty = 需要继续生产的PI Position数量
+/// - NextOperationContext不是Supply、不是Position、不是Allocation
 /// </summary>
 public sealed class ProductionInstructionPositionResult
 {
@@ -27,6 +30,13 @@ public sealed class ProductionInstructionPositionResult
     /// 位置切片列表（FIRST_STAGE_PENDING / STAGE_WAITING / XC / INTERPLANT_TRANSIT / UNLOCATED）
     /// </summary>
     public IReadOnlyList<PositionSlice> Positions { get; init; } = Array.Empty<PositionSlice>();
+
+    /// <summary>
+    /// 执行起点上下文列表（该PI数量份额下一步从哪个Stage/Operation继续）
+    /// 同一PI可有多个切片（如200件从NC开始，800件从挤丝开始）
+    /// Σ SliceQty = 需要继续生产的PI Position数量
+    /// </summary>
+    public IReadOnlyList<NextOperationContextDto> NextOperationContexts { get; init; } = Array.Empty<NextOperationContextDto>();
 
     /// <summary>
     /// 位置计算问题记录

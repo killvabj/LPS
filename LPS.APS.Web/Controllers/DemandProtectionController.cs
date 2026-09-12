@@ -1,3 +1,5 @@
+using Microsoft.AspNetCore.Authorization;
+using LPS.APS.Core.Authorization;
 using LPS.APS.BusinessRules.Services;
 using LPS.APS.Core.Dto;
 using LPS.APS.Shared.Models;
@@ -16,6 +18,7 @@ namespace LPS.APS.Web.Controllers;
 /// - 查看：5号位自己实现（直接查库）
 /// - 释放：必须通过2号位Application Service（暂未实现）
 /// </summary>
+[Authorize(Policy = PermissionCodes.PlanView)]
 [ApiController]
 [Route("api/demand-protection")]
 public class DemandProtectionController : ControllerBase

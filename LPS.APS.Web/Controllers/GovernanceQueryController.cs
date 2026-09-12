@@ -1,3 +1,5 @@
+using Microsoft.AspNetCore.Authorization;
+using LPS.APS.Core.Authorization;
 using LPS.APS.BusinessRules.Services;
 using LPS.APS.Core.Dto;
 using LPS.APS.Core.DTOs.Governance;
@@ -7,17 +9,20 @@ using Microsoft.AspNetCore.Mvc;
 namespace LPS.APS.Web.Controllers;
 
 /// <summary>
-/// 治理查询控制器（G4/G7：5号位中转，直接读取APS事实表）
+/// 治理查询控制器（G4/G7：5号位业务接口接入层）
 ///
 /// 路由规范：
 ///   GET /api/governance-query/runs                    - 排程运行列表（G4）
 ///   GET /api/governance-query/domain-dependencies     - 排程域依赖（G7）
 ///
-/// 【职责边界】
-/// - 5号位提供只读查询接口
-/// - 不修改、不重算业务结果
-/// - ScheduleRun状态由2号位/3号位产生，5号位只读展示
+/// 【职责边界 - 2026-09-06审核确认】
+/// - 普通结果查询：4 → 5 → 2（5号位中转，2号位运行真值）
+/// - 治理动作：4 → 3 → 2（3号位治理，5号位不涉及）
+/// - 5号位提供只读查询接口，不修改、不重算业务结果
+/// - ScheduleRun状态由2号位运行收口产生，5号位只读展示
+/// - 后续目标：G4/G7数据源从直读APS表迁移到2号位Query Service
 /// </summary>
+[Authorize(Policy = PermissionCodes.PlanView)]
 [ApiController]
 [Route("api/governance-query")]
 public class GovernanceQueryController : ControllerBase

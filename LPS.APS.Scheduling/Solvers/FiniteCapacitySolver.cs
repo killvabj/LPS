@@ -21,9 +21,14 @@ namespace LPS.APS.Scheduling.Solvers;
 /// - 纯内存计算，严禁任何I/O操作
 /// - 不读库、不写库，只对内存对象排资源和时间
 /// - 设备负荷率必须 ≤ 100%（这是算法正确性保证，不是业务校验）
+///
+/// 【生产入口】只有 <see cref="SolveAsync"/> 是真实排程入口（Phase 1-5 五阶段流程）。
+/// 早期单方法版本 Solve() / Reschedule() 已被五阶段流程取代，属于遗留死代码，
+/// 仅依赖它们的 TimeSlotFinder / SetupOptimizer / PriorityTaskQueue / ScopeConstraint 也随之失效（见各文件头注释）。
 /// </summary>
 public class FiniteCapacitySolver : IFiniteCapacityScheduler
 {
+    // 遗留字段：仅供下方死代码 Solve()/Reschedule() 使用，生产五阶段流程（SolveAsync）不经过它们。
     private readonly TimeSlotFinder _timeSlotFinder;
     private readonly SetupOptimizer _setupOptimizer;
 
@@ -100,7 +105,10 @@ public class FiniteCapacitySolver : IFiniteCapacityScheduler
     }
 
     /// <summary>
-    /// 执行有限产能排程
+    /// 【遗留死代码】早期单方法版本排程入口，已被 <see cref="SolveAsync"/> 五阶段流程取代。
+    /// 生产环境没有任何调用方（唯一调用入口是 SolveAsync → Phase1-5）。
+    /// 本方法走 TimeSlotFinder.FindSlot 旧寻址路径，Phase2/Phase4 各自持有独立副本。
+    /// 保留仅为历史参考，请勿在此路径上修改或新增逻辑。
     /// </summary>
     /// <param name="context">排程沙盘上下文（由2号位在阶段1填充）</param>
     /// <param name="options">排程配置选项</param>
@@ -191,9 +199,10 @@ public class FiniteCapacitySolver : IFiniteCapacityScheduler
     // }
 
     /// <summary>
-    /// 执行局部重排（场景6步骤6.3，文档二 LOCAL_RESCHEDULE 模式）
-    /// 锁定的Task作为时间锚点不移动，只对范围内可移动的Task重新寻址
-    /// 典型场景：插单/急单到达，需要重排未开工的Task，但已在制Task不能动
+    /// 【遗留死代码】早期局部重排入口（场景6步骤6.3，LOCAL_RESCHEDULE 模式），已被五阶段流程取代。
+    /// 生产环境没有任何调用方。锁定的Task作为时间锚点不移动，只对范围内可移动的Task重新寻址。
+    /// 本方法走 TimeSlotFinder.FindSlot + PriorityTaskQueue 旧路径，同样为死代码。
+    /// 保留仅为历史参考，请勿在此路径上修改或新增逻辑。
     /// </summary>
     /// <param name="context">排程沙盘上下文</param>
     /// <param name="options">排程配置选项</param>
@@ -260,7 +269,8 @@ public class FiniteCapacitySolver : IFiniteCapacityScheduler
     }
 
     /// <summary>
-    /// 构建优先级队列（Priority降序）
+    /// 【仅供死代码 Solve() 使用】构建优先级队列（Priority降序）。
+    /// 生产五阶段流程的排序逻辑在 PhaseTwoInitialScheduler（按 CrossMaterialOrder 分层），不经过这里。
     /// </summary>
     /// <param name="context">排程沙盘上下文</param>
     /// <returns>按Priority DESC排序的任务队列</returns>

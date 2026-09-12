@@ -1,7 +1,7 @@
 [
   {
     "ContainingType": "Program\u002B\u003C\u003Ec",
-    "Method": "\u003C\u003CMain\u003E$\u003Eb__0_10",
+    "Method": "\u003C\u003CMain\u003E$\u003Eb__0_12",
     "RelativePath": "",
     "HttpMethod": "GET",
     "IsController": false,
@@ -435,7 +435,7 @@
       },
       {
         "Name": "entityId",
-        "Type": "System.Nullable\u00601[[System.Int64, System.Private.CoreLib, Version=8.0.0.0, Culture=neutral, PublicKeyToken=7cec85d7bea7798e]]",
+        "Type": "System.String",
         "IsRequired": false
       },
       {
@@ -1697,6 +1697,88 @@
     "ReturnTypes": [
       {
         "Type": "LPS.APS.Shared.Models.ApiResponse\u00601[[LPS.APS.Core.Dto.PeggingTraceSummaryDto, LPS.APS.Core, Version=1.0.0.0, Culture=neutral, PublicKeyToken=null]]",
+        "MediaTypes": [
+          "text/plain",
+          "application/json",
+          "text/json"
+        ],
+        "StatusCode": 200
+      }
+    ]
+  },
+  {
+    "ContainingType": "LPS.APS.Web.Controllers.PiPositionController",
+    "Method": "Query",
+    "RelativePath": "api/pi-position",
+    "HttpMethod": "GET",
+    "IsController": true,
+    "Order": 0,
+    "Parameters": [
+      {
+        "Name": "planVersionId",
+        "Type": "System.Int32",
+        "IsRequired": false
+      },
+      {
+        "Name": "productionInstructionNo",
+        "Type": "System.String",
+        "IsRequired": false
+      },
+      {
+        "Name": "materialCode",
+        "Type": "System.String",
+        "IsRequired": false
+      },
+      {
+        "Name": "positionType",
+        "Type": "System.String",
+        "IsRequired": false
+      },
+      {
+        "Name": "stageCode",
+        "Type": "System.String",
+        "IsRequired": false
+      },
+      {
+        "Name": "skip",
+        "Type": "System.Int32",
+        "IsRequired": false
+      },
+      {
+        "Name": "take",
+        "Type": "System.Int32",
+        "IsRequired": false
+      }
+    ],
+    "ReturnTypes": [
+      {
+        "Type": "LPS.APS.Shared.Models.ApiResponse\u00601[[System.Collections.Generic.List\u00601[[LPS.APS.Core.Dto.PiPositionDto, LPS.APS.Core, Version=1.0.0.0, Culture=neutral, PublicKeyToken=null]], System.Private.CoreLib, Version=8.0.0.0, Culture=neutral, PublicKeyToken=7cec85d7bea7798e]]",
+        "MediaTypes": [
+          "text/plain",
+          "application/json",
+          "text/json"
+        ],
+        "StatusCode": 200
+      }
+    ]
+  },
+  {
+    "ContainingType": "LPS.APS.Web.Controllers.PiPositionController",
+    "Method": "GetSummary",
+    "RelativePath": "api/pi-position/summary",
+    "HttpMethod": "GET",
+    "IsController": true,
+    "Order": 0,
+    "Parameters": [
+      {
+        "Name": "planVersionId",
+        "Type": "System.Int32",
+        "IsRequired": false
+      }
+    ],
+    "ReturnTypes": [
+      {
+        "Type": "LPS.APS.Shared.Models.ApiResponse\u00601[[LPS.APS.Core.Dto.PiPositionSummaryDto, LPS.APS.Core, Version=1.0.0.0, Culture=neutral, PublicKeyToken=null]]",
         "MediaTypes": [
           "text/plain",
           "application/json",

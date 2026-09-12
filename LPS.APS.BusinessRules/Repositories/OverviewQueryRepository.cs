@@ -76,6 +76,8 @@ WHERE PlanVersionId = @PlanVersionId";
         int topN = 10,
         CancellationToken ct = default)
     {
+        // 注意：Bottleneck判定应由2号位正式Query提供，5号位不做二次计算
+        // 此处仅返回资源任务数统计，不判定Bottleneck
         var sql = @"
 SELECT TOP (@TopN)
     t.ResourceId,
@@ -84,11 +86,7 @@ SELECT TOP (@TopN)
     r.ResourceType,
     COUNT(*) AS TaskCount,
     SUM(ISNULL(t.Duration, 0)) / 3600.0 AS TotalPlannedHours,
-    CASE
-        WHEN SUM(ISNULL(t.Duration, 0)) > 0
-        THEN SUM(ISNULL(t.Duration, 0)) / (7.0 * 24 * 3600)  -- 假设7天可用工时
-        ELSE 0
-    END AS UtilizationRate,
+    NULL AS UtilizationRate,
     0 AS IsBottleneck
 FROM Task t
 INNER JOIN Resource r ON r.Id = t.ResourceId
@@ -102,25 +100,7 @@ ORDER BY TotalPlannedHours DESC";
         var results = await _connectionManager.QueryAsync<OverviewResourceBottleneckDto>(
             sql, parameters, CommandType.Text, DatabaseId.APS, commandTimeout: 30);
 
-        var list = results.ToList();
-
-        // 标记负荷最高的为Bottleneck
-        if (list.Count > 0)
-        {
-            list[0] = new OverviewResourceBottleneckDto
-            {
-                ResourceId = list[0].ResourceId,
-                ResourceCode = list[0].ResourceCode,
-                ResourceName = list[0].ResourceName,
-                ResourceType = list[0].ResourceType,
-                TaskCount = list[0].TaskCount,
-                TotalPlannedHours = list[0].TotalPlannedHours,
-                UtilizationRate = list[0].UtilizationRate,
-                IsBottleneck = true
-            };
-        }
-
-        return list;
+        return results.ToList();
     }
 
     public async Task<OverviewCandidateSummaryDto> GetCandidateSummaryAsync(

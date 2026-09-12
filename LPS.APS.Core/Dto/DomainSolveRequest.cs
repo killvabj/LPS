@@ -19,6 +19,14 @@ public sealed class DomainSolveRequest
     public IReadOnlyList<LogicalProductionDemand> LogicalProductionDemands { get; init; }
         = Array.Empty<LogicalProductionDemand>();
 
+    /// <summary>
+    /// 多层 BOM「任务喂任务」血缘输入（PM 2026-09-10 裁决 R2）：父 LogicalProductionDemand → 子 LogicalProductionDemand
+    /// 运行时关系。1号位据此 + 拆批/合批 + Routing 生成真实 TaskDependency（FinalTaskPeggingDraft）。
+    /// 子件全库存 / 全 PI 时无子 NEW_REQUIREMENT，不产对应 link。
+    /// </summary>
+    public IReadOnlyList<MaterialRequirementLink> MaterialRequirementLinks { get; init; }
+        = Array.Empty<MaterialRequirementLink>();
+
     public IReadOnlyList<AllocationLineage> AllocationLineage { get; init; }
         = Array.Empty<AllocationLineage>();
 

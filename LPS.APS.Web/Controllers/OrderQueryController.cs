@@ -1,3 +1,5 @@
+using Microsoft.AspNetCore.Authorization;
+using LPS.APS.Core.Authorization;
 using LPS.APS.BusinessRules.Services;
 using LPS.APS.Core.Dto;
 using LPS.APS.Shared.Models;
@@ -16,6 +18,7 @@ namespace LPS.APS.Web.Controllers;
 /// - 5号位提供只读查询接口，直接读取APS事实表
 /// - 不重算Pegging，不修改订单状态
 /// </summary>
+[Authorize(Policy = PermissionCodes.PlanView)]
 [ApiController]
 [Route("api/order-query")]
 public class OrderQueryController : ControllerBase

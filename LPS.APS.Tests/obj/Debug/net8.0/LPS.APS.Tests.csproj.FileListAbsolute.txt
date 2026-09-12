@@ -263,3 +263,6 @@ D:\WorkSpace_LocalLib\Windsurf WorkSpace\LPS_SVN\LPS.APS.Tests\obj\Debug\net8.0\
 D:\WorkSpace_LocalLib\Windsurf WorkSpace\LPS_SVN\LPS.APS.Tests\obj\Debug\net8.0\LPS.APS.Tests.pdb
 D:\WorkSpace_LocalLib\Windsurf WorkSpace\LPS_SVN\LPS.APS.Tests\obj\Debug\net8.0\LPS.APS.Tests.genruntimeconfig.cache
 D:\WorkSpace_LocalLib\Windsurf WorkSpace\LPS_SVN\LPS.APS.Tests\obj\Debug\net8.0\ref\LPS.APS.Tests.dll
+D:\WorkSpace_LocalLib\Windsurf WorkSpace\LPS_SVN\LPS.APS.Tests\bin\Debug\net8.0\appsettings.Test.Local.json
+D:\WorkSpace_LocalLib\Windsurf WorkSpace\LPS_SVN\LPS.APS.Tests\bin\Debug\net8.0\Validation.dll
+D:\WorkSpace_LocalLib\Windsurf WorkSpace\LPS_SVN\LPS.APS.Tests\bin\Debug\net8.0\Xunit.SkippableFact.dll

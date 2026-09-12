@@ -40,9 +40,10 @@
             登出
             </summary>
         </member>
-        <member name="M:LPS.APS.Web.Controllers.AuthController.GetCurrentUser">
+        <member name="M:LPS.APS.Web.Controllers.AuthController.GetCurrentUser(System.Threading.CancellationToken)">
             <summary>
             获取当前用户信息（验证Token有效性）
+            含业务范围（IsGlobal + 各维度集合），直接复用 IDiaScopeService（不建立第二套 Scope DTO 真值）。
             </summary>
         </member>
         <member name="T:LPS.APS.Web.Controllers.BusinessFactIssueController">
@@ -92,15 +93,17 @@
         </member>
         <member name="T:LPS.APS.Web.Controllers.DomainStatusController">
              <summary>
-             排程域状态查询控制器（G8：5号位中转，3号位真源）
-            
-             职责边界（0号位裁定）：
-             - 5号位提供前端接口接入
-             - 3号位RunLifecycleService提供状态真源
-             - 5号位不自行聚合状态
+             排程域状态查询控制器（G8：5号位业务接口接入层）
             
              路由规范：
                GET /api/domain-status/{scheduleRunId}  - 查询排程域状态
+            
+             【职责边界 - 2026-09-06审核确认】
+             - 普通结果查询：4 → 5 → 2（5号位中转，2号位运行真值）
+             - 当前实现：5号位调用3号位RunLifecycleService获取状态真源
+             - 后续目标：G8数据源从5→3迁移到5→2（2号位Query Service）
+             - 5号位不自行聚合状态，不重算业务真值
+             - 状态取值：COMPLETED / CANDIDATE / RUNNING / FAILED / BLOCKED / NOT_STARTED
              </summary>
         </member>
         <member name="M:LPS.APS.Web.Controllers.DomainStatusController.GetRunDomainStatus(System.Int32,System.Threading.CancellationToken)">
@@ -144,6 +147,9 @@
         </member>
         <member name="M:LPS.APS.Web.Controllers.GovernanceController.GetCurrentUserId">
             <summary>解析当前登录用户 Id（无效时返回 0 → 范围解析为拒绝全部，安全默认）</summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.GetCurrentUserCode">
+            <summary>解析当前登录用户工号（审计真实 Actor，P1-04 强制后端取身份，禁止信任请求体）</summary>
         </member>
         <member name="M:LPS.APS.Web.Controllers.GovernanceController.GetRuleSetVersions(System.Int64,System.Threading.CancellationToken)">
             <summary>获取规则集的所有版本</summary>
@@ -321,7 +327,7 @@
             <summary>域依赖关系查询（G7：4号位失败链 / 域依赖展示；数据源为 2号位 sp_ScanDomainDependency 扫描结果，只读）</summary>
             <remarks>开发者：3号位</remarks>
         </member>
-        <member name="M:LPS.APS.Web.Controllers.GovernanceController.GetAuditLogs(System.String,System.Nullable{System.Int64},System.Nullable{System.DateTime},System.Nullable{System.DateTime},System.Nullable{System.Int32},System.Threading.CancellationToken)">
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.GetAuditLogs(System.String,System.String,System.Nullable{System.DateTime},System.Nullable{System.DateTime},System.Nullable{System.Int32},System.Threading.CancellationToken)">
             <summary>治理审计日志查询（G6：实体类型/实体ID/时间范围 可空组合，按操作时间倒序）</summary>
             <remarks>开发者：3号位</remarks>
         </member>
@@ -375,9 +381,6 @@
             <summary>版本停用请求 DTO（G2：3-4联调）</summary>
             <remarks>开发者：3号位</remarks>
         </member>
-        <member name="P:LPS.APS.Web.Controllers.DisableRequest.OperatedBy">
-            <summary>操作人（必填，审计记录）</summary>
-        </member>
         <member name="P:LPS.APS.Web.Controllers.DisableRequest.Reason">
             <summary>停用原因（写入版本 Remarks + 审计 Remarks，可空）</summary>
         </member>
@@ -385,18 +388,12 @@
             <summary>Candidate 确认请求 DTO（P0-08）</summary>
             <remarks>开发者：3号位</remarks>
         </member>
-        <member name="P:LPS.APS.Web.Controllers.ConfirmCandidateRequest.Actor">
-            <summary>确认人（必填）</summary>
-        </member>
         <member name="P:LPS.APS.Web.Controllers.ConfirmCandidateRequest.Remark">
             <summary>必要备注（可空）</summary>
         </member>
         <member name="T:LPS.APS.Web.Controllers.ActivateCandidateRequest">
             <summary>Candidate 激活请求 DTO（P0-08）</summary>
             <remarks>开发者：3号位</remarks>
-        </member>
-        <member name="P:LPS.APS.Web.Controllers.ActivateCandidateRequest.Actor">
-            <summary>激活人（必填）</summary>
         </member>
         <member name="T:LPS.APS.Web.Controllers.CreateCandidateRunRequest">
             <summary>白天候选运行创建请求 DTO（B-1）</summary>
@@ -417,24 +414,23 @@
         <member name="P:LPS.APS.Web.Controllers.CreateCandidateRunRequest.DataCutoffTime">
             <summary>本次运行统一数据切片边界（可选；缺省 now）</summary>
         </member>
-        <member name="P:LPS.APS.Web.Controllers.CreateCandidateRunRequest.Actor">
-            <summary>操作人（必填）</summary>
-        </member>
         <member name="P:LPS.APS.Web.Controllers.CreateCandidateRunRequest.Remark">
             <summary>备注（契约位保留，B-1 本轮不参与业务逻辑）</summary>
         </member>
         <member name="T:LPS.APS.Web.Controllers.GovernanceQueryController">
              <summary>
-             治理查询控制器（G4/G7：5号位中转，直接读取APS事实表）
+             治理查询控制器（G4/G7：5号位业务接口接入层）
             
              路由规范：
                GET /api/governance-query/runs                    - 排程运行列表（G4）
                GET /api/governance-query/domain-dependencies     - 排程域依赖（G7）
             
-             【职责边界】
-             - 5号位提供只读查询接口
-             - 不修改、不重算业务结果
-             - ScheduleRun状态由2号位/3号位产生，5号位只读展示
+             【职责边界 - 2026-09-06审核确认】
+             - 普通结果查询：4 → 5 → 2（5号位中转，2号位运行真值）
+             - 治理动作：4 → 3 → 2（3号位治理，5号位不涉及）
+             - 5号位提供只读查询接口，不修改、不重算业务结果
+             - ScheduleRun状态由2号位运行收口产生，5号位只读展示
+             - 后续目标：G4/G7数据源从直读APS表迁移到2号位Query Service
              </summary>
         </member>
         <member name="M:LPS.APS.Web.Controllers.GovernanceQueryController.GetRuns(System.String,System.String,System.Int32,System.Threading.CancellationToken)">
@@ -532,6 +528,29 @@
         <member name="M:LPS.APS.Web.Controllers.PeggingTraceController.GetSummary(System.Int32,System.Threading.CancellationToken)">
             <summary>
             查询Pegging Trace汇总
+            </summary>
+        </member>
+        <member name="T:LPS.APS.Web.Controllers.PiPositionController">
+             <summary>
+             PI Position查询控制器（5号位提供给4号位）
+            
+             路由规范：
+               GET /api/pi-position?planVersionId=        - PI Position列表查询
+               GET /api/pi-position/summary?planVersionId= - PI Position汇总
+            
+             【职责边界】
+             - 5号位提供只读查询接口，直接读取ProductionInstructionPositionSnapshot表
+             - 不重算Position，不修改Snapshot
+             </summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.PiPositionController.Query(System.Int32,System.String,System.String,System.String,System.String,System.Int32,System.Int32,System.Threading.CancellationToken)">
+            <summary>
+            查询PI Position列表
+            </summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.PiPositionController.GetSummary(System.Int32,System.Threading.CancellationToken)">
+            <summary>
+            查询PI Position汇总
             </summary>
         </member>
         <member name="T:LPS.APS.Web.Controllers.ProcurementManualEtaController">
@@ -659,13 +678,17 @@
         </member>
         <member name="T:LPS.APS.Web.Controllers.ScheduleController">
              <summary>
-             排程结果查询控制器（3号位，供 4号位前端甘特图调用）
+             排程结果查询控制器（5号位中转，供4号位前端甘特图调用）
             
              路由规范：
                GET /api/schedule/versions          - 计划版本列表
                GET /api/schedule/gantt/{id}        - 指定版本的甘特图数据
                GET /api/schedule/summary/{id}      - 指定版本的排程概要 KPI
             
+             【职责边界】
+             - 5号位提供只读查询接口
+             - 数据来源：IScheduleQueryService（读取已落盘APS事实）
+             - V1不包含：触发重排/拖拽调整/解冻申请等写操作
              F-G4：以当前登录用户 Id 为入口，由 IScheduleQueryService 内部解析业务范围并过滤（Domain/Factory 维度）。
              V1 不包含：触发重排 / 拖拽调整 / 解冻申请 等写操作（后续阶段铺开）
              </summary>
@@ -766,6 +789,24 @@
         </member>
         <member name="P:LPS.APS.Web.Dto.Auth.UserInfoDto.Permissions">
             <summary>功能权限码列表（登录签发时注入 JWT，供前端菜单/按钮渲染）</summary>
+        </member>
+        <member name="P:LPS.APS.Web.Dto.Auth.UserInfoDto.IsGlobal">
+            <summary>业务范围：是否全局放行（Global 时为全放行，各维度集合为空）</summary>
+        </member>
+        <member name="P:LPS.APS.Web.Dto.Auth.UserInfoDto.Factories">
+            <summary>业务范围：工厂范围值集合</summary>
+        </member>
+        <member name="P:LPS.APS.Web.Dto.Auth.UserInfoDto.ProductFamilies">
+            <summary>业务范围：产品族范围值集合</summary>
+        </member>
+        <member name="P:LPS.APS.Web.Dto.Auth.UserInfoDto.Departments">
+            <summary>业务范围：部门范围值集合</summary>
+        </member>
+        <member name="P:LPS.APS.Web.Dto.Auth.UserInfoDto.Domains">
+            <summary>业务范围：域范围值集合</summary>
+        </member>
+        <member name="P:LPS.APS.Web.Dto.Auth.UserInfoDto.ResourceOrgGroups">
+            <summary>业务范围：资源组织组范围值集合（兼容字段）</summary>
         </member>
         <member name="T:LPS.APS.Web.Extensions.AuthorizationExtensions">
             <summary>认证授权扩展（F-G2/F-G3，3号位）</summary>

@@ -29,10 +29,33 @@ internal class PhaseTwoInitialScheduler
         // P0-07修复：构建锁定任务的DraftId集合，用于排除已固定的需求
         var lockedDraftIds = new HashSet<string>(constraints.LockedTasks.Keys);
 
-        // 按 DemandSequence 排序（2号位已排好序）
-        var sortedDemands = request.LogicalProductionDemands
-            .OrderBy(d => d.DemandSequence)
-            .ToList();
+        // 跨物料时序硬约束（任务喂任务，方案A）：子先父后分层遍历。
+        // 若存在 BOM 依赖环，Phase1 已标记，此处直接判技术失败。
+        if (constraints.CrossMaterialHasCycle)
+        {
+            result.TechnicalFailure = true;
+            result.TechnicalFailureReason = "跨物料 BOM 依赖存在环（任务喂任务）";
+            return result;
+        }
+
+        // 按跨物料分层顺序排序（子层先、父层后，层内按 DemandSequence）；无跨物料关系时等价于旧平铺。
+        var demandByKey = request.LogicalProductionDemands
+            .ToDictionary(d => d.LogicalDemandKey);
+
+        List<LogicalProductionDemand> sortedDemands;
+        if (constraints.CrossMaterialOrder.Count > 0)
+        {
+            sortedDemands = constraints.CrossMaterialOrder
+                .Select(key => demandByKey.GetValueOrDefault(key))
+                .Where(d => d != null)
+                .ToList()!;
+        }
+        else
+        {
+            sortedDemands = request.LogicalProductionDemands
+                .OrderBy(d => d.DemandSequence)
+                .ToList();
+        }
 
         // 资源占用追踪：ResourceId → 已占用时间窗列表
         var resourceOccupancy = InitializeResourceOccupancy(request.Resources, constraints);
@@ -75,8 +98,8 @@ internal class PhaseTwoInitialScheduler
         // 第4轮Merge修复：记录Demand到Task的份额追溯，支持合批
         var allocationTaskShare = new Dictionary<string, List<(string DemandKey, decimal ShareQty)>>();
 
-        // PI Position 执行起点上下文专项：S29 merge 执行起点一致性校验所需的反查索引
-        var demandByKey = request.LogicalProductionDemands.ToDictionary(d => d.LogicalDemandKey);
+        // 跨物料时序（块3/块4）：记录每个已排需求的最晚完成时间，供父件取子件完成时间作为动态物料下界。
+        var demandCompletion = new Dictionary<string, DateTime>();
 
         foreach (var demand in sortedDemands)
         {
@@ -164,6 +187,17 @@ internal class PhaseTwoInitialScheduler
                 return result;
             }
 
+            // 块3/块4（任务喂任务，方案A）：子件完成时间 → 父件动态物料下界。
+            // 拓扑序保证排父件时子件已排过；子件未成功排程则父件缺料 → Unscheduled。
+            var dynamicMaterialFloor = GetDynamicMaterialFloor(
+                demand.LogicalDemandKey, constraints, demandCompletion, out bool childUnavailable);
+
+            if (childUnavailable)
+            {
+                result.UnscheduledDemandKeys.Add(demand.LogicalDemandKey);
+                continue;
+            }
+
             // 排程该需求的所有工序（使用actualDemand）
             List<FinalTaskDraft> demandTasks;
 
@@ -181,7 +215,8 @@ internal class PhaseTwoInitialScheduler
                     allocationTaskShare,
                     demandByKey,
                     request.PlanningStart,
-                    request.PlanningEnd);
+                    request.PlanningEnd,
+                    dynamicMaterialFloor);
             }
             else
             {
@@ -193,7 +228,8 @@ internal class PhaseTwoInitialScheduler
                     constraints,
                     resourceOccupancy,
                     request.PlanningStart,
-                    request.PlanningEnd);
+                    request.PlanningEnd,
+                    dynamicMaterialFloor);
             }
 
             // 第5轮Merge修复：Merge成功时返回空List，但Demand已进入TaskShare，不应标记为Unscheduled
@@ -211,10 +247,53 @@ internal class PhaseTwoInitialScheduler
             else
             {
                 result.ScheduledTasks.AddRange(demandTasks);
+
+                // 块3/块4：登记本需求完成时间（所有工序Task的最晚End），供父件取动态物料下界。
+                var completion = demandTasks.Max(t => t.PlannedEndTime);
+                demandCompletion[demand.LogicalDemandKey] = completion;
             }
         }
 
         return result;
+    }
+
+    /// <summary>
+    /// 块4（任务喂任务，方案A）：计算某需求的「子件完成时间」动态物料下界。
+    /// 取该需求所有直接子件（CrossMaterialParentToChildren）已排程完成时间的最大值。
+    /// 若任一子件尚未成功排程（缺料），返回 childUnavailable=true，调用方应标记父件 Unscheduled。
+    /// 无子件时返回 DateTime.MinValue（无动态下界，等价于旧行为）。
+    /// </summary>
+    private DateTime GetDynamicMaterialFloor(
+        string demandKey,
+        ConstraintContext constraints,
+        Dictionary<string, DateTime> demandCompletion,
+        out bool childUnavailable)
+    {
+        childUnavailable = false;
+
+        if (!constraints.CrossMaterialParentToChildren.TryGetValue(demandKey, out var children)
+            || children.Count == 0)
+        {
+            return DateTime.MinValue;
+        }
+
+        DateTime floor = DateTime.MinValue;
+        foreach (var childKey in children)
+        {
+            if (!demandCompletion.TryGetValue(childKey, out var childEnd))
+            {
+                // 子件未成功排程 → 父件缺料，硬约束无法满足
+                childUnavailable = true;
+                continue;
+            }
+
+            if (childEnd > floor)
+            {
+                floor = childEnd;
+            }
+        }
+
+        return floor;
     }
 
     /// <summary>
@@ -434,26 +513,27 @@ internal class PhaseTwoInitialScheduler
         ConstraintContext constraints,
         Dictionary<int, List<TimeWindow>> resourceOccupancy,
         DateTime planningStart,
-        DateTime planningEnd)
+        DateTime planningEnd,
+        DateTime dynamicMaterialFloor)
     {
         var tasks = new List<FinalTaskDraft>();
 
         // 根据排程方向选择策略
         if (direction == "BACKWARD")
         {
-            tasks = ScheduleBackward(demand, operations, routingGraph, constraints, resourceOccupancy, planningStart, planningEnd);
+            tasks = ScheduleBackward(demand, operations, routingGraph, constraints, resourceOccupancy, planningStart, planningEnd, dynamicMaterialFloor);
         }
         else if (direction == "FORWARD")
         {
-            tasks = ScheduleForward(demand, operations, routingGraph, constraints, resourceOccupancy, planningStart, planningEnd);
+            tasks = ScheduleForward(demand, operations, routingGraph, constraints, resourceOccupancy, planningStart, planningEnd, dynamicMaterialFloor);
         }
         else // MIXED 或其他
         {
             // 先尝试倒排，失败则转正排（§八 8.3 Mixed模式）
-            tasks = ScheduleBackward(demand, operations, routingGraph, constraints, resourceOccupancy, planningStart, planningEnd);
+            tasks = ScheduleBackward(demand, operations, routingGraph, constraints, resourceOccupancy, planningStart, planningEnd, dynamicMaterialFloor);
             if (tasks.Count == 0)
             {
-                tasks = ScheduleForward(demand, operations, routingGraph, constraints, resourceOccupancy, planningStart, planningEnd);
+                tasks = ScheduleForward(demand, operations, routingGraph, constraints, resourceOccupancy, planningStart, planningEnd, dynamicMaterialFloor);
             }
         }
 
@@ -471,17 +551,20 @@ internal class PhaseTwoInitialScheduler
         ConstraintContext constraints,
         Dictionary<int, List<TimeWindow>> resourceOccupancy,
         DateTime planningStart,
-        DateTime planningEnd)
+        DateTime planningEnd,
+        DateTime dynamicMaterialFloor)
     {
         var tasks = new List<FinalTaskDraft>();
         var currentEndTime = demand.RequiredAvailableTime;
 
         // P0-05修复：获取物料最早可用时间，作为倒排的硬约束下界
+        // 块4（任务喂任务）：合并子件完成时间，父件不能早于子件完成
         var materialEarliestTime = GetMaterialEarliestTime(
             demand.AllocationSequence,
             demand.NetOutputQty,
             constraints,
             planningStart,
+            dynamicMaterialFloor,
             out bool isMaterialSufficient);
 
         // P0-05修复：物料总量不足时，标记为业务Unscheduled（不是技术失败）
@@ -590,17 +673,20 @@ internal class PhaseTwoInitialScheduler
         ConstraintContext constraints,
         Dictionary<int, List<TimeWindow>> resourceOccupancy,
         DateTime planningStart,
-        DateTime planningEnd)
+        DateTime planningEnd,
+        DateTime dynamicMaterialFloor)
     {
         var tasks = new List<FinalTaskDraft>();
 
         // 获取物料最早可用时间
         // P0-05修复：传入所需数量，根据累计可用量确定启动时间，并验证总量是否足够
+        // 块4（任务喂任务）：合并子件完成时间，父件不能早于子件完成
         var materialEarliestStart = GetMaterialEarliestTime(
             demand.AllocationSequence,
             demand.NetOutputQty,
             constraints,
             planningStart,
+            dynamicMaterialFloor,
             out bool isMaterialSufficient);
 
         // P0-05修复：物料总量不足时，标记为业务Unscheduled（不是技术失败）
@@ -725,15 +811,20 @@ internal class PhaseTwoInitialScheduler
     /// 获取物料最早可用时间
     /// 文档：§四 4.6、§十二 Stage overlap
     /// P0-05修复：支持多段Quantity-Time，根据所需数量确定可用时间，并验证总量是否足够
+    /// 块4（任务喂任务，方案A）：合并子件完成时间（dynamicMaterialFloor），
+    /// 父件的物料最早可用时间 = max(静态到货时间, 子件真实完成时间)。
     /// </summary>
     private DateTime GetMaterialEarliestTime(
         long allocationSequence,
         decimal requiredQuantity,
         ConstraintContext constraints,
         DateTime planningStart,
+        DateTime dynamicMaterialFloor,
         out bool isSufficient)
     {
         isSufficient = true;
+
+        DateTime staticEarliest;
 
         if (constraints.MaterialAvailability.TryGetValue(allocationSequence, out var segments) && segments.Count > 0)
         {
@@ -745,15 +836,20 @@ internal class PhaseTwoInitialScheduler
                 if (accumulated >= requiredQuantity)
                 {
                     // 累计数量满足需求，返回该段时间
-                    return segment.AvailableTime;
+                    staticEarliest = segment.AvailableTime;
+                    return staticEarliest > dynamicMaterialFloor ? staticEarliest : dynamicMaterialFloor;
                 }
             }
 
             // P0-05修复：所有段累计仍不足需求量，标记不足并返回最后一段时间
             isSufficient = false;
-            return segments.Max(s => s.AvailableTime);
+            staticEarliest = segments.Max(s => s.AvailableTime);
+            return staticEarliest > dynamicMaterialFloor ? staticEarliest : dynamicMaterialFloor;
         }
-        return planningStart;
+
+        // 无静态物料约束：直接用动态下界（无子件时 dynamicMaterialFloor 为 MinValue，等价于 planningStart）
+        staticEarliest = planningStart;
+        return staticEarliest > dynamicMaterialFloor ? staticEarliest : dynamicMaterialFloor;
     }
 
     /// <summary>
@@ -819,13 +915,15 @@ internal class PhaseTwoInitialScheduler
         }
 
         // 遍历日历窗口
+        // 0号位裁决（2026-09-12）：无末期限制 —— PlanningEnd 不是硬上界，
+        // 正排不再被 planningEnd 截断，只受资源日历窗口（calWindow.End）约束。
+        // planningEnd 参数保留仅为签名一致，不再作为末期硬边界。
         foreach (var calWindow in calendar.OrderBy(w => w.Start))
         {
             if (calWindow.End <= earliestStart) continue;
-            if (calWindow.Start >= planningEnd) break;
 
             var windowStart = calWindow.Start > earliestStart ? calWindow.Start : earliestStart;
-            var windowEnd = calWindow.End < planningEnd ? calWindow.End : planningEnd;
+            var windowEnd = calWindow.End;
 
             if (windowEnd - windowStart < duration) continue;
 
@@ -986,7 +1084,8 @@ internal class PhaseTwoInitialScheduler
         Dictionary<string, List<(string DemandKey, decimal ShareQty)>> allocationTaskShare,
         Dictionary<string, LogicalProductionDemand> demandByKey,
         DateTime planningStart,
-        DateTime planningEnd)
+        DateTime planningEnd,
+        DateTime dynamicMaterialFloor)
     {
         // 检测是否可以合并到已有Task
         var candidateTasks = FindMergeableTasks(demand, operations, scheduledTasks, constraints, demandByKey);
@@ -1020,7 +1119,8 @@ internal class PhaseTwoInitialScheduler
             constraints,
             resourceOccupancy,
             planningStart,
-            planningEnd);
+            planningEnd,
+            dynamicMaterialFloor);
     }
 
     /// <summary>

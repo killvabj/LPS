@@ -1,3 +1,5 @@
+using Microsoft.AspNetCore.Authorization;
+using LPS.APS.Core.Authorization;
 using LPS.APS.BusinessRules.Services;
 using LPS.APS.Core.Dto;
 using LPS.APS.Shared.Models;
@@ -17,6 +19,7 @@ namespace LPS.APS.Web.Controllers;
 /// - 5号位提供原始供应事实查询
 /// - 4号位用于Pegging行源事实查看
 /// </summary>
+[Authorize(Policy = PermissionCodes.PlanView)]
 [ApiController]
 [Route("api/supply-fact-trace")]
 public class SupplyFactTraceController : ControllerBase

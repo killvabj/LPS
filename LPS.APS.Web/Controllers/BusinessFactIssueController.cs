@@ -1,3 +1,5 @@
+using Microsoft.AspNetCore.Authorization;
+using LPS.APS.Core.Authorization;
 using LPS.APS.BusinessRules.Services;
 using LPS.APS.Core.Dto;
 using LPS.APS.Shared.Models;
@@ -20,6 +22,7 @@ namespace LPS.APS.Web.Controllers;
 /// - 5号位提供ODS/复杂事实Issue查询
 /// - 4号位用于Explanation辅助和事实异常展示
 /// </summary>
+[Authorize(Policy = PermissionCodes.PlanView)]
 [ApiController]
 [Route("api/business-fact-issues")]
 public class BusinessFactIssueController : ControllerBase

@@ -102,8 +102,8 @@ public class ScheduleQueryService : IScheduleQueryService
         }
 
         // 2. 资源行（仅返回该版本里被 Task 使用到的资源，减少前端噪声）
-        //    G2-b 档①：DomainKey = 'FACTORY_{FactoryId}'（单工厂域，与 LogicalProductionDemand 一致）
-        //              factoryName / productionDepartmentName / stage 由域主数据 JOIN 投影
+        //    F-G4：资源 DomainKey 不再以 FACTORY_{id} 命名规则推导，改用 PlanVersion.DomainKey（版本唯一权威域）
+        //    factoryName / productionDepartmentName / stage 由域主数据 JOIN 投影
         var resources = await _connectionManager.QueryAsync<GanttResourceDto>(
             @"SELECT DISTINCT
                 r.Id AS ResourceId,
@@ -111,7 +111,7 @@ public class ScheduleQueryService : IScheduleQueryService
                 r.ResourceName,
                 r.FactoryId,
                 r.ProductionDepartmentId,
-                'FACTORY_' + CAST(r.FactoryId AS NVARCHAR(10)) AS DomainKey,
+                @DomainKey AS DomainKey,
                 f.Name AS FactoryName,
                 pd.DeptName AS ProductionDepartmentName,
                 pd.StageCode AS Stage
@@ -121,7 +121,7 @@ public class ScheduleQueryService : IScheduleQueryService
               LEFT JOIN ProductionDepartment pd ON pd.Id = r.ProductionDepartmentId
               WHERE t.PlanVersionId = @Id
               ORDER BY r.FactoryId, r.ProductionDepartmentId, r.ResourceCode",
-            new { Id = planVersionId },
+            new { Id = planVersionId, DomainKey = version.DomainKey },
             db: DatabaseId.APS);
 
         // 3. 任务条
@@ -412,8 +412,11 @@ public class ScheduleQueryService : IScheduleQueryService
     /// <summary>
     /// 解析当前用户有效范围并映射为可落 SQL 的 DomainKey 约束（F-G4）。
     /// 返回 null=全局放行；空集合=拒绝全部；否则 DomainKey ∈ 集合。
-    /// 仅 Domain/Factory 维度可映射到 PlanVersion.DomainKey（Factory 依 G2-b 档① 'FACTORY_{id}' 单工厂域约定）；
-    /// 仅授权 ProductFamily/Department 等无法在版本列表直接表达的维度时按拒绝处理（安全默认，待对齐）。
+    /// 仅 Domain 维度可无损映射到 PlanVersion.DomainKey（DomainDefinition 为唯一权威映射源）。
+    /// Factory / ProductFamily / Department 等维度不得靠命名规则（如 FACTORY_{id}）推导权威 DomainKey
+    /// （0号位 2026-09-07 F-G4 裁决：Business Scope ≠ Domain Scope 别名）。
+    /// 仅授权这些维度而无 Domain 授权时按拒绝处理（fail-closed 安全默认）；
+    /// 其正式查询闭环随普通查询迁 5号位 后由 5→2 依据 DomainDefinition / ProductionDepartment 真值落地。
     /// </summary>
     private async Task<IReadOnlySet<string>?> ResolveAllowedDomainKeysAsync(int userId, CancellationToken cancellationToken)
         => ResolveAllowedDomainKeys(await _dataScopeService.ResolveScopeAsync(userId, cancellationToken));
@@ -425,23 +428,12 @@ public class ScheduleQueryService : IScheduleQueryService
         if (scope.IsEmpty)
             return new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
-        HashSet<string>? allowed = null;
-
         var domain = scope.GetValues(DataScopeTypes.Domain);
         if (domain is { Count: > 0 })
-            allowed = new HashSet<string>(domain, StringComparer.OrdinalIgnoreCase);
+            return new HashSet<string>(domain, StringComparer.OrdinalIgnoreCase);
 
-        var factory = scope.GetValues(DataScopeTypes.Factory);
-        if (factory is { Count: > 0 })
-        {
-            var factoryKeys = factory.Select(f => $"FACTORY_{f}").ToHashSet(StringComparer.OrdinalIgnoreCase);
-            if (allowed == null)
-                allowed = factoryKeys;
-            else
-                allowed.IntersectWith(factoryKeys);
-        }
-
-        return allowed ?? new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        // Factory / ProductFamily / Department 无法直接映射为权威 DomainKey（F-G4）——拒绝全部（fail-closed）
+        return new HashSet<string>(StringComparer.OrdinalIgnoreCase);
     }
 
     private static bool IsDomainAllowed(IReadOnlySet<string>? allowed, string domainKey)

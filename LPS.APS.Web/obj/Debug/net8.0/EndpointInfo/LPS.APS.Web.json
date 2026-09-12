@@ -139,7 +139,7 @@
         "tags": [
           "Auth"
         ],
-        "summary": "获取当前用户信息（验证Token有效性）",
+        "summary": "获取当前用户信息（验证Token有效性）\r\n含业务范围（IsGlobal + 各维度集合），直接复用 IDiaScopeService（不建立第二套 Scope DTO 真值）。",
         "responses": {
           "200": {
             "description": "Success",
@@ -1902,8 +1902,7 @@
             "name": "entityId",
             "in": "query",
             "schema": {
-              "type": "integer",
-              "format": "int64"
+              "type": "string"
             }
           },
           {
@@ -2794,6 +2793,132 @@
               "text/json": {
                 "schema": {
                   "$ref": "#/components/schemas/PeggingTraceSummaryDtoApiResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/pi-position": {
+      "get": {
+        "tags": [
+          "PiPosition"
+        ],
+        "summary": "查询PI Position列表",
+        "parameters": [
+          {
+            "name": "planVersionId",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "format": "int32"
+            }
+          },
+          {
+            "name": "productionInstructionNo",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "materialCode",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "positionType",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "stageCode",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "skip",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "default": 0
+            }
+          },
+          {
+            "name": "take",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "default": 100
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "$ref": "#/components/schemas/PiPositionDtoListApiResponse"
+                }
+              },
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PiPositionDtoListApiResponse"
+                }
+              },
+              "text/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PiPositionDtoListApiResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/pi-position/summary": {
+      "get": {
+        "tags": [
+          "PiPosition"
+        ],
+        "summary": "查询PI Position汇总",
+        "parameters": [
+          {
+            "name": "planVersionId",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "format": "int32"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "$ref": "#/components/schemas/PiPositionSummaryDtoApiResponse"
+                }
+              },
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PiPositionSummaryDtoApiResponse"
+                }
+              },
+              "text/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PiPositionSummaryDtoApiResponse"
                 }
               }
             }
@@ -4162,13 +4287,6 @@
     "schemas": {
       "ActivateCandidateRequest": {
         "type": "object",
-        "properties": {
-          "actor": {
-            "type": "string",
-            "description": "激活人（必填）",
-            "nullable": true
-          }
-        },
         "additionalProperties": false,
         "description": "Candidate 激活请求 DTO（P0-08）"
       },
@@ -4429,11 +4547,6 @@
       "ConfirmCandidateRequest": {
         "type": "object",
         "properties": {
-          "actor": {
-            "type": "string",
-            "description": "确认人（必填）",
-            "nullable": true
-          },
           "remark": {
             "type": "string",
             "description": "必要备注（可空）",
@@ -4471,11 +4584,6 @@
             "type": "string",
             "description": "本次运行统一数据切片边界（可选；缺省 now）",
             "format": "date-time",
-            "nullable": true
-          },
-          "actor": {
-            "type": "string",
-            "description": "操作人（必填）",
             "nullable": true
           },
           "remark": {
@@ -4520,7 +4628,7 @@
             "type": "string",
             "nullable": true
           },
-          "category": {
+          "actionType": {
             "type": "string",
             "nullable": true
           },
@@ -4570,16 +4678,6 @@
           },
           "phoneNumber": {
             "type": "string",
-            "nullable": true
-          },
-          "factoryId": {
-            "type": "integer",
-            "format": "int32",
-            "nullable": true
-          },
-          "departmentId": {
-            "type": "integer",
-            "format": "int32",
             "nullable": true
           }
         },
@@ -4828,11 +4926,6 @@
       "DisableRequest": {
         "type": "object",
         "properties": {
-          "operatedBy": {
-            "type": "string",
-            "description": "操作人（必填，审计记录）",
-            "nullable": true
-          },
           "reason": {
             "type": "string",
             "description": "停用原因（写入版本 Remarks + 审计 Remarks，可空）",
@@ -6436,7 +6529,7 @@
             "type": "string",
             "nullable": true
           },
-          "category": {
+          "actionType": {
             "type": "string",
             "nullable": true
           },
@@ -6492,6 +6585,163 @@
               "$ref": "#/components/schemas/PermissionSummaryDto"
             },
             "nullable": true
+          },
+          "traceId": {
+            "type": "string",
+            "nullable": true
+          },
+          "timestamp": {
+            "type": "string",
+            "format": "date-time"
+          }
+        },
+        "additionalProperties": false
+      },
+      "PiPositionDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "scheduleRunId": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "planVersionId": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "productionInstructionNo": {
+            "type": "string",
+            "nullable": true
+          },
+          "materialId": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "materialCode": {
+            "type": "string",
+            "nullable": true
+          },
+          "positionType": {
+            "type": "string",
+            "nullable": true
+          },
+          "quantity": {
+            "type": "number",
+            "format": "double"
+          },
+          "currentStageCode": {
+            "type": "string",
+            "nullable": true
+          },
+          "nextStageCode": {
+            "type": "string",
+            "nullable": true
+          },
+          "availableTime": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          },
+          "sourceType": {
+            "type": "string",
+            "nullable": true
+          },
+          "sourceKey": {
+            "type": "string",
+            "nullable": true
+          },
+          "issueCode": {
+            "type": "string",
+            "nullable": true
+          },
+          "confidence": {
+            "type": "string",
+            "nullable": true
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "date-time"
+          }
+        },
+        "additionalProperties": false
+      },
+      "PiPositionDtoListApiResponse": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "message": {
+            "type": "string",
+            "nullable": true
+          },
+          "data": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PiPositionDto"
+            },
+            "nullable": true
+          },
+          "traceId": {
+            "type": "string",
+            "nullable": true
+          },
+          "timestamp": {
+            "type": "string",
+            "format": "date-time"
+          }
+        },
+        "additionalProperties": false
+      },
+      "PiPositionSummaryDto": {
+        "type": "object",
+        "properties": {
+          "planVersionId": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "piCount": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "totalPositions": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "positionTypeCounts": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PositionTypeCountDto"
+            },
+            "nullable": true
+          },
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PiPositionDto"
+            },
+            "nullable": true
+          }
+        },
+        "additionalProperties": false
+      },
+      "PiPositionSummaryDtoApiResponse": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "message": {
+            "type": "string",
+            "nullable": true
+          },
+          "data": {
+            "$ref": "#/components/schemas/PiPositionSummaryDto"
           },
           "traceId": {
             "type": "string",
@@ -6596,6 +6846,24 @@
           "timestamp": {
             "type": "string",
             "format": "date-time"
+          }
+        },
+        "additionalProperties": false
+      },
+      "PositionTypeCountDto": {
+        "type": "object",
+        "properties": {
+          "positionType": {
+            "type": "string",
+            "nullable": true
+          },
+          "count": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "totalQuantity": {
+            "type": "number",
+            "format": "double"
           }
         },
         "additionalProperties": false
@@ -6710,10 +6978,6 @@
       "PublishRequest": {
         "type": "object",
         "properties": {
-          "publishedBy": {
-            "type": "string",
-            "nullable": true
-          },
           "changeReason": {
             "type": "string",
             "description": "变更原因（G10：发布时写入版本 Remarks，审计可追溯）",
@@ -7401,16 +7665,6 @@
           "phoneNumber": {
             "type": "string",
             "nullable": true
-          },
-          "factoryId": {
-            "type": "integer",
-            "format": "int32",
-            "nullable": true
-          },
-          "departmentId": {
-            "type": "integer",
-            "format": "int32",
-            "nullable": true
           }
         },
         "additionalProperties": false
@@ -7447,6 +7701,50 @@
               "type": "string"
             },
             "description": "功能权限码列表（登录签发时注入 JWT，供前端菜单/按钮渲染）",
+            "nullable": true
+          },
+          "isGlobal": {
+            "type": "boolean",
+            "description": "业务范围：是否全局放行（Global 时为全放行，各维度集合为空）"
+          },
+          "factories": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "业务范围：工厂范围值集合",
+            "nullable": true
+          },
+          "productFamilies": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "业务范围：产品族范围值集合",
+            "nullable": true
+          },
+          "departments": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "业务范围：部门范围值集合",
+            "nullable": true
+          },
+          "domains": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "业务范围：域范围值集合",
+            "nullable": true
+          },
+          "resourceOrgGroups": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "业务范围：资源组织组范围值集合（兼容字段）",
             "nullable": true
           }
         },
@@ -7499,16 +7797,6 @@
           },
           "phoneNumber": {
             "type": "string",
-            "nullable": true
-          },
-          "factoryId": {
-            "type": "integer",
-            "format": "int32",
-            "nullable": true
-          },
-          "departmentId": {
-            "type": "integer",
-            "format": "int32",
             "nullable": true
           },
           "status": {

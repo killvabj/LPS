@@ -23,7 +23,7 @@ public class StrategyProfileVersionGovernanceTests
     private readonly Mock<IParameterSetVersionRepository> _parameterSetRepo = new();
     private readonly Mock<IStrategyProfileRepository> _strategyProfileRepo = new();
     private readonly Mock<IStrategyProfileVersionRepository> _strategyProfileVersionRepo = new();
-    private readonly Mock<IGovernanceAuditLogRepository> _auditRepo = new();
+    private readonly Mock<IAuditLogRepository> _auditRepo = new();
     private readonly GovernanceVersionService _service;
 
     public StrategyProfileVersionGovernanceTests()
@@ -155,7 +155,7 @@ public class StrategyProfileVersionGovernanceTests
         version.Status.Should().Be(GovernanceVersionStatus.Published);
         version.PublishedAt.Should().NotBeNull();
         _strategyProfileVersionRepo.Verify(r => r.UpdateAsync(version, It.IsAny<CancellationToken>()), Times.Once);
-        _auditRepo.Verify(r => r.AddAsync(It.IsAny<LPS.APS.Core.Entities.Auth.GovernanceAuditLog>(), It.IsAny<CancellationToken>()), Times.Once);
+        _auditRepo.Verify(r => r.AddAsync(It.IsAny<LPS.APS.Core.Entities.Auth.AuditLog>(), It.IsAny<CancellationToken>()), Times.Once);
     }
 
     [Fact]

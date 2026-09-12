@@ -14,8 +14,6 @@ public class UserSummaryDto
     public string UserName { get; set; } = string.Empty;
     public string? Email { get; set; }
     public string? PhoneNumber { get; set; }
-    public int? FactoryId { get; set; }
-    public int? DepartmentId { get; set; }
     public string Status { get; set; } = string.Empty;
     public DateTime? LastLoginTime { get; set; }
     public DateTime CreatedAt { get; set; }
@@ -41,7 +39,7 @@ public class PermissionSummaryDto
     public string PermissionName { get; set; } = string.Empty;
     public string? Description { get; set; }
     public string Module { get; set; } = string.Empty;
-    public string Category { get; set; } = string.Empty;
+    public string ActionType { get; set; } = string.Empty;
     public bool IsActive { get; set; }
     public DateTime CreatedAt { get; set; }
 }
@@ -62,18 +60,14 @@ public sealed record CreateUserRequest(
     string UserName,
     string Password,
     string? Email = null,
-    string? PhoneNumber = null,
-    int? FactoryId = null,
-    int? DepartmentId = null);
+    string? PhoneNumber = null);
 
 /// <summary>更新用户请求（Status 取值 Active / Deleted）</summary>
 public sealed record UpdateUserRequest(
     string UserName,
     string Status,
     string? Email = null,
-    string? PhoneNumber = null,
-    int? FactoryId = null,
-    int? DepartmentId = null);
+    string? PhoneNumber = null);
 
 /// <summary>创建角色请求</summary>
 public sealed record CreateRoleRequest(
@@ -92,7 +86,7 @@ public sealed record CreatePermissionRequest(
     string PermissionCode,
     string PermissionName,
     string Module,
-    string Category,
+    string ActionType,
     string? Description = null);
 
 /// <summary>创建业务范围策略请求</summary>

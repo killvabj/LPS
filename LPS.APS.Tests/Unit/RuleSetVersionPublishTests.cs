@@ -24,7 +24,7 @@ public class RuleSetVersionPublishTests
             Mock.Of<IParameterSetVersionRepository>(),
             Mock.Of<IStrategyProfileRepository>(),
             Mock.Of<IStrategyProfileVersionRepository>(),
-            Mock.Of<IGovernanceAuditLogRepository>());
+            Mock.Of<IAuditLogRepository>());
     }
 
     [Fact]

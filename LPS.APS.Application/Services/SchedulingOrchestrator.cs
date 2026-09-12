@@ -298,6 +298,7 @@ public class SchedulingOrchestrator : ISchedulingOrchestrator
             await _connectionManager.ExecuteAsync(
                 @"DELETE FROM PeggingSupplyAllocation WHERE PlanVersionId = @Id;
                   DELETE FROM [Pegging]               WHERE PlanVersionId = @Id;
+                  DELETE FROM AllocationTaskShare     WHERE PlanVersionId = @Id;
                   DELETE FROM [Task]                  WHERE PlanVersionId = @Id;",
                 new { Id = planVersionId },
                 db: DatabaseId.APS);
@@ -607,10 +608,16 @@ public class SchedulingOrchestrator : ISchedulingOrchestrator
                 IsAvailable      = true
             });
 
-            // V1 日历：计划期内 7x24 连续可用
+            // 0号位裁决（2026-09-12）：取需求窗口 ≠ 排成窗口（PlanningEnd 非硬墙）。
+            // V1 合成日历即「排成窗口」：末端不再截到 PlanHorizonEnd，而是往后预留排程延伸余量，
+            // 保证正排即使在需求窗口末期（如第90天）接到长周期订单（如300天）也能排到第390天。
+            // 1号位已去掉 Phase2/Phase4 FindForwardSlot 对 planningEnd 的 break/clamp，只认本日历窗口边界，
+            // 故此处延长末端即可放开正排的末期限制；PlanHorizonEnd 仍保留用于「取数截止」（如管线供给 ETA 过滤）。
+            // TODO(配置化)：730 → 待 0号位/3号位 提供「排成窗口天数」策略参数后改读配置。
+            var schedulingWindowEnd = context.PlanHorizonStart.AddDays(730);
             context.ResourceCalendars[resIdStr] = new List<TimeWindow>
             {
-                new TimeWindow(context.PlanHorizonStart, context.PlanHorizonEnd)
+                new TimeWindow(context.PlanHorizonStart, schedulingWindowEnd)
             };
         }
     }

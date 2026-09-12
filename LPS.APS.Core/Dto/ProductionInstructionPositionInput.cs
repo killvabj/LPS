@@ -19,9 +19,19 @@ public sealed class ProductionInstructionPositionInput
     public int MaterialId { get; init; }
 
     /// <summary>
+    /// 物料编码
+    /// </summary>
+    public string MaterialCode { get; init; } = string.Empty;
+
+    /// <summary>
     /// 工厂ID
     /// </summary>
     public int FactoryId { get; init; }
+
+    /// <summary>
+    /// 工厂编码
+    /// </summary>
+    public string FactoryCode { get; init; } = string.Empty;
 
     /// <summary>
     /// ERP剩余数量（该PI尚未最终进入目标M库的全部剩余数量）

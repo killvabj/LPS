@@ -29,7 +29,7 @@ public class GovernanceController : ControllerBase
     private readonly IParameterSetRepository _parameterSetRepo;
     private readonly IStrategyProfileRepository _strategyProfileRepo;
     private readonly IDomainDependencyRepository _domainDependencyRepo;
-    private readonly IGovernanceAuditLogRepository _auditLogRepo;
+    private readonly IAuditLogRepository _auditLogRepo;
     private readonly IRunLifecycleService _runLifecycleService;
     private readonly IScheduleRunRepository _scheduleRunRepo;
     private readonly IScheduleQueryService _queryService;
@@ -45,7 +45,7 @@ public class GovernanceController : ControllerBase
         IParameterSetRepository parameterSetRepo,
         IStrategyProfileRepository strategyProfileRepo,
         IDomainDependencyRepository domainDependencyRepo,
-        IGovernanceAuditLogRepository auditLogRepo,
+        IAuditLogRepository auditLogRepo,
         IRunLifecycleService runLifecycleService,
         IScheduleRunRepository scheduleRunRepo,
         IScheduleQueryService queryService,
@@ -71,6 +71,10 @@ public class GovernanceController : ControllerBase
     /// <summary>解析当前登录用户 Id（无效时返回 0 → 范围解析为拒绝全部，安全默认）</summary>
     private int GetCurrentUserId()
         => int.TryParse(User.FindFirst(ClaimTypes.NameIdentifier)?.Value, out var id) ? id : 0;
+
+    /// <summary>解析当前登录用户工号（审计真实 Actor，P1-04 强制后端取身份，禁止信任请求体）</summary>
+    private string GetCurrentUserCode()
+        => User.FindFirst(ClaimTypes.Name)?.Value ?? string.Empty;
 
     #region RuleSetVersion CRUD
 
@@ -102,7 +106,7 @@ public class GovernanceController : ControllerBase
     [HttpPost("rule-set/version")]
     public async Task<IActionResult> CreateRuleSetVersion([FromBody] RuleSetVersion version, CancellationToken ct)
     {
-        var created = await _governanceService.CreateRuleSetVersionAsync(version, version.CreatedBy, ct);
+        var created = await _governanceService.CreateRuleSetVersionAsync(version, GetCurrentUserCode(), ct);
         return CreatedAtAction(nameof(GetRuleSetVersion), new { versionId = created.Id }, new { success = true, data = created });
     }
 
@@ -156,7 +160,7 @@ public class GovernanceController : ControllerBase
     [HttpPost("parameter-set/version")]
     public async Task<IActionResult> CreateParameterSetVersion([FromBody] ParameterSetVersion version, CancellationToken ct)
     {
-        var created = await _governanceService.CreateParameterSetVersionAsync(version, version.CreatedBy, ct);
+        var created = await _governanceService.CreateParameterSetVersionAsync(version, GetCurrentUserCode(), ct);
         return CreatedAtAction(nameof(GetParameterSetVersion), new { versionId = created.Id }, new { success = true, data = created });
     }
 
@@ -193,8 +197,8 @@ public class GovernanceController : ControllerBase
     {
         try
         {
-            await _governanceService.PublishRuleSetVersionAsync(versionId, request?.PublishedBy, ct, changeReason: request?.ChangeReason);
-            _logger.LogInformation("规则集版本已发布：{VersionId}，发布人：{PublishedBy}", versionId, request?.PublishedBy);
+            await _governanceService.PublishRuleSetVersionAsync(versionId, GetCurrentUserCode(), ct, changeReason: request?.ChangeReason);
+            _logger.LogInformation("规则集版本已发布：{VersionId}，发布人：{PublishedBy}", versionId, GetCurrentUserCode());
             return Ok(new { success = true, message = $"规则集版本 {versionId} 已发布" });
         }
         catch (InvalidOperationException ex)
@@ -215,8 +219,8 @@ public class GovernanceController : ControllerBase
     {
         try
         {
-            await _governanceService.PublishParameterSetVersionAsync(versionId, request?.PublishedBy, ct, changeReason: request?.ChangeReason);
-            _logger.LogInformation("参数集版本已发布：{VersionId}，发布人：{PublishedBy}", versionId, request?.PublishedBy);
+            await _governanceService.PublishParameterSetVersionAsync(versionId, GetCurrentUserCode(), ct, changeReason: request?.ChangeReason);
+            _logger.LogInformation("参数集版本已发布：{VersionId}，发布人：{PublishedBy}", versionId, GetCurrentUserCode());
             return Ok(new { success = true, message = $"参数集版本 {versionId} 已发布" });
         }
         catch (InvalidOperationException ex)
@@ -241,8 +245,8 @@ public class GovernanceController : ControllerBase
     {
         try
         {
-            await _governanceService.DisableRuleSetVersionAsync(versionId, request?.OperatedBy, request?.Reason, ct);
-            _logger.LogInformation("规则集版本已停用：{VersionId}，操作人：{OperatedBy}", versionId, request?.OperatedBy);
+            await _governanceService.DisableRuleSetVersionAsync(versionId, GetCurrentUserCode(), request?.Reason, ct);
+            _logger.LogInformation("规则集版本已停用：{VersionId}，操作人：{OperatedBy}", versionId, GetCurrentUserCode());
             return Ok(new { success = true, message = $"规则集版本 {versionId} 已停用" });
         }
         catch (InvalidOperationException ex)
@@ -263,8 +267,8 @@ public class GovernanceController : ControllerBase
     {
         try
         {
-            await _governanceService.DisableParameterSetVersionAsync(versionId, request?.OperatedBy, request?.Reason, ct);
-            _logger.LogInformation("参数集版本已停用：{VersionId}，操作人：{OperatedBy}", versionId, request?.OperatedBy);
+            await _governanceService.DisableParameterSetVersionAsync(versionId, GetCurrentUserCode(), request?.Reason, ct);
+            _logger.LogInformation("参数集版本已停用：{VersionId}，操作人：{OperatedBy}", versionId, GetCurrentUserCode());
             return Ok(new { success = true, message = $"参数集版本 {versionId} 已停用" });
         }
         catch (InvalidOperationException ex)
@@ -286,8 +290,8 @@ public class GovernanceController : ControllerBase
     {
         try
         {
-            await _governanceService.DisableStrategyProfileVersionAsync(versionId, request?.OperatedBy, request?.Reason, ct);
-            _logger.LogInformation("策略包版本已停用：{VersionId}，操作人：{OperatedBy}", versionId, request?.OperatedBy);
+            await _governanceService.DisableStrategyProfileVersionAsync(versionId, GetCurrentUserCode(), request?.Reason, ct);
+            _logger.LogInformation("策略包版本已停用：{VersionId}，操作人：{OperatedBy}", versionId, GetCurrentUserCode());
             return Ok(new { success = true, message = $"策略包版本 {versionId} 已停用" });
         }
         catch (InvalidOperationException ex)
@@ -406,7 +410,7 @@ public class GovernanceController : ControllerBase
     [HttpPost("strategy-profile/version")]
     public async Task<IActionResult> CreateStrategyProfileVersion([FromBody] StrategyProfileVersion version, CancellationToken ct)
     {
-        var created = await _governanceService.CreateStrategyProfileVersionAsync(version, version.CreatedBy, ct);
+        var created = await _governanceService.CreateStrategyProfileVersionAsync(version, GetCurrentUserCode(), ct);
         return CreatedAtAction(nameof(GetStrategyProfileVersion), new { versionId = created.Id }, new { success = true, data = created });
     }
 
@@ -436,7 +440,7 @@ public class GovernanceController : ControllerBase
     {
         try
         {
-            await _governanceService.PublishStrategyProfileVersionAsync(versionId, request?.PublishedBy, ct, changeReason: request?.ChangeReason);
+            await _governanceService.PublishStrategyProfileVersionAsync(versionId, GetCurrentUserCode(), ct, changeReason: request?.ChangeReason);
             return Ok(new { success = true, message = $"策略包版本 {versionId} 发布成功" });
         }
         catch (InvalidOperationException ex)
@@ -496,12 +500,13 @@ public class GovernanceController : ControllerBase
 
     /// <summary>校验 ScheduleRun.ExpectedDomainKeysJson 冻结规则（P0-08：FULL≥1 / RESCHEDULE 恰1）</summary>
     /// <remarks>开发者：3号位</remarks>
+    [Authorize(Policy = PermissionCodes.RuleMaintain)]
     [HttpPost("run/{scheduleRunId}/validate-domain-keys")]
     public async Task<IActionResult> ValidateExpectedDomainKeys(int scheduleRunId, CancellationToken ct)
     {
         try
         {
-            await _runLifecycleService.ValidateExpectedDomainKeysAsync(scheduleRunId, ct);
+            await _runLifecycleService.ValidateExpectedDomainKeysAsync(scheduleRunId, GetCurrentUserId(), ct);
             return Ok(new { success = true, message = $"ScheduleRun {scheduleRunId} 的 ExpectedDomainKeysJson 冻结规则校验通过" });
         }
         catch (InvalidOperationException ex)
@@ -519,7 +524,7 @@ public class GovernanceController : ControllerBase
     {
         try
         {
-            await _runLifecycleService.ConfirmCandidateAsync(planVersionId, request?.Actor ?? string.Empty, request?.Remark, ct);
+            await _runLifecycleService.ConfirmCandidateAsync(planVersionId, GetCurrentUserId(), GetCurrentUserCode(), request?.Remark, ct);
             return Ok(new { success = true, message = $"候选版本 {planVersionId} 已确认（待激活）" });
         }
         catch (InvalidOperationException ex)
@@ -531,13 +536,13 @@ public class GovernanceController : ControllerBase
 
     /// <summary>激活 Candidate（P0-08：CANDIDATE → ACTIVE，每域单一正式采用版本）</summary>
     /// <remarks>开发者：3号位</remarks>
-    [Authorize(Policy = PermissionCodes.CandidateConfirm)]
+    [Authorize(Policy = PermissionCodes.CandidateActivate)]
     [HttpPost("plan-version/{planVersionId}/activate-candidate")]
     public async Task<IActionResult> ActivateCandidate(int planVersionId, [FromBody] ActivateCandidateRequest request, CancellationToken ct)
     {
         try
         {
-            await _runLifecycleService.ActivateCandidateAsync(planVersionId, request?.Actor ?? string.Empty, ct);
+            await _runLifecycleService.ActivateCandidateAsync(planVersionId, GetCurrentUserId(), GetCurrentUserCode(), ct);
             return Ok(new { success = true, message = $"候选版本 {planVersionId} 已正式采用（ACTIVE）" });
         }
         catch (InvalidOperationException ex)
@@ -574,12 +579,13 @@ public class GovernanceController : ControllerBase
 
     /// <summary>FAILED 恢复（P0-08：为 FAILED ScheduleRun 新建一条 RUNNING 重跑，继承基线；旧记录不动）</summary>
     /// <remarks>开发者：3号位</remarks>
+    [Authorize(Policy = PermissionCodes.PlanRun)]
     [HttpPost("run/{failedScheduleRunId}/recover")]
     public async Task<IActionResult> RecoverFailedRun(int failedScheduleRunId, CancellationToken ct)
     {
         try
         {
-            var newRunId = await _runLifecycleService.RecoverFailedRunAsync(failedScheduleRunId, ct);
+            var newRunId = await _runLifecycleService.RecoverFailedRunAsync(failedScheduleRunId, GetCurrentUserId(), ct);
             return Ok(new { success = true, data = new { NewScheduleRunId = newRunId }, message = $"FAILED 运行 {failedScheduleRunId} 已恢复，新建运行 {newRunId}" });
         }
         catch (InvalidOperationException ex)
@@ -591,6 +597,7 @@ public class GovernanceController : ControllerBase
 
     /// <summary>白天候选运行创建（B-1：0号位 2026-08-29 裁决3——4号位 → 3号位 入口；冻结 RunType×Purpose×策略版本，交 2号位 主流程执行收口）</summary>
     /// <remarks>开发者：3号位；触发 2号位 主流程留契约接缝（契约草案 §四 方案 A/B/C，待 2号位/0号位 裁定）</remarks>
+    [Authorize(Policy = PermissionCodes.PlanRun)]
     [HttpPost("run/candidate")]
     public async Task<IActionResult> CreateCandidateRun([FromBody] CreateCandidateRunRequest request, CancellationToken ct)
     {
@@ -603,8 +610,8 @@ public class GovernanceController : ControllerBase
                 DomainKey = request?.DomainKey ?? string.Empty,
                 BasePlanVersionId = request?.BasePlanVersionId,
                 DataCutoffTime = request?.DataCutoffTime,
-                Actor = request?.Actor ?? string.Empty,
-            }, ct);
+                Actor = GetCurrentUserCode(),
+            }, GetCurrentUserId(), ct);
             return Ok(new
             {
                 success = true,
@@ -767,7 +774,7 @@ public class GovernanceController : ControllerBase
     [HttpGet("audit-logs")]
     public async Task<IActionResult> GetAuditLogs(
         [FromQuery] string? entityType = null,
-        [FromQuery] long? entityId = null,
+        [FromQuery] string? entityId = null,
         [FromQuery] DateTime? from = null,
         [FromQuery] DateTime? to = null,
         [FromQuery] int? take = 200,
@@ -857,12 +864,13 @@ public class GovernanceController : ControllerBase
 
     /// <summary>新建域定义（G-D02：唯一性 / ScopeType / 引用合法性校验 + 审计；新建默认启用）</summary>
     /// <remarks>开发者：3号位</remarks>
+    [Authorize(Policy = PermissionCodes.RuleMaintain)]
     [HttpPost("domain-definition")]
     public async Task<IActionResult> CreateDomainDefinition([FromBody] DomainDefinition entity, CancellationToken ct)
     {
         try
         {
-            var created = await _domainDefinitionService.CreateAsync(entity, entity.CreatedBy, ct);
+            var created = await _domainDefinitionService.CreateAsync(entity, GetCurrentUserId(), GetCurrentUserCode(), ct);
             return CreatedAtAction(nameof(GetDomainDefinition), new { id = created.Id }, new { success = true, data = created });
         }
         catch (InvalidOperationException ex)
@@ -874,12 +882,13 @@ public class GovernanceController : ControllerBase
 
     /// <summary>编辑域定义（G-D03~G-D05：DomainKey 不可变更 + 校验）</summary>
     /// <remarks>开发者：3号位</remarks>
+    [Authorize(Policy = PermissionCodes.RuleMaintain)]
     [HttpPut("domain-definition/{id}")]
     public async Task<IActionResult> UpdateDomainDefinition(int id, [FromBody] DomainDefinition entity, CancellationToken ct)
     {
         try
         {
-            var updated = await _domainDefinitionService.UpdateAsync(id, entity, entity.UpdatedBy ?? entity.CreatedBy, ct);
+            var updated = await _domainDefinitionService.UpdateAsync(id, entity, GetCurrentUserId(), GetCurrentUserCode(), ct);
             return Ok(new { success = true, data = updated });
         }
         catch (InvalidOperationException ex)
@@ -891,12 +900,13 @@ public class GovernanceController : ControllerBase
 
     /// <summary>启用域定义（G-D16 反向）</summary>
     /// <remarks>开发者：3号位</remarks>
+    [Authorize(Policy = PermissionCodes.RuleMaintain)]
     [HttpPost("domain-definition/{id}/enable")]
     public async Task<IActionResult> EnableDomainDefinition(int id, [FromQuery] string? operatedBy, CancellationToken ct)
     {
         try
         {
-            var updated = await _domainDefinitionService.SetActiveAsync(id, true, operatedBy, ct);
+            var updated = await _domainDefinitionService.SetActiveAsync(id, true, GetCurrentUserId(), GetCurrentUserCode(), ct);
             return Ok(new { success = true, data = updated });
         }
         catch (InvalidOperationException ex)
@@ -908,12 +918,13 @@ public class GovernanceController : ControllerBase
 
     /// <summary>停用域定义</summary>
     /// <remarks>开发者：3号位</remarks>
+    [Authorize(Policy = PermissionCodes.RuleMaintain)]
     [HttpPost("domain-definition/{id}/disable")]
     public async Task<IActionResult> DisableDomainDefinition(int id, [FromQuery] string? operatedBy, CancellationToken ct)
     {
         try
         {
-            var updated = await _domainDefinitionService.SetActiveAsync(id, false, operatedBy, ct);
+            var updated = await _domainDefinitionService.SetActiveAsync(id, false, GetCurrentUserId(), GetCurrentUserCode(), ct);
             return Ok(new { success = true, data = updated });
         }
         catch (InvalidOperationException ex)
@@ -930,8 +941,6 @@ public class GovernanceController : ControllerBase
 /// <remarks>开发者：3号位</remarks>
 public class PublishRequest
 {
-    public string? PublishedBy { get; set; }
-
     /// <summary>变更原因（G10：发布时写入版本 Remarks，审计可追溯）</summary>
     public string? ChangeReason { get; set; }
 }
@@ -940,9 +949,6 @@ public class PublishRequest
 /// <remarks>开发者：3号位</remarks>
 public class DisableRequest
 {
-    /// <summary>操作人（必填，审计记录）</summary>
-    public string? OperatedBy { get; set; }
-
     /// <summary>停用原因（写入版本 Remarks + 审计 Remarks，可空）</summary>
     public string? Reason { get; set; }
 }
@@ -951,9 +957,6 @@ public class DisableRequest
 /// <remarks>开发者：3号位</remarks>
 public class ConfirmCandidateRequest
 {
-    /// <summary>确认人（必填）</summary>
-    public string? Actor { get; set; }
-
     /// <summary>必要备注（可空）</summary>
     public string? Remark { get; set; }
 }
@@ -962,8 +965,6 @@ public class ConfirmCandidateRequest
 /// <remarks>开发者：3号位</remarks>
 public class ActivateCandidateRequest
 {
-    /// <summary>激活人（必填）</summary>
-    public string? Actor { get; set; }
 }
 
 /// <summary>白天候选运行创建请求 DTO（B-1）</summary>
@@ -984,9 +985,6 @@ public class CreateCandidateRunRequest
 
     /// <summary>本次运行统一数据切片边界（可选；缺省 now）</summary>
     public DateTime? DataCutoffTime { get; set; }
-
-    /// <summary>操作人（必填）</summary>
-    public string? Actor { get; set; }
 
     /// <summary>备注（契约位保留，B-1 本轮不参与业务逻辑）</summary>
     public string? Remark { get; set; }

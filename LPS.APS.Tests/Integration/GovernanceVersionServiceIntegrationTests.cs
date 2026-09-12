@@ -78,7 +78,7 @@ public class GovernanceVersionServiceIntegrationTests : IDisposable
     }
 
     /// <summary>构造审计仓储（Auth 库 EF Core；库不可达时构造成功、首次写入时失败→测试 Skip 条件先行探测）</summary>
-    private static GovernanceAuditLogRepository CreateAuditRepository(ILoggerFactory loggerFactory)
+    private static AuditLogRepository CreateAuditRepository(ILoggerFactory loggerFactory)
     {
         var configuration = new ConfigurationBuilder()
             .SetBasePath(Directory.GetCurrentDirectory())
@@ -90,16 +90,14 @@ public class GovernanceVersionServiceIntegrationTests : IDisposable
         var options = new DbContextOptionsBuilder<AuthDbContext>()
             .UseSqlServer(authConn)
             .Options;
-        return new GovernanceAuditLogRepository(
-            new AuthDbContext(options),
-            loggerFactory.CreateLogger<GovernanceAuditLogRepository>());
+        return new AuditLogRepository(new AuthDbContext(options));
     }
 
     [SkippableFact]
     public async Task 发布闭环_规则集参数集策略包全链路_校验发布解析追溯()
     {
-        Skip.If(!TestEnvironment.IsAuthDbAvailable() || !TestEnvironment.HasContentSnapshotJsonColumn() || !TestEnvironment.HasGovernanceAuditLogTable(),
-            "测试环境缺 APS_Auth 库、ContentSnapshotJson 列或 GovernanceAuditLog 表（方案 A/审计 DDL 未迁移），需 2号位部署 v5.1.2 后转绿");
+        Skip.If(!TestEnvironment.IsAuthDbAvailable() || !TestEnvironment.HasContentSnapshotJsonColumn() || !TestEnvironment.HasAuditLogTable(),
+            "测试环境缺 APS_Auth 库、ContentSnapshotJson 列或 AuditLog 表（方案 A/审计 DDL 未迁移），需 2号位部署 v5.1.2 后转绿");
 
         await SetupBaseVersionsAsync();
 
@@ -210,8 +208,8 @@ public class GovernanceVersionServiceIntegrationTests : IDisposable
     {
         // P1-01 方案 A 真实持久化端到端链（ContentSnapshotJson 唯一内容真相）：
         // Create → Reload → Update → Validate → Publish → Reload → Snapshot 六块值 → 历史重放
-        Skip.If(!TestEnvironment.IsAuthDbAvailable() || !TestEnvironment.HasContentSnapshotJsonColumn() || !TestEnvironment.HasGovernanceAuditLogTable(),
-            "测试库缺 APS_Auth 库、ContentSnapshotJson 列或 GovernanceAuditLog 表（方案 A/审计 DDL 未迁移），需 2号位部署 v5.1.2 后转绿");
+        Skip.If(!TestEnvironment.IsAuthDbAvailable() || !TestEnvironment.HasContentSnapshotJsonColumn() || !TestEnvironment.HasAuditLogTable(),
+            "测试库缺 APS_Auth 库、ContentSnapshotJson 列或 AuditLog 表（方案 A/审计 DDL 未迁移），需 2号位部署 v5.1.2 后转绿");
 
         await SetupBaseVersionsAsync();
 

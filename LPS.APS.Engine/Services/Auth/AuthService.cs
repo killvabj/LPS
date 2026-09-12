@@ -51,8 +51,8 @@ public class AuthService : IAuthService
 
         // 1. 查询用户
         var user = await _connectionManager.QueryFirstOrDefaultAsync<User>(
-            "SELECT * FROM [User] WHERE UserCode = @UserCode",
-            new { UserCode = userCode },
+            "SELECT * FROM [User] WHERE LoginName = @LoginName",
+            new { LoginName = userCode },
             db: DatabaseId.Auth);
 
         if (user == null)
@@ -62,7 +62,7 @@ public class AuthService : IAuthService
         }
 
         // 2. 账户状态检查
-        if (user.Status != "Active")
+        if (!user.IsEnabled || user.IsDeleted)
         {
             _logger.LogWarning("登录失败: 账户已禁用 UserCode={UserCode}", userCode);
             return LoginResult("用户名或密码错误");
@@ -112,7 +112,7 @@ public class AuthService : IAuthService
         // 7. 更新用户登录信息
         await _connectionManager.ExecuteAsync(
             @"UPDATE [User] SET
-                LastLoginTime = GETDATE(),
+                LastLoginAt = GETDATE(),
                 FailedLoginAttempts = 0,
                 LockoutEnd = NULL,
                 PasswordHash = CASE WHEN @Rehashed IS NULL THEN PasswordHash ELSE @Rehashed END,
@@ -138,8 +138,8 @@ public class AuthService : IAuthService
             RefreshToken = refreshToken,
             ExpiresAt = expiresAt,
             UserId = user.Id,
-            UserCode = user.UserCode,
-            UserName = user.UserName,
+            UserCode = user.LoginName,
+            UserName = user.DisplayName,
             Roles = roleList
         };
     }
@@ -211,8 +211,8 @@ public class AuthService : IAuthService
             RefreshToken = newRefreshToken,
             ExpiresAt = expiresAt,
             UserId = user.Id,
-            UserCode = user.UserCode,
-            UserName = user.UserName,
+            UserCode = user.LoginName,
+            UserName = user.DisplayName,
             Roles = roleList
         };
     }
@@ -245,8 +245,8 @@ public class AuthService : IAuthService
         var claims = new List<Claim>
         {
             new(ClaimTypes.NameIdentifier, user.Id.ToString()),
-            new(ClaimTypes.Name, user.UserCode),
-            new("userName", user.UserName),
+            new(ClaimTypes.Name, user.LoginName),
+            new("userName", user.DisplayName),
             new(JwtRegisteredClaimNames.Jti, Guid.NewGuid().ToString())
         };
 

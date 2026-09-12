@@ -522,6 +522,11 @@ internal class PhaseFourLocalRepair
             .Concat(scheduleResult.UnscheduledDemandKeys.Except(affectedDemands))
             .ToList();
 
+        // 块4（任务喂任务）：修复路径遵守子件完成下界。
+        var demandCompletion = scheduleResult.ScheduledTasks
+            .GroupBy(t => t.SourceDraftId)
+            .ToDictionary(g => g.Key, g => g.Max(t => t.PlannedEndTime));
+
         foreach (var demandKey in orderedDemandKeys)
         {
             var demand = request.LogicalProductionDemands
@@ -529,12 +534,22 @@ internal class PhaseFourLocalRepair
 
             if (demand == null) continue;
 
+            // 块4：父件缺料（子件未排成）→ 保持 Unscheduled，不得被修复绕过。
+            var dynamicMaterialFloor = GetDynamicMaterialFloor(
+                demandKey, constraints, demandCompletion, out bool childUnavailable);
+            if (childUnavailable)
+            {
+                result.StillUnscheduledKeys.Add(demandKey);
+                continue;
+            }
+
             // 尝试资源切换
             var repairedTasks = TryResourceSwitch(
                 demand,
                 constraints,
                 resourceOccupancy,
-                request);
+                request,
+                dynamicMaterialFloor);
 
             if (repairedTasks.Count > 0)
             {
@@ -571,6 +586,11 @@ internal class PhaseFourLocalRepair
     {
         var result = new RepairResult();
 
+        // 块4（任务喂任务）：从已排 Task 反推每个 demand 的完成时间，修复路径据此遵守子件完成下界。
+        var demandCompletion = scheduleResult.ScheduledTasks
+            .GroupBy(t => t.SourceDraftId)
+            .ToDictionary(g => g.Key, g => g.Max(t => t.PlannedEndTime));
+
         foreach (var demandKey in scheduleResult.UnscheduledDemandKeys)
         {
             var demand = request.LogicalProductionDemands
@@ -578,12 +598,22 @@ internal class PhaseFourLocalRepair
 
             if (demand == null) continue;
 
+            // 块4：父件缺料（子件未排成）→ 保持 Unscheduled，不得被修复绕过。
+            var dynamicMaterialFloor = GetDynamicMaterialFloor(
+                demandKey, constraints, demandCompletion, out bool childUnavailable);
+            if (childUnavailable)
+            {
+                result.StillUnscheduledKeys.Add(demandKey);
+                continue;
+            }
+
             // 尝试资源切换
             var repairedTasks = TryResourceSwitch(
                 demand,
                 constraints,
                 resourceOccupancy,
-                request);
+                request,
+                dynamicMaterialFloor);
 
             if (repairedTasks.Count > 0)
             {
@@ -705,7 +735,8 @@ internal class PhaseFourLocalRepair
         LogicalProductionDemand demand,
         ConstraintContext constraints,
         Dictionary<int, List<TimeWindow>> resourceOccupancy,
-        DomainSolveRequest request)
+        DomainSolveRequest request,
+        DateTime dynamicMaterialFloor)
     {
         // 获取工艺路线
         if (!constraints.RoutingGraphs.TryGetValue(demand.MaterialId, out var routeGraphs))
@@ -735,6 +766,12 @@ internal class PhaseFourLocalRepair
         if (!isMaterialSufficient)
         {
             return new List<FinalTaskDraft>(); // 物料总量不足
+        }
+
+        // 块4（任务喂任务）：修复路径也必须遵守子件完成时间下界，父件不得早于子件完成。
+        if (dynamicMaterialFloor > earliestStart)
+        {
+            earliestStart = dynamicMaterialFloor;
         }
 
         // P0-17修复：改为for循环以便访问下一道工序，应用Routing LagTime
@@ -852,6 +889,39 @@ internal class PhaseFourLocalRepair
     }
 
     /// <summary>
+    /// 块4（任务喂任务）：计算某需求的「子件完成时间」动态物料下界。
+    /// 与 Phase2.GetDynamicMaterialFloor 口径一致：取所有直接子件已排完成时间的最大值。
+    /// 任一子件未成功排程（缺料）时 childUnavailable=true，调用方应保持该需求 Unscheduled。
+    /// </summary>
+    private DateTime GetDynamicMaterialFloor(
+        string demandKey,
+        ConstraintContext constraints,
+        Dictionary<string, DateTime> demandCompletion,
+        out bool childUnavailable)
+    {
+        childUnavailable = false;
+
+        if (!constraints.CrossMaterialParentToChildren.TryGetValue(demandKey, out var children)
+            || children.Count == 0)
+        {
+            return DateTime.MinValue;
+        }
+
+        DateTime floor = DateTime.MinValue;
+        foreach (var childKey in children)
+        {
+            if (!demandCompletion.TryGetValue(childKey, out var childEnd))
+            {
+                childUnavailable = true;
+                continue;
+            }
+            if (childEnd > floor) floor = childEnd;
+        }
+
+        return floor;
+    }
+
+    /// <summary>
     /// 获取物料最早可用时间
     /// 文档：§四 4.6、§十二 Stage overlap
     /// P0-05修复：支持多段Quantity-Time，根据所需数量确定可用时间，并验证总量是否足够
@@ -919,13 +989,14 @@ internal class PhaseFourLocalRepair
             return null;
         }
 
+        // 0号位裁决（2026-09-12）：无末期限制 —— 正排不再被 planningEnd 截断，
+        // 只受资源日历窗口约束。与 Phase2.FindForwardSlot 口径一致。
         foreach (var calWindow in calendar.OrderBy(w => w.Start))
         {
             if (calWindow.End <= earliestStart) continue;
-            if (calWindow.Start >= planningEnd) break;
 
             var windowStart = calWindow.Start > earliestStart ? calWindow.Start : earliestStart;
-            var windowEnd = calWindow.End < planningEnd ? calWindow.End : planningEnd;
+            var windowEnd = calWindow.End;
 
             if (windowEnd - windowStart < duration) continue;
 

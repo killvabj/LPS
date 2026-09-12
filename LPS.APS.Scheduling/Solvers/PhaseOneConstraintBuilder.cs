@@ -42,6 +42,11 @@ internal class PhaseOneConstraintBuilder
         BuildRoutingGraphs(lockedOperations, lockedDependencies, context);
 
         // ═══════════════════════════════════════════════
+        // 1.5 解析跨物料依赖 DAG（任务喂任务，方案A）：子先父后拓扑分层
+        // ═══════════════════════════════════════════════
+        BuildCrossMaterialDag(request, context);
+
+        // ═══════════════════════════════════════════════
         // 2. 解析工序资源资格（使用部门锁定后的 Eligibility）
         // ═══════════════════════════════════════════════
         BuildOperationResourceEligibility(lockedEligibilities, context);
@@ -209,6 +214,142 @@ internal class PhaseOneConstraintBuilder
 
             context.RoutingGraphs[materialId] = routeGraphs;
         }
+    }
+
+    /// <summary>
+    /// 构建跨物料依赖 DAG（任务喂任务，方案A）：子先父后拓扑分层
+    /// 文档：0号位 2026-09-10 裁决 方案A —— 跨物料时序作为硬约束在求解内实现
+    ///
+    /// 消费 request.MaterialRequirementLinks（父 ConsumerLogicalDemandKey → 子 ProducerLogicalDemandKey）
+    /// 产出：
+    ///   - context.CrossMaterialOrder：按「子层先、父层后」拍平的有序 DemandKey 列表（层内按 DemandSequence）
+    ///   - context.CrossMaterialLayers：分层结构（每层一个 DemandKey 列表），供 Phase2 层内排序
+    ///   - context.CrossMaterialHasCycle：是否检测到 BOM 依赖环（技术失败）
+    /// 无 link（如子件全库存/全PI，不产 link）时：CrossMaterialOrder 保持原 DemandSequence 平铺顺序，零影响。
+    /// </summary>
+    private void BuildCrossMaterialDag(DomainSolveRequest request, ConstraintContext context)
+    {
+        var links = request.MaterialRequirementLinks;
+        if (links == null || links.Count == 0)
+        {
+            // 无跨物料依赖：直接按 DemandSequence 平铺（等价于旧行为）
+            context.CrossMaterialOrder = request.LogicalProductionDemands
+                .OrderBy(d => d.DemandSequence)
+                .Select(d => d.LogicalDemandKey)
+                .ToList();
+            context.CrossMaterialLayers = new List<List<string>> { context.CrossMaterialOrder };
+            return;
+        }
+
+        // 参与拓扑的节点 = 所有 demand 的 LogicalDemandKey
+        var allDemandKeys = request.LogicalProductionDemands
+            .Select(d => d.LogicalDemandKey)
+            .ToHashSet();
+
+        // 邻接表：child → list<parent>（子先排，父后排）
+        var childrenToParents = new Dictionary<string, List<string>>();
+        var parentToChildren = new Dictionary<string, List<string>>();
+        var inDegree = new Dictionary<string, int>();
+        foreach (var key in allDemandKeys)
+        {
+            inDegree[key] = 0;
+        }
+
+        foreach (var link in links)
+        {
+            // 只处理两端节点都在当前 Demand 集合内的 link（防御：忽略脏数据/域外引用）
+            if (!allDemandKeys.Contains(link.ProducerLogicalDemandKey) ||
+                !allDemandKeys.Contains(link.ConsumerLogicalDemandKey))
+            {
+                continue;
+            }
+
+            var child = link.ProducerLogicalDemandKey;
+            var parent = link.ConsumerLogicalDemandKey;
+
+            if (!childrenToParents.TryGetValue(child, out var parents))
+            {
+                parents = new List<string>();
+                childrenToParents[child] = parents;
+            }
+            parents.Add(parent);
+
+            if (!parentToChildren.TryGetValue(parent, out var children))
+            {
+                children = new List<string>();
+                parentToChildren[parent] = children;
+            }
+            children.Add(child);
+
+            // 父的入度 = 它依赖的子件数
+            inDegree[parent]++;
+        }
+
+        context.CrossMaterialParentToChildren = parentToChildren;
+
+        // 层内按 DemandSequence 排序（保持 2号位 业务优先级）——索引只建一次
+        var demandByKey = request.LogicalProductionDemands
+            .ToDictionary(d => d.LogicalDemandKey);
+
+        // Kahn 拓扑排序：入度为 0 的（不依赖任何子件的）先入队
+        var queue = new Queue<string>();
+        foreach (var key in allDemandKeys)
+        {
+            if (inDegree[key] == 0)
+            {
+                queue.Enqueue(key);
+            }
+        }
+
+        var layers = new List<List<string>>();
+        var ordered = new List<string>();
+        var visited = 0;
+
+        while (queue.Count > 0)
+        {
+            var layer = new List<string>(queue.Count);
+            var nextLayer = new List<string>();
+
+            foreach (var node in queue)
+            {
+                layer.Add(node);
+                ordered.Add(node);
+                visited++;
+
+                if (childrenToParents.TryGetValue(node, out var parents))
+                {
+                    foreach (var parent in parents)
+                    {
+                        inDegree[parent]--;
+                        if (inDegree[parent] == 0)
+                        {
+                            nextLayer.Add(parent);
+                        }
+                    }
+                }
+            }
+
+            layer.Sort((a, b) => DemandSeq(a).CompareTo(DemandSeq(b)));
+            nextLayer.Sort((a, b) => DemandSeq(a).CompareTo(DemandSeq(b)));
+
+            layers.Add(layer);
+            queue = new Queue<string>(nextLayer);
+        }
+
+        int DemandSeq(string key)
+            => demandByKey.TryGetValue(key, out var d) ? d.DemandSequence : int.MaxValue;
+
+        // 环检测：visited < 总节点数 → 存在环
+        if (visited < allDemandKeys.Count)
+        {
+            context.CrossMaterialHasCycle = true;
+            context.CrossMaterialOrder = ordered;
+            context.CrossMaterialLayers = layers;
+            return;
+        }
+
+        context.CrossMaterialOrder = ordered;
+        context.CrossMaterialLayers = layers;
     }
 
     /// <summary>
@@ -400,6 +541,28 @@ internal class ConstraintContext
     /// 对应的 Demand 应标记 Unscheduled，Reason = MISSING_PRODUCTION_DEPARTMENT_CONTEXT。
     /// </summary>
     public HashSet<int> MissingDepartmentContextMaterialIds { get; set; } = new();
+
+    /// <summary>
+    /// 跨物料依赖（任务喂任务，方案A）：子先父后的有序 LogicalDemandKey 列表（已按层拍平）。
+    /// 无跨物料 link 时等价于按 DemandSequence 平铺。
+    /// </summary>
+    public List<string> CrossMaterialOrder { get; set; } = new();
+
+    /// <summary>
+    /// 跨物料依赖分层：每层一个 LogicalDemandKey 列表（子件层在前，父件层在后）。
+    /// </summary>
+    public List<List<string>> CrossMaterialLayers { get; set; } = new();
+
+    /// <summary>
+    /// 父 → 子 映射（父 LogicalDemandKey → 其直接子件 LogicalDemandKey 列表）。
+    /// 供 Phase2 在排父件时取子件的真实完成时间（动态物料可用时间合并）。
+    /// </summary>
+    public Dictionary<string, List<string>> CrossMaterialParentToChildren { get; set; } = new();
+
+    /// <summary>
+    /// 跨物料 BOM 依赖存在环（技术失败标记）。
+    /// </summary>
+    public bool CrossMaterialHasCycle { get; set; } = false;
 }
 
 /// <summary>

@@ -6,7 +6,7 @@ namespace LPS.APS.Core.Interfaces;
 /// RBAC 管理服务接口（F-G5，3号位）
 /// 提供 User/Role/Permission/UserRole/RolePermission/DataScopePolicy 的增删改与分配能力。
 /// 所有写入端点由 <c>[Authorize(Policy = PermissionCodes.AuthManage)]</c> 保护（Controller 层强制）。
-/// 所有变更方法接收 operatorId（操作人用户 Id），用于审计留痕（GovernanceAuditLog.OperatedBy）。
+/// 所有变更方法接收 operatorId（操作人用户 Id），用于审计留痕（AuditLog.UserCode）。
 /// </summary>
 public interface IRbacManagementService
 {

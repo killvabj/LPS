@@ -25,7 +25,7 @@ public class ParameterSetVersionPublishTests
             _repo.Object,
             Mock.Of<IStrategyProfileRepository>(),
             Mock.Of<IStrategyProfileVersionRepository>(),
-            Mock.Of<IGovernanceAuditLogRepository>());
+            Mock.Of<IAuditLogRepository>());
     }
 
     /// <summary>构造合法五块参数 JSON（P0-05 + P0-02b：发布前强制校验，测试数据须含 SolverStrategy/CandidateGuardrail 合法内容）</summary>

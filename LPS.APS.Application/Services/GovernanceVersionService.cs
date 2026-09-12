@@ -26,7 +26,7 @@ public class GovernanceVersionService : IGovernanceVersionService
     private readonly IParameterSetVersionRepository _parameterSetVersionRepository;
     private readonly IStrategyProfileRepository _strategyProfileRepository;
     private readonly IStrategyProfileVersionRepository _strategyProfileVersionRepository;
-    private readonly IGovernanceAuditLogRepository _auditLogRepository;
+    private readonly IAuditLogRepository _auditLogRepository;
     /// <summary>权威仓库事实源只读访问（0号位 裁决5：INVALID_WAREHOUSE_REF 校验；可空——未接入事实源时跳过校验，见清单三 2号位/5号位 确认项）</summary>
     private readonly DatabaseConnectionManager? _connectionManager;
     /// <summary>Demand Priority 业务校验器（无状态纯校验，P0-05 强制接入发布前校验）</summary>
@@ -43,7 +43,7 @@ public class GovernanceVersionService : IGovernanceVersionService
         IParameterSetVersionRepository parameterSetVersionRepository,
         IStrategyProfileRepository strategyProfileRepository,
         IStrategyProfileVersionRepository strategyProfileVersionRepository,
-        IGovernanceAuditLogRepository auditLogRepository,
+        IAuditLogRepository auditLogRepository,
         DatabaseConnectionManager? connectionManager = null)
     {
         _ruleSetVersionRepository = ruleSetVersionRepository;
@@ -83,17 +83,17 @@ public class GovernanceVersionService : IGovernanceVersionService
         await _ruleSetVersionRepository.UpdateAsync(version, ct);
 
         // A-7 审计日志：记录发布操作
-        await _auditLogRepository.AddAsync(new Core.Entities.Auth.GovernanceAuditLog
+        await _auditLogRepository.AddAsync(new Core.Entities.Auth.AuditLog
         {
-            OperationType = "Publish",
+            ActionCode = "Publish",
             EntityType = "RuleSetVersion",
-            EntityId = ruleSetVersionId,
+            EntityId = ruleSetVersionId.ToString(),
             VersionCode = version.VersionCode,
-            BeforeStatus = beforeStatus,
-            AfterStatus = GovernanceVersionStatus.Published,
-            OperatedBy = publishedBy,
-            OperatedAt = DateTime.UtcNow,
-            Remarks = string.IsNullOrWhiteSpace(changeReason) ? "规则集版本发布" : changeReason
+            OldValue = beforeStatus,
+            NewValue = GovernanceVersionStatus.Published,
+            UserCode = publishedBy,
+            OccurredAt = DateTime.UtcNow,
+            Remark = string.IsNullOrWhiteSpace(changeReason) ? "规则集版本发布" : changeReason
         }, ct);
     }
 
@@ -123,17 +123,17 @@ public class GovernanceVersionService : IGovernanceVersionService
         await _parameterSetVersionRepository.UpdateAsync(version, ct);
 
         // A-7 审计日志：记录发布操作
-        await _auditLogRepository.AddAsync(new Core.Entities.Auth.GovernanceAuditLog
+        await _auditLogRepository.AddAsync(new Core.Entities.Auth.AuditLog
         {
-            OperationType = "Publish",
+            ActionCode = "Publish",
             EntityType = "ParameterSetVersion",
-            EntityId = parameterSetVersionId,
+            EntityId = parameterSetVersionId.ToString(),
             VersionCode = version.VersionCode,
-            BeforeStatus = beforeStatus,
-            AfterStatus = GovernanceVersionStatus.Published,
-            OperatedBy = publishedBy,
-            OperatedAt = DateTime.UtcNow,
-            Remarks = string.IsNullOrWhiteSpace(changeReason) ? "参数集版本发布" : changeReason
+            OldValue = beforeStatus,
+            NewValue = GovernanceVersionStatus.Published,
+            UserCode = publishedBy,
+            OccurredAt = DateTime.UtcNow,
+            Remark = string.IsNullOrWhiteSpace(changeReason) ? "参数集版本发布" : changeReason
         }, ct);
     }
 
@@ -192,17 +192,17 @@ public class GovernanceVersionService : IGovernanceVersionService
         await _ruleSetVersionRepository.UpdateAsync(version, ct);
 
         // A-7 审计日志：记录停用操作
-        await _auditLogRepository.AddAsync(new Core.Entities.Auth.GovernanceAuditLog
+        await _auditLogRepository.AddAsync(new Core.Entities.Auth.AuditLog
         {
-            OperationType = "Disable",
+            ActionCode = "Disable",
             EntityType = "RuleSetVersion",
-            EntityId = ruleSetVersionId,
+            EntityId = ruleSetVersionId.ToString(),
             VersionCode = version.VersionCode,
-            BeforeStatus = beforeStatus,
-            AfterStatus = GovernanceVersionStatus.Disabled,
-            OperatedBy = operatedBy,
-            OperatedAt = DateTime.UtcNow,
-            Remarks = reason
+            OldValue = beforeStatus,
+            NewValue = GovernanceVersionStatus.Disabled,
+            UserCode = operatedBy,
+            OccurredAt = DateTime.UtcNow,
+            Remark = reason
         }, ct);
     }
 
@@ -219,17 +219,17 @@ public class GovernanceVersionService : IGovernanceVersionService
         await _parameterSetVersionRepository.UpdateAsync(version, ct);
 
         // A-7 审计日志：记录停用操作
-        await _auditLogRepository.AddAsync(new Core.Entities.Auth.GovernanceAuditLog
+        await _auditLogRepository.AddAsync(new Core.Entities.Auth.AuditLog
         {
-            OperationType = "Disable",
+            ActionCode = "Disable",
             EntityType = "ParameterSetVersion",
-            EntityId = parameterSetVersionId,
+            EntityId = parameterSetVersionId.ToString(),
             VersionCode = version.VersionCode,
-            BeforeStatus = beforeStatus,
-            AfterStatus = GovernanceVersionStatus.Disabled,
-            OperatedBy = operatedBy,
-            OperatedAt = DateTime.UtcNow,
-            Remarks = reason
+            OldValue = beforeStatus,
+            NewValue = GovernanceVersionStatus.Disabled,
+            UserCode = operatedBy,
+            OccurredAt = DateTime.UtcNow,
+            Remark = reason
         }, ct);
     }
 
@@ -252,17 +252,17 @@ public class GovernanceVersionService : IGovernanceVersionService
         await _strategyProfileVersionRepository.UpdateAsync(version, ct);
 
         // A-7 审计日志：记录停用操作
-        await _auditLogRepository.AddAsync(new Core.Entities.Auth.GovernanceAuditLog
+        await _auditLogRepository.AddAsync(new Core.Entities.Auth.AuditLog
         {
-            OperationType = "Disable",
+            ActionCode = "Disable",
             EntityType = "StrategyProfileVersion",
-            EntityId = strategyProfileVersionId,
+            EntityId = strategyProfileVersionId.ToString(),
             VersionCode = version.VersionCode,
-            BeforeStatus = beforeStatus,
-            AfterStatus = GovernanceVersionStatus.Disabled,
-            OperatedBy = operatedBy,
-            OperatedAt = DateTime.UtcNow,
-            Remarks = reason
+            OldValue = beforeStatus,
+            NewValue = GovernanceVersionStatus.Disabled,
+            UserCode = operatedBy,
+            OccurredAt = DateTime.UtcNow,
+            Remark = reason
         }, ct);
     }
 
@@ -606,9 +606,9 @@ public class GovernanceVersionService : IGovernanceVersionService
     /// 无效仓库引用校验（0号位 裁决5，INVALID_WAREHOUSE_REF）
     /// 校验参数集配置中的仓库编码（Supply.Inventory.WarehousePriority、Procurement.WarehousePriority、
     /// DefaultPurchaseLt[].WarehouseCode、ArrivalToUsableOffsets[].WarehouseCode）是否存在于现有
-    /// APS 权威仓库事实源（主数据链 MaterialSupplyContext ∪ 库存事实链 InventoryFact_ERP 的 DISTINCT WarehouseCode）。
+    /// APS 权威仓库事实源（仓库字典跨库包装视图 ext_MES_ProcessCode_View 的 DISTINCT ProcessCode）。
     /// 约定：事实源为空（系统尚未同步任何仓库事实）时跳过校验，避免对未就绪数据源误判；
-    /// 若 2号位/5号位 确认权威读模型为其他表，仅需调整本方法查询（清单三 待确认项）。
+    /// 权威读模型已确认为 ext_MES_ProcessCode_View（2026-09-07 用户确认）。
     /// </summary>
     private async Task ValidateWarehouseReferencesAsync(string? contentSnapshotJson, PublishValidationResult result)
     {
@@ -658,11 +658,11 @@ public class GovernanceVersionService : IGovernanceVersionService
             return;
         }
 
-        // 2. 读取权威仓库事实源（仓库字典契约视图 MES_ProcessCode_View，ODS；IsActive=1 已由视图内置）
+        // 2. 读取权威仓库事实源（仓库字典跨库包装视图 ext_MES_ProcessCode_View，APS；IsActive=1 已由视图内置）
         var existing = await _connectionManager.QueryAsync<string>(
-            @"SELECT DISTINCT ProcessCode FROM [MES_ProcessCode_View]",
+            @"SELECT DISTINCT ProcessCode FROM [ext_MES_ProcessCode_View]",
             null,
-            db: DatabaseId.ODS);
+            db: DatabaseId.APS);
 
         var existingSet = new HashSet<string>(existing ?? [], StringComparer.OrdinalIgnoreCase);
         if (existingSet.Count == 0)
@@ -677,7 +677,7 @@ public class GovernanceVersionService : IGovernanceVersionService
             result.Errors.Add(new ValidationError
             {
                 Code = "INVALID_WAREHOUSE_REF",
-                Message = $"参数配置引用了不存在的仓库编码：{code}（权威仓库事实源：MES_ProcessCode_View 仓库字典）",
+                Message = $"参数配置引用了不存在的仓库编码：{code}（权威仓库事实源：ext_MES_ProcessCode_View 仓库字典）",
                 FieldName = "Procurement/Warehouse"
             });
         }
@@ -1212,17 +1212,17 @@ public class GovernanceVersionService : IGovernanceVersionService
         await _strategyProfileVersionRepository.UpdateAsync(version, ct);
 
         // A-7 审计日志
-        await _auditLogRepository.AddAsync(new Core.Entities.Auth.GovernanceAuditLog
+        await _auditLogRepository.AddAsync(new Core.Entities.Auth.AuditLog
         {
-            OperationType = "Publish",
+            ActionCode = "Publish",
             EntityType = "StrategyProfileVersion",
-            EntityId = strategyProfileVersionId,
+            EntityId = strategyProfileVersionId.ToString(),
             VersionCode = version.VersionCode,
-            BeforeStatus = beforeStatus,
-            AfterStatus = GovernanceVersionStatus.Published,
-            OperatedBy = publishedBy,
-            OperatedAt = DateTime.UtcNow,
-            Remarks = string.IsNullOrWhiteSpace(changeReason) ? "策略包版本发布" : changeReason
+            OldValue = beforeStatus,
+            NewValue = GovernanceVersionStatus.Published,
+            UserCode = publishedBy,
+            OccurredAt = DateTime.UtcNow,
+            Remark = string.IsNullOrWhiteSpace(changeReason) ? "策略包版本发布" : changeReason
         }, ct);
     }
 

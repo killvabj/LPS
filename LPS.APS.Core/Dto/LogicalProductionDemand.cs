@@ -48,9 +48,10 @@ public sealed class LogicalProductionDemand
     public int FactoryId { get; init; }
 
     /// <summary>
-    /// 从哪里开始继续生产（大工艺阶段码，机加工/氧化级，对应 RoutingOperation.StageCode）
+    /// 从哪里开始继续生产（大工艺阶段码，机加工/氧化级，对应 RoutingOperation.StageCode）。
+    /// 2号位在 PeggingLoop 后据 Routing 有向图「无入边源结点」回填（原 init 改为 set 以支持回填，见 PeggingOrchestrator.FillStartStageCodes）。
     /// </summary>
-    public string StartStageCode { get; init; } = string.Empty;
+    public string StartStageCode { get; set; } = string.Empty;
 
     /// <summary>
     /// 续排起点工序码（工序级，比 StartStageCode 更细，对应 5号位 的 NextOperation/StartOperation）

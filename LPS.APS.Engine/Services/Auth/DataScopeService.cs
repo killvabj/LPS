@@ -41,7 +41,7 @@ public class DataScopeService : IDataScopeService
 
         var policies = await (
             from p in _context.DataScopePolicies
-            where policyIds.Contains(p.Id)
+            where policyIds.Contains(p.Id) && p.IsEnabled
             select new { p.ScopeType, p.ScopeValue }
         ).ToListAsync(cancellationToken);
 

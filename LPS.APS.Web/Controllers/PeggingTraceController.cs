@@ -1,3 +1,5 @@
+using Microsoft.AspNetCore.Authorization;
+using LPS.APS.Core.Authorization;
 using LPS.APS.BusinessRules.Services;
 using LPS.APS.Core.Dto;
 using LPS.APS.Shared.Models;
@@ -17,6 +19,7 @@ namespace LPS.APS.Web.Controllers;
 /// - 5号位提供只读查询接口，直接读取PeggingSupplyAllocation表
 /// - 不重算Allocation，不修改分配结果
 /// </summary>
+[Authorize(Policy = PermissionCodes.PlanView)]
 [ApiController]
 [Route("api/pegging-trace")]
 public class PeggingTraceController : ControllerBase

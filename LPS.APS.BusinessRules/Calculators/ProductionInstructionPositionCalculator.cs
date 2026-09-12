@@ -128,11 +128,15 @@ public class ProductionInstructionPositionCalculator : IProductionInstructionPos
             });
         }
 
+        // 第八步：计算NextOperationContext（执行起点上下文）
+        var nextOperationContexts = CalculateNextOperationContexts(input, finalPositions, issues);
+
         return new ProductionInstructionPositionResult
         {
             ProductionInstructionNo = input.ProductionInstructionNo,
             TotalRemainingQty = input.ErpRemainingQty,
             Positions = finalPositions,
+            NextOperationContexts = nextOperationContexts,
             Issues = issues,
             IsSuccess = isSuccess,
             FailureReason = isSuccess ? null : "Position总量无法与ERP RemainingQty闭合"
@@ -813,5 +817,233 @@ public class ProductionInstructionPositionCalculator : IProductionInstructionPos
 
             return positions;
         }
+    }
+
+    /// <summary>
+    /// 计算NextOperationContext（执行起点上下文）
+    ///
+    /// 回答：该PI数量份额下一步应从哪个Stage/Operation继续
+    ///
+    /// 规则：
+    /// 1. STAGE_WAITING/FIRST_STAGE_PENDING → 按Operation进度拆分切片
+    /// 2. XC → 跳过（XC是Stage内部线边仓）
+    /// 3. INTERPLANT_TRANSIT → StartStageCode = 到达目标工厂的Stage
+    /// 4. UNLOCATED → 按保守规则返回最早可信Stage
+    /// 5. 同一PI可有多个切片，Σ SliceQty = 需要继续生产的PI Position数量
+    ///
+    /// 同一PI多执行起点切片示例：
+    ///   PI001 RemainingQty = 1000
+    ///   200件：NextOperation = NC（未完成NC）
+    ///   800件：NextOperation = 挤丝（已完成NC，下一步挤丝）
+    /// </summary>
+    private List<NextOperationContextDto> CalculateNextOperationContexts(
+        ProductionInstructionPositionInput input,
+        List<PositionSlice> finalPositions,
+        List<PositionIssue> issues)
+    {
+        var contexts = new List<NextOperationContextDto>();
+
+        foreach (var position in finalPositions)
+        {
+            // 跳过XC（XC是Stage内部的线边仓，不需要独立的执行起点）
+            if (position.PositionType == PositionType.XC)
+                continue;
+
+            string startStageCode;
+            bool isUnlocated = false;
+
+            switch (position.PositionType)
+            {
+                case PositionType.STAGE_WAITING:
+                case PositionType.FIRST_STAGE_PENDING:
+                    startStageCode = position.StageCode ?? string.Empty;
+                    break;
+
+                case PositionType.INTERPLANT_TRANSIT:
+                    var targetEdge = input.CrossFactoryEdges
+                        .FirstOrDefault(e => e.FromStageCode == position.StageCode);
+                    startStageCode = targetEdge?.ToStageCode ?? position.StageCode ?? string.Empty;
+                    break;
+
+                case PositionType.UNLOCATED:
+                    isUnlocated = true;
+                    startStageCode = GetEarliestStage(input, issues);
+                    break;
+
+                default:
+                    continue;
+            }
+
+            if (string.IsNullOrWhiteSpace(startStageCode))
+            {
+                issues.Add(new PositionIssue
+                {
+                    IssueType = "NEXT_OPERATION_NO_STAGE",
+                    Level = PositionIssueLevel.WARN,
+                    Description = $"无法确定执行起点Stage: PositionType={position.PositionType}",
+                    ProductionInstructionNo = input.ProductionInstructionNo,
+                    AffectedQuantity = position.Quantity
+                });
+                continue;
+            }
+
+            // 按Operation进度拆分切片
+            if (!isUnlocated && input.OperationProgress?.Count > 0)
+            {
+                var operationSlices = SplitByOperationProgress(
+                    input, position, startStageCode, issues);
+                contexts.AddRange(operationSlices);
+            }
+            else
+            {
+                // 无Operation进度数据或UNLOCATED，整体作为一个切片
+                contexts.Add(CreateNextOperationContext(
+                    input, position, startStageCode, null, isUnlocated));
+            }
+        }
+
+        return contexts;
+    }
+
+    /// <summary>
+    /// 按Operation进度拆分PositionSlice
+    ///
+    /// 示例：
+    ///   Position: 1000件 at Stage "加工"
+    ///   NC (seq=1): CumulativeCompletedQty = 800
+    ///   挤丝 (seq=2): CumulativeCompletedQty = 0
+    ///   → 200件 StartOperation = NC（未完成NC）
+    ///   → 800件 StartOperation = 挤丝（已完成NC）
+    /// </summary>
+    private List<NextOperationContextDto> SplitByOperationProgress(
+        ProductionInstructionPositionInput input,
+        PositionSlice position,
+        string stageCode,
+        List<PositionIssue> issues)
+    {
+        var contexts = new List<NextOperationContextDto>();
+
+        // 获取该Stage的OperationProgress，按序号排序
+        var operations = input.OperationProgress
+            .Where(op => op.StageCode == stageCode)
+            .OrderBy(op => op.OperationSequence)
+            .ToList();
+
+        if (operations.Count == 0)
+        {
+            // 该Stage无Operation进度数据，整体作为一个切片
+            contexts.Add(CreateNextOperationContext(
+                input, position, stageCode, null, false));
+            return contexts;
+        }
+
+        decimal remainingQty = position.Quantity;
+
+        // 从第一个Operation往后遍历，计算每个Operation的StartQty
+        // 算法：
+        //   第一个Operation：StartQty = TotalRemainingQty - CumulativeCompletedQty
+        //   后续Operation：StartQty = 前一个Operation.CumulativeCompletedQty - 本Operation.CumulativeCompletedQty
+        for (int i = 0; i < operations.Count && remainingQty > 0.0001m; i++)
+        {
+            decimal operationStartQty;
+
+            if (i == 0)
+            {
+                // 第一个Operation：StartQty = Position.Quantity - 本Operation.CumulativeCompletedQty
+                operationStartQty = position.Quantity - operations[i].CumulativeCompletedQty;
+            }
+            else
+            {
+                // 后续Operation：StartQty = 前一个Operation.CumulativeCompletedQty - 本Operation.CumulativeCompletedQty
+                operationStartQty = operations[i - 1].CumulativeCompletedQty - operations[i].CumulativeCompletedQty;
+            }
+
+            // 只处理有数量的切片
+            if (operationStartQty > 0.0001m)
+            {
+                var sliceQty = Math.Min(operationStartQty, remainingQty);
+                remainingQty -= sliceQty;
+
+                contexts.Add(CreateNextOperationContext(
+                    input, position, stageCode, operations[i].OperationName, false, sliceQty));
+            }
+        }
+
+        // 如果还有剩余数量（理论上不应该），补充一个切片
+        if (remainingQty > 0.0001m)
+        {
+            contexts.Add(CreateNextOperationContext(
+                input, position, stageCode, operations.LastOrDefault()?.OperationName, false, remainingQty));
+        }
+
+        return contexts;
+    }
+
+    /// <summary>
+    /// 创建NextOperationContextDto
+    /// </summary>
+    private NextOperationContextDto CreateNextOperationContext(
+        ProductionInstructionPositionInput input,
+        PositionSlice position,
+        string startStageCode,
+        string? startOperationCode,
+        bool isUnlocated,
+        decimal? sliceQty = null)
+    {
+        return new NextOperationContextDto
+        {
+            ProductionInstructionNo = input.ProductionInstructionNo,
+            MaterialId = input.MaterialId,
+            MaterialCode = input.MaterialCode,
+            FactoryId = input.FactoryId,
+            FactoryCode = input.FactoryCode,
+            PositionType = position.PositionType.ToString(),
+            SliceQty = sliceQty ?? position.Quantity,
+            StartStageCode = startStageCode,
+            StartOperationCode = startOperationCode,
+            RoutingKey = null,
+            IsUnlocated = isUnlocated,
+            DataCutoffTime = DateTime.UtcNow,
+            SourcePositionId = null,
+            IssueCode = isUnlocated ? "UNLOCATED_CONSERVATIVE" : null,
+            IssueMessage = isUnlocated ? "UNLOCATED位置，按保守规则返回最早Stage" : null
+        };
+    }
+
+    /// <summary>
+    /// 获取最早可信Stage（UNLOCATED保守规则）
+    ///
+    /// 规则：
+    /// - 从StagePath中找到第一个"无法证明一定完成"的Stage
+    /// - 如果完全没有可靠位置证据，回退到StagePath的第一个Stage
+    /// </summary>
+    private string GetEarliestStage(ProductionInstructionPositionInput input, List<PositionIssue> issues)
+    {
+        // 优先使用StagePath中的起始Stage
+        var startStage = input.StagePath
+            .Where(sp => sp.IsStartStage)
+            .FirstOrDefault();
+
+        if (startStage != null)
+            return startStage.StageCode;
+
+        // 如果没有标记IsStartStage，使用StageSequence最小的
+        var earliestStage = input.StagePath
+            .OrderBy(sp => sp.StageSequence)
+            .FirstOrDefault();
+
+        if (earliestStage != null)
+            return earliestStage.StageCode;
+
+        // 如果StagePath为空，返回空字符串（由2号位处理）
+        issues.Add(new PositionIssue
+        {
+            IssueType = "NO_STAGE_PATH",
+            Level = PositionIssueLevel.ERROR,
+            Description = "UNLOCATED但无StagePath信息，无法确定保守执行起点",
+            ProductionInstructionNo = input.ProductionInstructionNo
+        });
+
+        return string.Empty;
     }
 }
