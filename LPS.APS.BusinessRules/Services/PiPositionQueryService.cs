@@ -29,14 +29,15 @@ public class PiPositionQueryService
         string? stageCode = null,
         int skip = 0,
         int take = 100,
-        CancellationToken ct = default)
+        CancellationToken ct = default,
+        IReadOnlySet<string>? allowedFactories = null)
     {
         if (planVersionId <= 0) throw new ArgumentException("planVersionId is required");
         if (take <= 0 || take > 500) take = 100;
 
         return await _repository.QueryAsync(
             planVersionId, productionInstructionNo, materialCode,
-            positionType, stageCode, skip, take, ct);
+            positionType, stageCode, skip, take, ct, allowedFactories);
     }
 
     /// <summary>
@@ -49,5 +50,20 @@ public class PiPositionQueryService
         if (planVersionId <= 0) throw new ArgumentException("planVersionId is required");
 
         return await _repository.GetSummaryAsync(planVersionId, ct);
+    }
+
+    /// <summary>
+    /// 根据生产指令号查询该 PI 的所有 Position（单 PI 详情）
+    /// </summary>
+    public async Task<List<PiPositionDto>> GetByProductionInstructionAsync(
+        int planVersionId,
+        string productionInstructionNo,
+        CancellationToken ct = default)
+    {
+        if (planVersionId <= 0) throw new ArgumentException("planVersionId is required");
+        if (string.IsNullOrWhiteSpace(productionInstructionNo))
+            throw new ArgumentException("productionInstructionNo is required");
+
+        return await _repository.GetByProductionInstructionAsync(planVersionId, productionInstructionNo, ct);
     }
 }

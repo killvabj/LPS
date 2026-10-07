@@ -39,6 +39,16 @@ public sealed class ProductionInstructionPositionResult
     public IReadOnlyList<NextOperationContextDto> NextOperationContexts { get; init; } = Array.Empty<NextOperationContextDto>();
 
     /// <summary>
+    /// 标准化既存MES执行上下文列表（5号位 → 2号位，跨版本连续性专用）
+    ///
+    /// 每个IN_PROGRESS MES工单对应一个上下文，供2号位 Continuation 分桶消费。
+    /// 5号位结合 WorkOrderSnapshot + OperationProgress + StageProgress + PI Position 形成。
+    ///
+    /// ⚠️ DerivedRemainingQty 是运行时派生，不是MES工单级原生字段。
+    /// </summary>
+    public IReadOnlyList<ExistingExecutionContextDto> ExistingExecutionContexts { get; init; } = Array.Empty<ExistingExecutionContextDto>();
+
+    /// <summary>
     /// 位置计算问题记录
     /// </summary>
     public IReadOnlyList<PositionIssue> Issues { get; init; } = Array.Empty<PositionIssue>();

@@ -25,33 +25,43 @@ public class PiPositionQueryRepository : IPiPositionQueryRepository
         string? stageCode = null,
         int skip = 0,
         int take = 100,
-        CancellationToken ct = default)
+        CancellationToken ct = default,
+        IReadOnlySet<string>? allowedFactories = null)
     {
+        // Dapper 列表参数只进 IN；@AllowedFactories IS NULL 标量判空会随列表一起扩成 (…) 导致 4145，用 Has 标志替代；空集 fail-closed 返空。
+        if (allowedFactories is { Count: 0 })
+            return new List<PiPositionDto>();
+        var hasFactories = allowedFactories is { Count: > 0 };
+
         var sql = @"
 SELECT
-    Id,
-    ScheduleRunId,
-    PlanVersionId,
-    ProductionInstructionNo,
-    MaterialId,
-    MaterialCode,
-    PositionType,
-    Quantity,
-    CurrentStageCode,
-    NextStageCode,
-    AvailableTime,
-    SourceType,
-    SourceKey,
-    IssueCode,
-    Confidence,
-    CreatedAt
-FROM ProductionInstructionPositionSnapshot
-WHERE PlanVersionId = @PlanVersionId
-    AND (@PINO IS NULL OR ProductionInstructionNo LIKE '%' + @PINO + '%')
-    AND (@MaterialCode IS NULL OR MaterialCode LIKE '%' + @MaterialCode + '%')
-    AND (@PositionType IS NULL OR PositionType = @PositionType)
-    AND (@StageCode IS NULL OR CurrentStageCode = @StageCode OR NextStageCode = @StageCode)
-ORDER BY ProductionInstructionNo, PositionType
+    p.Id,
+    p.ScheduleRunId,
+    p.PlanVersionId,
+    p.ProductionInstructionNo,
+    p.MaterialId,
+    p.MaterialCode,
+    p.PositionType,
+    p.Quantity,
+    p.CurrentStageCode,
+    p.NextStageCode,
+    p.AvailableTime,
+    p.SourceType,
+    p.SourceKey,
+    p.IssueCode,
+    p.Confidence,
+    p.CreatedAt
+FROM ProductionInstructionPositionSnapshot p
+LEFT JOIN [Order] o
+    ON o.PlanVersionId = p.PlanVersionId
+   AND o.MTS_InstructionNo = p.ProductionInstructionNo
+WHERE p.PlanVersionId = @PlanVersionId
+    AND (@PINO IS NULL OR p.ProductionInstructionNo LIKE '%' + @PINO + '%')
+    AND (@MaterialCode IS NULL OR p.MaterialCode LIKE '%' + @MaterialCode + '%')
+    AND (@PositionType IS NULL OR p.PositionType = @PositionType)
+    AND (@StageCode IS NULL OR p.CurrentStageCode = @StageCode OR p.NextStageCode = @StageCode)
+    AND (@HasFactories = 0 OR o.SourceFactoryId IN @AllowedFactories)
+ORDER BY p.ProductionInstructionNo, p.PositionType
 OFFSET @Skip ROWS FETCH NEXT @Take ROWS ONLY";
 
         var parameters = new
@@ -61,6 +71,8 @@ OFFSET @Skip ROWS FETCH NEXT @Take ROWS ONLY";
             MaterialCode = materialCode,
             PositionType = positionType,
             StageCode = stageCode,
+            HasFactories = hasFactories,
+            AllowedFactories = allowedFactories,
             Skip = skip,
             Take = take
         };
@@ -112,5 +124,45 @@ ORDER BY COUNT(*) DESC";
             TotalPositions = summary.TotalPositions,
             PositionTypeCounts = typeCounts
         };
+    }
+
+    public async Task<List<PiPositionDto>> GetByProductionInstructionAsync(
+        int planVersionId,
+        string productionInstructionNo,
+        CancellationToken ct = default)
+    {
+        var sql = @"
+SELECT
+    p.Id,
+    p.ScheduleRunId,
+    p.PlanVersionId,
+    p.ProductionInstructionNo,
+    p.MaterialId,
+    p.MaterialCode,
+    p.PositionType,
+    p.Quantity,
+    p.CurrentStageCode,
+    p.NextStageCode,
+    p.AvailableTime,
+    p.SourceType,
+    p.SourceKey,
+    p.IssueCode,
+    p.Confidence,
+    p.CreatedAt
+FROM ProductionInstructionPositionSnapshot p
+WHERE p.PlanVersionId = @PlanVersionId
+    AND p.ProductionInstructionNo = @ProductionInstructionNo
+ORDER BY p.PositionType";
+
+        var parameters = new
+        {
+            PlanVersionId = planVersionId,
+            ProductionInstructionNo = productionInstructionNo
+        };
+
+        var results = await _connectionManager.QueryAsync<PiPositionDto>(
+            sql, parameters, CommandType.Text, DatabaseId.APS, commandTimeout: 10);
+
+        return results.ToList();
     }
 }

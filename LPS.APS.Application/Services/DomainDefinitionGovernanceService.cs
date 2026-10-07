@@ -1,4 +1,6 @@
 using DomainDefinition = LPS.APS.Core.Entities.APS.DomainDefinition;
+using ProductFamily = LPS.APS.Core.Entities.APS.ProductFamily;
+using Factory = LPS.APS.Core.Entities.APS.Factory;
 using AuditLog = LPS.APS.Core.Entities.Auth.AuditLog;
 using LPS.APS.Core.Authorization;
 using LPS.APS.Core.Interfaces;
@@ -24,8 +26,14 @@ public class DomainDefinitionGovernanceService : IDomainDefinitionGovernanceServ
     private const string ScopeTypeFactoryFamily = "FACTORY_FAMILY";
     private const string EntityTypeDomainDefinition = "DomainDefinition";
     private const int DefaultSortOrder = 100;
-    private const int MaxDomainKeyLength = 50;
-    private const int MaxDomainNameLength = 200;
+    private const int MinSortOrder = 0;
+    private const int MaxSortOrder = 9999;
+    private const int MinDomainNameLength = 2;
+    private const int MaxDomainNameLength = 64;
+
+    /// <summary>DomainKey 契约（4号位 字段校验缺口 F2）：首字符大写字母，4-50 字符，仅含 [A-Z0-9_-]。</summary>
+    private static readonly System.Text.RegularExpressions.Regex DomainKeyPattern =
+        new(@"^[A-Z][A-Z0-9_-]{3,49}$", System.Text.RegularExpressions.RegexOptions.Compiled);
 
     private readonly IDomainDefinitionRepository _repository;
     private readonly IAuditLogRepository _auditLogRepository;
@@ -53,6 +61,12 @@ public class DomainDefinitionGovernanceService : IDomainDefinitionGovernanceServ
     public Task<IReadOnlyList<DomainDefinition>> GetActiveAsync(CancellationToken ct = default)
         => _repository.GetActiveAsync(ct);
 
+    public Task<IReadOnlyList<ProductFamily>> GetProductFamiliesAsync(CancellationToken ct = default)
+        => _repository.GetProductFamiliesAsync(ct);
+
+    public Task<IReadOnlyList<Factory>> GetFactoriesAsync(CancellationToken ct = default)
+        => _repository.GetFactoriesAsync(ct);
+
     public async Task<DomainDefinition> CreateAsync(DomainDefinition input, int actorUserId, string? operatedBy, CancellationToken ct = default)
     {
         await ValidateCoreAsync(input, ct);
@@ -78,7 +92,7 @@ public class DomainDefinitionGovernanceService : IDomainDefinitionGovernanceServ
         await _auditLogRepository.EnsureWritableAsync(ct);
 
         var created = await _repository.CreateAsync(entity, ct);
-        await AuditAsync("Create", created, beforeStatus: null, afterStatus: StatusOf(created.IsActive), operatedBy, ct);
+        await AuditAsync("Create", created, beforeStatus: null, afterStatus: StatusOf(created.IsActive), actorUserId, operatedBy, ct);
         return created;
     }
 
@@ -115,7 +129,7 @@ public class DomainDefinitionGovernanceService : IDomainDefinitionGovernanceServ
         await _auditLogRepository.EnsureWritableAsync(ct);
 
         await _repository.UpdateAsync(entity, ct);
-        await AuditAsync("Update", entity, beforeStatus: StatusOf(existing.IsActive), afterStatus: StatusOf(entity.IsActive), operatedBy, ct);
+        await AuditAsync("Update", entity, beforeStatus: StatusOf(existing.IsActive), afterStatus: StatusOf(entity.IsActive), actorUserId, operatedBy, ct);
         return entity;
     }
 
@@ -151,33 +165,47 @@ public class DomainDefinitionGovernanceService : IDomainDefinitionGovernanceServ
             UpdatedAt = DateTime.UtcNow
         };
 
-        await AuditAsync(isActive ? "Enable" : "Disable", updated, beforeStatus: StatusOf(existing.IsActive), afterStatus: StatusOf(isActive), operatedBy, ct);
+        await AuditAsync(isActive ? "Enable" : "Disable", updated, beforeStatus: StatusOf(existing.IsActive), afterStatus: StatusOf(isActive), actorUserId, operatedBy, ct);
         return updated;
     }
 
     private async Task ValidateCoreAsync(DomainDefinition input, CancellationToken ct)
     {
+        // F1：sortOrder 边界 0-9999（越界显式 400，不回落到默认值）
+        if (input.SortOrder < MinSortOrder || input.SortOrder > MaxSortOrder)
+        {
+            throw new InvalidOperationException($"SortOrder 须在 {MinSortOrder}-{MaxSortOrder} 之间");
+        }
+
         if (string.IsNullOrWhiteSpace(input.DomainKey))
         {
             throw new InvalidOperationException("DomainKey 不能为空");
         }
-        if (input.DomainKey.Trim().Length > MaxDomainKeyLength)
+        // F2：DomainKey 字符集 + 长度（首字符大写字母，4-50 字符，仅 [A-Z0-9_-]；作为 DomainKeyPath 一部分，禁止中文/空格/SQL 注入字符）
+        if (!DomainKeyPattern.IsMatch(input.DomainKey.Trim()))
         {
-            throw new InvalidOperationException($"DomainKey 长度不能超过 {MaxDomainKeyLength} 字符");
+            throw new InvalidOperationException("DomainKey 须以大写字母开头，4-50 字符，仅含 [A-Z0-9_-]");
         }
+
         if (string.IsNullOrWhiteSpace(input.DomainName))
         {
             throw new InvalidOperationException("DomainName 不能为空");
+        }
+        // F4：DomainName 长度 2-64
+        if (input.DomainName.Trim().Length < MinDomainNameLength)
+        {
+            throw new InvalidOperationException($"DomainName 至少 {MinDomainNameLength} 个字符");
         }
         if (input.DomainName.Trim().Length > MaxDomainNameLength)
         {
             throw new InvalidOperationException($"DomainName 长度不能超过 {MaxDomainNameLength} 字符");
         }
 
-        var scopeType = (input.ScopeType ?? string.Empty).Trim().ToUpperInvariant();
+        // F3：ScopeType 严格大小写（仅 FAMILY / FACTORY_FAMILY，移除 ToUpper 宽容）
+        var scopeType = (input.ScopeType ?? string.Empty).Trim();
         if (scopeType != ScopeTypeFamily && scopeType != ScopeTypeFactoryFamily)
         {
-            throw new InvalidOperationException($"ScopeType 仅支持 {ScopeTypeFamily} / {ScopeTypeFactoryFamily}，当前：{input.ScopeType}");
+            throw new InvalidOperationException($"ScopeType 仅支持 {ScopeTypeFamily} / {ScopeTypeFactoryFamily}（严格大小写），当前：{input.ScopeType}");
         }
 
         if (input.ProductFamilyId <= 0)
@@ -238,6 +266,7 @@ public class DomainDefinitionGovernanceService : IDomainDefinitionGovernanceServ
         DomainDefinition entity,
         string? beforeStatus,
         string? afterStatus,
+        int actorUserId,
         string? operatedBy,
         CancellationToken ct)
     {
@@ -251,6 +280,7 @@ public class DomainDefinitionGovernanceService : IDomainDefinitionGovernanceServ
                 VersionCode = null,
                 OldValue = beforeStatus,
                 NewValue = afterStatus,
+                UserId = actorUserId,
                 UserCode = operatedBy,
                 OccurredAt = DateTime.UtcNow,
                 Remark = $"域定义 {entity.DomainKey}（{entity.ScopeType}）"

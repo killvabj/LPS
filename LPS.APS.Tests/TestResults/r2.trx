@@ -1,0 +1,53 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TestRun id="c4501990-d32c-4ddf-b6b8-bef3532ba659" name="SMC7824@CN1000-7050W001 2026-09-29 08:39:19" runUser="SMC9001\SMC7824" xmlns="http://microsoft.com/schemas/VisualStudio/TeamTest/2010">
+  <Times creation="2026-09-29T08:39:19.5815950+08:00" queuing="2026-09-29T08:39:19.5815950+08:00" start="2026-09-29T08:39:05.9476055+08:00" finish="2026-09-29T08:39:19.5867969+08:00" />
+  <TestSettings name="default" id="35f42c4c-885e-42c4-b5ce-486a6ef22423">
+    <Deployment runDeploymentRoot="SMC7824_CN1000-7050W001_2026-09-29_08_39_19" />
+  </TestSettings>
+  <Results>
+    <UnitTestResult executionId="e4020fd8-7068-47db-bc2c-5462616dfe68" testId="1472fbc6-f5bb-84b5-3dec-eba42910e4fd" testName="v5.1.2: 完整排程流程集成测试" computerName="CN1000-7050W001" duration="00:00:12.9097679" startTime="2026-09-29T08:39:19.3859747+08:00" endTime="2026-09-29T08:39:19.3859934+08:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Failed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="e4020fd8-7068-47db-bc2c-5462616dfe68">
+      <Output>
+        <ErrorInfo>
+          <Message>System.Exception : Task表没有数据！PeggingOrchestrator可能未正确INSERT</Message>
+          <StackTrace>   at LPS.APS.Tests.Integration.RealSchedulingIntegrationTest.VerifyTaskTableAsync() in D:\CODE\LPS\LPS.APS.Tests\Integration\RealSchedulingIntegrationTest.cs:line 582&#xD;
+   at LPS.APS.Tests.Integration.RealSchedulingIntegrationTest.RunAllTestsAsync() in D:\CODE\LPS\LPS.APS.Tests\Integration\RealSchedulingIntegrationTest.cs:line 118&#xD;
+--- End of stack trace from previous location ---</StackTrace>
+        </ErrorInfo>
+      </Output>
+    </UnitTestResult>
+  </Results>
+  <TestDefinitions>
+    <UnitTest name="v5.1.2: 完整排程流程集成测试" storage="d:\code\lps\lps.aps.tests\bin\debug\net8.0\lps.aps.tests.dll" id="1472fbc6-f5bb-84b5-3dec-eba42910e4fd">
+      <Execution id="e4020fd8-7068-47db-bc2c-5462616dfe68" />
+      <TestMethod codeBase="D:\CODE\LPS\LPS.APS.Tests\bin\Debug\net8.0\LPS.APS.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner2/netcoreapp" className="LPS.APS.Tests.Integration.RealSchedulingIntegrationTest" name="RunAllTestsAsync" />
+    </UnitTest>
+  </TestDefinitions>
+  <TestEntries>
+    <TestEntry testId="1472fbc6-f5bb-84b5-3dec-eba42910e4fd" executionId="e4020fd8-7068-47db-bc2c-5462616dfe68" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+  </TestEntries>
+  <TestLists>
+    <TestList name="列表中未列出的结果" id="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestList name="所有已加载的结果" id="19431567-8539-422a-85d7-44ee4e166bda" />
+  </TestLists>
+  <ResultSummary outcome="Failed">
+    <Counters total="1" executed="1" passed="0" failed="1" error="0" timeout="0" aborted="0" inconclusive="0" passedButRunAborted="0" notRunnable="0" notExecuted="0" disconnected="0" warning="0" completed="0" inProgress="0" pending="0" />
+    <Output>
+      <StdOut>[xUnit.net 00:00:00.00] xUnit.net VSTest Adapter v2.5.4.1+b9eacec401 (64-bit .NET 8.0.11)&#xD;
+[xUnit.net 00:00:00.08]   Discovering: LPS.APS.Tests&#xD;
+[xUnit.net 00:00:00.16]   Discovered:  LPS.APS.Tests&#xD;
+[xUnit.net 00:00:00.16]   Starting:    LPS.APS.Tests&#xD;
+[xUnit.net 00:00:13.11]       System.Exception : Task表没有数据！PeggingOrchestrator可能未正确INSERT&#xD;
+[xUnit.net 00:00:13.11]       Stack Trace:&#xD;
+[xUnit.net 00:00:13.11]         D:\CODE\LPS\LPS.APS.Tests\Integration\RealSchedulingIntegrationTest.cs(582,0): at LPS.APS.Tests.Integration.RealSchedulingIntegrationTest.VerifyTaskTableAsync()&#xD;
+[xUnit.net 00:00:13.11]         D:\CODE\LPS\LPS.APS.Tests\Integration\RealSchedulingIntegrationTest.cs(118,0): at LPS.APS.Tests.Integration.RealSchedulingIntegrationTest.RunAllTestsAsync()&#xD;
+[xUnit.net 00:00:13.11]         --- End of stack trace from previous location ---&#xD;
+[xUnit.net 00:00:13.12]   Finished:    LPS.APS.Tests&#xD;
+</StdOut>
+    </Output>
+    <RunInfos>
+      <RunInfo computerName="CN1000-7050W001" outcome="Error" timestamp="2026-09-29T08:39:19.3846593+08:00">
+        <Text>[xUnit.net 00:00:13.11]     v5.1.2: 完整排程流程集成测试 [FAIL]</Text>
+      </RunInfo>
+    </RunInfos>
+  </ResultSummary>
+</TestRun>

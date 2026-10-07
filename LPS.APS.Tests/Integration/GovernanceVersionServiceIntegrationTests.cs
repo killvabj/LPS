@@ -1,6 +1,7 @@
 using FluentAssertions;
 using LPS.APS.Application.Services;
 using LPS.APS.Core.Dto;
+using LPS.APS.Core.Enum;
 using LPS.APS.Core.Interfaces;
 using LPS.APS.Engine.Data;
 using LPS.APS.Engine.Repositories.Auth;
@@ -44,6 +45,7 @@ public class GovernanceVersionServiceIntegrationTests : IDisposable
     private long _testStrategyProfileVersionId;
     private long _testRuleSetVersionId;
     private long _testParameterSetVersionId;
+    private int _testActorUserId;
     private readonly string _uniqueSuffix;
     private readonly DateTime _now;
 
@@ -108,13 +110,13 @@ public class GovernanceVersionServiceIntegrationTests : IDisposable
         paramSetValidation.IsValid.Should().BeTrue();
 
         // 发布：规则集/参数集 DRAFT → PUBLISHED（策略包引用版本须先 PUBLISHED 才能通过 REF_NOT_PUBLISHED，P0-06）
-        await _service.PublishRuleSetVersionAsync(_testRuleSetVersionId, "IntegrationTest");
-        await _service.PublishParameterSetVersionAsync(_testParameterSetVersionId, "IntegrationTest");
+        await _service.PublishRuleSetVersionAsync(_testRuleSetVersionId, "IntegrationTest", _testActorUserId);
+        await _service.PublishParameterSetVersionAsync(_testParameterSetVersionId, "IntegrationTest", _testActorUserId);
 
         // 策略包：引用已 PUBLISHED → 校验通过 → 发布
         var spvValidation = await _service.ValidateStrategyProfileVersionForPublishAsync(_testStrategyProfileVersionId);
         spvValidation.IsValid.Should().BeTrue();
-        await _service.PublishStrategyProfileVersionAsync(_testStrategyProfileVersionId, "IntegrationTest");
+        await _service.PublishStrategyProfileVersionAsync(_testStrategyProfileVersionId, "IntegrationTest", _testActorUserId);
 
         var publishedRuleSet = await _ruleSetVersionRepo.GetByIdAsync(_testRuleSetVersionId);
         publishedRuleSet!.Status.Should().Be("PUBLISHED");
@@ -161,7 +163,7 @@ public class GovernanceVersionServiceIntegrationTests : IDisposable
         var validation = await _service.ValidateRuleSetVersionForPublishAsync(_testRuleSetVersionId);
         validation.IsValid.Should().BeFalse();
 
-        var act = async () => await _service.PublishRuleSetVersionAsync(_testRuleSetVersionId, "IntegrationTest");
+        var act = async () => await _service.PublishRuleSetVersionAsync(_testRuleSetVersionId, "IntegrationTest", _testActorUserId);
         await act.Should().ThrowAsync<InvalidOperationException>()
             .WithMessage("*发布前校验失败*");
 
@@ -199,6 +201,83 @@ public class GovernanceVersionServiceIntegrationTests : IDisposable
         var result = validator.Validate(priorityBlock!);
 
         result.IsValid.Should().BeTrue();
+    }
+
+    // ==================== R3 fork 双发链路（4号位 forkDraft 调用序列实证） ====================
+
+    [SkippableFact]
+    public async Task R3_F1_F4_fork双发链路_新建双DRAFT并回读_策略包可引用()
+    {
+        // R3（Rules.vue 联调阻塞项）：F1 GET rule-set/version/{id}、F2 GET parameter-set/version/{id}、
+        // F3 POST rule-set/version、F4 POST parameter-set/version —— 4号位 forkDraft() 双发链路。
+        // 真实持久化验证：POST 建 DRAFT → 返新 versionId → GET 回读字段一致 → Status=DRAFT → 可被 StrategyProfile 引用。
+        Skip.If(!TestEnvironment.IsAuthDbAvailable() || !TestEnvironment.HasContentSnapshotJsonColumn() || !TestEnvironment.HasAuditLogTable(),
+            "测试库缺 APS_Auth 库、ContentSnapshotJson 列或 AuditLog 表（DDL 未迁移），需 2号位部署 v5.1.2 后转绿");
+
+        await SetupBaseVersionsAsync();
+
+        // F3：POST rule-set/version → 返新 ruleSetVersionId
+        var forkRuleSet = await _service.CreateRuleSetVersionAsync(new RuleSetVersion
+        {
+            RuleSetId = _testRuleSetId,
+            VersionCode = $"FORK-R-{_now:yyyyMMddHHmmss}",
+            DemandPriorityJson = JsonSerializer.Serialize(new DemandPriorityBlock
+            {
+                Segments =
+                [
+                    new PrioritySegment
+                    {
+                        SegmentOrder = 1,
+                        SegmentName = "R3-fork段",
+                        IsEnabled = true,
+                        MatchConditions = [],
+                        SortFields = [],
+                    },
+                ],
+            }),
+        }, "IntegrationTest");
+        forkRuleSet.Id.Should().BeGreaterThan(0);                      // 落库返新 Id
+        forkRuleSet.Status.Should().Be(GovernanceVersionStatus.Draft); // 强制 DRAFT
+
+        // F1：GET rule-set/version/{id} → 回读一致
+        var gotRuleSet = await _service.GetRuleSetVersionAsync(forkRuleSet.Id);
+        gotRuleSet.Should().NotBeNull();
+        gotRuleSet!.VersionCode.Should().Be(forkRuleSet.VersionCode);
+        gotRuleSet.RuleSetId.Should().Be(_testRuleSetId);
+        gotRuleSet.DemandPriorityJson.Should().NotBeNullOrWhiteSpace();
+
+        // F4：POST parameter-set/version → 返新 parameterSetVersionId
+        var forkParamSet = await _service.CreateParameterSetVersionAsync(new ParameterSetVersion
+        {
+            ParameterSetId = _testParameterSetId,
+            VersionCode = $"FORK-P-{_now:yyyyMMddHHmmss}",
+            SolverStrategyJson = JsonSerializer.Serialize(new SolverStrategyBlock { Mode = SolverStrategyMode.Backward, OnTimeTarget = new OnTimeTargetParams { TargetPercent = 85 }, Setup = new SetupParams() }),
+        }, "IntegrationTest");
+        forkParamSet.Id.Should().BeGreaterThan(0);
+        forkParamSet.Status.Should().Be(GovernanceVersionStatus.Draft);
+
+        // F2：GET parameter-set/version/{id} → 回读一致
+        var gotParamSet = await _service.GetParameterSetVersionAsync(forkParamSet.Id);
+        gotParamSet.Should().NotBeNull();
+        gotParamSet!.VersionCode.Should().Be(forkParamSet.VersionCode);
+        gotParamSet.ParameterSetId.Should().Be(_testParameterSetId);
+        gotParamSet.SolverStrategyJson.Should().NotBeNullOrWhiteSpace();
+
+        // 双 DRAFT 可被 StrategyProfile fork 引用（级联链路完整）
+        var forkSpv = await _service.CreateStrategyProfileVersionAsync(new StrategyProfileVersion
+        {
+            StrategyProfileId = _testStrategyProfileId,
+            VersionCode = $"FORK-S-{_now:yyyyMMddHHmmss}",
+            RuleSetVersionId = forkRuleSet.Id,
+            ParameterSetVersionId = forkParamSet.Id,
+            IsDefault = false,
+        }, "IntegrationTest");
+        forkSpv.Id.Should().BeGreaterThan(0);
+
+        // 清理 fork 产物由 Dispose 统一删（沿用 _testStrategyProfileId 主键 + 级联记录）
+        await _cm.ExecuteAsync("DELETE FROM StrategyProfileVersion WHERE Id = @Id", new { Id = forkSpv.Id }, db: DatabaseId.APS);
+        await _cm.ExecuteAsync("DELETE FROM RuleSetVersion WHERE Id = @Id", new { Id = forkRuleSet.Id }, db: DatabaseId.APS);
+        await _cm.ExecuteAsync("DELETE FROM ParameterSetVersion WHERE Id = @Id", new { Id = forkParamSet.Id }, db: DatabaseId.APS);
     }
 
     // ==================== P1-01 方案 A 端到端链（真实持久化全链路） ====================
@@ -263,12 +342,12 @@ public class GovernanceVersionServiceIntegrationTests : IDisposable
         (await _service.ValidateParameterSetVersionForPublishAsync(_testParameterSetVersionId)).IsValid.Should().BeTrue();
 
         // ④ Publish 规则集 + 参数集（DRAFT → PUBLISHED）
-        await _service.PublishRuleSetVersionAsync(_testRuleSetVersionId, "IntegrationTest");
-        await _service.PublishParameterSetVersionAsync(_testParameterSetVersionId, "IntegrationTest");
+        await _service.PublishRuleSetVersionAsync(_testRuleSetVersionId, "IntegrationTest", _testActorUserId);
+        await _service.PublishParameterSetVersionAsync(_testParameterSetVersionId, "IntegrationTest", _testActorUserId);
 
         // ⑤ Validate + Publish 策略包（引用已 PUBLISHED → 校验通过；P0-06 正式发布强制校验）
         (await _service.ValidateStrategyProfileVersionForPublishAsync(_testStrategyProfileVersionId)).IsValid.Should().BeTrue();
-        await _service.PublishStrategyProfileVersionAsync(_testStrategyProfileVersionId, "IntegrationTest");
+        await _service.PublishStrategyProfileVersionAsync(_testStrategyProfileVersionId, "IntegrationTest", _testActorUserId);
 
         // ⑥ Reload 验证 PUBLISHED
         var pubRuleSet = await _ruleSetVersionRepo.GetByIdAsync(_testRuleSetVersionId);
@@ -312,6 +391,13 @@ public class GovernanceVersionServiceIntegrationTests : IDisposable
     /// <summary>创建 RuleSet/ParameterSet/StrategyProfile 父记录 + 三版本（均 DRAFT），互相引用合法 JSON</summary>
     private async Task SetupBaseVersionsAsync()
     {
+        // 审计操作者：dbo.[User]（Auth 库）须存在对应 Id，否则 AuditLog.UserId 外键（FK__AuditLog__UserId）插入冲突。
+        // User.Id 为 IDENTITY(1,1) 不自增显式指定，取 SCOPE_IDENTITY() 作为本测试操作者 actorUserId（替换原硬编码 1001）。
+        _testActorUserId = await _cm.QueryFirstOrDefaultAsync<int>(
+            "INSERT INTO dbo.[User] (LoginName, DisplayName, PasswordHash) VALUES (@Login, @Display, @Pwd); SELECT CAST(SCOPE_IDENTITY() AS INT);",
+            new { Login = $"TEST-USER-{_uniqueSuffix}", Display = "集成测试操作者", Pwd = "integration-test-hash" },
+            db: DatabaseId.Auth);
+
         // 父表：RuleSet
         _testRuleSetId = await _cm.QueryFirstOrDefaultAsync<long>(
             "INSERT INTO [dbo].[RuleSet] ([RuleSetCode], [RuleSetName], [Description], [IsActive], [CreatedAt], [CreatedBy]) VALUES (@Code, @Name, @Description, 1, @CreatedAt, @CreatedBy); SELECT CAST(SCOPE_IDENTITY() AS BIGINT);",
@@ -390,7 +476,7 @@ public class GovernanceVersionServiceIntegrationTests : IDisposable
             {
                 Mode = SolverStrategyMode.Backward,
                 OnTimeTarget = new OnTimeTargetParams { TargetPercent = 85 },
-                Setup = new SetupParams { DefaultSetupMinutes = 45, SetupLookAheadSize = 4 },
+                Setup = new SetupParams(),
             }),
             CandidateGuardrailJson = JsonSerializer.Serialize(new CandidateGuardrailBlock
             {

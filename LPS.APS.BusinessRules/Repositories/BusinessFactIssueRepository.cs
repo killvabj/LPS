@@ -24,8 +24,17 @@ public class BusinessFactIssueRepository : IBusinessFactIssueRepository
         string? reviewStatus = null,
         int skip = 0,
         int take = 50,
-        CancellationToken ct = default)
+        CancellationToken ct = default,
+        IReadOnlySet<string>? allowedFactories = null)
     {
+        // Q5 三级 Scope 处理（31-0 裁决）：
+        // ① 有 ExpectedFactory/ActualFactory → 按 Factory Scope 过滤
+        // ② Factory 均 NULL → 仅 Global 用户可见（本查询无法通过其他权威关系确定 Scope）
+        // Dapper 列表参数只进 IN；@AllowedFactories IS NULL 标量判空会随列表一起扩成 (…) 导致 4145，用 Has 标志替代；空集 fail-closed 返空。
+        if (allowedFactories is { Count: 0 })
+            return new List<BusinessFactIssueDto>();
+        var hasFactories = allowedFactories is { Count: > 0 };
+
         var sql = @"
 SELECT
     'BOM_WORKSET' AS Source,
@@ -33,7 +42,7 @@ SELECT
     Severity,
     Detail,
     ISNULL(ParentMaterialCode, ChildMaterialCode) AS MaterialCode,
-    NULL AS FactoryCode,
+    COALESCE(ExpectedFactory, ActualFactory) AS FactoryCode,
     BOMNO AS DocumentNo,
     NULL AS StageCode,
     NULL AS AffectedQuantity,
@@ -48,6 +57,7 @@ WHERE 1=1
     AND (@MaterialCode IS NULL OR ParentMaterialCode = @MaterialCode OR ChildMaterialCode = @MaterialCode)
     AND (@Severity IS NULL OR Severity = @Severity)
     AND (@ReviewStatus IS NULL OR ReviewStatus = @ReviewStatus)
+    AND (@HasFactories = 0 OR COALESCE(ExpectedFactory, ActualFactory) IN @AllowedFactories)
 ORDER BY CreatedAt DESC
 OFFSET @Skip ROWS FETCH NEXT @Take ROWS ONLY";
 
@@ -57,6 +67,8 @@ OFFSET @Skip ROWS FETCH NEXT @Take ROWS ONLY";
             MaterialCode = materialCode,
             Severity = severity,
             ReviewStatus = reviewStatus,
+            HasFactories = hasFactories,
+            AllowedFactories = allowedFactories,
             Skip = skip,
             Take = take
         };
@@ -74,31 +86,43 @@ OFFSET @Skip ROWS FETCH NEXT @Take ROWS ONLY";
         string? reviewStatus = null,
         int skip = 0,
         int take = 50,
-        CancellationToken ct = default)
+        CancellationToken ct = default,
+        IReadOnlySet<string>? allowedFactories = null)
     {
+        // Q5 三级 Scope 处理（31-0 裁决）：
+        // ① 有 StageCode → 通过 ProcessCodeDict 派生 FactoryCode → 按 Factory Scope 过滤
+        // ② StageCode 均无法派生 FactoryCode → 仅 Global 用户可见
+        // Dapper 列表参数只进 IN；@AllowedFactories IS NULL 会导致 4145，用 Has 标志替代；空集 fail-closed 返空。
+        if (allowedFactories is { Count: 0 })
+            return new List<BusinessFactIssueDto>();
+        var hasFactories = allowedFactories is { Count: > 0 };
+
         var sql = @"
 SELECT
     'MATERIAL_STAGE_CONTEXT' AS Source,
-    IssueType,
-    Severity,
-    Detail,
-    MaterialCode,
-    NULL AS FactoryCode,
+    m.IssueType,
+    m.Severity,
+    m.Detail,
+    m.MaterialCode,
+    pc.FactoryCode,
     NULL AS DocumentNo,
-    StageCode,
+    m.StageCode,
     NULL AS AffectedQuantity,
-    DegradeAction,
-    ReviewStatus,
-    ReviewedBy,
-    ReviewedAt,
-    CreatedAt
-FROM MaterialStageDeptContext_Issues
+    m.DegradeAction,
+    m.ReviewStatus,
+    m.ReviewedBy,
+    m.ReviewedAt,
+    m.CreatedAt
+FROM MaterialStageDeptContext_Issues m
+LEFT JOIN ext_MES_ProcessCode_View pc
+    ON pc.StageCode = m.StageCode
 WHERE 1=1
-    AND (@BatchNo IS NULL OR BatchNo = @BatchNo)
-    AND (@MaterialCode IS NULL OR MaterialCode = @MaterialCode)
-    AND (@Severity IS NULL OR Severity = @Severity)
-    AND (@ReviewStatus IS NULL OR ReviewStatus = @ReviewStatus)
-ORDER BY CreatedAt DESC
+    AND (@BatchNo IS NULL OR m.BatchNo = @BatchNo)
+    AND (@MaterialCode IS NULL OR m.MaterialCode = @MaterialCode)
+    AND (@Severity IS NULL OR m.Severity = @Severity)
+    AND (@ReviewStatus IS NULL OR m.ReviewStatus = @ReviewStatus)
+    AND (@HasFactories = 0 OR pc.FactoryCode IN @AllowedFactories)
+ORDER BY m.CreatedAt DESC
 OFFSET @Skip ROWS FETCH NEXT @Take ROWS ONLY";
 
         var parameters = new
@@ -107,6 +131,8 @@ OFFSET @Skip ROWS FETCH NEXT @Take ROWS ONLY";
             MaterialCode = materialCode,
             Severity = severity,
             ReviewStatus = reviewStatus,
+            HasFactories = hasFactories,
+            AllowedFactories = allowedFactories,
             Skip = skip,
             Take = take
         };
@@ -125,7 +151,8 @@ OFFSET @Skip ROWS FETCH NEXT @Take ROWS ONLY";
         string? reviewStatus = null,
         int skip = 0,
         int take = 100,
-        CancellationToken ct = default)
+        CancellationToken ct = default,
+        IReadOnlySet<string>? allowedFactories = null)
     {
         var allIssues = new List<BusinessFactIssueDto>();
 
@@ -134,7 +161,8 @@ OFFSET @Skip ROWS FETCH NEXT @Take ROWS ONLY";
         {
             var bomIssues = await QueryBomWorksetIssuesAsync(
                 materialCode: materialCode, severity: severity,
-                reviewStatus: reviewStatus, take: take, ct: ct);
+                reviewStatus: reviewStatus, take: take, ct: ct,
+                allowedFactories: allowedFactories);
             allIssues.AddRange(bomIssues);
         }
 
@@ -143,7 +171,8 @@ OFFSET @Skip ROWS FETCH NEXT @Take ROWS ONLY";
         {
             var mscIssues = await QueryMaterialStageContextIssuesAsync(
                 materialCode: materialCode, severity: severity,
-                reviewStatus: reviewStatus, take: take, ct: ct);
+                reviewStatus: reviewStatus, take: take, ct: ct,
+                allowedFactories: allowedFactories);
             allIssues.AddRange(mscIssues);
         }
 

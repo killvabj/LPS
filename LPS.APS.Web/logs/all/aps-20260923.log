@@ -1,0 +1,47 @@
+[2026-09-23 11:40:08.379 INF] [] ========================================
+[2026-09-23 11:40:08.416 INF] [] LPS.APS 应用程序启动中...
+[2026-09-23 11:40:08.416 INF] [] ========================================
+[2026-09-23 11:40:16.134 INF] [] LPS.APS 应用程序启动完成
+[2026-09-23 11:40:16.140 DBG] [Microsoft.Extensions.Hosting.Internal.Host] Hosting starting
+[2026-09-23 11:40:16.333 INF] [Microsoft.Hosting.Lifetime] Now listening on: https://localhost:7044
+[2026-09-23 11:40:16.334 INF] [Microsoft.Hosting.Lifetime] Now listening on: http://localhost:5163
+[2026-09-23 11:40:16.417 INF] [Microsoft.Hosting.Lifetime] Application started. Press Ctrl+C to shut down.
+[2026-09-23 11:40:16.417 INF] [Microsoft.Hosting.Lifetime] Hosting environment: Development
+[2026-09-23 11:40:16.418 INF] [Microsoft.Hosting.Lifetime] Content root path: D:\WorkSpace_LocalLib\Windsurf WorkSpace\LPS_SVN\LPS.APS.Web
+[2026-09-23 11:40:16.418 DBG] [Microsoft.Extensions.Hosting.Internal.Host] Hosting started
+[2026-09-23 11:42:21.723 INF] [] ========================================
+[2026-09-23 11:42:21.762 INF] [] LPS.APS 应用程序启动中...
+[2026-09-23 11:42:21.763 INF] [] ========================================
+[2026-09-23 11:42:33.201 INF] [] LPS.APS 应用程序启动完成
+[2026-09-23 11:42:33.206 DBG] [Microsoft.Extensions.Hosting.Internal.Host] Hosting starting
+[2026-09-23 11:42:33.387 INF] [Microsoft.Hosting.Lifetime] Now listening on: https://localhost:7044
+[2026-09-23 11:42:33.388 INF] [Microsoft.Hosting.Lifetime] Now listening on: http://localhost:5163
+[2026-09-23 11:42:33.477 INF] [Microsoft.Hosting.Lifetime] Application started. Press Ctrl+C to shut down.
+[2026-09-23 11:42:33.478 INF] [Microsoft.Hosting.Lifetime] Hosting environment: Development
+[2026-09-23 11:42:33.478 INF] [Microsoft.Hosting.Lifetime] Content root path: D:\WorkSpace_LocalLib\Windsurf WorkSpace\LPS_SVN\LPS.APS.Web
+[2026-09-23 11:42:33.479 DBG] [Microsoft.Extensions.Hosting.Internal.Host] Hosting started
+[2026-09-23 12:17:33.760 INF] [] ========================================
+[2026-09-23 12:17:33.797 INF] [] LPS.APS 应用程序启动中...
+[2026-09-23 12:17:33.798 INF] [] ========================================
+[2026-09-23 14:03:39.079 INF] [] ========================================
+[2026-09-23 14:03:39.115 INF] [] LPS.APS 应用程序启动中...
+[2026-09-23 14:03:39.116 INF] [] ========================================
+[2026-09-23 14:03:47.892 INF] [] LPS.APS 应用程序启动完成
+[2026-09-23 14:03:47.897 DBG] [Microsoft.Extensions.Hosting.Internal.Host] Hosting starting
+[2026-09-23 14:03:48.064 INF] [Microsoft.Hosting.Lifetime] Now listening on: https://localhost:7044
+[2026-09-23 14:03:48.065 INF] [Microsoft.Hosting.Lifetime] Now listening on: http://localhost:5163
+[2026-09-23 14:03:48.158 INF] [Microsoft.Hosting.Lifetime] Application started. Press Ctrl+C to shut down.
+[2026-09-23 14:03:48.158 INF] [Microsoft.Hosting.Lifetime] Hosting environment: Development
+[2026-09-23 14:03:48.159 INF] [Microsoft.Hosting.Lifetime] Content root path: D:\WorkSpace_LocalLib\Windsurf WorkSpace\LPS_SVN\LPS.APS.Web
+[2026-09-23 14:03:48.159 DBG] [Microsoft.Extensions.Hosting.Internal.Host] Hosting started
+[2026-09-23 14:14:31.515 INF] [] ========================================
+[2026-09-23 14:14:31.550 INF] [] LPS.APS 应用程序启动中...
+[2026-09-23 14:14:31.550 INF] [] ========================================
+[2026-09-23 14:14:45.560 INF] [] LPS.APS 应用程序启动完成
+[2026-09-23 14:14:45.565 DBG] [Microsoft.Extensions.Hosting.Internal.Host] Hosting starting
+[2026-09-23 14:14:45.734 INF] [Microsoft.Hosting.Lifetime] Now listening on: https://localhost:7044
+[2026-09-23 14:14:45.735 INF] [Microsoft.Hosting.Lifetime] Now listening on: http://localhost:5163
+[2026-09-23 14:14:45.815 INF] [Microsoft.Hosting.Lifetime] Application started. Press Ctrl+C to shut down.
+[2026-09-23 14:14:45.816 INF] [Microsoft.Hosting.Lifetime] Hosting environment: Development
+[2026-09-23 14:14:45.816 INF] [Microsoft.Hosting.Lifetime] Content root path: D:\WorkSpace_LocalLib\Windsurf WorkSpace\LPS_SVN\LPS.APS.Web
+[2026-09-23 14:14:45.816 DBG] [Microsoft.Extensions.Hosting.Internal.Host] Hosting started

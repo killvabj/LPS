@@ -34,4 +34,14 @@ public interface IAuditLogRepository
         DateTime? to = null,
         int? take = null,
         CancellationToken cancellationToken = default);
+
+    /// <summary>分页组合查询审计（操作人 Id / 动作 / 时间范围 可空组合，按发生时间倒序分页）</summary>
+    Task<IReadOnlyList<AuditLog>> QueryPagedAsync(
+        int? userId = null,
+        string? action = null,
+        DateTime? from = null,
+        DateTime? to = null,
+        int page = 1,
+        int pageSize = 20,
+        CancellationToken cancellationToken = default);
 }

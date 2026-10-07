@@ -1,0 +1,18 @@
+[2026-09-29 09:41:31.060] [] ========================================
+[2026-09-29 09:41:31.121] [] LPS.APS 应用程序启动中...
+[2026-09-29 09:41:31.122] [] ========================================
+[2026-09-29 09:41:37.740] [] LPS.APS 应用程序启动完成
+[2026-09-29 09:41:37.930] [Microsoft.Hosting.Lifetime] Now listening on: https://localhost:7044
+[2026-09-29 09:41:37.931] [Microsoft.Hosting.Lifetime] Now listening on: http://localhost:5163
+[2026-09-29 09:41:38.016] [Microsoft.Hosting.Lifetime] Application started. Press Ctrl+C to shut down.
+[2026-09-29 09:41:38.017] [Microsoft.Hosting.Lifetime] Hosting environment: Development
+[2026-09-29 09:41:38.017] [Microsoft.Hosting.Lifetime] Content root path: D:\WorkSpace_LocalLib\Windsurf WorkSpace\LPS_SVN\LPS.APS.Web
+[2026-09-29 15:21:45.969] [] ========================================
+[2026-09-29 15:21:46.024] [] LPS.APS 应用程序启动中...
+[2026-09-29 15:21:46.025] [] ========================================
+[2026-09-29 15:21:46.751] [] LPS.APS 应用程序启动完成
+[2026-09-29 15:21:46.895] [Microsoft.Hosting.Lifetime] Now listening on: https://localhost:7044
+[2026-09-29 15:21:46.897] [Microsoft.Hosting.Lifetime] Now listening on: http://localhost:5163
+[2026-09-29 15:21:46.971] [Microsoft.Hosting.Lifetime] Application started. Press Ctrl+C to shut down.
+[2026-09-29 15:21:46.971] [Microsoft.Hosting.Lifetime] Hosting environment: Development
+[2026-09-29 15:21:46.972] [Microsoft.Hosting.Lifetime] Content root path: D:\WorkSpace_LocalLib\Windsurf WorkSpace\LPS_SVN\LPS.APS.Web

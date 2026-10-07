@@ -102,4 +102,45 @@ public class AuditLogRepository : IAuditLogRepository
 
         return await query.ToListAsync(cancellationToken);
     }
+
+    public async Task<IReadOnlyList<AuditLog>> QueryPagedAsync(
+        int? userId = null,
+        string? action = null,
+        DateTime? from = null,
+        DateTime? to = null,
+        int page = 1,
+        int pageSize = 20,
+        CancellationToken cancellationToken = default)
+    {
+        IQueryable<AuditLog> query = _context.AuditLogs.AsNoTracking();
+
+        if (userId.HasValue)
+        {
+            query = query.Where(log => log.UserId == userId.Value);
+        }
+
+        if (!string.IsNullOrWhiteSpace(action))
+        {
+            query = query.Where(log => log.ActionCode == action);
+        }
+
+        if (from.HasValue)
+        {
+            query = query.Where(log => log.OccurredAt >= from.Value);
+        }
+
+        if (to.HasValue)
+        {
+            query = query.Where(log => log.OccurredAt <= to.Value);
+        }
+
+        var safePage = Math.Max(page, 1);
+        var safeSize = Math.Clamp(pageSize, 1, 200);
+
+        return await query
+            .OrderByDescending(log => log.OccurredAt)
+            .Skip((safePage - 1) * safeSize)
+            .Take(safeSize)
+            .ToListAsync(cancellationToken);
+    }
 }

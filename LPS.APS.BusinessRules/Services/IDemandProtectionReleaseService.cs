@@ -6,7 +6,8 @@ namespace LPS.APS.BusinessRules.Services;
 /// Demand Protection 释放业务服务接口（2号位，数量真相 Owner）
 ///
 /// 【职责】释放 DemandSupplyHardLock 中 LockType='DEMAND_PROTECTION' 的锁，
-///  由 5号位 Application Service 中转调用（4号位前端 → 5号位 API → 本服务）。
+///  由 DemandProtectionAppService（Application 层）中转调用
+///  （4号位前端 → 5号位 API → DemandProtectionAppService → 本服务）。
 ///
 /// 【边界】
 /// - 5号位 只做权限/Scope 校验与中转，不得自己算释放数量、改 Lock / Allocation；
@@ -22,7 +23,7 @@ public interface IDemandProtectionReleaseService
     /// </summary>
     /// <param name="lockIds">要释放的 Lock Id 列表（去重后处理）</param>
     /// <param name="releasedBy">操作人</param>
-    /// <param name="releaseReason">释放原因（至少 5 个字符）</param>
+    /// <param name="releaseReason">释放原因（必填）</param>
     /// <param name="ct">取消令牌</param>
     /// <returns>逐 Lock 的释放结果列表（顺序与请求去重后一致）</returns>
     Task<List<DemandProtectionReleaseResult>> ReleaseLocksAsync(

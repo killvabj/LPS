@@ -80,6 +80,26 @@ public sealed class ProductionInstructionPositionInput
     public IReadOnlyList<ReceivedFact> StrongFacts { get; init; } = Array.Empty<ReceivedFact>();
 
     /// <summary>
+    /// 工单快照事实列表（2号位从MESWorkOrderSnapshot提取，仅IN_PROGRESS工单）
+    ///
+    /// 用途：5号位结合工单身份（MESWorkOrderNo/WorkOrderStatus）+ 工序进度 + PI Position
+    /// 输出标准化既存执行上下文（ExistingExecutionContext），供2号位 Continuation 分桶。
+    ///
+    /// ⚠️ 只传IN_PROGRESS工单；RELEASED/CLOSED/DELETED不传。
+    /// </summary>
+    public IReadOnlyList<WorkOrderSnapshotFact> WorkOrders { get; init; } = Array.Empty<WorkOrderSnapshotFact>();
+
+    /// <summary>
+    /// Routing 工序节点事实（按物料+部门过滤后的该 PI 子集；5号位 DAG 拓扑前沿算法输入）
+    /// </summary>
+    public IReadOnlyList<RoutingOperationFact> RoutingOperations { get; init; } = Array.Empty<RoutingOperationFact>();
+
+    /// <summary>
+    /// Routing 依赖边事实（同上物料+部门范围；激活条件：Count > 0 即走 DAG 拓扑前沿）
+    /// </summary>
+    public IReadOnlyList<RoutingDependencyFact> RoutingDependencies { get; init; } = Array.Empty<RoutingDependencyFact>();
+
+    /// <summary>
     /// 本次计算使用的冻结参数快照ID（可选）
     /// </summary>
     public long? FrozenParameterSnapshotId { get; init; }

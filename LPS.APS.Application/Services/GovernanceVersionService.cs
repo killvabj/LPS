@@ -1,3 +1,4 @@
+using LPS.APS.Application.Models;
 using RuleSetVersion = LPS.APS.Core.Entities.APS.RuleSetVersion;
 using ParameterSetVersion = LPS.APS.Core.Entities.APS.ParameterSetVersion;
 using StrategyProfileVersion = LPS.APS.Core.Entities.APS.StrategyProfileVersion;
@@ -57,7 +58,7 @@ public class GovernanceVersionService : IGovernanceVersionService
     /// <summary>合法发布前驱状态（其余状态发布一律拒绝）</summary>
     private static readonly string[] PublishableStatuses = [GovernanceVersionStatus.Draft, GovernanceVersionStatus.Submitted, GovernanceVersionStatus.Approved];
 
-    public async Task PublishRuleSetVersionAsync(long ruleSetVersionId, string? publishedBy, CancellationToken ct = default, string? changeReason = null)
+    public async Task PublishRuleSetVersionAsync(long ruleSetVersionId, string? publishedBy, int actorUserId, CancellationToken ct = default, string? changeReason = null)
     {
         var version = await _ruleSetVersionRepository.GetByIdAsync(ruleSetVersionId, ct)
             ?? throw new InvalidOperationException($"规则集版本不存在：{ruleSetVersionId}");
@@ -91,13 +92,14 @@ public class GovernanceVersionService : IGovernanceVersionService
             VersionCode = version.VersionCode,
             OldValue = beforeStatus,
             NewValue = GovernanceVersionStatus.Published,
+            UserId = actorUserId,
             UserCode = publishedBy,
             OccurredAt = DateTime.UtcNow,
             Remark = string.IsNullOrWhiteSpace(changeReason) ? "规则集版本发布" : changeReason
         }, ct);
     }
 
-    public async Task PublishParameterSetVersionAsync(long parameterSetVersionId, string? publishedBy, CancellationToken ct = default, string? changeReason = null)
+    public async Task PublishParameterSetVersionAsync(long parameterSetVersionId, string? publishedBy, int actorUserId, CancellationToken ct = default, string? changeReason = null)
     {
         var version = await _parameterSetVersionRepository.GetByIdAsync(parameterSetVersionId, ct)
             ?? throw new InvalidOperationException($"参数集版本不存在：{parameterSetVersionId}");
@@ -131,6 +133,7 @@ public class GovernanceVersionService : IGovernanceVersionService
             VersionCode = version.VersionCode,
             OldValue = beforeStatus,
             NewValue = GovernanceVersionStatus.Published,
+            UserId = actorUserId,
             UserCode = publishedBy,
             OccurredAt = DateTime.UtcNow,
             Remark = string.IsNullOrWhiteSpace(changeReason) ? "参数集版本发布" : changeReason
@@ -179,7 +182,7 @@ public class GovernanceVersionService : IGovernanceVersionService
         };
     }
 
-    public async Task DisableRuleSetVersionAsync(long ruleSetVersionId, string? operatedBy, string? reason = null, CancellationToken ct = default)
+    public async Task DisableRuleSetVersionAsync(long ruleSetVersionId, string? operatedBy, int actorUserId, string? reason = null, CancellationToken ct = default)
     {
         var version = await _ruleSetVersionRepository.GetByIdAsync(ruleSetVersionId, ct)
             ?? throw new InvalidOperationException($"规则集版本不存在：{ruleSetVersionId}");
@@ -200,13 +203,14 @@ public class GovernanceVersionService : IGovernanceVersionService
             VersionCode = version.VersionCode,
             OldValue = beforeStatus,
             NewValue = GovernanceVersionStatus.Disabled,
+            UserId = actorUserId,
             UserCode = operatedBy,
             OccurredAt = DateTime.UtcNow,
             Remark = reason
         }, ct);
     }
 
-    public async Task DisableParameterSetVersionAsync(long parameterSetVersionId, string? operatedBy, string? reason = null, CancellationToken ct = default)
+    public async Task DisableParameterSetVersionAsync(long parameterSetVersionId, string? operatedBy, int actorUserId, string? reason = null, CancellationToken ct = default)
     {
         var version = await _parameterSetVersionRepository.GetByIdAsync(parameterSetVersionId, ct)
             ?? throw new InvalidOperationException($"参数集版本不存在：{parameterSetVersionId}");
@@ -227,13 +231,14 @@ public class GovernanceVersionService : IGovernanceVersionService
             VersionCode = version.VersionCode,
             OldValue = beforeStatus,
             NewValue = GovernanceVersionStatus.Disabled,
+            UserId = actorUserId,
             UserCode = operatedBy,
             OccurredAt = DateTime.UtcNow,
             Remark = reason
         }, ct);
     }
 
-    public async Task DisableStrategyProfileVersionAsync(long strategyProfileVersionId, string? operatedBy, string? reason = null, CancellationToken ct = default)
+    public async Task DisableStrategyProfileVersionAsync(long strategyProfileVersionId, string? operatedBy, int actorUserId, string? reason = null, CancellationToken ct = default)
     {
         var version = await _strategyProfileVersionRepository.GetByIdAsync(strategyProfileVersionId, ct)
             ?? throw new InvalidOperationException($"策略包版本不存在：{strategyProfileVersionId}");
@@ -260,6 +265,7 @@ public class GovernanceVersionService : IGovernanceVersionService
             VersionCode = version.VersionCode,
             OldValue = beforeStatus,
             NewValue = GovernanceVersionStatus.Disabled,
+            UserId = actorUserId,
             UserCode = operatedBy,
             OccurredAt = DateTime.UtcNow,
             Remark = reason
@@ -286,6 +292,10 @@ public class GovernanceVersionService : IGovernanceVersionService
             CompareField("DemandPriority", "需求优先级配置",
                 ExtractBlockJson(sourceVersion.ContentSnapshotJson, "DemandPriority"),
                 ExtractBlockJson(targetVersion.ContentSnapshotJson, "DemandPriority")),
+            // S-6：Setup 换型规则子块对比（fail-open：缺失/为空 → 空规则集，对比仍可安全执行）
+            CompareField("SetupTransitionRules", "换型规则配置",
+                ExtractBlockJson(sourceVersion.ContentSnapshotJson, SetupTransitionRuleProjector.SetupTransitionRulesBlockName),
+                ExtractBlockJson(targetVersion.ContentSnapshotJson, SetupTransitionRuleProjector.SetupTransitionRulesBlockName)),
             CompareField("EffectiveFrom", "生效起始", sourceVersion.EffectiveFrom?.ToString("yyyy-MM-dd HH:mm:ss"), targetVersion.EffectiveFrom?.ToString("yyyy-MM-dd HH:mm:ss")),
             CompareField("EffectiveTo", "生效截止", sourceVersion.EffectiveTo?.ToString("yyyy-MM-dd HH:mm:ss"), targetVersion.EffectiveTo?.ToString("yyyy-MM-dd HH:mm:ss")),
             CompareField("PublishedAt", "发布时间", sourceVersion.PublishedAt?.ToString("yyyy-MM-dd HH:mm:ss"), targetVersion.PublishedAt?.ToString("yyyy-MM-dd HH:mm:ss")),
@@ -518,6 +528,37 @@ public class GovernanceVersionService : IGovernanceVersionService
                     Code = "INVALID_JSON",
                     Message = "DemandPriorityJson 格式无效",
                     FieldName = "DemandPriorityJson",
+                    Details = ex.Message
+                });
+            }
+        }
+
+        // S-6：Setup 换型规则子块发布前校验（fail-open：缺失/为空 → 通过，无规则 DEFAULT 兜底；
+        // 存在但 JSON 损坏 → 阻断，不静默吞错——写入口严格、读出口宽容，与 SetupRuleService 合法写路径零冲突）
+        var setupBlockJson = ExtractBlockJson(version.ContentSnapshotJson, SetupTransitionRuleProjector.SetupTransitionRulesBlockName);
+        if (!string.IsNullOrWhiteSpace(setupBlockJson))
+        {
+            try
+            {
+                var setupRules = System.Text.Json.JsonSerializer.Deserialize<List<LPS.APS.Core.Entities.APS.SetupTransitionRule>>(
+                    setupBlockJson, JsonOptions);
+                if (setupRules == null)
+                {
+                    result.Errors.Add(new ValidationError
+                    {
+                        Code = "INVALID_SETUP_TRANSITION_RULES",
+                        Message = "SetupTransitionRules 子块反序列化结果为空",
+                        FieldName = SetupTransitionRuleProjector.SetupTransitionRulesBlockName
+                    });
+                }
+            }
+            catch (System.Text.Json.JsonException ex)
+            {
+                result.Errors.Add(new ValidationError
+                {
+                    Code = "INVALID_SETUP_TRANSITION_RULES",
+                    Message = "SetupTransitionRules 子块格式无效",
+                    FieldName = SetupTransitionRuleProjector.SetupTransitionRulesBlockName,
                     Details = ex.Message
                 });
             }
@@ -979,6 +1020,15 @@ public class GovernanceVersionService : IGovernanceVersionService
                 ?? throw new InvalidOperationException($"规则集版本 {version.Id} 的 DemandPriorityJson 反序列化失败，无法归一化内容快照")
         };
 
+        // S-6：Setup 换型规则子块由 SetupRuleService 直写 ContentSnapshotJson（独立写路径，不走主题 JSON），
+        // 全量重建快照时须保留既有 SetupTransitionRules 子块，避免被 DemandPriority 归一化覆盖（数据丢失）。
+        var setupBlockJson = ExtractBlockJson(version.ContentSnapshotJson, SetupTransitionRuleProjector.SetupTransitionRulesBlockName);
+        if (!string.IsNullOrWhiteSpace(setupBlockJson))
+        {
+            blocks[SetupTransitionRuleProjector.SetupTransitionRulesBlockName] =
+                System.Text.Json.JsonSerializer.Deserialize<System.Text.Json.JsonElement>(setupBlockJson, JsonOptions);
+        }
+
         version.ContentSnapshotJson = System.Text.Json.JsonSerializer.Serialize(blocks);
     }
 
@@ -1184,7 +1234,7 @@ public class GovernanceVersionService : IGovernanceVersionService
         }
     }
 
-    public async Task PublishStrategyProfileVersionAsync(long strategyProfileVersionId, string? publishedBy, CancellationToken ct = default, string? changeReason = null)
+    public async Task PublishStrategyProfileVersionAsync(long strategyProfileVersionId, string? publishedBy, int actorUserId, CancellationToken ct = default, string? changeReason = null)
     {
         var version = await _strategyProfileVersionRepository.GetByIdAsync(strategyProfileVersionId, ct)
             ?? throw new InvalidOperationException($"策略包版本不存在：{strategyProfileVersionId}");
@@ -1220,6 +1270,7 @@ public class GovernanceVersionService : IGovernanceVersionService
             VersionCode = version.VersionCode,
             OldValue = beforeStatus,
             NewValue = GovernanceVersionStatus.Published,
+            UserId = actorUserId,
             UserCode = publishedBy,
             OccurredAt = DateTime.UtcNow,
             Remark = string.IsNullOrWhiteSpace(changeReason) ? "策略包版本发布" : changeReason

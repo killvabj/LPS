@@ -168,10 +168,11 @@ public class DemandProtectionReleaseServiceTests
     }
 
     [Fact]
-    public async Task Release_reason不足5字符_抛ArgumentException()
+    public async Task Release_短reason_不抛异常_仅需非空白()
     {
+        // 0号位 31-0 裁决撤销 ≥5 字符硬约束，仅保留非空白校验
         var act = () => _service.ReleaseLocksAsync(new List<long> { 1 }, "op1", "取消");
-        await act.Should().ThrowAsync<ArgumentException>();
+        await act.Should().NotThrowAsync();
     }
 
     [Fact]

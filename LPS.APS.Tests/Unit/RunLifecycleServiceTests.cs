@@ -31,19 +31,24 @@ public class RunLifecycleServiceTests
     private readonly Mock<IAuditLogRepository> _auditRepo = new();
     private readonly Mock<IDataScopeService> _dataScopeService = new();
     private readonly Mock<ISchedulingOrchestrator> _schedulingOrchestrator = new();
+    private readonly Mock<IScheduleRunService> _scheduleRunService = new();
     private readonly RunLifecycleService _service;
 
     public RunLifecycleServiceTests()
     {
         // 5e：默认全范围放行（Global），既有用例不感知业务范围校验
         _dataScopeService
-            .Setup(s => s.ResolveScopeAsync(It.IsAny<int>(), It.IsAny<CancellationToken>()))
-            .ReturnsAsync(DataScopeContext.Global);
+            .Setup(s => s.EnsureInScopeAsync(It.IsAny<int>(), It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .Returns(Task.CompletedTask);
 
         // P1-02：3→2 排程发令枪默认成功（2号位 主流程不在单测内重演）
         _schedulingOrchestrator
             .Setup(o => o.RunSchedulingAndFinalizeAsync(
                 It.IsAny<int>(), It.IsAny<int>(), It.IsAny<long>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new SchedulingRunResult { IsSuccess = true });
+        // P1-03：FAILED 恢复内联执行 seam（ExecuteRunAsync）默认全成功
+        _schedulingOrchestrator
+            .Setup(o => o.ExecuteRunAsync(It.IsAny<int>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(new SchedulingRunResult { IsSuccess = true });
 
         _service = new RunLifecycleService(
@@ -55,6 +60,7 @@ public class RunLifecycleServiceTests
             _auditRepo.Object,
             _dataScopeService.Object,
             _schedulingOrchestrator.Object,
+            _scheduleRunService.Object,
             NullLogger<RunLifecycleService>.Instance);
     }
 
@@ -348,8 +354,8 @@ public class RunLifecycleServiceTests
         var version = CandidateVersion(5, "D1");
         _planVersionRepo.Setup(r => r.GetByIdAsync(5, It.IsAny<CancellationToken>())).ReturnsAsync(version);
         _dataScopeService
-            .Setup(s => s.ResolveScopeAsync(It.IsAny<int>(), It.IsAny<CancellationToken>()))
-            .ReturnsAsync(DataScopeContext.FromPolicies(new[] { (DataScopeTypes.Domain, "D2") }));
+            .Setup(s => s.EnsureInScopeAsync(It.IsAny<int>(), DataScopeTypes.Domain, "D1", It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new ScopeViolationException(DataScopeTypes.Domain, "D1"));
 
         // Act
         var act = async () => await _service.ConfirmCandidateAsync(5, 1, "u1", null, CancellationToken.None);
@@ -510,8 +516,8 @@ public class RunLifecycleServiceTests
         _auditRepo.Setup(r => r.GetByEntityAsync("PlanVersion", "5", It.IsAny<CancellationToken>()))
             .ReturnsAsync(ConfirmedLogs());
         _dataScopeService
-            .Setup(s => s.ResolveScopeAsync(It.IsAny<int>(), It.IsAny<CancellationToken>()))
-            .ReturnsAsync(DataScopeContext.FromPolicies(new[] { (DataScopeTypes.Domain, "D2") }));
+            .Setup(s => s.EnsureInScopeAsync(It.IsAny<int>(), DataScopeTypes.Domain, "D1", It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new ScopeViolationException(DataScopeTypes.Domain, "D1"));
 
         // Act
         var act = async () => await _service.ActivateCandidateAsync(5, 1, "u1", CancellationToken.None);
@@ -561,19 +567,24 @@ public class RunLifecycleServiceTests
         failed.CompletedAt = DateTime.UtcNow;
         failed.ErrorMessage = "致命错误";
         _scheduleRunRepo.Setup(r => r.GetByIdAsync(1, It.IsAny<CancellationToken>())).ReturnsAsync(failed);
-        _scheduleRunRepo.Setup(r => r.InsertForRecoveryAsync(failed, It.IsAny<string>(), It.IsAny<CancellationToken>()))
+        _scheduleRunRepo.Setup(r => r.InsertForRecoveryWithShellsAsync(
+            failed, It.IsAny<IReadOnlyList<RecoveryShellSpec>>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(100);
+        // 失败 Run 无既有 PlanVersion → 壳窗口兜底今天 ~ +90 天（不影响本用例断言）
+        _planVersionRepo.Setup(r => r.GetByScheduleRunIdAsync(1, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new List<PlanVersion>());
 
         // Act
         var newId = await _service.RecoverFailedRunAsync(1, 1, CancellationToken.None);
 
-        // Assert：返回新 Id、继承 StrategyProfileVersionId + ExpectedDomainKeysJson 基线、旧 FAILED 记录不动
+        // Assert：返回新 Id、继承 StrategyProfileVersionId + ExpectedDomainKeysJson 基线、一域一壳（2 壳）、旧 FAILED 记录不动
         newId.Should().Be(100);
-        _scheduleRunRepo.Verify(r => r.InsertForRecoveryAsync(
+        _scheduleRunRepo.Verify(r => r.InsertForRecoveryWithShellsAsync(
             It.Is<ScheduleRunGov>(s =>
                 s.StrategyProfileVersionId == 10
                 && s.ExpectedDomainKeysJson == """["D1","D2"]"""
                 && s.RunType == "FULL_SCHEDULE"),
+            It.Is<IReadOnlyList<RecoveryShellSpec>>(shells => shells.Count == 2),
             It.IsAny<string>(),
             It.IsAny<CancellationToken>()), Times.Once);
         failed.Status.Should().Be("FAILED");   // 旧记录不回改 RUNNING
@@ -598,8 +609,27 @@ public class RunLifecycleServiceTests
 
         // Assert：不新建、旧记录不动
         await act.Should().ThrowAsync<InvalidOperationException>();
-        _scheduleRunRepo.Verify(r => r.InsertForRecoveryAsync(
-            It.IsAny<ScheduleRunGov>(), It.IsAny<string>(), It.IsAny<CancellationToken>()), Times.Never);
+        _scheduleRunRepo.Verify(r => r.InsertForRecoveryWithShellsAsync(
+            It.IsAny<ScheduleRunGov>(), It.IsAny<IReadOnlyList<RecoveryShellSpec>>(), It.IsAny<string>(), It.IsAny<CancellationToken>()), Times.Never);
+        failed.Status.Should().Be("FAILED");
+    }
+
+    [Fact]
+    public async Task Recover_非FULL_RunType_拒绝恢复且不新建()
+    {
+        // Arrange：FAILED 但 RunType 为 MANUAL_RESCHEDULE（非 FULL_SCHEDULE，P1-03 §5.1 fail-closed，无 Base 基线可继承）
+        var failed = CandidateRun(2, expectedJson: """["D1"]""");
+        failed.Status = "FAILED";
+        _scheduleRunRepo.Setup(r => r.GetByIdAsync(2, It.IsAny<CancellationToken>())).ReturnsAsync(failed);
+
+        // Act
+        var act = async () => await _service.RecoverFailedRunAsync(2, 1, CancellationToken.None);
+
+        // Assert：拒绝且不新建（旧记录不动、不产生 RUNNING 壳）
+        await act.Should().ThrowAsync<InvalidOperationException>()
+            .WithMessage("*仅 FULL_SCHEDULE 可恢复*");
+        _scheduleRunRepo.Verify(r => r.InsertForRecoveryWithShellsAsync(
+            It.IsAny<ScheduleRunGov>(), It.IsAny<IReadOnlyList<RecoveryShellSpec>>(), It.IsAny<string>(), It.IsAny<CancellationToken>()), Times.Never);
         failed.Status.Should().Be("FAILED");
     }
 

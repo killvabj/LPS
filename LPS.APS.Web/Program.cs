@@ -14,6 +14,7 @@ using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.AspNetCore.RateLimiting;
 using System.Threading.RateLimiting;
 using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Mvc;
 using Microsoft.IdentityModel.Tokens;
 using Microsoft.OpenApi.Models;
 using Serilog;
@@ -35,7 +36,7 @@ Log.Logger = new LoggerConfiguration()
 try
 {
     Log.Information("========================================");
-    Log.Information("LPS.APS 应用程序启动中...");
+    Log.Information("LPS.APS 应用程序启动中...");  
     Log.Information("========================================");
 
 var builder = WebApplication.CreateBuilder(args);
@@ -71,6 +72,20 @@ builder.Services.AddHangfireServices(builder.Configuration);
 builder.Services.AddControllers(options =>
 {
     options.Filters.Add<GlobalExceptionFilter>();
+})
+.ConfigureApiBehaviorOptions(options =>
+{
+    // [ApiController] 自动模型校验失败时，统一返回 422 + ApiResponse 信封（前端按 json.code 解析，替代默认 400 ProblemDetails）
+    options.InvalidModelStateResponseFactory = context =>
+    {
+        var firstError = context.ModelState
+            .Where(kv => kv.Value?.Errors.Count > 0)
+            .SelectMany(kv => kv.Value!.Errors.Select(e => e.ErrorMessage))
+            .FirstOrDefault() ?? "请求参数校验失败";
+
+        return new UnprocessableEntityObjectResult(
+            ApiResponse.Fail(422, firstError));
+    };
 })
 .AddJsonOptions(options =>
 {

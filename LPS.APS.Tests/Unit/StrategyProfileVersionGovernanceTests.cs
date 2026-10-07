@@ -149,7 +149,7 @@ public class StrategyProfileVersionGovernanceTests
         SetupValidReferences(100, 200);
 
         // Act
-        await _service.PublishStrategyProfileVersionAsync(1, "tester", CancellationToken.None);
+        await _service.PublishStrategyProfileVersionAsync(1, "tester", 1001, CancellationToken.None);
 
         // Assert
         version.Status.Should().Be(GovernanceVersionStatus.Published);
@@ -174,7 +174,7 @@ public class StrategyProfileVersionGovernanceTests
         SetupValidReferences(100, 200);
 
         // Act
-        await _service.PublishStrategyProfileVersionAsync(1, "tester", CancellationToken.None);
+        await _service.PublishStrategyProfileVersionAsync(1, "tester", 1001, CancellationToken.None);
 
         // Assert —— 先清旧默认再更新
         _strategyProfileVersionRepo.Verify(r => r.ClearDefaultFlagAsync(10, 1, It.IsAny<CancellationToken>()), Times.Once);
@@ -195,7 +195,7 @@ public class StrategyProfileVersionGovernanceTests
         SetupValidReferences(100, 200);
 
         // Act
-        var act = () => _service.PublishStrategyProfileVersionAsync(1, "tester", CancellationToken.None);
+        var act = () => _service.PublishStrategyProfileVersionAsync(1, "tester", 1001, CancellationToken.None);
 
         // Assert
         await act.Should().ThrowAsync<InvalidOperationException>();

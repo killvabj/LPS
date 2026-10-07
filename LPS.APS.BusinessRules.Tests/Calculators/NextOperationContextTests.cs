@@ -20,12 +20,9 @@ public class NextOperationContextTests
     }
 
     /// <summary>
-    /// 测试同一PI多执行起点切片
-    /// PI001 RemainingQty = 1000
-    /// Stage CN_MACHINING: CumulativeCompletedQty = 1000（所有件都在这个Stage）
-    /// NC (seq=1): CumulativeCompletedQty = 800
-    /// 挤丝 (seq=2): CumulativeCompletedQty = 0
-    /// 期望：200件 StartOperation = NC, 800件 StartOperation = 挤丝
+    /// 唯一 frontier 判定（39-0 §四.1）
+    /// NC 已开工未完成（GoodQty=800>0, RemainingQty=200>0），挤丝未开工（GoodQty=0, RemainingQty=1000>0）
+    /// 期望：1个切片，StartOperation = NC（唯一已开工未完成的工序），整量 1000
     /// </summary>
     [Test]
     public async Task NextOp_MultiSlice_SplitsCorrectly()
@@ -43,7 +40,7 @@ public class NextOperationContextTests
                 new StageProgressFact
                 {
                     StageCode = "CN_MACHINING",
-                    CumulativeCompletedQty = 1000m,  // 所有1000件都在这个Stage
+                    GoodCompletedQty = 1000m,
                     StageSequence = 1,
                     SnapshotId = 1
                 }
@@ -55,7 +52,8 @@ public class NextOperationContextTests
                     OperationCode = "NC001",
                     OperationName = "NC",
                     StageCode = "CN_MACHINING",
-                    CumulativeCompletedQty = 800m,
+                    GoodQty = 800m,
+                    RemainingQty = 200m,
                     OperationSequence = 1
                 },
                 new OperationProgressFact
@@ -63,7 +61,8 @@ public class NextOperationContextTests
                     OperationCode = "EXTRUDE001",
                     OperationName = "挤丝",
                     StageCode = "CN_MACHINING",
-                    CumulativeCompletedQty = 0m,
+                    GoodQty = 0m,
+                    RemainingQty = 1000m,
                     OperationSequence = 2
                 }
             },
@@ -78,27 +77,16 @@ public class NextOperationContextTests
 
         var result = results.First();
 
-        // 验证Position闭合
         Assert.That(result.IsSuccess, Is.True);
         Assert.That(result.Positions.Sum(p => p.Quantity), Is.EqualTo(1000m));
 
-        // 验证NextOperationContext
-        Assert.That(result.NextOperationContexts.Count, Is.EqualTo(2));
+        // 39-0：唯一 frontier → 整量给该工序（不再按 OperationSequence 级联拆分）
+        Assert.That(result.NextOperationContexts.Count, Is.EqualTo(1));
 
-        // 200件 StartOperation = NC
-        var ncSlice = result.NextOperationContexts.FirstOrDefault(c => c.StartOperationCode == "NC");
-        Assert.That(ncSlice, Is.Not.Null);
-        Assert.That(ncSlice!.SliceQty, Is.EqualTo(200m));
+        var ncSlice = result.NextOperationContexts.First();
+        Assert.That(ncSlice.StartOperationCode, Is.EqualTo("NC"));
+        Assert.That(ncSlice.SliceQty, Is.EqualTo(1000m));
         Assert.That(ncSlice.StartStageCode, Is.EqualTo("CN_MACHINING"));
-
-        // 800件 StartOperation = 挤丝
-        var extrudeSlice = result.NextOperationContexts.FirstOrDefault(c => c.StartOperationCode == "挤丝");
-        Assert.That(extrudeSlice, Is.Not.Null);
-        Assert.That(extrudeSlice!.SliceQty, Is.EqualTo(800m));
-        Assert.That(extrudeSlice.StartStageCode, Is.EqualTo("CN_MACHINING"));
-
-        // 验证SliceQty闭合
-        Assert.That(result.NextOperationContexts.Sum(c => c.SliceQty), Is.EqualTo(1000m));
     }
 
     /// <summary>
@@ -120,7 +108,7 @@ public class NextOperationContextTests
                 new StageProgressFact
                 {
                     StageCode = "CN_MACHINING",
-                    CumulativeCompletedQty = 100m,  // 所有100件都在这个Stage
+                    GoodCompletedQty = 100m,  // 所有100件都在这个Stage
                     StageSequence = 1,
                     SnapshotId = 1
                 }
@@ -195,7 +183,7 @@ public class NextOperationContextTests
                 new StageProgressFact
                 {
                     StageCode = "CN_MACHINING",
-                    CumulativeCompletedQty = 100m,
+                    GoodCompletedQty = 100m,
                     StageSequence = 1,
                     SnapshotId = 1
                 }
@@ -251,7 +239,7 @@ public class NextOperationContextTests
                 new StageProgressFact
                 {
                     StageCode = "CN_MACHINING",
-                    CumulativeCompletedQty = 800m,
+                    GoodCompletedQty = 800m,
                     StageSequence = 1,
                     SnapshotId = 1
                 }
@@ -263,7 +251,8 @@ public class NextOperationContextTests
                     OperationCode = "NC001",
                     OperationName = "NC",
                     StageCode = "CN_MACHINING",
-                    CumulativeCompletedQty = 800m,
+                    GoodQty = 800m,
+                    RemainingQty = 200m,
                     OperationSequence = 1
                 },
                 new OperationProgressFact
@@ -271,7 +260,8 @@ public class NextOperationContextTests
                     OperationCode = "EXTRUDE001",
                     OperationName = "挤丝",
                     StageCode = "CN_MACHINING",
-                    CumulativeCompletedQty = 0m,
+                    GoodQty = 0m,
+                    RemainingQty = 1000m,
                     OperationSequence = 2
                 }
             },
@@ -286,14 +276,14 @@ public class NextOperationContextTests
 
         var result = results.First();
 
-        // 验证NextOperationContext不是Supply类型
+        // NextOperationContext不是Supply类型
         foreach (var context in result.NextOperationContexts)
         {
             Assert.That(context.PositionType, Is.Not.EqualTo("SUPPLY"));
             Assert.That(context.PositionType, Is.Not.EqualTo("OPERATION_SUPPLY"));
         }
 
-        // 验证Position不是Operation级
+        // Position不是Operation级
         foreach (var position in result.Positions)
         {
             Assert.That(position.PositionType, Is.Not.EqualTo(PositionType.XC) | Is.Not.EqualTo(PositionType.INTERPLANT_TRANSIT));
@@ -301,12 +291,10 @@ public class NextOperationContextTests
     }
 
     /// <summary>
-    /// 测试三个Operation的拆分
-    /// Stage CN_MACHINING: CumulativeCompletedQty = 1000
-    /// NC(seq=1): CumulativeCompletedQty = 500
-    /// 挤丝(seq=2): CumulativeCompletedQty = 200
-    /// 研磨(seq=3): CumulativeCompletedQty = 0
-    /// 期望：500件 NC, 300件 挤丝, 200件 研磨
+    /// 多 frontier → NEXT_OPERATION_AMBIGUOUS（39-0 §四.2 / §五）
+    /// NC(GoodQty=500>0, RemainingQty=500>0) + 挤丝(GoodQty=200>0, RemainingQty=800>0) 均已开工未完成
+    /// 研磨(GoodQty=0, RemainingQty=1000>0) 未开工
+    /// 2个 frontier 候选 → 无法唯一定位，降级到 Stage 级 + NEXT_OPERATION_AMBIGUOUS
     /// </summary>
     [Test]
     public async Task NextOp_ThreeOperations_SplitsCorrectly()
@@ -324,7 +312,7 @@ public class NextOperationContextTests
                 new StageProgressFact
                 {
                     StageCode = "CN_MACHINING",
-                    CumulativeCompletedQty = 1000m,  // 所有1000件都在这个Stage
+                    GoodCompletedQty = 1000m,
                     StageSequence = 1,
                     SnapshotId = 1
                 }
@@ -336,7 +324,8 @@ public class NextOperationContextTests
                     OperationCode = "NC001",
                     OperationName = "NC",
                     StageCode = "CN_MACHINING",
-                    CumulativeCompletedQty = 500m,
+                    GoodQty = 500m,
+                    RemainingQty = 500m,
                     OperationSequence = 1
                 },
                 new OperationProgressFact
@@ -344,7 +333,8 @@ public class NextOperationContextTests
                     OperationCode = "EXTRUDE001",
                     OperationName = "挤丝",
                     StageCode = "CN_MACHINING",
-                    CumulativeCompletedQty = 200m,
+                    GoodQty = 200m,
+                    RemainingQty = 800m,
                     OperationSequence = 2
                 },
                 new OperationProgressFact
@@ -352,7 +342,8 @@ public class NextOperationContextTests
                     OperationCode = "GRIND001",
                     OperationName = "研磨",
                     StageCode = "CN_MACHINING",
-                    CumulativeCompletedQty = 0m,
+                    GoodQty = 0m,
+                    RemainingQty = 1000m,
                     OperationSequence = 3
                 }
             },
@@ -367,29 +358,253 @@ public class NextOperationContextTests
 
         var result = results.First();
 
-        // 验证Position闭合
         Assert.That(result.IsSuccess, Is.True);
         Assert.That(result.Positions.Sum(p => p.Quantity), Is.EqualTo(1000m));
 
-        // 验证NextOperationContext
-        Assert.That(result.NextOperationContexts.Count, Is.EqualTo(3));
+        // 39-0：2个已开工未完成（NC + 挤丝）→ AMBIGUOUS，降级到 Stage 级
+        Assert.That(result.NextOperationContexts.Count, Is.EqualTo(1));
 
-        // 1000 - 500 = 500件 StartOperation = NC
-        var ncSlice = result.NextOperationContexts.FirstOrDefault(c => c.StartOperationCode == "NC");
-        Assert.That(ncSlice, Is.Not.Null);
-        Assert.That(ncSlice!.SliceQty, Is.EqualTo(500m));
+        var ambiguousSlice = result.NextOperationContexts.First();
+        Assert.That(ambiguousSlice.StartOperationCode, Is.Null);
+        Assert.That(ambiguousSlice.SliceQty, Is.EqualTo(1000m));
+        Assert.That(ambiguousSlice.StartStageCode, Is.EqualTo("CN_MACHINING"));
+        Assert.That(ambiguousSlice.IssueCode, Is.EqualTo("NEXT_OPERATION_AMBIGUOUS"));
+    }
 
-        // 500 - 200 = 300件 StartOperation = 挤丝
-        var extrudeSlice = result.NextOperationContexts.FirstOrDefault(c => c.StartOperationCode == "挤丝");
-        Assert.That(extrudeSlice, Is.Not.Null);
-        Assert.That(extrudeSlice!.SliceQty, Is.EqualTo(300m));
+    // ========================================================================
+    // S11: DAG 拓扑前沿测试（39-0 §二/§五，Routing 数据可用时）
+    // ========================================================================
 
-        // 200 - 0 = 200件 StartOperation = 研磨
-        var grindSlice = result.NextOperationContexts.FirstOrDefault(c => c.StartOperationCode == "研磨");
-        Assert.That(grindSlice, Is.Not.Null);
-        Assert.That(grindSlice!.SliceQty, Is.EqualTo(200m));
+    /// <summary>
+    /// DAG 串行链：A→B→C，A 完成，B 已开工未完成，C 未开工
+    /// 前沿 = B（唯一已开工未完成且前驱全部完成）
+    /// </summary>
+    [Test]
+    public async Task NextOp_DagSerialChain_FindsFrontier()
+    {
+        var input = new ProductionInstructionPositionInput
+        {
+            ProductionInstructionNo = "PI-DAG-SERIAL-001",
+            MaterialId = 1001,
+            MaterialCode = "MAT-001",
+            FactoryId = 5001,
+            FactoryCode = "CN",
+            ErpRemainingQty = 1000m,
+            StageProgress = new[]
+            {
+                new StageProgressFact
+                {
+                    StageCode = "CN_MACHINING",
+                    GoodCompletedQty = 1000m,
+                    StageSequence = 1,
+                    SnapshotId = 1
+                }
+            },
+            OperationProgress = new[]
+            {
+                new OperationProgressFact
+                {
+                    OperationCode = "OP-A", OperationName = "NC",
+                    StageCode = "CN_MACHINING", GoodQty = 1000m, RemainingQty = 0m
+                },
+                new OperationProgressFact
+                {
+                    OperationCode = "OP-B", OperationName = "挤丝",
+                    StageCode = "CN_MACHINING", GoodQty = 200m, RemainingQty = 800m
+                },
+                new OperationProgressFact
+                {
+                    OperationCode = "OP-C", OperationName = "研磨",
+                    StageCode = "CN_MACHINING", GoodQty = 0m, RemainingQty = 1000m
+                }
+            },
+            RoutingOperations = new[]
+            {
+                new RoutingOperationFact { OperationCode = "OP-A", OperationName = "NC", StageCode = "CN_MACHINING" },
+                new RoutingOperationFact { OperationCode = "OP-B", OperationName = "挤丝", StageCode = "CN_MACHINING" },
+                new RoutingOperationFact { OperationCode = "OP-C", OperationName = "研磨", StageCode = "CN_MACHINING" }
+            },
+            RoutingDependencies = new[]
+            {
+                new RoutingDependencyFact { FromOperationCode = "OP-A", ToOperationCode = "OP-B" },
+                new RoutingDependencyFact { FromOperationCode = "OP-B", ToOperationCode = "OP-C" }
+            },
+            StagePath = new[]
+            {
+                new StagePathFact { StageCode = "CN_MACHINING", StageSequence = 1, IsStartStage = true }
+            }
+        };
 
-        // 验证SliceQty闭合
-        Assert.That(result.NextOperationContexts.Sum(c => c.SliceQty), Is.EqualTo(1000m));
+        var results = await _calculator.CalculateProductionInstructionPositionsAsync(
+            new[] { input }, new FrozenFactParameters(), CancellationToken.None);
+
+        var result = results.First();
+
+        Assert.That(result.IsSuccess, Is.True);
+
+        // DAG 唯一前沿 = 挤丝（NC 完成，挤丝已开工，研磨未开工）
+        Assert.That(result.NextOperationContexts.Count, Is.EqualTo(1));
+        var slice = result.NextOperationContexts.First();
+        Assert.That(slice.StartOperationCode, Is.EqualTo("挤丝"));
+        Assert.That(slice.SliceQty, Is.EqualTo(1000m));
+        Assert.That(slice.IssueCode, Is.Null);
+    }
+
+    /// <summary>
+    /// DAG 并行分支：A→B, A→C, B→D, C→D，A 完成，B 和 C 均已开工未完成
+    /// AMBIGUOUS（2 个合法前沿，不得重新线性化）
+    /// </summary>
+    [Test]
+    public async Task NextOp_DagParallelBranch_Ambiguous()
+    {
+        var input = new ProductionInstructionPositionInput
+        {
+            ProductionInstructionNo = "PI-DAG-PARALLEL-001",
+            MaterialId = 1001,
+            MaterialCode = "MAT-001",
+            FactoryId = 5001,
+            FactoryCode = "CN",
+            ErpRemainingQty = 1000m,
+            StageProgress = new[]
+            {
+                new StageProgressFact
+                {
+                    StageCode = "CN_MACHINING",
+                    GoodCompletedQty = 1000m,
+                    StageSequence = 1,
+                    SnapshotId = 1
+                }
+            },
+            OperationProgress = new[]
+            {
+                new OperationProgressFact
+                {
+                    OperationCode = "OP-A", OperationName = "NC",
+                    StageCode = "CN_MACHINING", GoodQty = 1000m, RemainingQty = 0m
+                },
+                new OperationProgressFact
+                {
+                    OperationCode = "OP-B", OperationName = "挤丝",
+                    StageCode = "CN_MACHINING", GoodQty = 200m, RemainingQty = 800m
+                },
+                new OperationProgressFact
+                {
+                    OperationCode = "OP-C", OperationName = "研磨",
+                    StageCode = "CN_MACHINING", GoodQty = 300m, RemainingQty = 700m
+                },
+                new OperationProgressFact
+                {
+                    OperationCode = "OP-D", OperationName = "检测",
+                    StageCode = "CN_MACHINING", GoodQty = 0m, RemainingQty = 1000m
+                }
+            },
+            RoutingOperations = new[]
+            {
+                new RoutingOperationFact { OperationCode = "OP-A", OperationName = "NC", StageCode = "CN_MACHINING" },
+                new RoutingOperationFact { OperationCode = "OP-B", OperationName = "挤丝", StageCode = "CN_MACHINING" },
+                new RoutingOperationFact { OperationCode = "OP-C", OperationName = "研磨", StageCode = "CN_MACHINING" },
+                new RoutingOperationFact { OperationCode = "OP-D", OperationName = "检测", StageCode = "CN_MACHINING" }
+            },
+            RoutingDependencies = new[]
+            {
+                new RoutingDependencyFact { FromOperationCode = "OP-A", ToOperationCode = "OP-B" },
+                new RoutingDependencyFact { FromOperationCode = "OP-A", ToOperationCode = "OP-C" },
+                new RoutingDependencyFact { FromOperationCode = "OP-B", ToOperationCode = "OP-D" },
+                new RoutingDependencyFact { FromOperationCode = "OP-C", ToOperationCode = "OP-D" }
+            },
+            StagePath = new[]
+            {
+                new StagePathFact { StageCode = "CN_MACHINING", StageSequence = 1, IsStartStage = true }
+            }
+        };
+
+        var results = await _calculator.CalculateProductionInstructionPositionsAsync(
+            new[] { input }, new FrozenFactParameters(), CancellationToken.None);
+
+        var result = results.First();
+
+        Assert.That(result.IsSuccess, Is.True);
+
+        // 并行分支：挤丝 + 研磨 均已开工，A 完成 → AMBIGUOUS
+        Assert.That(result.NextOperationContexts.Count, Is.EqualTo(1));
+        var slice = result.NextOperationContexts.First();
+        Assert.That(slice.StartOperationCode, Is.Null);
+        Assert.That(slice.IssueCode, Is.EqualTo("NEXT_OPERATION_AMBIGUOUS"));
+        Assert.That(slice.SliceQty, Is.EqualTo(1000m));
+    }
+
+    /// <summary>
+    /// DAG 并行结构但仅一侧开工：A→B, A→C，A 完成，B 已开工未完成，C 未开工
+    /// 前沿 = B（只有 B 是已开工且前驱完成的）
+    /// </summary>
+    [Test]
+    public async Task NextOp_DagParallelOneStarted_FindsFrontier()
+    {
+        var input = new ProductionInstructionPositionInput
+        {
+            ProductionInstructionNo = "PI-DAG-PARALLEL-ONE-001",
+            MaterialId = 1001,
+            MaterialCode = "MAT-001",
+            FactoryId = 5001,
+            FactoryCode = "CN",
+            ErpRemainingQty = 1000m,
+            StageProgress = new[]
+            {
+                new StageProgressFact
+                {
+                    StageCode = "CN_MACHINING",
+                    GoodCompletedQty = 1000m,
+                    StageSequence = 1,
+                    SnapshotId = 1
+                }
+            },
+            OperationProgress = new[]
+            {
+                new OperationProgressFact
+                {
+                    OperationCode = "OP-A", OperationName = "NC",
+                    StageCode = "CN_MACHINING", GoodQty = 1000m, RemainingQty = 0m
+                },
+                new OperationProgressFact
+                {
+                    OperationCode = "OP-B", OperationName = "挤丝",
+                    StageCode = "CN_MACHINING", GoodQty = 200m, RemainingQty = 800m
+                },
+                new OperationProgressFact
+                {
+                    OperationCode = "OP-C", OperationName = "研磨",
+                    StageCode = "CN_MACHINING", GoodQty = 0m, RemainingQty = 1000m
+                }
+            },
+            RoutingOperations = new[]
+            {
+                new RoutingOperationFact { OperationCode = "OP-A", OperationName = "NC", StageCode = "CN_MACHINING" },
+                new RoutingOperationFact { OperationCode = "OP-B", OperationName = "挤丝", StageCode = "CN_MACHINING" },
+                new RoutingOperationFact { OperationCode = "OP-C", OperationName = "研磨", StageCode = "CN_MACHINING" }
+            },
+            RoutingDependencies = new[]
+            {
+                new RoutingDependencyFact { FromOperationCode = "OP-A", ToOperationCode = "OP-B" },
+                new RoutingDependencyFact { FromOperationCode = "OP-A", ToOperationCode = "OP-C" }
+            },
+            StagePath = new[]
+            {
+                new StagePathFact { StageCode = "CN_MACHINING", StageSequence = 1, IsStartStage = true }
+            }
+        };
+
+        var results = await _calculator.CalculateProductionInstructionPositionsAsync(
+            new[] { input }, new FrozenFactParameters(), CancellationToken.None);
+
+        var result = results.First();
+
+        Assert.That(result.IsSuccess, Is.True);
+
+        // 并行结构但只有 B 开工 → 唯一前沿 = 挤丝
+        Assert.That(result.NextOperationContexts.Count, Is.EqualTo(1));
+        var slice = result.NextOperationContexts.First();
+        Assert.That(slice.StartOperationCode, Is.EqualTo("挤丝"));
+        Assert.That(slice.SliceQty, Is.EqualTo(1000m));
+        Assert.That(slice.IssueCode, Is.Null);
     }
 }

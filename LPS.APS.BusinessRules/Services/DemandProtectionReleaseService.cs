@@ -31,8 +31,9 @@ public class DemandProtectionReleaseService : IDemandProtectionReleaseService
             throw new ArgumentException("lockIds 不能为空", nameof(lockIds));
         if (string.IsNullOrWhiteSpace(releasedBy))
             throw new ArgumentException("releasedBy 不能为空", nameof(releasedBy));
-        if (string.IsNullOrWhiteSpace(releaseReason) || releaseReason.Trim().Length < 5)
-            throw new ArgumentException("releaseReason 至少 5 个字符", nameof(releaseReason));
+        // 仅必填校验（0号位 31-0 裁决：releaseReason ≥5字符 无冻结依据，撤销长度硬约束）
+        if (string.IsNullOrWhiteSpace(releaseReason))
+            throw new ArgumentException("releaseReason 不能为空", nameof(releaseReason));
 
         var ids = lockIds.Distinct().ToList();
 

@@ -1,5 +1,7 @@
+using System.Security.Claims;
 using Microsoft.AspNetCore.Authorization;
 using LPS.APS.Core.Authorization;
+using LPS.APS.Core.Interfaces;
 using LPS.APS.BusinessRules.Services;
 using LPS.APS.Core.Dto;
 using LPS.APS.Shared.Models;
@@ -24,15 +26,22 @@ namespace LPS.APS.Web.Controllers;
 public class PiPositionController : ControllerBase
 {
     private readonly PiPositionQueryService _service;
+    private readonly IDataScopeService _dataScopeService;
     private readonly ILogger<PiPositionController> _logger;
 
     public PiPositionController(
         PiPositionQueryService service,
+        IDataScopeService dataScopeService,
         ILogger<PiPositionController> logger)
     {
         _service = service ?? throw new ArgumentNullException(nameof(service));
+        _dataScopeService = dataScopeService ?? throw new ArgumentNullException(nameof(dataScopeService));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
     }
+
+    /// <summary>解析当前登录用户 Id（无效返回 0 → 范围解析为拒绝全部，安全默认）</summary>
+    private int GetCurrentUserId()
+        => int.TryParse(User.FindFirst(ClaimTypes.NameIdentifier)?.Value, out var id) ? id : 0;
 
     /// <summary>
     /// 查询PI Position列表
@@ -50,9 +59,16 @@ public class PiPositionController : ControllerBase
     {
         try
         {
+            var scope = await _dataScopeService.ResolveScopeAsync(GetCurrentUserId(), cancellationToken);
+
+            // 过滤：PI Position 的 Factory Scope = PI 所属生产工厂（31-0 Q4 裁决）。
+            // 授权后查看该 PI 完整 Position 集合，空参按授权范围收窄结果集。
+            var allowedFactories = scope.GetValues(DataScopeTypes.Factory);
+
             var result = await _service.QueryAsync(
                 planVersionId, productionInstructionNo, materialCode,
-                positionType, stageCode, skip, take, cancellationToken);
+                positionType, stageCode, skip, take, cancellationToken,
+                allowedFactories);
 
             return ApiResponse<List<PiPositionDto>>.Success(result);
         }
@@ -88,6 +104,36 @@ public class PiPositionController : ControllerBase
         {
             _logger.LogError(ex, "Failed to get PI position summary");
             return ApiResponse<PiPositionSummaryDto>.Fail(500, $"Query failed: {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// 查询单个生产指令的所有 Position（单 PI 详情）
+    /// </summary>
+    [HttpGet("{productionInstructionNo}")]
+    public async Task<ApiResponse<List<PiPositionDto>>> GetByProductionInstruction(
+        string productionInstructionNo,
+        [FromQuery] int planVersionId,
+        CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            var result = await _service.GetByProductionInstructionAsync(
+                planVersionId, productionInstructionNo, cancellationToken);
+
+            if (result.Count == 0)
+                return ApiResponse<List<PiPositionDto>>.Fail(404, "PI Position not found");
+
+            return ApiResponse<List<PiPositionDto>>.Success(result);
+        }
+        catch (ArgumentException ex)
+        {
+            return ApiResponse<List<PiPositionDto>>.Fail(400, ex.Message);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to get PI position detail");
+            return ApiResponse<List<PiPositionDto>>.Fail(500, $"Query failed: {ex.Message}");
         }
     }
 }

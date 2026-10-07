@@ -81,6 +81,21 @@ public sealed class DemandProtectionSummaryDto
 }
 
 /// <summary>
+/// Demand Protection释放请求
+/// </summary>
+public sealed class DemandProtectionReleaseRequest
+{
+    /// <summary>要释放的Lock ID列表</summary>
+    public List<long> LockIds { get; init; } = new();
+
+    /// <summary>操作人</summary>
+    public string ReleasedBy { get; init; } = string.Empty;
+
+    /// <summary>释放原因（必填）</summary>
+    public string ReleaseReason { get; init; } = string.Empty;
+}
+
+/// <summary>
 /// Demand Protection 释放结果（逐 Lock 返回，与请求 lockIds 一一对应）
 ///
 /// 每个 lockId 独立返回一条状态，便于前端逐条提示。
