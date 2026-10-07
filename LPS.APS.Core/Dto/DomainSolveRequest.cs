@@ -302,6 +302,7 @@ public sealed class FiniteCapacityParameters
 /// <summary>
 /// SolverStrategyMode ↔ SchedulingDirection 字符串固定映射（P1-02 §五-3：1↔2 契约正式化）。
 /// 由 2号位 在投影处唯一使用；1号位 消费 SchedulingDirection 字符串（PhaseTwoInitialScheduler）。
+/// 2026-10-07（0号位 裁决）：Mode += Auto，透传 "AUTO"——由 1号位 按当前求解上下文决定最终方向（不按 OrderType 硬编码）。
 /// </summary>
 public static class SolverStrategyModeMap
 {
@@ -310,6 +311,7 @@ public static class SolverStrategyModeMap
         SolverStrategyMode.Forward  => "FORWARD",
         SolverStrategyMode.Backward => "BACKWARD",
         SolverStrategyMode.Mixed    => "MIXED",
+        SolverStrategyMode.Auto     => "AUTO",         // 1号位 按求解上下文决定最终方向（0号位 2026-10-07 裁决）
         _                            => "BACKWARD"    // 防御未知枚举，等效 Backward（与历史行为一致）
     };
 }

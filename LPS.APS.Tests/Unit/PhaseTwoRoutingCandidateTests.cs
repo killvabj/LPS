@@ -50,7 +50,9 @@ public class PhaseTwoRoutingCandidateTests
         string? demandRouteCode = null,
         int? demandPathId = null,
         string direction = "FORWARD",
-        ExecutionConstraint? locked = null)
+        ExecutionConstraint? locked = null,
+        bool isContinuation = false,
+        string? continuationKey = null)
     {
         var ops = new List<RoutingOperation>();
         var deps = new List<RoutingDependency>();
@@ -137,7 +139,11 @@ public class PhaseTwoRoutingCandidateTests
                     AllocationSequence = 1, DemandKey = "D1", MaterialId = MaterialId, FactoryId = 1,
                     NetOutputQty = 1m, PlannedProcessQty = 1m,
                     RequiredAvailableTime = PlanningStart.AddDays(20), DemandSequence = 1,
-                    RouteCode = demandRouteCode, PathId = demandPathId
+                    RouteCode = demandRouteCode, PathId = demandPathId,
+                    // 0号位 2026-10-07 (5).md P0-05：连续份额输入完整性 Fail Closed 的反证锁用。
+                    IsContinuation = isContinuation,
+                    ContinuationKey = continuationKey,
+                    NoSplitMerge = isContinuation
                 }
             },
             RoutingOperations = ops,
@@ -337,5 +343,215 @@ public class PhaseTwoRoutingCandidateTests
             Assert.True(t.RouteCode is "RTA" or "RTB", $"非候选路径身份：{t.RouteCode}");
             Assert.Equal(1, t.PathId);
         });
+    }
+
+    /// <summary>
+    /// ⑧ Direction `AUTO` 显式承载（规则清单 v1.5 **B-004**：「Direction 支持 AUTO/FORWARD/BACKWARD/MIXED；
+    ///    OrderType 不得直接决定 Direction」）+ 0号位 2026-10-07 裁决 **Q-1**：「MIXED/**AUTO** → 沿用现有 Mixed 结果」。
+    ///    ⇒ 断言 AUTO 与 MIXED **结果逐字段一致**（同批任务数 / 未排程数 / 身份 / 资源 / 时间）。
+    ///    ⚠ 本用例只锁「显式分列 + 与 MIXED 等价」，**不声称** B-005「按上下文自决方向」已实现 ——
+    ///    该完整语义属**未落码项**，不得据此认为已达标。
+    /// </summary>
+    [Fact]
+    public async Task Direction_AUTO_与MIXED结果一致()
+    {
+        var paths = new[]
+        {
+            new PathSpec("RTA", 1, 1, PlanningStart.AddDays(10), PlanningEnd),
+            new PathSpec("RTB", 1, 2, PlanningStart, PlanningEnd)
+        };
+
+        var auto = await _solver.SolveAsync(Build(paths, direction: "AUTO"));
+        var mixed = await _solver.SolveAsync(Build(paths, direction: "MIXED"));
+
+        Assert.True(auto.Success, auto.ErrorMessage);
+        Assert.True(mixed.Success, mixed.ErrorMessage);
+        Assert.Equal(mixed.UnscheduledTasks.Count, auto.UnscheduledTasks.Count);
+        Assert.Equal(
+            mixed.FinalTasks
+                .Select(t => (t.StageCode, t.OperationCode, t.ResourceId, t.RouteCode, t.PathId,
+                              t.PlannedStartTime, t.PlannedEndTime))
+                .ToList(),
+            auto.FinalTasks
+                .Select(t => (t.StageCode, t.OperationCode, t.ResourceId, t.RouteCode, t.PathId,
+                              t.PlannedStartTime, t.PlannedEndTime))
+                .ToList());
+    }
+
+    // ─────────── 0号位 2026-10-07 (5).md 反证单测辅助 + ③④⑤ ───────────
+
+    private readonly record struct DemandSpec2(
+        string Key, int Seq, decimal Qty, string? RouteCode, int? PathId, bool IsContinuation = false);
+
+    /// <summary>
+    /// 单工序 Path 夹具（Merge 类反证专用）：每条 Path 只含一道 OP10@STAGE1，独立资源 + 日历。
+    /// Merge 仅在 <c>operations.Count == 1</c> 时才会被尝试（<c>FindMergeableTasks</c> 守卫）
+    /// ⇒ 反证「跨 Path 禁 Merge」「Merge 真实完成」必须用**单工序**路径。
+    /// </summary>
+    private static DomainSolveRequest BuildSingleOp(
+        IReadOnlyList<PathSpec> paths,
+        IReadOnlyList<DemandSpec2> demands,
+        bool allowMerge = true,
+        string direction = "FORWARD")
+    {
+        var ops = new List<RoutingOperation>();
+        var elig = new List<OperationResourceEligibility>();
+        var resources = new List<ResourceDefinition>();
+        var calendars = new List<ResourceCalendarSlot>();
+        var stageDepts = new List<MaterialStageDepartmentContextDto>();
+
+        foreach (var p in paths)
+        {
+            ops.Add(new RoutingOperation
+            {
+                MaterialId = MaterialId, ProductionDepartmentId = DeptId,
+                RouteCode = p.RouteCode, PathId = p.PathId,
+                OperationCode = "OP10", StageCode = "STAGE1",
+                StandardDuration = 60m, OperationPlanningMode = "FINITE_RESOURCE"
+            });
+            elig.Add(new OperationResourceEligibility
+            {
+                MaterialId = MaterialId, ProductionDepartmentId = DeptId,
+                RouteCode = p.RouteCode, PathId = p.PathId,
+                OperationCode = "OP10", ResourceId = p.ResourceId, Priority = 1, CapacityFactor = 1m
+            });
+            resources.Add(new ResourceDefinition
+            {
+                ResourceId = p.ResourceId, ResourceCode = $"R{p.ResourceId}", FactoryCode = "F1", Capacity = 1m
+            });
+            if (p.CalStart is DateTime cs && p.CalEnd is DateTime ce)
+            {
+                calendars.Add(new ResourceCalendarSlot
+                {
+                    ResourceId = p.ResourceId, Start = cs, End = ce, IsAvailable = true
+                });
+            }
+        }
+
+        stageDepts.Add(new MaterialStageDepartmentContextDto
+        {
+            MaterialId = MaterialId, StageCode = "STAGE1", ProductionDepartmentId = DeptId
+        });
+
+        return new DomainSolveRequest
+        {
+            PlanVersionId = 1,
+            DomainKey = "DOMAIN",
+            PlanningStart = PlanningStart,
+            PlanningEnd = PlanningEnd,
+            LogicalProductionDemands = demands.Select(d => new LogicalProductionDemand
+            {
+                LogicalDemandKey = d.Key, PlanVersionId = 1L, DomainKey = "DOMAIN",
+                AllocationSequence = d.Seq, DemandKey = d.Key, MaterialId = MaterialId, FactoryId = 1,
+                NetOutputQty = d.Qty, PlannedProcessQty = d.Qty,
+                RequiredAvailableTime = PlanningStart.AddDays(20), DemandSequence = d.Seq,
+                RouteCode = d.RouteCode, PathId = d.PathId,
+                IsContinuation = d.IsContinuation, NoSplitMerge = d.IsContinuation
+            }).ToList(),
+            RoutingOperations = ops,
+            RoutingDependencies = new List<RoutingDependency>(),
+            OperationResourceEligibility = elig,
+            MaterialStageDepartmentContexts = stageDepts,
+            ExecutionConstraints = Array.Empty<ExecutionConstraint>(),
+            Resources = resources,
+            CalendarSlots = calendars,
+            StrategySnapshot = new SolverStrategySnapshot
+            {
+                Parameters = new FiniteCapacityParameters
+                {
+                    SchedulingDirection = direction,
+                    AllowMerge = allowMerge
+                }
+            }
+        };
+    }
+
+    /// <summary>
+    /// ③ P0-05 反证锁：`IsContinuation=true` 但 **RouteCode / PathId / ContinuationKey / StartOperationCode
+    ///    全缺** ⇒ 必须 Fail Closed（Unscheduled），**禁止**退化成「无固定路径 ⇒ 自由候选选路」。
+    ///    图中**确有两条可行路径**：若实现按旧口径（`RouteCode 非空 || PathId 非空` 才固定路径）就会排下
+    ///    ⇒ 本用例红。这正是 0号位 判的「把 A/B 当 C 桶选路」。
+    /// </summary>
+    [Fact]
+    public async Task 连续份额_缺固定路径身份_FailClosed不排()
+    {
+        var result = await _solver.SolveAsync(Build(
+            new[]
+            {
+                new PathSpec("RTA", 1, 1, PlanningStart, PlanningEnd),
+                new PathSpec("RTB", 1, 2, PlanningStart, PlanningEnd)
+            },
+            isContinuation: true));
+
+        Assert.Empty(result.FinalTasks);
+        Assert.Contains(result.UnscheduledTasks, u => u.DraftId == "D1");
+    }
+
+    /// <summary>
+    /// ④ P0-06 反证锁：两条 Path **含同名工序码**（OP10 在 RTA、RTB 各一份）时，
+    ///    不得把 Path A 的既有 Task 当成 Path B 需求的合并目标（否则 target 的 RouteCode/PathId/
+    ///    ExecutionBatchDraftKey 被保留 ⇒ 同一 Execution Batch 混入两条 Path 的节点）。
+    ///
+    /// ⚠ 构造要点：两条 Path **必须共用同一资源**。若资源不同，对被合并 Task 的 ResourceId 取
+    ///    CapacityFactor 会因资格键带 (RouteCode, PathId) 而查不到 ⇒ Merge 本就被拒，
+    ///    这样即使删掉跨 Path 检查用例也依然是绿的（**假反证**）。共用资源才真正把
+    ///    「唯一拦截点 = RouteCode/PathId 比较」暴露出来。
+    ///
+    ///     D0 钉 RTA 先排；D1 钉 RTB ⇒ 必须各自成 Task、批键不同。
+    /// </summary>
+    [Fact]
+    public async Task 两条Path同名工序_禁止PathA合并进PathB的Task()
+    {
+        var result = await _solver.SolveAsync(BuildSingleOp(
+            new[]
+            {
+                new PathSpec("RTA", 1, 1, PlanningStart, PlanningEnd),
+                new PathSpec("RTB", 1, 1, PlanningStart, PlanningEnd)   // 同资源、同 PathId，仅 RouteCode 不同
+            },
+            new[]
+            {
+                new DemandSpec2("D0", 1, 1m, "RTA", 1),
+                new DemandSpec2("D1", 2, 1m, "RTB", 1)
+            }));
+
+        Assert.True(result.Success, result.ErrorMessage);
+        Assert.Equal(2, result.FinalTasks.Count);
+
+        var d0 = result.FinalTasks.Single(t => t.SourceDraftId == "D0");
+        var d1 = result.FinalTasks.Single(t => t.SourceDraftId == "D1");
+        Assert.Equal("RTA", d0.RouteCode);
+        Assert.Equal("RTB", d1.RouteCode);
+        Assert.NotEqual(d0.ExecutionBatchDraftKey, d1.ExecutionBatchDraftKey);
+    }
+
+    /// <summary>
+    /// ⑤ P0-04 反证锁：Merge 候选必须用**合并后的真实 PlannedEndTime**参与择优。
+    ///    D0 钉 RTA（qty1）先排；D1 自由（2 候选、qty1、AllowMerge=true）：
+    ///      · 走 RTA：Merge 进 D0 的 Task ⇒ 合并后 end = t0 + 2×60min；
+    ///      · 走 RTB：新建 Task ⇒ end = t0 + 1×60min。
+    ///    FORWARD 取更早完成 ⇒ **必须选 RTB**。旧实现对 Merge 候选给 `DateTime.MinValue`
+    ///    ⇒ 被误评为「0 延期、完成最早」而永远胜出 ⇒ 本用例在旧实现下红。
+    /// </summary>
+    [Fact]
+    public async Task 合并候选真实完成更晚_必须选另一条Path()
+    {
+        var result = await _solver.SolveAsync(BuildSingleOp(
+            new[]
+            {
+                new PathSpec("RTA", 1, 1, PlanningStart, PlanningEnd),
+                new PathSpec("RTB", 1, 2, PlanningStart, PlanningEnd)
+            },
+            new[]
+            {
+                new DemandSpec2("D0", 1, 1m, "RTA", 1),
+                new DemandSpec2("D1", 2, 1m, null, null)
+            }));
+
+        Assert.True(result.Success, result.ErrorMessage);
+        Assert.Equal(2, result.FinalTasks.Count);
+
+        var d1 = result.FinalTasks.Single(t => t.SourceDraftId == "D1");
+        Assert.Equal("RTB", d1.RouteCode);
+        Assert.Equal(1m, d1.Quantity);   // 未被合并（若被 Merge 进 D0，则 D1 无自有 Task 且数量为 2）
     }
 }

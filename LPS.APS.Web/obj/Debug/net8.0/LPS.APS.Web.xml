@@ -1144,6 +1144,36 @@
             聚合查询所有供应事实
             </summary>
         </member>
+        <member name="T:LPS.APS.Web.Controllers.TaskSplitRuleConfigController">
+            <summary>
+            执行批拆分规则治理 API（TaskSplitRuleConfig / Batch Policy，0号位 2026-10-07 裁决本轮落码，归 3号位 治理）。
+            路径前缀 /api/governance（与 SetupRuleController / GovernanceController / StageLeadTimeParamController 共享前缀，字面路由段不冲突）。
+            权限：查看 aps.rule.view；维护 aps.rule.edit（复用 Rule 码，零权限种子变更）。
+            载体「两级承接」：主题表 CRUD；停用走 DELETE（软删 IsActive=0），不物理删。
+            错误映射：422 数据红线 / 404 不存在 / 400 参数 / 403 权限不足（[Authorize]）。
+            </summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.TaskSplitRuleConfigController.GetCurrentUserId">
+            <summary>解析当前登录用户 Id（无效时返回 0 → 审计可追溯性不降级原则下置空处理）</summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.TaskSplitRuleConfigController.GetCurrentUserCode">
+            <summary>解析当前登录用户工号（审计真实 Actor，后端从身份取，禁止信任请求体）</summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.TaskSplitRuleConfigController.HandleError(System.Exception,System.String)">
+            <summary>统一错误映射：422 数据红线 / 404 不存在 / 400 参数；未知异常上抛由框架处理（500）</summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.TaskSplitRuleConfigController.List(System.Nullable{System.Int32},System.Nullable{System.Int32},System.Nullable{System.Boolean},System.Threading.CancellationToken)">
+            <summary>列出执行批拆分规则（可按物料/生产部门/启用态过滤），供 4号位 配置页面。</summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.TaskSplitRuleConfigController.Create(LPS.APS.Core.DTOs.Governance.SaveTaskSplitRuleConfigRequest,System.Threading.CancellationToken)">
+            <summary>新增执行批拆分规则。</summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.TaskSplitRuleConfigController.Update(System.Int32,LPS.APS.Core.DTOs.Governance.SaveTaskSplitRuleConfigRequest,System.Threading.CancellationToken)">
+            <summary>编辑执行批拆分规则（PUT 整对象替换，不改动 IsActive）。</summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.TaskSplitRuleConfigController.Deactivate(System.Int32,System.Threading.CancellationToken)">
+            <summary>停用执行批拆分规则（软删 IsActive=0，保留历史与生效窗口）。</summary>
+        </member>
         <member name="T:LPS.APS.Web.Dto.Auth.LoginRequestDto">
             <summary>登录请求</summary>
         </member>

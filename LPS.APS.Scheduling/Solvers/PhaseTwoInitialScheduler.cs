@@ -159,10 +159,12 @@ internal class PhaseTwoInitialScheduler
                 ExecutionLockId = null, // TODO: 关联ExecutionConstraint.Id
                 // v1.6 §1：FinalTask 一律原样回传 ContinuationKey；路径身份可解出时才生成执行批键
                 //（与上方「不编造 RouteCode/PathId」同口径 —— 解不出身份就不给批键，不留伪真值）。
+                // P0-02 后键域改为 (需求键, 批序号)：无真实 Path ⇒ 该 Task 不构成「一条完整 Path 的执行批」
+                // ⇒ 仍不给批键（守卫理由由「身份反推」改为「无完整 Path 不构成执行批」，语义更贴合冻结口径）。
                 ContinuationKey = demand?.ContinuationKey,
                 ExecutionBatchDraftKey = lockedPathId is null
                     ? null
-                    : ExecutionBatchKey(lockedTask.DraftId, lockedRouteCode, lockedPathId)
+                    : ExecutionBatchKey(lockedTask.DraftId)
             };
             result.ScheduledTasks.Add(inheritedTask);
         }
@@ -272,6 +274,32 @@ internal class PhaseTwoInitialScheduler
                     PreferredResourceCode = demand.PreferredResourceCode
                 };
             }
+            // ── P0-05（0号位 2026-10-07 (5).md）：连续份额**输入完整性 Fail Closed** ──
+            //   判据必须**从 `IsContinuation` 出发**，而**不是**从「有没有 RouteCode」倒推。
+            //   旧实现用 `RouteCode 非空 || PathId 非空` 决定「固定路径 / 自由候选」⇒
+            //   `IsContinuation=true` 但缺 Route/Path 的 A/B 会掉进自由候选选路（把 A/B 当 C 桶），
+            //   违反 v1.6「A/B 输入必须带真实固定 RouteCode / PathId / StartOperation 且不得切换 Routing」。
+            //
+            //   硬校验（任一缺失 ⇒ 明确 Unscheduled，**禁止**进入 Routing 竞争；
+            //   指定 Route/Path 是否**真实存在于图中**由下方 `TryGetRoutingGraph` 继续 Fail Closed）。
+            if (actualDemand.IsContinuation)
+            {
+                var missing = new List<string>(5);
+                if (string.IsNullOrEmpty(actualDemand.ContinuationKey)) missing.Add("ContinuationKey");
+                if (string.IsNullOrEmpty(actualDemand.RouteCode)) missing.Add("RouteCode");
+                if (actualDemand.PathId is null) missing.Add("PathId");
+                if (string.IsNullOrEmpty(actualDemand.StartOperationCode)) missing.Add("StartOperationCode");
+                if (!actualDemand.NoSplitMerge) missing.Add("NoSplitMerge");
+
+                if (missing.Count > 0)
+                {
+                    // 与 Phase2 其它 Fail Closed 点同口径（:129/:203/:314/:325/:364…）：**只记 UnscheduledDemandKeys、
+                    // 不产 Task、不写 TraceNotes**（TraceNotes 会经 SolveTraceNote 落库给 2号位，不得自造码）。
+                    result.UnscheduledDemandKeys.Add(actualDemand.LogicalDemandKey);
+                    continue;
+                }
+            }
+
             // ── 需求级路径候选解析（Path-aware，0号位 2026-10-07 裁决 Q-3 / §四）──
             //
             //   ① 需求**自带固定路径**（v1.6：「A/B 输入必须带真实固定 RouteCode / PathId / StartOperation」）
@@ -358,104 +386,185 @@ internal class PhaseTwoInitialScheduler
                 dynamicMaterialFloor = continuityEnd;
             }
 
-            // 步骤 2：候选试排（每条候选在**同一初始上下文**上跑完整排程，互不污染）。
-            //   单候选（V1 常态 / A/B 固定路径）⇒ 试排后在真实上下文重跑，结果与既有完全一致（零回归）。
-            var realTimeline = constraints.ProductTimeline;
-            var trials = new List<(RoutePathKey Key, bool Feasible, DateTime Completion, decimal SetupMinutes)>();
+            // ── P0-01 / P0-02 / P0-03（0号位 2026-10-07《未命名的Markdown文件 (5).md》）──
+            //   执行批**先于 Routing 选择**形成，判词根因是旧实现把 `LogicalDemand` **当成了** Execution Batch
+            //   （批身份由 Route/Path 反推 —— 同一 Demand 拆出的两批会撞成同一个键）。
+            //
+            //   0号位 指定链：
+            //     `Free Slice → Batch Policy → 1..N ExecutionBatchDraft(BatchDraftKey, Qty)
+            //      → 每个 Batch 分别进行 Direction + RoutingCandidate + Resource + Calendar + Setup 联合求解
+            //      → 每个 Batch 选择一条完整 Path
+            //      → 同 Batch 全部 Operation FinalTask 共享 BatchDraftKey → 不同 Batch 必定不同 Key`
+            var batches = FormExecutionBatches(actualDemand, constraints.ExecutionBatchPolicy);
 
-            // 试排隔离：`constraints.TraceNotes` 是**共享可变**状态（Setup 追踪三元组在此追加），
-            // 试排会把它当真实产出写进去 ⇒ 多候选试排会留下 N 份重复 trace。
-            // 记下水位，试排结束回滚；步骤 4 在真实上下文重跑会重新写恰好一份。
-            var traceNotesWatermark = constraints.TraceNotes.Count;
+            // 批键**先于试排/择优/落定**登记 ⇒ Phase4 重建 Task 时经 ResolveExecutionBatchKeyForRebuild 复用同键
+            //（局部修复不得把同一执行批劈成两个键）。
+            constraints.ExecutionBatchDraftKeys[actualDemand.LogicalDemandKey] =
+                batches.Select(b => b.BatchDraftKey).ToList();
 
-            foreach (var (pathKey, graph, ops) in plannedCandidates)
+            // 多批时**禁止 Merge**：Merge 会把本批工序并入**别的批**的既有 Task ⇒ 一个 Task 混两个批键，
+            //   违反「同 Batch 共 Key、不同 Batch 必不同键」。
+            // 单批（生产现状：⑧块 Batch Policy 载体未达 1号位 ⇒ 恒 1 批）行为与旧版**逐字一致**（零回归）。
+            var multiBatch = batches.Count > 1;
+            var allowMergeForDemand = request.StrategySnapshot.Parameters.AllowMerge && !multiBatch;
+
+            var demandTasksAll = new List<FinalTaskDraft>();
+            var batchFailed = false;
+
+            foreach (var batch in batches)
             {
-                if (ops.Count == 0)
+                // 单批：直接用原实例（零回归）；多批才克隆并覆写本批数量。
+                var batchDemand = multiBatch
+                    ? CloneDemandWithBatchQty(actualDemand, batch.NetOutputQty, batch.PlannedProcessQty)
+                    : actualDemand;
+
+                // 步骤 2：候选试排（每条候选在**同一初始上下文**上跑完整排程，互不污染）。
+                //   单候选（V1 常态 / A/B 固定路径）⇒ 试排后在真实上下文重跑，结果与既有完全一致（零回归）。
+                var realTimeline = constraints.ProductTimeline;
+                var trials = new List<(RoutePathKey Key, bool Feasible, DateTime Completion, decimal SetupMinutes)>();
+
+                // 试排隔离：`constraints.TraceNotes` 是**共享可变**状态（Setup 追踪三元组在此追加），
+                // 试排会把它当真实产出写进去 ⇒ 多候选试排会留下 N 份重复 trace。
+                // 记下水位，试排结束回滚；步骤 4 在真实上下文重跑会重新写恰好一份。
+                var traceNotesWatermark = constraints.TraceNotes.Count;
+
+                foreach (var (pathKey, graph, ops) in plannedCandidates)
                 {
-                    trials.Add((pathKey, false, DateTime.MinValue, 0m));
+                    if (ops.Count == 0)
+                    {
+                        trials.Add((pathKey, false, DateTime.MinValue, 0m));
+                        continue;
+                    }
+
+                    constraints.ProductTimeline = realTimeline.Clone();
+                    var trialOccupancy = CloneOccupancy(resourceOccupancy);
+                    var trialTasks = new List<FinalTaskDraft>(result.ScheduledTasks);
+                    var trialShares = CloneShares(allocationTaskShare);
+                    var beforeEnds = trialTasks.ToDictionary(t => t.FinalDraftId, t => t.PlannedEndTime);
+
+                    var produced = RunDemandSchedule(
+                        batchDemand, ops, graph, direction, constraints, trialOccupancy,
+                        trialTasks, trialShares, demandByKey, request.PlanningStart, request.PlanningEnd,
+                        dynamicMaterialFloor, stageOverlap, allowMergeForDemand, batch.BatchDraftKey);
+
+                    // Merge 成功时返回空 List，且替换了 scheduledTasks 中的既有 Task（完成时间变化）
+                    var merged = produced.Count == 0 &&
+                                 trialTasks.Any(t => beforeEnds.TryGetValue(t.FinalDraftId, out var oldEnd)
+                                                     && oldEnd != t.PlannedEndTime);
+
+                    var feasible = produced.Count > 0 || merged;
+
+                    // ── P0-04（0号位 2026-10-07 (5).md）：Merge 候选必须取**合并后真实 PlannedEndTime** ──
+                    //   旧实现 Merge 成功给 `DateTime.MinValue`（「并入既有 Task，不产生新完成时间」）⇒
+                    //   `DelayMinutes(MinValue, due)` 恒 0（见 :913 短路）⇒ FORWARD 下被误评为「0 延期、完成最早」，
+                    //   **永远压过真实更优的另一条 Routing**，择优结果反向。
+                    DateTime completion;
+                    if (produced.Count > 0)
+                    {
+                        completion = produced.Max(t => t.PlannedEndTime);
+                    }
+                    else if (merged)
+                    {
+                        // 合并成功的 signal：既有 Task 的 PlannedEndTime 相对试排前发生了变化。
+                        var mergedTask = trialTasks.FirstOrDefault(t =>
+                            beforeEnds.TryGetValue(t.FinalDraftId, out var oldEnd) && oldEnd != t.PlannedEndTime);
+                        completion = mergedTask?.PlannedEndTime ?? DateTime.MinValue;
+                    }
+                    else
+                    {
+                        completion = DateTime.MinValue;   // 不可行候选：仅占位，SelectBestRoutingCandidate 只取可行者
+                    }
+
+                    var setupMinutes = produced.Sum(t => t.SetupTime);
+
+                    trials.Add((pathKey, feasible, completion, setupMinutes));
+                }
+
+                constraints.ProductTimeline = realTimeline;   // 试排结束，还原真实上下文（试排不污染）
+
+                // 试排产生的 Setup 追踪一并回滚（见上方 watermark）；落定重跑会重新写一份。
+                if (constraints.TraceNotes.Count > traceNotesWatermark)
+                {
+                    constraints.TraceNotes.RemoveRange(
+                        traceNotesWatermark, constraints.TraceNotes.Count - traceNotesWatermark);
+                }
+
+                // 步骤 3：**本批**候选内择优（Q-1 冻结四层目标；P0-03：Routing 择优的业务单位是执行批，不是需求）。
+                var winnerIndex = SelectBestRoutingCandidate(trials, batchDemand, direction, constraints);
+                if (winnerIndex < 0)
+                {
+                    // 本批全部候选不可排 ⇒ 该批落不下（需求整体记 Unscheduled，见循环后聚合）
+                    batchFailed = true;
+                    break;
+                }
+
+                // 步骤 4：在**真实上下文**上重跑选中候选落定（排程确定性 ⇒ 与试排同结果）。
+                var winner = plannedCandidates[winnerIndex];
+
+                if (!multiBatch)
+                {
+                    constraints.ChosenRoutePaths[actualDemand.LogicalDemandKey] = winner.Key;   // RT-002：局部修复不得换路径
+                }
+                // 多批：各批**各自**可能选中不同 Path，而 `ChosenRoutePaths` 是「需求 → 单一路径键」的单值表，
+                //   **无法承载**多批结果 ⇒ 不登记（Phase4 取图回落「多路径且未登记 ⇒ 不猜」，Fail Closed）。
+                //   待办 EBD-01：EBD-02（⑧块载体接入）销账后须把 `ChosenRoutePaths` 升维为「批键 → 路径键」。
+
+                var batchTasks = RunDemandSchedule(
+                    batchDemand, winner.Ops, winner.Graph, direction, constraints, resourceOccupancy,
+                    result.ScheduledTasks, allocationTaskShare, demandByKey,
+                    request.PlanningStart, request.PlanningEnd, dynamicMaterialFloor, stageOverlap,
+                    allowMergeForDemand, batch.BatchDraftKey);
+
+                // 第5轮Merge修复：Merge成功时返回空List，但Demand已进入TaskShare，不应标记为Unscheduled
+                if (batchTasks.Count == 0)
+                {
+                    // 检查该Demand是否已通过Merge进入TaskShare
+                    bool isMerged = allocationTaskShare.Values.Any(shares =>
+                        shares.Any(s => s.DemandKey == demand.DemandKey || s.DemandKey == demand.LogicalDemandKey));
+
+                    if (!isMerged)
+                    {
+                        batchFailed = true;
+                        break;
+                    }
+                    // Merge 成功：本批无新 Task（份额已并入既有 Task），继续下一批。
                     continue;
                 }
 
-                constraints.ProductTimeline = realTimeline.Clone();
-                var trialOccupancy = CloneOccupancy(resourceOccupancy);
-                var trialTasks = new List<FinalTaskDraft>(result.ScheduledTasks);
-                var trialShares = CloneShares(allocationTaskShare);
-                var beforeEnds = trialTasks.ToDictionary(t => t.FinalDraftId, t => t.PlannedEndTime);
-
-                var produced = RunDemandSchedule(
-                    actualDemand, ops, graph, direction, constraints, trialOccupancy,
-                    trialTasks, trialShares, demandByKey, request.PlanningStart, request.PlanningEnd,
-                    dynamicMaterialFloor, stageOverlap, request.StrategySnapshot.Parameters.AllowMerge);
-
-                // Merge 成功时返回空 List，且替换了 scheduledTasks 中的既有 Task（完成时间变化）
-                var merged = produced.Count == 0 &&
-                             trialTasks.Any(t => beforeEnds.TryGetValue(t.FinalDraftId, out var oldEnd)
-                                                 && oldEnd != t.PlannedEndTime);
-
-                var feasible = produced.Count > 0 || merged;
-                var completion = produced.Count > 0
-                    ? produced.Max(t => t.PlannedEndTime)
-                    : DateTime.MinValue;   // Merge：并入既有 Task，不产生新完成时间
-                var setupMinutes = produced.Sum(t => t.SetupTime);
-
-                trials.Add((pathKey, feasible, completion, setupMinutes));
+                result.ScheduledTasks.AddRange(batchTasks);
+                demandTasksAll.AddRange(batchTasks);
             }
 
-            constraints.ProductTimeline = realTimeline;   // 试排结束，还原真实上下文（试排不污染）
-
-            // 试排产生的 Setup 追踪一并回滚（见上方 watermark）；落定重跑会重新写一份。
-            if (constraints.TraceNotes.Count > traceNotesWatermark)
+            // 批循环后的聚合。
+            //   ⚠ 判据必须区分「**批失败**」与「**批以 Merge 落定**（无新 Task）」—— 后者不是失败：
+            //     旧实现即「tasks==0 且 isMerged ⇒ 不标 Unscheduled」。若此处把 Merge 也当失败，
+            //     需求会被误标 Unscheduled ⇒ Phase4 会把它当未排需求**整链重建**（等于把 Merge 撤销）。
+            if (batchFailed)
             {
-                constraints.TraceNotes.RemoveRange(
-                    traceNotesWatermark, constraints.TraceNotes.Count - traceNotesWatermark);
-            }
-
-            // 步骤 3：候选内择优（Q-1 冻结四层目标）。
-            var winnerIndex = SelectBestRoutingCandidate(trials, actualDemand, direction, constraints);
-            if (winnerIndex < 0)
-            {
-                // 全部候选不可排 ⇒ 需求 Unscheduled（沿用既有根因链，由 Phase5 归因）
-                result.UnscheduledDemandKeys.Add(actualDemand.LogicalDemandKey);
+                // 任一批判失败 ⇒ 需求整体记 Unscheduled。
+                //   已落定的前序批**保留**（「能排下的排下」，与「排不下不得静默丢弃」同向），
+                //   需求仍进 `UnscheduledDemandKeys` 以示**未按完整执行批全部满足**。
+                result.UnscheduledDemandKeys.Add(demand.LogicalDemandKey);
                 continue;
             }
 
-            // 步骤 4：在**真实上下文**上重跑选中候选落定（排程确定性 ⇒ 与试排同结果）。
-            var winner = plannedCandidates[winnerIndex];
-            constraints.ChosenRoutePaths[actualDemand.LogicalDemandKey] = winner.Key;   // RT-002：局部修复不得换路径
-
-            var demandTasks = RunDemandSchedule(
-                actualDemand, winner.Ops, winner.Graph, direction, constraints, resourceOccupancy,
-                result.ScheduledTasks, allocationTaskShare, demandByKey,
-                request.PlanningStart, request.PlanningEnd, dynamicMaterialFloor, stageOverlap,
-                request.StrategySnapshot.Parameters.AllowMerge);
-
-            // 第5轮Merge修复：Merge成功时返回空List，但Demand已进入TaskShare，不应标记为Unscheduled
-            if (demandTasks.Count == 0)
+            if (demandTasksAll.Count == 0)
             {
-                // 检查该Demand是否已通过Merge进入TaskShare
-                bool isMerged = allocationTaskShare.Values.Any(shares =>
-                    shares.Any(s => s.DemandKey == demand.DemandKey || s.DemandKey == demand.LogicalDemandKey));
-
-                if (!isMerged)
-                {
-                    result.UnscheduledDemandKeys.Add(demand.LogicalDemandKey);
-                }
+                // 全部批均以 Merge 落定（份额已并入既有 Task，无新 Task）：与旧版同口径 ——
+                // 不登记完成时间、不标 Unscheduled。
+                continue;
             }
-            else
+
+            // 块3/块4：登记本需求完成时间（所有批所有工序 Task 的最晚 End），供父件取动态物料下界。
+            var demandCompletionTime = demandTasksAll.Max(t => t.PlannedEndTime);
+            demandCompletion[demand.LogicalDemandKey] = demandCompletionTime;
+
+            // P0-08：登记连续份额完成时间，供同 PI 自由份额做时间下界。
+            if (actualDemand.IsContinuation && !string.IsNullOrEmpty(actualDemand.ProductionInstructionNo))
             {
-                result.ScheduledTasks.AddRange(demandTasks);
-
-                // 块3/块4：登记本需求完成时间（所有工序Task的最晚End），供父件取动态物料下界。
-                var completion = demandTasks.Max(t => t.PlannedEndTime);
-                demandCompletion[demand.LogicalDemandKey] = completion;
-
-                // P0-08：登记连续份额完成时间，供同 PI 自由份额做时间下界。
-                if (actualDemand.IsContinuation && !string.IsNullOrEmpty(actualDemand.ProductionInstructionNo))
-                {
-                    var pi = actualDemand.ProductionInstructionNo!;
-                    if (!continuityCompletionByPI.TryGetValue(pi, out var existing) || completion > existing)
-                        continuityCompletionByPI[pi] = completion;
-                }
+                var pi = actualDemand.ProductionInstructionNo!;
+                if (!continuityCompletionByPI.TryGetValue(pi, out var existing) || demandCompletionTime > existing)
+                    continuityCompletionByPI[pi] = demandCompletionTime;
             }
         }
 
@@ -800,7 +909,8 @@ internal class PhaseTwoInitialScheduler
         DateTime planningEnd,
         DateTime dynamicMaterialFloor,
         StageOverlapParams stageOverlap,
-        bool allowMerge)
+        bool allowMerge,
+        string? batchDraftKey = null)   // P0-01/P0-02：本批归批键（null ⇒ 回落 ExecutionBatchKey(demandKey, 1)）
     {
         // 第4轮Merge修复：检测是否可以合并到已有Task
         if (allowMerge)
@@ -808,12 +918,12 @@ internal class PhaseTwoInitialScheduler
             return TryMergeOrSchedule(
                 demand, operations, routingGraph, direction, constraints,
                 resourceOccupancy, scheduledTasks, allocationTaskShare, demandByKey,
-                planningStart, planningEnd, dynamicMaterialFloor, stageOverlap);
+                planningStart, planningEnd, dynamicMaterialFloor, stageOverlap, batchDraftKey);
         }
 
         return ScheduleDemandOperations(
             demand, operations, routingGraph, direction, constraints,
-            resourceOccupancy, planningStart, planningEnd, dynamicMaterialFloor, stageOverlap);
+            resourceOccupancy, planningStart, planningEnd, dynamicMaterialFloor, stageOverlap, batchDraftKey);
     }
 
     /// <summary>
@@ -943,26 +1053,46 @@ internal class PhaseTwoInitialScheduler
         DateTime planningStart,
         DateTime planningEnd,
         DateTime dynamicMaterialFloor,
-        StageOverlapParams stageOverlap)
+        StageOverlapParams stageOverlap,
+        string? batchDraftKey = null)
     {
         var tasks = new List<FinalTaskDraft>();
 
         // 根据排程方向选择策略
+        // 冻结口径：
+        //   · 规则清单 v1.5 **B-004**：「Direction 支持 AUTO/FORWARD/BACKWARD/MIXED；OrderType 不得直接决定 Direction」
+        //     ⇒ `AUTO` 是**正式冻结取值**，必须显式承载，不再由 `else` 隐式兜底。
+        //   · 规则清单 v1.5 **B-005**：Direction 由 DemandGoal / RequiredAvailableTime / Slack / Material /
+        //     Resource / Execution / Firm-Frozen-Lock 等上下文综合决定，Owner = 1号位。
+        //   · 0号位 2026-10-07 裁决 **Q-1**：「MIXED/**AUTO** → 沿用现有 Mixed 结果」。
+        // ⇒ 本实现内 `AUTO` 与 `MIXED` **行为等价**（先倒排、失败转正排），此处显式并列为同一分支；
+        //   真正的「按上下文自决方向」（B-005 完整语义）尚未实现，属**未落码项**，不得据此认为已达标。
         if (direction == "BACKWARD")
         {
-            tasks = ScheduleBackward(demand, operations, routingGraph, constraints, resourceOccupancy, planningStart, planningEnd, dynamicMaterialFloor, stageOverlap);
+            tasks = ScheduleBackward(demand, operations, routingGraph, constraints, resourceOccupancy, planningStart, planningEnd, dynamicMaterialFloor, stageOverlap, batchDraftKey);
         }
         else if (direction == "FORWARD")
         {
-            tasks = ScheduleForward(demand, operations, routingGraph, constraints, resourceOccupancy, planningStart, planningEnd, dynamicMaterialFloor, stageOverlap);
+            tasks = ScheduleForward(demand, operations, routingGraph, constraints, resourceOccupancy, planningStart, planningEnd, dynamicMaterialFloor, stageOverlap, batchDraftKey);
         }
-        else // MIXED 或其他
+        else if (direction is "MIXED" or "AUTO")
         {
-            // 先尝试倒排，失败则转正排（§八 8.3 Mixed模式）
-            tasks = ScheduleBackward(demand, operations, routingGraph, constraints, resourceOccupancy, planningStart, planningEnd, dynamicMaterialFloor, stageOverlap);
+            // MIXED：先尝试倒排，失败则转正排（§八 8.3 Mixed模式）。
+            // AUTO：0号位 Q-1 裁定「沿用现有 Mixed 结果」⇒ 与 MIXED 同分支。
+            tasks = ScheduleBackward(demand, operations, routingGraph, constraints, resourceOccupancy, planningStart, planningEnd, dynamicMaterialFloor, stageOverlap, batchDraftKey);
             if (tasks.Count == 0)
             {
-                tasks = ScheduleForward(demand, operations, routingGraph, constraints, resourceOccupancy, planningStart, planningEnd, dynamicMaterialFloor, stageOverlap);
+                tasks = ScheduleForward(demand, operations, routingGraph, constraints, resourceOccupancy, planningStart, planningEnd, dynamicMaterialFloor, stageOverlap, batchDraftKey);
+            }
+        }
+        else
+        {
+            // 未知 Direction：2号位 投影侧 `SolverStrategyModeMap.ToDirection` 已对未知枚举防御为 "BACKWARD"，
+            // 故此处理论不可达；万一到达，保持历史行为（等效 MIXED），**不改变结果**。
+            tasks = ScheduleBackward(demand, operations, routingGraph, constraints, resourceOccupancy, planningStart, planningEnd, dynamicMaterialFloor, stageOverlap, batchDraftKey);
+            if (tasks.Count == 0)
+            {
+                tasks = ScheduleForward(demand, operations, routingGraph, constraints, resourceOccupancy, planningStart, planningEnd, dynamicMaterialFloor, stageOverlap, batchDraftKey);
             }
         }
 
@@ -982,7 +1112,8 @@ internal class PhaseTwoInitialScheduler
         DateTime planningStart,
         DateTime planningEnd,
         DateTime dynamicMaterialFloor,
-        StageOverlapParams stageOverlap)
+        StageOverlapParams stageOverlap,
+        string? batchDraftKey = null)
     {
         var tasks = new List<FinalTaskDraft>();
         var currentEndTime = constraints.EffectiveDue(demand);   // M5 第一批：倒排锚用覆盖交期
@@ -1012,7 +1143,7 @@ internal class PhaseTwoInitialScheduler
             // 不占资源、保留工艺时间走链 —— 以 currentEndTime 为锚倒推产 ResourceId=NULL 的 Task，不判失败。
             if (IsNonResourceMode(operation.OperationPlanningMode))
             {
-                var nonResourceTask = CreateNonResourceTask(demand, operation, currentEndTime, backward: true);
+                var nonResourceTask = CreateNonResourceTask(demand, operation, currentEndTime, backward: true, batchDraftKey);
                 tasks.Insert(0, nonResourceTask);   // 倒序插入
                 // 更新倒排锚：本工序开始时间（含 LagTime）
                 currentEndTime = nonResourceTask.PlannedStartTime;
@@ -1032,7 +1163,8 @@ internal class PhaseTwoInitialScheduler
             var eligibleResources = OrderResourcesByPreference(
                 demand,
                 GetEligibleResources(demand.MaterialId, operation, constraints),
-                constraints);
+                constraints,
+                operation.OperationCode);   // P1-02：软偏好仅作用于当前承接工序
             if (eligibleResources.Count == 0)
             {
                 return new List<FinalTaskDraft>(); // 无合格资源（FINITE_RESOURCE fail-closed）
@@ -1114,7 +1246,7 @@ internal class PhaseTwoInitialScheduler
                     var taskSetupSource = convergedResolution.HasValue
                         ? SetupOptimizer.SetupOutcomeToSource(convergedResolution.Value.Outcome)
                         : null;
-                    scheduledTask = CreateTask(demand, operation, resourceId, taskStart, foundSlot.Value.End, setupMinutes, constraints, taskSetupSource);
+                    scheduledTask = CreateTask(demand, operation, resourceId, taskStart, foundSlot.Value.End, setupMinutes, constraints, taskSetupSource, batchDraftKey);
 
                     // 更新资源占用：从Setup开始到End结束
                     resourceOccupancy[resourceId].Add(new TimeWindow(foundSlot.Value.Start, foundSlot.Value.End));
@@ -1161,7 +1293,8 @@ internal class PhaseTwoInitialScheduler
         DateTime planningStart,
         DateTime planningEnd,
         DateTime dynamicMaterialFloor,
-        StageOverlapParams stageOverlap)
+        StageOverlapParams stageOverlap,
+        string? batchDraftKey = null)
     {
         var tasks = new List<FinalTaskDraft>();
 
@@ -1234,7 +1367,7 @@ internal class PhaseTwoInitialScheduler
             // 不占资源、保留工艺时间走链 —— 产 ResourceId=NULL 的 Task，不判失败（FINITE_RESOURCE 才 fail-closed）。
             if (IsNonResourceMode(operation.OperationPlanningMode))
             {
-                var nonResourceTask = CreateNonResourceTask(demand, operation, earliestStart, backward: false);
+                var nonResourceTask = CreateNonResourceTask(demand, operation, earliestStart, backward: false, batchDraftKey);
                 tasks.Add(nonResourceTask);
                 operationEndTimes[operationKey] = nonResourceTask.PlannedEndTime;
                 continue;
@@ -1244,7 +1377,8 @@ internal class PhaseTwoInitialScheduler
             var eligibleResources = OrderResourcesByPreference(
                 demand,
                 GetEligibleResources(demand.MaterialId, operation, constraints),
-                constraints);
+                constraints,
+                operation.OperationCode);   // P1-02：软偏好仅作用于当前承接工序
             if (eligibleResources.Count == 0)
             {
                 return new List<FinalTaskDraft>(); // 无合格资源（FINITE_RESOURCE fail-closed）
@@ -1306,7 +1440,7 @@ internal class PhaseTwoInitialScheduler
                     var taskStart = occSlot.Start + setupDuration;
                     // SetupSource 填充：解析命中类型 → 大写 5 值（5号位 值契约统一 20260921）
                     var taskSetupSource = SetupOptimizer.SetupOutcomeToSource(setupResolution.Outcome);
-                    scheduledTask = CreateTask(demand, operation, resourceId, taskStart, occSlot.End, setupMinutes, constraints, taskSetupSource);
+                    scheduledTask = CreateTask(demand, operation, resourceId, taskStart, occSlot.End, setupMinutes, constraints, taskSetupSource, batchDraftKey);
 
                     // 资源占用从Setup开始
                     resourceOccupancy[resourceId].Add(occSlot);
@@ -1416,12 +1550,31 @@ internal class PhaseTwoInitialScheduler
     ///   · Code 非空且经 <c>ResourceIdsByCode</c> 反查到 ResourceId ⇒ 以该 ResourceId 为软偏好首选；
     ///   · Code 为空 / 反查不到 / 反查到的 ResourceId 不在合法资源集内 ⇒ **回落** `PreferredResourceId`；
     ///   · **不得 Hard Lock**（Q-1 明文）：偏好资源不可用时不失败，按原顺序继续找槽。
+    ///
+    /// **P1-02（0号位 2026-10-07 (5).md）作用域收窄**：`PreferredResourceCode` 的语义是
+    ///   「上一 ACTIVE Task 的资源」= **当前承接工序的连续性偏好**，不是「整条 Route 的设备偏好」。
+    ///   原实现把它对每个 Operation 都调用，等于把连续性偏好扩散到后续全部工序。
+    ///   现收窄为：**仅作用于 Continuation Slice 的 StartOperation（当前承接工序）**；
+    ///   `currentOperationCode` 与 `demand.StartOperationCode` 不一致时**不施加任何偏好**。
+    ///   （非连续份额 / 未提供 currentOperationCode ⇒ 维持原行为，零回归。）
+    ///
+    /// **P1-01**：本函数为 Phase2/Phase4 **统一纯函数**，Phase4 不再自带只认 Id 的旧版
+    ///   （旧版完全不看 `PreferredResourceCode`，Phase4 局部修复会丢弃 Code 偏好）。
     /// </summary>
-    private static List<int> OrderResourcesByPreference(
+    internal static List<int> OrderResourcesByPreference(
         LogicalProductionDemand demand,
         List<int> eligibleResources,
-        ConstraintContext constraints)
+        ConstraintContext constraints,
+        string? currentOperationCode = null)
     {
+        // P1-02：连续份额的软偏好只对「当前承接工序」生效，不得扩散到后续整条 Route。
+        if (demand.IsContinuation
+            && currentOperationCode is not null
+            && !string.Equals(currentOperationCode, demand.StartOperationCode, StringComparison.Ordinal))
+        {
+            return eligibleResources;
+        }
+
         // Code 优先，反查不到则回落 Id（Code 为空串不算合法业务编码，与 RouteCode 同口径）
         int? preferred = null;
         if (!string.IsNullOrEmpty(demand.PreferredResourceCode) &&
@@ -1646,7 +1799,8 @@ internal class PhaseTwoInitialScheduler
         LogicalProductionDemand demand,
         OperationNode operation,
         DateTime anchorTime,
-        bool backward)
+        bool backward,
+        string? batchDraftKey = null)   // P0-01/P0-02：本批归批键（null ⇒ 回落 ExecutionBatchKey(demandKey, 1)）
     {
         var durationMinutes = operation.StandardDuration * demand.PlannedProcessQty;
         var duration = TimeSpan.FromMinutes((double)durationMinutes);
@@ -1676,23 +1830,214 @@ internal class PhaseTwoInitialScheduler
             Priority = demand.DemandSequence,
             IsVirtual = false,
             // 非资源工序 Task 同样属该执行批 ⇒ 与资源 Task 共 Key（v1.6：FinalTask 一律回传）。
+            // P0-02：键域为 (需求键, 批序号)；批键由本批入参给定，缺省即 1 号批。
             ContinuationKey = demand.ContinuationKey,
-            ExecutionBatchDraftKey = ExecutionBatchKey(demand.LogicalDemandKey, operation.RouteCode, operation.PathId)
+            ExecutionBatchDraftKey = batchDraftKey ?? ExecutionBatchKey(demand.LogicalDemandKey)
         };
     }
 
     /// <summary>
-    /// 生成执行批键（0号位 2026-10-07 裁决 §七：本项 1号位 **无前置生产职责**，今天即可完成）。
+    /// 生成执行批键（P0-02，0号位 2026-10-07《未命名的Markdown文件 (5).md》）。
     ///
-    /// 冻结要求「每个 Execution Batch 只允许一条完整 Path」⇒ 同一批内所有 Operation FinalTask 的
-    /// (RouteCode, PathId) 必须一致。故键由 (LogicalDemandKey, RouteCode, PathId) 唯一决定 ——
-    /// 该构造**结构性地**保证「同 Key ⇒ 同 Path」，无需事后校验。
+    /// 【为什么改键域】旧键 <c>EB|{demand}|{route}|{path}</c> 由 **Route/Path 派生** ⇒
+    ///   ① 批身份被路由选择**反向决定**（0号位 判词：「把 LogicalDemand 当成了 Execution Batch」）；
+    ///   ② 同一 Demand 拆出的 N 个批**会撞成同一个键**（同 Route / 同 Path）⇒
+    ///      「同 Batch 共键、不同 Batch 必不同键」**结构性失效**。
+    /// 新键只由 **(逻辑需求键, 批序号)** 决定 ⇒ 批身份是**主键**，Route/Path 是批的**属性**
+    ///   （每批各自选一条完整 Path，见 P0-03），构造上保证「不同 Batch 即使同 Route/Path 也必不同键」。
     ///
-    /// ⚠ 同一 Demand 若需拆成多个 Execution Batch，批身份须由上游在 LogicalDemandKey 上区分
-    ///   （V1 口径：一 Demand 一批）。**不使用「候选 Path 条数」反推批身份**（0号位 裁决 §四）。
+    /// ⚠ 批序号由 `FormExecutionBatches` 产出（1 起、连续、确定性），**不由候选 Path 条数反推**
+    ///   （0号位 裁决 §四）。
     /// </summary>
-    internal static string ExecutionBatchKey(string logicalDemandKey, string? routeCode, long? pathId)
-        => $"EB|{logicalDemandKey}|{routeCode ?? string.Empty}|{pathId?.ToString() ?? string.Empty}";
+    public static string ExecutionBatchKey(string logicalDemandKey, int batchOrdinal = 1)
+        => $"EB|{logicalDemandKey}|{batchOrdinal:D3}";
+
+    /// <summary>
+    /// P0-02：Phase4 重建 Task（`TryResourceSwitch` / `TrySplitOperation`）的归批键解析。
+    ///
+    /// 语义：重建的 Task 必然是**某个既有执行批的工序重建**，其批键必须与 Phase2 为该批发出的键
+    /// **逐字一致**（否则同一批被劈成两个键，违反「同批共键」）。
+    ///
+    /// 解析顺序：
+    ///   ① Phase2 已登记该需求的批键（`ConstraintContext.ExecutionBatchDraftKeys`）⇒ **复用**（生产现状恒此，且只有 1 个）；
+    ///   ② 未登记（Phase4 先于 Phase2 落定 / 需求未进入 Phase2 主循环）⇒ 回落 `ExecutionBatchKey(demandKey)`（1 号批）。
+    ///
+    /// ⚠ **待办 EBD-01（未销账，不静默）**：`keys.Count &gt; 1` 时本处取**首批键** —— 这**仅当 N=1 时正确**。
+    ///   Phase4 的整链重建（`TryResourceSwitch` 逐工序重建整条工艺）目前**无「批序号」入参**，
+    ///   多批情形下无法唯一归属。因 ⑧块 Batch Policy 载体未达 1号位（见 EBD-02），生产路径恒 N=1，
+    ///   该分支当前**不可达**；**EBD-02 一旦销账（载体接入），必须同步给 Phase4 补批序号入参**。
+    /// </summary>
+    public static string ResolveExecutionBatchKeyForRebuild(string logicalDemandKey, ConstraintContext constraints)
+    {
+        if (constraints.ExecutionBatchDraftKeys.TryGetValue(logicalDemandKey, out var keys) && keys.Count > 0)
+        {
+            // keys.Count > 1 见上方 EBD-01。
+            return keys[0];
+        }
+
+        return ExecutionBatchKey(logicalDemandKey);
+    }
+
+    /// <summary>
+    /// 一个执行批（Execution Batch）的排程草稿（P0-01 / P0-02，0号位 2026-10-07 (5).md）。
+    ///
+    /// 冻结单位：**执行批是 Routing 择优的业务单位**（「每个 Execution Batch 只允许一条完整 Path」）。
+    /// 因此 `BatchDraftKey` 只依赖 (逻辑需求键, 批序号)，与 Route/Path **无关**。
+    /// </summary>
+    public sealed record ExecutionBatchDraft(
+        string BatchDraftKey,            // EB|{逻辑需求键}|{批序号:D3}
+        string SourceLogicalDemandKey,
+        int Ordinal,                     // 1 起、连续
+        decimal NetOutputQty,            // 本批净产出（各批求和 = 需求 NetOutputQty，逐分不丢）
+        decimal PlannedProcessQty);      // 本批计划加工量（各批求和 = 需求 PlannedProcessQty）
+
+    /// <summary>
+    /// ⑧块 Batch Policy 在 **1号位 侧**的执行批策略输入（P0-01）。
+    ///
+    /// ⚠ 契约来源：字段口径取自 ⑧块 `BatchPolicyRuleSnapshot`（`FrozenStrategySnapshot.cs`），
+    ///   但该类属 **2↔3** 层，**未投影进 1↔2 的 `SolverStrategySnapshot`**（无 BatchPolicy 成员）。
+    ///   本类型是 1号位 侧的**消费侧形参**，不是新契约：生产装配处当前恒 null（见 EBD-02），
+    ///   由单测直接注入以锁住多批行为。
+    /// </summary>
+    public sealed record ExecutionBatchPolicyInput(
+        decimal MinExecutionBatchQty = 0m,          // ⑧块 MinExecutionBatchQty（硬最小批量）
+        decimal? MaxExecutionBatchQty = null,       // ⑧块 MaxExecutionBatchQty（硬最大批量；null = 无硬上限）
+        decimal? PreferredBatchQty = null,          // ⑧块 PreferredBatchQty（软偏好切点；V1 未消费，登记不实现）
+        bool AllowSplit = false,                    // ⑧块 AllowSplit
+        bool AllowMerge = false,                    // ⑧块 AllowMerge
+        int? MaxOptimizationSplitCount = null,      // ⑧块 MaxOptimizationSplitCount（仅限制优化性拆分搜索）
+        int? MaxBatchCandidates = null);            // ⑧块 MaxBatchCandidates（V1 未消费，登记不实现）
+
+    /// <summary>
+    /// 执行批形成（P0-01）—— 0号位 指定链路的第一环：`Free Slice → Batch Policy → 1..N ExecutionBatchDraft`。
+    ///
+    /// 硬约束（任何策略都不得推翻）：
+    ///   · A/B（`IsContinuation` / `NoSplitMerge`）⇒ **恒 1 批**（v1.6 NoSplitMerge；Phase4 P0_07 同向）。
+    ///   · 缺策略（`policy == null`）⇒ **恒 1 批**（缺 ⑧块不拆）。
+    ///
+    /// V1 批数裁决（`DecideExecutionBatchCount`）：
+    ///   · **硬最大批量**（`MaxExecutionBatchQty`）⇒ **强制拆到每批不超过它**（`SplitParams.MaxOptimizationSplitCount`
+    ///     注释明文：「仅限制优化性拆分搜索（**不限制硬 Max 强制拆分**）」⇒ 硬 Max 不受 AllowSplit 限制）。
+    ///   · **优化性拆批**（`AllowSplit` + `MaxOptimizationSplitCount` / `PreferredBatchQty`）⇒ **V1 不做搜索**：
+    ///     多拆一批的收益须由「跨批 Routing/资源/日历联合求解」的目标值比较得出，
+    ///     而该比较的输入（⑧块搜索预算/切点语义）本轮无载体 ⇒ **登记不实现**（待办 EBD-03），
+    ///     **不静默降级为「拆得越多越好」**（那会把 Setup 与在制推高，违反四层目标第④层）。
+    ///   · **硬最小批量**（`MinExecutionBatchQty`）⇒ **V1 无作用面**（有硬 Max 时批数已是最小可行批数；
+    ///     无硬 Max 时恒 1 批）⇒ 不落代码，登记待办 **EBD-03**（详见 `DecideExecutionBatchCount` 内注释）。
+    ///
+    /// 数量切分：各批**逐分不丢**（前 N-1 批向下取整到 4 位小数，末批取余数）——
+    ///   保证 `Σ NetOutputQty = 需求 NetOutputQty`、`Σ PlannedProcessQty = 需求 PlannedProcessQty`。
+    /// </summary>
+    public static List<ExecutionBatchDraft> FormExecutionBatches(
+        LogicalProductionDemand demand,
+        ExecutionBatchPolicyInput? policy)
+    {
+        int count = DecideExecutionBatchCount(demand, policy);
+
+        var batches = new List<ExecutionBatchDraft>(count);
+        decimal netAssigned = 0m;
+        decimal procAssigned = 0m;
+
+        for (int ordinal = 1; ordinal <= count; ordinal++)
+        {
+            bool last = ordinal == count;
+
+            decimal batchNet = last
+                ? demand.NetOutputQty - netAssigned
+                : decimal.Round(demand.NetOutputQty / count, 4, MidpointRounding.ToZero);
+            decimal batchProc = last
+                ? demand.PlannedProcessQty - procAssigned
+                : decimal.Round(demand.PlannedProcessQty / count, 4, MidpointRounding.ToZero);
+
+            netAssigned += batchNet;
+            procAssigned += batchProc;
+
+            batches.Add(new ExecutionBatchDraft(
+                ExecutionBatchKey(demand.LogicalDemandKey, ordinal),
+                demand.LogicalDemandKey,
+                ordinal,
+                batchNet,
+                batchProc));
+        }
+
+        return batches;
+    }
+
+    /// <summary>
+    /// V1 批数裁决（判据来源与边界见 <see cref="FormExecutionBatches"/> 的文档块）。
+    /// </summary>
+    private static int DecideExecutionBatchCount(LogicalProductionDemand demand, ExecutionBatchPolicyInput? policy)
+    {
+        // ① A/B（连续份额）硬约束：不拆批。
+        if (demand.IsContinuation || demand.NoSplitMerge)
+        {
+            return 1;
+        }
+
+        // ② 缺 ⑧块策略：不拆（不认领 BATCH_POLICY_MISSING —— 与 0号位 20260928 §十五 四级兜底链冲突，属待裁项）。
+        if (policy is null || demand.NetOutputQty <= 0m)
+        {
+            return 1;
+        }
+
+        int count = 1;
+
+        // ③ 硬最大批量：强制拆（不受 AllowSplit / MaxOptimizationSplitCount 限制）。
+        if (policy.MaxExecutionBatchQty is > 0m)
+        {
+            count = (int)Math.Ceiling(demand.NetOutputQty / policy.MaxExecutionBatchQty.Value);
+        }
+
+        // ④ 硬最小批量（MinExecutionBatchQty）：**V1 无作用面，故不落代码**（登记 EBD-03，不静默）——
+        //    · 有硬 Max 时：count = ceil(qty / Max) 已是「满足硬 Max 的最小批数」，
+        //      再减一批必使每批 > Max ⇒ 违反硬 Max（容量型硬约束优先）⇒ 收不下去；
+        //    · 无硬 Max 时：count 恒 1 ⇒ 不存在「批太小」的批 ⇒ 无批可减。
+        //    ⇒ 两种情形下 Min 都不改变 count。**硬 Min 要起作用必须先有「优化性拆批」**，
+        //      而优化性拆批的搜索预算/切点语义本轮无载体（EBD-02/03）⇒ 一并待裁。
+        //    （旧版此处有一段 Min 收缩 while 循环，经上述分析确认**不可达**，已删除；
+        //      「硬 Max vs 硬 Min 冲突」因此在 V1 **不会发生**，无需优先级裁决代码。）
+        return count;
+    }
+
+    /// <summary>
+    /// P0-01/P0-03：按执行批数量克隆需求（只改数量，其余字段**全量逐字拷贝**，不得漏项）。
+    ///
+    /// 只在 `batches.Count &gt; 1` 时调用；`count == 1` 一律直接用原 `LogicalProductionDemand` 实例
+    /// （保证单批路径与旧版**逐字一致**，零回归）。
+    /// </summary>
+    private static LogicalProductionDemand CloneDemandWithBatchQty(
+        LogicalProductionDemand demand,
+        decimal netOutputQty,
+        decimal plannedProcessQty)
+        => new()
+        {
+            LogicalDemandKey = demand.LogicalDemandKey,
+            PlanVersionId = demand.PlanVersionId,
+            DomainKey = demand.DomainKey,
+            AllocationSequence = demand.AllocationSequence,
+            DemandKey = demand.DemandKey,
+            OrderId = demand.OrderId,
+            MaterialId = demand.MaterialId,
+            FactoryId = demand.FactoryId,
+            StartStageCode = demand.StartStageCode,
+            RequiredStageCode = demand.RequiredStageCode,
+            StartOperationCode = demand.StartOperationCode,
+            NetOutputQty = netOutputQty,
+            PlannedProcessQty = plannedProcessQty,
+            UOM = demand.UOM,
+            RequiredAvailableTime = demand.RequiredAvailableTime,
+            DemandSequence = demand.DemandSequence,
+            ProductionInstructionNo = demand.ProductionInstructionNo,
+            IsUnlocated = demand.IsUnlocated,
+            PreferredResourceId = demand.PreferredResourceId,
+            FallbackResourceId = demand.FallbackResourceId,
+            IsContinuation = demand.IsContinuation,
+            ContinuationKey = demand.ContinuationKey,
+            RouteCode = demand.RouteCode,
+            PathId = demand.PathId,
+            NoSplitMerge = demand.NoSplitMerge,
+            PreferredResourceCode = demand.PreferredResourceCode
+        };
 
     private FinalTaskDraft CreateTask(
         LogicalProductionDemand demand,
@@ -1702,7 +2047,8 @@ internal class PhaseTwoInitialScheduler
         DateTime end,
         decimal setupMinutes,     // item1 接线（阶段二）：规则解析出的换型分钟（调用方经 FindSlotWithDynamicSetup/收敛迭代取得）
         ConstraintContext constraints,
-        string? setupSource = null)  // SetupSource 填充（v1.2/5号位 值契约）：SetupOutcome → 大写 5 值
+        string? setupSource = null,  // SetupSource 填充（v1.2/5号位 值契约）：SetupOutcome → 大写 5 值
+        string? batchDraftKey = null)   // P0-01/P0-02：本批归批键（null ⇒ 回落 ExecutionBatchKey(demandKey, 1)）
     {
         // P0-16修复：V1新生成的都是生产Task，统一使用PRODUCTION
         // UNLOCATED、无PI等作为独立标识/来源事实，不增加新TaskType
@@ -1735,8 +2081,9 @@ internal class PhaseTwoInitialScheduler
             // v1.6 §新增/替换实施要求：FinalTask 必须原样回传 ContinuationKey + 回传真实 RouteCode/PathId。
             // ContinuationKey：1号位 **不生成、不解析**，从源 Demand 逐字拷贝（null 表示无该身份）。
             ContinuationKey = demand.ContinuationKey,
-            // ExecutionBatchDraftKey：同一执行批（同一 Demand 的同一 Routing 选择）下多 Operation 共 Key。
-            ExecutionBatchDraftKey = ExecutionBatchKey(demand.LogicalDemandKey, operation.RouteCode, operation.PathId)
+            // ExecutionBatchDraftKey：同一执行批下多 Operation 共 Key。
+            // P0-02：键域为 (需求键, 批序号)，**不再由 Route/Path 派生**；批键由本批入参给定，缺省即 1 号批。
+            ExecutionBatchDraftKey = batchDraftKey ?? ExecutionBatchKey(demand.LogicalDemandKey)
         };
     }
 
@@ -1787,7 +2134,8 @@ internal class PhaseTwoInitialScheduler
         DateTime planningStart,
         DateTime planningEnd,
         DateTime dynamicMaterialFloor,
-        StageOverlapParams stageOverlap)
+        StageOverlapParams stageOverlap,
+        string? batchDraftKey = null)   // P0-01/P0-02：本批归批键（转交 ScheduleDemandOperations）
     {
         // P0-07：连续份额不可被普通 Merge 破坏逐工单身份，直接独立排程，不尝试合并。
         // v1.6 `:26` + 0号位 2026-10-07 裁决 `:246`「`NoSplitMerge` 及固定 Route/Path 应**显式落实**」：
@@ -1797,7 +2145,7 @@ internal class PhaseTwoInitialScheduler
         {
             return ScheduleDemandOperations(
                 demand, operations, routingGraph, direction, constraints,
-                resourceOccupancy, planningStart, planningEnd, dynamicMaterialFloor, stageOverlap);
+                resourceOccupancy, planningStart, planningEnd, dynamicMaterialFloor, stageOverlap, batchDraftKey);
         }
 
         // 检测是否可以合并到已有Task
@@ -1809,7 +2157,7 @@ internal class PhaseTwoInitialScheduler
             var targetTask = candidateTasks[0];
 
             // 检查合并后是否破坏交期：合并后Duration增加，End时间延后
-            var mergedTask = TryMergeDemandIntoTask(demand, targetTask, routingGraph, constraints, resourceOccupancy, allocationTaskShare, planningEnd);
+            var mergedTask = TryMergeDemandIntoTask(demand, targetTask, routingGraph, constraints, resourceOccupancy, allocationTaskShare, planningEnd, demandByKey);
             if (mergedTask != null)
             {
                 // 合并成功：替换scheduledTasks中的旧Task
@@ -1834,7 +2182,8 @@ internal class PhaseTwoInitialScheduler
             planningStart,
             planningEnd,
             dynamicMaterialFloor,
-            stageOverlap);
+            stageOverlap,
+            batchDraftKey);
     }
 
     /// <summary>
@@ -1872,6 +2221,20 @@ internal class PhaseTwoInitialScheduler
             // Stage和Operation必须完全匹配
             if (task.StageCode != (targetOp.StageCode ?? string.Empty)) continue;
             if (task.OperationCode != targetOp.OperationCode) continue;
+
+            // ── P0-06（0号位 2026-10-07 (5).md）：**跨 Path 不得 Merge** ──
+            //   评估 Routing A 时若把既有 Routing B 的 Task 当成合并目标，会保留 target 的
+            //   (RouteCode, PathId, ExecutionBatchDraftKey) ⇒ 同一 Execution Batch 里混入另一条 Path 的
+            //   节点与资源，违反「每个 Execution Batch 只允许一条完整 Path」。
+            //   两条 Path 存在**同名工序码**时（OP10 在 A、B 各一份）本检查是唯一拦截点。
+            if (!string.Equals(task.RouteCode ?? string.Empty, targetOp.RouteCode ?? string.Empty, StringComparison.Ordinal))
+            {
+                continue;
+            }
+            if (task.PathId != targetOp.PathId)
+            {
+                continue;
+            }
 
             // S29：执行起点一致性校验——不同执行起点不得合批，避免已完成工序被重新排产
             // 反查候选Task的来源Demand，比较 StartStageCode / StartOperationCode
@@ -1913,7 +2276,8 @@ internal class PhaseTwoInitialScheduler
         ConstraintContext constraints,
         Dictionary<int, List<TimeWindow>> resourceOccupancy,
         Dictionary<string, List<(string DemandKey, decimal ShareQty)>> allocationTaskShare,
-        DateTime planningEnd)
+        DateTime planningEnd,
+        Dictionary<string, LogicalProductionDemand>? demandByKey = null)
     {
         // 计算合并后的总数量
         var mergedQty = targetTask.PlannedProcessQty + demand.PlannedProcessQty;
@@ -1952,6 +2316,43 @@ internal class PhaseTwoInitialScheduler
         if (newEndTime > planningEnd)
         {
             return null; // 合并后超出计划窗口，无法合并
+        }
+
+        // ── P0-04（0号位 2026-10-07 (5).md）：Merge 必须校验**交期不被破坏** ──
+        //   旧实现只查 PlanningEnd + 资源后续冲突，**未查新 Demand 的有效交期，也未查被合并 Task
+        //   已有份额的交期是否因延长而恶化**。合批会延长 Task 的 PlannedEndTime ⇒ 必须验证：
+        //   ① 本 Demand：newEndTime 不得越过 `RequiredAvailableTime`（有效交期）；
+        //   ② target 已服务的**全部既有份额**（血缘在 allocationTaskShare，另加 SourceDraftId 兜底）：
+        //      目标 Task 原完成时间已合规，但延长后若越过任一既有份额的交期 ⇒ 该份额被推违约 ⇒ 放弃合并。
+        if (demand.RequiredAvailableTime != DateTime.MaxValue && newEndTime > demand.RequiredAvailableTime)
+        {
+            return null;
+        }
+
+        if (demandByKey is not null)
+        {
+            var targetDue = DateTime.MaxValue;
+            void WidenDue(string demandKey)
+            {
+                if (demandByKey.TryGetValue(demandKey, out var d) && d.RequiredAvailableTime < targetDue)
+                {
+                    targetDue = d.RequiredAvailableTime;
+                }
+            }
+
+            WidenDue(targetTask.SourceDraftId);
+            if (allocationTaskShare.TryGetValue(targetTask.FinalDraftId, out var existingShares))
+            {
+                foreach (var (shareDemandKey, _) in existingShares)
+                {
+                    WidenDue(shareDemandKey);
+                }
+            }
+
+            if (targetDue != DateTime.MaxValue && newEndTime > targetDue)
+            {
+                return null; // 延长后使既有份额交期恶化，无法合并
+            }
         }
 
         // 第5轮修复：检查延长Task后是否与同资源的后续Task冲突

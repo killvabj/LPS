@@ -1062,6 +1062,31 @@ internal class ConstraintContext
     public Dictionary<string, RoutePathKey> ChosenRoutePaths { get; set; } = new(StringComparer.Ordinal);
 
     /// <summary>
+    /// 需求 → **本 Run 该需求的全部执行批归批键**（Scheduling 内部，不动 Core）。
+    ///
+    /// Phase2 `FormExecutionBatches` 产出后**在需求循环开头即登记**（先于试排/择优/落定），
+    /// Phase4 重建 Task（`TryResourceSwitch` / `TrySplitOperation`）经
+    /// `PhaseTwoInitialScheduler.ResolveExecutionBatchKeyForRebuild` 复用同一批键 ——
+    /// 保证「局部修复不得把同一执行批劈成两个键」。
+    ///
+    /// ⚠ 生产现状：`DomainSolveRequest.StrategySnapshot` 无 ⑧块 Batch Policy 载体 ⇒ `ExecutionBatchPolicy` 恒 null
+    /// ⇒ 每需求恒 **1 批**（`EB|{demand}|001`）。多批路径已落码并单测，但**其生产入口缺失**
+    /// （见 `PhaseTwoInitialScheduler.ExecutionBatchPolicy` 与 待办 EBD-02）。
+    /// </summary>
+    public Dictionary<string, List<string>> ExecutionBatchDraftKeys { get; set; } = new(StringComparer.Ordinal);
+
+    /// <summary>
+    /// ⑧块 Batch Policy 的 **1号位 侧执行批策略输入**（P0-01，0号位 2026-10-07 (5).md）。
+    ///
+    /// ⚠ **生产路径恒 null**：`DomainSolveRequest.StrategySnapshot`（`SolverStrategySnapshot`）**没有** BatchPolicy 成员，
+    ///   而 ⑧块内容（`FrozenStrategySnapshot.BatchPolicy` / `BatchPolicyRuleSnapshot`）只到 2↔3 层。
+    ///   把它接到 1号位 需**扩 1↔2 Core Contract**（加字段）+ 动 2号位 投影 —— 两者均被本轮裁决明文禁止
+    ///   （「这一轮不要再扩 Core Contract，也不要碰2号位生产者」）。⇒ 见 待办 **EBD-02**。
+    ///   null ⇒ `FormExecutionBatches` 每需求恒 1 批（不拆），行为与旧版逐字一致。
+    /// </summary>
+    public PhaseTwoInitialScheduler.ExecutionBatchPolicyInput? ExecutionBatchPolicy { get; set; }
+
+    /// <summary>
     /// 需求级取图（Phase4 / Phase5 消费点用），解析顺序：
     ///   ① **Phase2 已登记选中路径**（<see cref="ChosenRoutePaths"/>）—— RT-002「局部修复不得换路径」，**优先且不重选**；
     ///   ② 需求自带固定路径（A/B，<c>LogicalProductionDemand.RouteCode/PathId</c>）；

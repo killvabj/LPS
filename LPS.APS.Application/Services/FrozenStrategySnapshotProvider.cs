@@ -116,7 +116,11 @@ public class FrozenStrategySnapshotProvider : IFrozenStrategySnapshotProvider
             // ⑦ Setup 换型规则（重构方案 S-4：RuleSetVersion.ContentSnapshotJson.SetupTransitionRules 子块 → 第⑦块）
             // 原由 PeggingOrchestrator.LoadSetupTransitionRulesAsync 从独立物理表装载；重构后随六块统一经快照通道，
             // 缺子块/为空 = 无 Setup 规则（消费端三层命中按 0 分钟 + 追踪兜底，与旧空行语义一致，不 fail-closed）。
-            SetupTransitionRules = DeserializeSetupTransitionRules(ruleSetVersion)
+            SetupTransitionRules = DeserializeSetupTransitionRules(ruleSetVersion),
+
+            // ⑧ 批量策略 Batch Policy（0号位 2026-10-07 裁决本轮落码）：ParameterSetVersion.ContentSnapshotJson.BatchPolicy 子块 → 第⑧块。
+            // fail-open：缺子块/为空 = 无批量策略规则（缺策略 fail-closed 属 1号位 消费侧 BATCH_POLICY_MISSING，本块不承载信号位）。
+            BatchPolicy = DeserializeBatchPolicy(parameterSetVersion)
         };
 
         // B-5：写入缓存（失败路径已在上述反序列化抛异常退出，不会写入坏快照）。
@@ -195,6 +199,16 @@ public class FrozenStrategySnapshotProvider : IFrozenStrategySnapshotProvider
         LPS.APS.Core.Entities.APS.RuleSetVersion version)
     {
         return SetupTransitionRuleProjector.ProjectFromSnapshot(version.ContentSnapshotJson);
+    }
+
+    /// <summary>
+    /// 从 ParameterSetVersion.ContentSnapshotJson 反序列化 BatchPolicy 子块 → 第⑧块快照。
+    /// fail-open：缺失/为空/损坏 → 空列表（无批量策略规则；缺策略 fail-closed 属消费侧），与 ⑦ Setup 规则同轨。
+    /// </summary>
+    private List<BatchPolicyRuleSnapshot> DeserializeBatchPolicy(
+        LPS.APS.Core.Entities.APS.ParameterSetVersion version)
+    {
+        return TaskSplitRuleConfigProjector.ProjectFromSnapshot(version.ContentSnapshotJson);
     }
 
     /// <summary>从 ParameterSetVersion.ContentSnapshotJson 反序列化指定子块（P0-02 六块统一失败）</summary>

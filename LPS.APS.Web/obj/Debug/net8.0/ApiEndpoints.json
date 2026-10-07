@@ -1895,6 +1895,85 @@
     "ReturnTypes": []
   },
   {
+    "ContainingType": "LPS.APS.Web.Controllers.TaskSplitRuleConfigController",
+    "Method": "List",
+    "RelativePath": "api/governance/task-split-rule-configs",
+    "HttpMethod": "GET",
+    "IsController": true,
+    "Order": 0,
+    "Parameters": [
+      {
+        "Name": "materialId",
+        "Type": "System.Nullable\u00601[[System.Int32, System.Private.CoreLib, Version=8.0.0.0, Culture=neutral, PublicKeyToken=7cec85d7bea7798e]]",
+        "IsRequired": false
+      },
+      {
+        "Name": "productionDepartmentId",
+        "Type": "System.Nullable\u00601[[System.Int32, System.Private.CoreLib, Version=8.0.0.0, Culture=neutral, PublicKeyToken=7cec85d7bea7798e]]",
+        "IsRequired": false
+      },
+      {
+        "Name": "isActive",
+        "Type": "System.Nullable\u00601[[System.Boolean, System.Private.CoreLib, Version=8.0.0.0, Culture=neutral, PublicKeyToken=7cec85d7bea7798e]]",
+        "IsRequired": false
+      }
+    ],
+    "ReturnTypes": []
+  },
+  {
+    "ContainingType": "LPS.APS.Web.Controllers.TaskSplitRuleConfigController",
+    "Method": "Create",
+    "RelativePath": "api/governance/task-split-rule-configs",
+    "HttpMethod": "POST",
+    "IsController": true,
+    "Order": 0,
+    "Parameters": [
+      {
+        "Name": "input",
+        "Type": "LPS.APS.Core.DTOs.Governance.SaveTaskSplitRuleConfigRequest",
+        "IsRequired": true
+      }
+    ],
+    "ReturnTypes": []
+  },
+  {
+    "ContainingType": "LPS.APS.Web.Controllers.TaskSplitRuleConfigController",
+    "Method": "Update",
+    "RelativePath": "api/governance/task-split-rule-configs/{id}",
+    "HttpMethod": "PUT",
+    "IsController": true,
+    "Order": 0,
+    "Parameters": [
+      {
+        "Name": "id",
+        "Type": "System.Int32",
+        "IsRequired": true
+      },
+      {
+        "Name": "input",
+        "Type": "LPS.APS.Core.DTOs.Governance.SaveTaskSplitRuleConfigRequest",
+        "IsRequired": true
+      }
+    ],
+    "ReturnTypes": []
+  },
+  {
+    "ContainingType": "LPS.APS.Web.Controllers.TaskSplitRuleConfigController",
+    "Method": "Deactivate",
+    "RelativePath": "api/governance/task-split-rule-configs/{id}",
+    "HttpMethod": "DELETE",
+    "IsController": true,
+    "Order": 0,
+    "Parameters": [
+      {
+        "Name": "id",
+        "Type": "System.Int32",
+        "IsRequired": true
+      }
+    ],
+    "ReturnTypes": []
+  },
+  {
     "ContainingType": "LPS.APS.Web.Controllers.ManualCapacityController",
     "Method": "BulkCreateCalendar",
     "RelativePath": "api/manual-capacity/calendar",

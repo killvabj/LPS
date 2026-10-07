@@ -936,10 +936,13 @@ internal class PhaseFourLocalRepair
         {
             var operation = operations[i];
 
-            // 获取合格资源列表（P1-11：软偏好资源优先，Preferred 最前、Fallback 次之）
-            var eligibleResources = OrderResourcesByPreference(
+            // 获取合格资源列表（P1-01：统一走 Phase2 纯函数 —— 在此前 Phase4 自带旧版**只认 Id、完全不看
+            // PreferredResourceCode**，导致 Phase4 局部修复会静默丢弃 Code 软偏好；现与 Phase2 同源。）
+            var eligibleResources = PhaseTwoInitialScheduler.OrderResourcesByPreference(
                 demand,
-                GetEligibleResources(demand.MaterialId, operation, constraints));
+                GetEligibleResources(demand.MaterialId, operation, constraints),
+                constraints,
+                operation.OperationCode);   // P1-02：软偏好仅作用于当前承接工序
 
             FinalTaskDraft? scheduledTask = null;
 
@@ -1185,42 +1188,9 @@ internal class PhaseFourLocalRepair
     }
 
     /// <summary>
-    /// P1-11：软偏好资源优先——在合法资源集内把 PreferredResourceId 排最前、FallbackResourceId 次之，
-    /// 其余保持原顺序。软偏好不改变合法性（非硬锁），偏好资源不可用时自然回落。
+    /// P1-01：旧版 Phase4 专用「只认 Id」的软偏好排序已**移除**，统一改调
+    /// <see cref="PhaseTwoInitialScheduler.OrderResourcesByPreference"/>（同时消费 Code + Id + P1-02 作用域）。
     /// </summary>
-    private static List<int> OrderResourcesByPreference(
-        LogicalProductionDemand demand,
-        List<int> eligibleResources)
-    {
-        if (demand.PreferredResourceId == null && demand.FallbackResourceId == null)
-        {
-            return eligibleResources;
-        }
-
-        var ordered = new List<int>(eligibleResources.Count);
-
-        if (demand.PreferredResourceId is int preferred && eligibleResources.Contains(preferred))
-        {
-            ordered.Add(preferred);
-        }
-
-        if (demand.FallbackResourceId is int fallback
-            && fallback != demand.PreferredResourceId
-            && eligibleResources.Contains(fallback))
-        {
-            ordered.Add(fallback);
-        }
-
-        foreach (var resourceId in eligibleResources)
-        {
-            if (!ordered.Contains(resourceId))
-            {
-                ordered.Add(resourceId);
-            }
-        }
-
-        return ordered;
-    }
 
     /// <summary>
     /// 正排寻找时间槽
@@ -1335,10 +1305,11 @@ internal class PhaseFourLocalRepair
             Priority = demand.DemandSequence,
             IsVirtual = false,
             // v1.6 §1：FinalTask 必须原样回传 ContinuationKey + 归批键（局部修复/拆分新建的 Task 同样要带）。
-            // Split 子任务与源 Task 同 Route/Path ⇒ 与 Phase2 生成的键同构、同批。
+            // P0-02：批键**不由 Route/Path 派生**（键域 = (需求键, 批序号)）——
+            //   重建的 Task 属**同一执行批**，必须复用 Phase2 为该批发出的键（否则同一批被劈成两个键）。
             ContinuationKey = demand.ContinuationKey,
-            ExecutionBatchDraftKey = PhaseTwoInitialScheduler.ExecutionBatchKey(
-                demand.LogicalDemandKey, operation.RouteCode, operation.PathId)
+            ExecutionBatchDraftKey = PhaseTwoInitialScheduler.ResolveExecutionBatchKeyForRebuild(
+                demand.LogicalDemandKey, constraints)
         };
     }
 
@@ -1558,10 +1529,11 @@ internal class PhaseFourLocalRepair
             Priority = demand.DemandSequence,
             IsVirtual = false,
             // v1.6 §1：FinalTask 必须原样回传 ContinuationKey + 归批键（局部修复/拆分新建的 Task 同样要带）。
-            // Split 子任务与源 Task 同 Route/Path ⇒ 与 Phase2 生成的键同构、同批。
+            // P0-02：批键**不由 Route/Path 派生**（键域 = (需求键, 批序号)）——
+            //   重建的 Task 属**同一执行批**，必须复用 Phase2 为该批发出的键（否则同一批被劈成两个键）。
             ContinuationKey = demand.ContinuationKey,
-            ExecutionBatchDraftKey = PhaseTwoInitialScheduler.ExecutionBatchKey(
-                demand.LogicalDemandKey, operation.RouteCode, operation.PathId)
+            ExecutionBatchDraftKey = PhaseTwoInitialScheduler.ResolveExecutionBatchKeyForRebuild(
+                demand.LogicalDemandKey, constraints)
         };
     }
 }

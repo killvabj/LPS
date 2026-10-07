@@ -6413,6 +6413,139 @@
           }
         }
       }
+    },
+    "/api/governance/task-split-rule-configs": {
+      "get": {
+        "tags": [
+          "TaskSplitRuleConfig"
+        ],
+        "summary": "列出执行批拆分规则（可按物料/生产部门/启用态过滤），供 4号位 配置页面。",
+        "parameters": [
+          {
+            "name": "materialId",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "format": "int32"
+            }
+          },
+          {
+            "name": "productionDepartmentId",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "format": "int32"
+            }
+          },
+          {
+            "name": "isActive",
+            "in": "query",
+            "schema": {
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "TaskSplitRuleConfig"
+        ],
+        "summary": "新增执行批拆分规则。",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SaveTaskSplitRuleConfigRequest"
+              }
+            },
+            "text/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SaveTaskSplitRuleConfigRequest"
+              }
+            },
+            "application/*+json": {
+              "schema": {
+                "$ref": "#/components/schemas/SaveTaskSplitRuleConfigRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Success"
+          }
+        }
+      }
+    },
+    "/api/governance/task-split-rule-configs/{id}": {
+      "put": {
+        "tags": [
+          "TaskSplitRuleConfig"
+        ],
+        "summary": "编辑执行批拆分规则（PUT 整对象替换，不改动 IsActive）。",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int32"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SaveTaskSplitRuleConfigRequest"
+              }
+            },
+            "text/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SaveTaskSplitRuleConfigRequest"
+              }
+            },
+            "application/*+json": {
+              "schema": {
+                "$ref": "#/components/schemas/SaveTaskSplitRuleConfigRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Success"
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "TaskSplitRuleConfig"
+        ],
+        "summary": "停用执行批拆分规则（软删 IsActive=0，保留历史与生效窗口）。",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int32"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          }
+        }
+      }
     }
   },
   "components": {
@@ -10501,6 +10634,72 @@
           },
           "isDefault": {
             "type": "boolean"
+          }
+        },
+        "additionalProperties": false
+      },
+      "SaveTaskSplitRuleConfigRequest": {
+        "type": "object",
+        "properties": {
+          "materialId": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "productionDepartmentId": {
+            "type": "integer",
+            "format": "int32",
+            "nullable": true
+          },
+          "minExecutionBatchQty": {
+            "type": "number",
+            "format": "double",
+            "nullable": true
+          },
+          "maxExecutionBatchQty": {
+            "type": "number",
+            "format": "double",
+            "nullable": true
+          },
+          "preferredBatchQty": {
+            "type": "number",
+            "format": "double",
+            "nullable": true
+          },
+          "allowSplit": {
+            "type": "boolean",
+            "nullable": true
+          },
+          "allowMerge": {
+            "type": "boolean",
+            "nullable": true
+          },
+          "maxOptimizationSplitCount": {
+            "type": "integer",
+            "format": "int32",
+            "nullable": true
+          },
+          "maxBatchCandidates": {
+            "type": "integer",
+            "format": "int32",
+            "nullable": true
+          },
+          "bottleneckSplitStrategy": {
+            "type": "string",
+            "nullable": true
+          },
+          "nonBottleneckStrategy": {
+            "type": "string",
+            "nullable": true
+          },
+          "effectiveFrom": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          },
+          "effectiveTo": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
           }
         },
         "additionalProperties": false
