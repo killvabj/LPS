@@ -129,9 +129,35 @@ public class CalendarDelayDiagnosticsTests
         Assert.Empty(DemandFacts(result));
     }
 
-    /// <summary>Demand 级延期原因事实（ObjectType = "DEMAND"）。</summary>
+    /// <summary>
+    /// ④ P1-04 回归（0号位 2026-10-07 审核）：**多工序**下日历覆盖不足**不得被漏判**。
+    ///
+    /// 场景：同一物料两道工序 OP10（30 分钟，依赖根）、OP20（180 分钟，OP10 的后继），
+    /// R1 日历仅 [T0, T0+60) 一个窗。
+    ///   · OP10（30min）装得进 60min 窗；OP20（180min）**任何**窗都装不下 ⇒ 需求必排不下。
+    ///   · **旧判据** `durations.Any(d =&gt; d &lt;= windowMinutes)` 因 OP10 通过 ⇒ 误判「覆盖足够」
+    ///     ⇒ Reason 落到兜底串（即「Phase 2 初始排程失败…」），**漏判** CALENDAR_COVERAGE_INSUFFICIENT。
+    ///   · **新判据**逐工序校验 ⇒ OP20 无窗可容 ⇒ `CALENDAR_COVERAGE_INSUFFICIENT`（本用例锁死该漏判）。
+    /// </summary>
+    [Fact]
+    public async Task 多工序_仅长工序装不下_仍判CALENDAR_COVERAGE_INSUFFICIENT()
+    {
+        var result = await _solver.SolveAsync(BuildMultiOp(
+            shortOpMinutes: 30,
+            longOpMinutes: 180,
+            requiredAvailableTime: PlanningStart.AddMinutes(30),
+            windows: new[] { (PlanningStart, PlanningStart.AddMinutes(60)) }));
+
+        // 排不下（OP20 无窗可容）⇒ 走 Unscheduled + §11.3 专属 Reason（旧码会漏判成兜底串）
+        Assert.Contains(result.UnscheduledTasks,
+            u => u.DraftId == "M1" && u.Reason == "CALENDAR_COVERAGE_INSUFFICIENT");
+        // §11.3：这不是「普通延期」⇒ 不得产出任何需求级延期原因事实
+        Assert.Empty(DemandFacts(result));
+    }
+
+    /// <summary>需求（订单）级延期原因事实（ObjectType = "ORDER"；2026-10-07 按 0号位 P0-02 由 "DEMAND" 整改）。</summary>
     private static IEnumerable<ScheduleExplanationFact> DemandFacts(DomainSolveResult result)
-        => result.ExplanationFacts.Where(f => f.ObjectType == "DEMAND");
+        => result.ExplanationFacts.Where(f => f.ObjectType == "ORDER");
 
     private static DomainSolveRequest Build(
         double durationMinutes,
@@ -199,6 +225,119 @@ public class CalendarDelayDiagnosticsTests
             PlanningEnd = PlanningEnd,
             LogicalProductionDemands = logicalDemands,
             RoutingOperations = routingOps,
+            OperationResourceEligibility = eligibilities,
+            MaterialStageDepartmentContexts = deptContexts,
+            Resources = resources,
+            CalendarSlots = calendarSlots,
+            StrategySnapshot = new SolverStrategySnapshot
+            {
+                Parameters = new FiniteCapacityParameters
+                {
+                    SchedulingDirection = "FORWARD",
+                    AllowMerge = false,
+                    AllowSplit = false
+                },
+                SolverStrategy = new SolverStrategyBlock
+                {
+                    BottleneckMode = DynamicBottleneckMode.Auto,
+                    AnchorResourceCode = null
+                }
+            }
+        };
+    }
+
+    /// <summary>
+    /// P1-04 多工序用：同物料两道工序 OP10(短) → OP20(长)（RoutingDependency 保证两道都必须执行），
+    /// 均落在部门 100 / STAGE1 / R1；日历窗由 <paramref name="windows"/> 给定。
+    /// </summary>
+    private static DomainSolveRequest BuildMultiOp(
+        double shortOpMinutes,
+        double longOpMinutes,
+        DateTime requiredAvailableTime,
+        (DateTime Start, DateTime End)[] windows)
+    {
+        const int deptId = 100;
+        const string stage = "STAGE1";
+        const string shortOp = "OP10";
+        const string longOp = "OP20";
+
+        var logicalDemands = new List<LogicalProductionDemand>
+        {
+            new()
+            {
+                LogicalDemandKey = "M1", PlanVersionId = 1L, DomainKey = "DOMAIN",
+                AllocationSequence = 1, DemandKey = "M1", MaterialId = 1, FactoryId = 1,
+                NetOutputQty = 1m, PlannedProcessQty = 1m,
+                RequiredAvailableTime = requiredAvailableTime, DemandSequence = 1
+            }
+        };
+
+        var routingOps = new List<RoutingOperation>
+        {
+            new()
+            {
+                MaterialId = 1, ProductionDepartmentId = deptId, RouteCode = "DEFAULT",
+                OperationCode = shortOp, StageCode = stage,
+                StandardDuration = (decimal)shortOpMinutes, SetupTime = 0m
+            },
+            new()
+            {
+                MaterialId = 1, ProductionDepartmentId = deptId, RouteCode = "DEFAULT",
+                OperationCode = longOp, StageCode = stage,
+                StandardDuration = (decimal)longOpMinutes, SetupTime = 0m
+            }
+        };
+
+        // 依赖边 OP10 → OP20（两道工序都必须执行 ⇒ 任一道排不下 ⇒ 整个需求 Unscheduled）
+        var routingDeps = new List<LPS.APS.Core.Entities.APS.RoutingDependency>
+        {
+            new()
+            {
+                MaterialId = 1, ProductionDepartmentId = deptId, RouteCode = "DEFAULT", PathId = 1,
+                FromOperationCode = shortOp, ToOperationCode = longOp, DependencyType = "ES"
+            }
+        };
+
+        var eligibilities = new List<OperationResourceEligibility>
+        {
+            new()
+            {
+                MaterialId = 1, ProductionDepartmentId = deptId, RouteCode = "DEFAULT",
+                OperationCode = shortOp, ResourceId = 1, Priority = 1, CapacityFactor = 1m
+            },
+            new()
+            {
+                MaterialId = 1, ProductionDepartmentId = deptId, RouteCode = "DEFAULT",
+                OperationCode = longOp, ResourceId = 1, Priority = 1, CapacityFactor = 1m
+            }
+        };
+
+        var deptContexts = new List<MaterialStageDepartmentContextDto>
+        {
+            new() { MaterialId = 1, StageCode = stage, ProductionDepartmentId = deptId }
+        };
+
+        var resources = new List<ResourceDefinition>
+        {
+            new() { ResourceId = 1, ResourceCode = "R1", FactoryCode = "F1", Capacity = 1m }
+        };
+
+        var calendarSlots = windows
+            .Select(w => new ResourceCalendarSlot
+            {
+                ResourceId = 1, Start = w.Start, End = w.End, IsAvailable = true
+            })
+            .ToList();
+
+        return new DomainSolveRequest
+        {
+            PlanVersionId = 1,
+            DomainKey = "DOMAIN",
+            PlanningStart = PlanningStart,
+            PlanningEnd = PlanningEnd,
+            LogicalProductionDemands = logicalDemands,
+            RoutingOperations = routingOps,
+            RoutingDependencies = routingDeps,
             OperationResourceEligibility = eligibilities,
             MaterialStageDepartmentContexts = deptContexts,
             Resources = resources,

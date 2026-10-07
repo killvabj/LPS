@@ -78,11 +78,28 @@ internal class PhaseTwoInitialScheduler
 
         // P0-07修复：先将锁定任务直接继承为FinalTask（原地保留）
         // 第8轮P0-01修复：使用LockedQuantity和Stage/Operation，不再写空字符串
+        // 2026-10-07 P0-01 二次整改（0号位 审核）：**禁止再硬编码 RouteCode="DEFAULT" / PathId=1**。
+        //   锁定任务经 (StageCode, OperationCode) 在物料唯一路径图中反查真实路径身份；
+        //   图缺失 / 节点缺失 ⇒ 回传 null（**不编造**）。正式载体（ExecutionConstraint 补
+        //   RouteCode/PathId）到位前不写伪真值 —— 本号位不造字段、不降目标。
         foreach (var lockedTask in constraints.LockedTasks.Values)
         {
             // 从对应的Demand获取数量、物料等信息
             var demand = request.LogicalProductionDemands
                 .FirstOrDefault(d => d.LogicalDemandKey == lockedTask.DraftId);
+
+            // 真实路径身份反查（V1 单路径解析 v1.6 + Q1）：(StageCode, OperationCode) → OperationNode。
+            // 与 Phase2 非锁定路径 / Phase3 / Phase4 / Phase5 同一套解析口径（TryGetSingleRoutingGraph）。
+            string? lockedRouteCode = null;
+            long? lockedPathId = null;
+            if (demand != null &&
+                constraints.TryGetSingleRoutingGraph(demand.MaterialId, out var lockedGraph) &&
+                lockedGraph.Operations.TryGetValue(
+                    OperationNodeKey.Of(lockedTask.StageCode, lockedTask.OperationCode), out var lockedNode))
+            {
+                lockedRouteCode = lockedNode.RouteCode;
+                lockedPathId = lockedNode.PathId;
+            }
 
             var inheritedTask = new FinalTaskDraft
             {
@@ -95,8 +112,9 @@ internal class PhaseTwoInitialScheduler
                 TaskType = "PRODUCTION", // P0-16修复：锁定任务仍是生产Task，不是ConstraintType
                 ResourceId = lockedTask.ResourceId,
                 ResourceCode = GetResourceCode(lockedTask.ResourceId, constraints),
-                RouteCode = "DEFAULT",
-                PathId = 1,
+                // P0-01 整改：真实路径身份（反查失败时为 null，不再 DEFAULT/1）
+                RouteCode = lockedRouteCode,
+                PathId = lockedPathId,
                 Quantity = lockedTask.LockedNetOutputQty ?? lockedTask.LockedQuantity ?? demand?.NetOutputQty ?? 0m,
                 PlannedProcessQty = lockedTask.LockedPlannedProcessQty ?? lockedTask.LockedQuantity ?? demand?.PlannedProcessQty ?? 0m,
                 UOM = demand?.UOM ?? string.Empty,

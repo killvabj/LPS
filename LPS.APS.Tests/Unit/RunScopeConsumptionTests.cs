@@ -47,7 +47,7 @@ public class RunScopeConsumptionTests
         var task = Assert.Single(result.FinalTasks);
         // 正式交期(20天)下 end(Day+10h+1h)≪交期不延期；覆盖交期(5h)下 end > due → 必须判定延期
         var delayedFacts = result.ExplanationFacts
-            .Where(f => f.ObjectType == "DEMAND" && f.FinalDraftId == task.FinalDraftId).ToList();
+            .Where(f => f.ObjectType == "ORDER" && f.FinalDraftId == task.FinalDraftId).ToList();
         Assert.Single(delayedFacts);
         Assert.Equal((double)(task.PlannedEndTime - Day.AddHours(5)).TotalHours, (double)(delayedFacts[0].ImpactHours ?? 0), 2);
     }
@@ -90,8 +90,8 @@ public class RunScopeConsumptionTests
 
         Assert.True(result.Success, result.ErrorMessage);
         var task = Assert.Single(result.FinalTasks);
-        // 正式交期(20天)下按期 → 无 DEMAND 延期事实
-        Assert.DoesNotContain(result.ExplanationFacts, f => f.ObjectType == "DEMAND");
+        // 正式交期(20天)下按期 → 无 ORDER 级延期事实
+        Assert.DoesNotContain(result.ExplanationFacts, f => f.ObjectType == "ORDER");
     }
 
     // ── ④ TaskTargetOverrides 软目标：无 ChangeSeedKeys 也进传播，求解零破坏 ──

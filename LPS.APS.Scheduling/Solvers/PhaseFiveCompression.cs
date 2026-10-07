@@ -215,9 +215,18 @@ internal class PhaseFiveCompression
     /// 作为正式计划 ⇒ 本判据**只**看真实 <see cref="ConstraintContext.ResourceCalendars"/>
     /// （Phase1 `BuildResourceCalendars` 仅装载 `IsAvailable` 窗），不引入任何合成产能。
     ///
-    /// 【判据】该 Demand **有资格资源**，但**没有任何**「资格资源 × 其真实日历窗」能容纳该物料的**任一**工序时长。
+    /// 【判据 —— 2026-10-07 按 0号位 P1-04 整改为**逐工序**】该 Demand 的**每一个**必须执行的
+    ///   `FINITE_RESOURCE` 工序，都存在「其合法资格资源 × 该资源真实日历窗」能容纳**该工序**时长。
+    ///   · **旧实现的 Bug**（0号位 2026-10-07 审核 P1-04）：原判据为「**任一**工序能塞进**任一**窗」
+    ///     即返回覆盖足够（`durations.Any(d =&gt; d &lt;= windowMinutes)`）。多工序需求下会**漏判** ——
+    ///     例：OP10=30min 塞得进 60min 窗、OP20=180min 永远塞不进，旧码因 OP10 通过而判「覆盖足够」，
+    ///     但 OP20 实无合法日历窗 ⇒ 该 Demand 仍会因日历覆盖不足排不下。三条旧单测**全是单工序**，故未暴露。
+    ///   · 工序身份用 **(ProductionDepartmentId, OperationCode)**：与 <c>EligibilityLookupKey</c> 的部门维度同口径，
+    ///     消解「同物料同工序码跨部门」的歧义（2号位 实测 117 物料）。
+    ///   · 只取 `FINITE_RESOURCE` 工序：`UNCONSTRAINED` / `WAIT_ONLY` 不占正式资源日历
+    ///     （Phase2 对二者跳过资源找槽、Task `ResourceId=NULL`），纳入会误报。
     ///   · 与 Phase2 <c>FindForwardSlot</c> 同源：该方法对「该资源无日历」与「窗长装不下」**均**返回 null ⇒ 需求 Unscheduled。
-    ///   · 保守性：任一能装下的窗即返回 false —— **不抢**缺部门 / StageSeq 冲突 / 其它根因的归属。
+    ///   · 保守性：任一工序在任一资格资源的任一窗装下即视为该工序可排；**不抢**缺部门 / StageSeq 冲突 / 其它根因的归属。
     /// </summary>
     private bool IsCalendarCoverageInsufficient(
         string demandKey,
@@ -231,48 +240,62 @@ internal class PhaseFiveCompression
             return false;
         }
 
-        // 该需求有资格的全部资源（按 MaterialId 归集；资格键已含部门/路径 ⇒ 与 Phase2 GetEligibleResources 同口径）
-        var eligibleResourceIds = constraints.OperationResourceEligibility
-            .Where(kv => kv.Key.MaterialId == demand.MaterialId)
-            .SelectMany(kv => kv.Value)
-            .Distinct()
-            .ToList();
-        if (eligibleResourceIds.Count == 0)
-        {
-            return false;   // 无资格资源 ⇒ 根因是工艺/资格，不是日历
-        }
-
-        // 该物料各工序的加工时长（含 Setup，与 Phase2 占资源窗口径一致）
-        var durations = request.RoutingOperations
+        // 该物料的**逐工序**时长（含 Setup，与 Phase2 占资源窗口径一致）。
+        // 时长源仍取 RoutingOperation（OperationNode 已按 item1 删除静态 SetupTime 字段）。
+        var operations = request.RoutingOperations
             .Where(op => op.MaterialId == demand.MaterialId)
-            .Select(op => (double)(op.StandardDuration + op.SetupTime))
+            .Where(op => string.Equals(op.OperationPlanningMode, "FINITE_RESOURCE", StringComparison.Ordinal))
+            .GroupBy(op => (op.ProductionDepartmentId, op.OperationCode))
+            .Select(g => (
+                DepartmentId: g.Key.ProductionDepartmentId,
+                OperationCode: g.Key.OperationCode,
+                DurationMinutes: g.Max(op => (double)(op.StandardDuration + op.SetupTime))))
             .ToList();
-        if (durations.Count == 0)
+        if (operations.Count == 0)
         {
-            return false;   // 无工序 ⇒ 根因不是日历
+            return false;   // 无有限资源工序 ⇒ 根因不是日历
         }
 
-        // 任一「资格资源 × 其真实日历窗」能容纳任一工序 ⇒ 覆盖足够（保守返回 false）
-        foreach (var resourceId in eligibleResourceIds)
+        // 逐工序校验：**每个**有限资源工序都必须 ∃「其资格资源 × 其真实日历窗」装得下。
+        foreach (var op in operations)
         {
-            if (!constraints.ResourceCalendars.TryGetValue(resourceId, out var windows) || windows.Count == 0)
+            // 该工序有资格的全部资源（按 MaterialId + 部门 + 工序码归集，与 EligibilityLookupKey 口径一致）
+            var eligibleResourceIds = constraints.OperationResourceEligibility
+                .Where(kv => kv.Key.MaterialId == demand.MaterialId
+                             && kv.Key.ProductionDepartmentId == op.DepartmentId
+                             && kv.Key.OperationCode == op.OperationCode)
+                .SelectMany(kv => kv.Value)
+                .Distinct()
+                .ToList();
+            if (eligibleResourceIds.Count == 0)
             {
-                continue;
+                return false;   // 无资格资源 ⇒ 根因是工艺/资格，不是日历（保守：不抢归属）
             }
 
-            foreach (var window in windows)
+            var anyWindowFits = false;
+            foreach (var resourceId in eligibleResourceIds)
             {
-                var windowMinutes = (window.End - window.Start).TotalMinutes;
-                if (durations.Any(d => d <= windowMinutes))
+                if (!constraints.ResourceCalendars.TryGetValue(resourceId, out var windows) || windows.Count == 0)
                 {
-                    return false;
+                    continue;
+                }
+
+                if (windows.Any(w => (w.End - w.Start).TotalMinutes >= op.DurationMinutes))
+                {
+                    anyWindowFits = true;
+                    break;
                 }
             }
+
+            if (!anyWindowFits)
+            {
+                // 该工序在**所有**资格资源的真实日历中均装不下 ⇒ 日历覆盖不足（按 §11.2 判）
+                return true;
+            }
         }
 
-        // 走到此处 = 每个资格资源要么无真实日历、要么窗全都装不下任一工序
-        // ⇒ 按 §11.2「没有真实日历，就不能说未来仍存在合法产能」，判为日历覆盖不足。
-        return true;
+        // 所有有限资源工序都至少有一个可容纳窗 ⇒ 覆盖足够（保守返回 false）
+        return false;
     }
 
     /// <summary>
