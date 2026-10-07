@@ -79,27 +79,59 @@ internal class PhaseTwoInitialScheduler
         // P0-07修复：先将锁定任务直接继承为FinalTask（原地保留）
         // 第8轮P0-01修复：使用LockedQuantity和Stage/Operation，不再写空字符串
         // 2026-10-07 P0-01 二次整改（0号位 审核）：**禁止再硬编码 RouteCode="DEFAULT" / PathId=1**。
-        //   锁定任务经 (StageCode, OperationCode) 在物料唯一路径图中反查真实路径身份；
-        //   图缺失 / 节点缺失 ⇒ 回传 null（**不编造**）。正式载体（ExecutionConstraint 补
-        //   RouteCode/PathId）到位前不写伪真值 —— 本号位不造字段、不降目标。
+        //   锁定任务经 (StageCode, OperationCode) 反查真实路径身份；
+        //   图缺失 / 节点缺失 ⇒ **Fail Closed**（不产 Task、不编造伪身份、不猜 Path，见下方 Q-3 注释）。
         foreach (var lockedTask in constraints.LockedTasks.Values)
         {
             // 从对应的Demand获取数量、物料等信息
             var demand = request.LogicalProductionDemands
                 .FirstOrDefault(d => d.LogicalDemandKey == lockedTask.DraftId);
 
-            // 真实路径身份反查（V1 单路径解析 v1.6 + Q1）：(StageCode, OperationCode) → OperationNode。
-            // 与 Phase2 非锁定路径 / Phase3 / Phase4 / Phase5 同一套解析口径（TryGetSingleRoutingGraph）。
+            // 真实路径身份反查（v1.6 §1：业务真值 RouteCode/PathId 必须真实，禁 DEFAULT/1）：
+            //   (StageCode, OperationCode) → OperationNode。
+            //   · 需求自带固定路径（A/B 桶，v1.6 `:26`）⇒ 用**该固定路径**的图解析（Path-aware）；
+            //   · 无固定路径 ⇒ 回落 `TryGetSingleRoutingGraph`（**仅单路径物料可用**；多路径时该方法
+            //     返回 false ⇒ 身份保持 null，**不猜**）。
+            //   ⚠ 正式载体（ExecutionConstraint 补 RouteCode/PathId）**尚未冻结**（v1.6 未列此字段）
+            //     ⇒ 本号位不造字段。多路径 + 无固定路径的锁定任务解不出身份 ⇒ **Fail Closed**
+            //     （记入 `UnscheduledDemandKeys`、不产 Task），**不回传 null 伪身份**。
             string? lockedRouteCode = null;
             long? lockedPathId = null;
-            if (demand != null &&
-                constraints.TryGetSingleRoutingGraph(demand.MaterialId, out var lockedGraph) &&
-                lockedGraph.Operations.TryGetValue(
-                    OperationNodeKey.Of(lockedTask.StageCode, lockedTask.OperationCode), out var lockedNode))
+            RoutingGraph? lockedGraph = null;
+            if (demand != null)
             {
-                lockedRouteCode = lockedNode.RouteCode;
-                lockedPathId = lockedNode.PathId;
+                if (!string.IsNullOrEmpty(demand.RouteCode) || demand.PathId is not null)
+                {
+                    constraints.TryGetRoutingGraph(demand.MaterialId, demand.RouteCode, demand.PathId, out lockedGraph);
+                }
+                else
+                {
+                    constraints.TryGetSingleRoutingGraph(demand.MaterialId, out lockedGraph);
+                }
             }
+
+            OperationNode? lockedNode = null;
+            if (lockedGraph != null)
+            {
+                lockedGraph.Operations.TryGetValue(
+                    OperationNodeKey.Of(lockedTask.StageCode, lockedTask.OperationCode), out lockedNode);
+            }
+
+            // Q-3 Fail Closed（0号位 2026-10-07 裁决 Q-3 `:186`：「Route/Path 缺失时应 Fail Closed 或
+            //   进入明确异常，**不得跨 Path 寻找替代节点**」；同件职责表 `:357`：「A/B 固定 Route/Path …
+            //   **缺值 Fail Closed**」）：
+            //   锁定任务按 A/B「固定真实 RouteCode/PathId」语义处理 —— 必须能解出**真实**路径身份才产出
+            //   FinalTask。解不出身份（图缺失 / 节点缺失 / 需求缺失）⇒ **不产伪身份 Task**，明确记为未排程
+            //   （与需求级 Fail Closed 同一口径：`UnscheduledDemandKeys` + 不产 Task），
+            //   **不得**回退 `TryGetSingleRoutingGraph` 猜唯一 Path、**不得**跨 Path 找替代节点。
+            if (lockedNode == null)
+            {
+                result.UnscheduledDemandKeys.Add(lockedTask.DraftId);
+                continue;
+            }
+
+            lockedRouteCode = lockedNode.RouteCode;
+            lockedPathId = lockedNode.PathId;
 
             var inheritedTask = new FinalTaskDraft
             {
@@ -124,7 +156,13 @@ internal class PhaseTwoInitialScheduler
                 SetupSource = null,   // SetupSource 填充：锁定继承任务无 1号位 Setup 解析来源 → null（2号位 落库留空）
                 Priority = demand?.DemandSequence ?? 0,
                 IsVirtual = false,
-                ExecutionLockId = null // TODO: 关联ExecutionConstraint.Id
+                ExecutionLockId = null, // TODO: 关联ExecutionConstraint.Id
+                // v1.6 §1：FinalTask 一律原样回传 ContinuationKey；路径身份可解出时才生成执行批键
+                //（与上方「不编造 RouteCode/PathId」同口径 —— 解不出身份就不给批键，不留伪真值）。
+                ContinuationKey = demand?.ContinuationKey,
+                ExecutionBatchDraftKey = lockedPathId is null
+                    ? null
+                    : ExecutionBatchKey(lockedTask.DraftId, lockedRouteCode, lockedPathId)
             };
             result.ScheduledTasks.Add(inheritedTask);
         }
@@ -222,39 +260,82 @@ internal class PhaseTwoInitialScheduler
                     UOM = demand.UOM,
                     PreferredResourceId = demand.PreferredResourceId,
                     FallbackResourceId = demand.FallbackResourceId,
-                    IsContinuation = demand.IsContinuation
+                    IsContinuation = demand.IsContinuation,
+                    // ── 以下 5 项随克隆一并带走（与上方 RequiredStageCode 同款理由）──
+                    // 漏拷 = 「部分锁定」需求静默丢失路径身份/连续键/拆合批约束/软偏好，
+                    // 表现为：C桶多路径退化为「无固定路径 ⇒ 候选择优」（可接受）但 A/B 固定路径
+                    // 退化为候选择优（**违反 v1.6「A/B 固定 Route/Path」**），且 ContinuationKey 断链。
+                    ContinuationKey = demand.ContinuationKey,
+                    RouteCode = demand.RouteCode,
+                    PathId = demand.PathId,
+                    NoSplitMerge = demand.NoSplitMerge,
+                    PreferredResourceCode = demand.PreferredResourceCode
                 };
             }
-            // 获取该需求的工艺路线（使用actualDemand）。
-            // V1 单路径解析（v1.6 + Q1）：物料唯一一条 (RouteCode, PathId) 图；无图 / 多路径（需求侧无选路载体）均不可排。
-            if (!constraints.TryGetSingleRoutingGraph(actualDemand.MaterialId, out var routingGraph))
+            // ── 需求级路径候选解析（Path-aware，0号位 2026-10-07 裁决 Q-3 / §四）──
+            //
+            //   ① 需求**自带固定路径**（v1.6：「A/B 输入必须带真实固定 RouteCode / PathId / StartOperation」）
+            //      ⇒ 固定该条，**不选路**；图中不存在该路径 ⇒ **Fail Closed**
+            //      （Q-3 红线：不得回退 TryGetSingleRoutingGraph 猜唯一 Path）。
+            //   ② 无固定路径（Free Slice / C桶）
+            //      ⇒ 取该物料全部候选 Path；1 条 = 既有单路径行为（零回归），N 条 = 候选内联合择优。
+            //
+            //   ⚠ 禁止用「候选条数」反推 A/B/C 身份（0号位 裁决 §四）—— 桶身份只认 IsContinuation / 固定路径。
+            if (!constraints.TryGetRoutingGraphs(actualDemand.MaterialId, out var allPaths))
             {
                 // 无工艺路线 → 无法排程
                 result.UnscheduledDemandKeys.Add(actualDemand.LogicalDemandKey);
                 continue;
             }
 
-            // 从 StartStageCode / StartOperationCode 开始的工序列表（使用actualDemand）
-            var operationsToSchedule = GetOperationsFromStage(
-                actualDemand.StartStageCode,
-                actualDemand.StartOperationCode,
-                routingGraph,
-                constraints,
-                out var startFailureReason);
-
-            if (operationsToSchedule.Count == 0)
+            List<KeyValuePair<RoutePathKey, RoutingGraph>> candidatePaths;
+            if (!string.IsNullOrEmpty(actualDemand.RouteCode) || actualDemand.PathId is not null)
             {
-                if (startFailureReason != null)
+                if (!constraints.TryGetRoutingGraph(
+                        actualDemand.MaterialId, actualDemand.RouteCode, actualDemand.PathId, out var fixedGraph))
                 {
-                    // S26：StartStage/StartOperation 非法，业务 Unscheduled（非技术失败，不静默回退）
+                    // Fail Closed：需求声明了固定路径但图缺失 ⇒ 不排（不猜、不跨 Path 找替代节点）
                     result.UnscheduledDemandKeys.Add(actualDemand.LogicalDemandKey);
                     continue;
                 }
 
-                // P0-03修复：Routing有环或非法，属于技术失败
-                result.TechnicalFailure = true;
-                result.TechnicalFailureReason = $"Routing图非法或存在环：MaterialId={demand.MaterialId}, RouteCode=DEFAULT";
-                return result;
+                candidatePaths = new List<KeyValuePair<RoutePathKey, RoutingGraph>>
+                {
+                    new(RoutePathKey.Of(actualDemand.RouteCode, actualDemand.PathId!.Value), fixedGraph)
+                };
+            }
+            else
+            {
+                candidatePaths = allPaths;
+            }
+
+            // 步骤 1：为每条候选求工序列表（纯读，不改任何上下文）。
+            var plannedCandidates = new List<(RoutePathKey Key, RoutingGraph Graph, List<OperationNode> Ops)>();
+            foreach (var (pathKey, graph) in candidatePaths)
+            {
+                var ops = GetOperationsFromStage(
+                    actualDemand.StartStageCode,
+                    actualDemand.StartOperationCode,
+                    graph,
+                    constraints,
+                    out var reason);
+
+                if (ops.Count == 0 && reason == null)
+                {
+                    // P0-03修复：Routing有环或非法，属于技术失败（与既有单路径语义一致）
+                    result.TechnicalFailure = true;
+                    result.TechnicalFailureReason = $"Routing图非法或存在环：MaterialId={actualDemand.MaterialId}, Route={pathKey}";
+                    return result;
+                }
+
+                plannedCandidates.Add((pathKey, graph, ops));
+            }
+
+            if (plannedCandidates.All(p => p.Ops.Count == 0))
+            {
+                // S26：全部候选的 StartStage/StartOperation 均非法 ⇒ 业务 Unscheduled（非技术失败，不静默回退）
+                result.UnscheduledDemandKeys.Add(actualDemand.LogicalDemandKey);
+                continue;
             }
 
             // 块3/块4（任务喂任务，方案A）：子件完成时间 → 父件动态物料下界。
@@ -277,41 +358,76 @@ internal class PhaseTwoInitialScheduler
                 dynamicMaterialFloor = continuityEnd;
             }
 
-            // 排程该需求的所有工序（使用actualDemand）
-            List<FinalTaskDraft> demandTasks;
+            // 步骤 2：候选试排（每条候选在**同一初始上下文**上跑完整排程，互不污染）。
+            //   单候选（V1 常态 / A/B 固定路径）⇒ 试排后在真实上下文重跑，结果与既有完全一致（零回归）。
+            var realTimeline = constraints.ProductTimeline;
+            var trials = new List<(RoutePathKey Key, bool Feasible, DateTime Completion, decimal SetupMinutes)>();
 
-            // 第4轮Merge修复：检测是否可以合并到已有Task
-            if (request.StrategySnapshot.Parameters.AllowMerge)
+            // 试排隔离：`constraints.TraceNotes` 是**共享可变**状态（Setup 追踪三元组在此追加），
+            // 试排会把它当真实产出写进去 ⇒ 多候选试排会留下 N 份重复 trace。
+            // 记下水位，试排结束回滚；步骤 4 在真实上下文重跑会重新写恰好一份。
+            var traceNotesWatermark = constraints.TraceNotes.Count;
+
+            foreach (var (pathKey, graph, ops) in plannedCandidates)
             {
-                demandTasks = TryMergeOrSchedule(
-                    actualDemand,
-                    operationsToSchedule,
-                    routingGraph,
-                    direction,
-                    constraints,
-                    resourceOccupancy,
-                    result.ScheduledTasks,
-                    allocationTaskShare,
-                    demandByKey,
-                    request.PlanningStart,
-                    request.PlanningEnd,
-                    dynamicMaterialFloor,
-                    stageOverlap);
+                if (ops.Count == 0)
+                {
+                    trials.Add((pathKey, false, DateTime.MinValue, 0m));
+                    continue;
+                }
+
+                constraints.ProductTimeline = realTimeline.Clone();
+                var trialOccupancy = CloneOccupancy(resourceOccupancy);
+                var trialTasks = new List<FinalTaskDraft>(result.ScheduledTasks);
+                var trialShares = CloneShares(allocationTaskShare);
+                var beforeEnds = trialTasks.ToDictionary(t => t.FinalDraftId, t => t.PlannedEndTime);
+
+                var produced = RunDemandSchedule(
+                    actualDemand, ops, graph, direction, constraints, trialOccupancy,
+                    trialTasks, trialShares, demandByKey, request.PlanningStart, request.PlanningEnd,
+                    dynamicMaterialFloor, stageOverlap, request.StrategySnapshot.Parameters.AllowMerge);
+
+                // Merge 成功时返回空 List，且替换了 scheduledTasks 中的既有 Task（完成时间变化）
+                var merged = produced.Count == 0 &&
+                             trialTasks.Any(t => beforeEnds.TryGetValue(t.FinalDraftId, out var oldEnd)
+                                                 && oldEnd != t.PlannedEndTime);
+
+                var feasible = produced.Count > 0 || merged;
+                var completion = produced.Count > 0
+                    ? produced.Max(t => t.PlannedEndTime)
+                    : DateTime.MinValue;   // Merge：并入既有 Task，不产生新完成时间
+                var setupMinutes = produced.Sum(t => t.SetupTime);
+
+                trials.Add((pathKey, feasible, completion, setupMinutes));
             }
-            else
+
+            constraints.ProductTimeline = realTimeline;   // 试排结束，还原真实上下文（试排不污染）
+
+            // 试排产生的 Setup 追踪一并回滚（见上方 watermark）；落定重跑会重新写一份。
+            if (constraints.TraceNotes.Count > traceNotesWatermark)
             {
-                demandTasks = ScheduleDemandOperations(
-                    actualDemand,
-                    operationsToSchedule,
-                    routingGraph,
-                    direction,
-                    constraints,
-                    resourceOccupancy,
-                    request.PlanningStart,
-                    request.PlanningEnd,
-                    dynamicMaterialFloor,
-                    stageOverlap);
+                constraints.TraceNotes.RemoveRange(
+                    traceNotesWatermark, constraints.TraceNotes.Count - traceNotesWatermark);
             }
+
+            // 步骤 3：候选内择优（Q-1 冻结四层目标）。
+            var winnerIndex = SelectBestRoutingCandidate(trials, actualDemand, direction, constraints);
+            if (winnerIndex < 0)
+            {
+                // 全部候选不可排 ⇒ 需求 Unscheduled（沿用既有根因链，由 Phase5 归因）
+                result.UnscheduledDemandKeys.Add(actualDemand.LogicalDemandKey);
+                continue;
+            }
+
+            // 步骤 4：在**真实上下文**上重跑选中候选落定（排程确定性 ⇒ 与试排同结果）。
+            var winner = plannedCandidates[winnerIndex];
+            constraints.ChosenRoutePaths[actualDemand.LogicalDemandKey] = winner.Key;   // RT-002：局部修复不得换路径
+
+            var demandTasks = RunDemandSchedule(
+                actualDemand, winner.Ops, winner.Graph, direction, constraints, resourceOccupancy,
+                result.ScheduledTasks, allocationTaskShare, demandByKey,
+                request.PlanningStart, request.PlanningEnd, dynamicMaterialFloor, stageOverlap,
+                request.StrategySnapshot.Parameters.AllowMerge);
 
             // 第5轮Merge修复：Merge成功时返回空List，但Demand已进入TaskShare，不应标记为Unscheduled
             if (demandTasks.Count == 0)
@@ -665,6 +781,155 @@ internal class PhaseTwoInitialScheduler
     }
 
     /// <summary>
+    /// 在**给定上下文**上排程一个需求的全部工序（Merge 开关分支）。
+    /// 抽出本方法供 C桶候选内择优的**试排**与**落定**共用同一段逻辑，保证试排与落定结果一致。
+    /// ⚠ 调用方负责传入隔离的 <paramref name="resourceOccupancy"/> / <paramref name="scheduledTasks"/> /
+    ///   <paramref name="allocationTaskShare"/>（试排传克隆，落定传真实对象）。
+    /// </summary>
+    private List<FinalTaskDraft> RunDemandSchedule(
+        LogicalProductionDemand demand,
+        List<OperationNode> operations,
+        RoutingGraph routingGraph,
+        string direction,
+        ConstraintContext constraints,
+        Dictionary<int, List<TimeWindow>> resourceOccupancy,
+        List<FinalTaskDraft> scheduledTasks,
+        Dictionary<string, List<(string DemandKey, decimal ShareQty)>> allocationTaskShare,
+        Dictionary<string, LogicalProductionDemand> demandByKey,
+        DateTime planningStart,
+        DateTime planningEnd,
+        DateTime dynamicMaterialFloor,
+        StageOverlapParams stageOverlap,
+        bool allowMerge)
+    {
+        // 第4轮Merge修复：检测是否可以合并到已有Task
+        if (allowMerge)
+        {
+            return TryMergeOrSchedule(
+                demand, operations, routingGraph, direction, constraints,
+                resourceOccupancy, scheduledTasks, allocationTaskShare, demandByKey,
+                planningStart, planningEnd, dynamicMaterialFloor, stageOverlap);
+        }
+
+        return ScheduleDemandOperations(
+            demand, operations, routingGraph, direction, constraints,
+            resourceOccupancy, planningStart, planningEnd, dynamicMaterialFloor, stageOverlap);
+    }
+
+    /// <summary>
+    /// C桶候选内择优（0号位 2026-10-07 裁决 Q-1/Q-2）——
+    /// 按冻结**四层目标**逐层比较，**不新增** Routing 专属加权目标函数（Q-1 明文禁止）。
+    ///
+    /// 冻结依据：《APS_有限产能排产与滚动90天计划业务说明 v1.7》+《APS_V1_最终全部流程与业务基线 v1.8》——
+    ///   ① 硬约束 → ② 履约优先 → ③ 客户承诺/交期目标 → ④ 次级优化（Setup / WIP / 利用率 / 稳定性）。
+    ///   「如果存在能满足客户承诺目标的方案，不能为了 Setup 或利用率选择更差履约方案」。
+    ///
+    /// 比较顺序（可解释的目标顺序，非加权）：
+    ///   1) 不可行候选淘汰（Q-1：「先过滤违反硬约束的候选」）；
+    ///   2) ② 履约：按期（延期 = 0）优于延期；都延期 ⇒ 延期更短者优先；
+    ///   3) ③ 交期：都按期时受该 Execution Batch 的 **Direction** 控制（Q-1 定死的表）——
+    ///        FORWARD    → 更早可行完成优先；
+    ///        BACKWARD   → 在不延期前提下更靠近 RequiredAvailableTime / Due（避免过早生产）；
+    ///        MIXED/AUTO → 沿用现有求解结果比较（取更早完成，稳定）；
+    ///   4) ④ 次级：Setup 总量小者优先；
+    ///   5) 确定性 tiebreak：(RouteCode, PathId) 序。
+    ///
+    /// ⚠ PreferredResource 只进次级优化、**不得反压履约**（Q-1 明文）。V1 把它放在既有 Phase2 排程内部
+    ///   消费（资源连续性软偏好），候选比较层不再额外加权 —— 否则即等于新增 Routing 专属加权目标。
+    /// </summary>
+    /// <returns>选中候选下标；全部不可行时返回 -1。</returns>
+    private static int SelectBestRoutingCandidate(
+        List<(RoutePathKey Key, bool Feasible, DateTime Completion, decimal SetupMinutes)> trials,
+        LogicalProductionDemand demand,
+        string direction,
+        ConstraintContext constraints)
+    {
+        var due = constraints.EffectiveDue(demand);
+
+        static int Compare(
+            (RoutePathKey Key, bool Feasible, DateTime Completion, decimal SetupMinutes) a,
+            (RoutePathKey Key, bool Feasible, DateTime Completion, decimal SetupMinutes) b,
+            DateTime due,
+            string direction)
+        {
+            // ① 可行优于不可行
+            if (a.Feasible != b.Feasible)
+            {
+                return a.Feasible ? -1 : 1;
+            }
+
+            // ② 履约：延期短者优先（按期 = 0）
+            var delayA = DelayMinutes(a.Completion, due);
+            var delayB = DelayMinutes(b.Completion, due);
+            if (delayA != delayB)
+            {
+                return delayA < delayB ? -1 : 1;
+            }
+
+            // ③ 交期：均按期时受 Direction 控制
+            if (delayA == 0 && a.Completion != b.Completion)
+            {
+                if (string.Equals(direction, "BACKWARD", StringComparison.Ordinal))
+                {
+                    // 倒排：不延期前提下更靠近 Due（避免过早生产）⇒ 完成更晚者优先（两者均 ≤ Due）
+                    return a.Completion > b.Completion ? -1 : 1;
+                }
+
+                // FORWARD / MIXED / AUTO：更早可行完成优先
+                return a.Completion < b.Completion ? -1 : 1;
+            }
+
+            // ④ 次级：Setup 总量小者优先
+            if (a.SetupMinutes != b.SetupMinutes)
+            {
+                return a.SetupMinutes < b.SetupMinutes ? -1 : 1;
+            }
+
+            // ⑤ 确定性 tiebreak：(RouteCode, PathId) 序
+            var rc = string.CompareOrdinal(a.Key.RouteCode, b.Key.RouteCode);
+            return rc != 0 ? rc : a.Key.PathId.CompareTo(b.Key.PathId);
+        }
+
+        var best = -1;
+        for (int i = 0; i < trials.Count; i++)
+        {
+            if (!trials[i].Feasible)
+            {
+                continue;
+            }
+
+            if (best < 0 || Compare(trials[i], trials[best], due, direction) < 0)
+            {
+                best = i;
+            }
+        }
+
+        return best;
+    }
+
+    /// <summary>延期分钟数（0 = 按期）。Merge 无新完成时间 / 无交期 ⇒ 视为按期。</summary>
+    private static long DelayMinutes(DateTime completion, DateTime due)
+    {
+        if (completion == DateTime.MinValue || due == DateTime.MaxValue)
+        {
+            return 0;
+        }
+
+        var minutes = (long)(completion - due).TotalMinutes;
+        return minutes > 0 ? minutes : 0;
+    }
+
+    /// <summary>资源占用深拷贝（候选试排隔离用）。</summary>
+    private static Dictionary<int, List<TimeWindow>> CloneOccupancy(
+        Dictionary<int, List<TimeWindow>> source)
+        => source.ToDictionary(kv => kv.Key, kv => new List<TimeWindow>(kv.Value));
+
+    /// <summary>合批份额深拷贝（候选试排隔离用）。</summary>
+    private static Dictionary<string, List<(string DemandKey, decimal ShareQty)>> CloneShares(
+        Dictionary<string, List<(string DemandKey, decimal ShareQty)>> source)
+        => source.ToDictionary(kv => kv.Key, kv => new List<(string, decimal)>(kv.Value));
+
+    /// <summary>
     /// 排程单个需求的所有工序
     /// 文档：§八 Forward/Backward/Mixed
     /// </summary>
@@ -766,7 +1031,8 @@ internal class PhaseTwoInitialScheduler
             // 查找合格资源（P1-11：软偏好资源优先，Preferred 最前、Fallback 次之）
             var eligibleResources = OrderResourcesByPreference(
                 demand,
-                GetEligibleResources(demand.MaterialId, operation, constraints));
+                GetEligibleResources(demand.MaterialId, operation, constraints),
+                constraints);
             if (eligibleResources.Count == 0)
             {
                 return new List<FinalTaskDraft>(); // 无合格资源（FINITE_RESOURCE fail-closed）
@@ -977,7 +1243,8 @@ internal class PhaseTwoInitialScheduler
             // 查找合格资源（P1-11：软偏好资源优先，Preferred 最前、Fallback 次之）
             var eligibleResources = OrderResourcesByPreference(
                 demand,
-                GetEligibleResources(demand.MaterialId, operation, constraints));
+                GetEligibleResources(demand.MaterialId, operation, constraints),
+                constraints);
             if (eligibleResources.Count == 0)
             {
                 return new List<FinalTaskDraft>(); // 无合格资源（FINITE_RESOURCE fail-closed）
@@ -1141,27 +1408,43 @@ internal class PhaseTwoInitialScheduler
     }
 
     /// <summary>
-    /// P1-11：软偏好资源优先——在合法资源集内把 PreferredResourceId 排最前、FallbackResourceId 次之，
+    /// P1-11：软偏好资源优先——在合法资源集内把偏好资源排最前、FallbackResourceId 次之，
     /// 其余保持原顺序。软偏好不改变合法性（非硬锁），偏好资源不可用时自然回落。
+    ///
+    /// v1.6 §1号位新增/替换实施要求（`:27`）：新增契约字段 `PreferredResourceCode?`（业务编码）为**软偏好**。
+    /// 消费口径（0号位 2026-10-07 裁决 §六 授权落地）：
+    ///   · Code 非空且经 <c>ResourceIdsByCode</c> 反查到 ResourceId ⇒ 以该 ResourceId 为软偏好首选；
+    ///   · Code 为空 / 反查不到 / 反查到的 ResourceId 不在合法资源集内 ⇒ **回落** `PreferredResourceId`；
+    ///   · **不得 Hard Lock**（Q-1 明文）：偏好资源不可用时不失败，按原顺序继续找槽。
     /// </summary>
     private static List<int> OrderResourcesByPreference(
         LogicalProductionDemand demand,
-        List<int> eligibleResources)
+        List<int> eligibleResources,
+        ConstraintContext constraints)
     {
-        if (demand.PreferredResourceId == null && demand.FallbackResourceId == null)
+        // Code 优先，反查不到则回落 Id（Code 为空串不算合法业务编码，与 RouteCode 同口径）
+        int? preferred = null;
+        if (!string.IsNullOrEmpty(demand.PreferredResourceCode) &&
+            constraints.ResourceIdsByCode.TryGetValue(demand.PreferredResourceCode!, out var byCode))
+        {
+            preferred = byCode;
+        }
+        preferred ??= demand.PreferredResourceId;
+
+        if (preferred == null && demand.FallbackResourceId == null)
         {
             return eligibleResources;
         }
 
         var ordered = new List<int>(eligibleResources.Count);
 
-        if (demand.PreferredResourceId is int preferred && eligibleResources.Contains(preferred))
+        if (preferred is int preferredId && eligibleResources.Contains(preferredId))
         {
-            ordered.Add(preferred);
+            ordered.Add(preferredId);
         }
 
         if (demand.FallbackResourceId is int fallback
-            && fallback != demand.PreferredResourceId
+            && fallback != preferred
             && eligibleResources.Contains(fallback))
         {
             ordered.Add(fallback);
@@ -1391,9 +1674,25 @@ internal class PhaseTwoInitialScheduler
             SetupTime = 0m,                // 非资源无换型
             SetupSource = null,            // 非资源无 Setup 来源
             Priority = demand.DemandSequence,
-            IsVirtual = false
+            IsVirtual = false,
+            // 非资源工序 Task 同样属该执行批 ⇒ 与资源 Task 共 Key（v1.6：FinalTask 一律回传）。
+            ContinuationKey = demand.ContinuationKey,
+            ExecutionBatchDraftKey = ExecutionBatchKey(demand.LogicalDemandKey, operation.RouteCode, operation.PathId)
         };
     }
+
+    /// <summary>
+    /// 生成执行批键（0号位 2026-10-07 裁决 §七：本项 1号位 **无前置生产职责**，今天即可完成）。
+    ///
+    /// 冻结要求「每个 Execution Batch 只允许一条完整 Path」⇒ 同一批内所有 Operation FinalTask 的
+    /// (RouteCode, PathId) 必须一致。故键由 (LogicalDemandKey, RouteCode, PathId) 唯一决定 ——
+    /// 该构造**结构性地**保证「同 Key ⇒ 同 Path」，无需事后校验。
+    ///
+    /// ⚠ 同一 Demand 若需拆成多个 Execution Batch，批身份须由上游在 LogicalDemandKey 上区分
+    ///   （V1 口径：一 Demand 一批）。**不使用「候选 Path 条数」反推批身份**（0号位 裁决 §四）。
+    /// </summary>
+    internal static string ExecutionBatchKey(string logicalDemandKey, string? routeCode, long? pathId)
+        => $"EB|{logicalDemandKey}|{routeCode ?? string.Empty}|{pathId?.ToString() ?? string.Empty}";
 
     private FinalTaskDraft CreateTask(
         LogicalProductionDemand demand,
@@ -1432,7 +1731,12 @@ internal class PhaseTwoInitialScheduler
             SetupTime = setupMinutes,   // item1 接线：规则值（原 operation.SetupTime 已废止，v1.2 §1.2）
             SetupSource = setupSource,  // SetupSource 填充：SetupOutcome → 大写 5 值（2号位 原样落库）
             Priority = demand.DemandSequence,
-            IsVirtual = false
+            IsVirtual = false,
+            // v1.6 §新增/替换实施要求：FinalTask 必须原样回传 ContinuationKey + 回传真实 RouteCode/PathId。
+            // ContinuationKey：1号位 **不生成、不解析**，从源 Demand 逐字拷贝（null 表示无该身份）。
+            ContinuationKey = demand.ContinuationKey,
+            // ExecutionBatchDraftKey：同一执行批（同一 Demand 的同一 Routing 选择）下多 Operation 共 Key。
+            ExecutionBatchDraftKey = ExecutionBatchKey(demand.LogicalDemandKey, operation.RouteCode, operation.PathId)
         };
     }
 
@@ -1486,7 +1790,10 @@ internal class PhaseTwoInitialScheduler
         StageOverlapParams stageOverlap)
     {
         // P0-07：连续份额不可被普通 Merge 破坏逐工单身份，直接独立排程，不尝试合并。
-        if (demand.IsContinuation)
+        // v1.6 `:26` + 0号位 2026-10-07 裁决 `:246`「`NoSplitMerge` 及固定 Route/Path 应**显式落实**」：
+        //   A/B 语义含 `NoSplitMerge=true`（不拆不合）⇒ 此处显式读该冻结字段，
+        //   不再只靠 `IsContinuation` 间接覆盖（两者当前同源，但契约字段须显式落实）。
+        if (demand.IsContinuation || demand.NoSplitMerge)
         {
             return ScheduleDemandOperations(
                 demand, operations, routingGraph, direction, constraints,
@@ -1573,7 +1880,9 @@ internal class PhaseTwoInitialScheduler
                 continue; // 无法追溯来源 demand，保守不 merge
             }
             // P0-07：连续份额任务不能被普通 Merge 吸收，自由份额也不得并入连续份额任务（保逐工单身份）。
-            if (sourceDemand.IsContinuation || demand.IsContinuation)
+            // NoSplitMerge（不拆不合）显式落实：任一侧带该标记都不得合批。
+            if (sourceDemand.IsContinuation || demand.IsContinuation
+                || sourceDemand.NoSplitMerge || demand.NoSplitMerge)
             {
                 continue;
             }
@@ -1691,7 +2000,12 @@ internal class PhaseTwoInitialScheduler
             SetupTime = targetTask.SetupTime,
             SetupSource = targetTask.SetupSource,   // SetupSource 填充：合并保留 target 来源（2号位 原样落库）
             Priority = targetTask.Priority,
-            IsVirtual = targetTask.IsVirtual
+            IsVirtual = targetTask.IsVirtual,
+            // 合批：保留 target 批身份（同 Key ⇒ 同 Path 不变量天然成立 —— RouteCode/PathId 亦取自 target）。
+            // 被吸收 Demand 的血缘不丢：见下方 allocationTaskShare 追加记录。
+            // Merge 仅适用于非连续份额（FindMergeableTasks 已排除 IsContinuation）⇒ ContinuationKey 恒 null。
+            ContinuationKey = targetTask.ContinuationKey,
+            ExecutionBatchDraftKey = targetTask.ExecutionBatchDraftKey
         };
 
         // 找到targetTask在scheduledTasks中的索引，替换为mergedTask

@@ -966,11 +966,15 @@ internal class ConstraintContext
 
     /// <summary>
     /// V1 单路径解析：取该物料**唯一**一条 (RouteCode, PathId) 的 Routing 图。
-    /// 契约 <c>LogicalProductionDemand</c> 无 RouteCode/PathId 字段 ⇒ 需求无法自述走哪条路径，
-    /// 故 V1 口径 = 「该物料在本请求内只有一条路径时直接取用」：
+    /// ⚠ **2026-10-07 起口径收窄**：`LogicalProductionDemand` 已补 `RouteCode`/`PathId` 契约字段
+    ///   （v1.6 §新增/替换实施要求 + 0号位 裁决 §六 授权落 Core），需求**已能自述走哪条路径**
+    ///   ⇒ 常规调用应改用 <see cref="TryGetRoutingGraph"/> / <see cref="TryGetDemandRoutingGraph"/>。
+    ///   本方法**仅保留两处兜底**（均要求「唯一」才命中，**任何情况下都不猜**，与 Q-3 红线不冲突）：
+    ///     · 需求**未**声明固定路径、且该物料在本请求内**只有一条**路径时直接取用；
+    ///     · 锁定任务继承时的路径身份反查（需求无固定路径时）。
     ///   · 0 条 → false（无 Routing，调用方按既有语义处理）；
-    ///   · 1 条 → 命中（V1 恒为 'DEFAULT'/1，与升维前 <c>TryGetValue("DEFAULT")</c> 行为等价）；
-    ///   · &gt;1 条 → **false 且登记**（多路径是 V2/C 桶 RoutingCandidates 场景，需求侧尚无选择载体，
+    ///   · 1 条 → 命中（与升维前 <c>TryGetValue("DEFAULT")</c> 行为等价）；
+    ///   · &gt;1 条 → **false 且登记**（多路径必须由需求固定路径或 C 桶候选择优定夺，
     ///     此处**不猜**、不取 First()，与全仓「不静默」原则一致）。
     /// </summary>
     public bool TryGetSingleRoutingGraph(int materialId, [NotNullWhen(true)] out RoutingGraph? graph)
@@ -988,6 +992,136 @@ internal class ConstraintContext
         }
 
         AmbiguousRoutingPathMaterialIds.Add(materialId);
+        return false;
+    }
+
+    /// <summary>
+    /// 【Path-aware 解析（0号位 2026-10-07 裁决 Q-3，**必须整改**）】按**给定的** (RouteCode, PathId)
+    /// 精确取图，不再假设「一物料一图」。
+    ///
+    /// 任务级调用点一律用**任务自身**的 (RouteCode, PathId) 调用本方法：已有 FinalTask 却按 MaterialId
+    /// 取「物料唯一图」是旧的单路径假设，多 Path 下会**串 Path**（拿另一条备选路径的前驱/后继边接本任务工序）。
+    ///
+    /// **Fail Closed（0号位 2026-10-07 裁决 §三 新增红线）**：routeCode / pathId 任一缺失 ⇒ 返回 false，
+    ///   **不得**退回 <see cref="TryGetSingleRoutingGraph"/> 按物料猜唯一 Path，也不得跨 Path 找替代节点。
+    ///   调用方按既有语义处理（跳过该项判定 / 该需求 Unscheduled）。
+    /// </summary>
+    public bool TryGetRoutingGraph(
+        int materialId,
+        string? routeCode,
+        long? pathId,
+        [NotNullWhen(true)] out RoutingGraph? graph)
+    {
+        graph = null;
+
+        // Fail Closed：缺路径身份不猜（空串不是合法 RouteCode）。
+        // pathId 用 long? 承载（FinalTaskDraft.PathId 为 long?），越 int 域视为非法身份 ⇒ 同样不猜。
+        if (string.IsNullOrEmpty(routeCode) || pathId is null
+            || pathId.Value < int.MinValue || pathId.Value > int.MaxValue)
+        {
+            return false;
+        }
+
+        if (!RoutingGraphs.TryGetValue(materialId, out var byPath) || byPath.Count == 0)
+        {
+            return false;
+        }
+
+        return byPath.TryGetValue(RoutePathKey.Of(routeCode, (int)pathId.Value), out graph);
+    }
+
+    /// <summary>
+    /// 取该物料在本次请求内的**全部**候选路径（(RouteCode, PathId) → 图），按 (RouteCode, PathId) 升序 ——
+    /// 顺序确定、可重放（C桶候选内择优要求确定性）。无路径 ⇒ false。
+    /// </summary>
+    public bool TryGetRoutingGraphs(
+        int materialId,
+        [NotNullWhen(true)] out List<KeyValuePair<RoutePathKey, RoutingGraph>>? candidates)
+    {
+        candidates = null;
+        if (!RoutingGraphs.TryGetValue(materialId, out var byPath) || byPath.Count == 0)
+        {
+            return false;
+        }
+
+        candidates = byPath
+            .OrderBy(kv => kv.Key.RouteCode, StringComparer.Ordinal)
+            .ThenBy(kv => kv.Key.PathId)
+            .ToList();
+        return true;
+    }
+
+    /// <summary>
+    /// 需求 → **已选中路径** 登记表（Scheduling 内部，不动 Core）。
+    ///
+    /// Phase2 需求级选路后登记；Phase4 局部修复 / Phase5 各需求级消费点复用。
+    /// 依据 RT-002「A/B 固定真实 RouteCode + PathId，**局部修复不得换路径**」——
+    /// 局部修复**不得重选路径**，只能复用 Phase2 的选中结果。
+    /// 未登记（单 Path 退化 / 需求自带固定路径）⇒ 调用方回落需求自身 RouteCode/PathId 或唯一那条。
+    /// </summary>
+    public Dictionary<string, RoutePathKey> ChosenRoutePaths { get; set; } = new(StringComparer.Ordinal);
+
+    /// <summary>
+    /// 需求级取图（Phase4 / Phase5 消费点用），解析顺序：
+    ///   ① **Phase2 已登记选中路径**（<see cref="ChosenRoutePaths"/>）—— RT-002「局部修复不得换路径」，**优先且不重选**；
+    ///   ② 需求自带固定路径（A/B，<c>LogicalProductionDemand.RouteCode/PathId</c>）；
+    ///   ③ 唯一那条（单路径退化，行为与升维前等价）；多路径且未登记 ⇒ **false，不猜**。
+    /// </summary>
+    public bool TryGetDemandRoutingGraph(
+        string logicalDemandKey,
+        int materialId,
+        string? demandRouteCode,
+        int? demandPathId,
+        [NotNullWhen(true)] out RoutingGraph? graph)
+    {
+        graph = null;
+
+        if (ChosenRoutePaths.TryGetValue(logicalDemandKey, out var chosen))
+        {
+            return RoutingGraphs.TryGetValue(materialId, out var byPath)
+                   && byPath.TryGetValue(chosen, out graph);
+        }
+
+        if (TryGetRoutingGraph(materialId, demandRouteCode, demandPathId, out graph))
+        {
+            return true;
+        }
+
+        return TryGetSingleRoutingGraph(materialId, out graph);
+    }
+
+    /// <summary>
+    /// 需求级取**路径键**（Calendar 判据 Path 隔离用，P1-04）。解析顺序与
+    /// <see cref="TryGetDemandRoutingGraph"/> 完全一致：选中路径 → 需求固定路径 → 唯一那条。
+    /// 多路径且未登记 ⇒ false（不猜）。
+    /// </summary>
+    public bool TryGetDemandRoutePath(
+        string logicalDemandKey,
+        int materialId,
+        string? demandRouteCode,
+        int? demandPathId,
+        out RoutePathKey pathKey)
+    {
+        pathKey = default;
+
+        if (ChosenRoutePaths.TryGetValue(logicalDemandKey, out var chosen))
+        {
+            pathKey = chosen;
+            return true;
+        }
+
+        if (!string.IsNullOrEmpty(demandRouteCode) && demandPathId is not null)
+        {
+            pathKey = RoutePathKey.Of(demandRouteCode, demandPathId.Value);
+            return true;
+        }
+
+        if (RoutingGraphs.TryGetValue(materialId, out var byPath) && byPath.Count == 1)
+        {
+            pathKey = byPath.Keys.First();
+            return true;
+        }
+
         return false;
     }
 

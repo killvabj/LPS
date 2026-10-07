@@ -248,8 +248,8 @@ internal class PhaseFourLocalRepair
 
                 if (demand != null)
                 {
-                    // V1 单路径解析（v1.6 + Q1）：物料唯一一条 (RouteCode, PathId) 图。
-                    if (constraints.TryGetSingleRoutingGraph(demand.MaterialId, out var graph))
+                    // Path-aware 解析（0号位 2026-10-07 裁决 Q-3）：按**任务自身** (RouteCode, PathId) 取图，不串 Path。
+                    if (constraints.TryGetRoutingGraph(task.MaterialId, task.RouteCode, task.PathId, out var graph))
                     {
                         // 0号位 2026-09-29 裁决 §5.3：节点身份 = (StageCode, OperationCode)。
                         // 同码跨 Stage 时若只按 OperationCode 匹配，会把另一 Stage 的同名工序误认为前驱/后继。
@@ -349,6 +349,9 @@ internal class PhaseFourLocalRepair
                         SetupSource = newSetupSource, // SetupSource 填充：新位置命中类型 / 保留原来源
                         Priority = task.Priority,
                         IsVirtual = task.IsVirtual,
+                        // v1.6 §1：重建 Task 必须逐字带走身份键（漏拷 = 下游静默丢执行批/连续份额身份）
+                        ExecutionBatchDraftKey = task.ExecutionBatchDraftKey,
+                        ContinuationKey = task.ContinuationKey,
                         StageExecutionBatchDraftKey = task.StageExecutionBatchDraftKey,
                         StageExecutionBatchQty = task.StageExecutionBatchQty,
                         ExistingMESPlanReleaseId = task.ExistingMESPlanReleaseId,
@@ -397,8 +400,8 @@ internal class PhaseFourLocalRepair
                     .FirstOrDefault(d => d.LogicalDemandKey == task.SourceDraftId);
                 if (taskDemand != null)
                 {
-                    // V1 单路径解析（v1.6 + Q1）：物料唯一一条 (RouteCode, PathId) 图。
-                    if (constraints.TryGetSingleRoutingGraph(taskDemand.MaterialId, out var graph))
+                    // Path-aware 解析（0号位 2026-10-07 裁决 Q-3）：按**任务自身** (RouteCode, PathId) 取图，不串 Path。
+                    if (constraints.TryGetRoutingGraph(task.MaterialId, task.RouteCode, task.PathId, out var graph))
                     {
                         // 0号位 2026-09-29 裁决 §5.3：节点身份 = (StageCode, OperationCode)
                         var taskNodeKey = OperationNodeKey.Of(task.StageCode, task.OperationCode);
@@ -514,8 +517,12 @@ internal class PhaseFourLocalRepair
                     foreach (var consumer in materialConsumers)
                     {
                         // 检查是否存在工艺依赖关系
-                        // V1 单路径解析（v1.6 + Q1）：物料唯一一条 (RouteCode, PathId) 图。
-                        if (constraints.TryGetSingleRoutingGraph(currentTaskForMaterial.MaterialId, out var materialGraph))
+                        // Path-aware 解析（0号位 2026-10-07 裁决 Q-3）：按**任务自身** (RouteCode, PathId) 取图，不串 Path。
+                        if (constraints.TryGetRoutingGraph(
+                                currentTaskForMaterial.MaterialId,
+                                currentTaskForMaterial.RouteCode,
+                                currentTaskForMaterial.PathId,
+                                out var materialGraph))
                         {
                             // 检查consumer是否依赖当前Task的工序
                             // 0号位 2026-09-29 裁决 §5.3：节点身份 = (StageCode, OperationCode)
@@ -880,8 +887,9 @@ internal class PhaseFourLocalRepair
         DomainSolveRequest request,
         DateTime dynamicMaterialFloor)
     {
-        // 获取工艺路线（V1 单路径解析，v1.6 + Q1：物料唯一一条 (RouteCode, PathId) 图）
-        if (!constraints.TryGetSingleRoutingGraph(demand.MaterialId, out var routingGraph))
+        // 需求级取图（RT-002「局部修复不得换路径」）：复用 Phase2 选中路径 → 需求固定路径 → 唯一那条。
+        if (!constraints.TryGetDemandRoutingGraph(
+                demand.LogicalDemandKey, demand.MaterialId, demand.RouteCode, demand.PathId, out var routingGraph))
         {
             return new List<FinalTaskDraft>();
         }
@@ -992,7 +1000,10 @@ internal class PhaseFourLocalRepair
             {
                 // 第4轮Split修复：当前工序无法在任何资源找到完整时间槽时，尝试有限Split
                 // P0-07：连续份额不可被普通 Split 破坏逐工单身份，禁止拆分。
-                if (request.StrategySnapshot.Parameters.AllowSplit && !demand.IsContinuation && demand.PlannedProcessQty > 1.0m)
+                // NoSplitMerge（不拆不合）显式落实（0号位 2026-10-07 裁决 `:246`／职责表 `:357`）：
+                //   与 Phase2 合批守卫同一口径，显式读该冻结字段，不再只靠 IsContinuation 间接覆盖。
+                if (request.StrategySnapshot.Parameters.AllowSplit && !demand.IsContinuation
+                    && !demand.NoSplitMerge && demand.PlannedProcessQty > 1.0m)
                 {
                     var splitTasks = TrySplitOperation(
                         demand,
@@ -1322,7 +1333,12 @@ internal class PhaseFourLocalRepair
             SetupTime = setupMinutes,   // item1 接线：规则值（RoutingOperation.SetupTime 已废止，v1.2 §1.2）
             SetupSource = setupSource,  // SetupSource 填充：SetupOutcome → 大写 5 值（2号位 原样落库）
             Priority = demand.DemandSequence,
-            IsVirtual = false
+            IsVirtual = false,
+            // v1.6 §1：FinalTask 必须原样回传 ContinuationKey + 归批键（局部修复/拆分新建的 Task 同样要带）。
+            // Split 子任务与源 Task 同 Route/Path ⇒ 与 Phase2 生成的键同构、同批。
+            ContinuationKey = demand.ContinuationKey,
+            ExecutionBatchDraftKey = PhaseTwoInitialScheduler.ExecutionBatchKey(
+                demand.LogicalDemandKey, operation.RouteCode, operation.PathId)
         };
     }
 
@@ -1540,7 +1556,12 @@ internal class PhaseFourLocalRepair
             SetupTime = setupMinutes,   // item1 接线：规则值（RoutingOperation.SetupTime 已废止，v1.2 §1.2）
             SetupSource = setupSource,  // SetupSource 填充：SetupOutcome → 大写 5 值（2号位 原样落库）
             Priority = demand.DemandSequence,
-            IsVirtual = false
+            IsVirtual = false,
+            // v1.6 §1：FinalTask 必须原样回传 ContinuationKey + 归批键（局部修复/拆分新建的 Task 同样要带）。
+            // Split 子任务与源 Task 同 Route/Path ⇒ 与 Phase2 生成的键同构、同批。
+            ContinuationKey = demand.ContinuationKey,
+            ExecutionBatchDraftKey = PhaseTwoInitialScheduler.ExecutionBatchKey(
+                demand.LogicalDemandKey, operation.RouteCode, operation.PathId)
         };
     }
 }

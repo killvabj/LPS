@@ -240,10 +240,21 @@ internal class PhaseFiveCompression
             return false;
         }
 
-        // 该物料的**逐工序**时长（含 Setup，与 Phase2 占资源窗口径一致）。
+        // P1-04（0号位 2026-10-07 裁决 §3.4）**Path 隔离**：判据必须**只对该需求已选中的 Path** 判 ——
+        //   未选中 Path 的工序混入会过度误报（另一条备选路径的长工序与本需求无关）。
+        //   选中路径 = Phase2 登记 → 需求固定路径 → 唯一那条；多路径且未登记 ⇒ 不抢日历归属。
+        if (!constraints.TryGetDemandRoutePath(
+                demandKey, demand.MaterialId, demand.RouteCode, demand.PathId, out var chosenPath))
+        {
+            return false;
+        }
+
+        // 该物料的**逐工序**时长（含 Setup，与 Phase2 占资源窗口径一致），**限定选中 Path**。
         // 时长源仍取 RoutingOperation（OperationNode 已按 item1 删除静态 SetupTime 字段）。
         var operations = request.RoutingOperations
-            .Where(op => op.MaterialId == demand.MaterialId)
+            .Where(op => op.MaterialId == demand.MaterialId
+                         && string.Equals(op.RouteCode, chosenPath.RouteCode, StringComparison.Ordinal)
+                         && op.PathId == chosenPath.PathId)
             .Where(op => string.Equals(op.OperationPlanningMode, "FINITE_RESOURCE", StringComparison.Ordinal))
             .GroupBy(op => (op.ProductionDepartmentId, op.OperationCode))
             .Select(g => (
@@ -259,10 +270,13 @@ internal class PhaseFiveCompression
         // 逐工序校验：**每个**有限资源工序都必须 ∃「其资格资源 × 其真实日历窗」装得下。
         foreach (var op in operations)
         {
-            // 该工序有资格的全部资源（按 MaterialId + 部门 + 工序码归集，与 EligibilityLookupKey 口径一致）
+            // 该工序有资格的全部资源（按 MaterialId + 部门 + RouteCode + PathId + 工序码归集，
+            // 与 EligibilityLookupKey 口径一致 —— P1-04 Path 隔离：不得跨 Path 混用资格）
             var eligibleResourceIds = constraints.OperationResourceEligibility
                 .Where(kv => kv.Key.MaterialId == demand.MaterialId
                              && kv.Key.ProductionDepartmentId == op.DepartmentId
+                             && string.Equals(kv.Key.RouteCode, chosenPath.RouteCode, StringComparison.Ordinal)
+                             && kv.Key.PathId == chosenPath.PathId
                              && kv.Key.OperationCode == op.OperationCode)
                 .SelectMany(kv => kv.Value)
                 .Distinct()
@@ -365,7 +379,7 @@ internal class PhaseFiveCompression
 
             // 2) Routing 前序（同 Demand，含 Lag；Split 多前序 Task 取最大完成）
             // 0号位 2026-09-29 裁决 §5.3：节点身份 = (StageCode, OperationCode)
-            if (constraints.TryGetSingleRoutingGraph(demand.MaterialId, out var graph) &&
+            if (constraints.TryGetRoutingGraph(task.MaterialId, task.RouteCode, task.PathId, out var graph) &&
                 graph.Dependencies.TryGetValue(
                     OperationNodeKey.Of(task.StageCode, task.OperationCode), out var preds) &&
                 index.BySource.TryGetValue(task.SourceDraftId, out var sameTasks))
@@ -500,6 +514,9 @@ internal class PhaseFiveCompression
             SetupSource = task.SetupSource,   // SetupSource 填充：压实仅移时间不重算 Setup → 透传原来源（2号位 原样落库）
             Priority = task.Priority,
             IsVirtual = task.IsVirtual,
+            // v1.6 §1：重建 Task 必须逐字带走身份键（漏拷 = 下游静默丢执行批/连续份额身份）
+            ExecutionBatchDraftKey = task.ExecutionBatchDraftKey,
+            ContinuationKey = task.ContinuationKey,
             StageExecutionBatchDraftKey = task.StageExecutionBatchDraftKey,
             StageExecutionBatchQty = task.StageExecutionBatchQty,
             ExistingMESPlanReleaseId = task.ExistingMESPlanReleaseId,
@@ -699,7 +716,7 @@ internal class PhaseFiveCompression
             // 0号位 2026-09-29 裁决 §5.3：节点身份 = (StageCode, OperationCode)
             var taskNodeKey = OperationNodeKey.Of(task.StageCode, task.OperationCode);
             RoutingGraph? graph = null;
-            constraints.TryGetSingleRoutingGraph(demand.MaterialId, out graph);
+            constraints.TryGetRoutingGraph(task.MaterialId, task.RouteCode, task.PathId, out graph);
             if (graph != null && graph.Dependencies.TryGetValue(taskNodeKey, out var preds) &&
                 index.BySource.TryGetValue(task.SourceDraftId, out var sameTasks))
             {
@@ -958,7 +975,8 @@ internal class PhaseFiveCompression
 
             // 段内 Routing 前序链：前序在段内必须位于序列更早处（否则违反工艺顺序 → 不可行）
             // 0号位 2026-09-29 裁决 §5.3：节点身份 = (StageCode, OperationCode)
-            if (constraints.TryGetSingleRoutingGraph(info.Task.MaterialId, out var graph) &&
+            if (constraints.TryGetRoutingGraph(
+                    info.Task.MaterialId, info.Task.RouteCode, info.Task.PathId, out var graph) &&
                 graph.Dependencies.TryGetValue(
                     OperationNodeKey.Of(info.Task.StageCode, info.Task.OperationCode), out var preds))
             {
@@ -1052,6 +1070,9 @@ internal class PhaseFiveCompression
             SetupSource = setupSource,   // SetupSource 填充：序列优化重算命中类型 → 大写 5 值（2号位 原样落库）
             Priority = task.Priority,
             IsVirtual = task.IsVirtual,
+            // v1.6 §1：重建 Task 必须逐字带走身份键（漏拷 = 下游静默丢执行批/连续份额身份）
+            ExecutionBatchDraftKey = task.ExecutionBatchDraftKey,
+            ContinuationKey = task.ContinuationKey,
             StageExecutionBatchDraftKey = task.StageExecutionBatchDraftKey,
             StageExecutionBatchQty = task.StageExecutionBatchQty,
             ExistingMESPlanReleaseId = task.ExistingMESPlanReleaseId,
@@ -1168,8 +1189,9 @@ internal class PhaseFiveCompression
             if (!demandByKey.TryGetValue(demandGroup.Key, out var demand))
                 continue;
 
-            // 获取工艺路线依赖关系（V1 单路径解析，v1.6 + Q1）
-            if (!constraints.TryGetSingleRoutingGraph(demand.MaterialId, out var routingGraph))
+            // 需求级取图（RT-002：复用 Phase2 选中路径，不重选、不串 Path）
+            if (!constraints.TryGetDemandRoutingGraph(
+                    demandGroup.Key, demand.MaterialId, demand.RouteCode, demand.PathId, out var routingGraph))
                 continue;
 
             // 标记所有有downstream的Task（非末端）。
@@ -1319,8 +1341,9 @@ internal class PhaseFiveCompression
                 .FirstOrDefault(d => d.LogicalDemandKey == demandGroup.Key);
             if (demand == null) continue;
 
-            // 获取工艺路线（V1 单路径解析，v1.6 + Q1）
-            if (!constraints.TryGetSingleRoutingGraph(demand.MaterialId, out var routingGraph))
+            // 需求级取图（RT-002：复用 Phase2 选中路径，不重选、不串 Path）
+            if (!constraints.TryGetDemandRoutingGraph(
+                    demandGroup.Key, demand.MaterialId, demand.RouteCode, demand.PathId, out var routingGraph))
                 continue;
 
             // 遍历工艺路线中的依赖关系

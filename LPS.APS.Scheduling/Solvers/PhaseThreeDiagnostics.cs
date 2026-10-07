@@ -422,10 +422,10 @@ internal class PhaseThreeDiagnostics
     {
         key = default;
 
-        // V1 单路径解析（v1.6 + Q1）：物料唯一一条 (RouteCode, PathId) 图。
-        // 旧实现按 task.RouteCode 查内层字典（且带 `?? "DEFAULT"` 兜底），升维后统一走单路径解析，
-        // 顺带消除「task.RouteCode 为 null 时 TryGetValue(null) 抛异常」的隐患。
-        if (!constraints.TryGetSingleRoutingGraph(task.MaterialId, out var graph))
+        // Path-aware 解析（0号位 2026-10-07 裁决 Q-3，必须整改）：按**任务自身** (RouteCode, PathId) 取图。
+        // 旧实现按 task.MaterialId 取「物料唯一图」——隐含「一物料一图」，多 Path 下会**串 Path**
+        // （拿另一条备选路径的节点接本任务工序）。缺 RouteCode/PathId ⇒ **Fail Closed**（不猜唯一 Path）。
+        if (!constraints.TryGetRoutingGraph(task.MaterialId, task.RouteCode, task.PathId, out var graph))
         {
             return false;
         }
