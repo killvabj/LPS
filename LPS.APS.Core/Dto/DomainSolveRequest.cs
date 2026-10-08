@@ -185,6 +185,14 @@ public sealed class SolverStrategySnapshot
     /// （EXACT/DEFAULT 命中，无规则 0 分钟，禁止 RoutingOperation.SetupTime 兜底）。</summary>
     public IReadOnlyList<SetupTransitionRuleSnapshot> SetupTransitionRules { get; init; }
         = Array.Empty<SetupTransitionRuleSnapshot>();
+
+    /// <summary>⑧ 批量策略（Batch Policy）规则（0号位 2026-10-07《未命名的Markdown文件 (7).md》§四/§十/§十一）。
+    /// 粒度 = <c>Material + ProductionDepartment</c>（冻结 B-001；<c>ProductionDepartmentId</c> 可空 = Material 级默认）。
+    /// 2号位 按本 Run 从 `TaskSplitRuleConfig` 装载并投影；1号位 `PhaseOneConstraintBuilder` 收进
+    /// <c>ConstraintContext.ExecutionBatchPolicies</c>，由 <c>PhaseTwoInitialScheduler</c> 做 C 桶 Batch Decision。
+    /// 空 ⇒ 每需求恒 1 批（不拆）；**1号位 不得自造全局默认策略**（§十一 第 3 条）。</summary>
+    public IReadOnlyList<BatchPolicyRuleSnapshot> BatchPolicies { get; init; }
+        = Array.Empty<BatchPolicyRuleSnapshot>();
 }
 
 /// <summary>

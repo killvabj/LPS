@@ -93,6 +93,11 @@ internal class PhaseOneConstraintBuilder
         // ═══════════════════════════════════════════════
         BuildRunScope(request, context);
 
+        // ═══════════════════════════════════════════════
+        // 9. 装载 ⑧块 Batch Policy（P0-01：Material + ProductionDepartment 键控）
+        // ═══════════════════════════════════════════════
+        BuildExecutionBatchPolicies(request, context);
+
         return context;
     }
 
@@ -929,6 +934,30 @@ internal class PhaseOneConstraintBuilder
     }
 
     /// <summary>
+    /// P0-01 接线：装载第⑧块冻结 Batch Policy 规则 → <see cref="ConstraintContext.ExecutionBatchPolicies"/>。
+    ///
+    /// 数据链路：`TaskSplitRuleConfig`（3号位 治理）→ 本 Run 一次性 `FrozenStrategySnapshot.BatchPolicies`
+    ///   → 2号位 投影进 `SolverStrategySnapshot.BatchPolicies`（1↔2 契约，0号位 (7).md §十）
+    ///   → 此处**整块逐字收进** `ConstraintContext`（**不在装载层裁剪、不按 Domain 塌成单值**）
+    ///   → `PhaseTwoInitialScheduler.ResolveExecutionBatchPolicy` 按 `(MaterialId, Dept)` **逐需求**解析。
+    ///
+    /// **不得**在装载层做「同键合并 / 取第一条」等裁剪：键域语义（精确命中 + Material 级默认回落）
+    ///   由解析侧 `ResolveExecutionBatchPolicy` 统一负责，装载层只做**保真搬运**。
+    /// 空（`StrategySnapshot` 为 null 或 ⑧块为空）⇒ 策略集为空 ⇒ 每需求恒 1 批，行为与旧版**逐字一致**。
+    /// </summary>
+    private static void BuildExecutionBatchPolicies(DomainSolveRequest request, ConstraintContext context)
+    {
+        var policies = request.StrategySnapshot?.BatchPolicies;
+        if (policies is null || policies.Count == 0)
+        {
+            context.ExecutionBatchPolicies = new List<LPS.APS.Core.Dto.BatchPolicyRuleSnapshot>();
+            return;
+        }
+
+        context.ExecutionBatchPolicies = new List<LPS.APS.Core.Dto.BatchPolicyRuleSnapshot>(policies);
+    }
+
+    /// <summary>
     /// M5 第一批：装载 RunScope 投影（Run 级交期覆盖 + Task 软目标）成内存词典。
     /// 键体系已由 2号位 转为内存键（DueDateOverrides=LogicalDemandKey；TaskTargetOverrides=(DraftId, OperationCode)）。
     /// null/空 RunScope = FULL 语义 → 两词典均空，现有行为零改变（向后兼容）。
@@ -1062,29 +1091,58 @@ internal class ConstraintContext
     public Dictionary<string, RoutePathKey> ChosenRoutePaths { get; set; } = new(StringComparer.Ordinal);
 
     /// <summary>
+    /// **批键 → 本批选中路径键**（P0-03 升维，0号位 (7).md §六/§七）。
+    ///
+    /// 为什么必须升维：`ChosenRoutePaths` 是「**需求** → 单一路径键」的单值表，**无法承载**多批各自选路
+    ///   （`D1 → Batch-001 走 RouteA`、`Batch-002 走 RouteB` 完全合法，RT-003/RT-004）。
+    ///   本表按**执行批**登记，Phase4 局部修复据此**逐批**取图 —— 不串批、不重选路径（RT-002）。
+    ///
+    /// 登记时机：Phase2 步骤 4 落定后**每批**登记（单批亦登记，与 `ChosenRoutePaths` 同值 ⇒ 行为零回归）。
+    /// 未登记（该批未及落定）⇒ 调用方回落需求固定路径 → 唯一那条（同 <see cref="TryGetDemandRoutingGraph"/>）。
+    /// </summary>
+    public Dictionary<string, RoutePathKey> ChosenBatchRoutePaths { get; set; } = new(StringComparer.Ordinal);
+
+    /// <summary>
+    /// **需求 → 本 Run 该需求的执行批清单（批键 + 本批数量）**（P0-03）。
+    ///
+    /// Phase4 局部修复的基本单位 = **执行批**（不是 `LogicalProductionDemand`）：据此**逐批**重建，
+    ///   **不得**用整份需求数量重建，**不得**把 Batch-002 的修复结果写回 Batch-001 的键。
+    /// Phase2 `FormExecutionBatches` 产出后**在需求循环开头即登记**（先于试排/择优/落定）。
+    /// 空（未登记）⇒ 该需求按**单批**回落（键 = `EB|{需求键}|001`，数量 = 需求数量）—— 与升维前逐字一致。
+    /// </summary>
+    public Dictionary<string, List<ExecutionBatchPlanEntry>> ExecutionBatchPlans { get; set; }
+        = new(StringComparer.Ordinal);
+
+    /// <summary>
     /// 需求 → **本 Run 该需求的全部执行批归批键**（Scheduling 内部，不动 Core）。
     ///
     /// Phase2 `FormExecutionBatches` 产出后**在需求循环开头即登记**（先于试排/择优/落定），
-    /// Phase4 重建 Task（`TryResourceSwitch` / `TrySplitOperation`）经
-    /// `PhaseTwoInitialScheduler.ResolveExecutionBatchKeyForRebuild` 复用同一批键 ——
-    /// 保证「局部修复不得把同一执行批劈成两个键」。
-    ///
-    /// ⚠ 生产现状：`DomainSolveRequest.StrategySnapshot` 无 ⑧块 Batch Policy 载体 ⇒ `ExecutionBatchPolicy` 恒 null
-    /// ⇒ 每需求恒 **1 批**（`EB|{demand}|001`）。多批路径已落码并单测，但**其生产入口缺失**
-    /// （见 `PhaseTwoInitialScheduler.ExecutionBatchPolicy` 与 待办 EBD-02）。
+    /// Phase4 **逐批**修复（`PhaseFourLocalRepair.ExpandRepairUnits` 读本表 + <see cref="ExecutionBatchPlans"/>）
+    /// 按**本批键**重建 —— 保证「局部修复不得把同一执行批劈成两个键」，
+    /// 且不得把 Batch-002 写回 Batch-001 的键（P0-03；原 `ResolveExecutionBatchKeyForRebuild` 已删除）。
     /// </summary>
     public Dictionary<string, List<string>> ExecutionBatchDraftKeys { get; set; } = new(StringComparer.Ordinal);
 
     /// <summary>
-    /// ⑧块 Batch Policy 的 **1号位 侧执行批策略输入**（P0-01，0号位 2026-10-07 (5).md）。
+    /// ⑧块 Batch Policy —— **按 `(MaterialId, ProductionDepartmentId?)` 键控的策略集**
+    /// （P0-01 整改，0号位 2026-10-07《未命名的Markdown文件 (7).md》§四）。
     ///
-    /// ⚠ **生产路径恒 null**：`DomainSolveRequest.StrategySnapshot`（`SolverStrategySnapshot`）**没有** BatchPolicy 成员，
-    ///   而 ⑧块内容（`FrozenStrategySnapshot.BatchPolicy` / `BatchPolicyRuleSnapshot`）只到 2↔3 层。
-    ///   把它接到 1号位 需**扩 1↔2 Core Contract**（加字段）+ 动 2号位 投影 —— 两者均被本轮裁决明文禁止
-    ///   （「这一轮不要再扩 Core Contract，也不要碰2号位生产者」）。⇒ 见 待办 **EBD-02**。
-    ///   null ⇒ `FormExecutionBatches` 每需求恒 1 批（不拆），行为与旧版逐字一致。
+    /// **为什么必须是集合而不是单值**：正式业务粒度 = **Material + ProductionDepartment**（B-001；
+    ///   `TaskSplitRuleConfig` / `BatchPolicyRuleSnapshot` 同口径）。一个 Domain 内
+    ///   `Material A + Dept X`、`Material A + Dept Y`、`Material B + Dept X` 各有不同策略是**正常的**；
+    ///   用单值代表整个 Domain 会让不同物料/部门**错误共用批量硬约束**，直接改变排程业务结果。
+    ///
+    /// **解析**：<see cref="PhaseTwoInitialScheduler.ResolveExecutionBatchPolicy"/> 按需求
+    ///   `(MaterialId, StartStageCode → ProductionDepartmentId)` 精确命中；未命中回落
+    ///   `(MaterialId, ProductionDepartmentId == null)` 的 **Material 级默认**（该默认语义由 ⑧块 DTO 自身承载）；
+    ///   仍无命中 ⇒ **缺策略**（不拆，恒 1 批；不认领 `BATCH_POLICY_MISSING` —— 与 0号位 20260928 §十五 四级兜底链冲突，属待裁项）。
+    ///
+    /// **载体**：`SolverStrategySnapshot.BatchPolicies`（⑧块，1↔2 契约，0号位 (7).md §十/§十一）⇒
+    ///   `PhaseOneConstraintBuilder.BuildExecutionBatchPolicies` **整块逐字**收进本集合（**不在装载层裁剪**，
+    ///   键域解析统一由 `ResolveExecutionBatchPolicy` 负责）。
+    ///   空集合 ⇒ `FormExecutionBatches` 每需求恒 1 批（不拆），行为与旧版逐字一致。
     /// </summary>
-    public PhaseTwoInitialScheduler.ExecutionBatchPolicyInput? ExecutionBatchPolicy { get; set; }
+    public List<LPS.APS.Core.Dto.BatchPolicyRuleSnapshot> ExecutionBatchPolicies { get; set; } = new();
 
     /// <summary>
     /// 需求级取图（Phase4 / Phase5 消费点用），解析顺序：
@@ -1102,6 +1160,37 @@ internal class ConstraintContext
         graph = null;
 
         if (ChosenRoutePaths.TryGetValue(logicalDemandKey, out var chosen))
+        {
+            return RoutingGraphs.TryGetValue(materialId, out var byPath)
+                   && byPath.TryGetValue(chosen, out graph);
+        }
+
+        if (TryGetRoutingGraph(materialId, demandRouteCode, demandPathId, out graph))
+        {
+            return true;
+        }
+
+        return TryGetSingleRoutingGraph(materialId, out graph);
+    }
+
+    /// <summary>
+    /// **批级取图**（P0-03，Phase4 局部修复用）。解析顺序：
+    ///   ① **本批已登记选中路径**（<see cref="ChosenBatchRoutePaths"/>）—— RT-002「局部修复不得换路径」，优先且不重选；
+    ///   ② 需求自带固定路径（A/B，`RouteCode/PathId`）；
+    ///   ③ 唯一那条；多路径且未登记 ⇒ **false，不猜**（Fail Closed）。
+    ///
+    /// 与 <see cref="TryGetDemandRoutingGraph"/> 的唯一差别是①的键：本方法按**批键**，后者按**需求键**。
+    /// </summary>
+    public bool TryGetBatchRoutingGraph(
+        string batchKey,
+        int materialId,
+        string? demandRouteCode,
+        int? demandPathId,
+        [NotNullWhen(true)] out RoutingGraph? graph)
+    {
+        graph = null;
+
+        if (ChosenBatchRoutePaths.TryGetValue(batchKey, out var chosen))
         {
             return RoutingGraphs.TryGetValue(materialId, out var byPath)
                    && byPath.TryGetValue(chosen, out graph);
@@ -1341,6 +1430,15 @@ internal readonly record struct OperationNodeKey(string StageCode, string Operat
 /// V1 装载层目前把所有工序归一化为 'DEFAULT'/1（2号位 <c>NormalizeToSingleRoute</c>），
 /// 故本键在 V1 恒为唯一一组，行为与升维前等价；Q1 要求装载层停用该归一化后，本键即真实生效。
 /// </summary>
+/// <summary>
+/// 执行批的**求解态身份**（P0-03）：Phase2 `FormExecutionBatches` 形成后登记，
+/// 供 Phase4 局部修复**逐批**重建（键 + 本批数量）。Scheduling 内部类型，非 1↔2 契约面。
+/// </summary>
+internal readonly record struct ExecutionBatchPlanEntry(
+    string BatchKey,
+    decimal NetOutputQty,
+    decimal PlannedProcessQty);
+
 internal readonly record struct RoutePathKey(string RouteCode, int PathId)
 {
     /// <summary>空安全构造：null RouteCode 归一化为 string.Empty（与 2号位「RouteCode 恒非空」口径一致）。</summary>

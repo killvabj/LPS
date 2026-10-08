@@ -1,3 +1,4 @@
+using System.Diagnostics.CodeAnalysis;
 using LPS.APS.Core.Dto;
 using LPS.APS.Shared.Models;
 
@@ -1189,27 +1190,31 @@ internal class PhaseFiveCompression
             if (!demandByKey.TryGetValue(demandGroup.Key, out var demand))
                 continue;
 
-            // 需求级取图（RT-002：复用 Phase2 选中路径，不重选、不串 Path）
-            if (!constraints.TryGetDemandRoutingGraph(
-                    demandGroup.Key, demand.MaterialId, demand.RouteCode, demand.PathId, out var routingGraph))
-                continue;
-
-            // 标记所有有downstream的Task（非末端）。
-            // 0号位 2026-09-29 裁决 §5.3：节点身份 = (StageCode, OperationCode)。
-            // 同一物料的不同 Stage 可能出现**相同 OperationCode**（2号位 实测 117 物料）。
-            // 边端点升维后 dep.From.StageCode 直接可用 ⇒ **取消**原先「Stage 不可得则退回单键匹配」
-            // 的兜底：那个兜底正是单键任取（会把别的 Stage 的同名 Task 误标为非末端 ⇒ AllocationTaskShare 归错 Task）。
-            foreach (var depList in routingGraph.Dependencies.Values)
+            // P0-04（反证 ⑧）：末端判定同源**逐批** —— 多批时按批键分区 + 按**批键**取图，
+            //   否则需求级图（多批时 `ChosenRoutePaths` 未登记，会回落需求声明路径）可能与本批实际路径不符
+            //   ⇒ 末端集合算错 ⇒ AllocationTaskShare 归错 Task。
+            foreach (var batchTasks in PartitionByExecutionBatch(demandGroup))
             {
-                foreach (var dep in depList)
-                {
-                    var upstreamTask = demandGroup.FirstOrDefault(t =>
-                        t.OperationCode == dep.From.OperationCode &&
-                        string.Equals(t.StageCode, dep.From.StageCode, StringComparison.Ordinal));
+                if (!TryGetGraphForBatch(constraints, FirstBatchKey(batchTasks), demand, out var routingGraph))
+                    continue;
 
-                    if (upstreamTask != null)
+                // 标记所有有downstream的Task（非末端）。
+                // 0号位 2026-09-29 裁决 §5.3：节点身份 = (StageCode, OperationCode)。
+                // 同一物料的不同 Stage 可能出现**相同 OperationCode**（2号位 实测 117 物料）。
+                // 边端点升维后 dep.From.StageCode 直接可用 ⇒ **取消**原先「Stage 不可得则退回单键匹配」
+                // 的兜底：那个兜底正是单键任取（会把别的 Stage 的同名 Task 误标为非末端 ⇒ AllocationTaskShare 归错 Task）。
+                foreach (var depList in routingGraph.Dependencies.Values)
+                {
+                    foreach (var dep in depList)
                     {
-                        downstreamTasks.Add(upstreamTask.FinalDraftId);
+                        var upstreamTask = batchTasks.FirstOrDefault(t =>
+                            t.OperationCode == dep.From.OperationCode &&
+                            string.Equals(t.StageCode, dep.From.StageCode, StringComparison.Ordinal));
+
+                        if (upstreamTask != null)
+                        {
+                            downstreamTasks.Add(upstreamTask.FinalDraftId);
+                        }
                     }
                 }
             }
@@ -1341,74 +1346,81 @@ internal class PhaseFiveCompression
                 .FirstOrDefault(d => d.LogicalDemandKey == demandGroup.Key);
             if (demand == null) continue;
 
-            // 需求级取图（RT-002：复用 Phase2 选中路径，不重选、不串 Path）
-            if (!constraints.TryGetDemandRoutingGraph(
-                    demandGroup.Key, demand.MaterialId, demand.RouteCode, demand.PathId, out var routingGraph))
-                continue;
-
-            // 遍历工艺路线中的依赖关系
-            // 第5轮修复：Split场景下，一个Operation可能对应多个Task，必须为所有组合建立Dependency
-            foreach (var depList in routingGraph.Dependencies.Values)
+            // ── P0-04（0号位 2026-10-07《未命名的Markdown文件 (7).md》§六 / §十三 反证 ⑧）：**逐批**建边 ──
+            //   旧实现按需求整体取 `demandGroup.Value` ⇒ 同一需求的两批 Task 落在同一集合，
+            //   数量不等时走下方「均摊」分支 ⇒ 给**全部上游 × 全部下游**建边 ⇒ **批间交叉**
+            //   （Batch-001 的 OP10 连到 Batch-002 的 OP20）。分区后每批只在本批 Task 内配对，永不跨批。
+            foreach (var batchTasks in PartitionByExecutionBatch(demandGroup.Value))
             {
-                foreach (var dep in depList)
+                // 取图（RT-002：复用 Phase2 选中路径，不重选、不串 Path）：
+                // 多批 ⇒ 按**批键**取本批选中路径（不串批）；无批键 ⇒ 回落需求级取图。
+                if (!TryGetGraphForBatch(constraints, FirstBatchKey(batchTasks), demand, out var routingGraph))
+                    continue;
+
+                // 遍历工艺路线中的依赖关系
+                // 第5轮修复：Split场景下，一个Operation可能对应多个Task，必须为所有组合建立Dependency
+                foreach (var depList in routingGraph.Dependencies.Values)
                 {
-                    // 找到对应的所有上游Task和下游Task
-                    // 0号位 2026-09-29 裁决 §5.3：节点身份 = (StageCode, OperationCode)，
-                    // 同码跨 Stage 时单键会把另一 Stage 的同名 Task 也算进来（血缘错接）。
-                    var upstreamTasks = demandGroup.Value
-                        .Where(t => t.OperationCode == dep.From.OperationCode &&
-                                    string.Equals(t.StageCode, dep.From.StageCode, StringComparison.Ordinal))
-                        .ToList();
-                    var downstreamTasks = demandGroup.Value
-                        .Where(t => t.OperationCode == dep.To.OperationCode &&
-                                    string.Equals(t.StageCode, dep.To.StageCode, StringComparison.Ordinal))
-                        .ToList();
-
-                    // P0-06修复：Split场景不再做全量交叉积（那会把整条需求数量重复算到每条边）。
-                    // 等数量时按下标一一配对（每条边取下游Task真实数量）；
-                    // 数量不等时，把每个下游Task的数量按上游个数均摊，避免数量重复累计。
-                    if (upstreamTasks.Count == 0 || downstreamTasks.Count == 0)
+                    foreach (var dep in depList)
                     {
-                        continue;
-                    }
+                        // 找到对应的所有上游Task和下游Task
+                        // 0号位 2026-09-29 裁决 §5.3：节点身份 = (StageCode, OperationCode)，
+                        // 同码跨 Stage 时单键会把另一 Stage 的同名 Task 也算进来（血缘错接）。
+                        var upstreamTasks = batchTasks
+                            .Where(t => t.OperationCode == dep.From.OperationCode &&
+                                        string.Equals(t.StageCode, dep.From.StageCode, StringComparison.Ordinal))
+                            .ToList();
+                        var downstreamTasks = batchTasks
+                            .Where(t => t.OperationCode == dep.To.OperationCode &&
+                                        string.Equals(t.StageCode, dep.To.StageCode, StringComparison.Ordinal))
+                            .ToList();
 
-                    if (upstreamTasks.Count == downstreamTasks.Count)
-                    {
-                        for (int i = 0; i < upstreamTasks.Count; i++)
+                        // P0-06修复：Split场景不再做全量交叉积（那会把整条需求数量重复算到每条边）。
+                        // 等数量时按下标一一配对（每条边取下游Task真实数量）；
+                        // 数量不等时，把每个下游Task的数量按上游个数均摊，避免数量重复累计。
+                        if (upstreamTasks.Count == 0 || downstreamTasks.Count == 0)
                         {
-                            dependencies.Add(new FinalTaskPeggingDraft
-                            {
-                                UpstreamFinalDraftId = upstreamTasks[i].FinalDraftId,
-                                DownstreamFinalDraftId = downstreamTasks[i].FinalDraftId,
-                                UpstreamMaterialId = demand.MaterialId,
-                                DownstreamMaterialId = demand.MaterialId,
-                                Quantity = downstreamTasks[i].Quantity,
-                                UOM = string.Empty,
-                                InheritedPriority = demand.DemandSequence,
-                                DependencyType = dep.DependencyType,
-                                LagTime = dep.LagTime
-                            });
+                            continue;
                         }
-                    }
-                    else
-                    {
-                        foreach (var downstreamTask in downstreamTasks)
+
+                        if (upstreamTasks.Count == downstreamTasks.Count)
                         {
-                            decimal edgeQty = Math.Round(downstreamTask.Quantity / upstreamTasks.Count, 3);
-                            foreach (var upstreamTask in upstreamTasks)
+                            for (int i = 0; i < upstreamTasks.Count; i++)
                             {
                                 dependencies.Add(new FinalTaskPeggingDraft
                                 {
-                                    UpstreamFinalDraftId = upstreamTask.FinalDraftId,
-                                    DownstreamFinalDraftId = downstreamTask.FinalDraftId,
+                                    UpstreamFinalDraftId = upstreamTasks[i].FinalDraftId,
+                                    DownstreamFinalDraftId = downstreamTasks[i].FinalDraftId,
                                     UpstreamMaterialId = demand.MaterialId,
                                     DownstreamMaterialId = demand.MaterialId,
-                                    Quantity = edgeQty,
+                                    Quantity = downstreamTasks[i].Quantity,
                                     UOM = string.Empty,
                                     InheritedPriority = demand.DemandSequence,
                                     DependencyType = dep.DependencyType,
                                     LagTime = dep.LagTime
                                 });
+                            }
+                        }
+                        else
+                        {
+                            foreach (var downstreamTask in downstreamTasks)
+                            {
+                                decimal edgeQty = Math.Round(downstreamTask.Quantity / upstreamTasks.Count, 3);
+                                foreach (var upstreamTask in upstreamTasks)
+                                {
+                                    dependencies.Add(new FinalTaskPeggingDraft
+                                    {
+                                        UpstreamFinalDraftId = upstreamTask.FinalDraftId,
+                                        DownstreamFinalDraftId = downstreamTask.FinalDraftId,
+                                        UpstreamMaterialId = demand.MaterialId,
+                                        DownstreamMaterialId = demand.MaterialId,
+                                        Quantity = edgeQty,
+                                        UOM = string.Empty,
+                                        InheritedPriority = demand.DemandSequence,
+                                        DependencyType = dep.DependencyType,
+                                        LagTime = dep.LagTime
+                                    });
+                                }
                             }
                         }
                     }
@@ -1421,6 +1433,67 @@ internal class PhaseFiveCompression
         dependencies.AddRange(GenerateCrossMaterialDependencies(tasks, request, constraints));
 
         return dependencies;
+    }
+
+    /// <summary>
+    /// P0-04（0号位 2026-10-07《未命名的Markdown文件 (7).md》§六 / §十三 反证 ⑧）：把一个需求名下的 Task
+    /// 按**执行批**分区 —— 批内自成一条完整链，**批间不得交叉**（TaskDependency / 末端判定同源）。
+    ///
+    /// 分区规则（保守、零回归）：
+    ///   · 该需求名下**至多一个**非空 `ExecutionBatchDraftKey` ⇒ **不分区**（单批 / 全无批键 ⇒ 与旧行为逐字一致）。
+    ///     锚点继承任务在路径身份不可解时 `ExecutionBatchDraftKey = null`（`PhaseTwoInitialScheduler.cs:165`），
+    ///     与同需求的单批新任务同组 ⇒ **不丢边**。
+    ///   · 出现 **≥2 个**不同非空批键 ⇒ 按批键分区；`null` 批键单独成区 —— **不猜批身份**
+    ///     （0号位 §六 明令不得用 `LogicalDemandKey` 反推批身份；无批键的 Task 本就不构成「一条完整 Path 的执行批」）。
+    ///
+    /// 分区内**保持原顺序**（`GroupBy` 保序）⇒ 下游「等数量按下标一一配对」仍按时间序配对，行为不变。
+    /// </summary>
+    private static List<List<FinalTaskDraft>> PartitionByExecutionBatch(IEnumerable<FinalTaskDraft> demandTasks)
+    {
+        var all = demandTasks.ToList();
+
+        var distinctKeys = all
+            .Select(t => t.ExecutionBatchDraftKey)
+            .Where(k => !string.IsNullOrEmpty(k))
+            .Distinct(StringComparer.Ordinal)
+            .ToList();
+
+        if (distinctKeys.Count <= 1)
+        {
+            return new List<List<FinalTaskDraft>> { all };
+        }
+
+        return all
+            .GroupBy(t => t.ExecutionBatchDraftKey ?? string.Empty, StringComparer.Ordinal)
+            .Select(g => g.ToList())
+            .ToList();
+    }
+
+    /// <summary>取该分区内的执行批键（分区内最多一个非空键；全空 ⇒ null）。</summary>
+    private static string? FirstBatchKey(IEnumerable<FinalTaskDraft> batchTasks)
+        => batchTasks.Select(t => t.ExecutionBatchDraftKey)
+            .FirstOrDefault(k => !string.IsNullOrEmpty(k));
+
+    /// <summary>
+    /// 取本**批**的 Routing 图（RT-002：复用 Phase2 选中路径，不重选、不串 Path）：
+    ///   有批键 ⇒ <see cref="ConstraintContext.TryGetBatchRoutingGraph"/>（批键未登记时其内部同样回落
+    ///   「需求固定路径 → 唯一那条」，与需求级取图**逐字同源**，故锚点继承批零回归）；
+    ///   无批键 ⇒ 需求级 <see cref="ConstraintContext.TryGetDemandRoutingGraph"/>。
+    /// </summary>
+    private static bool TryGetGraphForBatch(
+        ConstraintContext constraints,
+        string? batchKey,
+        LogicalProductionDemand demand,
+        [NotNullWhen(true)] out RoutingGraph? routingGraph)
+    {
+        if (!string.IsNullOrEmpty(batchKey))
+        {
+            return constraints.TryGetBatchRoutingGraph(
+                batchKey, demand.MaterialId, demand.RouteCode, demand.PathId, out routingGraph);
+        }
+
+        return constraints.TryGetDemandRoutingGraph(
+            demand.LogicalDemandKey, demand.MaterialId, demand.RouteCode, demand.PathId, out routingGraph);
     }
 
     /// <summary>
