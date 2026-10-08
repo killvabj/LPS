@@ -98,11 +98,22 @@ public class TaskSplitRuleConfigProjectorTests
     }
 
     [Fact]
-    public void ExtractRules_缺失或空或损坏_返回空列表()
+    public void ExtractRules_子块缺失为空或损坏_返回空列表_failOpen装载()
     {
+        // ⑧ 为非必填块，装载 fail-open（05契约 §6.10.5，与⑦ Setup 同轨）：缺子块/为空/损坏 → 空列表。
+        // 冻结 §十五 fail-closed 属匹配终端 ④（1号位 消费侧 Strategy Snapshot 校验），装载端不承载信号位。
         TaskSplitRuleConfigProjector.ExtractRules(null).Should().BeEmpty();
         TaskSplitRuleConfigProjector.ExtractRules(string.Empty).Should().BeEmpty();
         TaskSplitRuleConfigProjector.ExtractRules("{\"Lock\":{}}").Should().BeEmpty();
+        TaskSplitRuleConfigProjector.ExtractRules("{\"BatchPolicy\":null}").Should().BeEmpty();
+        TaskSplitRuleConfigProjector.ExtractRules("{\"BatchPolicy\":[]}").Should().BeEmpty();
         TaskSplitRuleConfigProjector.ExtractRules("{{{bad json").Should().BeEmpty();
+    }
+
+    [Fact]
+    public void ExtractRules_有效子块_返回规则列表()
+    {
+        TaskSplitRuleConfigProjector.ExtractRules("{\"BatchPolicy\":[{\"MaterialId\":100,\"AllowSplit\":true}]}")
+            .Should().ContainSingle().Which.MaterialId.Should().Be(100);
     }
 }

@@ -633,6 +633,13 @@ internal class PhaseFourLocalRepair
 
             if (demand == null) continue;
 
+            // ── P0-02（0号位 2026-10-08 §五 / §十一-1）：硬业务失败禁止普通修复 ──
+            if (scheduleResult.IsBatchPolicyHardFailure(demandKey))
+            {
+                result.StillUnscheduledKeys.Add(demandKey);
+                continue;
+            }
+
             // 块4：父件缺料（子件未排成）→ 保持 Unscheduled，不得被修复绕过。
             var dynamicMaterialFloor = GetDynamicMaterialFloor(
                 demandKey, constraints, demandCompletion, out bool childUnavailable);
@@ -652,8 +659,9 @@ internal class PhaseFourLocalRepair
 
             // P0-03：**逐批**修复 —— 局部修复的基本单位 = **执行批**（0号位 (7).md §六），
             //   每批带本批键 + 本批数量；不得用整份需求数量重建，不得把 Batch-002 写回 Batch-001 的键。
-            var repairUnits = ExpandRepairUnits(demand, constraints);
-            var repairedAnyBatch = false;
+            //   P0-03 整改：单元 = **未落定执行批**（已成功批不展开）。
+            var repairUnits = ExpandRepairUnits(demand, scheduleResult, constraints);
+            var repairedBatchCount = 0;
 
             foreach (var (unitBatchKey, unitDemand) in repairUnits)
             {
@@ -670,7 +678,7 @@ internal class PhaseFourLocalRepair
                     continue;
                 }
 
-                repairedAnyBatch = true;
+                repairedBatchCount++;
                 result.RepairedTasks.AddRange(repairedTasks);
 
                 // P0-08：修复出连续份额时登记完成时间，供后续同 PI 自由份额做下界。
@@ -697,8 +705,10 @@ internal class PhaseFourLocalRepair
                 }
             }
 
-            // 有**任一批**修出 ⇒ 不标 Unscheduled（「能排下的排下」）；全部批都修不出 ⇒ 需求仍 Unscheduled。
-            if (!repairedAnyBatch)
+            // ── P0-03（0号位 2026-10-08 §六 / §十一-2）：需求级成功条件 = **所有未落定批全部修复成功** ──
+            //   旧形态 `repairedAnyBatch`（任一批修出即算需求已修）会同时造成三个错误结果：
+            //     ① 已成功批被重复生产；② 失败批没排出来；③ Demand 却不再标记 Unscheduled。
+            if (repairedBatchCount < repairUnits.Count)
             {
                 result.StillUnscheduledKeys.Add(demandKey);
             }
@@ -733,6 +743,16 @@ internal class PhaseFourLocalRepair
 
             if (demand == null) continue;
 
+            // ── P0-02（0号位 2026-10-08《未命名的Markdown文件 (1)(1).md》§五 / §十一-1）──
+            //   硬业务失败（`BATCH_POLICY_MISSING` / `BATCH_POLICY_CONFLICT`）⇒ **NonRepairable**：
+            //   **禁止**进入普通 Local Repair。否则 Phase4 会把「Qty10/Min6/Max6」当成普通「资源/日历没排下」
+            //   重新 Resource Switch / Split / Local Repair，最终产出绕过 Min/Max 硬约束的非法 FinalTask。
+            if (scheduleResult.IsBatchPolicyHardFailure(demandKey))
+            {
+                result.StillUnscheduledKeys.Add(demandKey);
+                continue;
+            }
+
             // 块4：父件缺料（子件未排成）→ 保持 Unscheduled，不得被修复绕过。
             var dynamicMaterialFloor = GetDynamicMaterialFloor(
                 demandKey, constraints, demandCompletion, out bool childUnavailable);
@@ -751,8 +771,9 @@ internal class PhaseFourLocalRepair
             }
 
             // P0-03：**逐批**修复（同上方 Base 路径；基本单位 = 执行批）。
-            var repairUnits = ExpandRepairUnits(demand, constraints);
-            var repairedAnyBatch = false;
+            //   P0-03 整改：单元 = **未落定执行批**（已成功批不展开）。
+            var repairUnits = ExpandRepairUnits(demand, scheduleResult, constraints);
+            var repairedBatchCount = 0;
 
             foreach (var (unitBatchKey, unitDemand) in repairUnits)
             {
@@ -769,7 +790,7 @@ internal class PhaseFourLocalRepair
                     continue;
                 }
 
-                repairedAnyBatch = true;
+                repairedBatchCount++;
                 result.RepairedTasks.AddRange(repairedTasks);
 
                 // P0-08：修复出连续份额时登记完成时间，供后续同 PI 自由份额做下界。
@@ -803,8 +824,8 @@ internal class PhaseFourLocalRepair
                 // 注：旧描述「模具/刀具/材质/颜色」属 v1.2 已废止的 SetupAttribute 口径，勿再引用。
             }
 
-            // 有**任一批**修出 ⇒ 不标 Unscheduled；全部批都修不出 ⇒ 需求仍 Unscheduled。
-            if (!repairedAnyBatch)
+            // P0-03：需求级成功条件 = **所有未落定批全部修复成功**（不是「任一批修出」）。
+            if (repairedBatchCount < repairUnits.Count)
             {
                 result.StillUnscheduledKeys.Add(demandKey);
             }
@@ -908,13 +929,32 @@ internal class PhaseFourLocalRepair
     /// 局部修复的基本单位 = **执行批**（0号位 (7).md §六）：Phase2 登记了几批就修几批，
     ///   每批带**本批数量**（<see cref="PhaseTwoInitialScheduler.CloneDemandWithBatchQty"/>，其余字段全量逐字拷贝）
     ///   与**本批键** —— 不得用整份需求数量重建，不得把 Batch-002 写回 Batch-001 的键。
-    /// 未登记（Phase2 未及形成该需求 / 单批回落）⇒ 恒 1 单元（键 = `EB|{需求键}|001`，数量 = 需求数量），
-    ///   与升维前**逐字一致**（零回归）。
+    ///
+    /// **P0-03 整改（0号位 2026-10-08《未命名的Markdown文件 (1)(1).md》§六 / §十一-2）**：
+    ///   修复单元**只取「未落定执行批」**（<see cref="InitialScheduleResult.FailedExecutionBatches"/>）——
+    ///   Phase2 已成功落定的前序批**禁止**重新展开（否则同一批键产出第二套完整链 ⇒ 重复生产）。
+    ///   未登记失败批（Phase2 未及形成该需求 / 单批回落 / 非批失败类未排）⇒ 回落既有口径，与升维前逐字一致。
     /// </summary>
     private static IReadOnlyList<(string BatchKey, LogicalProductionDemand Demand)> ExpandRepairUnits(
         LogicalProductionDemand demand,
+        InitialScheduleResult scheduleResult,
         ConstraintContext constraints)
     {
+        // P0-03：优先按「未落定执行批」展开 —— 已成功批**不在此表**，因此不会被重复修复。
+        var unsettled = scheduleResult.FailedExecutionBatches
+            .Where(f => string.Equals(f.LogicalDemandKey, demand.LogicalDemandKey, StringComparison.Ordinal))
+            .OrderBy(f => f.Ordinal)
+            .ToList();
+
+        if (unsettled.Count > 0)
+        {
+            return unsettled
+                .Select(f => (f.ExecutionBatchDraftKey,
+                    PhaseTwoInitialScheduler.CloneDemandWithBatchQty(
+                        demand, f.BatchQty, f.BatchPlannedProcessQty)))
+                .ToList();
+        }
+
         if (constraints.ExecutionBatchPlans.TryGetValue(demand.LogicalDemandKey, out var plans) && plans.Count > 0)
         {
             if (plans.Count == 1)

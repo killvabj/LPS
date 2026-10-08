@@ -1,3 +1,4 @@
+using System.Data;
 using System.Text;
 using System.Text.Json;
 using Dapper;
@@ -79,18 +80,18 @@ VALUES (@MaterialId, @ProductionDepartmentId, @MinExecutionBatchQty, @MaxExecuti
 
         var p = new DynamicParameters();
         p.Add("MaterialId", input.MaterialId);
-        p.Add("ProductionDepartmentId", (object?)input.ProductionDepartmentId ?? DBNull.Value);
-        p.Add("MinExecutionBatchQty", (object?)input.MinExecutionBatchQty ?? DBNull.Value);
-        p.Add("MaxExecutionBatchQty", (object?)input.MaxExecutionBatchQty ?? DBNull.Value);
-        p.Add("PreferredBatchQty", (object?)input.PreferredBatchQty ?? DBNull.Value);
+        p.Add("ProductionDepartmentId", input.ProductionDepartmentId, DbType.Int32);
+        p.Add("MinExecutionBatchQty", input.MinExecutionBatchQty, DbType.Decimal);
+        p.Add("MaxExecutionBatchQty", input.MaxExecutionBatchQty, DbType.Decimal);
+        p.Add("PreferredBatchQty", input.PreferredBatchQty, DbType.Decimal);
         p.Add("AllowSplit", input.AllowSplit!.Value);
         p.Add("AllowMerge", input.AllowMerge!.Value);
-        p.Add("MaxOptimizationSplitCount", (object?)input.MaxOptimizationSplitCount ?? DBNull.Value);
-        p.Add("MaxBatchCandidates", (object?)input.MaxBatchCandidates ?? DBNull.Value);
-        p.Add("BottleneckSplitStrategy", (object?)input.BottleneckSplitStrategy ?? DBNull.Value);
-        p.Add("NonBottleneckStrategy", (object?)input.NonBottleneckStrategy ?? DBNull.Value);
-        p.Add("EffectiveFrom", (object?)input.EffectiveFrom ?? DBNull.Value);
-        p.Add("EffectiveTo", (object?)input.EffectiveTo ?? DBNull.Value);
+        p.Add("MaxOptimizationSplitCount", input.MaxOptimizationSplitCount, DbType.Int32);
+        p.Add("MaxBatchCandidates", input.MaxBatchCandidates, DbType.Int32);
+        p.Add("BottleneckSplitStrategy", input.BottleneckSplitStrategy, DbType.String);
+        p.Add("NonBottleneckStrategy", input.NonBottleneckStrategy, DbType.String);
+        p.Add("EffectiveFrom", input.EffectiveFrom, DbType.DateTime);
+        p.Add("EffectiveTo", input.EffectiveTo, DbType.DateTime);
         p.Add("CreatedAt", now);
         p.Add("UpdatedAt", now);
 
@@ -164,18 +165,18 @@ WHERE Id = @Id";
         var p = new DynamicParameters();
         p.Add("Id", id);
         p.Add("MaterialId", input.MaterialId);
-        p.Add("ProductionDepartmentId", (object?)input.ProductionDepartmentId ?? DBNull.Value);
-        p.Add("MinExecutionBatchQty", (object?)input.MinExecutionBatchQty ?? DBNull.Value);
-        p.Add("MaxExecutionBatchQty", (object?)input.MaxExecutionBatchQty ?? DBNull.Value);
-        p.Add("PreferredBatchQty", (object?)input.PreferredBatchQty ?? DBNull.Value);
+        p.Add("ProductionDepartmentId", input.ProductionDepartmentId, DbType.Int32);
+        p.Add("MinExecutionBatchQty", input.MinExecutionBatchQty, DbType.Decimal);
+        p.Add("MaxExecutionBatchQty", input.MaxExecutionBatchQty, DbType.Decimal);
+        p.Add("PreferredBatchQty", input.PreferredBatchQty, DbType.Decimal);
         p.Add("AllowSplit", input.AllowSplit!.Value);
         p.Add("AllowMerge", input.AllowMerge!.Value);
-        p.Add("MaxOptimizationSplitCount", (object?)input.MaxOptimizationSplitCount ?? DBNull.Value);
-        p.Add("MaxBatchCandidates", (object?)input.MaxBatchCandidates ?? DBNull.Value);
-        p.Add("BottleneckSplitStrategy", (object?)input.BottleneckSplitStrategy ?? DBNull.Value);
-        p.Add("NonBottleneckStrategy", (object?)input.NonBottleneckStrategy ?? DBNull.Value);
-        p.Add("EffectiveFrom", (object?)input.EffectiveFrom ?? DBNull.Value);
-        p.Add("EffectiveTo", (object?)input.EffectiveTo ?? DBNull.Value);
+        p.Add("MaxOptimizationSplitCount", input.MaxOptimizationSplitCount, DbType.Int32);
+        p.Add("MaxBatchCandidates", input.MaxBatchCandidates, DbType.Int32);
+        p.Add("BottleneckSplitStrategy", input.BottleneckSplitStrategy, DbType.String);
+        p.Add("NonBottleneckStrategy", input.NonBottleneckStrategy, DbType.String);
+        p.Add("EffectiveFrom", input.EffectiveFrom, DbType.DateTime);
+        p.Add("EffectiveTo", input.EffectiveTo, DbType.DateTime);
         p.Add("UpdatedAt", now);
 
         await _connectionManager.ExecuteAsync(updateSql, p, db: DatabaseId.APS);
@@ -364,7 +365,7 @@ WHERE MaterialId = @MaterialId
 
         var p = new DynamicParameters();
         p.Add("MaterialId", materialId);
-        p.Add("Dept", (object?)productionDepartmentId ?? DBNull.Value);
+        p.Add("Dept", productionDepartmentId, DbType.Int32);
         p.Add("ExcludeId", excludeId);
 
         var count = await _connectionManager.QueryFirstOrDefaultAsync<int>(sql, p, db: DatabaseId.APS);

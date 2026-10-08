@@ -198,7 +198,10 @@ public class ExecutionBatchDraftTests
                     SchedulingDirection = "FORWARD",
                     AllowSplit = allowSplit
                 },
-                BatchPolicies = batchPolicies ?? Array.Empty<BatchPolicyRuleSnapshot>()
+                // P0-01（0号位 2026-10-08 §四）：C 桶缺有效 Batch Policy ⇒ Fail Closed。
+                //   默认给一条 Material 级宽松策略（恒 1 批，与 P0-01 之前行为逐字一致），
+                //   使**非批决策**类用例不受影响；验证 Fail Closed 本身的用例显式传 `Array.Empty<>()`。
+                BatchPolicies = batchPolicies ?? TestBatchPolicy.Permissive(MaterialId)
             }
         };
     }
@@ -295,20 +298,25 @@ public class ExecutionBatchDraftTests
     }
 
     /// <summary>
-    /// 缺 ⑧块批策略（`policy == null`）⇒ 恒 1 批。
-    /// 依据：四级兜底链（0号位 20260928 §十五）中「缺策略」走兜底，**不认领** `BATCH_POLICY_MISSING`
-    /// （该码与兜底链冲突，属待裁项，不擅自认领）。
+    /// **P0-01（0号位 2026-10-08《未命名的Markdown文件 (1)(1).md》§四）**：
+    ///   C 桶**缺有效 Batch Policy**（`policy == null`）⇒ **`BATCH_POLICY_MISSING` / Fail Closed**，
+    ///   **不得**再被静默降级成「不拆、恒 1 批」。
+    ///
+    /// 正式兜底链（0号位 2026-09-28 §十五）：① Material + ProductionDepartment 精确 →
+    ///   ② Material 级默认 → ③ 正式发布的 Global Batch Default → ④ `BATCH_POLICY_MISSING`。
+    ///   1号位 **不越权设计** ①②③ 的展开方式（归 2/3号位），但**收到最终输入后仍找不到有效 Policy 时必须 Fail Closed**。
+    ///
+    /// 反证性：旧实现 `policy == null → ExecutionBatchPlan.Legal(1)`（= 隐藏业务默认「默认策略 = 不拆批」）⇒ 本用例 **红**。
     /// </summary>
     [Fact]
-    public void 缺批策略_恒单批()
+    public void 缺批策略_FailClosed_不产批()
     {
         var formation = PhaseTwoInitialScheduler.FormExecutionBatches(Demand(netQty: 100m), null);
 
-        Assert.True(formation.IsLegal, formation.ConflictReason);
-        var batches = formation.Batches;
-        Assert.Single(batches);
-        Assert.Equal("EB|D1|001", batches[0].BatchDraftKey);
-        Assert.Equal(100m, batches[0].NetOutputQty);
+        Assert.False(formation.IsLegal);
+        Assert.True(formation.IsMissingPolicy);
+        Assert.Empty(formation.Batches);
+        Assert.Contains("BATCH_POLICY_MISSING", formation.ConflictReason);
     }
 
     /// <summary>
@@ -458,12 +466,17 @@ public class ExecutionBatchDraftTests
 
     /// <summary>
     /// 解析回落顺序：**精确 (Material, Dept) 未命中 ⇒ 回落 (Material, null) Material 级默认**；
-    /// **都无 ⇒ null**（缺策略 ⇒ 不拆）。**禁止**回落到「全局默认策略」（0号位 (7).md §十一 第 3 条）。
+    /// **都无 ⇒ null** ⇒ 调用方 **`BATCH_POLICY_MISSING` Fail Closed**
+    ///   （P0-01，0号位 2026-10-08 §四：**不得**降级成「不拆、恒 1 批」）。
+    /// **禁止**回落到「全局默认策略」（0号位 (7).md §十一 第 3 条）。
+    ///
+    /// 本用例自行往 `constraints.ExecutionBatchPolicies` 里加策略 ⇒ 请求侧须传**空**策略集，
+    ///   否则夹具默认的 Material 级宽松策略会先被命中，掩盖本用例要验证的回落顺序。
     /// </summary>
     [Fact]
     public void 策略解析_精确未命中回落物料级默认_再无则缺策略()
     {
-        var request = BuildRequest();
+        var request = BuildRequest(batchPolicies: Array.Empty<BatchPolicyRuleSnapshot>());
         var constraints = new PhaseOneConstraintBuilder().BuildConstraints(request);
 
         // 只有 Material 级默认（Dept=null）
@@ -748,9 +761,11 @@ public class ExecutionBatchDraftTests
         Assert.Contains(constraints.ExecutionBatchPolicies, p => p.ProductionDepartmentId == 100 && p.MaxExecutionBatchQty == 6m);
         Assert.Contains(constraints.ExecutionBatchPolicies, p => p.ProductionDepartmentId == 200 && p.MaxExecutionBatchQty == 100m);
 
-        // 缺 ⑧块（默认）⇒ 空集合 ⇒ 恒 1 批
+        // 缺 ⑧块（显式传空）⇒ 策略集为空 ⇒ **`BATCH_POLICY_MISSING` Fail Closed**
+        //   （P0-01 后**不再**是「空集合 ⇒ 恒 1 批」；恒 1 批只由**有效策略** `AllowSplit=false` 表达）
         Assert.Empty(new PhaseOneConstraintBuilder()
-            .BuildConstraints(BuildRequest()).ExecutionBatchPolicies);
+            .BuildConstraints(BuildRequest(batchPolicies: Array.Empty<BatchPolicyRuleSnapshot>()))
+            .ExecutionBatchPolicies);
     }
 
     /// <summary>
@@ -796,27 +811,32 @@ public class ExecutionBatchDraftTests
     }
 
     /// <summary>
-    /// 缺 ⑧块策略（`SolverStrategySnapshot.BatchPolicies` 默认空）⇒ 策略集为空 ⇒ 恒 1 批。
+    /// **P0-01 端到端（0号位 2026-10-08 §十二 第 1 行）**：C 桶**无任何有效 Batch Policy**
+    ///   ⇒ `BATCH_POLICY_MISSING`，**0 FinalTask**，需求进 `UnscheduledTasks` 且 `Reason` 逐字为该硬失败码。
+    ///
+    /// 必须调**正式** `FiniteCapacitySolver.SolveAsync()`（§十二：「不能只测 Helper」）。
+    ///   旧实现（`BuildRequest` 默认空策略 ⇒ `policy == null` ⇒ `Legal(1)`）在本用例下会**产出 FinalTask** ⇒ **红**。
+    ///
     /// **不是**「多批端到端不可达」的论证 —— 多批端到端见 <see cref="端到端_一个CDemand拆两批_两批各自完整链路"/>。
     /// </summary>
     [Fact]
-    public async Task 缺策略_恒单批()
+    public async Task 缺策略_端到端FailClosed_零FinalTask且Reason为BATCH_POLICY_MISSING()
     {
-        var constraints = new PhaseOneConstraintBuilder().BuildConstraints(
-            BuildRequest(qty: 10m, demandRouteCode: Route, demandPathId: Path));
+        var request = BuildRequest(qty: 10m, demandRouteCode: Route, demandPathId: Path,
+            batchPolicies: Array.Empty<BatchPolicyRuleSnapshot>());
+
+        var constraints = new PhaseOneConstraintBuilder().BuildConstraints(request);
         Assert.Empty(constraints.ExecutionBatchPolicies);
 
-        var result = await _solver.SolveAsync(BuildRequest(qty: 10m, demandRouteCode: Route, demandPathId: Path));
+        var result = await _solver.SolveAsync(request);
 
-        Assert.True(result.Success, result.ErrorMessage);
-        var distinctKeys = result.FinalTasks
-            .Select(t => t.ExecutionBatchDraftKey)
-            .Where(k => !string.IsNullOrEmpty(k))
-            .Distinct()
-            .ToList();
+        // §四：不生成 FinalTask、不进入 Phase4 普通修复
+        Assert.Empty(result.FinalTasks);
 
-        Assert.Single(distinctKeys);
-        Assert.Equal("EB|D1|001", distinctKeys[0]);
+        // 出口必须明确报未排，且 Reason = 硬失败码（不得降格成「Phase 2 初始排程失败…」泛化原因）
+        var unscheduled = Assert.Single(result.UnscheduledTasks);
+        Assert.Equal("D1", unscheduled.DraftId);
+        Assert.Equal("BATCH_POLICY_MISSING", unscheduled.Reason);
     }
 
     // ═══════════════════════════════════════════════════════════════════
@@ -919,7 +939,8 @@ public class ExecutionBatchDraftTests
             StrategySnapshot = new SolverStrategySnapshot
             {
                 Parameters = new FiniteCapacityParameters { SchedulingDirection = "FORWARD" },
-                BatchPolicies = batchPolicies ?? Array.Empty<BatchPolicyRuleSnapshot>()
+                // P0-01（0号位 2026-10-08 §四）：缺有效 Batch Policy ⇒ Fail Closed。
+                BatchPolicies = batchPolicies ?? TestBatchPolicy.Permissive(MaterialId)
             }
         };
     }
@@ -1090,5 +1111,431 @@ public class ExecutionBatchDraftTests
         // 数量守恒（逐分不丢）：各批 STAGE1 数量之和 = 需求数量 10。
         Assert.Equal(10m,
             byBatch.Values.SelectMany(t => t).Where(t => t.StageCode == "STAGE1").Sum(t => t.Quantity));
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    //  K. §十二 端到端反证（0号位 2026-10-08《未命名的Markdown文件 (1)(1).md》）
+    //
+    //  0号位 明文：「以下测试必须调用正式 `FiniteCapacitySolver.SolveAsync()`，不能只测 Helper」
+    //  ⇒ 除第 8 行（守卫本身需要**手工构造重复输入**才可能被触发，见该用例说明）外，
+    //     全部经**正式求解入口**驱动，不得以「内部 Helper 断言」替代。
+    //
+    //  第 1 行（C 桶无有效 Policy ⇒ `BATCH_POLICY_MISSING`，0 FinalTask）已落地于 §G：
+    //    <see cref="缺策略_端到端FailClosed_零FinalTask且Reason为BATCH_POLICY_MISSING"/>。
+    // ═══════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// **§十二 第 2 行**：`Qty=10 / Min=6 / Max=6` ⇒ `BATCH_POLICY_CONFLICT`，**Phase4 不得排下**。
+    ///
+    /// 反证性：旧实现 Phase2 判冲突后只把原因写进 `BatchPolicyConflicts`（字符串表），Phase4 不读该表
+    ///   ⇒ 把需求当「资源/日历没排下」走**普通 Local Repair** 重排 ⇒ 产出**绕过 Min/Max 硬约束**的
+    ///   FinalTask（10 件整批或 5+5 都非法）⇒ `Assert.Empty(result.FinalTasks)` **红**。
+    /// </summary>
+    [Fact]
+    public async Task 反证2_Qty10_Min6_Max6_端到端Conflict且Phase4不得排下()
+    {
+        var request = BuildRequest(qty: 10m, demandRouteCode: Route, demandPathId: Path,
+            batchPolicies: new[] { Policy(min: 6m, max: 6m) });
+
+        var result = await _solver.SolveAsync(request);
+
+        // §五：硬失败 ⇒ 不产 FinalTask，且**不得**被 Phase4 普通修复绕过
+        Assert.Empty(result.FinalTasks);
+
+        var unscheduled = Assert.Single(result.UnscheduledTasks);
+        Assert.Equal("D1", unscheduled.DraftId);
+        Assert.Equal("BATCH_POLICY_CONFLICT", unscheduled.Reason);
+    }
+
+    /// <summary>
+    /// **§十二 第 3 行**：`AllowSplit=false` 且 `Qty &gt; Max` ⇒ Conflict，**Phase4 不得强拆或整批排下**。
+    ///
+    /// 两侧同时关闭才构成完整反证：策略侧 `AllowSplit=false`（批决策侧，v5.1.9 §7.3 逐字「0 且 Qty&gt;Max
+    ///   时返回 `BATCH_POLICY_CONFLICT`」）+ `FiniteCapacityParameters.AllowSplit=false`（Phase4 有限 Split 侧）。
+    ///
+    /// 反证性：旧实现 Phase4 不读冲突表 ⇒ 用有限 Split 把 10 件**强拆**排下，或按整批排下
+    ///   ⇒ `Assert.Empty(result.FinalTasks)` **红**。
+    /// </summary>
+    [Fact]
+    public async Task 反证3_不允许拆批且Qty超Max_端到端Conflict且不得强拆或整批排下()
+    {
+        var request = BuildRequest(qty: 10m, demandRouteCode: Route, demandPathId: Path,
+            batchPolicies: new[] { Policy(max: 4m, allowSplit: false) },
+            allowSplit: false);
+
+        var result = await _solver.SolveAsync(request);
+
+        Assert.Empty(result.FinalTasks);
+
+        var unscheduled = Assert.Single(result.UnscheduledTasks);
+        Assert.Equal("D1", unscheduled.DraftId);
+        Assert.Equal("BATCH_POLICY_CONFLICT", unscheduled.Reason);
+    }
+
+    /// <summary>
+    /// **§十二 第 4 / 5 / 6 行 + §六 P0-03 + §七 P0-04**：
+    ///   **Batch-001 成功、Batch-002 失败** ⇒ Phase4 **只能修 Batch-002**、**不得再生成 Batch-001**、
+    ///   且需求**仍必须 Unscheduled**。
+    ///
+    /// 构造（`Min=4 / Max=6` ⇒ 合法批数**唯一** n=2，无候选择优歧义；`Qty=10` ⇒ 两批各 5 件）：
+    ///   日历**只有一段 10 小时**可用窗，而单批两工序链（5 件 × 60 分钟 × 2 工序）**恰好占满 10 小时**
+    ///   ⇒ Phase2：Batch-001 **落定**、Batch-002 **落不下**（`failedBatchIndex = 1`）；
+    ///   `Parameters.AllowSplit=false` ⇒ Phase4 无 Split 手段，Batch-002 **确定修不成**。
+    ///
+    /// 断言（每条都是反证点）：
+    ///   · `EB|D1|001` 恰好 **2 个 Task**（一工序一个）—— **不得**出现第二套 `EB|D1|001` 完整链；
+    ///   · **不存在** `EB|D1|002` 的 Task —— 失败批不得被伪造出来（旧实现 `ExpandRepairUnits(D1)`
+    ///     重新展开**全部**批 ⇒ 此处 **红**）；
+    ///   · 逐工序物理数量 Σ = **5**（= 已落定批的净产出），**不是 15、也不是 10** —— 旧实现的
+    ///     「已成功批被重复生产 + 失败批被伪造成整份需求」⇒ 数量放大到 15 ⇒ 此处 **红**；
+    ///   · 需求 **仍必须** Unscheduled —— 旧实现 `repairedAnyBatch` 语义（任一批成功即视为已修复）
+    ///     ⇒ D1 从 `UnscheduledTasks` 消失 ⇒ 此处 **红**。
+    /// </summary>
+    [Fact]
+    public async Task 反证4_5_6_首批成功次批失败_只修失败批且需求仍Unscheduled()
+    {
+        // 唯一可用窗 = 恰好容下**一批**两工序链：5 件 × 60 分钟 × 2 工序 = 10 小时（留 30 分钟边界余量，
+        //   但远不足以再容下第二批的 10 小时 ⇒ 第二批必然落不下）。
+        var window = new List<ResourceCalendarSlot>
+        {
+            new()
+            {
+                ResourceId = 1, Start = PlanningStart,
+                End = PlanningStart.AddHours(10).AddMinutes(30), IsAvailable = true
+            }
+        };
+
+        var request = BuildRequest(qty: 10m, demandRouteCode: Route, demandPathId: Path,
+            batchPolicies: new[] { Policy(min: 4m, max: 6m) },
+            calendarSlots: window,
+            allowSplit: false);   // 关掉 Phase4 有限 Split ⇒ 失败批确定修不成
+
+        var result = await _solver.SolveAsync(request);
+
+        Assert.True(result.Success, result.ErrorMessage);
+
+        var batch001 = result.FinalTasks.Where(t => t.ExecutionBatchDraftKey == "EB|D1|001").ToList();
+        var batch002 = result.FinalTasks.Where(t => t.ExecutionBatchDraftKey == "EB|D1|002").ToList();
+
+        // 已落定批：**恰好一条完整链（2 工序），且只有一套** —— 不得重复生产
+        Assert.Equal(2, batch001.Count);
+        Assert.Equal(
+            new[] { "STAGE1", "STAGE2" },
+            batch001.Select(t => t.StageCode).OrderBy(s => s, StringComparer.Ordinal));
+
+        // 失败批：不得被伪造出任何 Task
+        Assert.Empty(batch002);
+
+        // §七：逐工序物理数量闭合到**已落定批的净产出 5**（不是 15、也不是整份需求 10）
+        foreach (var stageGroup in result.FinalTasks.GroupBy(t => t.StageCode))
+        {
+            Assert.Equal(5m, stageGroup.Sum(t => t.Quantity));
+        }
+
+        // §六：需求**仍必须** Unscheduled（不得因「任一批成功」而错报已满足）
+        var unscheduled = Assert.Single(result.UnscheduledTasks);
+        Assert.Equal("D1", unscheduled.DraftId);
+        Assert.False(string.IsNullOrEmpty(unscheduled.Reason));
+        // 未排原因**不得**是批策略硬失败码（本场景策略合法、是日历装不下）
+        Assert.DoesNotContain("BATCH_POLICY", unscheduled.Reason, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// **§十二 第 6 行**：**两个执行批在 Phase2 都失败、Phase4 只修好其中一个** ⇒
+    ///   需求**仍必须** Unscheduled（不得因「有批落定」就视为已满足）。
+    ///
+    /// 构造：`Qty=10 / Min=4 / Max=6` ⇒ 2 批（各 5 件）；`opDuration=10m` ⇒ 每批每工序 50 分钟，
+    ///   而日历只有 **4 个 30 分钟槽**（两两相隔 30 分钟不可用）⇒ 无任何连续 50 分钟窗
+    ///   ⇒ Phase2 **两批都落不下**（`failedBatchIndex = 0` ⇒ `FailedExecutionBatches = [001, 002]`）；
+    ///   `AllowSplit=true` ⇒ Phase4 有限 Split 把每批每工序拆成 2×25 分钟 ⇒ **一批占 4 个槽**
+    ///   ⇒ 只有 **1 个批**能被修好，另一个因槽位耗尽仍落不下。
+    ///
+    /// 反证性：旧实现 `repairedAnyBatch` 语义（**任一批**修复成功即视为需求已修复）⇒
+    ///   D1 从 `UnscheduledTasks` 消失 ⇒ 本条断言 **红**（这正是 §六 指出的「错误成功状态」）。
+    /// </summary>
+    [Fact]
+    public async Task 反证6_两批都失败只修好一批_需求仍必须Unscheduled()
+    {
+        // 4 个 30 分钟可用槽、两两相隔 30 分钟不可用 ⇒ 总可用 2 小时：
+        //   恰好够「1 批 × 2 工序 × 拆 2 份 × 25 分钟 = 4 槽」，不够第 2 批。
+        var slots = new List<ResourceCalendarSlot>();
+        for (int i = 0; i < 4; i++)
+        {
+            var start = PlanningStart.AddHours(8 + i);
+            slots.Add(new ResourceCalendarSlot
+            {
+                ResourceId = 1, Start = start, End = start.AddMinutes(30), IsAvailable = true
+            });
+        }
+
+        var request = BuildRequest(qty: 10m, demandRouteCode: Route, demandPathId: Path,
+            batchPolicies: new[] { Policy(min: 4m, max: 6m) },
+            opDuration: 10m,        // 每批每工序 50 分钟 > 单槽 30 分钟 ⇒ Phase2 两批均落不下
+            calendarSlots: slots,
+            allowSplit: true);      // Phase4 有限 Split 才能修好其中一批
+
+        var result = await _solver.SolveAsync(request);
+
+        Assert.True(result.Success, result.ErrorMessage);
+
+        // 只有**一个**执行批落定（另一个修不成），且它是真实批键
+        var landedKeys = result.FinalTasks
+            .Select(t => t.ExecutionBatchDraftKey!)
+            .Distinct()
+            .ToList();
+        Assert.Single(landedKeys);
+        Assert.Contains(landedKeys[0], new[] { "EB|D1|001", "EB|D1|002" });
+
+        // 已落定批的数量 = 5（不是整份需求 10）
+        foreach (var stageGroup in result.FinalTasks.GroupBy(t => t.StageCode))
+        {
+            Assert.Equal(5m, stageGroup.Sum(t => t.Quantity));
+        }
+
+        // §六：**仍必须** Unscheduled（旧 `repairedAnyBatch` 语义 ⇒ 此处红）
+        var unscheduled = Assert.Single(result.UnscheduledTasks);
+        Assert.Equal("D1", unscheduled.DraftId);
+        Assert.False(string.IsNullOrEmpty(unscheduled.Reason));
+    }
+
+    /// <summary>
+    /// **§十二 第 7 行**：`Qty=10 / Min=4 / Max=6` ⇒ 2 批**全部排下** ⇒
+    ///   **每个工序上 Σ各 Execution Batch Quantity 严格等于需求对应数量 10**，
+    ///   且**不存在**重复批身份下的第二套完整链。
+    ///
+    /// 与 <see cref="端到端_一个CDemand拆两批_两批各自完整链路"/> 的区别：本用例断言的是 **P0-04
+    ///   最终物理数量闭合**（§七），即「逐工序 Σ = 需求数量」这一条此前**无任何守卫**的性质。
+    /// </summary>
+    [Fact]
+    public async Task 反证7_两批全排下_逐工序数量严格闭合且无重复批链()
+    {
+        var request = BuildRequest(qty: 10m, demandRouteCode: Route, demandPathId: Path,
+            batchPolicies: new[] { Policy(min: 4m, max: 6m) });
+
+        var result = await _solver.SolveAsync(request);
+
+        Assert.True(result.Success, result.ErrorMessage);
+        Assert.Empty(result.UnscheduledTasks);
+
+        // 每个执行批恰好一条完整链（2 工序）—— 不存在同批键下的第二套链
+        foreach (var batchGroup in result.FinalTasks.GroupBy(t => t.ExecutionBatchDraftKey!))
+        {
+            Assert.Equal(2, batchGroup.Count());
+        }
+
+        // §七 逐工序数量严格闭合：Σ各 Execution Batch Quantity = 需求 NetOutputQty = 10
+        foreach (var stageGroup in result.FinalTasks.GroupBy(t => t.StageCode))
+        {
+            Assert.Equal(10m, stageGroup.Sum(t => t.Quantity));
+        }
+    }
+
+    /// <summary>
+    /// **§十二 第 8 行**：**重复 Batch ⇒ 必须被最终硬校验拒绝**。
+    ///
+    /// 分两段（缺一不可）：
+    ///   **(a) 端到端不可达**：`Qty=10 / Min=4 / Max=6` ⇒ 2 批全排下；同一 (批键, 工序) 下**只有一个 Task**
+    ///       —— P0-03 修好后（Phase4 只修失败批）「重复执行批链」在正式路径上**已不可达**；
+    ///   **(b) 守卫本身必须有效**：用手工构造的**重复批链**（`EB|D1|001` 两套 + `EB|D1|002` 一套 ⇒ 逐工序
+    ///       Σ=15 &gt; 需求 10）直接驱动 Phase5 最终硬校验 ⇒ 必须 `IsValid=false` 并报数量不闭合。
+    ///
+    /// 为何 (b) 不能走 `SolveAsync()`：守卫一旦「不可达」就永不被触发、也就永不被验证 ⇒ 只能给守卫本身
+    ///   **造一次真实输入**。这不是绕过正式路径（另 8 行全部走 `SolveAsync()`），而是对守卫的直接证明。
+    ///   任务时间窗刻意**互不重叠**，以免先撞上「资源互斥」检查而掩盖数量闭合检查。
+    /// </summary>
+    [Fact]
+    public async Task 反证8_重复批链_被最终硬校验拒绝()
+    {
+        var request = BuildRequest(qty: 10m, demandRouteCode: Route, demandPathId: Path,
+            batchPolicies: new[] { Policy(min: 4m, max: 6m) });
+
+        // ── (a) 正式路径：重复批链不可达 ──
+        var result = await _solver.SolveAsync(request);
+        Assert.True(result.Success, result.ErrorMessage);
+
+        foreach (var group in result.FinalTasks.GroupBy(t => (t.ExecutionBatchDraftKey, t.StageCode)))
+        {
+            Assert.Single(group);
+        }
+
+        // ── (b) 守卫直接证明：手工构造「同批键两套完整链」 ──
+        var constraints = new PhaseOneConstraintBuilder().BuildConstraints(request);
+
+        FinalTaskDraft MakeTask(string stage, string op, string batchKey, int slot)
+            => new()
+            {
+                SourceDraftId = "D1",
+                MaterialId = MaterialId,
+                FactoryId = 1,
+                StageCode = stage,
+                OperationCode = op,
+                ResourceId = 1,
+                RouteCode = Route,
+                PathId = Path,
+                Quantity = 5m,
+                PlannedProcessQty = 5m,
+                ExecutionBatchDraftKey = batchKey,
+                PlannedStartTime = PlanningStart.AddHours(5 * slot),
+                PlannedEndTime = PlanningStart.AddHours(5 * (slot + 1))
+            };
+
+        var duplicated = new List<FinalTaskDraft>
+        {
+            MakeTask("STAGE1", "OP10", "EB|D1|001", 0),
+            MakeTask("STAGE2", "OP20", "EB|D1|001", 1),
+            MakeTask("STAGE1", "OP10", "EB|D1|002", 2),
+            MakeTask("STAGE2", "OP20", "EB|D1|002", 3),
+            // 重复的第二套 EB|D1|001 完整链 —— 正是 P0-03「10 件产出 15 件」的症状
+            MakeTask("STAGE1", "OP10", "EB|D1|001", 4),
+            MakeTask("STAGE2", "OP20", "EB|D1|001", 5)
+        };
+
+        var (isValidScheduled, errorScheduled) = PhaseFiveCompression.ValidateHardResultForTest(
+            duplicated,
+            new List<AllocationTaskShare>(),
+            new List<FinalTaskPeggingDraft>(),
+            request, constraints,
+            new HashSet<string>(StringComparer.Ordinal),   // D1 视为「已排定」⇒ 必须**严格**闭合
+            new Dictionary<string, List<(string DemandKey, decimal ShareQty)>>());
+
+        Assert.False(isValidScheduled);
+        Assert.Contains("数量未闭合", errorScheduled, StringComparison.Ordinal);
+
+        // 同一构造在「需求未排定」口径下：允许小于、**绝不允许放大** ⇒ 同样必须拒绝
+        var (isValidUnscheduled, errorUnscheduled) = PhaseFiveCompression.ValidateHardResultForTest(
+            duplicated,
+            new List<AllocationTaskShare>(),
+            new List<FinalTaskPeggingDraft>(),
+            request, constraints,
+            new HashSet<string>(new[] { "D1" }, StringComparer.Ordinal),
+            new Dictionary<string, List<(string DemandKey, decimal ShareQty)>>());
+
+        Assert.False(isValidUnscheduled);
+        Assert.Contains("被放大", errorUnscheduled, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// **§十二 第 9 行**：`AllowMerge=true` + multiBatch ⇒ **不得在入口处无条件禁用**。
+    ///
+    /// 0号位 §八 同时明令「**不得简单删 `!multiBatch`**」（Execution Batch 已成正式身份）⇒ 本用例锁死
+    ///   整改后的**身份保持**语义，并给出「简单删除」这条错解的反证点：
+    ///   构造 D2（单批，`Qty=5`）先排、D1（多批，`Qty=10 / Min=4 / Max=6` ⇒ 2 批）后到，
+    ///   **同物料、同工序、同 Route/Path** ⇒ D1 的批**有已归批的目标可合并**。
+    ///   · 简单删除 `!multiBatch` ⇒ D1 的 `EB|D1|001` 被并进 D2 的 Task（沿用它 `EB|D2|001`）⇒
+    ///     D1 只剩 1 个批键 ⇒ **断言 ② 红**；
+    ///   · 整改后（入口解禁 + 目标侧身份保持）⇒ 目标已归批、拒绝合并 ⇒ D1 两批身份完整 ⇒ 绿。
+    ///
+    /// ⚠ **如实登记的缺口**（不降目标、不假装达标）：本用例**不能**证明「multiBatch 合并真的发生」——
+    ///   现有 `FinalTaskDraft.ExecutionBatchDraftKey` 为**单值**、`AllocationTaskShare` 与 Phase5
+    ///   `mergeLineage` **均无批键** ⇒「一个 Task 承载两个 Execution Batch 身份」在当前载体上无法表达，
+    ///   而正常装配路径下**所有生产 Task 均带批键** ⇒ 多批需求**没有**合法的未归批合并目标。
+    ///   第二半（让 multiBatch 合并真正可用）需**载体升级** ⇒ 载体归 2号位、语义归 0号位，已出件提请。
+    /// </summary>
+    [Fact]
+    public async Task 反证9_AllowMerge开且多批_入口不得整类禁用且批身份不得被吞()
+    {
+        var request = BuildSingleOpMergeRequest(d1Qty: 10m, d2Qty: 5m);
+
+        var result = await _solver.SolveAsync(request);
+
+        Assert.True(result.Success, result.ErrorMessage);
+
+        // ① 每个 Task 的批键必须**属于其自身需求**（不得出现「Task 装 D1 的数量、却带 D2 的批键」）
+        Assert.All(result.FinalTasks, t => Assert.StartsWith(
+            $"EB|{t.SourceDraftId}|", t.ExecutionBatchDraftKey ?? string.Empty, StringComparison.Ordinal));
+
+        // ② D1 的两个批身份必须**都还在**（简单删除 `!multiBatch` ⇒ `EB|D1|001` 被 D2 的 Task 吞掉 ⇒ 红）
+        var d1Keys = result.FinalTasks
+            .Where(t => t.SourceDraftId == "D1")
+            .Select(t => t.ExecutionBatchDraftKey!)
+            .Distinct()
+            .OrderBy(k => k, StringComparer.Ordinal)
+            .ToList();
+        Assert.Equal(new[] { "EB|D1|001", "EB|D1|002" }, d1Keys);
+
+        // ③ 数量闭合（单工序 ⇒ 逐需求 Σ = 需求数量）
+        Assert.Equal(10m, result.FinalTasks.Where(t => t.SourceDraftId == "D1").Sum(t => t.Quantity));
+        Assert.Equal(5m, result.FinalTasks.Where(t => t.SourceDraftId == "D2").Sum(t => t.Quantity));
+    }
+
+    /// <summary>
+    /// §十二 第 9 行夹具：**单工序**（`OP10@STAGE1`，资源 1）+ 两个**同物料**需求
+    ///   （Merge 要求 `operations.Count == 1` 且同 `MaterialId`）。
+    ///   顺序：`D2`（`AllocationSequence=1`）先排、`D1`（`=2`）后到 ⇒ D1 的批有「**已归批**的目标」可合并。
+    ///   策略 `Min=4 / Max=6` 对两需求同时成立：`D2 Qty=5` ⇒ 1 批；`D1 Qty=10` ⇒ 2 批。
+    /// </summary>
+    private static DomainSolveRequest BuildSingleOpMergeRequest(decimal d1Qty, decimal d2Qty)
+    {
+        LogicalProductionDemand MergeDemand(string key, decimal qty, long allocSeq)
+            => new()
+            {
+                LogicalDemandKey = key, PlanVersionId = 1L, DomainKey = "DOMAIN",
+                AllocationSequence = allocSeq, DemandKey = key,
+                MaterialId = MaterialId, FactoryId = 1,
+                StartStageCode = "STAGE1",
+                NetOutputQty = qty, PlannedProcessQty = qty,
+                RequiredAvailableTime = PlanningStart.AddDays(20),
+                DemandSequence = (int)allocSeq,
+                RouteCode = Route, PathId = Path
+            };
+
+        return new DomainSolveRequest
+        {
+            PlanVersionId = 1,
+            DomainKey = "DOMAIN",
+            PlanningStart = PlanningStart,
+            PlanningEnd = PlanningEnd,
+            LogicalProductionDemands = new List<LogicalProductionDemand>
+            {
+                MergeDemand("D2", d2Qty, 1),
+                MergeDemand("D1", d1Qty, 2)
+            },
+            RoutingOperations = new List<RoutingOperation>
+            {
+                new()
+                {
+                    MaterialId = MaterialId, ProductionDepartmentId = DeptId,
+                    RouteCode = Route, PathId = Path,
+                    OperationCode = "OP10", StageCode = "STAGE1",
+                    StandardDuration = 60m, OperationPlanningMode = "FINITE_RESOURCE"
+                }
+            },
+            RoutingDependencies = new List<RoutingDependency>(),
+            OperationResourceEligibility = new List<OperationResourceEligibility>
+            {
+                new()
+                {
+                    MaterialId = MaterialId, ProductionDepartmentId = DeptId,
+                    RouteCode = Route, PathId = Path,
+                    OperationCode = "OP10", ResourceId = 1, Priority = 1, CapacityFactor = 1m
+                }
+            },
+            MaterialStageDepartmentContexts = new List<MaterialStageDepartmentContextDto>
+            {
+                new() { MaterialId = MaterialId, StageCode = "STAGE1", ProductionDepartmentId = DeptId }
+            },
+            ExecutionConstraints = Array.Empty<ExecutionConstraint>(),
+            Resources = new List<ResourceDefinition>
+            {
+                new() { ResourceId = 1, ResourceCode = "R1", FactoryCode = "F1", Capacity = 1m }
+            },
+            CalendarSlots = new List<ResourceCalendarSlot>
+            {
+                new() { ResourceId = 1, Start = PlanningStart, End = PlanningEnd, IsAvailable = true }
+            },
+            StrategySnapshot = new SolverStrategySnapshot
+            {
+                Parameters = new FiniteCapacityParameters
+                {
+                    SchedulingDirection = "FORWARD",
+                    AllowMerge = true,    // §八：Merge 的正式控制源是 Batch Policy，此处同步打开旧全局参数
+                    AllowSplit = false
+                },
+                BatchPolicies = new List<BatchPolicyRuleSnapshot>
+                {
+                    Policy(min: 4m, max: 6m, allowMerge: true)
+                }
+            }
+        };
     }
 }

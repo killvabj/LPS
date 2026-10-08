@@ -406,7 +406,22 @@ internal class PhaseTwoInitialScheduler
             if (!formation.IsLegal)
             {
                 result.UnscheduledDemandKeys.Add(demand.LogicalDemandKey);
-                result.BatchPolicyConflicts.Add($"[{demand.LogicalDemandKey}] {formation.ConflictReason}");
+
+                // ── P0-01 / P0-02（0号位 2026-10-08《未命名的Markdown文件 (1)(1).md》§四 / §五）──
+                //   `BATCH_POLICY_MISSING`（缺有效策略）与 `BATCH_POLICY_CONFLICT`（无合法切分）
+                //   同属 **NonRepairable / HardFailure**：除登记外写入**硬失败表**，
+                //   Phase4 据此**禁止进入普通 Local Repair**（§五：Phase4 不得绕过 Min/Max 硬约束），
+                //   Phase5 据此给出口 Reason（§十二：C 桶无有效策略 ⇒ `BATCH_POLICY_MISSING`、0 FinalTask）。
+                var failureReason = formation.IsMissingPolicy ? "BATCH_POLICY_MISSING" : "BATCH_POLICY_CONFLICT";
+                result.BatchPolicyHardFailures[demand.LogicalDemandKey] = failureReason;
+                if (formation.IsMissingPolicy)
+                {
+                    result.BatchPolicyMissingDemandKeys.Add($"[{demand.LogicalDemandKey}] {formation.ConflictReason}");
+                }
+                else
+                {
+                    result.BatchPolicyConflicts.Add($"[{demand.LogicalDemandKey}] {formation.ConflictReason}");
+                }
                 continue;
             }
 
@@ -464,6 +479,33 @@ internal class PhaseTwoInitialScheduler
                 //   已落定的前序批**保留**（「能排下的排下」，与「排不下不得静默丢弃」同向），
                 //   需求仍进 `UnscheduledDemandKeys` 以示**未按完整执行批全部满足**。
                 result.UnscheduledDemandKeys.Add(demand.LogicalDemandKey);
+
+                // ── P0-03（0号位 2026-10-08《未命名的Markdown文件 (1)(1).md》§六 / §十一-2）──
+                //   登记**未落定执行批身份** = 首个失败批 **及其后所有未试批**
+                //   （`RunBatchPlan` 遇首个失败批即 `break` ⇒ 其后的批根本没被尝试，同属未落定）。
+                //   Phase4 只能修这批；**已落定的前序批禁止重新展开** —— 否则同一批键产出第二套完整链，
+                //   造成「重复生产 / 漏排 / 错误成功状态」三合一（§六）。
+                for (int i = outcome.FailedBatchIndex; i >= 0 && i < batches.Count; i++)
+                {
+                    var failedBatch = batches[i];
+                    string? failedRoute = null;
+                    long? failedPath = null;
+                    if (constraints.ChosenBatchRoutePaths.TryGetValue(failedBatch.BatchDraftKey, out var failedKey))
+                    {
+                        failedRoute = failedKey.RouteCode;
+                        failedPath = failedKey.PathId;
+                    }
+
+                    result.FailedExecutionBatches.Add(new FailedExecutionBatch(
+                        demand.LogicalDemandKey,
+                        failedBatch.BatchDraftKey,
+                        failedBatch.Ordinal,
+                        failedBatch.NetOutputQty,
+                        failedBatch.PlannedProcessQty,
+                        failedRoute,
+                        failedPath));
+                }
+
                 continue;
             }
 
@@ -818,7 +860,8 @@ internal class PhaseTwoInitialScheduler
         bool BatchFailed,
         List<FinalTaskDraft> NewTasks,
         decimal SetupTotal,
-        DateTime Completion);
+        DateTime Completion,
+        int FailedBatchIndex);   // P0-03：首个**未落定**批在 batches 中的下标（-1 = 全部落定）
 
     /// <summary>
     /// P1-01：在**给定工作缓冲**上执行一个**批方案**（原 Phase2 批循环主体，逐字抽出）。
@@ -853,18 +896,38 @@ internal class PhaseTwoInitialScheduler
         Dictionary<string, RoutePathKey> chosenBatchRoutePaths,
         Dictionary<string, RoutePathKey> chosenRoutePaths)
     {
-        // 多批时**禁止 Merge**：Merge 会把本批工序并入**别的批**的既有 Task ⇒ 一个 Task 混两个批键，
-        //   违反「同 Batch 共 Key、不同 Batch 必不同键」。
+        // 多批时 Merge 受**身份保持**判据约束（见循环内 P1-01）。
         var multiBatch = batches.Count > 1;
-        var allowMergeForDemand = mergeAllowed && !multiBatch;
 
         var newTasks = new List<FinalTaskDraft>();
         var batchFailed = false;
+        var failedBatchIndex = -1;
         decimal setupTotal = 0m;
         var planCompletion = DateTime.MinValue;
 
-        foreach (var batch in batches)
+        for (int batchIndex = 0; batchIndex < batches.Count; batchIndex++)
         {
+            var batch = batches[batchIndex];
+
+            // ── P1-01（0号位 2026-10-08《未命名的Markdown文件 (1)(1).md》§八）：Merge 门控**不得按批数整类禁用** ──
+            //   旧形态 `mergeAllowed && !multiBatch` 把「本需求拆成多批」直接解释成「**永久禁止 Merge**」，
+            //   使正式字段 `BatchPolicy.AllowMerge` 对 multiBatch 这一整类 C 桶排程**整体失效**。
+            //   0号位 同时明令「**不得简单删 `!multiBatch`**」（Execution Batch 已成正式身份）⇒ 整改分两步：
+            //     ① 入口解禁：`allowMergeForThisBatch = mergeAllowed`（不再看批数）；
+            //     ② 身份把关下移到**目标侧**：`requireIdentityPreserving = multiBatch` ⇒ 合并目标必须是
+            //        **尚未归属任何执行批**（`ExecutionBatchDraftKey == null`）的 Task，合并结果采用**本批键**
+            //        （见 `TryMergeDemandIntoTask`）⇒ 本批身份不丢；目标已属别的执行批则拒绝
+            //        （否则一个 Task 混两个批键，违反「同 Batch 共 Key、不同 Batch 必不同键」）。
+            //   ⚠ 结构性限制（**如实登记，不声称达标**）：现有 `FinalTaskDraft.ExecutionBatchDraftKey` 为**单值**、
+            //     `AllocationTaskShare` 与 Phase5 `mergeLineage` **均无批键** ⇒「一个 Task 承载两个 Execution Batch
+            //     身份」在当前载体上**无法表达**。故多批需求合并**只可能落在未归批目标上**，而本求解器在正常装配
+            //     路径下**所有生产 Task 均带批键** ⇒ multiBatch 合并当前**实际不发生**。
+            //     本次落地的是「入口不再整类禁用」（§八 第一半），**不是**「multiBatch 合并已可用」；
+            //     第二半需**载体升级**（多值批键，或 `AllocationTaskShare` 加批键）⇒ 载体归 2号位、语义归 0号位，
+            //     已出件提请（不降目标：做不到直说，不以「替代路径也算达标」充数）。
+            //   单批需求保持既有行为（零回归）。
+            var requireIdentityPreserving = multiBatch;
+            var allowMergeForThisBatch = mergeAllowed;
             // 单批：直接用原实例（零回归）；多批才克隆并覆写本批数量。
             var batchDemand = multiBatch
                 ? CloneDemandWithBatchQty(actualDemand, batch.NetOutputQty, batch.PlannedProcessQty)
@@ -897,7 +960,8 @@ internal class PhaseTwoInitialScheduler
                 var produced = RunDemandSchedule(
                     batchDemand, ops, graph, direction, constraints, trialOccupancy,
                     trialTasks, trialShares, demandByKey, request.PlanningStart, request.PlanningEnd,
-                    dynamicMaterialFloor, stageOverlap, allowMergeForDemand, batch.BatchDraftKey);
+                    dynamicMaterialFloor, stageOverlap, allowMergeForThisBatch, batch.BatchDraftKey,
+                    requireIdentityPreserving);
 
                 // Merge 成功时返回空 List，且替换了 scheduledTasks 中的既有 Task（完成时间变化）
                 var merged = produced.Count == 0 &&
@@ -945,8 +1009,11 @@ internal class PhaseTwoInitialScheduler
             var winnerIndex = SelectBestRoutingCandidate(trials, batchDemand, direction, constraints);
             if (winnerIndex < 0)
             {
-                // 本批全部候选不可排 ⇒ 该批落不下（需求整体记 Unscheduled，见调用方聚合）
+                // 本批全部候选不可排 ⇒ 该批落不下（需求整体记 Unscheduled，见调用方聚合）。
+                // P0-03：登记**首个未落定批**的下标 —— 调用方据此只对「本批及其后未试批」登记失败身份，
+                //   已落定的前序批**不得**再进入 Phase4 重新展开（否则重复生产）。
                 batchFailed = true;
+                failedBatchIndex = batchIndex;
                 break;
             }
 
@@ -967,7 +1034,7 @@ internal class PhaseTwoInitialScheduler
                 batchDemand, winner.Ops, winner.Graph, direction, constraints, resourceOccupancy,
                 scheduledTasks, allocationTaskShare, demandByKey,
                 request.PlanningStart, request.PlanningEnd, dynamicMaterialFloor, stageOverlap,
-                allowMergeForDemand, batch.BatchDraftKey);
+                allowMergeForThisBatch, batch.BatchDraftKey, requireIdentityPreserving);
 
             // 第5轮Merge修复：Merge成功时返回空List，但Demand已进入TaskShare，不应标记为Unscheduled
             if (batchTasks.Count == 0)
@@ -980,6 +1047,7 @@ internal class PhaseTwoInitialScheduler
                 if (!isMerged)
                 {
                     batchFailed = true;
+                    failedBatchIndex = batchIndex;
                     break;
                 }
                 // Merge 成功：本批无新 Task（份额已并入既有 Task），继续下一批。
@@ -997,7 +1065,7 @@ internal class PhaseTwoInitialScheduler
             }
         }
 
-        return new BatchPlanRunOutcome(batchFailed, newTasks, setupTotal, planCompletion);
+        return new BatchPlanRunOutcome(batchFailed, newTasks, setupTotal, planCompletion, failedBatchIndex);
     }
 
     /// <summary>
@@ -1143,7 +1211,8 @@ internal class PhaseTwoInitialScheduler
         DateTime dynamicMaterialFloor,
         StageOverlapParams stageOverlap,
         bool allowMerge,
-        string? batchDraftKey = null)   // P0-01/P0-02：本批归批键（null ⇒ 回落 ExecutionBatchKey(demandKey, 1)）
+        string? batchDraftKey = null,   // P0-01/P0-02：本批归批键（null ⇒ 回落 ExecutionBatchKey(demandKey, 1)）
+        bool requireIdentityPreservingMerge = false)   // P1-01：多批需求 ⇒ 只合并到「未归属执行批」的目标 Task
     {
         // 第4轮Merge修复：检测是否可以合并到已有Task
         if (allowMerge)
@@ -1151,7 +1220,8 @@ internal class PhaseTwoInitialScheduler
             return TryMergeOrSchedule(
                 demand, operations, routingGraph, direction, constraints,
                 resourceOccupancy, scheduledTasks, allocationTaskShare, demandByKey,
-                planningStart, planningEnd, dynamicMaterialFloor, stageOverlap, batchDraftKey);
+                planningStart, planningEnd, dynamicMaterialFloor, stageOverlap, batchDraftKey,
+                requireIdentityPreservingMerge);
         }
 
         return ScheduleDemandOperations(
@@ -2133,7 +2203,8 @@ internal class PhaseTwoInitialScheduler
     ///   ① `(demand.MaterialId, deptId)` **精确命中** —— deptId 由 `(MaterialId, StartStageCode)` 从
     ///      `DomainSolveRequest.MaterialStageDepartmentContexts` 反查，**与既有「部门锁定」同口径，不另造部门、不跨部门选优**；
     ///   ② 未命中 ⇒ `(demand.MaterialId, ProductionDepartmentId == null)` 的 **Material 级默认**（⑧块 DTO 自带语义）；
-    ///   ③ 仍无命中 ⇒ `null`（缺策略 ⇒ 不拆，恒 1 批）。
+    ///   ③ 仍无命中 ⇒ `null`（**缺策略**）。⚠ P0-01 后 `null` **不再**意味着「不拆、恒 1 批」：
+    ///      C 桶需求一律判 `BATCH_POLICY_MISSING` 并 **Fail Closed**（见 `DecideExecutionBatchPlan`）。
     ///
     /// **禁止**回落到「全局默认批量策略」—— 0号位 (7).md §十一 第 3 条明文：1号位不得自行创造全局默认策略。
     /// </summary>
@@ -2199,18 +2270,38 @@ internal class PhaseTwoInitialScheduler
     /// **明令禁止的旧结论**（0号位 (7).md §五）：不得再写「Max 优先于 Min」或「Min 在 V1 无作用面」。
     ///   `Qty=10/Min=6/Max=6` ⇒ **无合法切分**（n=1: 10&gt;6；n=2: 12&gt;10）⇒ **冲突**，不得产出 5+5。
     ///
-    /// A/B（`IsContinuation` / `NoSplitMerge`）⇒ 恒 1 批；缺策略 ⇒ 恒 1 批。
+    /// A/B（`IsContinuation` / `NoSplitMerge`）⇒ 恒 1 批（既存执行批，不受普通 C 桶 Batch Decision 约束）。
+    /// C 桶**缺有效 Batch Policy ⇒ `BATCH_POLICY_MISSING`**（P0-01，见下）。
     /// </summary>
     private static ExecutionBatchPlan DecideExecutionBatchPlan(
         LogicalProductionDemand demand,
         BatchPolicyRuleSnapshot? policy)
     {
+        // A/B 已是**既存执行批**（v1.6 `:26` + B-003：A/B 不参加普通自由拆合批）⇒ 恒 1 批，
+        //   不受本裁决的「缺策略 Fail Closed」约束（0号位 2026-10-08 §四末段明文）。
         if (demand.IsContinuation || demand.NoSplitMerge)
         {
             return ExecutionBatchPlan.Legal(1);
         }
 
-        if (policy is null || demand.NetOutputQty <= 0m)
+        // ── P0-01（0号位 2026-10-08《未命名的Markdown文件 (1)(1).md》§四 / §九）──
+        //   C 桶**缺有效 Batch Policy ⇒ Fail Closed**，判 `BATCH_POLICY_MISSING`。
+        //
+        //   禁止的旧形态：「缺策略 ⇒ 不拆，恒 1 批」—— 那等于 1号位 在内部自造了一套
+        //     「默认策略 = 不拆批」的**隐藏业务规则**，会绕开正式硬业务配置产出未经约束的生产计划。
+        //
+        //   正式兜底链（0号位 20260928 四级）：① Material+ProductionDepartment 精确 → ② Material 默认
+        //     → ③ **正式发布的 Global Batch Default** → ④ 仍无 ⇒ `BATCH_POLICY_MISSING`。
+        //   第③级由 2/3号位 在上游**投影成 Solver 可消费的有效 Policy** 后交给 1号位（§九：「不要求1号位
+        //   自己维护 Global Default」）；**1号位 不得自行展开该级、更不得把末级 `null` 解释成「单批合法」**。
+        if (policy is null)
+        {
+            return ExecutionBatchPlan.Missing(
+                "BATCH_POLICY_MISSING：C 桶需求在 Solver 输入中找不到有效 Batch Policy"
+                + "（(Material + ProductionDepartment) 精确命中 与 Material 级默认 均未命中）");
+        }
+
+        if (demand.NetOutputQty <= 0m)
         {
             return ExecutionBatchPlan.Legal(1);
         }
@@ -2253,26 +2344,42 @@ internal class PhaseTwoInitialScheduler
         return (int)value;
     }
 
-    /// <summary>批数裁决结果：区分「合法批方案」与「策略冲突 / 无合法切分」。</summary>
-    private readonly record struct ExecutionBatchPlan(bool IsLegal, int Count, string? ConflictReason)
+    /// <summary>
+    /// 批数裁决结果：区分「合法批方案」/「策略冲突（无合法切分）」/「**缺有效 Batch Policy**」。
+    ///
+    /// P0-01（0号位 2026-10-08《未命名的Markdown文件 (1)(1).md》§四/§九）：缺策略是**独立的硬失败类**
+    ///   （`BATCH_POLICY_MISSING`），既不得与 `BATCH_POLICY_CONFLICT` 混为一谈，
+    ///   更不得回落成「合法单批」—— 那是 1号位 自造的隐藏业务默认。
+    /// </summary>
+    private readonly record struct ExecutionBatchPlan(bool IsLegal, int Count, string? ConflictReason, bool IsMissingPolicy)
     {
-        public static ExecutionBatchPlan Legal(int count) => new(true, count, null);
-        public static ExecutionBatchPlan Conflict(string reason) => new(false, 0, reason);
+        public static ExecutionBatchPlan Legal(int count) => new(true, count, null, false);
+        public static ExecutionBatchPlan Conflict(string reason) => new(false, 0, reason, false);
+        public static ExecutionBatchPlan Missing(string reason) => new(false, 0, reason, true);
     }
 
     /// <summary>
     /// 执行批形成结果（P0-02）：`IsLegal=false` ⇒ 该需求**无合法批方案**，调用方须 fail-closed（不排该需求）。
+    ///
+    /// P0-01：`IsMissingPolicy=true` 表示失败类别是 **`BATCH_POLICY_MISSING`**（缺有效 Batch Policy），
+    ///   否则为 **`BATCH_POLICY_CONFLICT`**（有策略但 Min/Max/AllowSplit 无合法切分）。
+    ///   两者同属 **NonRepairable / HardFailure**（0号位 2026-10-08 §五）：Phase4 禁止进入普通 Local Repair。
     /// </summary>
     public sealed record ExecutionBatchFormation(
         bool IsLegal,
         string? ConflictReason,
-        IReadOnlyList<ExecutionBatchDraft> Batches)
+        IReadOnlyList<ExecutionBatchDraft> Batches,
+        bool IsMissingPolicy)
     {
         public static ExecutionBatchFormation Legal(IReadOnlyList<ExecutionBatchDraft> batches)
-            => new(true, null, batches);
+            => new(true, null, batches, false);
 
         public static ExecutionBatchFormation Conflict(string reason)
-            => new(false, reason, Array.Empty<ExecutionBatchDraft>());
+            => new(false, reason, Array.Empty<ExecutionBatchDraft>(), false);
+
+        /// <summary>P0-01：缺有效 Batch Policy（`BATCH_POLICY_MISSING`）。</summary>
+        public static ExecutionBatchFormation Missing(string reason)
+            => new(false, reason, Array.Empty<ExecutionBatchDraft>(), true);
     }
 
     /// <summary>
@@ -2280,7 +2387,8 @@ internal class PhaseTwoInitialScheduler
     ///
     /// 硬约束（任何策略都不得推翻）：
     ///   · A/B（`IsContinuation` / `NoSplitMerge`）⇒ **恒 1 批**（v1.6 NoSplitMerge；Phase4 P0_07 同向）。
-    ///   · 缺策略（`policy == null`）⇒ **恒 1 批**（缺 ⑧块不拆）。
+    ///   · C 桶**缺策略**（`policy == null`）⇒ **`IsLegal=false` / `IsMissingPolicy=true`**
+    ///     （`BATCH_POLICY_MISSING`，P0-01）—— **不再**回落成「不拆、恒 1 批」。
     ///
     /// 批数裁决见 <see cref="DecideExecutionBatchPlan"/>（**合法批域**：Min / Max / AllowSplit）。
     ///   **无合法批方案 ⇒ 返回 `IsLegal=false`**（调用方 fail-closed），**绝不产出非法批**。
@@ -2298,7 +2406,10 @@ internal class PhaseTwoInitialScheduler
         var plan = DecideExecutionBatchPlan(demand, policy);
         if (!plan.IsLegal)
         {
-            return ExecutionBatchFormation.Conflict(plan.ConflictReason!);
+            // P0-01：缺策略（`BATCH_POLICY_MISSING`）与冲突（`BATCH_POLICY_CONFLICT`）分列，供出口给不同 Reason。
+            return plan.IsMissingPolicy
+                ? ExecutionBatchFormation.Missing(plan.ConflictReason!)
+                : ExecutionBatchFormation.Conflict(plan.ConflictReason!);
         }
 
         return BuildBatchFormation(demand, policy, plan.Count, validateDomain: true);
@@ -2309,10 +2420,10 @@ internal class PhaseTwoInitialScheduler
     ///   与 P1-01 优化候选共用同一段切分逻辑（逐分不丢 + 边界复核），保证两条路径切分口径一致。
     ///
     /// 切分后逐批复核合法域：**仅在策略真正驱动了拆批**时校验（四舍五入可能把边界批推出域 ⇒ 越域即冲突，不静默放行）。
-    ///   排除两种「批数由更高优先级规则定死」的情形 —— 此时批数量**不受策略 Min/Max 管辖**，
+    ///   排除「批数由更高优先级规则定死」的情形 —— 此时批数量**不受策略 Min/Max 管辖**，
     ///   据策略判其越界会把合法批误杀：
-    ///     · A/B（`IsContinuation` / `NoSplitMerge`）⇒ 恒 1 批（B-003：A/B 不做普通自由拆合批）；
-    ///     · 缺策略（`policy == null`）⇒ 恒 1 批（缺 ⑧块不拆）。
+    ///     · A/B（`IsContinuation` / `NoSplitMerge`）⇒ 恒 1 批（B-003：A/B 不做普通自由拆合批）。
+    ///   （P0-01 后「缺策略」已不再进入本方法：C 桶缺策略在 `DecideExecutionBatchPlan` 即判硬失败。）
     /// </summary>
     private static ExecutionBatchFormation BuildBatchFormation(
         LogicalProductionDemand demand,
@@ -2386,7 +2497,8 @@ internal class PhaseTwoInitialScheduler
     ///   （不得因一个优化候选越界就把整个需求判冲突 —— 基线不受影响）。
     ///
     /// 不展开的条件（候选恒 = 1，直接返回基线）：
-    ///   · 无策略 / A/B（`IsContinuation` / `NoSplitMerge`）/ 非正数量 / `!AllowSplit`；
+    ///   · A/B（`IsContinuation` / `NoSplitMerge`）/ 非正数量 / `!AllowSplit`
+    ///     （`policy == null` 的 C 桶需求 P0-01 后已在上游判硬失败，到不了这里）；
     ///   · 唯一合法批数（`nMin == nMax`）。
     /// </summary>
     internal static List<ExecutionBatchFormation> EnumerateLegalBatchPlanCandidates(
@@ -2602,7 +2714,8 @@ internal class PhaseTwoInitialScheduler
         DateTime planningEnd,
         DateTime dynamicMaterialFloor,
         StageOverlapParams stageOverlap,
-        string? batchDraftKey = null)   // P0-01/P0-02：本批归批键（转交 ScheduleDemandOperations）
+        string? batchDraftKey = null,   // P0-01/P0-02：本批归批键（转交 ScheduleDemandOperations）
+        bool requireIdentityPreservingMerge = false)   // P1-01：只合并到「未归属执行批」的目标 Task
     {
         // P0-07：连续份额不可被普通 Merge 破坏逐工单身份，直接独立排程，不尝试合并。
         // v1.6 `:26` + 0号位 2026-10-07 裁决 `:246`「`NoSplitMerge` 及固定 Route/Path 应**显式落实**」：
@@ -2616,7 +2729,8 @@ internal class PhaseTwoInitialScheduler
         }
 
         // 检测是否可以合并到已有Task
-        var candidateTasks = FindMergeableTasks(demand, operations, scheduledTasks, constraints, demandByKey);
+        var candidateTasks = FindMergeableTasks(
+            demand, operations, scheduledTasks, constraints, demandByKey, requireIdentityPreservingMerge);
 
         if (candidateTasks.Count > 0)
         {
@@ -2624,7 +2738,7 @@ internal class PhaseTwoInitialScheduler
             var targetTask = candidateTasks[0];
 
             // 检查合并后是否破坏交期：合并后Duration增加，End时间延后
-            var mergedTask = TryMergeDemandIntoTask(demand, targetTask, routingGraph, constraints, resourceOccupancy, allocationTaskShare, planningEnd, demandByKey);
+            var mergedTask = TryMergeDemandIntoTask(demand, targetTask, routingGraph, constraints, resourceOccupancy, allocationTaskShare, planningEnd, demandByKey, batchDraftKey);
             if (mergedTask != null)
             {
                 // 合并成功：替换scheduledTasks中的旧Task
@@ -2663,7 +2777,8 @@ internal class PhaseTwoInitialScheduler
         List<OperationNode> operations,
         List<FinalTaskDraft> scheduledTasks,
         ConstraintContext constraints,
-        Dictionary<string, LogicalProductionDemand> demandByKey)
+        Dictionary<string, LogicalProductionDemand> demandByKey,
+        bool requireIdentityPreserving = false)
     {
         var candidates = new List<FinalTaskDraft>();
 
@@ -2679,6 +2794,14 @@ internal class PhaseTwoInitialScheduler
         // 遍历已排程的Task，找同Material、同Operation的Task
         foreach (var task in scheduledTasks)
         {
+            // ── P1-01（0号位 2026-10-08 §八）：多批需求下 Merge 必须**保持执行批身份** ──
+            //   目标 Task 若已归属某个执行批，合并后只能沿用**目标**批键 ⇒ 本批身份丢失
+            //   ⇒ 只接受「尚未归属任何执行批」的目标（合并后采用本批键，见 TryMergeDemandIntoTask）。
+            if (requireIdentityPreserving && task.ExecutionBatchDraftKey is not null)
+            {
+                continue;
+            }
+
             // Material必须相同
             if (task.MaterialId != demand.MaterialId) continue;
 
@@ -2744,7 +2867,8 @@ internal class PhaseTwoInitialScheduler
         Dictionary<int, List<TimeWindow>> resourceOccupancy,
         Dictionary<string, List<(string DemandKey, decimal ShareQty)>> allocationTaskShare,
         DateTime planningEnd,
-        Dictionary<string, LogicalProductionDemand>? demandByKey = null)
+        Dictionary<string, LogicalProductionDemand>? demandByKey = null,
+        string? batchDraftKey = null)   // P1-01：目标 Task 未归批时，合并结果**采用本批键**（批身份不丢）
     {
         // 计算合并后的总数量
         var mergedQty = targetTask.PlannedProcessQty + demand.PlannedProcessQty;
@@ -2873,7 +2997,9 @@ internal class PhaseTwoInitialScheduler
             // 被吸收 Demand 的血缘不丢：见下方 allocationTaskShare 追加记录。
             // Merge 仅适用于非连续份额（FindMergeableTasks 已排除 IsContinuation）⇒ ContinuationKey 恒 null。
             ContinuationKey = targetTask.ContinuationKey,
-            ExecutionBatchDraftKey = targetTask.ExecutionBatchDraftKey
+            // P1-01：目标未归批 ⇒ 合并结果采用**本批键**（执行批身份不丢）；目标已归批 ⇒ 沿用目标键
+            //   （`FindMergeableTasks` 在 requireIdentityPreserving 下已把「已归批目标」挡掉）。
+            ExecutionBatchDraftKey = targetTask.ExecutionBatchDraftKey ?? batchDraftKey
         };
 
         // 找到targetTask在scheduledTasks中的索引，替换为mergedTask
@@ -3005,8 +3131,55 @@ internal class InitialScheduleResult
     public List<string> BatchPolicyConflicts { get; set; } = new();
 
     /// <summary>
+    /// P0-01 整改（0号位 2026-10-08《未命名的Markdown文件 (1)(1).md》§四）：
+    /// 本 Run 中因 **C 桶缺有效 Batch Policy**（`BATCH_POLICY_MISSING`）而 fail-closed 的需求。
+    /// 与 <see cref="BatchPolicyConflicts"/> 分列 —— 两者原因类别不同，出口 Reason 亦不同。
+    /// </summary>
+    public List<string> BatchPolicyMissingDemandKeys { get; set; } = new();
+
+    /// <summary>
+    /// **需求键 → 硬失败原因**（`BATCH_POLICY_MISSING` / `BATCH_POLICY_CONFLICT`）。
+    ///
+    /// P0-02（0号位 2026-10-08 §五）：Solver 内部必须明确区分「**可修复未排**」与「**硬业务失败**」。
+    ///   本表就是硬失败登记：Phase4 读到即**跳过普通 Local Repair**（禁止绕过 Min/Max 硬约束），
+    ///   Phase5 读到即以本表值作为出口 `UnscheduledTaskResult.Reason`。
+    /// </summary>
+    public Dictionary<string, string> BatchPolicyHardFailures { get; set; } = new(StringComparer.Ordinal);
+
+    /// <summary>
+    /// **未落定执行批身份**（P0-03，0号位 2026-10-08 §六 / §十一-2）。
+    ///
+    /// 语义：Phase2 逐批落定时，首个失败批**及其后所有未试批**在此登记
+    ///   （已落定的前序批**不登记** ⇒ Phase4 不得重新展开它们）。
+    /// Phase4 `ExpandRepairUnits` 只按本表展开修复单元 ⇒ 需求级成功条件从
+    ///   「任意一批修出」收紧为「**所有未落定批全部修出**」（§十一-2）。
+    /// </summary>
+    public List<FailedExecutionBatch> FailedExecutionBatches { get; set; } = new();
+
+    /// <summary>
     /// P0-03+P0-15修复：技术失败标记（Routing非法、数据结构错误等）
     /// </summary>
     public bool TechnicalFailure { get; set; } = false;
     public string? TechnicalFailureReason { get; set; }
+
+    /// <summary>某需求是否属**硬业务失败**（Batch Policy 缺失 / 冲突）—— Phase4 据此禁止普通修复。</summary>
+    public bool IsBatchPolicyHardFailure(string logicalDemandKey)
+        => BatchPolicyHardFailures.ContainsKey(logicalDemandKey);
 }
+
+/// <summary>
+/// **未落定执行批**（P0-03，0号位 2026-10-08《未命名的Markdown文件 (1)(1).md》§六）。
+///
+/// 0号位 指定字段：`LogicalDemandKey` / `ExecutionBatchDraftKey` / `BatchQty` / `RouteCode` / `PathId`。
+///   `RouteCode` / `PathId` 在「本批已选出路径但落定失败」时有值；「尚未被尝试的批」为 null
+///   （Phase4 修复时按 `TryGetBatchRoutingGraph` 既有解析顺序取图，不在此处猜）。
+/// Scheduling 内部类型，**非 1↔2 契约面**（不动 Core）。
+/// </summary>
+internal sealed record FailedExecutionBatch(
+    string LogicalDemandKey,
+    string ExecutionBatchDraftKey,
+    int Ordinal,
+    decimal BatchQty,
+    decimal BatchPlannedProcessQty,
+    string? RouteCode,
+    long? PathId);

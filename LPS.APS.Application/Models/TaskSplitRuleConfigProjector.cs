@@ -10,7 +10,8 @@ namespace LPS.APS.Application.Models;
 ///   * SetRules / ExtractRules：ContentSnapshotJson.BatchPolicy 子块编解码（与 SetupTransitionRules 同轨，零 DDL）。
 /// 发布编排在 GovernanceVersionService.PublishParameterSetVersionAsync（读表 active 规则 → Project → 注入第⑧块源）；
 /// 装载在 FrozenStrategySnapshotProvider.DeserializeBatchPolicy（ContentSnapshotJson.BatchPolicy 子块 → 第⑧块）。
-/// 缺策略 fail-closed（BATCH_POLICY_MISSING）属 1号位 消费侧行为（查无 (Material,Dept) 命中规则即失败），本投影不承载信号位。
+/// 装载 fail-open（缺子块/为空/损坏 → 空列表：⑧ 为非必填块，与⑦ Setup 同轨，05契约 §6.10.5）；
+/// 匹配终端（某 Material+Dept 经 ①②③ 仍无命中）按冻结 §十五 ④ fail-closed，由 1号位 消费侧在 Strategy Snapshot 校验阶段执行，装载端不承载信号位。
 /// 开发者：3号位
 /// </summary>
 public static class TaskSplitRuleConfigProjector
@@ -56,32 +57,40 @@ public static class TaskSplitRuleConfigProjector
             .ToList();
     }
 
-    /// <summary>装载端便捷入口：ContentSnapshotJson.BatchPolicy 子块 → 第⑧块快照（fail-open：缺失/为空/损坏 → 空列表）。</summary>
+    /// <summary>装载端便捷入口：ContentSnapshotJson.BatchPolicy 子块 → 第⑧块快照（fail-open：缺失/为空/损坏 → 空列表，⑧ 为非必填块）。</summary>
     public static List<BatchPolicyRuleSnapshot> ProjectFromSnapshot(string? contentSnapshotJson)
         => ExtractRules(contentSnapshotJson);
 
-    /// <summary>提取 BatchPolicy 子块（反序列化 BatchPolicyRuleSnapshot 列表；缺失/为 null/损坏 → 空列表）。</summary>
+    /// <summary>
+    /// 提取 BatchPolicy 子块（反序列化 BatchPolicyRuleSnapshot 列表）。
+    /// 装载 fail-open：缺子块/为空/损坏 → 空列表（⑧ 为非必填块，与⑦ Setup 同轨，05契约 §6.10.5）。
+    /// 冻结 §十五 fail-closed 属匹配终端 ④（某 Material+Dept 经 ①②③ 仍无命中 → Strategy Snapshot 校验失败），
+    /// 由 1号位 消费侧执行，本装载端不承载信号位。
+    /// </summary>
     public static List<BatchPolicyRuleSnapshot> ExtractRules(string? contentSnapshotJson)
     {
         if (string.IsNullOrWhiteSpace(contentSnapshotJson))
         {
-            return new List<BatchPolicyRuleSnapshot>();
+            return [];
         }
 
         try
         {
             using var doc = JsonDocument.Parse(contentSnapshotJson);
-            if (!doc.RootElement.TryGetProperty(BatchPolicyBlockName, out var block))
+            if (!doc.RootElement.TryGetProperty(BatchPolicyBlockName, out var block)
+                || block.ValueKind == JsonValueKind.Null)
             {
-                return new List<BatchPolicyRuleSnapshot>();
+                // 子块缺失或为 null → 该版本未配置批量策略（合法，非装载失败）。
+                return [];
             }
 
-            var rules = block.Deserialize<List<BatchPolicyRuleSnapshot>>(JsonOptions);
-            return rules ?? new List<BatchPolicyRuleSnapshot>();
+            return block.Deserialize<List<BatchPolicyRuleSnapshot>>(JsonOptions) ?? [];
         }
         catch (JsonException)
         {
-            return new List<BatchPolicyRuleSnapshot>();
+            // JSON 损坏 → 空列表（fail-open）。兜底由匹配终端 ④ fail-closed 承担（1号位 消费侧），
+            // 装载端不静默产出"版本追溯失真"假数据、也不承载信号位。
+            return [];
         }
     }
 

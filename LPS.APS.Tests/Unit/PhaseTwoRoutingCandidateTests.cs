@@ -157,7 +157,10 @@ public class PhaseTwoRoutingCandidateTests
             CalendarSlots = calendars,
             StrategySnapshot = new SolverStrategySnapshot
             {
-                Parameters = new FiniteCapacityParameters { SchedulingDirection = direction }
+                Parameters = new FiniteCapacityParameters { SchedulingDirection = direction },
+                // P0-01（0号位 2026-10-08 §四）：C 桶必须显式给出有效 Batch Policy，否则 Fail Closed。
+                //   本夹具验证的是 Routing 候选择优，非批决策 ⇒ Material 级宽松策略（恒 1 批）。
+                BatchPolicies = TestBatchPolicy.Permissive(MaterialId)
             }
         };
     }
@@ -461,7 +464,10 @@ public class PhaseTwoRoutingCandidateTests
                 {
                     SchedulingDirection = direction,
                     AllowMerge = allowMerge
-                }
+                },
+                // P0-01（0号位 2026-10-08 §四）：C 桶必须显式给出有效 Batch Policy，否则 Fail Closed。
+                //   `AllowMerge` 镜像夹具参数：策略是 Merge 的正式控制源（§八 P1-01）。
+                BatchPolicies = TestBatchPolicy.Permissive(MaterialId, allowMerge)
             }
         };
     }

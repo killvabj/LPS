@@ -1135,12 +1135,15 @@ internal class ConstraintContext
     /// **解析**：<see cref="PhaseTwoInitialScheduler.ResolveExecutionBatchPolicy"/> 按需求
     ///   `(MaterialId, StartStageCode → ProductionDepartmentId)` 精确命中；未命中回落
     ///   `(MaterialId, ProductionDepartmentId == null)` 的 **Material 级默认**（该默认语义由 ⑧块 DTO 自身承载）；
-    ///   仍无命中 ⇒ **缺策略**（不拆，恒 1 批；不认领 `BATCH_POLICY_MISSING` —— 与 0号位 20260928 §十五 四级兜底链冲突，属待裁项）。
+    ///   仍无命中 ⇒ **缺策略**。⚠ P0-01（0号位 2026-10-08 §四）后缺策略**不再**等于「不拆、恒 1 批」：
+    ///   C 桶需求一律判 `BATCH_POLICY_MISSING` 并 **Fail Closed**（不产 FinalTask、不进 Phase4）。
+    ///   正式兜底链第③级「Global Batch Default」由 2/3号位 在上游**投影成有效 Policy** 后再交 1号位，
+    ///   1号位 不得自行展开该级、更不得把末级 `null` 解释成「单批合法」。
     ///
     /// **载体**：`SolverStrategySnapshot.BatchPolicies`（⑧块，1↔2 契约，0号位 (7).md §十/§十一）⇒
     ///   `PhaseOneConstraintBuilder.BuildExecutionBatchPolicies` **整块逐字**收进本集合（**不在装载层裁剪**，
     ///   键域解析统一由 `ResolveExecutionBatchPolicy` 负责）。
-    ///   空集合 ⇒ `FormExecutionBatches` 每需求恒 1 批（不拆），行为与旧版逐字一致。
+    ///   空集合 ⇒ 每个 C 桶需求均判 `BATCH_POLICY_MISSING`（Fail Closed）。
     /// </summary>
     public List<LPS.APS.Core.Dto.BatchPolicyRuleSnapshot> ExecutionBatchPolicies { get; set; } = new();
 

@@ -119,7 +119,7 @@ public class FrozenStrategySnapshotProvider : IFrozenStrategySnapshotProvider
             SetupTransitionRules = DeserializeSetupTransitionRules(ruleSetVersion),
 
             // ⑧ 批量策略 Batch Policy（0号位 2026-10-07 裁决本轮落码）：ParameterSetVersion.ContentSnapshotJson.BatchPolicy 子块 → 第⑧块。
-            // fail-open：缺子块/为空 = 无批量策略规则（缺策略 fail-closed 属 1号位 消费侧 BATCH_POLICY_MISSING，本块不承载信号位）。
+            // fail-open：缺子块/为空/损坏 → 空列表（⑧ 为非必填块，与⑦ Setup 同轨；匹配终端 ④ fail-closed 属 1号位 消费侧）。
             BatchPolicy = DeserializeBatchPolicy(parameterSetVersion)
         };
 
@@ -203,7 +203,8 @@ public class FrozenStrategySnapshotProvider : IFrozenStrategySnapshotProvider
 
     /// <summary>
     /// 从 ParameterSetVersion.ContentSnapshotJson 反序列化 BatchPolicy 子块 → 第⑧块快照。
-    /// fail-open：缺失/为空/损坏 → 空列表（无批量策略规则；缺策略 fail-closed 属消费侧），与 ⑦ Setup 规则同轨。
+    /// fail-open：缺失/为空/损坏 → 空列表（⑧ 为非必填块，与⑦ Setup 同轨）。
+    /// 冻结 §十五「仍无规则 → Strategy Snapshot 校验失败」属匹配终端 ④，由 1号位 消费侧执行，装载端不承载信号位。
     /// </summary>
     private List<BatchPolicyRuleSnapshot> DeserializeBatchPolicy(
         LPS.APS.Core.Entities.APS.ParameterSetVersion version)
