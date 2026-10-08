@@ -751,6 +751,12 @@
              参考：复审报告P1-01
              </summary>
         </member>
+        <member name="M:LPS.APS.Web.Controllers.ProcurementManualEtaController.ListWarehouses(System.String,System.Threading.CancellationToken)">
+            <summary>
+            收货仓库下拉（数据源：ext_MES_ProcessCode_View，processcode→code、processname→name）
+            GET /api/procurement-manual-eta/warehouses
+            </summary>
+        </member>
         <member name="M:LPS.APS.Web.Controllers.ProcurementManualEtaController.Query(System.String,System.String,System.String,System.String,System.Nullable{System.DateTime},System.Nullable{System.DateTime},System.Nullable{System.DateTime},System.Boolean,System.Int32,System.Int32,System.Threading.CancellationToken)">
             <summary>
             查询Manual ETA列表
@@ -769,6 +775,11 @@
         <member name="M:LPS.APS.Web.Controllers.ProcurementManualEtaController.Cancel(System.String,System.Int32,LPS.APS.Web.Controllers.CancelManualEtaRequest,System.Threading.CancellationToken)">
             <summary>
             取消Manual ETA（设置IsActive=0）
+            </summary>
+        </member>
+        <member name="T:LPS.APS.Web.Controllers.WarehouseLookupItem">
+            <summary>
+            收货仓库下拉项（数据源 ext_MES_ProcessCode_View：processcode→Code、processname→Name）
             </summary>
         </member>
         <member name="T:LPS.APS.Web.Controllers.CancelManualEtaRequest">

@@ -601,7 +601,7 @@ internal class PhaseTwoInitialScheduler
         {
             if (occupancy.ContainsKey(lockedTask.ResourceId))
             {
-                occupancy[lockedTask.ResourceId].Add(
+                AddOccupancyWindow(occupancy, null, lockedTask.ResourceId,
                     new TimeWindow(lockedTask.LockedStart, lockedTask.LockedEnd));
             }
         }
@@ -613,7 +613,7 @@ internal class PhaseTwoInitialScheduler
             {
                 if (occupancy.ContainsKey(block.ResourceId))
                 {
-                    occupancy[block.ResourceId].Add(
+                    AddOccupancyWindow(occupancy, null, block.ResourceId,
                         new TimeWindow(block.StartTime, block.EndTime));
                 }
             }
@@ -894,7 +894,8 @@ internal class PhaseTwoInitialScheduler
         StageOverlapParams stageOverlap,
         bool mergeAllowed,
         Dictionary<string, RoutePathKey> chosenBatchRoutePaths,
-        Dictionary<string, RoutePathKey> chosenRoutePaths)
+        Dictionary<string, RoutePathKey> chosenRoutePaths,
+        Dictionary<int, List<TimeWindow>>? occupancyPristine = null)   // 2026-10-08 COW：本表为克隆时传入其冻结快照
     {
         // 多批时 Merge 受**身份保持**判据约束（见循环内 P1-01）。
         var multiBatch = batches.Count > 1;
@@ -951,22 +952,68 @@ internal class PhaseTwoInitialScheduler
                     continue;
                 }
 
-                constraints.ProductTimeline = realTimeline.Clone();
-                var trialOccupancy = CloneOccupancy(resourceOccupancy);
-                var trialTasks = new List<FinalTaskDraft>(scheduledTasks);
-                var trialShares = CloneShares(allocationTaskShare);
-                var beforeEnds = trialTasks.ToDictionary(t => t.FinalDraftId, t => t.PlannedEndTime);
+                // 性能计数（§九「Routing 试跑次数」）：每个（执行批 × Routing 候选）⇒ 一次候选试排。
+                SolverDiagnostics.CountRoutingTrial();
 
+                long swTimeline2 = SolverDiagnostics.HotspotStart();
+                constraints.ProductTimeline = realTimeline.Clone();
+                SolverDiagnostics.HotspotEnd(swTimeline2, SolverDiagnostics.Hotspot.TimelineClone);
+
+                var trialOccupancy = CloneOccupancy(resourceOccupancy, out var trialOccupancyPristine);
+
+                // ── 性能（2026-10-08 第①刀）：把隔离判据从「开了 Merge」收紧为「Merge **结构上可能发生**」 ──
+                //   `scheduledTasks` / `allocationTaskShare` 的**唯一**写入方是 Merge 路径
+                //   （`TryMergeOrSchedule` → `TryMergeDemandIntoTask`）。而 `RunDemandSchedule` 走 Merge 路径还需：
+                //     ① `allowMerge == true`；
+                //     ② **非**连续份额 —— `TryMergeOrSchedule` 首部 `if (IsContinuation || NoSplitMerge) return
+                //        ScheduleDemandOperations(...)`（`NoSplitMerge`＝不拆不合，P0-07 显式落实）；
+                //     ③ 工序数为 1 —— `FindMergeableTasks` 首行 `if (operations.Count != 1) return candidates;`
+                //        （多工序必须独立排程保 DAG 完整性）⇒ 返回空 ⇒ 直接落 `ScheduleDemandOperations`。
+                //   三条**任一不满足 ⇒ 构造上不可能写这两张表** ⇒ 试排无需隔离，直接传真实对象。
+                //   而 `ScheduleDemandOperations` / `ScheduleForward` / `ScheduleBackward` 的**签名里根本没有**
+                //   这两个参数 ⇒ 连「误写」的机会都没有。
+                //   旧实现要求三者全满足才克隆（`allowMergeForThisBatch` 一个条件），**多工序需求每次都白克隆**
+                //   两张 O(N) 大表 —— 本项目常态是多工序 ⇒ 这一刀省下的是**绝大多数**克隆。
+                //   **零回归**：判据只把「不可能写」的情形改为不克隆；能写的情形（单工序自由份额 + 开 Merge）
+                //   逐字保留原克隆路径。
+                var mergeStructurallyPossible = allowMergeForThisBatch
+                                                && ops.Count == 1
+                                                && !batchDemand.IsContinuation
+                                                && !batchDemand.NoSplitMerge;
+
+                List<FinalTaskDraft> trialTasks;
+                Dictionary<string, List<(string DemandKey, decimal ShareQty)>> trialShares;
+                if (mergeStructurallyPossible)
+                {
+                    // 性能计数（§九「CloneTaskList 次数」）：Merge 分支的全量任务表复制（O(N)）。
+                    SolverDiagnostics.CountCloneTaskList();
+                    long swTasks2 = SolverDiagnostics.HotspotStart();
+                    trialTasks = new List<FinalTaskDraft>(scheduledTasks);
+                    SolverDiagnostics.HotspotEnd(swTasks2, SolverDiagnostics.Hotspot.CloneTaskList);
+                    trialShares = CloneShares(allocationTaskShare);
+                }
+                else
+                {
+                    trialTasks = scheduledTasks;
+                    trialShares = allocationTaskShare;
+                }
+
+                long swDemand = SolverDiagnostics.HotspotStart();
                 var produced = RunDemandSchedule(
                     batchDemand, ops, graph, direction, constraints, trialOccupancy,
                     trialTasks, trialShares, demandByKey, request.PlanningStart, request.PlanningEnd,
-                    dynamicMaterialFloor, stageOverlap, allowMergeForThisBatch, batch.BatchDraftKey,
-                    requireIdentityPreserving);
+                    dynamicMaterialFloor, stageOverlap, allowMergeForThisBatch,
+                    out var mergedIntoTask, batch.BatchDraftKey,
+                    requireIdentityPreserving, trialOccupancyPristine);
+                SolverDiagnostics.HotspotEnd(swDemand, SolverDiagnostics.Hotspot.DemandSchedule);
 
-                // Merge 成功时返回空 List，且替换了 scheduledTasks 中的既有 Task（完成时间变化）
-                var merged = produced.Count == 0 &&
-                             trialTasks.Any(t => beforeEnds.TryGetValue(t.FinalDraftId, out var oldEnd)
-                                                 && oldEnd != t.PlannedEndTime);
+                // ── 2026-10-08 第②刀：合并与否 + 合并后完成时间，均由 Merge 路径**显式上报**
+                //   （`mergedIntoTask`），取代旧的「试排前后整表 PlannedEndTime 比对推断」。
+                //   旧判据每次试排都要构造 `trialTasks.ToDictionary(t => t.FinalDraftId, t => t.PlannedEndTime)`
+                //   —— 一次**上万个 Entry 的字典** ⇒ 实测该档单次求解 15.9 GB 托管分配的主要来源之一
+                //   （38,877 次试排 × O(N)）。同时旧式「end 变了才算」若 end 恰好未变会**误判为未合并**
+                //   （把已登记份额的需求记成不可行）；显式上报无此隐患。
+                var merged = mergedIntoTask is not null;
 
                 var feasible = produced.Count > 0 || merged;
 
@@ -979,12 +1026,10 @@ internal class PhaseTwoInitialScheduler
                 {
                     completion = produced.Max(t => t.PlannedEndTime);
                 }
-                else if (merged)
+                else if (mergedIntoTask is not null)
                 {
-                    // 合并成功的 signal：既有 Task 的 PlannedEndTime 相对试排前发生了变化。
-                    var mergedTask = trialTasks.FirstOrDefault(t =>
-                        beforeEnds.TryGetValue(t.FinalDraftId, out var oldEnd) && oldEnd != t.PlannedEndTime);
-                    completion = mergedTask?.PlannedEndTime ?? DateTime.MinValue;
+                    // 合并成功：完成时间 = **合并后任务**的 PlannedEndTime（Merge 路径直接上报，无需再反查）。
+                    completion = mergedIntoTask.PlannedEndTime;
                 }
                 else
                 {
@@ -1034,7 +1079,7 @@ internal class PhaseTwoInitialScheduler
                 batchDemand, winner.Ops, winner.Graph, direction, constraints, resourceOccupancy,
                 scheduledTasks, allocationTaskShare, demandByKey,
                 request.PlanningStart, request.PlanningEnd, dynamicMaterialFloor, stageOverlap,
-                allowMergeForThisBatch, batch.BatchDraftKey, requireIdentityPreserving);
+                allowMergeForThisBatch, out _, batch.BatchDraftKey, requireIdentityPreserving, occupancyPristine);
 
             // 第5轮Merge修复：Merge成功时返回空List，但Demand已进入TaskShare，不应标记为Unscheduled
             if (batchTasks.Count == 0)
@@ -1106,9 +1151,19 @@ internal class PhaseTwoInitialScheduler
 
         for (int i = 0; i < candidates.Count; i++)
         {
+            // 性能计数（§九「BatchPlanCandidate 试跑次数」）：每个批方案候选 ⇒ 一次完整 RunBatchPlan 试跑。
+            SolverDiagnostics.CountBatchPlanCandidateTrial();
+
+            long swTimeline = SolverDiagnostics.HotspotStart();
             constraints.ProductTimeline = realTimeline.Clone();
-            var trialOccupancy = CloneOccupancy(resourceOccupancy);
+            SolverDiagnostics.HotspotEnd(swTimeline, SolverDiagnostics.Hotspot.TimelineClone);
+
+            var trialOccupancy = CloneOccupancy(resourceOccupancy, out var trialOccupancyPristine);
+            // 性能计数（§九「CloneTaskList 次数」）：这里是 §七.1 点名的**全量任务表复制**（O(N)）。
+            SolverDiagnostics.CountCloneTaskList();
+            long swTasks = SolverDiagnostics.HotspotStart();
             var trialTasks = new List<FinalTaskDraft>(scheduledTasks);
+            SolverDiagnostics.HotspotEnd(swTasks, SolverDiagnostics.Hotspot.CloneTaskList);
             var trialShares = CloneShares(allocationTaskShare);
             // 一次性副本：试跑**不得**污染真实选路登记表（P0-03 逐批登记只在落定批上发生）。
             var trialChosenBatch = new Dictionary<string, RoutePathKey>(
@@ -1116,10 +1171,13 @@ internal class PhaseTwoInitialScheduler
             var trialChosen = new Dictionary<string, RoutePathKey>(
                 constraints.ChosenRoutePaths, StringComparer.Ordinal);
 
+            long swBatchTrial = SolverDiagnostics.HotspotStart();
             var outcome = RunBatchPlan(
                 candidates[i].Batches, actualDemand, plannedCandidates, direction, constraints,
                 trialOccupancy, trialTasks, trialShares, demandByKey, request,
-                dynamicMaterialFloor, stageOverlap, mergeAllowed, trialChosenBatch, trialChosen);
+                dynamicMaterialFloor, stageOverlap, mergeAllowed, trialChosenBatch, trialChosen,
+                trialOccupancyPristine);
+            SolverDiagnostics.HotspotEnd(swBatchTrial, SolverDiagnostics.Hotspot.BatchPlanTrial);
 
             if (i == 0
                 || CompareBatchPlans(outcome, candidates[i], bestOutcome, candidates[bestIndex],
@@ -1211,8 +1269,10 @@ internal class PhaseTwoInitialScheduler
         DateTime dynamicMaterialFloor,
         StageOverlapParams stageOverlap,
         bool allowMerge,
+        out FinalTaskDraft? mergedIntoTask,   // 2026-10-08 第②刀：Merge **自己上报**合并后的 Task（取代整表 end 比对推断）
         string? batchDraftKey = null,   // P0-01/P0-02：本批归批键（null ⇒ 回落 ExecutionBatchKey(demandKey, 1)）
-        bool requireIdentityPreservingMerge = false)   // P1-01：多批需求 ⇒ 只合并到「未归属执行批」的目标 Task
+        bool requireIdentityPreservingMerge = false,   // P1-01：多批需求 ⇒ 只合并到「未归属执行批」的目标 Task
+        Dictionary<int, List<TimeWindow>>? occupancyPristine = null)   // 2026-10-08 COW：占用表冻结快照（null ⇒ 自有表）
     {
         // 第4轮Merge修复：检测是否可以合并到已有Task
         if (allowMerge)
@@ -1220,13 +1280,15 @@ internal class PhaseTwoInitialScheduler
             return TryMergeOrSchedule(
                 demand, operations, routingGraph, direction, constraints,
                 resourceOccupancy, scheduledTasks, allocationTaskShare, demandByKey,
-                planningStart, planningEnd, dynamicMaterialFloor, stageOverlap, batchDraftKey,
-                requireIdentityPreservingMerge);
+                planningStart, planningEnd, dynamicMaterialFloor, stageOverlap,
+                out mergedIntoTask, batchDraftKey,
+                requireIdentityPreservingMerge, occupancyPristine);
         }
 
+        mergedIntoTask = null;   // 未走 Merge 路径 ⇒ 构造上不可能合并
         return ScheduleDemandOperations(
             demand, operations, routingGraph, direction, constraints,
-            resourceOccupancy, planningStart, planningEnd, dynamicMaterialFloor, stageOverlap, batchDraftKey);
+            resourceOccupancy, planningStart, planningEnd, dynamicMaterialFloor, stageOverlap, batchDraftKey, occupancyPristine);
     }
 
     /// <summary>
@@ -1332,15 +1394,106 @@ internal class PhaseTwoInitialScheduler
         return minutes > 0 ? minutes : 0;
     }
 
-    /// <summary>资源占用深拷贝（候选试排隔离用）。</summary>
+    /// <summary>
+    /// 资源占用**试排隔离副本**（copy-on-write）。
+    ///
+    /// ── 2026-10-08 性能（0号位《未命名的Markdown文件 (2)(1).md》§7.1/§7.2 + §十 允许的「增量 Delta /
+    ///    Copy-on-write」）──
+    /// 旧实现**每次** `source.ToDictionary(kv => kv.Key, kv => new List&lt;TimeWindow&gt;(kv.Value))`
+    /// ⇒ 每次克隆都为**每一个资源**分配并复制完整占用窗列表。实测 42,261 Task 场景本方法被调用 **94,940 次**，
+    /// 8,000 目标档下累计 **4,585 ms（ΣPhase 21.8%）**，并贡献约 **11.7 GB / 20.5 GB** 的全部托管分配
+    /// ⇒ 直接推高 Gen2 GC（该档实测 **596 次 Gen2**）。这是「速度慢」单项最大的来源。
+    ///
+    /// 新实现：**只做两层浅拷**（工作副本 + 冻结快照，均为 O(资源数) 的指针拷贝），
+    /// 占用窗列表本体**暂共享**；谁真被写、谁才在写入前深拷**该**资源那一份（见 <see cref="EnsureOwned"/>）。
+    /// 单条需求试排最多命中其工序合格资源（本例 ≤3），资源数 200 ⇒ 单次克隆的列表复制量降到约 1/66。
+    ///
+    /// **语义零变化（构造上安全）**：返回的 `pristine` 是**冻结快照**，两侧写入前都比对
+    /// `ReferenceEquals(working[rid], pristine[rid])` —— 相等才拷贝。快照本身永不被改写，
+    /// 故「克隆视图」与「源视图」在任何写入顺序下都不会互相污染
+    /// （这正是旧实现深拷所保证的不变式，现改为按需支付）。
+    /// </summary>
     private static Dictionary<int, List<TimeWindow>> CloneOccupancy(
-        Dictionary<int, List<TimeWindow>> source)
-        => source.ToDictionary(kv => kv.Key, kv => new List<TimeWindow>(kv.Value));
+        Dictionary<int, List<TimeWindow>> source,
+        out Dictionary<int, List<TimeWindow>> pristine)
+    {
+        // 性能计数（0号位 2026-10-08《未命名的Markdown文件 (2)(1).md》§九「CloneOccupancy 次数」）。
+        SolverDiagnostics.CountCloneOccupancy();
+        long sw = SolverDiagnostics.HotspotStart();
+
+        var working = new Dictionary<int, List<TimeWindow>>(source);    // 浅拷：O(资源数)
+        pristine = new Dictionary<int, List<TimeWindow>>(source);       // 冻结快照：O(资源数)，永不被改写
+
+        SolverDiagnostics.HotspotEnd(sw, SolverDiagnostics.Hotspot.CloneOccupancy);
+        return working;
+    }
+
+    /// <summary>
+    /// 写入前确保 `working[resourceId]` 是**本实例独占**的列表（copy-on-write）。
+    /// `pristine == null` ⇒ 该表是本实例自有（非克隆），直接原地写。
+    /// 否则该 list 若仍与冻结快照共享 ⇒ 先深拷一份再写（原表与快照均不受影响）。
+    /// </summary>
+    private static void EnsureOwned(
+        Dictionary<int, List<TimeWindow>> working,
+        Dictionary<int, List<TimeWindow>>? pristine,
+        int resourceId)
+    {
+        if (pristine is null) return;
+        if (!working.TryGetValue(resourceId, out var list)) return;     // 新键：本就本实例独占
+        if (pristine.TryGetValue(resourceId, out var original) && ReferenceEquals(list, original))
+        {
+            working[resourceId] = new List<TimeWindow>(original);
+        }
+    }
+
+    /// <summary>
+    /// 占用表**有序插入**（2026-10-08 SlotSearch 索引化）。
+    /// ── 为什么 ──
+    /// 读取端 <see cref="FindFirstAvailableSlot"/> / <see cref="HasConflict"/> 旧实现**每次调用**都要从头扫全表
+    /// （前者还先扫一遍确认「表是否有序」）。实测 42,261 Task 档该调用族共 **4,682,936 次**，
+    /// 占该档 ΣPhase 的 **36.6%（8k）/ 65%（20k）**，是当前最大单项。
+    /// 维持「列表按 `Start` 升序」不变式后，读取端可**二分跳段**，免掉那两趟 O(W)。
+    /// ── 代价取舍 ──
+    /// 有序插入的 `List.Insert` 是 O(W) 搬移；把成本从**读**（4.68M 次）挪到**写**（约 4 万次），
+    /// 且正排天然追加在末尾 ⇒ 二分定位到 `Count` ⇒ `Insert` 退化为 O(1) 追加。
+    /// ── 不变式与前提（读取端的正确性依赖它们）──
+    /// ① 该资源列表按 `Start` 升序 —— 由本方法保证，且 **Phase2 所有写入点都经本方法**
+    ///    （初始构建 / 正排 / 倒排 / Merge 追加）。
+    /// ② 该资源上的窗**互不重叠**（⇒ `End` 随 `Start` 非降）—— 由「找槽只在空档落位」
+    ///    与「Merge 先冲突检查再改写」保证；读取端据此才敢整体跳过某段前缀。
+    /// ⚠ Phase4 自建占用表、自用其 slot finder，**不在本变更范围**（其占比仅 3.5%）。
+    /// </summary>
+    private static void AddOccupancyWindow(
+        Dictionary<int, List<TimeWindow>> occupancy,
+        Dictionary<int, List<TimeWindow>>? pristine,
+        int resourceId,
+        TimeWindow window)
+    {
+        EnsureOwned(occupancy, pristine, resourceId);
+
+        var list = occupancy[resourceId];
+        int lo = 0, hi = list.Count;
+        while (lo < hi)
+        {
+            var mid = (lo + hi) / 2;
+            var w = list[mid];
+            if (w.Start < window.Start || (w.Start == window.Start && w.End <= window.End)) lo = mid + 1;
+            else hi = mid;
+        }
+        list.Insert(lo, window);
+    }
 
     /// <summary>合批份额深拷贝（候选试排隔离用）。</summary>
     private static Dictionary<string, List<(string DemandKey, decimal ShareQty)>> CloneShares(
         Dictionary<string, List<(string DemandKey, decimal ShareQty)>> source)
-        => source.ToDictionary(kv => kv.Key, kv => new List<(string, decimal)>(kv.Value));
+    {
+        // 性能计数（§九「Clone 次数」族）：份额表重建为 O(N) 字典操作，是候选试排隔离的成本之一。
+        SolverDiagnostics.CountCloneShares();
+        long sw = SolverDiagnostics.HotspotStart();
+        var result = source.ToDictionary(kv => kv.Key, kv => new List<(string, decimal)>(kv.Value));
+        SolverDiagnostics.HotspotEnd(sw, SolverDiagnostics.Hotspot.CloneShares);
+        return result;
+    }
 
     /// <summary>
     /// 排程单个需求的所有工序
@@ -1357,7 +1510,8 @@ internal class PhaseTwoInitialScheduler
         DateTime planningEnd,
         DateTime dynamicMaterialFloor,
         StageOverlapParams stageOverlap,
-        string? batchDraftKey = null)
+        string? batchDraftKey = null,
+        Dictionary<int, List<TimeWindow>>? occupancyPristine = null)   // 2026-10-08 COW：透传给写占用表的工序
     {
         var tasks = new List<FinalTaskDraft>();
 
@@ -1367,35 +1521,52 @@ internal class PhaseTwoInitialScheduler
         //     ⇒ `AUTO` 是**正式冻结取值**，必须显式承载，不再由 `else` 隐式兜底。
         //   · 规则清单 v1.5 **B-005**：Direction 由 DemandGoal / RequiredAvailableTime / Slack / Material /
         //     Resource / Execution / Firm-Frozen-Lock 等上下文综合决定，Owner = 1号位。
-        //   · 0号位 2026-10-07 裁决 **Q-1**：「MIXED/**AUTO** → 沿用现有 Mixed 结果」。
-        // ⇒ 本实现内 `AUTO` 与 `MIXED` **行为等价**（先倒排、失败转正排），此处显式并列为同一分支；
-        //   真正的「按上下文自决方向」（B-005 完整语义）尚未实现，属**未落码项**，不得据此认为已达标。
+        //   · 业务基线 v1.8 §Demand Goal、Batch、Direction、Routing：同义（不得由 OrderType 硬映射）。
+        //
+        // ── 2026-10-08 复审 P1-DIR-01 整改（0号位《未命名的Markdown文件 (2)(1).md》§三 / §十四 第二优先级）──
+        //   **撤销**「`AUTO` 与 `MIXED` 行为等价（沿用 0号位 2026-10-07 Q-1）」的实现 —— 0号位 明判：
+        //   「`AUTO == MIXED` 不能再作为最终 V1 实现」，此项关闭前 1号位 不能通过 V1 完整性验收。
+        //   `AUTO` 现改为**按本需求/本执行批自身上下文正式自决**（见 <see cref="SchedulingDirectionResolver"/>）：
+        //     Firm/Frozen/Lock + Execution 连续性 + Material 下界 + RequiredAvailableTime/Slack + Resource
+        //     （+ DemandGoal，载体缺失时登记缺口）⇒ FORWARD / BACKWARD / MIXED 三者之一。
+        //   调用点位置正确性：P0-01 链规定「每个 Batch 分别进行 Direction + RoutingCandidate + Resource +
+        //     Calendar + Setup 联合求解」⇒ 本方法**逐需求逐批**被调用，正是 `ResolveDirection(demand / executionBatch, context)`。
+        //   ⚠ `demandGoal: null`：冻结侧 `DemandGoal`（P-006 两值）**无 C# 载体**（全仓 grep 零命中），
+        //     属 2号位 Pegging 传播缺口（P-008）；此处**不猜、不自造字段**，由 Resolver 记 `DEMAND_GOAL_ABSENT`。
+        //   `MIXED` 保持字面语义不变（0号位 §三：可作为人工/策略明确模式继续保留）。
+        if (direction == SchedulingDirectionResolver.Auto)
+        {
+            direction = SchedulingDirectionResolver.Resolve(
+                demand, operations, constraints, planningStart, dynamicMaterialFloor,
+                demandGoal: null).Direction;
+        }
+
         if (direction == "BACKWARD")
         {
-            tasks = ScheduleBackward(demand, operations, routingGraph, constraints, resourceOccupancy, planningStart, planningEnd, dynamicMaterialFloor, stageOverlap, batchDraftKey);
+            tasks = ScheduleBackward(demand, operations, routingGraph, constraints, resourceOccupancy, planningStart, planningEnd, dynamicMaterialFloor, stageOverlap, batchDraftKey, occupancyPristine);
         }
         else if (direction == "FORWARD")
         {
-            tasks = ScheduleForward(demand, operations, routingGraph, constraints, resourceOccupancy, planningStart, planningEnd, dynamicMaterialFloor, stageOverlap, batchDraftKey);
+            tasks = ScheduleForward(demand, operations, routingGraph, constraints, resourceOccupancy, planningStart, planningEnd, dynamicMaterialFloor, stageOverlap, batchDraftKey, occupancyPristine);
         }
-        else if (direction is "MIXED" or "AUTO")
+        else if (direction == "MIXED")
         {
             // MIXED：先尝试倒排，失败则转正排（§八 8.3 Mixed模式）。
-            // AUTO：0号位 Q-1 裁定「沿用现有 Mixed 结果」⇒ 与 MIXED 同分支。
-            tasks = ScheduleBackward(demand, operations, routingGraph, constraints, resourceOccupancy, planningStart, planningEnd, dynamicMaterialFloor, stageOverlap, batchDraftKey);
+            //   本分支**只**服务显式 MIXED；`AUTO` 已在上方按 B-005 自决为具体方向或（信号冲突时）MIXED。
+            tasks = ScheduleBackward(demand, operations, routingGraph, constraints, resourceOccupancy, planningStart, planningEnd, dynamicMaterialFloor, stageOverlap, batchDraftKey, occupancyPristine);
             if (tasks.Count == 0)
             {
-                tasks = ScheduleForward(demand, operations, routingGraph, constraints, resourceOccupancy, planningStart, planningEnd, dynamicMaterialFloor, stageOverlap, batchDraftKey);
+                tasks = ScheduleForward(demand, operations, routingGraph, constraints, resourceOccupancy, planningStart, planningEnd, dynamicMaterialFloor, stageOverlap, batchDraftKey, occupancyPristine);
             }
         }
         else
         {
             // 未知 Direction：2号位 投影侧 `SolverStrategyModeMap.ToDirection` 已对未知枚举防御为 "BACKWARD"，
             // 故此处理论不可达；万一到达，保持历史行为（等效 MIXED），**不改变结果**。
-            tasks = ScheduleBackward(demand, operations, routingGraph, constraints, resourceOccupancy, planningStart, planningEnd, dynamicMaterialFloor, stageOverlap, batchDraftKey);
+            tasks = ScheduleBackward(demand, operations, routingGraph, constraints, resourceOccupancy, planningStart, planningEnd, dynamicMaterialFloor, stageOverlap, batchDraftKey, occupancyPristine);
             if (tasks.Count == 0)
             {
-                tasks = ScheduleForward(demand, operations, routingGraph, constraints, resourceOccupancy, planningStart, planningEnd, dynamicMaterialFloor, stageOverlap, batchDraftKey);
+                tasks = ScheduleForward(demand, operations, routingGraph, constraints, resourceOccupancy, planningStart, planningEnd, dynamicMaterialFloor, stageOverlap, batchDraftKey, occupancyPristine);
             }
         }
 
@@ -1416,7 +1587,8 @@ internal class PhaseTwoInitialScheduler
         DateTime planningEnd,
         DateTime dynamicMaterialFloor,
         StageOverlapParams stageOverlap,
-        string? batchDraftKey = null)
+        string? batchDraftKey = null,
+        Dictionary<int, List<TimeWindow>>? occupancyPristine = null)   // 2026-10-08 COW：透传
     {
         var tasks = new List<FinalTaskDraft>();
         var currentEndTime = constraints.EffectiveDue(demand);   // M5 第一批：倒排锚用覆盖交期
@@ -1553,7 +1725,9 @@ internal class PhaseTwoInitialScheduler
                     scheduledTask = CreateTask(demand, operation, resourceId, taskStart, foundSlot.Value.End, setupMinutes, constraints, taskSetupSource, batchDraftKey);
 
                     // 更新资源占用：从Setup开始到End结束
-                    resourceOccupancy[resourceId].Add(new TimeWindow(foundSlot.Value.Start, foundSlot.Value.End));
+                    // 2026-10-08 COW + 有序插入：先脱钩，再按 Start 二分定位插入（维持读端可二分的不变式）
+                    AddOccupancyWindow(resourceOccupancy, occupancyPristine, resourceId,
+                        new TimeWindow(foundSlot.Value.Start, foundSlot.Value.End));
                     constraints.ProductTimeline.Place(resourceId, foundSlot.Value.End, demand.MaterialId);
 
                     // P0-17修复：应用Routing LagTime到前序工序的结束时间约束
@@ -1598,7 +1772,8 @@ internal class PhaseTwoInitialScheduler
         DateTime planningEnd,
         DateTime dynamicMaterialFloor,
         StageOverlapParams stageOverlap,
-        string? batchDraftKey = null)
+        string? batchDraftKey = null,
+        Dictionary<int, List<TimeWindow>>? occupancyPristine = null)   // 2026-10-08 COW：透传
     {
         var tasks = new List<FinalTaskDraft>();
 
@@ -1748,7 +1923,8 @@ internal class PhaseTwoInitialScheduler
                     scheduledTask = CreateTask(demand, operation, resourceId, taskStart, occSlot.End, setupMinutes, constraints, taskSetupSource, batchDraftKey);
 
                     // 资源占用从Setup开始
-                    resourceOccupancy[resourceId].Add(occSlot);
+                    // 2026-10-08 COW + 有序插入（正排写点；天然追加到末尾 ⇒ 退化为 O(1)）
+                    AddOccupancyWindow(resourceOccupancy, occupancyPristine, resourceId, occSlot);
                     constraints.ProductTimeline.Place(resourceId, occSlot.End, demand.MaterialId);
 
                     // 第4轮C2修复：记录该Operation的实际完成时间，供后续工序使用
@@ -1941,20 +2117,27 @@ internal class PhaseTwoInitialScheduler
         Dictionary<int, List<TimeWindow>> resourceOccupancy,
         DateTime planningStart)
     {
+        // 性能计数（§九「SlotSearch 次数」）：倒排找槽。
+        SolverDiagnostics.CountSlotSearch();
+        long swSlot = SolverDiagnostics.HotspotStart();
+
         var candidate = new TimeWindow(candidateStart, candidateEnd);
 
         // 检查日历约束
         if (!IsWithinCalendar(candidate, resourceId, constraints))
         {
+            SolverDiagnostics.HotspotEnd(swSlot, SolverDiagnostics.Hotspot.SlotSearch);
             return null;
         }
 
         // 检查资源占用冲突
         if (HasConflict(candidate, resourceId, resourceOccupancy))
         {
+            SolverDiagnostics.HotspotEnd(swSlot, SolverDiagnostics.Hotspot.SlotSearch);
             return null;
         }
 
+        SolverDiagnostics.HotspotEnd(swSlot, SolverDiagnostics.Hotspot.SlotSearch);
         return candidate;
     }
 
@@ -2021,20 +2204,50 @@ internal class PhaseTwoInitialScheduler
         int resourceId,
         Dictionary<int, List<TimeWindow>> resourceOccupancy)
     {
-        var occupied = resourceOccupancy[resourceId].OrderBy(w => w.Start).ToList();
+        // ── 性能（2026-10-08，2号位 全量测试暴露）：**每次调用**都 `OrderBy(...).ToList()` 是 O(W log W)
+        //   且**每次都分配一个 W 元素的新数组**（W = 该资源累计占用窗数）。全量场景下 W ≈ 需求条数
+        //   ⇒ 本方法被调用 O(N) 次 ⇒ 合计 O(N² log W) + O(N²) 分配，是「单条成本随 N 上升」的主要来源之一。
+        //   占用窗在**正排**下天然按 Start 递增追加（每条新任务落在既有占用之后）⇒ 绝大多数调用时表**已有序**，
+        //   此时 `OrderBy` 的结果与**原表逐元素相同**（OrderBy 是稳定排序，非递减序列排序后不变）⇒ 可直接用原表，
+        //   零分配、零排序。**只有真的乱序时**才回落到原 `OrderBy(...).ToList()`（行为与改前逐字一致）。
+        //   本优化**不假设**任何写入方维持有序 —— 每次调用都自检，故对任意输入都保持原语义（零回归）。
+        // 性能计数（§九「SlotSearch 次数」）：正排找槽（本方法是 §7.3 点名的重复排序点）。
+        SolverDiagnostics.CountSlotSearch();
+        long swSlot = SolverDiagnostics.HotspotStart();
+
+        // ── 2026-10-08 SlotSearch 索引化：**二分跳段**（取代「每次 O(W) 自检有序 + 从头找缝」）──
+        //   不变式（见 AddOccupancyWindow）：该列表按 `Start` 升序，且窗互不重叠（⇒ `End` 随 `Start` 非降）。
+        //   跳段依据：`End <= windowStart` 的窗对结果**无贡献** ——
+        //     · 不可能触发早退：`Start <= End <= windowStart < windowStart + duration`（`duration` 为正）；
+        //     · 不推进 `cursor`（`cursor = max(cursor, End)` 仍为 `windowStart`）。
+        //   故可整体跳过「`Start <= windowStart`」这段前缀；其中**跨窗**（`End > windowStart`）至多一个，
+        //   用一次回退纳入（窗互不重叠时恰好退 0~1 步）。
+        var occupied = resourceOccupancy[resourceId];
+        int lo0 = 0, hi0 = occupied.Count;
+        while (lo0 < hi0)
+        {
+            var mid = (lo0 + hi0) / 2;
+            if (occupied[mid].Start <= windowStart) lo0 = mid + 1; else hi0 = mid;
+        }
+        int startIdx = lo0;
+        while (startIdx > 0 && occupied[startIdx - 1].End > windowStart) startIdx--;
+
         var cursor = windowStart;
 
-        foreach (var occ in occupied)
+        for (int i = startIdx; i < occupied.Count; i++)
         {
+            var occ = occupied[i];
             if (occ.Start >= cursor + duration)
             {
                 // 找到间隙
+                SolverDiagnostics.HotspotEnd(swSlot, SolverDiagnostics.Hotspot.SlotSearch);
                 return new TimeWindow(cursor, cursor + duration);
             }
             cursor = occ.End > cursor ? occ.End : cursor;
         }
 
         // 最后一个占用槽之后的空间
+        SolverDiagnostics.HotspotEnd(swSlot, SolverDiagnostics.Hotspot.SlotSearch);
         return new TimeWindow(cursor, cursor + duration);
     }
 
@@ -2062,8 +2275,25 @@ internal class PhaseTwoInitialScheduler
         int resourceId,
         Dictionary<int, List<TimeWindow>> resourceOccupancy)
     {
+        // ── 2026-10-08 SlotSearch 索引化：二分定区间 + 区内检查（取代全表 `Any`）──
+        //   不变式同上（按 `Start` 升序、互不重叠）。与 `candidate` 重叠的窗必须 `Start < candidate.End`
+        //   （否则 `Start >= End_c` ⇒ 不重叠）⇒ 只需检查该前缀；其中 `End <= candidate.Start` 者不重叠，
+        //   且因 `End` 随 `Start` 非降 ⇒ 该段是**连续前缀**，二分 + 回退即可界定，通常只查 0~1 个窗。
         var occupied = resourceOccupancy[resourceId];
-        return occupied.Any(o => Overlaps(candidate, o));
+        int hi = occupied.Count, lo = 0;
+        while (lo < hi)
+        {
+            var mid = (lo + hi) / 2;
+            if (occupied[mid].Start < candidate.End) lo = mid + 1; else hi = mid;
+        }
+        int upper = lo;                       // 前 upper 个窗满足 Start < candidate.End
+        int lower = upper;
+        while (lower > 0 && occupied[lower - 1].End > candidate.Start) lower--;
+        for (int i = lower; i < upper; i++)
+        {
+            if (Overlaps(candidate, occupied[i])) return true;
+        }
+        return false;
     }
 
     /// <summary>
@@ -2714,8 +2944,10 @@ internal class PhaseTwoInitialScheduler
         DateTime planningEnd,
         DateTime dynamicMaterialFloor,
         StageOverlapParams stageOverlap,
+        out FinalTaskDraft? mergedIntoTask,   // 2026-10-08 第②刀：真替换了既有 Task 时才非 null
         string? batchDraftKey = null,   // P0-01/P0-02：本批归批键（转交 ScheduleDemandOperations）
-        bool requireIdentityPreservingMerge = false)   // P1-01：只合并到「未归属执行批」的目标 Task
+        bool requireIdentityPreservingMerge = false,   // P1-01：只合并到「未归属执行批」的目标 Task
+        Dictionary<int, List<TimeWindow>>? occupancyPristine = null)   // 2026-10-08 COW：透传
     {
         // P0-07：连续份额不可被普通 Merge 破坏逐工单身份，直接独立排程，不尝试合并。
         // v1.6 `:26` + 0号位 2026-10-07 裁决 `:246`「`NoSplitMerge` 及固定 Route/Path 应**显式落实**」：
@@ -2723,9 +2955,10 @@ internal class PhaseTwoInitialScheduler
         //   不再只靠 `IsContinuation` 间接覆盖（两者当前同源，但契约字段须显式落实）。
         if (demand.IsContinuation || demand.NoSplitMerge)
         {
+            mergedIntoTask = null;   // 连续份额不参与 Merge（P0-07）
             return ScheduleDemandOperations(
                 demand, operations, routingGraph, direction, constraints,
-                resourceOccupancy, planningStart, planningEnd, dynamicMaterialFloor, stageOverlap, batchDraftKey);
+                resourceOccupancy, planningStart, planningEnd, dynamicMaterialFloor, stageOverlap, batchDraftKey, occupancyPristine);
         }
 
         // 检测是否可以合并到已有Task
@@ -2738,14 +2971,22 @@ internal class PhaseTwoInitialScheduler
             var targetTask = candidateTasks[0];
 
             // 检查合并后是否破坏交期：合并后Duration增加，End时间延后
-            var mergedTask = TryMergeDemandIntoTask(demand, targetTask, routingGraph, constraints, resourceOccupancy, allocationTaskShare, planningEnd, demandByKey, batchDraftKey);
+            var mergedTask = TryMergeDemandIntoTask(demand, targetTask, routingGraph, constraints, resourceOccupancy, allocationTaskShare, planningEnd, demandByKey, batchDraftKey, occupancyPristine);
             if (mergedTask != null)
             {
                 // 合并成功：替换scheduledTasks中的旧Task
                 var index = scheduledTasks.FindIndex(t => t.FinalDraftId == targetTask.FinalDraftId);
                 if (index >= 0)
                 {
+                    var endChanged = mergedTask.PlannedEndTime != targetTask.PlannedEndTime;
                     scheduledTasks[index] = mergedTask;
+                    // 与旧判据**逐字等价**：旧实现用「试排前后 PlannedEndTime 是否变化」推断合并，
+                    // 故此处也只在**结束时间真的变了**时才上报 —— 收紧语义增量，保证零回归。
+                    mergedIntoTask = endChanged ? mergedTask : null;
+                }
+                else
+                {
+                    mergedIntoTask = null;   // 目标不在任务表（理论不可达，保守按未合并处理）
                 }
                 // 不生成新Task
                 return new List<FinalTaskDraft>();
@@ -2753,6 +2994,7 @@ internal class PhaseTwoInitialScheduler
         }
 
         // 无法合并：正常排程
+        mergedIntoTask = null;
         return ScheduleDemandOperations(
             demand,
             operations,
@@ -2764,7 +3006,8 @@ internal class PhaseTwoInitialScheduler
             planningEnd,
             dynamicMaterialFloor,
             stageOverlap,
-            batchDraftKey);
+            batchDraftKey,
+            occupancyPristine);
     }
 
     /// <summary>
@@ -2868,7 +3111,8 @@ internal class PhaseTwoInitialScheduler
         Dictionary<string, List<(string DemandKey, decimal ShareQty)>> allocationTaskShare,
         DateTime planningEnd,
         Dictionary<string, LogicalProductionDemand>? demandByKey = null,
-        string? batchDraftKey = null)   // P1-01：目标 Task 未归批时，合并结果**采用本批键**（批身份不丢）
+        string? batchDraftKey = null,   // P1-01：目标 Task 未归批时，合并结果**采用本批键**（批身份不丢）
+        Dictionary<int, List<TimeWindow>>? occupancyPristine = null)   // 2026-10-08 COW：写占用表前脱钩
     {
         // 计算合并后的总数量
         var mergedQty = targetTask.PlannedProcessQty + demand.PlannedProcessQty;
@@ -3025,13 +3269,15 @@ internal class PhaseTwoInitialScheduler
 
             foreach (var oldWindow in oldWindows)
             {
+                // 2026-10-08 COW：Merge 会改写目标资源的占用表 ⇒ 先脱钩再改
+                EnsureOwned(resourceOccupancy, occupancyPristine, targetResourceId);
                 resourceOccupancy[targetResourceId].Remove(oldWindow);
             }
 
             // 添加新的时间窗：Setup时间也占用资源
             var setupDuration = TimeSpan.FromMinutes((double)mergedTask.SetupTime);
             var resourceStart = mergedTask.PlannedStartTime - setupDuration;
-            resourceOccupancy[targetResourceId].Add(
+            AddOccupancyWindow(resourceOccupancy, occupancyPristine, targetResourceId,
                 new TimeWindow(resourceStart, newEndTime));
         }
 

@@ -210,9 +210,16 @@ internal class PhaseFourLocalRepair
 
             var nextRoundAffected = new HashSet<string>();
 
+            // 热点计时（0号位 2026-10-08 §九）：传播循环整体（含其内部全表扫描）。
+            long swPropagation = SolverDiagnostics.HotspotStart();
+
             // 第9轮P0-02.1修复：先尝试重排受影响Task，让它们真实变化
             foreach (var affectedTaskId in currentRoundAffected)
             {
+                // 性能计数（0号位 2026-10-08《未命名的Markdown文件 (2)(1).md》§九「Phase4 传播 Task 数」）：
+                //   传播循环**实际访问**（含 `ScheduledTasks.FirstOrDefault` 全表扫描，见 §7.4）的 Task 次数。
+                SolverDiagnostics.CountPhase4PropagatedTask();
+
                 var task = scheduleResult.ScheduledTasks.FirstOrDefault(t => t.FinalDraftId == affectedTaskId);
                 if (task == null) continue;
 
@@ -574,6 +581,7 @@ internal class PhaseFourLocalRepair
             // 无真实变化时停止传播
             if (!hasRealChanges || nextRoundAffected.Count == 0)
             {
+                SolverDiagnostics.HotspotEnd(swPropagation, SolverDiagnostics.Hotspot.Phase4Propagation);
                 break;
             }
 
@@ -587,6 +595,7 @@ internal class PhaseFourLocalRepair
             }
 
             currentRoundAffected = nextRoundAffected;
+            SolverDiagnostics.HotspotEnd(swPropagation, SolverDiagnostics.Hotspot.Phase4Propagation);
         }
 
         // 第9轮P0-03.1修复：轮次耗尽时自动触发Fallback

@@ -33,35 +33,49 @@ public class FiniteCapacitySolver : IFiniteCapacityScheduler
     {
         var startTime = DateTime.UtcNow;
 
+        // ── Phase 边界计时（0号位 2026-10-08《未命名的Markdown文件 (2)(1).md》§九 / §十四 第三优先级）──
+        //   未开 `SolverDiagnostics.BeginScope()` 时 `StartPhase()` 返回 null ⇒ **零开销、零行为影响**；
+        //   压测工装在调用本方法前开 scope 即可拿到 Phase1Ms..Phase5Ms（不触碰 Core 契约 DTO）。
+
         // ═══════════════════════════════════════════════
         // Phase 1: 硬约束构建
         // ═══════════════════════════════════════════════
         var phase1 = new PhaseOneConstraintBuilder();
+        var p1 = SolverDiagnostics.StartPhase();
         var constraints = phase1.BuildConstraints(request);
+        SolverDiagnostics.EndPhase(p1, 1);
 
         // ═══════════════════════════════════════════════
         // Phase 2: 初始有限产能排程
         // ═══════════════════════════════════════════════
         var phase2 = new PhaseTwoInitialScheduler();
+        var p2 = SolverDiagnostics.StartPhase();
         var scheduleResult = phase2.Schedule(request, constraints);
+        SolverDiagnostics.EndPhase(p2, 2);
 
         // ═══════════════════════════════════════════════
         // Phase 3: 可行性与延期诊断
         // ═══════════════════════════════════════════════
         var phase3 = new PhaseThreeDiagnostics();
+        var p3 = SolverDiagnostics.StartPhase();
         var diagnostics = phase3.Diagnose(request, scheduleResult, constraints);
+        SolverDiagnostics.EndPhase(p3, 3);
 
         // ═══════════════════════════════════════════════
         // Phase 4: 有界局部修复
         // ═══════════════════════════════════════════════
         var phase4 = new PhaseFourLocalRepair();
+        var p4 = SolverDiagnostics.StartPhase();
         var repairResult = phase4.Repair(request, scheduleResult, diagnostics, constraints);
+        SolverDiagnostics.EndPhase(p4, 4);
 
         // ═══════════════════════════════════════════════
         // Phase 5: 压缩空隙与最终评价
         // ═══════════════════════════════════════════════
         var phase5 = new PhaseFiveCompression();
+        var p5 = SolverDiagnostics.StartPhase();
         var finalResult = phase5.Compress(request, scheduleResult, repairResult, diagnostics, constraints);
+        SolverDiagnostics.EndPhase(p5, 5);
 
         // 补充耗时统计
         var elapsed = (long)(DateTime.UtcNow - startTime).TotalMilliseconds;

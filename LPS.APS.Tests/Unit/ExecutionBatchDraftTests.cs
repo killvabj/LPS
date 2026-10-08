@@ -1173,26 +1173,28 @@ public class ExecutionBatchDraftTests
     }
 
     /// <summary>
-    /// **§十二 第 4 / 5 / 6 行 + §六 P0-03 + §七 P0-04**：
-    ///   **Batch-001 成功、Batch-002 失败** ⇒ Phase4 **只能修 Batch-002**、**不得再生成 Batch-001**、
-    ///   且需求**仍必须 Unscheduled**。
+    /// **2026-10-08 复审 NEW-P0-01（0号位《未命名的Markdown文件 (2)(1).md》§二 / §十二）+ §十五 第 1、2 项**：
+    ///   **Batch-001 成功、Batch-002 失败 ⇒ 部分落定 ⇒ 必须判 Domain 失败**。
+    ///
+    /// ⚠ **本用例此前断言 `Success == true`，那是我方按「代码实现困难」改出来的错口径，已撤销。**
+    ///   冻结基线：`AllocationQty = Σ AllocationTaskShare中的预计合格产出份额`（v1.7:1052）；
+    ///   且「TaskShare数量不闭合」属**有限产能硬错误 ⇒ 必须使 Domain 失败**（v1.7:1026-1034 / v1.6:790）。
+    ///   0号位 §十二 明示：「无法按客户DueDate完成不是Solver失败」与「Allocation只排出一部分数量
+    ///   且 TaskShare 不闭合也可以正式成功」**不是一个概念**。
     ///
     /// 构造（`Min=4 / Max=6` ⇒ 合法批数**唯一** n=2，无候选择优歧义；`Qty=10` ⇒ 两批各 5 件）：
     ///   日历**只有一段 10 小时**可用窗，而单批两工序链（5 件 × 60 分钟 × 2 工序）**恰好占满 10 小时**
     ///   ⇒ Phase2：Batch-001 **落定**、Batch-002 **落不下**（`failedBatchIndex = 1`）；
     ///   `Parameters.AllowSplit=false` ⇒ Phase4 无 Split 手段，Batch-002 **确定修不成**。
     ///
-    /// 断言（每条都是反证点）：
-    ///   · `EB|D1|001` 恰好 **2 个 Task**（一工序一个）—— **不得**出现第二套 `EB|D1|001` 完整链；
-    ///   · **不存在** `EB|D1|002` 的 Task —— 失败批不得被伪造出来（旧实现 `ExpandRepairUnits(D1)`
-    ///     重新展开**全部**批 ⇒ 此处 **红**）；
-    ///   · 逐工序物理数量 Σ = **5**（= 已落定批的净产出），**不是 15、也不是 10** —— 旧实现的
-    ///     「已成功批被重复生产 + 失败批被伪造成整份需求」⇒ 数量放大到 15 ⇒ 此处 **红**；
-    ///   · 需求 **仍必须** Unscheduled —— 旧实现 `repairedAnyBatch` 语义（任一批成功即视为已修复）
-    ///     ⇒ D1 从 `UnscheduledTasks` 消失 ⇒ 此处 **红**。
+    /// 断言（§十五 第 2 项的机器证据）：
+    ///   · **`Success == false`** —— 部分落定**不得**作为成功正式结果输出；
+    ///   · 失败报文**精确落在数量闭合**上，且**同时**出现「声明量 10」与「落定量 5」
+    ///     ⇒ 直接证明闭合目标**没有被降成 5**（降了就变成 `ΣShare=5 ≤ Quantity=5` ⇒ 静默通过 ⇒ 此处红）；
+    ///   · 失败路径是「全有全无」（Phase5 既有设计）⇒ 不输出半截正式结果。
     /// </summary>
     [Fact]
-    public async Task 反证4_5_6_首批成功次批失败_只修失败批且需求仍Unscheduled()
+    public async Task 反证4_5_6_首批成功次批失败_部分落定必须判Domain失败()
     {
         // 唯一可用窗 = 恰好容下**一批**两工序链：5 件 × 60 分钟 × 2 工序 = 10 小时（留 30 分钟边界余量，
         //   但远不足以再容下第二批的 10 小时 ⇒ 第二批必然落不下）。
@@ -1212,37 +1214,25 @@ public class ExecutionBatchDraftTests
 
         var result = await _solver.SolveAsync(request);
 
-        Assert.True(result.Success, result.ErrorMessage);
+        // §十五 第 2 项：部分 Execution Batch **不得**经由「降低闭合目标」变成 Success
+        Assert.False(result.Success, "部分落定（声明 10 / 落定 5）必须判 Domain 失败，不得作为成功结果输出");
 
-        var batch001 = result.FinalTasks.Where(t => t.ExecutionBatchDraftKey == "EB|D1|001").ToList();
-        var batch002 = result.FinalTasks.Where(t => t.ExecutionBatchDraftKey == "EB|D1|002").ToList();
+        // 失败报文必须定位到数量闭合，且「声明量 10」与「落定量 5」同时在
+        //   —— 闭合目标仍为**声明数量** 10 的机器证据（本用例只有 1 个参与构成的 Task ⇒ 份额恒为 10）
+        Assert.Contains("ΣShare=10", result.ErrorMessage);
+        Assert.Contains("超过 Quantity=5", result.ErrorMessage);
 
-        // 已落定批：**恰好一条完整链（2 工序），且只有一套** —— 不得重复生产
-        Assert.Equal(2, batch001.Count);
-        Assert.Equal(
-            new[] { "STAGE1", "STAGE2" },
-            batch001.Select(t => t.StageCode).OrderBy(s => s, StringComparer.Ordinal));
-
-        // 失败批：不得被伪造出任何 Task
-        Assert.Empty(batch002);
-
-        // §七：逐工序物理数量闭合到**已落定批的净产出 5**（不是 15、也不是整份需求 10）
-        foreach (var stageGroup in result.FinalTasks.GroupBy(t => t.StageCode))
-        {
-            Assert.Equal(5m, stageGroup.Sum(t => t.Quantity));
-        }
-
-        // §六：需求**仍必须** Unscheduled（不得因「任一批成功」而错报已满足）
-        var unscheduled = Assert.Single(result.UnscheduledTasks);
-        Assert.Equal("D1", unscheduled.DraftId);
-        Assert.False(string.IsNullOrEmpty(unscheduled.Reason));
-        // 未排原因**不得**是批策略硬失败码（本场景策略合法、是日历装不下）
-        Assert.DoesNotContain("BATCH_POLICY", unscheduled.Reason, StringComparison.Ordinal);
+        // 全有全无：失败即不输出任何正式结果（避免下游拿到「半截成功」）
+        Assert.Empty(result.FinalTasks);
+        Assert.Empty(result.AllocationShares);
+        Assert.Empty(result.UnscheduledTasks);
     }
 
     /// <summary>
-    /// **§十二 第 6 行**：**两个执行批在 Phase2 都失败、Phase4 只修好其中一个** ⇒
-    ///   需求**仍必须** Unscheduled（不得因「有批落定」就视为已满足）。
+    /// **2026-10-08 复审 NEW-P0-01 + §十五 第 2 项（第二种部分落定形态）**：
+    ///   **两个执行批在 Phase2 都失败、Phase4 只修好其中一个 ⇒ 仍是部分落定 ⇒ 必须判 Domain 失败**。
+    ///
+    /// ⚠ 本用例此前断言 `Success == true` + `UnscheduledTasks` 单条，同属**已撤销的错口径**。
     ///
     /// 构造：`Qty=10 / Min=4 / Max=6` ⇒ 2 批（各 5 件）；`opDuration=10m` ⇒ 每批每工序 50 分钟，
     ///   而日历只有 **4 个 30 分钟槽**（两两相隔 30 分钟不可用）⇒ 无任何连续 50 分钟窗
@@ -1250,11 +1240,13 @@ public class ExecutionBatchDraftTests
     ///   `AllowSplit=true` ⇒ Phase4 有限 Split 把每批每工序拆成 2×25 分钟 ⇒ **一批占 4 个槽**
     ///   ⇒ 只有 **1 个批**能被修好，另一个因槽位耗尽仍落不下。
     ///
-    /// 反证性：旧实现 `repairedAnyBatch` 语义（**任一批**修复成功即视为需求已修复）⇒
-    ///   D1 从 `UnscheduledTasks` 消失 ⇒ 本条断言 **红**（这正是 §六 指出的「错误成功状态」）。
+    /// 断言：`Success == false`，且失败报文落在「ΣShare 超过落定 Task 的 Quantity」上
+    ///   —— 声明量 10 被分摊到仅存的落定 Task（每件 Quantity=2.5）⇒ 第 3 项硬校验拒绝。
+    ///   **不**断言 ΣShare 的具体数字：参与构成的 Task 按 `FinalDraftId`（随机 Guid）排序，
+    ///   份额在 {3.333, 3.333, 3.334} 之间随机落位 ⇒ 只有「超过」这一性质是稳定的。
     /// </summary>
     [Fact]
-    public async Task 反证6_两批都失败只修好一批_需求仍必须Unscheduled()
+    public async Task 反证6_两批都失败只修好一批_部分落定仍必须判Domain失败()
     {
         // 4 个 30 分钟可用槽、两两相隔 30 分钟不可用 ⇒ 总可用 2 小时：
         //   恰好够「1 批 × 2 工序 × 拆 2 份 × 25 分钟 = 4 槽」，不够第 2 批。
@@ -1276,26 +1268,16 @@ public class ExecutionBatchDraftTests
 
         var result = await _solver.SolveAsync(request);
 
-        Assert.True(result.Success, result.ErrorMessage);
+        Assert.False(result.Success, "只修好一个批（部分落定）必须判 Domain 失败");
 
-        // 只有**一个**执行批落定（另一个修不成），且它是真实批键
-        var landedKeys = result.FinalTasks
-            .Select(t => t.ExecutionBatchDraftKey!)
-            .Distinct()
-            .ToList();
-        Assert.Single(landedKeys);
-        Assert.Contains(landedKeys[0], new[] { "EB|D1|001", "EB|D1|002" });
+        // 声明量 10 分摊到落定批的拆分件（Quantity=2.5）⇒ ΣShare > Quantity ⇒ 第 3 项硬校验拒绝。
+        //   （若闭合目标被降成落定量 5，份额为 5/3=1.667 ≤ 2.5 ⇒ 不会失败 ⇒ 此处红。）
+        Assert.Contains("ΣShare=", result.ErrorMessage);
+        Assert.Contains("超过 Quantity=2.5", result.ErrorMessage);
 
-        // 已落定批的数量 = 5（不是整份需求 10）
-        foreach (var stageGroup in result.FinalTasks.GroupBy(t => t.StageCode))
-        {
-            Assert.Equal(5m, stageGroup.Sum(t => t.Quantity));
-        }
-
-        // §六：**仍必须** Unscheduled（旧 `repairedAnyBatch` 语义 ⇒ 此处红）
-        var unscheduled = Assert.Single(result.UnscheduledTasks);
-        Assert.Equal("D1", unscheduled.DraftId);
-        Assert.False(string.IsNullOrEmpty(unscheduled.Reason));
+        Assert.Empty(result.FinalTasks);
+        Assert.Empty(result.AllocationShares);
+        Assert.Empty(result.UnscheduledTasks);
     }
 
     /// <summary>
@@ -1327,6 +1309,39 @@ public class ExecutionBatchDraftTests
         foreach (var stageGroup in result.FinalTasks.GroupBy(t => t.StageCode))
         {
             Assert.Equal(10m, stageGroup.Sum(t => t.Quantity));
+        }
+    }
+
+    /// <summary>
+    /// **2026-10-08 复审 NEW-P0-01 + §十五 第 1 项（正向半）**：
+    ///   **全部落定**时，冻结等式 `AllocationQty = Σ AllocationTaskShare中的预计合格产出份额`
+    ///   （v1.7:1052）必须在**份额层**严格成立，且每个 Task 的 ΣShare 不超过自身 Quantity。
+    ///
+    /// 与 <see cref="反证7_两批全排下_逐工序数量严格闭合且无重复批链"/> 的分工：反证7 断言的是
+    ///   **Task 物理数量**闭合（逐工序 Σ=10）；本用例断言的是 **Allocation→份额**闭合（ΣShare=10），
+    ///   两者是冻结文档里**两条不同的等式**。反向半（不等 ⇒ 必须判失败）由
+    ///   <see cref="反证4_5_6_首批成功次批失败_部分落定必须判Domain失败"/> 提供。
+    /// </summary>
+    [Fact]
+    public async Task NEW_P0_01_全部落定时_份额严格闭合到声明AllocationQty()
+    {
+        var request = BuildRequest(qty: 10m, demandRouteCode: Route, demandPathId: Path,
+            batchPolicies: new[] { Policy(min: 4m, max: 6m) });
+
+        var result = await _solver.SolveAsync(request);
+
+        Assert.True(result.Success, result.ErrorMessage);
+
+        // 本夹具只有 D1（AllocationSequence=1、NetOutputQty=10）⇒ ΣShare 必须严格等于 10
+        Assert.All(result.AllocationShares, s => Assert.Equal(1L, s.AllocationSequence));
+        Assert.Equal(10m, result.AllocationShares.Sum(s => s.ComponentQty));
+
+        // 份额不得把某个 Task 压超自身数量（硬校验第 3 项在**成功路径**上同样成立）
+        var taskQty = result.FinalTasks.ToDictionary(t => t.FinalDraftId, t => t.Quantity);
+        foreach (var shareGroup in result.AllocationShares.GroupBy(s => s.FinalDraftId))
+        {
+            Assert.True(taskQty.ContainsKey(shareGroup.Key), $"份额指向不存在的 Task: {shareGroup.Key}");
+            Assert.True(shareGroup.Sum(s => s.ComponentQty) <= taskQty[shareGroup.Key] + 0.001m);
         }
     }
 

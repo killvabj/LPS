@@ -52,7 +52,9 @@ public class PhaseTwoRoutingCandidateTests
         string direction = "FORWARD",
         ExecutionConstraint? locked = null,
         bool isContinuation = false,
-        string? continuationKey = null)
+        string? continuationKey = null,
+        DateTime? due = null,
+        string? preferredResourceCode = null)
     {
         var ops = new List<RoutingOperation>();
         var deps = new List<RoutingDependency>();
@@ -138,8 +140,11 @@ public class PhaseTwoRoutingCandidateTests
                     LogicalDemandKey = "D1", PlanVersionId = 1L, DomainKey = "DOMAIN",
                     AllocationSequence = 1, DemandKey = "D1", MaterialId = MaterialId, FactoryId = 1,
                     NetOutputQty = 1m, PlannedProcessQty = 1m,
-                    RequiredAvailableTime = PlanningStart.AddDays(20), DemandSequence = 1,
+                    // `due` 可覆写：B-005 Direction 自决的 E2E 用例靠「只改交期」驱动 Slack 变化。
+                    RequiredAvailableTime = due ?? PlanningStart.AddDays(20), DemandSequence = 1,
                     RouteCode = demandRouteCode, PathId = demandPathId,
+                    // B-005「Resource」上下文载体（P1-11 软偏好；仅进次级，不 Hard Lock）。
+                    PreferredResourceCode = preferredResourceCode,
                     // 0号位 2026-10-07 (5).md P0-05：连续份额输入完整性 Fail Closed 的反证锁用。
                     IsContinuation = isContinuation,
                     ContinuationKey = continuationKey,
@@ -348,37 +353,134 @@ public class PhaseTwoRoutingCandidateTests
         });
     }
 
+    // ═══════════════════════════════════════════════════════════════════════════════
+    // ⑧ Direction `AUTO` **正式按上下文自决**（0号位 2026-10-08《未命名的Markdown文件 (2)(1).md》
+    //    §三 **P1-DIR-01** / §十四 第二优先级 / §十五 第 3 项）
+    //
+    // 整改要点：**撤销**「`AUTO` 与 `MIXED` 行为等价」（0号位 2026-10-07 Q-1 的旧口径已被明判
+    //   「不能再作为最终 V1 实现」）。`AUTO` 现由 `SchedulingDirectionResolver` 按 Demand / Execution Batch
+    //   **自身上下文**（RequiredAvailableTime/Slack、Material、Resource、Execution、Firm-Frozen-Lock；
+    //   DemandGoal 载体缺失则登记缺口）正式裁决为 FORWARD / BACKWARD / MIXED 之一。
+    //
+    // 断言方式（行为层；**对 Phase5 压缩免疫**）：`AUTO` 的结果必须**逐字段等于**
+    //   「把自决方向显式传入」的结果；且同一夹具**只改一处上下文**时结果必须随之变化
+    //   ⇒ 证明 AUTO 不是「恒等某一固定方向」的空壳。
+    //
+    // 覆盖 §十五 第 3 项点名的四类场景：
+    //   ① 明显倒排（交期紧）② 明显正排（交期松）③ 连续份额（A/B 既存执行批）④ Slack / 资源 致 Direction 变化。
+    //   ⚠ Material（`dynamicMaterialFloor`）为 Scheduling 内部派生量，其 Direction 影响由
+    //     `SchedulingDirectionResolverTests` 判据层覆盖；本文件只做行为层 E2E。
+    // ═══════════════════════════════════════════════════════════════════════════════
+
+    /// <summary>排程几何签名（确定性字符串）：用于「AUTO 结果 == 显式方向结果」与「上下文变 ⇒ 结果变」的比对。</summary>
+    private static string Signature(DomainSolveResult r)
+        => string.Join("\n", r.FinalTasks
+            .OrderBy(t => t.StageCode, StringComparer.Ordinal)
+            .ThenBy(t => t.OperationCode, StringComparer.Ordinal)
+            .Select(t => $"{t.StageCode}|{t.OperationCode}|{t.ResourceId}|{t.RouteCode}|{t.PathId}"
+                       + $"|{t.PlannedStartTime:O}|{t.PlannedEndTime:O}"));
+
+    private static void AssertSameSchedule(DomainSolveResult expected, DomainSolveResult actual)
+    {
+        Assert.Equal(expected.FinalTasks.Count, actual.FinalTasks.Count);
+        Assert.Equal(Signature(expected), Signature(actual));
+    }
+
     /// <summary>
-    /// ⑧ Direction `AUTO` 显式承载（规则清单 v1.5 **B-004**：「Direction 支持 AUTO/FORWARD/BACKWARD/MIXED；
-    ///    OrderType 不得直接决定 Direction」）+ 0号位 2026-10-07 裁决 **Q-1**：「MIXED/**AUTO** → 沿用现有 Mixed 结果」。
-    ///    ⇒ 断言 AUTO 与 MIXED **结果逐字段一致**（同批任务数 / 未排程数 / 身份 / 资源 / 时间）。
-    ///    ⚠ 本用例只锁「显式分列 + 与 MIXED 等价」，**不声称** B-005「按上下文自决方向」已实现 ——
-    ///    该完整语义属**未落码项**，不得据此认为已达标。
+    /// ⑧-① **明显倒排场景**：两工序各 60min（lead = 120min），交期 = 计划起点 + 3h
+    ///   ⇒ Slack = 180 − 120 = 60min，落在工艺周期内 ⇒ 无交期信号、无其它上下文
+    ///   ⇒ 确定性默认 **BACKWARD**（`NO_CONTEXT_SIGNAL`，靠交期减少 WIP）。
+    ///   行为断言：AUTO 结果 == 显式 BACKWARD 结果。
     /// </summary>
     [Fact]
-    public async Task Direction_AUTO_与MIXED结果一致()
+    public async Task AUTO_明显倒排场景_自决为BACKWARD()
     {
-        var paths = new[]
-        {
-            new PathSpec("RTA", 1, 1, PlanningStart.AddDays(10), PlanningEnd),
-            new PathSpec("RTB", 1, 2, PlanningStart, PlanningEnd)
-        };
+        var paths = new[] { new PathSpec("RTA", 1, 1, PlanningStart, PlanningEnd) };
+        var due = PlanningStart.AddHours(3);
 
-        var auto = await _solver.SolveAsync(Build(paths, direction: "AUTO"));
-        var mixed = await _solver.SolveAsync(Build(paths, direction: "MIXED"));
+        var auto = await _solver.SolveAsync(Build(paths, direction: "AUTO", due: due));
+        var backward = await _solver.SolveAsync(Build(paths, direction: "BACKWARD", due: due));
 
         Assert.True(auto.Success, auto.ErrorMessage);
-        Assert.True(mixed.Success, mixed.ErrorMessage);
-        Assert.Equal(mixed.UnscheduledTasks.Count, auto.UnscheduledTasks.Count);
-        Assert.Equal(
-            mixed.FinalTasks
-                .Select(t => (t.StageCode, t.OperationCode, t.ResourceId, t.RouteCode, t.PathId,
-                              t.PlannedStartTime, t.PlannedEndTime))
-                .ToList(),
-            auto.FinalTasks
-                .Select(t => (t.StageCode, t.OperationCode, t.ResourceId, t.RouteCode, t.PathId,
-                              t.PlannedStartTime, t.PlannedEndTime))
-                .ToList());
+        AssertSameSchedule(backward, auto);
+    }
+
+    /// <summary>
+    /// ⑧-② **明显正排场景**：同一夹具，只把交期推到 20 天后
+    ///   ⇒ Slack = 20d − 120min ≫ lead ⇒ `DUE_LOOSE`（最早承诺）⇒ **FORWARD**。
+    /// </summary>
+    [Fact]
+    public async Task AUTO_明显正排场景_自决为FORWARD()
+    {
+        var paths = new[] { new PathSpec("RTA", 1, 1, PlanningStart, PlanningEnd) };
+        var due = PlanningStart.AddDays(20);
+
+        var auto = await _solver.SolveAsync(Build(paths, direction: "AUTO", due: due));
+        var forward = await _solver.SolveAsync(Build(paths, direction: "FORWARD", due: due));
+
+        Assert.True(auto.Success, auto.ErrorMessage);
+        AssertSameSchedule(forward, auto);
+    }
+
+    /// <summary>
+    /// ⑧-③ **连续份额场景**：`IsContinuation = true`（A/B 既存执行批，已经开始）
+    ///   ⇒ `CONTINUATION_SLICE` 正向信号（最早承诺）⇒ **FORWARD**（交期取中性值以免掩盖该信号）。
+    ///   反向对照：同夹具去掉连续性 ⇒ 退回 ⑧-① 的 BACKWARD ⇒ 证明 Execution 上下文**真的**参与裁决。
+    /// </summary>
+    [Fact]
+    public async Task AUTO_连续份额场景_自决为FORWARD()
+    {
+        var paths = new[] { new PathSpec("RTA", 1, 1, PlanningStart, PlanningEnd) };
+        var due = PlanningStart.AddHours(3);
+
+        var auto = await _solver.SolveAsync(Build(paths, direction: "AUTO",
+            demandRouteCode: "RTA", demandPathId: 1, isContinuation: true, due: due));
+        var forward = await _solver.SolveAsync(Build(paths, direction: "FORWARD",
+            demandRouteCode: "RTA", demandPathId: 1, isContinuation: true, due: due));
+
+        Assert.True(auto.Success, auto.ErrorMessage);
+        AssertSameSchedule(forward, auto);
+
+        // 反向对照：同一交期下，仅去掉连续性 ⇒ 方向退回 BACKWARD（= ⑧-①）
+        var notContinuation = await _solver.SolveAsync(Build(paths, direction: "AUTO", due: due));
+        AssertSameSchedule(
+            await _solver.SolveAsync(Build(paths, direction: "BACKWARD", due: due)), notContinuation);
+        Assert.NotEqual(Signature(auto), Signature(notContinuation));
+    }
+
+    /// <summary>
+    /// ⑧-④ **Slack / Resource 导致 Direction 变化场景**：
+    ///   · Slack：同一夹具只改交期（3h ↔ 20d）⇒ 方向 BACKWARD ↔ FORWARD，结果必须变；
+    ///   · Resource：交期取中性（3h）时，仅加 `PreferredResourceCode` ⇒ `PREFERRED_RESOURCE` 正向信号
+    ///     ⇒ 方向由 BACKWARD 翻为 FORWARD。
+    /// </summary>
+    [Fact]
+    public async Task AUTO_仅改Slack或Resource_自决方向随之变化()
+    {
+        var paths = new[] { new PathSpec("RTA", 1, 1, PlanningStart, PlanningEnd) };
+        var tightDue = PlanningStart.AddHours(3);
+
+        // ── Slack 变化 ──
+        var tight = await _solver.SolveAsync(Build(paths, direction: "AUTO", due: tightDue));
+        var loose = await _solver.SolveAsync(Build(paths, direction: "AUTO", due: PlanningStart.AddDays(20)));
+
+        Assert.True(tight.Success, tight.ErrorMessage);
+        Assert.True(loose.Success, loose.ErrorMessage);
+        AssertSameSchedule(
+            await _solver.SolveAsync(Build(paths, direction: "BACKWARD", due: tightDue)), tight);
+        AssertSameSchedule(
+            await _solver.SolveAsync(Build(paths, direction: "FORWARD", due: PlanningStart.AddDays(20))), loose);
+        Assert.NotEqual(Signature(tight), Signature(loose));
+
+        // ── Resource 偏好变化（交期不变）──
+        var withPref = await _solver.SolveAsync(Build(paths, direction: "AUTO",
+            due: tightDue, preferredResourceCode: "R1"));
+
+        Assert.True(withPref.Success, withPref.ErrorMessage);
+        AssertSameSchedule(
+            await _solver.SolveAsync(Build(paths, direction: "FORWARD",
+                due: tightDue, preferredResourceCode: "R1")), withPref);
+        Assert.NotEqual(Signature(tight), Signature(withPref));
     }
 
     // ─────────── 0号位 2026-10-07 (5).md 反证单测辅助 + ③④⑤ ───────────

@@ -3550,6 +3550,45 @@
         }
       }
     },
+    "/api/procurement-manual-eta/warehouses": {
+      "get": {
+        "tags": [
+          "ProcurementManualEta"
+        ],
+        "summary": "收货仓库下拉（数据源：ext_MES_ProcessCode_View，processcode→code、processname→name）\r\nGET /api/procurement-manual-eta/warehouses",
+        "parameters": [
+          {
+            "name": "search",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "$ref": "#/components/schemas/WarehouseLookupItemIReadOnlyListApiResponse"
+                }
+              },
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WarehouseLookupItemIReadOnlyListApiResponse"
+                }
+              },
+              "text/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WarehouseLookupItemIReadOnlyListApiResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/procurement-manual-eta": {
       "get": {
         "tags": [
@@ -3618,21 +3657,21 @@
             }
           },
           {
-            "name": "skip",
+            "name": "pageIndex",
             "in": "query",
             "schema": {
               "type": "integer",
               "format": "int32",
-              "default": 0
+              "default": 1
             }
           },
           {
-            "name": "take",
+            "name": "pageSize",
             "in": "query",
             "schema": {
               "type": "integer",
               "format": "int32",
-              "default": 100
+              "default": 20
             }
           }
         ],
@@ -3642,17 +3681,17 @@
             "content": {
               "text/plain": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProcurementManualEtaOverrideListApiResponse"
+                  "$ref": "#/components/schemas/ProcurementManualEtaOverridePageResultApiResponse"
                 }
               },
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProcurementManualEtaOverrideListApiResponse"
+                  "$ref": "#/components/schemas/ProcurementManualEtaOverridePageResultApiResponse"
                 }
               },
               "text/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProcurementManualEtaOverrideListApiResponse"
+                  "$ref": "#/components/schemas/ProcurementManualEtaOverridePageResultApiResponse"
                 }
               }
             }
@@ -10023,7 +10062,32 @@
         },
         "additionalProperties": false
       },
-      "ProcurementManualEtaOverrideListApiResponse": {
+      "ProcurementManualEtaOverridePageResult": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ProcurementManualEtaOverride"
+            },
+            "nullable": true
+          },
+          "total": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "page": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "pageSize": {
+            "type": "integer",
+            "format": "int32"
+          }
+        },
+        "additionalProperties": false
+      },
+      "ProcurementManualEtaOverridePageResultApiResponse": {
         "type": "object",
         "properties": {
           "code": {
@@ -10035,11 +10099,7 @@
             "nullable": true
           },
           "data": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/ProcurementManualEtaOverride"
-            },
-            "nullable": true
+            "$ref": "#/components/schemas/ProcurementManualEtaOverridePageResult"
           },
           "traceId": {
             "type": "string",
@@ -11542,6 +11602,50 @@
           },
           "data": {
             "$ref": "#/components/schemas/UserSummaryDtoPageResult"
+          },
+          "traceId": {
+            "type": "string",
+            "nullable": true
+          },
+          "timestamp": {
+            "type": "string",
+            "format": "date-time"
+          }
+        },
+        "additionalProperties": false
+      },
+      "WarehouseLookupItem": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string",
+            "nullable": true
+          },
+          "name": {
+            "type": "string",
+            "nullable": true
+          }
+        },
+        "additionalProperties": false,
+        "description": "收货仓库下拉项（数据源 ext_MES_ProcessCode_View：processcode→Code、processname→Name）"
+      },
+      "WarehouseLookupItemIReadOnlyListApiResponse": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "message": {
+            "type": "string",
+            "nullable": true
+          },
+          "data": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/WarehouseLookupItem"
+            },
+            "nullable": true
           },
           "traceId": {
             "type": "string",

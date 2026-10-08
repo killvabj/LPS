@@ -1265,6 +1265,21 @@ internal class PhaseFiveCompression
             .ToDictionary(g => g.Key, g => g.Sum(d => d.NetOutputQty));
 
         // P0-05修复：展开每个末端Task的真实 (Demand, Qty) 构成（含 merge 血缘），按 Allocation 归并贡献
+        // ── 2026-10-08 可重放性修复：**确定性任务排序键** ──
+        //   背景（实测发现，非推测）：`FinalDraftId = Guid.NewGuid().ToString()`（Phase2/Phase4 共 5 处）
+        //   ⇒ **每次运行都不同**。而下方份额分摊用 `OrderBy(x => x.TaskId)`（TaskId = FinalDraftId）
+        //   决定「**哪一个 Task 吸收 3 位小数残差**」⇒ **同输入跑两次，份额落到的 Task 不同**。
+        //   实测：同参两次求解，`T/S/U` 与 `ΣShare/ΣQty` 全部相同，但逐任务份额与业务签名 hash 不同。
+        //   这与既有冻结预期冲突：`DeterministicRandom` 明示「同一 Run 重放 → 同一结果」；
+        //   且 0号位 §十五 第 7 项要求「优化前后同输入、同输出业务结果一致性对照」——
+        //   **不确定就无从对照**。故此处改用稳定业务复合键排序（**不改分摊公式、不改数量、不改 ΣShare**）。
+        //   注：本修复只改变「残差归属哪个 Task」（量级 ≤ 0.001），不改变任何数量的总和。
+        var taskSortKeys = tasks.ToDictionary(
+            t => t.FinalDraftId,
+            t => $"{t.SourceDraftId}|{t.StageCode}|{t.OperationCode}|{t.RouteCode}|{t.PathId}"
+               + $"|{t.ExecutionBatchDraftKey}|{t.PlannedStartTime:O}|{t.PlannedEndTime:O}",
+            StringComparer.Ordinal);
+
         var contributions = tasks
             .Where(t => !downstreamTasks.Contains(t.FinalDraftId))
             .SelectMany(t => GetTaskDemandComposition(t, demandByKey, mergeLineage)
@@ -1282,23 +1297,29 @@ internal class PhaseFiveCompression
             var taskQtys = allocGroup
                 .GroupBy(c => c.TaskId)
                 .Select(g => new { TaskId = g.Key, ContributionQty = g.Sum(c => c.Qty) })
-                .OrderBy(x => x.TaskId)
+                // 可重放性修复：按**稳定业务键**排序（原为随机 Guid 的 `TaskId`）。键缺失时回落 TaskId。
+                .OrderBy(x => taskSortKeys.TryGetValue(x.TaskId, out var sortKey) ? sortKey : x.TaskId,
+                         StringComparer.Ordinal)
                 .ToList();
 
             if (taskQtys.Count == 0) continue;
 
             decimal totalContribution = taskQtys.Sum(x => x.ContributionQty);
 
-            // ── P0-03（0号位 2026-10-08《未命名的Markdown文件 (1)(1).md》§六）：份额闭合目标 = **实际落定数量** ──
-            //   `AllocationTaskShare` 承载的是「**已落定 Task** 上的份额」，故其闭合目标只能是落定数量。
-            //   需求只要有一个执行批没排下（`§六` 的「Batch-001 成功 / Batch-002 失败」），其落定数量就
-            //   **小于**声明数量；此时若仍按声明数量补差，会把**整份需求数量**压到仅存的那个批的 Task 上
-            //   ⇒ `ΣShare > Task.Quantity` ⇒ Phase5 硬校验（第 3 项）判失败 ⇒ **整个求解被中断**
-            //     （实测：`Task ... 的 ΣShare=10 超过 Quantity=5`）。
-            //   需求是否被完整满足由**出口 `UnscheduledTasks`（需求级）** + 下方**第 8 项逐需求逐工序数量闭合**保证，
-            //   不由 Allocation 级份额承担。
-            //   正常（全部落定）时 `totalContribution == expectedQty` ⇒ 逐字等价，零回归。
-            var closureTarget = Math.Min(expectedQty, totalContribution);
+            // ── 2026-10-08 复审 NEW-P0-01 整改：**撤销**「份额闭合目标 = `min(声明量, 落定量)`」──
+            //   0号位 2026-10-08《未命名的Markdown文件 (2)(1).md》§二 / §十二 + 冻结基线原文：
+            //     · `APS_有限产能排产…v1.7_20261005_Batch_Direction_AB_多Routing冻结回写版.md:1052`
+            //       `AllocationQty = Σ AllocationTaskShare中的预计合格产出份额`
+            //     · 同文 `:1026-1034`「有限产能硬错误，例如…**TaskShare数量不闭合**…必须使Domain失败」；
+            //       `APS_Pegging…v1.6_20261005…md:748/:759/:790` 同义（「必须使Domain失败，不能Warning后发布」）。
+            //   ⇒ **`AllocationQty`（声明数量）是权威**，份额的职责是「把该 Allocation 的数量**分摊**到已落定 Task 上」，
+            //     故闭合目标**恒为 `expectedQty`**，**不随落定量变化**（改成 `min(声明, 落定)` 等于把 AllocationQty
+            //     偷偷重定义成「已排出的数量」⇒ 冻结等式被架空 ⇒ 0号位 §二 判 NEW-P0-01）。
+            //   这正是 0号位 §二 要的失败出口：**部分落定**时把整份声明数量分摊到仅存 Task 上
+            //     ⇒ `ΣShare > Task.Quantity` ⇒ 下方 `ValidateHardResult` **第 3 项**判失败
+            //     （实测报文：`Task … 的 ΣShare=10 超过 Quantity=5`）⇒ **Domain 失败**。
+            //   绝不：把落定量当新目标 / 静默跳过该 Allocation（§二.4 明列禁止项）。
+            var closureTarget = expectedQty;
 
             for (int i = 0; i < taskQtys.Count; i++)
             {
@@ -1307,7 +1328,7 @@ internal class PhaseFiveCompression
 
                 if (i == taskQtys.Count - 1)
                 {
-                    // 最后一个：补差闭合（闭合到**落定数量**，见上 `closureTarget`）
+                    // 最后一个：补差，使 Σ 恰等于 `closureTarget`（消除 3 位小数舍入漂移）
                     var alreadyAllocated = shares
                         .Where(s => s.AllocationSequence == allocationSeq)
                         .Sum(s => s.ComponentQty);
@@ -1315,6 +1336,7 @@ internal class PhaseFiveCompression
                 }
                 else if (totalContribution > 0)
                 {
+                    // 按**真实贡献占比**分摊 `closureTarget`（= 声明数量），与旧实现逐字一致
                     shareQty = Math.Round(closureTarget * c.ContributionQty / totalContribution, 3);
                 }
                 else
@@ -1684,26 +1706,18 @@ internal class PhaseFiveCompression
             .GroupBy(s => s.AllocationSequence)
             .ToDictionary(g => g.Key, g => g.ToList());
 
-        // ── P0-03（0号位 2026-10-08 §六）：含**未排定需求**的 Allocation 不参与 Allocation 级闭合 ──
-        //   需求若有执行批没排下，它就在出口被报 Unscheduled（§六），其 `AllocationTaskShare` 只承载
-        //   **已落定批**的份额（见 `GenerateAllocationShares` 的 `closureTarget`）⇒
-        //   对它强制「ΣShare == 声明 NetOutputQty」是无意义的，会误判为失败。
-        //   该需求的数量正确性由下方**第 8 项（逐需求逐工序数量闭合：未排定 ⇒ 允许小于、绝不允许放大）**保证；
-        //   同 Allocation 内**已排定**需求的数量正确性同样由第 8 项**严格**保证 ⇒ 不因本跳过而放松。
-        var allocationsWithUnscheduledDemand = new HashSet<long>(
-            request.LogicalProductionDemands
-                .Where(d => unscheduledDemandKeys.Contains(d.LogicalDemandKey))
-                .Select(d => d.AllocationSequence));
-
+        // ── 2026-10-08 复审 NEW-P0-01 整改：**撤销**「含未排定需求的 Allocation 跳过本项闭合」的改法 ──
+        //   0号位 2026-10-08《未命名的Markdown文件 (2)(1).md》§二.4 明列禁止项：「**静默跳过该Allocation**」；
+        //   §十二 并指出「无法按客户DueDate完成不是Solver失败」与「Allocation只排出一部分数量且TaskShare不闭合
+        //   也可以正式成功」**不是一个概念**（v1.7:1052 + :1026-1034 要求 `TaskShare数量不闭合` 必须使 Domain 失败）。
+        //   ⇒ 本项**无条件**对所有**已产出份额**的 Allocation 执行。
+        //   注：整条 Allocation 的所有需求都未排定时，它不产出任何 Task ⇒ 不产生份额行 ⇒ 不出现在 `sharesByAllocation`
+        //   ⇒ 本项**天然不适用**（这不是跳过，而是「无份额可闭合」）⇒ 「产能不足 ⇒ Success=true + Unscheduled」的
+        //   冻结口径（v1.7 §41）**不受影响**；只有「**部分**落定」（ΣShare < 声明 AllocationQty）才判失败。
         foreach (var allocKvp in sharesByAllocation)
         {
             var allocationSeq = allocKvp.Key;
             var shares = allocKvp.Value;
-
-            if (allocationsWithUnscheduledDemand.Contains(allocationSeq))
-            {
-                continue;   // 见上：改由第 8 项逐需求逐工序闭合保证
-            }
 
             if (!allocationTotalNetOutput.TryGetValue(allocationSeq, out var expectedQty))
             {
