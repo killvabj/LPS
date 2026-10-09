@@ -1173,8 +1173,14 @@
         <member name="M:LPS.APS.Web.Controllers.TaskSplitRuleConfigController.HandleError(System.Exception,System.String)">
             <summary>统一错误映射：422 数据红线 / 404 不存在 / 400 参数；未知异常上抛由框架处理（500）</summary>
         </member>
-        <member name="M:LPS.APS.Web.Controllers.TaskSplitRuleConfigController.List(System.Nullable{System.Int32},System.Nullable{System.Int32},System.Nullable{System.Boolean},System.Threading.CancellationToken)">
-            <summary>列出执行批拆分规则（可按物料/生产部门/启用态过滤），供 4号位 配置页面。</summary>
+        <member name="M:LPS.APS.Web.Controllers.TaskSplitRuleConfigController.List(System.Nullable{System.Int32},System.Nullable{System.Int32},System.Nullable{System.Boolean},System.Int32,System.Int32,System.Threading.CancellationToken)">
+            <summary>分页列出执行批拆分规则（可按物料/生产部门/启用态过滤；R2 标准分页契约，4号位 2026-10-08 提请，方案 A）。</summary>
+            <param name="materialId">物料 Id（可选精确匹配）</param>
+            <param name="productionDepartmentId">生产部门 Id（可选精确匹配）</param>
+            <param name="isActive">启用态过滤（null = 全部）</param>
+            <param name="pageIndex">页码（1 基，&lt; 1 归 1）</param>
+            <param name="pageSize">每页条数（1~200，超限截断；默认 20）</param>
+            <param name="ct">取消令牌</param>
         </member>
         <member name="M:LPS.APS.Web.Controllers.TaskSplitRuleConfigController.Create(LPS.APS.Core.DTOs.Governance.SaveTaskSplitRuleConfigRequest,System.Threading.CancellationToken)">
             <summary>新增执行批拆分规则。</summary>

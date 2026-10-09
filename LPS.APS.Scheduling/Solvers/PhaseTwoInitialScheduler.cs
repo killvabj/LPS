@@ -127,6 +127,31 @@ internal class PhaseTwoInitialScheduler
             if (lockedNode == null)
             {
                 result.UnscheduledDemandKeys.Add(lockedTask.DraftId);
+
+                // ── P0-01（0号位 2026-10-09 第三轮复审 §二）：**区分两类失败，阻断假成功** ──
+                //   · 「普通业务无法排下」（产能/日历/物料确实不足）⇒ 只记 `UnscheduledDemandKeys`，
+                //     属**业务结果**，Success 仍可为 true；
+                //   · 「**已有已锁定执行 Task 身份不可恢复**」= 锁定任务（既成事实锚点）在本次输入里
+                //     解不出真实 RouteCode/PathId（图缺失 / 节点缺失 / 对应需求缺失）⇒ 这是**输入完整性
+                //     问题**，不是业务结果 ⇒ 必须经**既有技术失败载体**上报。
+                //   ⚠ 否则会出现复审点名的「**无锁定 Task、却 Success=true**」假成功：
+                //     `PhaseFiveCompression.cs` 的 `Success = !technicalFailure` **只看本标志**
+                //     （一般业务 Unscheduled 不会使其为 false）。
+                //   ⚠ 只**复用**既有载体（`TechnicalFailure` / `TechnicalFailureReason`，与 `:46`/`:354` 同口径），
+                //     **不新增**数据库字段、**不自造** ReasonCode 枚举；真实 Route/Path 输入由 2号位 保证
+                //     （复审 §二 P0-01 明文：「由2号位保证真实Route/Path输入，不需1号位新增数据库字段」）。
+                var identityGap = lockedGraph is null
+                    ? "Route/Path 图缺失"
+                    : "图中无该 (StageCode, OperationCode) 节点";
+                var identityFailure =
+                    $"锁定执行Task身份不可恢复：DraftId={lockedTask.DraftId}, "
+                    + $"MaterialId={(demand is null ? "(对应需求缺失)" : demand.MaterialId.ToString())}, "
+                    + $"StageCode={lockedTask.StageCode}, OperationCode={lockedTask.OperationCode}（{identityGap}）";
+                result.TechnicalFailure = true;
+                result.TechnicalFailureReason = string.IsNullOrEmpty(result.TechnicalFailureReason)
+                    ? identityFailure
+                    : result.TechnicalFailureReason + "；" + identityFailure;
+
                 continue;
             }
 
@@ -430,6 +455,60 @@ internal class PhaseTwoInitialScheduler
             //   本判据与批数无关 ⇒ 提到候选择优之前（择优需要它）。
             var mergeAllowed = batchPolicy?.AllowMerge ?? request.StrategySnapshot.Parameters.AllowMerge;
 
+            // ═══ P1-01（0号位 2026-10-09 第三轮复审 §二）：**AUTO 方向在进入批/路由择优之前一次性自决** ═══
+            //   复审源码证实的不一致：`AUTO` 原先**只在** `ScheduleDemandOperations`（真正排程执行时）本地解析，
+            //   而 `SelectBestBatchPlan` / `RunBatchPlan` / `SelectBestRoutingCandidate` / `CompareBatchPlans`
+            //   拿到的是**原始策略值**（`request.StrategySnapshot.Parameters.SchedulingDirection`，可能仍是 `AUTO`）
+            //   ⇒ 第③层「均按期时的交期目标」在 AUTO 下走「更早可行完成优先」分支，而本批**真实** ResolvedDirection
+            //     可能为 BACKWARD（要求「更晚但不延期」）⇒ 方向决策与路径择优第三层目标**冲突**。
+            //   整改：在**本需求（= 本批的真实上下文单位）进入择优前**解析**一次**，**同一 ResolvedDirection**
+            //     贯穿 试排 / 候选比较 / 落定 / 必要的 Phase5 语义；**不另建求解器**（仍复用 `SchedulingDirectionResolver`）。
+            //   零回归：单路径（V1 常态 / A/B 固定路径）时本处解析所用 `demand` 与 `ops` 与旧实现
+            //     `ScheduleDemandOperations` 内的局部解析**逐字相同** ⇒ 解析结果与排程结果完全一致。
+            var resolvedDirection = direction;
+            if (resolvedDirection == SchedulingDirectionResolver.Auto)
+            {
+                // 解析用工序集：取**首个非空**候选的工序 —— `plannedCandidates` 顺序确定 ⇒ 结果确定
+                //   （下方 `:362` 一带已保证至少一条非空）。`ops` 仅用于 lead-time 估算（Slack 判据），
+                //   不含资源争用，故「取首条」不改变方向判据的语义。
+                var decision = SchedulingDirectionResolver.Resolve(
+                    actualDemand,
+                    plannedCandidates.First(p => p.Ops.Count > 0).Ops,
+                    constraints,
+                    request.PlanningStart,
+                    dynamicMaterialFloor,
+                    demandGoal: null);
+                resolvedDirection = decision.Direction;
+
+                // ── P1-02（复审 §二）：缺口经**既有合法追溯通道**（`SolveTraceNote`）表达 ──
+                //   复审判词：「`DEMAND_GOAL_ABSENT` 只加到 `Decision.Signals`，未写入 `SolveTraceNotes`」
+                //   ⇒ 「生产路径恒记 DemandGoal 缺失」只对内部计算对象成立，**不等于**用户/日志可见证据。
+                //   处置：仅当该信号出现时写一条 trace。`ReasonCode` 位承载的是**决策说明层**取值 ——
+                //     与 `:1909` 附近 Setup 的 `ExplanationType` **同一先例**，**不是**冻结字典
+                //     `ScheduleExplanationFact.ReasonCode`（0号位 Q4：决策说明不进 ReasonCode 体系）
+                //     ⇒ **未自造 ReasonCode 枚举**（取值直接复用 Resolver 的既有信号常量）。
+                //   体积：每个 AUTO 需求至多一条；当前 DemandGoal 载体缺失 ⇒ 每需求一条，
+                //     如实记录这一**系统性输入缺口**（真实传播由 2号位 补齐后本信号自然消失）。
+                if (decision.Has(SchedulingDirectionResolver.SignalDemandGoalAbsent))
+                {
+                    constraints.TraceNotes.Add(new SolveTraceNote
+                    {
+                        Key = actualDemand.LogicalDemandKey,
+                        ReasonCode = SchedulingDirectionResolver.SignalDemandGoalAbsent,
+                        Message = "Direction 自决（B-005）缺 DemandGoal 载体（2号位 Pegging 传播未达）：" + decision.Reason,
+                        Level = "Warning"
+                    });
+                }
+            }
+
+            // ── Phase5 衔接（0号位 2026-10-09《未命名的Markdown文件 (3)(1).md》§一 第 3 行）──
+            //   复审判词：Phase5 的空隙压实 / Setup 序列优化**仍按 Run 级原始值**判 FORWARD，
+            //     即使 AUTO 内部已判为 FORWARD 也不会进入这两项优化 ⇒ 与 Phase2 的逐需求方向**脱节**。
+            //   处置：把**本需求自决后的方向**登记到 `ConstraintContext`，Phase5 据此按需求粒度门控
+            //     （**不另建求解器**、**不重算**——重算会因缺 Phase2 的试排上下文而漂移）。
+            //   零回归：Run 级 FORWARD/BACKWARD ⇒ 此处登记的即原值，Phase5 判定与整改前逐字一致。
+            constraints.ResolvedDirections[actualDemand.LogicalDemandKey] = resolvedDirection;
+
             // ── P1-01（0号位 2026-10-07《未命名的Markdown文件 (7).md》§八）：有界优化候选择优 ──
             //   结构上有界候选（≤5）：合法不拆 / 合法 2 批 / 合法 3 批 / Preferred 附近切分；
             //   受 `MaxOptimizationSplitCount` / `MaxBatchCandidates` **上限约束**（只收不放，不新增默认值）。
@@ -440,7 +519,7 @@ internal class PhaseTwoInitialScheduler
             if (planCandidates.Count > 1)
             {
                 formation = SelectBestBatchPlan(
-                    planCandidates, actualDemand, plannedCandidates, direction, constraints,
+                    planCandidates, actualDemand, plannedCandidates, resolvedDirection, constraints,
                     resourceOccupancy, result.ScheduledTasks, allocationTaskShare, demandByKey,
                     request, dynamicMaterialFloor, stageOverlap, mergeAllowed);
             }
@@ -461,7 +540,7 @@ internal class PhaseTwoInitialScheduler
 
             // 多批时**禁止 Merge**（判据在 `RunBatchPlan` 内：`mergeAllowed && !multiBatch`）。
             var outcome = RunBatchPlan(
-                batches, actualDemand, plannedCandidates, direction, constraints,
+                batches, actualDemand, plannedCandidates, resolvedDirection, constraints,
                 resourceOccupancy, result.ScheduledTasks, allocationTaskShare, demandByKey,
                 request, dynamicMaterialFloor, stageOverlap, mergeAllowed,
                 constraints.ChosenBatchRoutePaths, constraints.ChosenRoutePaths);
@@ -1534,6 +1613,13 @@ internal class PhaseTwoInitialScheduler
         //   ⚠ `demandGoal: null`：冻结侧 `DemandGoal`（P-006 两值）**无 C# 载体**（全仓 grep 零命中），
         //     属 2号位 Pegging 传播缺口（P-008）；此处**不猜、不自造字段**，由 Resolver 记 `DEMAND_GOAL_ABSENT`。
         //   `MIXED` 保持字面语义不变（0号位 §三：可作为人工/策略明确模式继续保留）。
+        //
+        // ── P1-01（0号位 2026-10-09 第三轮复审 §二）：本分支现为**防御性兜底**，生产路径**不再经过** ──
+        //   复审判词：AUTO 只在「排程执行时」本地解析，与批/路由候选评分所用方向**不一致**。
+        //   整改后，AUTO 已在调用方（`Schedule`，本需求进入批/路由择优之前）**一次性**解析为具体方向，
+        //   并经 `SelectBestBatchPlan` / `RunBatchPlan` **同一 `resolvedDirection`** 传入本方法
+        //   ⇒ 正常情况下本处 `direction` **恒不为 `AUTO`**。
+        //   保留本分支仅为「万一有旁路调用直接传 AUTO」时行为不退化（仍按 B-005 自决，绝不回到 AUTO==MIXED）。
         if (direction == SchedulingDirectionResolver.Auto)
         {
             direction = SchedulingDirectionResolver.Resolve(

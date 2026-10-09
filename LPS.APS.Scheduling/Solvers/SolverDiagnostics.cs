@@ -51,6 +51,12 @@ internal static class SolverDiagnostics
         /// <summary>Phase4 传播过程中实际访问（重排/改期）的 Task 次数。</summary>
         public long Phase4PropagatedTasks;
 
+        /// <summary>Phase5 `CompactGaps`（空隙压实）**门控放行并进入优化体**的次数（0 = 未进入）。</summary>
+        public long Phase5CompactionRuns;
+
+        /// <summary>Phase5 `OptimizeSetupSequences`（Setup 序列优化）**门控放行并进入优化体**的次数。</summary>
+        public long Phase5SetupOptimizationRuns;
+
         /// <summary>Phase 1（硬约束构建）耗时 ms。</summary>
         public long Phase1Ms;
 
@@ -189,6 +195,18 @@ internal static class SolverDiagnostics
     internal static void CountPhase4PropagatedTask()
     {
         if (Current.Value is { } c) c.Phase4PropagatedTasks++;
+    }
+
+    /// <summary>Phase5 `CompactGaps` 门控放行（进入压实优化体）时 +1。纯观测，不参与判定。</summary>
+    internal static void CountPhase5CompactionRun()
+    {
+        if (Current.Value is { } c) c.Phase5CompactionRuns++;
+    }
+
+    /// <summary>Phase5 `OptimizeSetupSequences` 门控放行（进入序列优化体）时 +1。纯观测，不参与判定。</summary>
+    internal static void CountPhase5SetupOptimizationRun()
+    {
+        if (Current.Value is { } c) c.Phase5SetupOptimizationRuns++;
     }
 
     // ══════════════════════════════════════════════════════════════════

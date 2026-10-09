@@ -73,6 +73,7 @@ public class ExistingExecutionContextStageFallbackTests
         Assert.That(ctx.StartOperationCode, Is.Null);          // 工序全完成，无前沿工序
         Assert.That(ctx.DerivedRemainingQty, Is.EqualTo(500m)); // Stage 兜底生效
         Assert.That(ctx.StartStageCode, Is.EqualTo("CN_ASSY"));
+        Assert.That(ctx.MaterialCode, Is.EqualTo("MAT-001"));  // T5-03: 物料身份透出
     }
 
     /// <summary>
@@ -240,6 +241,108 @@ public class ExistingExecutionContextStageFallbackTests
         var ctx = results.First().ExistingExecutionContexts.Single();
         Assert.That(ctx.DerivedRemainingQty, Is.EqualTo(0m));
         Assert.That(ctx.StartOperationCode, Is.Null);
+    }
+
+    /// <summary>
+    /// 多 Slice（T5-02 / 接口 v1.35 §18.3）：两道平行工序都已开工未完成 → 产 2 个 Slice，各带各的剩余。
+    /// 无 Routing 数据走中间态多候选分支；验证 Slices[] 结构 + Σ SliceQty = DerivedRemainingQty(兼容投影)。
+    /// </summary>
+    [Test]
+    public async Task MultiSlice_TwoParallelInProgress_ProducesTwoSlices()
+    {
+        var input = BuildInput(
+            workOrders: new[]
+            {
+                new WorkOrderSnapshotFact
+                {
+                    ProductionInstructionNo = "PI-001", MESWorkOrderNo = "WO-001",
+                    MaterialCode = "MAT-001", PlannedQty = 1000m,
+                    WorkOrderStatus = "IN_PROGRESS", DataCutoffTime = DateTime.UtcNow
+                }
+            },
+            operationProgress: new[]
+            {
+                new OperationProgressFact
+                {
+                    OperationCode = "OP-A", OperationName = "挤丝", StageCode = "CN_ASSY",
+                    MESWorkOrderNo = "WO-001", PlannedQty = 500m, GoodQty = 200m, RemainingQty = 300m
+                },
+                new OperationProgressFact
+                {
+                    OperationCode = "OP-B", OperationName = "磨削", StageCode = "CN_ASSY",
+                    MESWorkOrderNo = "WO-001", PlannedQty = 500m, GoodQty = 300m, RemainingQty = 200m
+                }
+            },
+            stageProgress: new[]
+            {
+                new StageProgressFact
+                {
+                    StageCode = "CN_ASSY", GoodCompletedQty = 1000m,
+                    PlannedQty = 1000m, RemainingQty = 0m, StageSequence = 1
+                }
+            });
+
+        var results = await _calculator.CalculateProductionInstructionPositionsAsync(
+            new[] { input }, new FrozenFactParameters(), CancellationToken.None);
+
+        var ctx = results.First().ExistingExecutionContexts.Single();
+
+        // 关键断言：Slices[] 产 2 个
+        Assert.That(ctx.Slices.Count, Is.EqualTo(2));
+
+        // 各 Slice 数量 = 各自 RemainingQty（挤丝 300 + 磨削 200）
+        var total = ctx.Slices.Sum(s => s.SliceQty);
+        Assert.That(total, Is.EqualTo(500m).Within(0.0001m));
+
+        // 兼容投影：N>1 时 StartOperationCode 为 null、DerivedRemainingQty = Σ
+        Assert.That(ctx.StartOperationCode, Is.Null);
+        Assert.That(ctx.DerivedRemainingQty, Is.EqualTo(500m).Within(0.0001m));
+
+        // 每个 Slice 的 Stage 正确
+        Assert.That(ctx.Slices.All(s => s.StartStageCode == "CN_ASSY"), Is.True);
+    }
+
+    /// <summary>
+    /// 单工序有剩余 → 1 个 Slice（兼容投影 N=1，StartOperationCode 不 null）
+    /// </summary>
+    [Test]
+    public async Task SingleSlice_OneRemaining_ProducesOneSlice()
+    {
+        var input = BuildInput(
+            workOrders: new[]
+            {
+                new WorkOrderSnapshotFact
+                {
+                    ProductionInstructionNo = "PI-001", MESWorkOrderNo = "WO-001",
+                    MaterialCode = "MAT-001", PlannedQty = 1000m,
+                    WorkOrderStatus = "IN_PROGRESS", DataCutoffTime = DateTime.UtcNow
+                }
+            },
+            operationProgress: new[]
+            {
+                new OperationProgressFact
+                {
+                    OperationCode = "OP-A", OperationName = "挤丝", StageCode = "CN_ASSY",
+                    MESWorkOrderNo = "WO-001", PlannedQty = 1000m, GoodQty = 700m, RemainingQty = 300m
+                }
+            },
+            stageProgress: new[]
+            {
+                new StageProgressFact
+                {
+                    StageCode = "CN_ASSY", GoodCompletedQty = 1000m,
+                    PlannedQty = 1000m, RemainingQty = 0m, StageSequence = 1
+                }
+            });
+
+        var results = await _calculator.CalculateProductionInstructionPositionsAsync(
+            new[] { input }, new FrozenFactParameters(), CancellationToken.None);
+
+        var ctx = results.First().ExistingExecutionContexts.Single();
+        Assert.That(ctx.Slices.Count, Is.EqualTo(1));
+        Assert.That(ctx.Slices[0].SliceQty, Is.EqualTo(300m));
+        Assert.That(ctx.Slices[0].StartStageCode, Is.EqualTo("CN_ASSY"));
+        Assert.That(ctx.DerivedRemainingQty, Is.EqualTo(300m));
     }
 
     /// <summary>

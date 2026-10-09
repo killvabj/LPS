@@ -44,20 +44,39 @@ public sealed class TaskSplitRuleConfigGovernanceService : ITaskSplitRuleConfigG
     }
 
     /// <inheritdoc />
-    public async Task<IReadOnlyList<TaskSplitRuleConfigDto>> ListAsync(
-        int? materialId, int? productionDepartmentId, bool? isActive, CancellationToken ct = default)
+    public async Task<PageResult<TaskSplitRuleConfigDto>> ListAsync(
+        int? materialId, int? productionDepartmentId, bool? isActive,
+        int pageIndex = 1, int pageSize = 20, CancellationToken ct = default)
     {
-        var sql = new StringBuilder($"SELECT {SelectColumns} FROM TaskSplitRuleConfig WHERE 1=1");
+        // R2 标准分页契约（4号位 2026-10-08 提请，方案 A）：pageIndex 1 基 <1 归 1；pageSize 1~200 超限截断；COUNT + OFFSET/FETCH。
+        pageIndex = Math.Max(pageIndex, 1);
+        pageSize = Math.Clamp(pageSize, 1, 200);
+        var offset = (pageIndex - 1) * pageSize;
+
+        var where = new StringBuilder(" FROM TaskSplitRuleConfig WHERE 1=1");
         var p = new DynamicParameters();
 
-        if (materialId.HasValue) { sql.Append(" AND MaterialId = @MaterialId"); p.Add("MaterialId", materialId.Value); }
-        if (productionDepartmentId.HasValue) { sql.Append(" AND ProductionDepartmentId = @ProductionDepartmentId"); p.Add("ProductionDepartmentId", productionDepartmentId.Value); }
-        if (isActive.HasValue) { sql.Append(" AND IsActive = @IsActive"); p.Add("IsActive", isActive.Value); }
+        if (materialId.HasValue) { where.Append(" AND MaterialId = @MaterialId"); p.Add("MaterialId", materialId.Value); }
+        if (productionDepartmentId.HasValue) { where.Append(" AND ProductionDepartmentId = @ProductionDepartmentId"); p.Add("ProductionDepartmentId", productionDepartmentId.Value); }
+        if (isActive.HasValue) { where.Append(" AND IsActive = @IsActive"); p.Add("IsActive", isActive.Value); }
 
-        sql.Append(" ORDER BY MaterialId, ProductionDepartmentId, Id");
+        p.Add("Offset", offset);
+        p.Add("PageSize", pageSize);
 
-        var rows = await _connectionManager.QueryAsync<TaskSplitRuleConfigDto>(sql.ToString(), p, db: DatabaseId.APS);
-        return rows.ToList();
+        var total = await _connectionManager.QueryFirstOrDefaultAsync<int?>(
+            $"SELECT COUNT(*){where}", p, db: DatabaseId.APS) ?? 0;
+
+        var rows = await _connectionManager.QueryAsync<TaskSplitRuleConfigDto>(
+            $"SELECT {SelectColumns}{where} ORDER BY MaterialId, ProductionDepartmentId, Id OFFSET @Offset ROWS FETCH NEXT @PageSize ROWS ONLY",
+            p, db: DatabaseId.APS);
+
+        return new PageResult<TaskSplitRuleConfigDto>
+        {
+            Items = rows.ToList(),
+            Total = total,
+            Page = pageIndex,
+            PageSize = pageSize
+        };
     }
 
     /// <inheritdoc />

@@ -351,6 +351,108 @@ public class PhaseTwoRoutingCandidateTests
             Assert.True(t.RouteCode is "RTA" or "RTB", $"非候选路径身份：{t.RouteCode}");
             Assert.Equal(1, t.PathId);
         });
+
+        // ── P0-01（0号位 2026-10-09 第三轮复审 §二）：「不得假成功」的**回归护栏** ──
+        //   锁定任务身份不可恢复属**输入完整性问题**，绝不能被当成「普通业务排不下」（后者 Success 仍为 true）。
+        //   ⚠ 本夹具（**部分**锁定 0.5）里 Phase5 硬校验会先一步拦下（「需求 D1 未排定却产出超额 FinalTask」）
+        //     ⇒ 整改前后 Success 均为 false ⇒ 本断言**不是**该整改的鉴别器，只是护栏。
+        //   鉴别器见 ⑦-a / ⑦-b：那两处 Phase5 校验**通过**，唯一使其 Success=false 的就是本整改。
+        Assert.False(result.Success, "锁定Task身份不可恢复必须使 Success=false（不得假成功）");
+    }
+
+    /// <summary>
+    /// ⑦-a P0-01 **反证**（复审 §二 点名：「应补 `LockedTask + 多Path + 路径缺失` 反证，并验证没有假成功」）：
+    ///   多路径物料 + 锁定任务无固定路径 ⇒ 身份不可恢复；且锁定量 = 需求全量 ⇒ 需求**全量锁定**、
+    ///   不再排剩余份额 ⇒ 最终集合里**没有任何 Task**，Phase5 的「锁定锚点时间」与「未排定却超额」两条
+    ///   校验都**通过**。
+    ///   ⇒ 此时**唯一**能让 `Success=false` 的就是本整改写入的 `TechnicalFailure`；
+    ///     ⚠ 整改前该输入会得到「**无锁定 Task、却 Success=true**」的假成功 ⇒ 本用例**红**。
+    /// </summary>
+    [Fact]
+    public async Task 锁定任务_多路径无固定路径_全量锁定_身份不可恢复_不假成功()
+    {
+        var locked = new ExecutionConstraint
+        {
+            DraftId = "D1",
+            ResourceId = 1,
+            LockedStart = PlanningStart,
+            LockedEnd = PlanningStart.AddHours(1),
+            ConstraintType = "MANUAL",
+            StageCode = "STAGE1",
+            OperationCode = "OP10",
+            LockedQuantity = 1m        // = 需求 NetOutputQty ⇒ 全量锁定 ⇒ 不排剩余份额
+        };
+
+        var result = await _solver.SolveAsync(Build(
+            new[]
+            {
+                new PathSpec("RTA", 1, 1, PlanningStart, PlanningEnd),
+                new PathSpec("RTB", 1, 2, PlanningStart, PlanningEnd)
+            },
+            locked: locked));
+
+        Assert.Empty(result.FinalTasks);
+        Assert.False(result.Success, "有锁定事实却身份不可恢复，必须 Success=false（不得假成功）");
+        Assert.Contains("锁定执行Task身份不可恢复", result.ErrorMessage ?? string.Empty);
+    }
+
+    /// <summary>
+    /// ⑦-b P0-01 **反证**（**节点缺失**变体）：单路径物料（图可解）但锁定任务的
+    ///   (StageCode, OperationCode) 在图中不存在 ⇒ 身份不可恢复；锁定量 = 需求全量 ⇒ 无 Task
+    ///   ⇒ Phase5 校验通过 ⇒ 唯一使 Success=false 的是本整改。
+    ///   本用例把「图缺失」与「节点缺失」两条路径分开锁死（复审 §二 点名三种情形）。
+    /// </summary>
+    [Fact]
+    public async Task 锁定任务_节点在图中缺失_技术失败不假成功()
+    {
+        var locked = new ExecutionConstraint
+        {
+            DraftId = "D1",
+            ResourceId = 1,
+            LockedStart = PlanningStart,
+            LockedEnd = PlanningStart.AddHours(1),
+            ConstraintType = "MANUAL",
+            StageCode = "STAGE9",        // 图中不存在
+            OperationCode = "OP90",      // 图中不存在
+            LockedQuantity = 1m          // 全量锁定 ⇒ 不排剩余份额
+        };
+
+        var result = await _solver.SolveAsync(Build(
+            new[] { new PathSpec("RTA", 1, 1, PlanningStart, PlanningEnd) },
+            locked: locked));
+
+        Assert.False(result.Success, "锁定Task节点缺失必须使 Success=false（不得假成功）");
+        Assert.Contains("锁定执行Task身份不可恢复", result.ErrorMessage ?? string.Empty);
+        Assert.Contains("图中无该", result.ErrorMessage ?? string.Empty);
+    }
+
+    /// <summary>
+    /// ⑦-c P0-01 反证（**对应需求缺失**变体）：锁定任务引用的 DraftId 在本次请求里
+    ///   没有对应需求 ⇒ 身份不可恢复 ⇒ 同样必须 Success=false。
+    ///   （其余需求仍正常排程 ⇒ 本用例同时锁死「技术失败 ≠ 整域无产出」的既有载体语义。）
+    /// </summary>
+    [Fact]
+    public async Task 锁定任务_对应需求缺失_技术失败不假成功()
+    {
+        var locked = new ExecutionConstraint
+        {
+            DraftId = "D_MISSING",   // 请求中不存在该需求
+            ResourceId = 1,
+            LockedStart = PlanningStart,
+            LockedEnd = PlanningStart.AddHours(1),
+            ConstraintType = "MANUAL",
+            StageCode = "STAGE1",
+            OperationCode = "OP10",
+            LockedQuantity = 0.5m
+        };
+
+        var result = await _solver.SolveAsync(Build(
+            new[] { new PathSpec("RTA", 1, 1, PlanningStart, PlanningEnd) },
+            locked: locked));
+
+        Assert.False(result.Success, "锁定Task对应需求缺失必须使 Success=false（不得假成功）");
+        Assert.Contains("锁定执行Task身份不可恢复", result.ErrorMessage ?? string.Empty);
+        Assert.Contains("(对应需求缺失)", result.ErrorMessage ?? string.Empty);
     }
 
     // ═══════════════════════════════════════════════════════════════════════════════
@@ -483,10 +585,136 @@ public class PhaseTwoRoutingCandidateTests
         Assert.NotEqual(Signature(tight), Signature(withPref));
     }
 
+    // ═══════════════════════════════════════════════════════════════════════════════
+    // ⑨ P1-01 反证（0号位 2026-10-09 第三轮复审 §二）：**AUTO 方向与批/路由候选评分口径一致**
+    //
+    // 复审判词（源码证实）：`AUTO` 原先只在 `ScheduleDemandOperations`（排程执行时）本地解析，
+    //   而 `SelectBestRoutingCandidate` / `CompareBatchPlans` 拿到的是**原始策略值**（仍为 `AUTO`）
+    //   ⇒ 第③层「均按期时的交期目标」在 AUTO 下走「更早完成优先」，与同批真实 ResolvedDirection
+    //     （BACKWARD ⇒「更晚但不延期」）**不一致**。
+    // 整改后：AUTO 在**进入择优之前一次性**解析，**同一 ResolvedDirection** 贯穿试排/比较/落定。
+    //
+    // ── 夹具几何的**硬约束**（源码推导，决定反证怎么造才真有鉴别力）──
+    //   `ScheduleBackward` 把末工序锚在 `EffectiveDue`：`candidateEnd = currentEndTime + overlapExtension`
+    //   ⇒ **倒排下每条可行候选的完成时间恒等于交期**；而 `FindBackwardSlot` 不做滑动（查不到槽即该资源不可行）。
+    //   ⇒ 「双 Route 均按期但完成时间不同」在**纯倒排的非合批候选之间不可实现**，
+    //     第③层会被跳过（完成时间相等）⇒ 只能靠**合批**（Merge 把目标 Task 的末端后延）造出完成时间差。
+    //   故本反证用「一个**锁定锚点 Task**（方向无关、两次运行逐字相同）+ 一条可合批的候选（早完）
+    //   + 一条不可合批的候选（晚完且恰按期）」把第③层真正逼出来。
+    // ═══════════════════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// ⑨-① **双 Route（一条经合批提前完成、一条恰在交期完成，且**都按期**）** ⇒ AUTO 自决为 BACKWARD
+    ///   ⇒ 候选择优必须与**显式 BACKWARD 逐字段一致**（都取「更晚但不延期」那条 = RTB）。
+    ///
+    /// 夹具几何（`lead` = 1×60min = 60min）：
+    ///   · `D0`：**锁定锚点**（`ExecutionConstraint` 固定 `RTA/1`、锁定量 0.5 = 需求全量 ⇒ 全量锁定、
+    ///     原地继承 `[P, P+30m]`、不参与排程）；交期 `P+90m` 是**合批合法性闸**
+    ///     （`TryMergeDemandIntoTask` 要求 `newEndTime ≤ min(本需求交期, 目标已有份额交期)`）。
+    ///     锁定锚点**与 Direction 无关** ⇒ AUTO / 显式 BACKWARD / 显式 FORWARD 三次运行的 D0 逐字相同，
+    ///     故三者的差异**只能**来自 D1 的候选择优。
+    ///   · `D1`：自由候选（RTA/RTB 两条 Path），交期 `P+2h` ⇒ Slack = 120 − 60 = 60（不 > lead）
+    ///     ⇒ 无交期信号、无其它上下文 ⇒ `NO_CONTEXT_SIGNAL` ⇒ **BACKWARD**。
+    ///     · 候选 **RTA**：合批进 D0 的锚点 Task ⇒ 合并量 0.5+1 = 1.5 ⇒ 新末端 `P+90m`（**早完**，按期）
+    ///     · 候选 **RTB**：不可合批（RouteCode 不同）⇒ 倒排 `[P+1h, P+2h]`（**晚完**，恰按期）
+    ///   ⇒ 第③层被真正触发：显式 FORWARD 取**更早**（RTA 合批 `P+90m`）、
+    ///     显式 BACKWARD 取**更晚**（RTB `P+2h`），二者必然不同（下方 `NotEqual` 即夹具自证的**鉴别力**锁）。
+    ///
+    /// ⚠ 整改前：AUTO 把原始 `"AUTO"` 传进候选比较 ⇒ 走「更早完成」分支 ⇒ 选中 RTA 合批
+    ///   ⇒ 与显式 BACKWARD（RTB）**不一致** ⇒ 本用例 **红**（正是复审点名的第三层目标冲突）。
+    /// ⚠ 本用例刻意**不用** `Build`（两工序）夹具：两工序 `operations.Count != 1` 时
+    ///   `FindMergeableTasks` 直接返回空 ⇒ 合批永不发生 ⇒ 造不出完成时间差 ⇒ **假反证**。
+    /// </summary>
+    [Fact]
+    public async Task AUTO_双Route一条经合批提前完成_自决BACKWARD须与显式BACKWARD一致()
+    {
+        var paths = new[]
+        {
+            new PathSpec("RTA", 1, 1, PlanningStart, PlanningEnd),
+            new PathSpec("RTB", 1, 2, PlanningStart, PlanningEnd)
+        };
+        var demands = new[]
+        {
+            // D0：锁定锚点（固定 RTA/1 ⇒ 身份可解，不触发 P0-01 技术失败）；交期 P+90m = 合批合法性闸上界。
+            new DemandSpec2("D0", 1, 0.5m, "RTA", 1, Due: PlanningStart.AddMinutes(90)),
+            // D1：自由候选；交期 P+2h ⇒ Slack = 60（不 > lead = 60）⇒ 无交期信号 ⇒ 自决 BACKWARD。
+            new DemandSpec2("D1", 2, 1m, null, null, Due: PlanningStart.AddMinutes(120))
+        };
+        var locked = new ExecutionConstraint
+        {
+            DraftId = "D0",
+            ResourceId = 1,
+            LockedStart = PlanningStart,
+            LockedEnd = PlanningStart.AddMinutes(30),
+            ConstraintType = "MANUAL",
+            StageCode = "STAGE1",
+            OperationCode = "OP10",
+            LockedQuantity = 0.5m          // = D0 需求全量 ⇒ 全量锁定 ⇒ 不排剩余份额
+        };
+
+        var lockedSet = new[] { locked };
+        var auto = await _solver.SolveAsync(BuildSingleOp(paths, demands, direction: "AUTO", locked: lockedSet));
+        var backward = await _solver.SolveAsync(BuildSingleOp(paths, demands, direction: "BACKWARD", locked: lockedSet));
+        var forward = await _solver.SolveAsync(BuildSingleOp(paths, demands, direction: "FORWARD", locked: lockedSet));
+
+        Assert.True(auto.Success, auto.ErrorMessage);
+        Assert.True(backward.Success, backward.ErrorMessage);
+        Assert.True(forward.Success, forward.ErrorMessage);
+
+        // 锁定锚点必须原地保留（方向无关 ⇒ 三次运行同一事实，反证的「唯一变量」是 D1 的择优）。
+        var d0 = auto.FinalTasks.Single(t => t.SourceDraftId == "D0");
+        Assert.Equal("RTA", d0.RouteCode);
+        Assert.Equal(PlanningStart, d0.PlannedStartTime);
+        Assert.Equal(PlanningStart.AddMinutes(30), d0.PlannedEndTime);
+
+        // 夹具自证「可判别」：两个显式方向必须选出**不同**的 D1 落点，否则本用例没有鉴别力。
+        Assert.NotEqual(Signature(forward), Signature(backward));
+        Assert.Equal("RTB", backward.FinalTasks.Single(t => t.SourceDraftId == "D1").RouteCode);
+
+        // 反证核心：AUTO 自决为 BACKWARD ⇒ 候选择优必须与显式 BACKWARD **逐字段一致**。
+        //   整改前 AUTO 走「更早完成」分支 ⇒ 选中 RTA（合批进 D0 锚点、D1 无自有 Task）⇒ 本断言红。
+        AssertSameSchedule(backward, auto);
+
+        // AUTO 不得退化成「恒等 FORWARD」（显式 FORWARD 取更早完成的 RTA 合批）。
+        Assert.NotEqual(Signature(forward), Signature(auto));
+    }
+
+    /// <summary>
+    /// ⑩ P1-02 反证（复审 §二）：**DemandGoal 缺失的缺口必须真正进入生产诊断出口**。
+    ///   复审判词：「`DEMAND_GOAL_ABSENT` 只加到 `Decision.Signals`，未写入 `SolveTraceNotes`」
+    ///   ⇒ 开发报告「生产路径恒记缺口」的说法只对内部对象成立，**不等于**用户/日志可见证据。
+    ///   整改：AUTO 自决时若缺 DemandGoal 载体 ⇒ 经**既有合法追溯通道** `DomainSolveResult.SolveTraceNotes`
+    ///   写出一条 `ReasonCode = DEMAND_GOAL_ABSENT` 的记录（**未自造** ReasonCode 枚举）。
+    ///
+    /// 反向对照：**显式**方向（BACKWARD）不经过 B-005 自决 ⇒ **不得**产出该 trace
+    ///   （锁死「不是无条件乱写 trace」）。
+    /// </summary>
+    [Fact]
+    public async Task AUTO解析_DemandGoal缺口经SolveTraceNotes出口()
+    {
+        var paths = new[] { new PathSpec("RTA", 1, 1, PlanningStart, PlanningEnd) };
+        var due = PlanningStart.AddHours(3);
+
+        var auto = await _solver.SolveAsync(Build(paths, direction: "AUTO", due: due));
+        Assert.True(auto.Success, auto.ErrorMessage);
+
+        // 出口断言：trace 载体（`SolveTraceNotes`）里必须能看到缺口
+        Assert.Contains(auto.SolveTraceNotes, n => n.ReasonCode == "DEMAND_GOAL_ABSENT");
+        // 追溯键归属该需求（可定位，不是匿名声）
+        Assert.Contains(auto.SolveTraceNotes,
+            n => n.ReasonCode == "DEMAND_GOAL_ABSENT" && n.Key == "D1");
+
+        // 反向对照：显式方向不做 B-005 自决 ⇒ 无此 trace
+        var explicitRun = await _solver.SolveAsync(Build(paths, direction: "BACKWARD", due: due));
+        Assert.True(explicitRun.Success, explicitRun.ErrorMessage);
+        Assert.DoesNotContain(explicitRun.SolveTraceNotes, n => n.ReasonCode == "DEMAND_GOAL_ABSENT");
+    }
+
     // ─────────── 0号位 2026-10-07 (5).md 反证单测辅助 + ③④⑤ ───────────
 
     private readonly record struct DemandSpec2(
-        string Key, int Seq, decimal Qty, string? RouteCode, int? PathId, bool IsContinuation = false);
+        string Key, int Seq, decimal Qty, string? RouteCode, int? PathId, bool IsContinuation = false,
+        DateTime? Due = null);
 
     /// <summary>
     /// 单工序 Path 夹具（Merge 类反证专用）：每条 Path 只含一道 OP10@STAGE1，独立资源 + 日历。
@@ -497,7 +725,8 @@ public class PhaseTwoRoutingCandidateTests
         IReadOnlyList<PathSpec> paths,
         IReadOnlyList<DemandSpec2> demands,
         bool allowMerge = true,
-        string direction = "FORWARD")
+        string direction = "FORWARD",
+        IReadOnlyList<ExecutionConstraint>? locked = null)
     {
         var ops = new List<RoutingOperation>();
         var elig = new List<OperationResourceEligibility>();
@@ -549,7 +778,7 @@ public class PhaseTwoRoutingCandidateTests
                 LogicalDemandKey = d.Key, PlanVersionId = 1L, DomainKey = "DOMAIN",
                 AllocationSequence = d.Seq, DemandKey = d.Key, MaterialId = MaterialId, FactoryId = 1,
                 NetOutputQty = d.Qty, PlannedProcessQty = d.Qty,
-                RequiredAvailableTime = PlanningStart.AddDays(20), DemandSequence = d.Seq,
+                RequiredAvailableTime = d.Due ?? PlanningStart.AddDays(20), DemandSequence = d.Seq,
                 RouteCode = d.RouteCode, PathId = d.PathId,
                 IsContinuation = d.IsContinuation, NoSplitMerge = d.IsContinuation
             }).ToList(),
@@ -557,7 +786,7 @@ public class PhaseTwoRoutingCandidateTests
             RoutingDependencies = new List<RoutingDependency>(),
             OperationResourceEligibility = elig,
             MaterialStageDepartmentContexts = stageDepts,
-            ExecutionConstraints = Array.Empty<ExecutionConstraint>(),
+            ExecutionConstraints = locked is null ? Array.Empty<ExecutionConstraint>() : locked,
             Resources = resources,
             CalendarSlots = calendars,
             StrategySnapshot = new SolverStrategySnapshot

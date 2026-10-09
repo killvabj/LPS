@@ -1124,6 +1124,22 @@ internal class ConstraintContext
     public Dictionary<string, List<string>> ExecutionBatchDraftKeys { get; set; } = new(StringComparer.Ordinal);
 
     /// <summary>
+    /// 需求 → **本 Run 该需求自决后的排程方向**（`LogicalDemandKey` → `FORWARD`/`BACKWARD`/`MIXED`）。
+    ///
+    /// Phase2 在**本需求进入批/路由择优之前**用 `SchedulingDirectionResolver` 解析一次并登记
+    ///   （P1-01 整改：同一 ResolvedDirection 贯穿 试排/候选比较/落定）；Phase5 的空隙压实与
+    ///   Setup 序列优化据此判定「本需求是否 FORWARD」，**不再使用 Run 级原始策略值**。
+    ///
+    /// ⚠ 为什么必须登记而不是在 Phase5 重算：Phase2 的解析输入含**本需求的候选工序集**与
+    ///   `dynamicMaterialFloor`（试排上下文）；Phase5 已无该上下文 ⇒ 重算会**漂移**。登记 = 一次解析、全链一致。
+    ///
+    /// Run 级 `FORWARD`/`BACKWARD` ⇒ 全量同向（Phase2 不解析、直接取原值）⇒ Phase5 行为与整改前**逐字一致**；
+    /// Run 级 `AUTO` ⇒ 逐需求方向不同 ⇒ Phase5 得以按需求粒度门控（整改前 Phase5 见到 `AUTO` 恒跳过两项优化）。
+    /// 未登记（旁路/早期 continue 的需求）⇒ 消费侧回落 Run 级原值（保守，与整改前一致）。
+    /// </summary>
+    public Dictionary<string, string> ResolvedDirections { get; set; } = new(StringComparer.Ordinal);
+
+    /// <summary>
     /// ⑧块 Batch Policy —— **按 `(MaterialId, ProductionDepartmentId?)` 键控的策略集**
     /// （P0-01 整改，0号位 2026-10-07《未命名的Markdown文件 (7).md》§四）。
     ///

@@ -11,16 +11,20 @@ namespace LPS.APS.Application.Services;
 /// </summary>
 public interface ITaskSplitRuleConfigGovernanceService
 {
-    /// <summary>列出执行批拆分规则（可按物料/生产部门/启用态过滤）。</summary>
+    /// <summary>分页列出执行批拆分规则（可按物料/生产部门/启用态过滤；R2 标准分页契约，4号位 2026-10-08 提请）。</summary>
     /// <param name="materialId">物料 Id（可选精确匹配）</param>
     /// <param name="productionDepartmentId">生产部门 Id（可选精确匹配）</param>
     /// <param name="isActive">启用态过滤（null = 全部）</param>
+    /// <param name="pageIndex">页码（1 基，&lt; 1 强制归 1）</param>
+    /// <param name="pageSize">每页条数（1~200，超限截断；默认 20）</param>
     /// <param name="ct">取消令牌</param>
-    /// <returns>规则列表（按 MaterialId, ProductionDepartmentId, Id 排序）</returns>
-    Task<IReadOnlyList<TaskSplitRuleConfigDto>> ListAsync(
+    /// <returns>PageResult（Items 按 MaterialId, ProductionDepartmentId, Id 排序；Total 为筛选后总数）</returns>
+    Task<PageResult<TaskSplitRuleConfigDto>> ListAsync(
         int? materialId,
         int? productionDepartmentId,
         bool? isActive,
+        int pageIndex = 1,
+        int pageSize = 20,
         CancellationToken ct = default);
 
     /// <summary>新增执行批拆分规则（治理侧直维护 + 审计）。业务键冲突 / 数值红线 → 数据红线异常。</summary>

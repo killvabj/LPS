@@ -353,6 +353,27 @@ internal class PhaseFiveCompression
     }
 
     /// <summary>
+    /// P1 整改（0号位 2026-10-09《未命名的Markdown文件 (3)(1).md》§一 第 3 行）：本需求是否**按 FORWARD 处理**。
+    ///
+    /// 判据 = Phase2 登记于 <see cref="ConstraintContext.ResolvedDirections"/> 的**本需求自决方向**，
+    ///   **不是** Run 级原始策略值 —— 整改前 Phase5 直接比较 `SchedulingDirection == "FORWARD"`，
+    ///   Run 级为 `AUTO` 时恒为 false ⇒ 即使本需求自决为 FORWARD 也永不进入压实 / 序列优化。
+    ///
+    /// 零回归：Run 级 `FORWARD`/`BACKWARD` ⇒ Phase2 登记的即原值 ⇒ 本判据与整改前**逐字等价**。
+    /// 未登记（旁路 / 早期 `continue` 的需求）⇒ 回落 Run 级原值（保守，与整改前一致）。
+    /// </summary>
+    private static bool IsForwardDemand(string demandKey, DomainSolveRequest request, ConstraintContext constraints)
+    {
+        if (constraints.ResolvedDirections.TryGetValue(demandKey, out var resolved))
+        {
+            return string.Equals(resolved, "FORWARD", StringComparison.Ordinal);
+        }
+
+        return string.Equals(
+            request.StrategySnapshot.Parameters.SchedulingDirection, "FORWARD", StringComparison.Ordinal);
+    }
+
+    /// <summary>
     /// P1-05：Gap Compaction —— 保序前向压实（V1 最小实现，Level 3 次级优化）。
     /// 仅 FORWARD 方向执行；把 Task 拉进更早的日历可用空档，全程满足：
     /// - Level 0 硬约束：Calendar/占用含 Setup（复用 Phase4.FindForwardSlot 唯一实现）/不换资源（Eligibility 不变）/
@@ -369,15 +390,32 @@ internal class PhaseFiveCompression
         DomainSolveRequest request,
         ConstraintContext constraints)
     {
-        // 避免过早生产：BACKWARD/MIXED 的 JIT 倒排锚点不前拉（V1 最小口径，只做 FORWARD 压实）
-        if (!string.Equals(request.StrategySnapshot.Parameters.SchedulingDirection, "FORWARD", StringComparison.Ordinal))
+        // 避免过早生产：BACKWARD/MIXED 的 JIT 倒排锚点不前拉（V1 最小口径，只做 FORWARD 压实）。
+        // P1 整改（0号位 2026-10-09《未命名的Markdown文件 (3)(1).md》§一 第 3 行）：判据由 **Run 级原始策略值**
+        //   改为 **本需求自决方向**（Phase2 登记于 `constraints.ResolvedDirections`）。
+        //   Run 级 FORWARD/BACKWARD ⇒ 全量同向 ⇒ 与整改前逐字一致；Run 级 AUTO ⇒ 逐需求判定 ——
+        //   自决为 FORWARD 的需求参与压实，自决为 BACKWARD/MIXED 的（JIT 倒排锚点）仍整体跳过、绝不前拉。
+        if (!request.LogicalProductionDemands.Any(d => IsForwardDemand(d.LogicalDemandKey, request, constraints)))
         {
             return;
         }
+        SolverDiagnostics.CountPhase5CompactionRun();
 
         var occupancy = PhaseFourLocalRepair.BuildResourceOccupancy(tasks, constraints);
         var immovable = PhaseFourLocalRepair.IdentifyImmovableTasks(request, tasks);
         var demandByKey = request.LogicalProductionDemands.ToDictionary(d => d.LogicalDemandKey);
+
+        // P1 整改：非 FORWARD 需求（BACKWARD/MIXED 的 JIT 倒排锚点）**整体按不可移动处理** ⇒
+        //   只作同资源序界，绝不前拉（避免过早生产）。这正是既有注释「BACKWARD/MIXED 锚点整体跳过」的
+        //   落实处：整改前靠「整 Run 门控」达成，整改后靠「逐需求门控」达成
+        //   ⇒ AUTO 下自决为 FORWARD 的需求得以压实，而非 FORWARD 需求仍被完整保护。
+        foreach (var t in tasks)
+        {
+            if (!IsForwardDemand(t.SourceDraftId, request, constraints))
+            {
+                immovable.Add(t.FinalDraftId);
+            }
+        }
 
         // P1-02 性能加固：三重索引消除每 Task 全表扫描（O(n²)→O(n·k)），10万 Task 标定前置。
         var index = TaskIndex.Build(tasks, demandByKey);
@@ -610,8 +648,14 @@ internal class PhaseFiveCompression
     {
         // §17：白天 Candidate 局部优先，不做全天序列重排
         if (request.CandidateContext != null) return;
-        // V1 口径：仅 FORWARD（BACKWARD JIT 锚点需倒排模拟器，待 0号位 背书后扩展——与 CompactGaps 门控一致）
-        if (!string.Equals(request.StrategySnapshot.Parameters.SchedulingDirection, "FORWARD", StringComparison.Ordinal)) return;
+        // V1 口径：仅 FORWARD（BACKWARD JIT 锚点需倒排模拟器，待 0号位 背书后扩展——与 CompactGaps 门控一致）。
+        // P1 整改（0号位 2026-10-09《未命名的Markdown文件 (3)(1).md》§一 第 3 行）：判据由 Run 级原始值
+        //   改为 **全量需求自决方向**。为什么这里必须**整 Run 一致**而不能像压实那样逐 Task 放行：
+        //   序列优化是**整资源段的前向模拟重排**（`SegmentSimulation` + `ResourceProductTimeline`），
+        //   段内若混有 BACKWARD/MIXED 的 JIT 倒排锚点，前向重排会把它前拉 ⇒ 过早生产。
+        //   ⇒ 只要存在任一非 FORWARD 需求即整体跳过（保守）；全量 FORWARD 时才执行（Run 级 AUTO 下亦得以进入）。
+        if (request.LogicalProductionDemands.Any(d => !IsForwardDemand(d.LogicalDemandKey, request, constraints))) return;
+        SolverDiagnostics.CountPhase5SetupOptimizationRun();
         if (tasks.Count < 2) return;
 
         // CompactGaps 可能已移动 Task（压实只维护自身占用图、未同步产品时间线）→

@@ -6458,11 +6458,12 @@
         "tags": [
           "TaskSplitRuleConfig"
         ],
-        "summary": "列出执行批拆分规则（可按物料/生产部门/启用态过滤），供 4号位 配置页面。",
+        "summary": "分页列出执行批拆分规则（可按物料/生产部门/启用态过滤；R2 标准分页契约，4号位 2026-10-08 提请，方案 A）。",
         "parameters": [
           {
             "name": "materialId",
             "in": "query",
+            "description": "物料 Id（可选精确匹配）",
             "schema": {
               "type": "integer",
               "format": "int32"
@@ -6471,6 +6472,7 @@
           {
             "name": "productionDepartmentId",
             "in": "query",
+            "description": "生产部门 Id（可选精确匹配）",
             "schema": {
               "type": "integer",
               "format": "int32"
@@ -6479,8 +6481,29 @@
           {
             "name": "isActive",
             "in": "query",
+            "description": "启用态过滤（null = 全部）",
             "schema": {
               "type": "boolean"
+            }
+          },
+          {
+            "name": "pageIndex",
+            "in": "query",
+            "description": "页码（1 基，< 1 归 1）",
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "default": 1
+            }
+          },
+          {
+            "name": "pageSize",
+            "in": "query",
+            "description": "每页条数（1~200，超限截断；默认 20）",
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "default": 20
             }
           }
         ],

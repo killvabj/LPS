@@ -283,23 +283,27 @@ public sealed class SetupTransitionRuleSnapshot
 
 /// <summary>
 /// ⑧ 批量策略（Batch Policy）规则快照——本 Run 冻结内容（0号位 2026-10-07 裁决：本轮落码）。
-/// 粒度：Material + ProductionDepartment（MaterialId NOT NULL；ProductionDepartmentId 可空=Material 级默认）。
+/// 粒度：Material + ProductionDepartment（MaterialId NOT NULL；ProductionDepartmentId 正式业务键须明确，NULL 仅历史兼容，
+/// v5.1.10 收口④：NULL 部门历史记录不默认为所有部门生效，投影端已按 HasValue 排除）。
 /// 来源：TaskSplitRuleConfig 物理表 active + 生效区间内规则，由 FrozenStrategySnapshotProvider 装配时投影。
 /// 缺策略（某 Material+Dept 无命中规则）由消费侧 fail-closed（BATCH_POLICY_MISSING），本块不承载信号位。
 /// 仅业务键 + 参数，不含审计字段（Id/Created/Updated/IsActive——投影时只取有效规则）。
+/// v5.1.10 收口①②（2026-10-09 生效）：MaxOptimizationSplitCount / MaxBatchCandidates / BottleneckSplitStrategy / NonBottleneckStrategy
+/// 投影恒 null、主链不得消费（Solver 技术预算归 1号位 版本化安全默认；策略列仅追溯）。字段保留仅为兼容旧快照反序列化与 1号位 消费侧类型，
+/// 不构成有效预算/拆合批倾向来源。
 /// </summary>
 public sealed class BatchPolicyRuleSnapshot
 {
     public int MaterialId { get; set; }                         // 物料（正式业务键）
-    public int? ProductionDepartmentId { get; set; }            // 生产部门（可空=Material 级默认）
+    public int? ProductionDepartmentId { get; set; }            // 生产部门（正式命中须明确；可空仅历史兼容，不默认为所有部门生效）
 
     public decimal? MinExecutionBatchQty { get; set; }          // 硬最小批量
     public decimal? MaxExecutionBatchQty { get; set; }          // 硬最大批量（NULL=无硬上限）
-    public decimal? PreferredBatchQty { get; set; }             // 软偏好切点
+    public decimal? PreferredBatchQty { get; set; }             // 软偏好切点（业务生效必填且 >0、处于硬 Min/Max 内，由治理发布校验）
     public bool AllowSplit { get; set; }                        // 是否允许拆分
     public bool AllowMerge { get; set; }                        // 是否允许合并
-    public int? MaxOptimizationSplitCount { get; set; }         // 仅限制优化性拆分搜索（不限制硬 Max 强制拆分）
-    public int? MaxBatchCandidates { get; set; }                // 单问题最多评估候选数
-    public string? BottleneckSplitStrategy { get; set; }        // PREFER_SPLIT / PREFER_MERGE（瓶颈资源拆分/合并策略）
-    public string? NonBottleneckStrategy { get; set; }          // PREFER_LARGE_BATCH / PREFER_SMALL_BATCH（非瓶颈批量策略）
+    public int? MaxOptimizationSplitCount { get; set; }         // v5.1.10 收口①：恒 null 不投（1号位 Solver 技术预算）；仅类型兼容
+    public int? MaxBatchCandidates { get; set; }                // v5.1.10 收口①：恒 null 不投（1号位 Solver 技术预算）；仅类型兼容
+    public string? BottleneckSplitStrategy { get; set; }        // v5.1.10 收口②：恒 null 不投（历史兼容列，V1 不得消费拆/合批倾向）；仅类型兼容
+    public string? NonBottleneckStrategy { get; set; }          // v5.1.10 收口②：恒 null 不投（历史兼容列，V1 不得消费拆/合批倾向）；仅类型兼容
 }

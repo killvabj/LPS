@@ -28,6 +28,7 @@ public class TaskSplitRuleConfigGovernanceServiceIntegrationTests : IDisposable
     private readonly List<AuditLog> _auditLogs = new();
     private readonly TaskSplitRuleConfigGovernanceService _service;
     private int _testMaterialId;
+    private readonly List<int> _pagingMaterialIds = new();
 
     public TaskSplitRuleConfigGovernanceServiceIntegrationTests()
     {
@@ -154,6 +155,47 @@ ORDER BY m.Id";
         _auditLogs.Should().ContainSingle(x => x.ActionCode == "Update");
     }
 
+    [Fact]
+    public async Task ListAsync_分页契约_pageSize截断与越界与归1()
+    {
+        // R2 标准分页契约（4号位 2026-10-08 提请，方案 A）：pageSize=2 → items.length=2 / total≥items.length / page=1 / pageSize=2；
+        // pageSize=9999 → 截断 200；pageIndex 超末页 → items 空数组但 total 真实；pageIndex<1 → 归 1。
+        // 建 3 条不同 Material（去重键 (MaterialId, ProductionDepartmentId) 各不相同，避免触发业务键冲突）。
+        for (var i = 0; i < 3; i++)
+        {
+            var mid = await PickFreeMaterialIdAsync();
+            _pagingMaterialIds.Add(mid);
+            await _service.CreateAsync(
+                new SaveTaskSplitRuleConfigRequest
+                {
+                    MaterialId = mid,
+                    AllowSplit = true,
+                    AllowMerge = true,
+                }, actorUserId: 1, actorUserCode: "test", CancellationToken.None);
+        }
+
+        var page1 = await _service.ListAsync(null, null, null, pageIndex: 1, pageSize: 2, CancellationToken.None);
+        page1.Page.Should().Be(1);
+        page1.PageSize.Should().Be(2);
+        page1.Items.Should().HaveCount(2);
+        page1.Total.Should().BeGreaterThanOrEqualTo(3);
+
+        // pageSize 超 200 → 静默截断到 200；表内总行 < 200 → 全量返回（total == items.Count）
+        var all = await _service.ListAsync(null, null, null, pageIndex: 1, pageSize: 9999, CancellationToken.None);
+        all.PageSize.Should().Be(200);
+        all.Items.Should().HaveCount(all.Total);
+
+        // pageIndex 超末页 → 200 + items 空数组，total 仍真实
+        var beyond = await _service.ListAsync(null, null, null, pageIndex: 9999, pageSize: 2, CancellationToken.None);
+        beyond.Page.Should().Be(9999);
+        beyond.Items.Should().BeEmpty();
+        beyond.Total.Should().BeGreaterThanOrEqualTo(3);
+
+        // pageIndex < 1 → 强制归 1
+        var clamped = await _service.ListAsync(null, null, null, pageIndex: 0, pageSize: 2, CancellationToken.None);
+        clamped.Page.Should().Be(1);
+    }
+
     public void Dispose()
     {
         // 清理本测试自建数据（仅按测试期选定的 MaterialId，绝不误删 4号位 curl / 真实数据）
@@ -162,6 +204,13 @@ ORDER BY m.Id";
             _connectionManager.ExecuteAsync(
                 "DELETE FROM TaskSplitRuleConfig WHERE MaterialId = @MaterialId",
                 new { MaterialId = _testMaterialId },
+                db: DatabaseId.APS).GetAwaiter().GetResult();
+        }
+        foreach (var mid in _pagingMaterialIds)
+        {
+            _connectionManager.ExecuteAsync(
+                "DELETE FROM TaskSplitRuleConfig WHERE MaterialId = @MaterialId",
+                new { MaterialId = mid },
                 db: DatabaseId.APS).GetAwaiter().GetResult();
         }
         _connectionManager.Dispose();
