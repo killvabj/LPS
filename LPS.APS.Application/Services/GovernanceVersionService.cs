@@ -82,7 +82,7 @@ public class GovernanceVersionService : IGovernanceVersionService
         version.ContentSnapshotJson = BuildRuleSetContentSnapshot(version);
 
         version.Status = GovernanceVersionStatus.Published;
-        version.PublishedAt = DateTime.UtcNow;
+        version.PublishedAt = DateTime.Now;
         version.PublishedBy = publishedBy;
 
         await _ruleSetVersionRepository.UpdateAsync(version, ct);
@@ -98,7 +98,7 @@ public class GovernanceVersionService : IGovernanceVersionService
             NewValue = GovernanceVersionStatus.Published,
             UserId = actorUserId,
             UserCode = publishedBy,
-            OccurredAt = DateTime.UtcNow,
+            OccurredAt = DateTime.Now,
             Remark = string.IsNullOrWhiteSpace(changeReason) ? "规则集版本发布" : changeReason
         }, ct);
     }
@@ -126,7 +126,7 @@ public class GovernanceVersionService : IGovernanceVersionService
         version.ContentSnapshotJson = await InjectBatchPolicyAsync(version.ContentSnapshotJson, ct);
 
         version.Status = GovernanceVersionStatus.Published;
-        version.PublishedAt = DateTime.UtcNow;
+        version.PublishedAt = DateTime.Now;
         version.PublishedBy = publishedBy;
 
         await _parameterSetVersionRepository.UpdateAsync(version, ct);
@@ -142,7 +142,7 @@ public class GovernanceVersionService : IGovernanceVersionService
             NewValue = GovernanceVersionStatus.Published,
             UserId = actorUserId,
             UserCode = publishedBy,
-            OccurredAt = DateTime.UtcNow,
+            OccurredAt = DateTime.Now,
             Remark = string.IsNullOrWhiteSpace(changeReason) ? "参数集版本发布" : changeReason
         }, ct);
     }
@@ -212,7 +212,7 @@ public class GovernanceVersionService : IGovernanceVersionService
             NewValue = GovernanceVersionStatus.Disabled,
             UserId = actorUserId,
             UserCode = operatedBy,
-            OccurredAt = DateTime.UtcNow,
+            OccurredAt = DateTime.Now,
             Remark = reason
         }, ct);
     }
@@ -240,7 +240,7 @@ public class GovernanceVersionService : IGovernanceVersionService
             NewValue = GovernanceVersionStatus.Disabled,
             UserId = actorUserId,
             UserCode = operatedBy,
-            OccurredAt = DateTime.UtcNow,
+            OccurredAt = DateTime.Now,
             Remark = reason
         }, ct);
     }
@@ -274,7 +274,7 @@ public class GovernanceVersionService : IGovernanceVersionService
             NewValue = GovernanceVersionStatus.Disabled,
             UserId = actorUserId,
             UserCode = operatedBy,
-            OccurredAt = DateTime.UtcNow,
+            OccurredAt = DateTime.Now,
             Remark = reason
         }, ct);
     }
@@ -318,7 +318,7 @@ public class GovernanceVersionService : IGovernanceVersionService
             TargetVersionCode = targetVersion.VersionCode,
             EntityType = "RuleSetVersion",
             FieldDiffs = diffs,
-            ComparedAt = DateTime.UtcNow
+            ComparedAt = DateTime.Now
         };
     }
 
@@ -369,7 +369,7 @@ public class GovernanceVersionService : IGovernanceVersionService
             TargetVersionCode = targetVersion.VersionCode,
             EntityType = "ParameterSetVersion",
             FieldDiffs = diffs,
-            ComparedAt = DateTime.UtcNow
+            ComparedAt = DateTime.Now
         };
     }
 
@@ -409,7 +409,7 @@ public class GovernanceVersionService : IGovernanceVersionService
             TargetVersionCode = targetVersion.VersionCode,
             EntityType = "StrategyProfileVersion",
             FieldDiffs = diffs,
-            ComparedAt = DateTime.UtcNow
+            ComparedAt = DateTime.Now
         };
     }
 
@@ -432,7 +432,7 @@ public class GovernanceVersionService : IGovernanceVersionService
     {
         var result = new PublishValidationResult
         {
-            ValidatedAt = DateTime.UtcNow
+            ValidatedAt = DateTime.Now
         };
 
         var version = await _ruleSetVersionRepository.GetByIdAsync(ruleSetVersionId, ct);
@@ -580,7 +580,7 @@ public class GovernanceVersionService : IGovernanceVersionService
     {
         var result = new PublishValidationResult
         {
-            ValidatedAt = DateTime.UtcNow
+            ValidatedAt = DateTime.Now
         };
 
         var version = await _parameterSetVersionRepository.GetByIdAsync(parameterSetVersionId, ct);
@@ -1160,7 +1160,7 @@ public class GovernanceVersionService : IGovernanceVersionService
     {
         var result = new PublishValidationResult
         {
-            ValidatedAt = DateTime.UtcNow
+            ValidatedAt = DateTime.Now
         };
 
         var version = await _strategyProfileVersionRepository.GetByIdAsync(strategyProfileVersionId, ct);
@@ -1288,7 +1288,7 @@ public class GovernanceVersionService : IGovernanceVersionService
 
         var beforeStatus = version.Status;
         version.Status = GovernanceVersionStatus.Published;
-        version.PublishedAt = DateTime.UtcNow;
+        version.PublishedAt = DateTime.Now;
         version.PublishedBy = publishedBy;
 
         await _strategyProfileVersionRepository.UpdateAsync(version, ct);
@@ -1304,7 +1304,7 @@ public class GovernanceVersionService : IGovernanceVersionService
             NewValue = GovernanceVersionStatus.Published,
             UserId = actorUserId,
             UserCode = publishedBy,
-            OccurredAt = DateTime.UtcNow,
+            OccurredAt = DateTime.Now,
             Remark = string.IsNullOrWhiteSpace(changeReason) ? "策略包版本发布" : changeReason
         }, ct);
     }
@@ -1318,7 +1318,7 @@ public class GovernanceVersionService : IGovernanceVersionService
         }
 
         var candidates = await _strategyProfileVersionRepository.GetDefaultByRunTypeAsync(runType, ct);
-        var effective = asOf ?? DateTime.UtcNow;
+        var effective = asOf ?? DateTime.Now;
 
         // 过滤生效窗口：EffectiveFrom <= now（有值才校验）、EffectiveTo >= now（有值才校验）
         var inWindow = candidates
@@ -1407,7 +1407,7 @@ public class GovernanceVersionService : IGovernanceVersionService
         string displayName)
         where T : class
     {
-        var now = DateTime.UtcNow;
+        var now = DateTime.Now;
         // 物化一次可空生效窗口，避免同一 getter 两次调用导致 CS8629 流分析告警
         var inWindow = versions
             .Where(v => statusGetter(v) == GovernanceVersionStatus.Published)
@@ -1465,7 +1465,7 @@ public class GovernanceVersionService : IGovernanceVersionService
     public async Task<RuleSetVersion> CreateRuleSetVersionAsync(RuleSetVersion version, string? createdBy, CancellationToken ct = default)
     {
         version.Status = GovernanceVersionStatus.Draft;
-        version.CreatedAt = DateTime.UtcNow;
+        version.CreatedAt = DateTime.Now;
         version.CreatedBy = createdBy;
         version.PublishedAt = null;
         version.PublishedBy = null;
@@ -1518,7 +1518,7 @@ public class GovernanceVersionService : IGovernanceVersionService
     public async Task<ParameterSetVersion> CreateParameterSetVersionAsync(ParameterSetVersion version, string? createdBy, CancellationToken ct = default)
     {
         version.Status = GovernanceVersionStatus.Draft;
-        version.CreatedAt = DateTime.UtcNow;
+        version.CreatedAt = DateTime.Now;
         version.CreatedBy = createdBy;
         version.PublishedAt = null;
         version.PublishedBy = null;
@@ -1568,7 +1568,7 @@ public class GovernanceVersionService : IGovernanceVersionService
     public async Task<StrategyProfileVersion> CreateStrategyProfileVersionAsync(StrategyProfileVersion version, string? createdBy, CancellationToken ct = default)
     {
         version.Status = GovernanceVersionStatus.Draft;
-        version.CreatedAt = DateTime.UtcNow;
+        version.CreatedAt = DateTime.Now;
         version.CreatedBy = createdBy;
         version.PublishedAt = null;
         version.PublishedBy = null;

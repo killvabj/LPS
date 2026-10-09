@@ -73,7 +73,7 @@ public class DomainDefinitionGovernanceService : IDomainDefinitionGovernanceServ
         await EnsureDomainAllowsAsync(actorUserId, input.DomainKey.Trim(), ct);
         await EnsureKeyUniqueAsync(input.DomainKey, excludeId: null, ct);
 
-        var now = DateTime.UtcNow;
+        var now = DateTime.Now;
         var entity = new DomainDefinition
         {
             DomainKey = input.DomainKey.Trim(),
@@ -123,7 +123,7 @@ public class DomainDefinitionGovernanceService : IDomainDefinitionGovernanceServ
             CreatedBy = existing.CreatedBy,
             CreatedAt = existing.CreatedAt,
             UpdatedBy = operatedBy,
-            UpdatedAt = DateTime.UtcNow
+            UpdatedAt = DateTime.Now
         };
 
         await _auditLogRepository.EnsureWritableAsync(ct);
@@ -147,7 +147,7 @@ public class DomainDefinitionGovernanceService : IDomainDefinitionGovernanceServ
 
         await _auditLogRepository.EnsureWritableAsync(ct);
 
-        await _repository.SetActiveAsync(id, isActive, operatedBy, DateTime.UtcNow, ct);
+        await _repository.SetActiveAsync(id, isActive, operatedBy, DateTime.Now, ct);
 
         var updated = new DomainDefinition
         {
@@ -162,7 +162,7 @@ public class DomainDefinitionGovernanceService : IDomainDefinitionGovernanceServ
             CreatedBy = existing.CreatedBy,
             CreatedAt = existing.CreatedAt,
             UpdatedBy = operatedBy,
-            UpdatedAt = DateTime.UtcNow
+            UpdatedAt = DateTime.Now
         };
 
         await AuditAsync(isActive ? "Enable" : "Disable", updated, beforeStatus: StatusOf(existing.IsActive), afterStatus: StatusOf(isActive), actorUserId, operatedBy, ct);
@@ -282,7 +282,7 @@ public class DomainDefinitionGovernanceService : IDomainDefinitionGovernanceServ
                 NewValue = afterStatus,
                 UserId = actorUserId,
                 UserCode = operatedBy,
-                OccurredAt = DateTime.UtcNow,
+                OccurredAt = DateTime.Now,
                 Remark = $"域定义 {entity.DomainKey}（{entity.ScopeType}）"
             }, ct);
         }

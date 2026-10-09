@@ -206,7 +206,7 @@ public class RunLifecycleService : IRunLifecycleService
             NewValue = PlanVersionComputedStatus,
             UserId = actorUserId,
             UserCode = actor,
-            OccurredAt = DateTime.UtcNow,
+            OccurredAt = DateTime.Now,
             Remark = $"确认候选版本（CandidatePlanVersionId={planVersionId}）"
                 + (string.IsNullOrWhiteSpace(remark) ? string.Empty : $"：{remark}"),
         }, ct);
@@ -243,7 +243,7 @@ public class RunLifecycleService : IRunLifecycleService
         // P0-03：来源 Run 可激活 —— SourceScheduleRunId 非空 + RunType != INSERT_ORDER_WHATIF
         await EnsureSourceRunActivatableAsync(version, ct);
 
-        var activatedAt = DateTime.UtcNow;
+        var activatedAt = DateTime.Now;
         version.Status = PlanVersionActiveStatus;
         version.ActivatedAt = activatedAt;
         version.ActivatedBy = actor;
@@ -406,7 +406,7 @@ public class RunLifecycleService : IRunLifecycleService
             OldValue = ScheduleRunFailedStatus,
             NewValue = ScheduleRunRunningStatus,
             UserId = actorUserId,
-            OccurredAt = DateTime.UtcNow,
+            OccurredAt = DateTime.Now,
             Remark = $"由 FAILED 运行 {failedScheduleRunId} 恢复，新建 RUNNING 运行 {newRunId}（一域一壳 {shells.Count} 个，继承 StrategyProfileVersionId 与 ExpectedDomainKeysJson 基线）",
         }, ct);
 
@@ -511,7 +511,7 @@ public class RunLifecycleService : IRunLifecycleService
         }
 
         // 6. 默认策略版本解析（有效窗口 0 缺失 / 多歧义拒绝——红线 #4：禁止盲目取第一个）
-        var now = spec.DataCutoffTime ?? DateTime.UtcNow;
+        var now = spec.DataCutoffTime ?? DateTime.Now;
         var defaultCandidates = await _strategyProfileVersionRepo.GetDefaultByRunTypeAsync(spec.RunType, ct);
         var effectiveDefaults = defaultCandidates
             .Where(v => (!v.EffectiveFrom.HasValue || v.EffectiveFrom.Value <= now)
@@ -558,7 +558,7 @@ public class RunLifecycleService : IRunLifecycleService
             NewValue = ScheduleRunRunningStatus,
             UserId = actorUserId,
             UserCode = spec.Actor,
-            OccurredAt = DateTime.UtcNow,
+            OccurredAt = DateTime.Now,
             Remark = $"白天候选运行创建：RunType={spec.RunType}, Purpose={spec.Purpose}, Domain={spec.DomainKey}, "
                 + $"BasePlanVersionId={createSpec.BasePlanVersionId}, StrategyProfileVersionId={strategyProfileVersionId}, "
                 + $"NewPlanVersionId={result.NewPlanVersionId}",

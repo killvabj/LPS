@@ -3,6 +3,7 @@ using System.Text;
 using System.Text.Json;
 using Dapper;
 using LPS.APS.Application.Models;
+using LPS.APS.Core.Authorization;
 using LPS.APS.Core.Dto;
 using LPS.APS.Core.DTOs.Governance;
 using LPS.APS.Core.Entities.Auth;
@@ -17,6 +18,9 @@ namespace LPS.APS.Application.Services;
 /// 执行批拆分规则治理服务实现（TaskSplitRuleConfig / Batch Policy，3号位 规则参数体系，0号位 2026-10-07 裁决本轮落码）。
 /// 直接持有 DatabaseConnectionManager 写 APS_Production.TaskSplitRuleConfig（DML，无 DDL，红线 #6 不违）；
 /// 审计写统一 AuditLog 表（IAuditLogRepository）。载体「两级承接」：主题表 CRUD 即最终态 + 发布时投影进快照第⑧块。
+/// 冻结依据（2026-10-09 候选）：实施包 v1.9 L51（后端校验 MaterialId/ProductionDepartmentId/PreferredBatchQty>0/硬 Min/Max/唯一有效期）
+/// + L54（Department Scope、有效期冲突、审计校验；4 技术预算列归 1号位 Solver，不纳入 Batch Policy 业务配置）
+/// + 字段说明 v5.1.10（正式业务字段 = Min/Max、AllowSplit/AllowMerge、有效发布必填 PreferredBatchQty）+ DDL v5.1.8.4。
 /// </summary>
 public sealed class TaskSplitRuleConfigGovernanceService : ITaskSplitRuleConfigGovernanceService
 {
@@ -27,20 +31,27 @@ public sealed class TaskSplitRuleConfigGovernanceService : ITaskSplitRuleConfigG
     private const string ActionUpdate = "Update";
     private const string ActionDeactivate = "Deactivate";
 
+    /// <summary>
+    /// 治理投影列（v5.1.10 收口①：不含 MaxOptimizationSplitCount/MaxBatchCandidates（1号位 Solver 技术预算）
+    /// 与 BottleneckSplitStrategy/NonBottleneckStrategy（历史兼容列，V1 主链不得消费拆/合批倾向）——物理列保留历史，治理 API 不再暴露。
+    /// </summary>
     private const string SelectColumns =
         "Id, MaterialId, ProductionDepartmentId, MinExecutionBatchQty, MaxExecutionBatchQty, PreferredBatchQty, " +
-        "AllowSplit, AllowMerge, MaxOptimizationSplitCount, MaxBatchCandidates, ResourceGroupId, MinimumOrderQuantity, EconomicOrderQuantity, " +
-        "BottleneckSplitStrategy, NonBottleneckStrategy, IsActive, EffectiveFrom, EffectiveTo, CreatedAt, UpdatedAt";
+        "AllowSplit, AllowMerge, ResourceGroupId, MinimumOrderQuantity, EconomicOrderQuantity, " +
+        "IsActive, EffectiveFrom, EffectiveTo, CreatedAt, UpdatedAt";
 
     private readonly DatabaseConnectionManager _connectionManager;
     private readonly IAuditLogRepository _auditLogRepository;
+    private readonly IDataScopeService _dataScopeService;
 
     public TaskSplitRuleConfigGovernanceService(
         DatabaseConnectionManager connectionManager,
-        IAuditLogRepository auditLogRepository)
+        IAuditLogRepository auditLogRepository,
+        IDataScopeService dataScopeService)
     {
         _connectionManager = connectionManager ?? throw new ArgumentNullException(nameof(connectionManager));
         _auditLogRepository = auditLogRepository ?? throw new ArgumentNullException(nameof(auditLogRepository));
+        _dataScopeService = dataScopeService ?? throw new ArgumentNullException(nameof(dataScopeService));
     }
 
     /// <inheritdoc />
@@ -84,31 +95,29 @@ public sealed class TaskSplitRuleConfigGovernanceService : ITaskSplitRuleConfigG
         SaveTaskSplitRuleConfigRequest input, int actorUserId, string actorUserCode, CancellationToken ct = default)
     {
         Validate(input);
-        await EnsureNotDuplicateAsync(input.MaterialId, input.ProductionDepartmentId, excludeId: 0);
+        await EnsureDepartmentScopeAsync(input.ProductionDepartmentId!.Value, actorUserId, ct);
+        await EnsureUniqueEffectiveWindowAsync(
+            input.MaterialId, input.ProductionDepartmentId!.Value, input.EffectiveFrom, input.EffectiveTo, excludeId: 0, ct);
 
         var now = DateTime.UtcNow;
         const string insertSql = @"
 INSERT INTO TaskSplitRuleConfig
 (MaterialId, ProductionDepartmentId, MinExecutionBatchQty, MaxExecutionBatchQty, PreferredBatchQty,
- AllowSplit, AllowMerge, MaxOptimizationSplitCount, MaxBatchCandidates,
- BottleneckSplitStrategy, NonBottleneckStrategy, IsActive, EffectiveFrom, EffectiveTo, CreatedAt, UpdatedAt)
+ AllowSplit, AllowMerge,
+ IsActive, EffectiveFrom, EffectiveTo, CreatedAt, UpdatedAt)
 OUTPUT INSERTED.Id
 VALUES (@MaterialId, @ProductionDepartmentId, @MinExecutionBatchQty, @MaxExecutionBatchQty, @PreferredBatchQty,
- @AllowSplit, @AllowMerge, @MaxOptimizationSplitCount, @MaxBatchCandidates,
- @BottleneckSplitStrategy, @NonBottleneckStrategy, 1, @EffectiveFrom, @EffectiveTo, @CreatedAt, @UpdatedAt)";
+ @AllowSplit, @AllowMerge,
+ 1, @EffectiveFrom, @EffectiveTo, @CreatedAt, @UpdatedAt)";
 
         var p = new DynamicParameters();
         p.Add("MaterialId", input.MaterialId);
-        p.Add("ProductionDepartmentId", input.ProductionDepartmentId, DbType.Int32);
+        p.Add("ProductionDepartmentId", input.ProductionDepartmentId!.Value, DbType.Int32);
         p.Add("MinExecutionBatchQty", input.MinExecutionBatchQty, DbType.Decimal);
         p.Add("MaxExecutionBatchQty", input.MaxExecutionBatchQty, DbType.Decimal);
-        p.Add("PreferredBatchQty", input.PreferredBatchQty, DbType.Decimal);
+        p.Add("PreferredBatchQty", input.PreferredBatchQty!.Value, DbType.Decimal);
         p.Add("AllowSplit", input.AllowSplit!.Value);
         p.Add("AllowMerge", input.AllowMerge!.Value);
-        p.Add("MaxOptimizationSplitCount", input.MaxOptimizationSplitCount, DbType.Int32);
-        p.Add("MaxBatchCandidates", input.MaxBatchCandidates, DbType.Int32);
-        p.Add("BottleneckSplitStrategy", input.BottleneckSplitStrategy, DbType.String);
-        p.Add("NonBottleneckStrategy", input.NonBottleneckStrategy, DbType.String);
         p.Add("EffectiveFrom", input.EffectiveFrom, DbType.DateTime);
         p.Add("EffectiveTo", input.EffectiveTo, DbType.DateTime);
         p.Add("CreatedAt", now);
@@ -126,7 +135,7 @@ VALUES (@MaterialId, @ProductionDepartmentId, @MinExecutionBatchQty, @MaxExecuti
             UserId = actorUserId,
             UserCode = actorUserCode,
             OccurredAt = now,
-            Remark = $"新增执行批拆分规则 [Material={input.MaterialId}/Dept={input.ProductionDepartmentId?.ToString() ?? "(默认)"}]",
+            Remark = $"新增执行批拆分规则 [Material={input.MaterialId}/Dept={input.ProductionDepartmentId}]",
         }, ct);
 
         return new TaskSplitRuleConfigDto
@@ -139,10 +148,6 @@ VALUES (@MaterialId, @ProductionDepartmentId, @MinExecutionBatchQty, @MaxExecuti
             PreferredBatchQty = input.PreferredBatchQty,
             AllowSplit = input.AllowSplit!.Value,
             AllowMerge = input.AllowMerge!.Value,
-            MaxOptimizationSplitCount = input.MaxOptimizationSplitCount,
-            MaxBatchCandidates = input.MaxBatchCandidates,
-            BottleneckSplitStrategy = input.BottleneckSplitStrategy,
-            NonBottleneckStrategy = input.NonBottleneckStrategy,
             IsActive = true,
             EffectiveFrom = input.EffectiveFrom,
             EffectiveTo = input.EffectiveTo,
@@ -168,7 +173,9 @@ VALUES (@MaterialId, @ProductionDepartmentId, @MinExecutionBatchQty, @MaxExecuti
             throw new ResourceNotFoundException($"执行批拆分规则（TaskSplitRuleConfig.Id={id}）不存在。");
         }
 
-        await EnsureNotDuplicateAsync(input.MaterialId, input.ProductionDepartmentId, excludeId: id);
+        await EnsureDepartmentScopeAsync(input.ProductionDepartmentId!.Value, actorUserId, ct);
+        await EnsureUniqueEffectiveWindowAsync(
+            input.MaterialId, input.ProductionDepartmentId!.Value, input.EffectiveFrom, input.EffectiveTo, excludeId: id, ct);
 
         var now = DateTime.UtcNow;
         const string updateSql = @"
@@ -176,24 +183,18 @@ UPDATE TaskSplitRuleConfig SET
   MaterialId = @MaterialId, ProductionDepartmentId = @ProductionDepartmentId,
   MinExecutionBatchQty = @MinExecutionBatchQty, MaxExecutionBatchQty = @MaxExecutionBatchQty, PreferredBatchQty = @PreferredBatchQty,
   AllowSplit = @AllowSplit, AllowMerge = @AllowMerge,
-  MaxOptimizationSplitCount = @MaxOptimizationSplitCount, MaxBatchCandidates = @MaxBatchCandidates,
-  BottleneckSplitStrategy = @BottleneckSplitStrategy, NonBottleneckStrategy = @NonBottleneckStrategy,
   EffectiveFrom = @EffectiveFrom, EffectiveTo = @EffectiveTo, UpdatedAt = @UpdatedAt
 WHERE Id = @Id";
 
         var p = new DynamicParameters();
         p.Add("Id", id);
         p.Add("MaterialId", input.MaterialId);
-        p.Add("ProductionDepartmentId", input.ProductionDepartmentId, DbType.Int32);
+        p.Add("ProductionDepartmentId", input.ProductionDepartmentId!.Value, DbType.Int32);
         p.Add("MinExecutionBatchQty", input.MinExecutionBatchQty, DbType.Decimal);
         p.Add("MaxExecutionBatchQty", input.MaxExecutionBatchQty, DbType.Decimal);
-        p.Add("PreferredBatchQty", input.PreferredBatchQty, DbType.Decimal);
+        p.Add("PreferredBatchQty", input.PreferredBatchQty!.Value, DbType.Decimal);
         p.Add("AllowSplit", input.AllowSplit!.Value);
         p.Add("AllowMerge", input.AllowMerge!.Value);
-        p.Add("MaxOptimizationSplitCount", input.MaxOptimizationSplitCount, DbType.Int32);
-        p.Add("MaxBatchCandidates", input.MaxBatchCandidates, DbType.Int32);
-        p.Add("BottleneckSplitStrategy", input.BottleneckSplitStrategy, DbType.String);
-        p.Add("NonBottleneckStrategy", input.NonBottleneckStrategy, DbType.String);
         p.Add("EffectiveFrom", input.EffectiveFrom, DbType.DateTime);
         p.Add("EffectiveTo", input.EffectiveTo, DbType.DateTime);
         p.Add("UpdatedAt", now);
@@ -210,7 +211,7 @@ WHERE Id = @Id";
             UserId = actorUserId,
             UserCode = actorUserCode,
             OccurredAt = now,
-            Remark = $"更新执行批拆分规则 [Material={input.MaterialId}/Dept={input.ProductionDepartmentId?.ToString() ?? "(默认)"}]",
+            Remark = $"更新执行批拆分规则 [Material={input.MaterialId}/Dept={input.ProductionDepartmentId}]",
         }, ct);
 
         return new TaskSplitRuleConfigDto
@@ -223,10 +224,6 @@ WHERE Id = @Id";
             PreferredBatchQty = input.PreferredBatchQty,
             AllowSplit = input.AllowSplit!.Value,
             AllowMerge = input.AllowMerge!.Value,
-            MaxOptimizationSplitCount = input.MaxOptimizationSplitCount,
-            MaxBatchCandidates = input.MaxBatchCandidates,
-            BottleneckSplitStrategy = input.BottleneckSplitStrategy,
-            NonBottleneckStrategy = input.NonBottleneckStrategy,
             IsActive = existing.IsActive,
             EffectiveFrom = input.EffectiveFrom,
             EffectiveTo = input.EffectiveTo,
@@ -250,6 +247,8 @@ WHERE Id = @Id";
             throw new ResourceNotFoundException($"执行批拆分规则（TaskSplitRuleConfig.Id={id}）不存在。");
         }
 
+        await EnsureDepartmentScopeAsync(existing.ProductionDepartmentId!.Value, actorUserId, ct);
+
         var now = DateTime.UtcNow;
         await _connectionManager.ExecuteAsync(
             "UPDATE TaskSplitRuleConfig SET IsActive = 0, UpdatedAt = @UpdatedAt WHERE Id = @Id",
@@ -266,7 +265,7 @@ WHERE Id = @Id";
             UserId = actorUserId,
             UserCode = actorUserCode,
             OccurredAt = now,
-            Remark = $"停用执行批拆分规则 [Material={existing.MaterialId}]",
+            Remark = $"停用执行批拆分规则 [Material={existing.MaterialId}/Dept={existing.ProductionDepartmentId}]",
         }, ct);
 
         return new TaskSplitRuleConfigDto
@@ -279,10 +278,6 @@ WHERE Id = @Id";
             PreferredBatchQty = existing.PreferredBatchQty,
             AllowSplit = existing.AllowSplit,
             AllowMerge = existing.AllowMerge,
-            MaxOptimizationSplitCount = existing.MaxOptimizationSplitCount,
-            MaxBatchCandidates = existing.MaxBatchCandidates,
-            BottleneckSplitStrategy = existing.BottleneckSplitStrategy,
-            NonBottleneckStrategy = existing.NonBottleneckStrategy,
             IsActive = false,
             EffectiveFrom = existing.EffectiveFrom,
             EffectiveTo = existing.EffectiveTo,
@@ -294,8 +289,9 @@ WHERE Id = @Id";
     /// <inheritdoc />
     public async Task<IReadOnlyList<BatchPolicyRuleSnapshot>> GetActiveRulesForSnapshotAsync(CancellationToken ct = default)
     {
+        // ④ NULL 部门不生效：既有 NULL 部门历史规则不默认为所有部门生效（不投快照），治理写路径也已拒绝新增/更新 NULL 部门规则。
         var rows = await _connectionManager.QueryAsync<TaskSplitRuleConfig>(
-            $"SELECT {SelectColumns} FROM TaskSplitRuleConfig WHERE IsActive = 1 ORDER BY MaterialId, ProductionDepartmentId, Id",
+            $"SELECT {SelectColumns} FROM TaskSplitRuleConfig WHERE IsActive = 1 AND ProductionDepartmentId IS NOT NULL ORDER BY MaterialId, ProductionDepartmentId, Id",
             null,
             db: DatabaseId.APS);
 
@@ -308,6 +304,7 @@ WHERE Id = @Id";
             new { Id = id },
             db: DatabaseId.APS);
 
+    /// <summary>业务校验（v5.1.10 收口③：部门必填、Preferred 必填且>0、Min≤Preferred≤Max；DDL v5.1.8.4 §2.14）。</summary>
     private static void Validate(SaveTaskSplitRuleConfigRequest input)
     {
         if (input.MaterialId <= 0)
@@ -315,9 +312,10 @@ WHERE Id = @Id";
             throw new ArgumentException("MaterialId 须大于 0。", nameof(input));
         }
 
-        if (input.ProductionDepartmentId.HasValue && input.ProductionDepartmentId.Value <= 0)
+        // ③ 新发布有效规则必须明确 ProductionDepartmentId（NULL 部门仅历史兼容，治理写路径拒绝——不再支持「Material 级默认」语义）。
+        if (!input.ProductionDepartmentId.HasValue || input.ProductionDepartmentId.Value <= 0)
         {
-            throw new ArgumentException("ProductionDepartmentId 须大于 0（空 = Material 级默认）。", nameof(input));
+            throw new SetupRuleDataRedLineException("ProductionDepartmentId 必填（NULL 部门仅历史兼容，新发布有效规则必须明确部门）。");
         }
 
         if (!input.AllowSplit.HasValue || !input.AllowMerge.HasValue)
@@ -341,56 +339,82 @@ WHERE Id = @Id";
             throw new SetupRuleDataRedLineException("MaxExecutionBatchQty 不能小于 MinExecutionBatchQty。");
         }
 
-        if (input.PreferredBatchQty.HasValue && input.PreferredBatchQty.Value < 0)
+        // ③ PreferredBatchQty 业务有效发布必填且 >0（DDL v5.1.8.4 §2.14 / 字段说明 v5.1.10）。
+        if (!input.PreferredBatchQty.HasValue)
         {
-            throw new SetupRuleDataRedLineException("PreferredBatchQty 不允许为负。");
+            throw new SetupRuleDataRedLineException("PreferredBatchQty 必填（业务有效发布必填软偏好）。");
         }
 
-        if (input.MaxOptimizationSplitCount.HasValue && input.MaxOptimizationSplitCount.Value < 0)
+        if (input.PreferredBatchQty.Value <= 0)
         {
-            throw new SetupRuleDataRedLineException("MaxOptimizationSplitCount 不允许为负。");
+            throw new SetupRuleDataRedLineException("PreferredBatchQty 必须大于 0。");
         }
 
-        if (input.MaxBatchCandidates.HasValue && input.MaxBatchCandidates.Value < 0)
+        // ③ Preferred 必须处于硬 Min/Max 区间内（已配时）。
+        if (input.MinExecutionBatchQty.HasValue && input.PreferredBatchQty.Value < input.MinExecutionBatchQty.Value)
         {
-            throw new SetupRuleDataRedLineException("MaxBatchCandidates 不允许为负。");
+            throw new SetupRuleDataRedLineException("PreferredBatchQty 不能小于 MinExecutionBatchQty（硬下限）。");
         }
 
-        if (!string.IsNullOrWhiteSpace(input.BottleneckSplitStrategy)
-            && !TaskSplitRuleConfigProjector.ValidBottleneckSplitStrategies.Contains(input.BottleneckSplitStrategy))
+        if (input.MaxExecutionBatchQty.HasValue && input.PreferredBatchQty.Value > input.MaxExecutionBatchQty.Value)
         {
-            throw new SetupRuleDataRedLineException("BottleneckSplitStrategy 必须为 PREFER_SPLIT / PREFER_MERGE 之一。");
+            throw new SetupRuleDataRedLineException("PreferredBatchQty 不能大于 MaxExecutionBatchQty（硬上限）。");
         }
 
-        if (!string.IsNullOrWhiteSpace(input.NonBottleneckStrategy)
-            && !TaskSplitRuleConfigProjector.ValidNonBottleneckStrategies.Contains(input.NonBottleneckStrategy))
-        {
-            throw new SetupRuleDataRedLineException("NonBottleneckStrategy 必须为 PREFER_LARGE_BATCH / PREFER_SMALL_BATCH 之一。");
-        }
-
-        if (input.EffectiveTo.HasValue && input.EffectiveTo.Value < input.EffectiveFrom)
+        if (input.EffectiveFrom.HasValue && input.EffectiveTo.HasValue
+            && input.EffectiveTo.Value < input.EffectiveFrom.Value)
         {
             throw new SetupRuleDataRedLineException("EffectiveTo 不能早于 EffectiveFrom。");
         }
     }
 
-    private async Task EnsureNotDuplicateAsync(int materialId, int? productionDepartmentId, int excludeId)
+    /// <summary>
+    /// A2 Department Scope：写路径（Create/Update/Deactivate）经部门业务码（ProductionDepartment.DeptCode）调
+    /// EnsureInScopeAsync(Department)。部门不存在 → 404（ResourceNotFoundException）；越界 → ScopeViolationException（Controller 映射 403）。
+    /// </summary>
+    private async Task EnsureDepartmentScopeAsync(int departmentId, int actorUserId, CancellationToken ct)
+    {
+        var deptCode = await _connectionManager.QueryFirstOrDefaultAsync<string?>(
+            "SELECT DeptCode FROM ProductionDepartment WHERE Id = @Id",
+            new { Id = departmentId },
+            db: DatabaseId.APS);
+
+        if (string.IsNullOrWhiteSpace(deptCode))
+        {
+            throw new ResourceNotFoundException($"生产部门（ProductionDepartment.Id={departmentId}）不存在。");
+        }
+
+        await _dataScopeService.EnsureInScopeAsync(actorUserId, DataScopeTypes.Department, deptCode, ct);
+    }
+
+    /// <summary>
+    /// A1 唯一有效期：同一 (MaterialId + ProductionDepartmentId) 任一时点至多一条 IsActive=1 有效规则。
+    /// 新生效时间窗与既有有效规则窗口重叠 → 422 拒绝；顺序非重叠窗口 → 允许；NULL 时间边界视为无界（EffectiveFrom NULL=不限开始、
+    /// EffectiveTo NULL=永久有效）；边界相切（< 严格判定）不视为重叠。冻结依据：实施包 v1.9 L51「唯一有效期」+ 字段说明 v5.1.10 §7.3。
+    /// </summary>
+    private async Task EnsureUniqueEffectiveWindowAsync(
+        int materialId, int departmentId, DateTime? effectiveFrom, DateTime? effectiveTo, int excludeId, CancellationToken ct)
     {
         const string sql = @"
 SELECT COUNT(1) FROM TaskSplitRuleConfig
 WHERE MaterialId = @MaterialId
-  AND ((@Dept IS NULL AND ProductionDepartmentId IS NULL) OR ProductionDepartmentId = @Dept)
-  AND Id <> @ExcludeId";
+  AND ProductionDepartmentId = @Dept
+  AND IsActive = 1 AND Id <> @ExcludeId
+  AND (EffectiveFrom IS NULL OR @EffectiveTo IS NULL OR EffectiveFrom < @EffectiveTo)
+  AND (@EffectiveFrom IS NULL OR EffectiveTo IS NULL OR @EffectiveFrom < EffectiveTo)";
 
         var p = new DynamicParameters();
         p.Add("MaterialId", materialId);
-        p.Add("Dept", productionDepartmentId, DbType.Int32);
+        p.Add("Dept", departmentId, DbType.Int32);
         p.Add("ExcludeId", excludeId);
+        p.Add("EffectiveFrom", effectiveFrom, DbType.DateTime);
+        p.Add("EffectiveTo", effectiveTo, DbType.DateTime);
 
         var count = await _connectionManager.QueryFirstOrDefaultAsync<int>(sql, p, db: DatabaseId.APS);
         if (count > 0)
         {
-            throw new SetupRuleDataRedLineException("已存在相同（物料+生产部门）组合的执行批拆分规则，不允许重复。");
+            throw new SetupRuleDataRedLineException(
+                "生效时间窗重叠，违反唯一有效期（同一物料+部门同一时点至多一条有效规则）。");
         }
     }
 }

@@ -34,11 +34,11 @@ public class TaskSplitRuleConfigProjectorTests
     {
         var rules = new[]
         {
-            Rule(id: 1, materialId: 100, isActive: true),
-            Rule(id: 2, materialId: 200, isActive: false),
+            Rule(id: 1, materialId: 100, deptId: 900, isActive: true),
+            Rule(id: 2, materialId: 200, deptId: 900, isActive: false),
         };
 
-        var result = TaskSplitRuleConfigProjector.Project(rules, asOf: DateTime.UtcNow);
+        var result = TaskSplitRuleConfigProjector.Project(rules, asOf: DateTime.Now);
 
         result.Should().ContainSingle().Which.MaterialId.Should().Be(100);
     }
@@ -46,12 +46,12 @@ public class TaskSplitRuleConfigProjectorTests
     [Fact]
     public void Project_筛除生效区间外()
     {
-        var now = DateTime.UtcNow;
+        var now = DateTime.Now;
         var rules = new[]
         {
-            Rule(id: 1, materialId: 100, effectiveFrom: now.AddDays(-1), effectiveTo: now.AddDays(1)),
-            Rule(id: 2, materialId: 200, effectiveFrom: now.AddDays(1)),
-            Rule(id: 3, materialId: 300, effectiveTo: now.AddDays(-1)),
+            Rule(id: 1, materialId: 100, deptId: 900, effectiveFrom: now.AddDays(-1), effectiveTo: now.AddDays(1)),
+            Rule(id: 2, materialId: 200, deptId: 900, effectiveFrom: now.AddDays(1)),
+            Rule(id: 3, materialId: 300, deptId: 900, effectiveTo: now.AddDays(-1)),
         };
 
         var result = TaskSplitRuleConfigProjector.Project(rules, asOf: now);
@@ -60,8 +60,9 @@ public class TaskSplitRuleConfigProjectorTests
     }
 
     [Fact]
-    public void Project_投影业务键与参数_去审计兼容字段()
+    public void Project_投影业务键与参数_去审计兼容字段_4技术字段恒null()
     {
+        // v5.1.10 收口①②：实体上即便有历史 4 字段值，投影快照亦恒 null（不投 Solver 技术预算/策略列，主链不得消费）。
         var rule = Rule(id: 7, materialId: 200, deptId: 300, min: 10m, max: 50m, allowSplit: false);
         rule.PreferredBatchQty = 25m;
         rule.AllowMerge = true;
@@ -79,10 +80,26 @@ public class TaskSplitRuleConfigProjectorTests
         result.PreferredBatchQty.Should().Be(25m);
         result.AllowSplit.Should().BeFalse();
         result.AllowMerge.Should().BeTrue();
-        result.MaxOptimizationSplitCount.Should().Be(3);
-        result.MaxBatchCandidates.Should().Be(5);
-        result.BottleneckSplitStrategy.Should().Be("PREFER_SPLIT");
-        result.NonBottleneckStrategy.Should().Be("PREFER_LARGE_BATCH");
+        result.MaxOptimizationSplitCount.Should().BeNull();
+        result.MaxBatchCandidates.Should().BeNull();
+        result.BottleneckSplitStrategy.Should().BeNull();
+        result.NonBottleneckStrategy.Should().BeNull();
+    }
+
+    [Fact]
+    public void Project_筛除NULL部门历史记录_不默认为所有部门生效()
+    {
+        // v5.1.10 收口④：NULL 部门历史记录不默认为所有部门的生效规则——即便 IsActive + 生效窗内亦不投快照。
+        var now = DateTime.UtcNow;
+        var rules = new[]
+        {
+            Rule(id: 1, materialId: 100, deptId: 900, effectiveFrom: now.AddDays(-1), effectiveTo: now.AddDays(1)),
+            Rule(id: 2, materialId: 200, deptId: null, effectiveFrom: now.AddDays(-1), effectiveTo: now.AddDays(1)),
+        };
+
+        var result = TaskSplitRuleConfigProjector.Project(rules, asOf: now);
+
+        result.Should().ContainSingle().Which.MaterialId.Should().Be(100);
     }
 
     [Fact]

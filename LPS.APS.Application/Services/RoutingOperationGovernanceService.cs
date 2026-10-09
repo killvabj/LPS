@@ -88,7 +88,7 @@ public sealed class RoutingOperationGovernanceService : IRoutingOperationGoverna
             throw new ResourceNotFoundException($"工序（RoutingOperation.Id={operationId}）不存在。");
         }
 
-        var updatedAt = DateTime.UtcNow;
+        var updatedAt = DateTime.Now;
         await _connectionManager.ExecuteAsync(
             @"UPDATE RoutingOperation
               SET OperationPlanningMode = @Mode, UpdatedAt = @UpdatedAt

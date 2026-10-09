@@ -50,7 +50,7 @@ public class ContinuityBucketingTests
             StartStageCode          = startStage,
             StartOperationCode      = startOp,
             DerivedRemainingQty     = remaining,
-            DataCutoffTime          = DateTime.UtcNow
+            DataCutoffTime          = DateTime.Now
         };
 
     private static Dictionary<string, IReadOnlyList<ExistingExecutionContextDto>> Map(
@@ -107,26 +107,61 @@ public class ContinuityBucketingTests
     public void 连续份额键_按工单身份生成_不随Slice裂分()
     {
         // 红线 Q3（0号位 2026-10-07 裁决 §六）：一个 ScheduleRun 内，一个 MESWorkOrderNo
-        // 有且仅有一个 ContinuationKey；同一工单多个 Slice **共享同一 Key**，不得拼入 LogicalDemandKey。
+        // 有且仅有一个 ContinuationKey，**不得拼入 LogicalDemandKey**。
+        // ⚠ 2026-10-09 修订：原用例用「两条需求共用同一 PI+同一 MES 工单」造出两个 Slice 来验键，
+        //   该前提已被 PM T2-06.2（同工单份额不得跨需求重复计提）推翻 ⇒ 改用「一条需求 + 两张工单」，
+        //   仍完整覆盖「键 = f(PlanVersionId, MESWorkOrderNo)、与 Slice 键无关」这条红线。
         var demands = new List<LogicalProductionDemand>
         {
             Demand("328_11", 11, "PI-C11", 100m),
-            Demand("328_12", 12, "PI-C11", 40m),   // 同一 PI 下的另一条需求 ⇒ 另一个 Slice 来源
         };
-        var ctxs = Map(Ctx("PI-C11", "WO900", 30m));   // 两条需求都源自同一张 MES 工单
+        var ctxs = Map(Ctx("PI-C11", "WO900", 30m), Ctx("PI-C11", "WO901", 20m));
 
         var result = Bucket(demands, ctxs);
         var conts = result.Where(d => d.IsContinuation).ToList();
 
-        conts.Should().HaveCount(2);                                  // 逐需求各切一片，工单不合并
-        conts.Select(c => c.LogicalDemandKey).Distinct().Should().HaveCount(2);   // Slice 键确实不同…
-        conts.Select(c => c.ContinuationKey).Distinct().Should().ContainSingle()  // …但 Key 只有一个
-             .Which.Should().Be("CK-328-WO900");                      // = f(PlanVersionId, MESWorkOrderNo)
+        conts.Should().HaveCount(2);                                   // 逐工单各切一片，工单不合并
+        conts.Select(c => c.ContinuationKey).Should().BeEquivalentTo(new[] { "CK-328-WO900", "CK-328-WO901" });
         conts.Should().OnlyContain(c => !c.ContinuationKey!.Contains(c.LogicalDemandKey));
 
         // A/B 恒 NoSplitMerge（1号位 PhaseTwoInitialScheduler.cs:292 硬校验）；Free 不得置位
         conts.Should().OnlyContain(c => c.NoSplitMerge);
         result.Where(d => !d.IsContinuation).Should().OnlyContain(d => !d.NoSplitMerge);
+    }
+
+    [Fact]
+    public void 同一MES工单份额_跨需求只消费一次_不重复复制E()
+    {
+        // PM 2026-10-09 T2-06.2 / C-Q4（F-04）：一个 MESWorkOrderNo 的可承接既存执行份额
+        // 在本 Run 内**不得跨需求重复计算**；合法多 Demand 共用同一 PI 时按真实份额逐次消耗，
+        // 不得按 Q 比例猜分、也不得把同一条 E 完整复制 N 次。
+        var demands = new List<LogicalProductionDemand>
+        {
+            Demand("328_21", 21, "PI-C21", 100m),
+            Demand("328_22", 22, "PI-C21", 40m),   // 同一 PI 下的另一条合法需求
+        };
+        var ctxs = Map(Ctx("PI-C21", "WO910", 30m));   // 该工单只有一份 30 的物理可承接量
+
+        var over = new List<PeggingOrchestrator.ContinuityOverCommitEvent>();
+        var result = Bucket(demands, ctxs, over.Add);
+
+        var conts = result.Where(d => d.IsContinuation).ToList();
+        conts.Should().HaveCount(1);                                   // 只有先到的需求拿到这份份额
+        conts.Single().NetOutputQty.Should().Be(30m);
+        conts.Single().ContinuationKey.Should().Be("CK-328-WO910");
+        conts.Select(c => c.ContinuationKey).Should().OnlyHaveUniqueItems();   // 一份份额 ⇒ 一个 Key
+
+        // 后到的需求：连续份额 0 ⇒ 整条需求原样直通（全额走自由/规划侧），需求不被砍、不裂片
+        var second = result.Single(d => d.LogicalDemandKey == "328_22");
+        second.IsContinuation.Should().BeFalse();
+        second.NetOutputQty.Should().Be(40m);
+        result.Should().NotContain(d => d.LogicalDemandKey == "328_22/WO:WO910");
+
+        // 总量守恒：30(连续) + 70(Free) + 40(Free) = 140 = 100 + 40，无放大
+        result.Sum(d => d.NetOutputQty).Should().Be(140m);
+
+        // 重复引用必须登记、不得静默（PM §九：保守保留 Issue）
+        over.Should().ContainSingle(e => e.Kind == "DUPLICATE_WO_SHARE");
     }
 
     [Fact]

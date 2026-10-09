@@ -67,7 +67,7 @@ public sealed class StageLeadTimeParamGovernanceService : IStageLeadTimeParamGov
         Validate(input);
         await EnsureNotDuplicateAsync(input.FactoryCode, input.StageCode, input.ProductionDeptCode, input.MaterialCode, input.ProductFamilyCode, excludeId: 0);
 
-        var now = DateTime.UtcNow;
+        var now = DateTime.Now;
         const string insertSql = @"
 INSERT INTO StageLeadTimeParam
 (FactoryCode, StageCode, ProductionDeptCode, MaterialCode, ProductFamilyCode,
@@ -145,7 +145,7 @@ VALUES (@FactoryCode, @StageCode, @ProductionDeptCode, @MaterialCode, @ProductFa
 
         await EnsureNotDuplicateAsync(input.FactoryCode, input.StageCode, input.ProductionDeptCode, input.MaterialCode, input.ProductFamilyCode, excludeId: id);
 
-        var now = DateTime.UtcNow;
+        var now = DateTime.Now;
         const string updateSql = @"
 UPDATE StageLeadTimeParam SET
   FactoryCode = @FactoryCode, StageCode = @StageCode, ProductionDeptCode = @ProductionDeptCode,
@@ -220,7 +220,7 @@ WHERE Id = @Id";
             throw new ResourceNotFoundException($"阶段提前期参数（StageLeadTimeParam.Id={id}）不存在。");
         }
 
-        var now = DateTime.UtcNow;
+        var now = DateTime.Now;
         await _connectionManager.ExecuteAsync(
             "UPDATE StageLeadTimeParam SET IsActive = 0, UpdatedAt = @UpdatedAt WHERE Id = @Id",
             new { UpdatedAt = now, Id = id },

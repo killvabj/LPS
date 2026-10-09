@@ -53,7 +53,7 @@ public class RunLifecycleServiceIntegrationTests : IDisposable
 
     public RunLifecycleServiceIntegrationTests()
     {
-        _now = DateTime.UtcNow;
+        _now = DateTime.Now;
         _uniqueSuffix = $"{_now:yyyyMMddHHmmssfff}-{Guid.NewGuid():N}".Substring(0, 30);
 
         _cm = TestEnvironment.GetConnectionManager();

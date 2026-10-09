@@ -111,7 +111,7 @@ public sealed class SetupRuleService : ISetupRuleService
             IsActive = true,
             CreatedBy = actorUserCode,
             // CreatedAt 须显式打戳（非空 DateTime，缺省会带 0001-01-01 → 序列化空值异常）
-            CreatedAt = DateTime.UtcNow,
+            CreatedAt = DateTime.Now,
         };
 
         EnsureNoConflict(existing, rule, excludingId: 0);
@@ -146,7 +146,7 @@ public sealed class SetupRuleService : ISetupRuleService
             IsActive = true,
             CreatedBy = actorUserCode,
             // CreatedAt 同病（见 CreateExactAsync 注释）：DEFAULT 创建亦须显式打戳
-            CreatedAt = DateTime.UtcNow,
+            CreatedAt = DateTime.Now,
         };
 
         EnsureNoConflict(existing, rule, excludingId: 0);
@@ -370,7 +370,7 @@ public sealed class SetupRuleService : ISetupRuleService
             ModifiedCount = modified.Count,
             RemovedCount = removed.Count,
             PublishStatus = targetVersion.Status,
-            ComparedAt = DateTime.UtcNow,
+            ComparedAt = DateTime.Now,
             SetupRuleChanges = new SetupRuleChangesDto
             {
                 Added = added,
@@ -591,7 +591,7 @@ public sealed class SetupRuleService : ISetupRuleService
             NewValue = newRule is null ? null : Serialize(newRule),
             UserId = actorUserId,
             UserCode = actorUserCode,
-            OccurredAt = DateTime.UtcNow,
+            OccurredAt = DateTime.Now,
             Remark = remark,
         }, ct);
     }

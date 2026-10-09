@@ -19,25 +19,22 @@ public static class TaskSplitRuleConfigProjector
     /// <summary>ContentSnapshotJson 子块键名（契约登记 §6.10.5 扩展）。</summary>
     public const string BatchPolicyBlockName = "BatchPolicy";
 
-    /// <summary>瓶颈批量策略合法枚举（PREFER_SPLIT / PREFER_MERGE）。</summary>
-    public static readonly System.Collections.Frozen.FrozenSet<string> ValidBottleneckSplitStrategies =
-        System.Collections.Frozen.FrozenSet.ToFrozenSet(["PREFER_SPLIT", "PREFER_MERGE"]);
-
-    /// <summary>非瓶颈批量策略合法枚举（PREFER_LARGE_BATCH / PREFER_SMALL_BATCH）。</summary>
-    public static readonly System.Collections.Frozen.FrozenSet<string> ValidNonBottleneckStrategies =
-        System.Collections.Frozen.FrozenSet.ToFrozenSet(["PREFER_LARGE_BATCH", "PREFER_SMALL_BATCH"]);
-
     /// <summary>
     /// 把 active + 生效区间内规则投影为快照（去审计字段 Id/Created/Updated/IsActive + 兼容字段，仅业务键 + 参数）。
-    /// 生效区间以 asOf 判定（发布时传入，默认当前 UTC）；IsActive=false 或超出生效窗的行排除。
+    /// 生效区间以 asOf 判定（发布时传入，默认当前 UTC）；IsActive=false、超出生效窗或 ProductionDepartmentId 为 NULL 的行排除
+    /// （v5.1.10 收口④：NULL 部门历史记录不默认为所有部门的生效规则，仅显式部门规则入快照）。
+    /// v5.1.10 收口①（2026-10-09 生效）：不再投 MaxOptimizationSplitCount/MaxBatchCandidates（1号位 Solver 技术预算）
+    /// 与 BottleneckSplitStrategy/NonBottleneckStrategy（历史兼容列，V1 主链不得消费拆/合批倾向）——
+    /// 三个字段恒 null，仅保留物理列历史；BatchPolicyRuleSnapshot 类上仍保留字段以兼容旧快照反序列化与 1号位 消费侧类型。
     /// </summary>
     public static List<BatchPolicyRuleSnapshot> Project(IEnumerable<TaskSplitRuleConfig> rules, DateTime? asOf = null)
     {
         ArgumentNullException.ThrowIfNull(rules);
-        var now = asOf ?? DateTime.UtcNow;
+        var now = asOf ?? DateTime.Now;
 
         return rules
             .Where(r => r.IsActive
+                && r.ProductionDepartmentId.HasValue
                 && (r.EffectiveFrom is null || r.EffectiveFrom <= now)
                 && (r.EffectiveTo is null || r.EffectiveTo >= now))
             .Select(r => new BatchPolicyRuleSnapshot
@@ -49,10 +46,7 @@ public static class TaskSplitRuleConfigProjector
                 PreferredBatchQty = r.PreferredBatchQty,
                 AllowSplit = r.AllowSplit,
                 AllowMerge = r.AllowMerge,
-                MaxOptimizationSplitCount = r.MaxOptimizationSplitCount,
-                MaxBatchCandidates = r.MaxBatchCandidates,
-                BottleneckSplitStrategy = r.BottleneckSplitStrategy,
-                NonBottleneckStrategy = r.NonBottleneckStrategy,
+                // v5.1.10 收口①：MaxOptimizationSplitCount / MaxBatchCandidates / BottleneckSplitStrategy / NonBottleneckStrategy 恒 null，不投快照。
             })
             .ToList();
     }

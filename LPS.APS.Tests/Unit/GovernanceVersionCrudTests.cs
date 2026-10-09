@@ -43,7 +43,7 @@ public class GovernanceVersionCrudTests
             RuleSetId = 10,
             VersionCode = "V1",
             Status = GovernanceVersionStatus.Published,
-            PublishedAt = DateTime.UtcNow,   // 伪造治理字段
+            PublishedAt = DateTime.Now,   // 伪造治理字段
             DemandPriorityJson = ValidDemandPriorityJson()
         };
         _ruleSetRepo.Setup(r => r.AddAsync(It.IsAny<RuleSetVersion>(), It.IsAny<CancellationToken>()))

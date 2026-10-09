@@ -84,10 +84,18 @@ public sealed class LogicalProductionDemand
     public decimal PlannedProcessQty { get; init; }
 
     /// <summary>
-    /// 数量单位（P1-08 方案a）：来自需求侧订单 Order.UOM，2号位装载时透传；
-    /// 1号位 FinalTaskDraft.UOM 据此原样回填，2号位落盘不再反查订单补 UOM。null = 无单位来源（旧订单/无 Order 场景）。
+    /// 数量单位（P1-08 方案a）：2号位 装载时透传；1号位 FinalTaskDraft.UOM 据此原样回填，
+    /// 2号位落盘不再反查订单补 UOM。null = 无单位来源（物料缺行 / Material.UOM 为空）。
+    ///
+    /// 【2026-10-09 修正取值源】原注释写「来自需求侧订单 <c>Order.UOM</c>」，但此处的 <c>order</c> 是**根订单**
+    /// （成品），经 <c>TraverseBomNode</c> 逐层原样下传 ⇒ 与 PI 身份同源的串味：子件需求会拿到**成品的单位**。
+    /// 实测 PV2：<c>[Order].UOM</c> 22,144 行**恒为 'PS'**；而 <c>Material.UOM</c> 1,022,985 行**零空值**
+    /// 且按物料各不相同（EA/…）。⇒ 取值改为**该需求自身物料**的 <c>Material.UOM</c>，由
+    /// <c>PeggingOrchestrator.FillDemandUomAsync</c> 在 Pegging 后按需求物料集统一回填（与
+    /// <see cref="StartStageCode"/> / <see cref="RequiredStageCode"/> 同款「Pegging 后解析」模式）。
+    /// 1号位 <c>PhaseFiveCompression.cs</c> 的注释「如需子件 UOM 请 2号位 指明」即此口径。
     /// </summary>
-    public string? UOM { get; init; }
+    public string? UOM { get; set; }
 
     /// <summary>
     /// 下游要求的可用时间
@@ -158,14 +166,18 @@ public sealed class LogicalProductionDemand
     /// 非空 ⇒ 该需求走**固定路径**，1号位 不选路（Continuation Slice）。
     /// null ⇒ 无固定路径，由 1号位 在候选内择优（Free Slice / C桶）。
     /// 与 <see cref="PathId"/> 成对使用；**A/B 缺值应 Fail Closed，不得回退猜唯一 Path**（0号位 2026-10-07 裁决 §三）。
+    ///
+    /// ⚠ 2026-10-09：由 <c>init</c> 放开为 <c>set</c> —— 分桶（<c>ApplyContinuityBucketing</c>）发生在
+    ///   <c>LoadRoutingContextAsync</c> **之前**，切片构造时拿不到路由上下文，只能在路由装载后由
+    ///   <c>FillContinuationRouteIdentities</c> 统一回填（与 <see cref="StartStageCode"/> 同款理由）。
     /// </summary>
-    public string? RouteCode { get; init; }
+    public string? RouteCode { get; set; }
 
     /// <summary>
     /// 固定路径序号（与 <see cref="RouteCode"/> 成对，语义见该字段）。
     /// 类型与 <c>RoutingOperation.PathId</c> 一致（int），可直接用于 <c>RoutePathKey</c> 图查找。
     /// </summary>
-    public int? PathId { get; init; }
+    public int? PathId { get; set; }
 
     /// <summary>
     /// 不拆不合硬标记（《APS_V1_1号位有限产能排程开发实施包 v1.6》：「A/B输入…并按 `NoSplitMerge` 处理」）。

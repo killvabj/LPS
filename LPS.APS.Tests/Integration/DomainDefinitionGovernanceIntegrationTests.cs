@@ -40,7 +40,7 @@ public class DomainDefinitionGovernanceIntegrationTests : IDisposable
 
     public DomainDefinitionGovernanceIntegrationTests()
     {
-        _uniqueSuffix = $"{DateTime.UtcNow:yyyyMMddHHmmssfff}-{Guid.NewGuid():N}".ToUpperInvariant()[..30];
+        _uniqueSuffix = $"{DateTime.Now:yyyyMMddHHmmssfff}-{Guid.NewGuid():N}".ToUpperInvariant()[..30];
 
         _cm = TestEnvironment.GetConnectionManager();
         var loggerFactory = LoggerFactory.Create(builder => { });

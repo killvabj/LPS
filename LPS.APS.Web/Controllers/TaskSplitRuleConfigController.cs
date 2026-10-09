@@ -47,6 +47,7 @@ public class TaskSplitRuleConfigController : ControllerBase
         return ex switch
         {
             SetupRuleDataRedLineException data => UnprocessableEntity(ApiResponse.Fail(422, data.Message)),
+            ScopeViolationException scope => StatusCode(403, ApiResponse.Fail(403, scope.Message)),
             ResourceNotFoundException missing => NotFound(ApiResponse.Fail(404, missing.Message)),
             ArgumentException argument => BadRequest(ApiResponse.Fail(400, argument.Message)),
             _ => throw ex,
