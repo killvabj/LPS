@@ -898,10 +898,13 @@ public class PhaseTwoRoutingCandidateTests
     //   `LockedTasks` 的键域必须含 StageCode，否则两条锚点在字典建立阶段就撞键。
     // ═══════════════════════════════════════════════════════════════════════════════
 
-    /// <summary>一条锚点规格：StageCode / OperationCode / 资源 / 锁定窗 / 锁定量。</summary>
+    /// <summary>一条锚点规格：StageCode / OperationCode / 资源 / 锁定窗 / 锁定量。
+    ///   P0-03（0号位 2026-10-09《APS_V1_3_20261009.md》§三）：可显式给出**净产出/加工量**两类覆盖量
+    ///   （null ⇒ 只用 `LockedQuantity`，即既有夹具行为，零回归）。</summary>
     private readonly record struct AnchorSpec(
         string StageCode, string OperationCode, int ResourceId,
-        DateTime LockedStart, DateTime LockedEnd, decimal LockedQty);
+        DateTime LockedStart, DateTime LockedEnd, decimal LockedQty,
+        decimal? LockedNetOutputQty = null, decimal? LockedPlannedProcessQty = null);
 
     /// <summary>一条工艺路径上的工序定义：Stage / 工序码 / 资源 / 部门 / 标准工时。</summary>
     private readonly record struct OpSpec(
@@ -1008,7 +1011,9 @@ public class PhaseTwoRoutingCandidateTests
                 ConstraintType = "MANUAL",
                 StageCode = a.StageCode,
                 OperationCode = a.OperationCode,
-                LockedQuantity = a.LockedQty
+                LockedQuantity = a.LockedQty,
+                LockedNetOutputQty = a.LockedNetOutputQty,
+                LockedPlannedProcessQty = a.LockedPlannedProcessQty
             }).ToList(),
             Resources = resources,
             CalendarSlots = calendars,
@@ -1152,6 +1157,103 @@ public class PhaseTwoRoutingCandidateTests
         // D1 全量锁定 ⇒ 其锚点原地保留；D2 无锁定 ⇒ 其 1 件必须被排下。
         Assert.Single(result.FinalTasks.Where(t => t.SourceDraftId == "D1"));
         Assert.Single(result.FinalTasks.Where(t => t.SourceDraftId == "D2"));
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════════
+    // P0-03 三组反证（0号位 2026-10-09《APS_V1_3_20261009.md》§三 / §六.1）
+    //   复审判词（成立）：旧实现把负值/超界校验放在 `if (lockedNetOutputQty >= demand.NetOutputQty) continue;`
+    //     **之后** ⇒ `lockedNetOutputQty > demand.NetOutputQty` 时必先 `continue`，
+    //     专门的 Fail Closed 分支**不可达**（净产出刚好等于需求量而加工量超额时同样先被跳过）。
+    //   要求（§六.1）：「超量锁定**先**受控 Fail Closed，**再**判断全量覆盖」。
+    //   三组**必须走完整 `SolveAsync`**（复审明示），不得只测内部辅助方法。
+    // ═══════════════════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// P0-03 反证 ①（复审 §三 第 1 组）：`NetOutputQty=10 / PlannedProcessQty=10 /
+    ///   锁定净产出=11 / 锁定加工量=11` ⇒ **必须** `Success=false` 且错误来自
+    ///   `SolverInputContractException` 通道（**不得**先被「全量锁定」`continue` 吃掉、更不得排出一套计划）。
+    ///
+    /// 整改前本用例**红**：`lockedNetOutputQty (11) >= 10` ⇒ 先 `continue` ⇒ 校验不可达
+    ///   ⇒ 既不报错也不排剩余 ⇒ 静默产出「0 新 Task 的成功结果」。
+    /// </summary>
+    [Fact]
+    public async Task P0_03_锁定净产出超界_受控FailClosed_不得先跳过()
+    {
+        var anchors = new[]
+        {
+            new AnchorSpec("STAGE1", "OP10", 1, PlanningStart, PlanningStart.AddMinutes(30), 11m,
+                LockedNetOutputQty: 11m, LockedPlannedProcessQty: 11m)
+        };
+        var demands = new[] { new DemandSpec2("D1", 1, 10m, "RTA", 1, Due: PlanningStart.AddDays(5)) };
+        var ops = new[] { new OpSpec("STAGE1", "OP10", 1, DeptId, 30m) };
+
+        var result = await _solver.SolveAsync(
+            BuildLockedGeometry(ops, Array.Empty<DepSpec>(), anchors, demands));
+
+        Assert.False(result.Success, "锁定覆盖量超出需求总量必须受控 Fail Closed，不得假成功");
+        Assert.Contains("Fail Closed", result.ErrorMessage ?? string.Empty);
+        Assert.Contains("锁定数量闭合失败", result.ErrorMessage ?? string.Empty);
+        Assert.Contains("锁定覆盖量超出需求总量", result.ErrorMessage ?? string.Empty);
+        Assert.Empty(result.FinalTasks);
+    }
+
+    /// <summary>
+    /// P0-03 反证 ②（复审 §三 第 2 组）：`NetOutputQty=10 / PlannedProcessQty=10 /
+    ///   锁定净产出=10 / 锁定加工量=11` ⇒ 净产出**刚好等于**需求量，但**加工量超额**
+    ///   ⇒ 同样必须受控 Fail Closed（口径不自洽），**不得**因「净产出已全量覆盖」而跳过。
+    ///
+    /// 整改前本用例**红**：`lockedNetOutputQty (10) >= 10` ⇒ 先 `continue` ⇒ 超额加工量被静默吞掉。
+    /// </summary>
+    [Fact]
+    public async Task P0_03_仅加工量超界_同样受控FailClosed()
+    {
+        var anchors = new[]
+        {
+            new AnchorSpec("STAGE1", "OP10", 1, PlanningStart, PlanningStart.AddMinutes(30), 11m,
+                LockedNetOutputQty: 10m, LockedPlannedProcessQty: 11m)
+        };
+        var demands = new[] { new DemandSpec2("D1", 1, 10m, "RTA", 1, Due: PlanningStart.AddDays(5)) };
+        var ops = new[] { new OpSpec("STAGE1", "OP10", 1, DeptId, 30m) };
+
+        var result = await _solver.SolveAsync(
+            BuildLockedGeometry(ops, Array.Empty<DepSpec>(), anchors, demands));
+
+        Assert.False(result.Success, "加工量覆盖超出需求总量必须受控 Fail Closed");
+        Assert.Contains("锁定数量闭合失败", result.ErrorMessage ?? string.Empty);
+        Assert.Contains("锁定覆盖量超出需求总量", result.ErrorMessage ?? string.Empty);
+        Assert.Empty(result.FinalTasks);
+    }
+
+    /// <summary>
+    /// P0-03 反向护栏（复审 §三 第 3 组）：`10 / 10 / 锁定 10 / 锁定 10` —— 覆盖量**严格等于**
+    ///   已声明需求且各项均合法 ⇒ **正常保留**（锚点原地继承）且**不新排** Task、需求**不**进 Unscheduled。
+    ///
+    /// 作用：证明整改「把校验提前」**没有**把合法的全量锁定也判成失败（过度收紧 = 另一种回归）。
+    /// </summary>
+    [Fact]
+    public async Task P0_03_覆盖量严格等于需求_正常保留且不新排()
+    {
+        var anchors = new[]
+        {
+            new AnchorSpec("STAGE1", "OP10", 1, PlanningStart, PlanningStart.AddMinutes(30), 10m,
+                LockedNetOutputQty: 10m, LockedPlannedProcessQty: 10m)
+        };
+        var demands = new[] { new DemandSpec2("D1", 1, 10m, "RTA", 1, Due: PlanningStart.AddDays(5)) };
+        var ops = new[] { new OpSpec("STAGE1", "OP10", 1, DeptId, 30m) };
+
+        var result = await _solver.SolveAsync(
+            BuildLockedGeometry(ops, Array.Empty<DepSpec>(), anchors, demands));
+
+        Assert.True(result.Success, result.ErrorMessage);
+
+        // ① 锚点原地继承、**不新排** ⇒ D1 恰有 1 条 Task。
+        var d1 = result.FinalTasks.Where(t => t.SourceDraftId == "D1").ToList();
+        Assert.Single(d1);
+        Assert.Equal(PlanningStart, d1[0].PlannedStartTime);
+        Assert.Equal(PlanningStart.AddMinutes(30), d1[0].PlannedEndTime);
+
+        // ② 全量覆盖 ⇒ 需求**不得**进 Unscheduled（也不得因本整改被误判失败）。
+        Assert.DoesNotContain("D1", result.UnscheduledTasks.Select(u => u.DraftId));
     }
 
     /// <summary>

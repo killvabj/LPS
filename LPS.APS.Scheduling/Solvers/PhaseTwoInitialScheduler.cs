@@ -272,7 +272,25 @@ internal class PhaseTwoInitialScheduler
                     ? 0m
                     : demandLockedTasks.Max(t => t.LockedPlannedProcessQty ?? t.LockedQuantity ?? demand.PlannedProcessQty);
 
-                // 如果锁定数量 >= 需求总量，完全锁定，跳过排程
+                // ── P0-03（0号位 2026-10-09《APS_V1_3_20261009.md》§三）：**超界校验必须先于「全量锁定直接跳过」** ──
+                //   复审判词（成立）：旧实现把负值校验放在 `if (lockedNetOutputQty >= demand.NetOutputQty) continue;`
+                //   **之后** ⇒ `lockedNetOutputQty > demand.NetOutputQty` 时必先 `continue`，
+                //   专门的 Fail Closed 分支**不可达**（净产出刚好等于需求、而加工量超额时同样先被跳过）。
+                //   现顺序（§六.1「超量锁定先受控 Fail Closed，再判断全量覆盖」）：
+                //     ① 任一覆盖量**超出**其需求总量 ⇒ 立即受控 Fail Closed（口径不自洽）；
+                //     ② 净产出**全量覆盖**（此时加工量必未超量）⇒ 跳过排程（既有语义，零回归）；
+                //     ③ 其余 ⇒ 部分锁定，排剩余份额。
+                //   ① 之后 `remaining*` 恒 ≥ 0 ⇒ 不再需要独立的负值分支（原分支已被本步取代）。
+                if (lockedNetOutputQty > demand.NetOutputQty || lockedPlannedProcessQty > demand.PlannedProcessQty)
+                {
+                    throw new SolverInputContractException(
+                        "锁定数量闭合失败：锁定覆盖量超出需求总量（口径不自洽）。" +
+                        $"LogicalDemandKey={demand.LogicalDemandKey}, " +
+                        $"NetOutputQty={demand.NetOutputQty}, 锁定净产出覆盖={lockedNetOutputQty}, " +
+                        $"PlannedProcessQty={demand.PlannedProcessQty}, 锁定加工量覆盖={lockedPlannedProcessQty}");
+                }
+
+                // 净产出全量覆盖 ⇒ 完全锁定，跳过排程（不产新 Task；锚点由 Phase2 物化保留）。
                 if (lockedNetOutputQty >= demand.NetOutputQty)
                 {
                     continue;
@@ -281,18 +299,6 @@ internal class PhaseTwoInitialScheduler
                 // 部分锁定：计算剩余数量，创建剩余需求对象
                 var remainingNetOutputQty = demand.NetOutputQty - lockedNetOutputQty;
                 var remainingPlannedProcessQty = demand.PlannedProcessQty - lockedPlannedProcessQty;
-
-                // P0-03 附带闭合校验：锁定覆盖量若**超出**需求总量，说明锁定输入与需求数量口径不自洽
-                //   ⇒ 不得带着负的「剩余数量」继续排程（静默产出负数量 Task = 数量闭合被破坏）。
-                //   受控 Fail Closed（P0-02 同款通道），不静默、不猜。
-                if (remainingNetOutputQty < 0m || remainingPlannedProcessQty < 0m)
-                {
-                    throw new SolverInputContractException(
-                        "锁定数量闭合失败：锁定覆盖量超出需求总量（口径不自洽）。" +
-                        $"LogicalDemandKey={demand.LogicalDemandKey}, " +
-                        $"NetOutputQty={demand.NetOutputQty}, 锁定净产出覆盖={lockedNetOutputQty}, " +
-                        $"PlannedProcessQty={demand.PlannedProcessQty}, 锁定加工量覆盖={lockedPlannedProcessQty}");
-                }
 
                 // 创建剩余需求对象（只排这部分）
                 actualDemand = new LogicalProductionDemand
@@ -591,6 +597,15 @@ internal class PhaseTwoInitialScheduler
             //   覆盖上方 `:542` 的需求级回落值 —— 二者仅在 `AUTO` 且候选 lead 不同时才可能不同，
             //   此时**真实落定**的方向才是权威（复审 §五.4「候选比较与真实落定同方向」）。
             constraints.ResolvedDirections[demand.LogicalDemandKey] = outcome.Direction;
+
+            // ── NEW-P1-01：登记**逐执行批**落定方向（批键 → 方向）──
+            //   Phase5 按 Task 的 `ExecutionBatchDraftKey` 消费本表（`IsForwardTask`），
+            //   需求级 `ResolvedDirections` 降为**回落**（Task 无批键 / 批键未登记时用）。
+            //   单批时两表同向 ⇒ Phase5 判定与整改前逐字一致（零回归）。
+            foreach (var kv in outcome.BatchDirections)
+            {
+                constraints.ResolvedBatchDirections[kv.Key] = kv.Value;
+            }
 
             var demandTasksAll = outcome.NewTasks;
             var batchFailed = outcome.BatchFailed;
@@ -988,7 +1003,8 @@ internal class PhaseTwoInitialScheduler
         decimal SetupTotal,
         DateTime Completion,
         int FailedBatchIndex,   // P0-03：首个**未落定**批在 batches 中的下标（-1 = 全部落定）
-        string Direction);      // P1-01：本批方案**实际落定**所用方向（= 胜出候选自己的方向；无批落定 ⇒ 传入的原值）
+        string Direction,       // P1-01：本批方案**实际落定**所用方向（= 胜出候选自己的方向；无批落定 ⇒ 传入的原值）
+        IReadOnlyDictionary<string, string> BatchDirections);   // NEW-P1-01：**批键 → 该批自身落定方向**（逐批独立）
 
     /// <summary>
     /// P1-01：在**给定工作缓冲**上执行一个**批方案**（原 Phase2 批循环主体，逐字抽出）。
@@ -1032,6 +1048,10 @@ internal class PhaseTwoInitialScheduler
         var failedBatchIndex = -1;
         // P1-01：记录**实际落定**所用方向（逐批覆盖；无批落定 ⇒ 保持传入值）。
         var landedDirection = direction;
+
+        // NEW-P1-01：**逐批**记录各自落定方向（批键 → 方向）。冻结模型是「每个执行批独立联合求解」
+        //   ⇒ 同一需求的不同批可各自落定到不同方向；只有逐批留痕才能让 Phase5 按 Task 所归批消费。
+        var batchDirections = new Dictionary<string, string>(StringComparer.Ordinal);
         decimal setupTotal = 0m;
         var planCompletion = DateTime.MinValue;
 
@@ -1217,6 +1237,17 @@ internal class PhaseTwoInitialScheduler
             var winnerDirection = trials[winnerIndex].Direction;
             landedDirection = winnerDirection;
 
+            // ── NEW-P1-01（0号位 2026-10-09《APS_V1_3_20261009.md》§三 / §六.2）：**逐批**留痕本批落定方向 ──
+            //   复审判词：「`RunBatchPlan` 每个Batch选中Winner后执行 `landedDirection = winnerDirection`；
+            //     循环结束仅返回**一个** `BatchPlanRunOutcome.Direction`」⇒ 「结果为**最后一个落定Batch的方向**，
+            //     不能代表前面的Batch」⇒ Phase5 按**需求 Key** 消费时会用错方向。
+            //   冻结模型（0号位 §三）：每个 Execution Batch **独立**做 Direction + Routing + Resource +
+            //     Calendar + Setup 联合求解 ⇒ 同一需求的不同批**可以**各有各的方向，必须逐批留痕。
+            //   主消费身份 = `ExecutionBatchDraftKey`（本批键）；`Direction` 仍保留（需求级回落 + 既有比较层）。
+            //   ⚠ Merge 落定的批此处同样留痕：合并目标 Task 采用**本批键**（见 `TryMergeDemandIntoTask`
+            //     的 `requireIdentityPreserving` 口径）⇒ 该 Task 在 Phase5 应受**本批**方向约束。
+            batchDirections[batch.BatchDraftKey] = winnerDirection;
+
             var batchTasks = RunDemandSchedule(
                 batchDemand, winner.Ops, winner.Graph, winnerDirection, constraints, resourceOccupancy,
                 scheduledTasks, allocationTaskShare, demandByKey,
@@ -1252,7 +1283,7 @@ internal class PhaseTwoInitialScheduler
             }
         }
 
-        return new BatchPlanRunOutcome(batchFailed, newTasks, setupTotal, planCompletion, failedBatchIndex, landedDirection);
+        return new BatchPlanRunOutcome(batchFailed, newTasks, setupTotal, planCompletion, failedBatchIndex, landedDirection, batchDirections);
     }
 
     /// <summary>

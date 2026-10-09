@@ -374,6 +374,33 @@ internal class PhaseFiveCompression
     }
 
     /// <summary>
+    /// NEW-P1-01（0号位 2026-10-09《APS_V1_3_20261009.md》§三 / §六.2）：本 **Task** 是否**按 FORWARD 处理**。
+    ///
+    /// 复审判词：「`RunBatchPlan` 循环结束仅返回**一个** `Direction`（= 最后一个落定Batch的方向），
+    ///   不能代表前面的Batch」；「Phase5 `IsForwardDemand()` 仅按**需求Key**读取方向」⇒ 同一需求多批不同方向时
+    ///   Phase5 会用**错批的方向**决定**所有** Task 的可移动性（应保护的 JIT 片段可能被前推 / Setup 重排）。
+    ///
+    /// 消费身份**优先 `ExecutionBatchDraftKey`**（冻结模型：**每个执行批独立**做 Direction + Routing +
+    ///   Resource + Calendar + Setup 联合求解 ⇒ 方向是**批级**属性）；消费顺序：
+    ///     ① <c>task.ExecutionBatchDraftKey</c> 命中 <see cref="ConstraintContext.ResolvedBatchDirections"/> ⇒ 用该值；
+    ///     ② 回落到需求级 <see cref="ConstraintContext.ResolvedDirections"/>（= 既有 <see cref="IsForwardDemand"/> 口径）；
+    ///     ③ 再回落 Run 级原始策略值。
+    ///
+    /// 零回归：单批需求 ⇒ 批键方向 == 需求级方向 ⇒ 与整改前**逐字等价**；
+    ///   `ExecutionBatchDraftKey == null`（V1 常态旁路 / 未归批 Task）⇒ 直接走 ②③，与整改前完全一致。
+    /// </summary>
+    private static bool IsForwardTask(FinalTaskDraft task, DomainSolveRequest request, ConstraintContext constraints)
+    {
+        if (!string.IsNullOrEmpty(task.ExecutionBatchDraftKey)
+            && constraints.ResolvedBatchDirections.TryGetValue(task.ExecutionBatchDraftKey!, out var batchDirection))
+        {
+            return string.Equals(batchDirection, "FORWARD", StringComparison.Ordinal);
+        }
+
+        return IsForwardDemand(task.SourceDraftId, request, constraints);
+    }
+
+    /// <summary>
     /// P1-05：Gap Compaction —— 保序前向压实（V1 最小实现，Level 3 次级优化）。
     /// 仅 FORWARD 方向执行；把 Task 拉进更早的日历可用空档，全程满足：
     /// - Level 0 硬约束：Calendar/占用含 Setup（复用 Phase4.FindForwardSlot 唯一实现）/不换资源（Eligibility 不变）/
@@ -395,7 +422,13 @@ internal class PhaseFiveCompression
         //   改为 **本需求自决方向**（Phase2 登记于 `constraints.ResolvedDirections`）。
         //   Run 级 FORWARD/BACKWARD ⇒ 全量同向 ⇒ 与整改前逐字一致；Run 级 AUTO ⇒ 逐需求判定 ——
         //   自决为 FORWARD 的需求参与压实，自决为 BACKWARD/MIXED 的（JIT 倒排锚点）仍整体跳过、绝不前拉。
-        if (!request.LogicalProductionDemands.Any(d => IsForwardDemand(d.LogicalDemandKey, request, constraints)))
+        // NEW-P1-01（0号位 2026-10-09《APS_V1_3_20261009.md》§六.2）：门控**必须批级可见** ——
+        //   同一需求多执行批可有不同方向；若只按**需求级**单值判，则「最后落定批为 BACKWARD」会把
+        //   该需求**全部** Task（含 FORWARD 批）挡在压实之外 ⇒ 与「优化FORWARD批」要求不符。
+        //   故本门控 = 需求级原有条件 **或** 任一 Task 按批级判定为 FORWARD（**并集**）：
+        //   需求级为真时必然放行（对既有单批/无批键输入 ⇒ 与整改前逐字一致，零回归）。
+        if (!request.LogicalProductionDemands.Any(d => IsForwardDemand(d.LogicalDemandKey, request, constraints))
+            && !tasks.Any(t => IsForwardTask(t, request, constraints)))
         {
             return;
         }
@@ -411,7 +444,9 @@ internal class PhaseFiveCompression
         //   ⇒ AUTO 下自决为 FORWARD 的需求得以压实，而非 FORWARD 需求仍被完整保护。
         foreach (var t in tasks)
         {
-            if (!IsForwardDemand(t.SourceDraftId, request, constraints))
+            // NEW-P1-01：**逐 Task** 按批级方向判定（`ExecutionBatchDraftKey` → 需求级 → Run 级）。
+            //   ⇒ 同一需求下 BACKWARD 批的 JIT 锚点被完整保护，FORWARD 批仍可参与优化。
+            if (!IsForwardTask(t, request, constraints))
             {
                 immovable.Add(t.FinalDraftId);
             }
@@ -677,7 +712,9 @@ internal class PhaseFiveCompression
         //   （撤销全 Run 一票否决后，局部保护改由本行 + 既有「段按锚点切分」共同达成。）
         foreach (var t in tasks)
         {
-            if (!IsForwardDemand(t.SourceDraftId, request, constraints))
+            // NEW-P1-01：**逐 Task** 按批级方向判定（`ExecutionBatchDraftKey` → 需求级 → Run 级）。
+            //   ⇒ 同一需求下 BACKWARD 批的 JIT 锚点被完整保护，FORWARD 批仍可参与优化。
+            if (!IsForwardTask(t, request, constraints))
             {
                 immovable.Add(t.FinalDraftId);
             }

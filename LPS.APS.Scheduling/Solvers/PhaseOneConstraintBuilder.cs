@@ -1154,6 +1154,23 @@ internal class ConstraintContext
     public Dictionary<string, string> ResolvedDirections { get; set; } = new(StringComparer.Ordinal);
 
     /// <summary>
+    /// **执行批键 → 该批实际落定所用方向**（NEW-P1-01，0号位 2026-10-09《APS_V1_3_20261009.md》§三）。
+    ///
+    /// 【为什么单靠 <see cref="ResolvedDirections"/> 不够】
+    ///   冻结模型是「**每个 Execution Batch 独立**做 Direction + RoutingCandidate + Resource + Calendar + Setup
+    ///   联合求解」⇒ 同一 `LogicalDemand` 的不同执行批**可以各自落定到不同方向**（例如 Batch-001 选中长 Lead 的
+    ///   Path 自决 BACKWARD，Batch-002 选中短 Lead 的 Path 自决 FORWARD）。
+    ///   而 <see cref="ResolvedDirections"/> 是**需求级单值**，只能承载「最后一个落定批」的方向
+    ///   ⇒ 用它驱动 Phase5 会**把某一批的方向套到全需求**（复审判词：「多批方向被需求级单值覆盖」）。
+    ///
+    /// 【消费口径】Phase5 先按 **Task 自己的 `ExecutionBatchDraftKey`** 查本表；未命中才回落
+    ///   <see cref="ResolvedDirections"/>（需求级，兼容旁路/单批），再回落 Run 级原值。
+    ///   回调顺序保证**零回归**：Run 级 `FORWARD`/`BACKWARD` ⇒ 两级登记的均是该原值；
+    ///   单批需求 ⇒ 批级与需求级同值。
+    /// </summary>
+    public Dictionary<string, string> ResolvedBatchDirections { get; set; } = new(StringComparer.Ordinal);
+
+    /// <summary>
     /// ⑧块 Batch Policy —— **按 `(MaterialId, ProductionDepartmentId?)` 键控的策略集**
     /// （P0-01 整改，0号位 2026-10-07《未命名的Markdown文件 (7).md》§四）。
     ///
