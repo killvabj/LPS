@@ -859,26 +859,40 @@ internal class PhaseOneConstraintBuilder
     /// </summary>
     private void BuildLockedTasks(DomainSolveRequest request, ConstraintContext context)
     {
-        // P1-07：复合键 (DraftId, OperationCode)。同一 LogicalDemand 多操作锚点（多 ExecutionConstraint）
-        // 不再因重复 DraftId 抛 ToDictionary 异常；OperationCode 归一化为 string.Empty（2号位 口径：恒非空）。
-        var lockedTasks = request.ExecutionConstraints
-            .ToDictionary(
-                ec => (ec.DraftId, ec.OperationCode ?? string.Empty),
-                ec => new LockedTaskConstraint
-                {
-                    DraftId = ec.DraftId,
-                    ResourceId = ec.ResourceId,
-                    LockedStart = ec.LockedStart,
-                    LockedEnd = ec.LockedEnd,
-                    ConstraintType = ec.ConstraintType,
-                    StageCode = ec.StageCode,
-                    OperationCode = ec.OperationCode,
-                    LockedQuantity = ec.LockedQuantity,
-                    LockedNetOutputQty = ec.LockedNetOutputQty,
-                    LockedPlannedProcessQty = ec.LockedPlannedProcessQty,
-                    TaskKey = ec.TaskKey
-                }
-            );
+        // P1-07：复合键。同一 LogicalDemand 多操作锚点（多 ExecutionConstraint）不再因重复 DraftId 抛异常；
+        //   StageCode / OperationCode 归一化为 string.Empty（2号位 口径：恒非空）。
+        // P0-02（0号位 2026-10-09《APS_V1_2_20261009.md》§三）：键域**必须含 StageCode** ——
+        //   已生效工序身份规则要求 StageCode 与 OperationCode **共同**定位工序，不得假设 OperationCode 全局唯一。
+        //   并改**显式循环 + 重复检测**（`ToDictionary` 的重复 Key 抛的是未受控 ArgumentException）：
+        //   同一三元键出现两条 ⇒ 输入契约无法唯一标识锚点 ⇒ **不得静默抹除锚点**，须受控 Fail Closed
+        //   （抛 `SolverInputContractException`，由 `FiniteCapacitySolver.SolveAsync` 捕获）。
+        var lockedTasks = new Dictionary<(string DraftId, string StageCode, string OperationCode), LockedTaskConstraint>();
+        foreach (var ec in request.ExecutionConstraints)
+        {
+            var lockedKey = (ec.DraftId, ec.StageCode ?? string.Empty, ec.OperationCode ?? string.Empty);
+            if (lockedTasks.ContainsKey(lockedKey))
+            {
+                throw new SolverInputContractException(
+                    "锁定约束键域冲突：同一 (DraftId, StageCode, OperationCode) 出现多条 ExecutionConstraint ⇒ " +
+                    $"无法唯一标识锚点，不得静默抹除。DraftId={ec.DraftId}, " +
+                    $"StageCode={ec.StageCode ?? "(null)"}, OperationCode={ec.OperationCode ?? "(null)"}");
+            }
+
+            lockedTasks[lockedKey] = new LockedTaskConstraint
+            {
+                DraftId = ec.DraftId,
+                ResourceId = ec.ResourceId,
+                LockedStart = ec.LockedStart,
+                LockedEnd = ec.LockedEnd,
+                ConstraintType = ec.ConstraintType,
+                StageCode = ec.StageCode,
+                OperationCode = ec.OperationCode,
+                LockedQuantity = ec.LockedQuantity,
+                LockedNetOutputQty = ec.LockedNetOutputQty,
+                LockedPlannedProcessQty = ec.LockedPlannedProcessQty,
+                TaskKey = ec.TaskKey
+            };
+        }
 
         context.LockedTasks = lockedTasks;
     }
@@ -1352,10 +1366,15 @@ internal class ConstraintContext
     public Dictionary<long, List<MaterialAvailabilitySegment>> MaterialAvailability { get; set; } = new();
 
     /// <summary>
-    /// 锁定任务约束：P1-07 复合键 (DraftId, OperationCode) → 锁定信息。
-    /// 同一 LogicalDemand 可有多操作锚点，故不能再用 DraftId 单键。
+    /// 锁定任务约束：复合键 <c>(DraftId, StageCode, OperationCode)</c> → 锁定信息。
+    ///
+    /// · P1-07：同一 LogicalDemand 可有多操作锚点 ⇒ 不能再用 DraftId 单键。
+    /// · P0-02（0号位 2026-10-09 第四轮复审《APS_V1_2_20261009.md》§三）：**必须含 StageCode**。
+    ///   已生效的工序身份规则要求 `StageCode` 与 `OperationCode` **共同**定位工序，不得假设
+    ///   `OperationCode` 全局唯一；否则「同 DraftId、Stage A/OP10 与 Stage B/OP10 同时锁定」
+    ///   会在建字典阶段抛重复 Key 异常。此前仅二维键 ⇒ 键域不足。
     /// </summary>
-    public Dictionary<(string DraftId, string OperationCode), LockedTaskConstraint> LockedTasks { get; set; } = new();
+    public Dictionary<(string DraftId, string StageCode, string OperationCode), LockedTaskConstraint> LockedTasks { get; set; } = new();
 
     /// <summary>
     /// 共享资源占用块：ResourceId → 占用时间块列表
@@ -1588,6 +1607,18 @@ internal class LockedTaskConstraint
     public decimal? LockedPlannedProcessQty { get; set; }
 
     public string? TaskKey { get; set; }
+}
+
+/// <summary>
+/// 求解器**输入契约**异常：输入无法满足冻结契约要求的唯一标识 / 完整身份（不是业务「排不下」）。
+///
+/// 由 <see cref="FiniteCapacitySolver.SolveAsync"/> 捕获 ⇒ **受控 Fail Closed**（`Success=false` + `ErrorMessage`），
+/// 不向外抛未处理异常、也不静默抹除锚点。
+/// 依据：0号位 2026-10-09《APS_V1_2_20261009.md》§三 P0-02（「SolveAsync 没有对该异常做受控 Fail Closed」）。
+/// </summary>
+internal sealed class SolverInputContractException : Exception
+{
+    public SolverInputContractException(string message) : base(message) { }
 }
 
 /// <summary>

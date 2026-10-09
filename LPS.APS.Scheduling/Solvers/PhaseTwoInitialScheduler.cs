@@ -241,16 +241,36 @@ internal class PhaseTwoInitialScheduler
             if (lockedDraftIds.Contains(demand.LogicalDemandKey))
             {
                 // P1-07：同 LogicalDemand 可有多操作锚点（多 ExecutionConstraint），
-                // 按复合键 (DraftId, OperationCode) 聚合该需求所有锁定任务的锁定数量。
+                // 按复合键 (DraftId, StageCode, OperationCode) 聚合该需求所有锁定任务的锁定数量
+                //   （P0-02：键域含 StageCode —— 工序身份 = StageCode + OperationCode，不得假设 OperationCode 全局唯一）。
                 var demandLockedTasks = constraints.LockedTasks.Values
                     .Where(t => t.DraftId == demand.LogicalDemandKey)
                     .ToList();
 
-                // P1-01：净产出与加工量分别取锁定字段（YIELD 场景），缺省依次回落 LockedQuantity → 需求原值
-                var lockedNetOutputQty = demandLockedTasks
-                    .Sum(t => t.LockedNetOutputQty ?? t.LockedQuantity ?? demand.NetOutputQty);
-                var lockedPlannedProcessQty = demandLockedTasks
-                    .Sum(t => t.LockedPlannedProcessQty ?? t.LockedQuantity ?? demand.PlannedProcessQty);
+                // ── P0-03（0号位 2026-10-09《APS_V1_2_20261009.md》§三）：**不得按锁定记录条数求和** ──
+                //   同一 LogicalDemand 下的多条锁定记录（P0-02 后键域 = (DraftId, StageCode, OperationCode)，
+                //   同一工序至多一条）描述的是**同一执行批沿工序流动的同一份物理数量**，不是多份互不重叠的
+                //   独立产出。旧实现直接 `Sum` ⇒ 把同一数量按工序重复扣除：两工序各报 10、需求 20 时
+                //   锁定覆盖被判为 20 ⇒ 「剩余 10」被误判为 0 ⇒ **静默漏排**。
+                //   冻结身份原则：多 Operation 同一执行批不得重复扣业务量。
+                //
+                //   覆盖量口径（单执行批）：取该需求下各锁定工序记录的**最大覆盖量**。
+                //     推导：单批数量 Q 沿工序流动时，任一工序持有的数量 ≤ Q，且整批必在某工序上被完整持有
+                //     ⇒ max(各工序锁定量) = 该执行批的实际数量 Q。按条数求和 = 把 Q 重复计了工序数次。
+                //
+                //   并行多 Slice 的**独立性**由独立 Demand（各自 LogicalDemandKey / AllocationSequence）表达，
+                //   外层逐需求循环已保证每个 Slice 各计一次；同需求内不存在「独立 Slice」这一载体。
+                //   ⚠ 残余歧义（如实登记，属 2号位 输入契约缺口，不自行造字段）：
+                //     契约未提供**分量身份**（Slice/Batch 键）与**按工序序的产量语义**（YIELD 下各工序净产出
+                //     本应逐工序不同）。当前口径在「同需求单批流动」前提下确定；若输入实际含同需求多批
+                //     部分重叠，覆盖量为**保守下界**（宁少扣、多排一个可被资源/时间约束显式暴露的 Task，
+                //     也不静默少排）—— 该形态需 2号位 提供分量身份后才能精确计量。
+                var lockedNetOutputQty = demandLockedTasks.Count == 0
+                    ? 0m
+                    : demandLockedTasks.Max(t => t.LockedNetOutputQty ?? t.LockedQuantity ?? demand.NetOutputQty);
+                var lockedPlannedProcessQty = demandLockedTasks.Count == 0
+                    ? 0m
+                    : demandLockedTasks.Max(t => t.LockedPlannedProcessQty ?? t.LockedQuantity ?? demand.PlannedProcessQty);
 
                 // 如果锁定数量 >= 需求总量，完全锁定，跳过排程
                 if (lockedNetOutputQty >= demand.NetOutputQty)
@@ -261,6 +281,18 @@ internal class PhaseTwoInitialScheduler
                 // 部分锁定：计算剩余数量，创建剩余需求对象
                 var remainingNetOutputQty = demand.NetOutputQty - lockedNetOutputQty;
                 var remainingPlannedProcessQty = demand.PlannedProcessQty - lockedPlannedProcessQty;
+
+                // P0-03 附带闭合校验：锁定覆盖量若**超出**需求总量，说明锁定输入与需求数量口径不自洽
+                //   ⇒ 不得带着负的「剩余数量」继续排程（静默产出负数量 Task = 数量闭合被破坏）。
+                //   受控 Fail Closed（P0-02 同款通道），不静默、不猜。
+                if (remainingNetOutputQty < 0m || remainingPlannedProcessQty < 0m)
+                {
+                    throw new SolverInputContractException(
+                        "锁定数量闭合失败：锁定覆盖量超出需求总量（口径不自洽）。" +
+                        $"LogicalDemandKey={demand.LogicalDemandKey}, " +
+                        $"NetOutputQty={demand.NetOutputQty}, 锁定净产出覆盖={lockedNetOutputQty}, " +
+                        $"PlannedProcessQty={demand.PlannedProcessQty}, 锁定加工量覆盖={lockedPlannedProcessQty}");
+                }
 
                 // 创建剩余需求对象（只排这部分）
                 actualDemand = new LogicalProductionDemand
@@ -455,25 +487,35 @@ internal class PhaseTwoInitialScheduler
             //   本判据与批数无关 ⇒ 提到候选择优之前（择优需要它）。
             var mergeAllowed = batchPolicy?.AllowMerge ?? request.StrategySnapshot.Parameters.AllowMerge;
 
-            // ═══ P1-01（0号位 2026-10-09 第三轮复审 §二）：**AUTO 方向在进入批/路由择优之前一次性自决** ═══
-            //   复审源码证实的不一致：`AUTO` 原先**只在** `ScheduleDemandOperations`（真正排程执行时）本地解析，
-            //   而 `SelectBestBatchPlan` / `RunBatchPlan` / `SelectBestRoutingCandidate` / `CompareBatchPlans`
-            //   拿到的是**原始策略值**（`request.StrategySnapshot.Parameters.SchedulingDirection`，可能仍是 `AUTO`）
-            //   ⇒ 第③层「均按期时的交期目标」在 AUTO 下走「更早可行完成优先」分支，而本批**真实** ResolvedDirection
-            //     可能为 BACKWARD（要求「更晚但不延期」）⇒ 方向决策与路径择优第三层目标**冲突**。
-            //   整改：在**本需求（= 本批的真实上下文单位）进入择优前**解析**一次**，**同一 ResolvedDirection**
-            //     贯穿 试排 / 候选比较 / 落定 / 必要的 Phase5 语义；**不另建求解器**（仍复用 `SchedulingDirectionResolver`）。
-            //   零回归：单路径（V1 常态 / A/B 固定路径）时本处解析所用 `demand` 与 `ops` 与旧实现
-            //     `ScheduleDemandOperations` 内的局部解析**逐字相同** ⇒ 解析结果与排程结果完全一致。
+            // ═══ P1-01（0号位 2026-10-09 第三轮复审 §二 → 2026-10-09《APS_V1_2_20261009.md》§三 P1-01）═══
+            //   上一轮已把 `AUTO` 从「只在 `ScheduleDemandOperations` 内本地解析」提到「进入批/路由择优之前
+            //   自决一次」；本轮复审指出该整改**仍不完整**：自决所用工序集是
+            //   `plannedCandidates.First(p => p.Ops.Count > 0).Ops`（输入顺序上的第一条 Path）⇒ 用一个由任意
+            //   首条外推的方向套所有 Batch / Route。详见下方整改说明。
+            // ── P1-01 整改（0号位 2026-10-09《APS_V1_2_20261009.md》§三 P1-01）──
+            //   复审判词（成立）：旧实现取 `plannedCandidates.First(p => p.Ops.Count > 0).Ops` 解析**一个**
+            //   `resolvedDirection` 再传给所有 Batch / Route ⇒ 方向由**输入顺序上的第一条 Path** 外推全路由。
+            //   而 Slack 判据（`DUE_TIGHT`/`DUE_LOOSE`）依赖该候选的**总标准工时**，两条合法 Route 工时不同
+            //   即可让一条判 FORWARD、另一条判 BACKWARD ⇒ **候选比较结果随候选输入顺序漂移**。
+            //   （旧注释「取首条不改变方向判据的语义」与此实现自相矛盾，已删除。）
+            //
+            //   整改分两层，职责不同、互不替代：
+            //     ① **需求级方向**（本处）= 仅作**登记回落**与批方案层兜底。工序输入取**规范首候选** ——
+            //        按 `(RouteCode, PathId)` 序排序后的首条（**与输入顺序无关**），不再是「任意第一 Path」。
+            //     ② **候选/批级方向**（`RunBatchPlan` 试排与落定内）= 每条候选路径按其**自身工序**解析
+            //        （见 `ResolveDirectionForOps`），参与候选评分，并由**胜出候选自己的方向**落定。
+            var canonicalCandidate = plannedCandidates
+                .Where(p => p.Ops is { Count: > 0 })
+                .OrderBy(p => p.Key.RouteCode, StringComparer.Ordinal)
+                .ThenBy(p => p.Key.PathId)
+                .FirstOrDefault();
+
             var resolvedDirection = direction;
-            if (resolvedDirection == SchedulingDirectionResolver.Auto)
+            if (resolvedDirection == SchedulingDirectionResolver.Auto && canonicalCandidate.Ops is { Count: > 0 })
             {
-                // 解析用工序集：取**首个非空**候选的工序 —— `plannedCandidates` 顺序确定 ⇒ 结果确定
-                //   （下方 `:362` 一带已保证至少一条非空）。`ops` 仅用于 lead-time 估算（Slack 判据），
-                //   不含资源争用，故「取首条」不改变方向判据的语义。
                 var decision = SchedulingDirectionResolver.Resolve(
                     actualDemand,
-                    plannedCandidates.First(p => p.Ops.Count > 0).Ops,
+                    canonicalCandidate.Ops,
                     constraints,
                     request.PlanningStart,
                     dynamicMaterialFloor,
@@ -519,7 +561,7 @@ internal class PhaseTwoInitialScheduler
             if (planCandidates.Count > 1)
             {
                 formation = SelectBestBatchPlan(
-                    planCandidates, actualDemand, plannedCandidates, resolvedDirection, constraints,
+                    planCandidates, actualDemand, plannedCandidates, direction, constraints,
                     resourceOccupancy, result.ScheduledTasks, allocationTaskShare, demandByKey,
                     request, dynamicMaterialFloor, stageOverlap, mergeAllowed);
             }
@@ -540,10 +582,15 @@ internal class PhaseTwoInitialScheduler
 
             // 多批时**禁止 Merge**（判据在 `RunBatchPlan` 内：`mergeAllowed && !multiBatch`）。
             var outcome = RunBatchPlan(
-                batches, actualDemand, plannedCandidates, resolvedDirection, constraints,
+                batches, actualDemand, plannedCandidates, direction, constraints,
                 resourceOccupancy, result.ScheduledTasks, allocationTaskShare, demandByKey,
                 request, dynamicMaterialFloor, stageOverlap, mergeAllowed,
                 constraints.ChosenBatchRoutePaths, constraints.ChosenRoutePaths);
+
+            // P1-01：登记**实际落定**方向（= 胜出候选自己的方向），供 Phase5 逐需求门控与出口追溯。
+            //   覆盖上方 `:542` 的需求级回落值 —— 二者仅在 `AUTO` 且候选 lead 不同时才可能不同，
+            //   此时**真实落定**的方向才是权威（复审 §五.4「候选比较与真实落定同方向」）。
+            constraints.ResolvedDirections[demand.LogicalDemandKey] = outcome.Direction;
 
             var demandTasksAll = outcome.NewTasks;
             var batchFailed = outcome.BatchFailed;
@@ -940,7 +987,8 @@ internal class PhaseTwoInitialScheduler
         List<FinalTaskDraft> NewTasks,
         decimal SetupTotal,
         DateTime Completion,
-        int FailedBatchIndex);   // P0-03：首个**未落定**批在 batches 中的下标（-1 = 全部落定）
+        int FailedBatchIndex,   // P0-03：首个**未落定**批在 batches 中的下标（-1 = 全部落定）
+        string Direction);      // P1-01：本批方案**实际落定**所用方向（= 胜出候选自己的方向；无批落定 ⇒ 传入的原值）
 
     /// <summary>
     /// P1-01：在**给定工作缓冲**上执行一个**批方案**（原 Phase2 批循环主体，逐字抽出）。
@@ -982,6 +1030,8 @@ internal class PhaseTwoInitialScheduler
         var newTasks = new List<FinalTaskDraft>();
         var batchFailed = false;
         var failedBatchIndex = -1;
+        // P1-01：记录**实际落定**所用方向（逐批覆盖；无批落定 ⇒ 保持传入值）。
+        var landedDirection = direction;
         decimal setupTotal = 0m;
         var planCompletion = DateTime.MinValue;
 
@@ -1016,7 +1066,9 @@ internal class PhaseTwoInitialScheduler
             // 步骤 2：候选试排（每条候选在**同一初始上下文**上跑完整排程，互不污染）。
             //   单候选（V1 常态 / A/B 固定路径）⇒ 试排后在真实上下文重跑，结果与既有完全一致（零回归）。
             var realTimeline = constraints.ProductTimeline;
-            var trials = new List<(RoutePathKey Key, bool Feasible, DateTime Completion, decimal SetupMinutes)>();
+            // P1-01：试排元组带**本候选自己的方向**（`Direction`）—— 候选比较层据此按各自方向裁决，
+            //   不再用一个由「任意第一 Path」外推的方向套所有候选。
+            var trials = new List<(RoutePathKey Key, bool Feasible, DateTime Completion, decimal SetupMinutes, string Direction)>();
 
             // 试排隔离：`constraints.TraceNotes` 是**共享可变**状态（Setup 追踪三元组在此追加），
             // 试排会把它当真实产出写进去 ⇒ 多候选试排会留下 N 份重复 trace。
@@ -1027,9 +1079,16 @@ internal class PhaseTwoInitialScheduler
             {
                 if (ops.Count == 0)
                 {
-                    trials.Add((pathKey, false, DateTime.MinValue, 0m));
+                    trials.Add((pathKey, false, DateTime.MinValue, 0m, direction));
                     continue;
                 }
+
+                // ── P1-01 整改核心：**本候选**按其**自身工序**解析实际方向 ──
+                //   非 AUTO ⇒ 原样（零回归）；AUTO ⇒ 本路径的 lead 决定本路径的 Slack 判据。
+                //   同一 `candidateDirection` 同时用于**试排**（本 trial 的完成时间）与**落定**（步骤 4），
+                //   保证「候选比较所用方向」与「真实落定所用方向」**同向**（复审 §五.4）。
+                var candidateDirection = ResolveDirectionForOps(
+                    direction, batchDemand, ops, constraints, request.PlanningStart, dynamicMaterialFloor);
 
                 // 性能计数（§九「Routing 试跑次数」）：每个（执行批 × Routing 候选）⇒ 一次候选试排。
                 SolverDiagnostics.CountRoutingTrial();
@@ -1079,7 +1138,7 @@ internal class PhaseTwoInitialScheduler
 
                 long swDemand = SolverDiagnostics.HotspotStart();
                 var produced = RunDemandSchedule(
-                    batchDemand, ops, graph, direction, constraints, trialOccupancy,
+                    batchDemand, ops, graph, candidateDirection, constraints, trialOccupancy,
                     trialTasks, trialShares, demandByKey, request.PlanningStart, request.PlanningEnd,
                     dynamicMaterialFloor, stageOverlap, allowMergeForThisBatch,
                     out var mergedIntoTask, batch.BatchDraftKey,
@@ -1117,7 +1176,7 @@ internal class PhaseTwoInitialScheduler
 
                 var setupMinutes = produced.Sum(t => t.SetupTime);
 
-                trials.Add((pathKey, feasible, completion, setupMinutes));
+                trials.Add((pathKey, feasible, completion, setupMinutes, candidateDirection));
             }
 
             constraints.ProductTimeline = realTimeline;   // 试排结束，还原真实上下文（试排不污染）
@@ -1130,7 +1189,7 @@ internal class PhaseTwoInitialScheduler
             }
 
             // 步骤 3：**本批**候选内择优（Q-1 冻结四层目标；P0-03：Routing 择优的业务单位是执行批，不是需求）。
-            var winnerIndex = SelectBestRoutingCandidate(trials, batchDemand, direction, constraints);
+            var winnerIndex = SelectBestRoutingCandidate(trials, batchDemand, constraints);
             if (winnerIndex < 0)
             {
                 // 本批全部候选不可排 ⇒ 该批落不下（需求整体记 Unscheduled，见调用方聚合）。
@@ -1154,8 +1213,12 @@ internal class PhaseTwoInitialScheduler
                 chosenRoutePaths[actualDemand.LogicalDemandKey] = winner.Key;
             }
 
+            // P1-01：落定必须用**胜出候选自己的方向**（= 步骤 2 试排该候选时所用方向 ⇒ 试排/落定同向）。
+            var winnerDirection = trials[winnerIndex].Direction;
+            landedDirection = winnerDirection;
+
             var batchTasks = RunDemandSchedule(
-                batchDemand, winner.Ops, winner.Graph, direction, constraints, resourceOccupancy,
+                batchDemand, winner.Ops, winner.Graph, winnerDirection, constraints, resourceOccupancy,
                 scheduledTasks, allocationTaskShare, demandByKey,
                 request.PlanningStart, request.PlanningEnd, dynamicMaterialFloor, stageOverlap,
                 allowMergeForThisBatch, out _, batch.BatchDraftKey, requireIdentityPreserving, occupancyPristine);
@@ -1189,7 +1252,7 @@ internal class PhaseTwoInitialScheduler
             }
         }
 
-        return new BatchPlanRunOutcome(batchFailed, newTasks, setupTotal, planCompletion, failedBatchIndex);
+        return new BatchPlanRunOutcome(batchFailed, newTasks, setupTotal, planCompletion, failedBatchIndex, landedDirection);
     }
 
     /// <summary>
@@ -1260,7 +1323,7 @@ internal class PhaseTwoInitialScheduler
 
             if (i == 0
                 || CompareBatchPlans(outcome, candidates[i], bestOutcome, candidates[bestIndex],
-                                     constraints, actualDemand, direction) < 0)
+                                     constraints, actualDemand) < 0)
             {
                 bestIndex = i;
                 bestOutcome = outcome;
@@ -1284,7 +1347,7 @@ internal class PhaseTwoInitialScheduler
     private static int CompareBatchPlans(
         BatchPlanRunOutcome a, ExecutionBatchFormation fa,
         BatchPlanRunOutcome b, ExecutionBatchFormation fb,
-        ConstraintContext constraints, LogicalProductionDemand demand, string direction)
+        ConstraintContext constraints, LogicalProductionDemand demand)
     {
         // ① 硬约束：全部批落定优于有批落不下
         if (a.BatchFailed != b.BatchFailed)
@@ -1302,10 +1365,14 @@ internal class PhaseTwoInitialScheduler
             return delayA < delayB ? -1 : 1;
         }
 
-        // ③ 交期：均按期时受 Direction 控制
-        if (delayA == 0 && a.Completion != b.Completion)
+        // ③ 交期：均按期时受 Direction 控制。
+        //   P1-01 整改：方向取**各候选批方案实际落定**的方向（`BatchPlanRunOutcome.Direction`），
+        //   不再用外部传入的单值套所有候选。两方案方向不同 ⇒ 本层不可比（目标相反）⇒ 判平，
+        //   交由 ④ Setup / 批数 裁决 —— 与候选输入顺序无关。
+        if (delayA == 0 && a.Completion != b.Completion
+            && string.Equals(a.Direction, b.Direction, StringComparison.Ordinal))
         {
-            if (string.Equals(direction, "BACKWARD", StringComparison.Ordinal))
+            if (string.Equals(a.Direction, "BACKWARD", StringComparison.Ordinal))
             {
                 return a.Completion > b.Completion ? -1 : 1;
             }
@@ -1384,7 +1451,10 @@ internal class PhaseTwoInitialScheduler
     ///   3) ③ 交期：都按期时受该 Execution Batch 的 **Direction** 控制（Q-1 定死的表）——
     ///        FORWARD    → 更早可行完成优先；
     ///        BACKWARD   → 在不延期前提下更靠近 RequiredAvailableTime / Due（避免过早生产）；
-    ///        MIXED/AUTO → 沿用现有求解结果比较（取更早完成，稳定）；
+    ///        MIXED      → 沿用现有求解结果比较（取更早完成，稳定）；
+    ///        P1-01 整改：`Direction` 取**每条候选自己的**（`trials[i].Direction`；`AUTO` 已在试排前按该
+    ///          路径自身工序解析）。两候选方向**不同** ⇒ 本层判平（各自目标相反，硬比即外推），
+    ///          由 ④/⑤ 裁决 ⇒ **结果与候选输入顺序无关**。
     ///   4) ④ 次级：Setup 总量小者优先；
     ///   5) 确定性 tiebreak：(RouteCode, PathId) 序。
     ///
@@ -1393,18 +1463,16 @@ internal class PhaseTwoInitialScheduler
     /// </summary>
     /// <returns>选中候选下标；全部不可行时返回 -1。</returns>
     private static int SelectBestRoutingCandidate(
-        List<(RoutePathKey Key, bool Feasible, DateTime Completion, decimal SetupMinutes)> trials,
+        List<(RoutePathKey Key, bool Feasible, DateTime Completion, decimal SetupMinutes, string Direction)> trials,
         LogicalProductionDemand demand,
-        string direction,
         ConstraintContext constraints)
     {
         var due = constraints.EffectiveDue(demand);
 
         static int Compare(
-            (RoutePathKey Key, bool Feasible, DateTime Completion, decimal SetupMinutes) a,
-            (RoutePathKey Key, bool Feasible, DateTime Completion, decimal SetupMinutes) b,
-            DateTime due,
-            string direction)
+            (RoutePathKey Key, bool Feasible, DateTime Completion, decimal SetupMinutes, string Direction) a,
+            (RoutePathKey Key, bool Feasible, DateTime Completion, decimal SetupMinutes, string Direction) b,
+            DateTime due)
         {
             // ① 可行优于不可行
             if (a.Feasible != b.Feasible)
@@ -1412,7 +1480,7 @@ internal class PhaseTwoInitialScheduler
                 return a.Feasible ? -1 : 1;
             }
 
-            // ② 履约：延期短者优先（按期 = 0）
+            // ② 履约：延期短者优先（按期 = 0）—— 与方向无关（真实业务量：延期分钟数）
             var delayA = DelayMinutes(a.Completion, due);
             var delayB = DelayMinutes(b.Completion, due);
             if (delayA != delayB)
@@ -1420,16 +1488,21 @@ internal class PhaseTwoInitialScheduler
                 return delayA < delayB ? -1 : 1;
             }
 
-            // ③ 交期：均按期时受 Direction 控制
-            if (delayA == 0 && a.Completion != b.Completion)
+            // ③ 交期：均按期时受 **Direction** 控制。
+            //   P1-01 整改：方向是**每条候选自己的**（AUTO 下随该路径 lead 而不同）。
+            //   两候选方向**不同** ⇒ 本层**不可比** —— 各自的目标函数相反（BACKWARD 要「更靠近 Due」，
+            //   FORWARD 要「更早」），硬比即等于拿一方的方向外推另一方（正是复审所指的缺陷）
+            //   ⇒ 判平，交由 ④ Setup / ⑤ 确定性 (RouteCode, PathId) 序裁决，**与输入顺序无关**。
+            if (delayA == 0 && a.Completion != b.Completion
+                && string.Equals(a.Direction, b.Direction, StringComparison.Ordinal))
             {
-                if (string.Equals(direction, "BACKWARD", StringComparison.Ordinal))
+                if (string.Equals(a.Direction, "BACKWARD", StringComparison.Ordinal))
                 {
                     // 倒排：不延期前提下更靠近 Due（避免过早生产）⇒ 完成更晚者优先（两者均 ≤ Due）
                     return a.Completion > b.Completion ? -1 : 1;
                 }
 
-                // FORWARD / MIXED / AUTO：更早可行完成优先
+                // FORWARD / MIXED：更早可行完成优先
                 return a.Completion < b.Completion ? -1 : 1;
             }
 
@@ -1452,13 +1525,38 @@ internal class PhaseTwoInitialScheduler
                 continue;
             }
 
-            if (best < 0 || Compare(trials[i], trials[best], due, direction) < 0)
+            if (best < 0 || Compare(trials[i], trials[best], due) < 0)
             {
                 best = i;
             }
         }
 
         return best;
+    }
+
+    /// <summary>
+    /// P1-01（0号位 2026-10-09《APS_V1_2_20261009.md》§三 P1-01）：按**该候选/该批自己的工序**解析实际 Direction。
+    ///
+    /// · 非 `AUTO`（FORWARD / BACKWARD / MIXED）⇒ **原样返回**（零回归：显式策略方向不因候选而异）。
+    /// · `AUTO` ⇒ 用**本候选的工序集**跑 <see cref="SchedulingDirectionResolver"/>（其 Slack 判据依赖
+    ///   该路径的**总标准工时**）⇒ 每条候选的方向与其实际工序一致，不再由「任意第一 Path」外推全路由。
+    /// · 无工序（`ops` 空）⇒ 无从估算 lead ⇒ 原样返回（调用方按不可行候选处理）。
+    /// </summary>
+    private static string ResolveDirectionForOps(
+        string strategyDirection,
+        LogicalProductionDemand demand,
+        IReadOnlyList<OperationNode> ops,
+        ConstraintContext constraints,
+        DateTime planningStart,
+        DateTime dynamicMaterialFloor)
+    {
+        if (strategyDirection != SchedulingDirectionResolver.Auto || ops.Count == 0)
+        {
+            return strategyDirection;
+        }
+
+        return SchedulingDirectionResolver.Resolve(
+            demand, ops, constraints, planningStart, dynamicMaterialFloor, demandGoal: null).Direction;
     }
 
     /// <summary>延期分钟数（0 = 按期）。Merge 无新完成时间 / 无交期 ⇒ 视为按期。</summary>
@@ -3127,6 +3225,18 @@ internal class PhaseTwoInitialScheduler
             //   目标 Task 若已归属某个执行批，合并后只能沿用**目标**批键 ⇒ 本批身份丢失
             //   ⇒ 只接受「尚未归属任何执行批」的目标（合并后采用本批键，见 TryMergeDemandIntoTask）。
             if (requireIdentityPreserving && task.ExecutionBatchDraftKey is not null)
+            {
+                continue;
+            }
+
+            // ── P0-01（0号位 2026-10-09《APS_V1_2_20261009.md》§三）：**既成事实锁定 Task 不得作为 Merge 目标** ──
+            //   锁定 Task（Execution / Firm / Frozen / Manual）是**原地继承的硬锚点**，其 PlannedEndTime
+            //   与数量不得被任何候选合批延长 / 改写。此前本方法只按 Material/Stage/Operation/Route/Path/身份
+            //   筛选，**不检查目标是否锁定** ⇒ 候选评分、路径择优乃至最终域失败都可能被污染。
+            //   虽然 Phase5 事后核查锁定时间，但**不能把「事后发现」当作「允许进入候选」的理由**（复审判词）。
+            //   判据 = (SourceDraftId, StageCode, OperationCode) 命中 `LockedTasks`（P0-02：键域含 StageCode）。
+            if (constraints.LockedTasks.ContainsKey(
+                    (task.SourceDraftId, task.StageCode ?? string.Empty, task.OperationCode ?? string.Empty)))
             {
                 continue;
             }

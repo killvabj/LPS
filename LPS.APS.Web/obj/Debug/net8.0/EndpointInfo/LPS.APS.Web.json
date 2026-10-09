@@ -10756,24 +10756,6 @@
             "type": "boolean",
             "nullable": true
           },
-          "maxOptimizationSplitCount": {
-            "type": "integer",
-            "format": "int32",
-            "nullable": true
-          },
-          "maxBatchCandidates": {
-            "type": "integer",
-            "format": "int32",
-            "nullable": true
-          },
-          "bottleneckSplitStrategy": {
-            "type": "string",
-            "nullable": true
-          },
-          "nonBottleneckStrategy": {
-            "type": "string",
-            "nullable": true
-          },
           "effectiveFrom": {
             "type": "string",
             "format": "date-time",

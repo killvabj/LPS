@@ -59,7 +59,7 @@ public class SchedulingDirectionResolverTests
     private static ConstraintContext CtxWithLock(string draftId)
     {
         var ctx = new ConstraintContext();
-        ctx.LockedTasks[(draftId, "OP10")] = new LockedTaskConstraint
+        ctx.LockedTasks[(draftId, "STAGE1", "OP10")] = new LockedTaskConstraint
         {
             DraftId = draftId,
             ResourceId = 1,

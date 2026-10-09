@@ -38,9 +38,11 @@ public class PhaseTwoRoutingCandidateTests
 
     private readonly FiniteCapacitySolver _solver = new();
 
-    /// <summary>一条候选路径的描述：路由身份 + 承载资源 + 该资源日历窗（null = 无日历 ⇒ 不可行）。</summary>
+    /// <summary>一条候选路径的描述：路由身份 + 承载资源 + 该资源日历窗（null = 无日历 ⇒ 不可行）
+    /// + **本路径工序标准工时**（P1-01：双 Route **不同 Lead** ⇒ 同一需求的两条候选可自决出**不同** Direction）。</summary>
     private readonly record struct PathSpec(
-        string RouteCode, int PathId, int ResourceId, DateTime? CalStart, DateTime? CalEnd);
+        string RouteCode, int PathId, int ResourceId, DateTime? CalStart, DateTime? CalEnd,
+        decimal LeadMinutes = 60m);
 
     /// <summary>
     /// 造一条两工序路径（OP10@STAGE1 → OP20@STAGE2，各 60 分钟），资源与日历按 <paramref name="paths"/> 铺。
@@ -75,7 +77,7 @@ public class PhaseTwoRoutingCandidateTests
                     PathId = p.PathId,
                     OperationCode = code,
                     StageCode = stage,
-                    StandardDuration = 60m,
+                    StandardDuration = p.LeadMinutes,
                     OperationPlanningMode = "FINITE_RESOURCE"
                 });
 
@@ -586,59 +588,148 @@ public class PhaseTwoRoutingCandidateTests
     }
 
     // ═══════════════════════════════════════════════════════════════════════════════
-    // ⑨ P1-01 反证（0号位 2026-10-09 第三轮复审 §二）：**AUTO 方向与批/路由候选评分口径一致**
+    // ⑨ P1-01 反证（0号位 2026-10-09《APS_V1_2_20261009.md》§三 P1-01）：
+    //    **每条候选的 Direction 必须与其自身工序一致；胜出候选按其自身方向落定**
     //
-    // 复审判词（源码证实）：`AUTO` 原先只在 `ScheduleDemandOperations`（排程执行时）本地解析，
-    //   而 `SelectBestRoutingCandidate` / `CompareBatchPlans` 拿到的是**原始策略值**（仍为 `AUTO`）
-    //   ⇒ 第③层「均按期时的交期目标」在 AUTO 下走「更早完成优先」，与同批真实 ResolvedDirection
-    //     （BACKWARD ⇒「更晚但不延期」）**不一致**。
-    // 整改后：AUTO 在**进入择优之前一次性**解析，**同一 ResolvedDirection** 贯穿试排/比较/落定。
+    // 复审判词（源码证实，成立）：旧实现取 `plannedCandidates.First(p => p.Ops.Count > 0).Ops`
+    //   解析**一个** `resolvedDirection` 再套给所有 Batch / Route；而 Slack 判据（`DUE_TIGHT`/`DUE_LOOSE`）
+    //   依赖该候选的**总标准工时** ⇒ 两条合法 Route 工时不同即可让一条判 FORWARD、另一条判 BACKWARD
+    //   ⇒ **方向由「任意第一 Path」外推全路由**，候选比较 / 落定所用方向与该候选真实上下文脱节。
     //
-    // ── 夹具几何的**硬约束**（源码推导，决定反证怎么造才真有鉴别力）──
-    //   `ScheduleBackward` 把末工序锚在 `EffectiveDue`：`candidateEnd = currentEndTime + overlapExtension`
-    //   ⇒ **倒排下每条可行候选的完成时间恒等于交期**；而 `FindBackwardSlot` 不做滑动（查不到槽即该资源不可行）。
-    //   ⇒ 「双 Route 均按期但完成时间不同」在**纯倒排的非合批候选之间不可实现**，
-    //     第③层会被跳过（完成时间相等）⇒ 只能靠**合批**（Merge 把目标 Task 的末端后延）造出完成时间差。
-    //   故本反证用「一个**锁定锚点 Task**（方向无关、两次运行逐字相同）+ 一条可合批的候选（早完）
-    //   + 一条不可合批的候选（晚完且恰按期）」把第③层真正逼出来。
+    // ⚠ **关于「候选顺序互换」的如实说明**（不编造鉴别力）：
+    //   `PhaseOneConstraintBuilder.TryGetRoutingGraphs`（`:1090-1093`）已按 `(RouteCode, PathId)` 排序
+    //   ⇒ `plannedCandidates` 的**列表顺序与输入顺序无关** ⇒ 单纯交换 `RoutingOperations` 顺序
+    //     **构造不出**「结果漂移」（旧实现同样不漂移）。故本反证**不用**「换序」，而直接断言
+    //     「**非首条候选胜出时，它必须按自己的方向落定**」—— 这正是旧实现真正错的地方。
+    //
+    // 夹具几何（`EffectiveDue` = 交期；倒排下末工序锚在交期 ⇒ 可行候选完成时间恒 = 交期）：
+    //   · `RTA`：lead 30min、**无日历 ⇒ 不可行**（但工序非空 ⇒ 旧实现仍取它做方向外推）。
+    //       Slack = 400 − 30 = 370 > lead ⇒ `DUE_LOOSE` ⇒ **本候选自决 FORWARD**。
+    //   · `RTB`：lead 300min、日历充足 ⇒ 可行。
+    //       Slack = 400 − 300 = 100 ∈ [0, lead] ⇒ 无交期信号、无其它上下文
+    //       ⇒ `NO_CONTEXT_SIGNAL` ⇒ **本候选自决 BACKWARD**。
+    //   ⇒ 胜出者必为 RTB（RTA 不可行）。旧实现：方向取首条 RTA 的 FORWARD ⇒ RTB 按**正排**落定
+    //     `[P, P+300]`；整改后：RTB 按**自己的 BACKWARD** 落定 `[P+100, P+400]`。
     // ═══════════════════════════════════════════════════════════════════════════════
 
     /// <summary>
-    /// ⑨-① **双 Route（一条经合批提前完成、一条恰在交期完成，且**都按期**）** ⇒ AUTO 自决为 BACKWARD
-    ///   ⇒ 候选择优必须与**显式 BACKWARD 逐字段一致**（都取「更晚但不延期」那条 = RTB）。
-    ///
-    /// 夹具几何（`lead` = 1×60min = 60min）：
-    ///   · `D0`：**锁定锚点**（`ExecutionConstraint` 固定 `RTA/1`、锁定量 0.5 = 需求全量 ⇒ 全量锁定、
-    ///     原地继承 `[P, P+30m]`、不参与排程）；交期 `P+90m` 是**合批合法性闸**
-    ///     （`TryMergeDemandIntoTask` 要求 `newEndTime ≤ min(本需求交期, 目标已有份额交期)`）。
-    ///     锁定锚点**与 Direction 无关** ⇒ AUTO / 显式 BACKWARD / 显式 FORWARD 三次运行的 D0 逐字相同，
-    ///     故三者的差异**只能**来自 D1 的候选择优。
-    ///   · `D1`：自由候选（RTA/RTB 两条 Path），交期 `P+2h` ⇒ Slack = 120 − 60 = 60（不 > lead）
-    ///     ⇒ 无交期信号、无其它上下文 ⇒ `NO_CONTEXT_SIGNAL` ⇒ **BACKWARD**。
-    ///     · 候选 **RTA**：合批进 D0 的锚点 Task ⇒ 合并量 0.5+1 = 1.5 ⇒ 新末端 `P+90m`（**早完**，按期）
-    ///     · 候选 **RTB**：不可合批（RouteCode 不同）⇒ 倒排 `[P+1h, P+2h]`（**晚完**，恰按期）
-    ///   ⇒ 第③层被真正触发：显式 FORWARD 取**更早**（RTA 合批 `P+90m`）、
-    ///     显式 BACKWARD 取**更晚**（RTB `P+2h`），二者必然不同（下方 `NotEqual` 即夹具自证的**鉴别力**锁）。
-    ///
-    /// ⚠ 整改前：AUTO 把原始 `"AUTO"` 传进候选比较 ⇒ 走「更早完成」分支 ⇒ 选中 RTA 合批
-    ///   ⇒ 与显式 BACKWARD（RTB）**不一致** ⇒ 本用例 **红**（正是复审点名的第三层目标冲突）。
-    /// ⚠ 本用例刻意**不用** `Build`（两工序）夹具：两工序 `operations.Count != 1` 时
-    ///   `FindMergeableTasks` 直接返回空 ⇒ 合批永不发生 ⇒ 造不出完成时间差 ⇒ **假反证**。
+    /// ⑨-① **双 Route 不同 Lead** ⇒ AUTO 下**每条候选按自身工序自决**，胜出候选按其**自身方向**落定。
+    ///   夹具见上方几何说明：RTA（首条、不可行、自决 FORWARD）、RTB（可行、自决 BACKWARD）。
+    ///   行为断言：AUTO 结果 == **显式 BACKWARD** 结果（都按 RTB 自己的 BACKWARD 落定），
+    ///     且 != 显式 FORWARD 结果（证明不是「恒等 FORWARD」，也证明方向**不是**从首条 RTA 外推来的）。
     /// </summary>
     [Fact]
-    public async Task AUTO_双Route一条经合批提前完成_自决BACKWARD须与显式BACKWARD一致()
+    public async Task AUTO_双Route不同Lead_胜出候选须按自身工序自决的方向落定()
     {
         var paths = new[]
         {
-            new PathSpec("RTA", 1, 1, PlanningStart, PlanningEnd),
-            new PathSpec("RTB", 1, 2, PlanningStart, PlanningEnd)
+            // RTA：(RouteCode,PathId) 序最小 ⇒ 旧实现的「首条」；无日历 ⇒ 不可行（但仍参与方向外推）。
+            new PathSpec("RTA", 1, 1, null, null, LeadMinutes: 30m),
+            // RTB：可行且必为胜出者。
+            new PathSpec("RTB", 1, 2, PlanningStart, PlanningStart.AddDays(30), LeadMinutes: 300m)
         };
+        var demands = new[] { new DemandSpec2("D1", 1, 1m, null, null, Due: PlanningStart.AddMinutes(400)) };
+
+        var auto = await _solver.SolveAsync(BuildSingleOp(paths, demands, direction: "AUTO"));
+        var backward = await _solver.SolveAsync(BuildSingleOp(paths, demands, direction: "BACKWARD"));
+        var forward = await _solver.SolveAsync(BuildSingleOp(paths, demands, direction: "FORWARD"));
+
+        Assert.True(auto.Success, auto.ErrorMessage);
+        Assert.True(backward.Success, backward.ErrorMessage);
+        Assert.True(forward.Success, forward.ErrorMessage);
+
+        // 夹具自证「有鉴别力」：两个显式方向对同一条可行路径必须给出**不同**落点
+        //   （倒排 ⇒ 完成 = 交期 P+400；正排 ⇒ 完成 = P+300）。否则本用例无鉴别力。
+        Assert.NotEqual(Signature(forward), Signature(backward));
+
+        // 胜出路径必须是 RTB（RTA 无日历不可行）—— 即**非首条**候选胜出（旧实现的方向外推源就是首条 RTA）。
+        var d1Auto = auto.FinalTasks.Single(t => t.SourceDraftId == "D1");
+        Assert.Equal("RTB", d1Auto.RouteCode);
+
+        // 反证核心：胜出候选必须按**它自己**（BACKWARD）的方向落定 ⇒ 与显式 BACKWARD 逐字段一致。
+        //   旧实现用首条 RTA 的方向（FORWARD）外推 ⇒ RTB 落成 [P, P+300] ⇒ 本断言**红**。
+        AssertSameSchedule(backward, auto);
+
+        // 且**不得**退化成显式 FORWARD 的落点。
+        Assert.NotEqual(Signature(forward), Signature(auto));
+    }
+
+    /// <summary>
+    /// ⑨-③ **候选输入顺序互换 ⇒ 最终合法择优不得漂移**（0号位 2026-10-09《APS_V1_2_20261009.md》§五.4）。
+    ///
+    /// 几何：两条**均可行**的路径，lead 差异使**各自**自决出**不同** Direction ——
+    ///   · `RTA`（lead 300）：Slack = 400 − 300 = 100 ∈ [0, 300] ⇒ `NO_CONTEXT_SIGNAL` ⇒ **BACKWARD**；
+    ///   · `RTB`（lead 30） ：Slack = 400 − 30 = 370 &gt; 30 ⇒ `DUE_LOOSE` ⇒ **FORWARD**。
+    ///   两条候选方向**不同** ⇒ 候选比较第 ③ 层（交期）**不可比**（各自目标函数相反：BACKWARD 要贴近 Due、
+    ///   FORWARD 要更早）⇒ 判平后由第 ⑤ 层确定性 `(RouteCode, PathId)` 序裁决 ⇒ 胜出者恒为 `RTA`。
+    ///
+    /// 与 ⑨-① 的分工（**如实说明，不夸大鉴别力**）：
+    ///   · ⑨-① 是**可判别的**反证（首条不可行 ⇒ 方向错用会真正改变胜出者的落点）；
+    ///   · 本用例的鉴别对象是 §五.4 字面要求「候选顺序互换不漂移」。因
+    ///     `PhaseOneConstraintBuilder.TryGetRoutingGraphs`（`:1090-1093`）已按 `(RouteCode, PathId)` 排序，
+    ///     候选列表顺序**与输入声明顺序无关** ⇒ 本用例对旧实现同样通过 —— 它是**回归护栏**
+    ///     （防未来把列表顺序重新引入决策），而非「整改前必红」的鉴别性反证。
+    /// </summary>
+    [Fact]
+    public async Task AUTO_双Route_候选输入顺序互换_选路与方向不漂移()
+    {
+        var rta = new PathSpec("RTA", 1, 1, PlanningStart, PlanningStart.AddDays(30), LeadMinutes: 300m);
+        var rtb = new PathSpec("RTB", 1, 2, PlanningStart, PlanningStart.AddDays(30), LeadMinutes: 30m);
+        var demands = new[] { new DemandSpec2("D1", 1, 1m, null, null, Due: PlanningStart.AddMinutes(400)) };
+
+        // 同一请求、只把两条候选的**声明顺序**互换（`BuildSingleOp` 按入参顺序逐条铺 `RoutingOperations`）。
+        var ordered = await _solver.SolveAsync(BuildSingleOp(new[] { rta, rtb }, demands, direction: "AUTO"));
+        var swapped = await _solver.SolveAsync(BuildSingleOp(new[] { rtb, rta }, demands, direction: "AUTO"));
+
+        Assert.True(ordered.Success, ordered.ErrorMessage);
+        Assert.True(swapped.Success, swapped.ErrorMessage);
+
+        // ① §五.4 字面要求：候选输入顺序互换 ⇒ 最终合法择优**逐字段不漂移**。
+        AssertSameSchedule(ordered, swapped);
+
+        // ② 胜出者 = `(RouteCode, PathId)` 序最小者（确定性 tiebreak），**不是**「输入里的第一条」。
+        var d1 = ordered.FinalTasks.Single(t => t.SourceDraftId == "D1");
+        Assert.Equal("RTA", d1.RouteCode);
+
+        // ③ 「候选比较所用方向」与「真实落定所用方向」同向：`RTA` 自决 BACKWARD ⇒ 落定与显式 BACKWARD 一致。
+        var backward = await _solver.SolveAsync(BuildSingleOp(new[] { rta, rtb }, demands, direction: "BACKWARD"));
+        Assert.True(backward.Success, backward.ErrorMessage);
+        AssertSameSchedule(backward, ordered);
+
+        // ④ 反向对照：方向确实参与结果 —— 显式 FORWARD 下 `RTB`（完成更早）胜出 ⇒ 签名必须不同
+        //    （否则本夹具无法证明「方向真的影响了选路」，① 的不漂移也就没有内容）。
+        var forward = await _solver.SolveAsync(BuildSingleOp(new[] { rta, rtb }, demands, direction: "FORWARD"));
+        Assert.True(forward.Success, forward.ErrorMessage);
+        Assert.NotEqual(Signature(forward), Signature(ordered));
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════════
+    // ⑨-② P0-01 E2E 反证（0号位 2026-10-09《APS_V1_2_20261009.md》§三 P0-01）：
+    //    **锁定 Task 可与非锁定同物料 / 同 Stage / 同 Operation 共存，但绝不能被吸收**
+    //
+    // 复审判词：`FindMergeableTasks` 只按 Material/Stage/Operation/Route/Path/身份筛选，
+    //   **不检查目标 Task 是否锁定** ⇒ 既成事实锚点被当成合法 Merge 候选（候选评分 / 路径择优 /
+    //   最终域失败都可能被污染）。整改：Merge 候选阶段**直接排除** `constraints.LockedTasks` 中的目标。
+    //
+    // 夹具：D0 = 锁定锚点（固定 RTA/1、锁定量 0.5 = 全量）；D1 = 自由候选（同物料同工序，量 1）。
+    //   旧实现：D1 合批进 D0 的锚点 Task ⇒ D0 末端被后延、D1 无自有 Task。
+    //   整改后：D1 **不得**并入 D0 ⇒ D1 必须有**自己的** Task，且 D0 锚点逐字段不动。
+    // ═══════════════════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// ⑨-② **锁定锚点不可被 Merge 吸收**：D1 与锁定 D0 同物料 / 同 Stage / 同 Operation / 同 Route
+    ///   （= 旧实现会合批的全部条件），但 D0 是既成事实锚点 ⇒ D1 必须另立 Task，D0 锚点逐字段不变。
+    /// </summary>
+    [Fact]
+    public async Task 锁定Task_同物料同工序_可共存但不得被Merge吸收()
+    {
+        var paths = new[] { new PathSpec("RTA", 1, 1, PlanningStart, PlanningStart.AddDays(30)) };
         var demands = new[]
         {
-            // D0：锁定锚点（固定 RTA/1 ⇒ 身份可解，不触发 P0-01 技术失败）；交期 P+90m = 合批合法性闸上界。
-            new DemandSpec2("D0", 1, 0.5m, "RTA", 1, Due: PlanningStart.AddMinutes(90)),
-            // D1：自由候选；交期 P+2h ⇒ Slack = 60（不 > lead = 60）⇒ 无交期信号 ⇒ 自决 BACKWARD。
-            new DemandSpec2("D1", 2, 1m, null, null, Due: PlanningStart.AddMinutes(120))
+            // D0：锁定锚点，固定 RTA/1（身份可解 ⇒ 不触发技术失败）。
+            new DemandSpec2("D0", 1, 0.5m, "RTA", 1, Due: PlanningStart.AddDays(5)),
+            // D1：自由候选，量 1；与 D0 同物料同工序同 Route ⇒ 满足旧实现 FindMergeableTasks 的**全部**筛选。
+            new DemandSpec2("D1", 2, 1m, null, null, Due: PlanningStart.AddDays(5))
         };
         var locked = new ExecutionConstraint
         {
@@ -652,31 +743,28 @@ public class PhaseTwoRoutingCandidateTests
             LockedQuantity = 0.5m          // = D0 需求全量 ⇒ 全量锁定 ⇒ 不排剩余份额
         };
 
-        var lockedSet = new[] { locked };
-        var auto = await _solver.SolveAsync(BuildSingleOp(paths, demands, direction: "AUTO", locked: lockedSet));
-        var backward = await _solver.SolveAsync(BuildSingleOp(paths, demands, direction: "BACKWARD", locked: lockedSet));
-        var forward = await _solver.SolveAsync(BuildSingleOp(paths, demands, direction: "FORWARD", locked: lockedSet));
+        var result = await _solver.SolveAsync(BuildSingleOp(
+            paths, demands, allowMerge: true, direction: "FORWARD", locked: new[] { locked }));
 
-        Assert.True(auto.Success, auto.ErrorMessage);
-        Assert.True(backward.Success, backward.ErrorMessage);
-        Assert.True(forward.Success, forward.ErrorMessage);
+        Assert.True(result.Success, result.ErrorMessage);
 
-        // 锁定锚点必须原地保留（方向无关 ⇒ 三次运行同一事实，反证的「唯一变量」是 D1 的择优）。
-        var d0 = auto.FinalTasks.Single(t => t.SourceDraftId == "D0");
-        Assert.Equal("RTA", d0.RouteCode);
+        // ① 锁定锚点逐字段不变（未被后延 / 未被改写）。
+        var d0 = result.FinalTasks.Single(t => t.SourceDraftId == "D0");
         Assert.Equal(PlanningStart, d0.PlannedStartTime);
         Assert.Equal(PlanningStart.AddMinutes(30), d0.PlannedEndTime);
+        Assert.Equal(0.5m, d0.Quantity);
 
-        // 夹具自证「可判别」：两个显式方向必须选出**不同**的 D1 落点，否则本用例没有鉴别力。
-        Assert.NotEqual(Signature(forward), Signature(backward));
-        Assert.Equal("RTB", backward.FinalTasks.Single(t => t.SourceDraftId == "D1").RouteCode);
+        // ② D1 **必须有自己的 Task**（旧实现会被并进 D0 ⇒ 这里 `Single` 抛异常 ⇒ 本用例红）。
+        var d1 = result.FinalTasks.Single(t => t.SourceDraftId == "D1");
+        Assert.NotEqual(d0.FinalDraftId, d1.FinalDraftId);
+        Assert.Equal(1m, d1.Quantity);
 
-        // 反证核心：AUTO 自决为 BACKWARD ⇒ 候选择优必须与显式 BACKWARD **逐字段一致**。
-        //   整改前 AUTO 走「更早完成」分支 ⇒ 选中 RTA（合批进 D0 锚点、D1 无自有 Task）⇒ 本断言红。
-        AssertSameSchedule(backward, auto);
+        // ③ 锁定 Task 与非锁定 Task **共存**（两条 Task 都在，锚点未被吸收、D1 也未被吞）。
+        Assert.Equal(2, result.FinalTasks.Count);
 
-        // AUTO 不得退化成「恒等 FORWARD」（显式 FORWARD 取更早完成的 RTA 合批）。
-        Assert.NotEqual(Signature(forward), Signature(auto));
+        // ④ D1 的份额（AllocationSequence = 2）不得被并进 D0 的锁定 Task（合并血缘不得指向锁定锚点）。
+        Assert.DoesNotContain(result.AllocationShares,
+            s => s.AllocationSequence == 2 && s.FinalDraftId == d0.FinalDraftId);
     }
 
     /// <summary>
@@ -741,7 +829,7 @@ public class PhaseTwoRoutingCandidateTests
                 MaterialId = MaterialId, ProductionDepartmentId = DeptId,
                 RouteCode = p.RouteCode, PathId = p.PathId,
                 OperationCode = "OP10", StageCode = "STAGE1",
-                StandardDuration = 60m, OperationPlanningMode = "FINITE_RESOURCE"
+                StandardDuration = p.LeadMinutes, OperationPlanningMode = "FINITE_RESOURCE"
             });
             elig.Add(new OperationResourceEligibility
             {
@@ -801,6 +889,269 @@ public class PhaseTwoRoutingCandidateTests
                 BatchPolicies = TestBatchPolicy.Permissive(MaterialId, allowMerge)
             }
         };
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════════
+    // P0-02 / P0-03 反证夹具（0号位 2026-10-09《APS_V1_2_20261009.md》§三）
+    //   共同几何：**同一 Route/Path 内两个 Stage 各有一道同名 `OP10`**（`OperationNodeKey.Of(Stage,Op)`
+    //   区分节点，但 `RoutingDependency` 只按 OperationCode 连边 ⇒ **不连边**，两个节点各自独立）。
+    //   `LockedTasks` 的键域必须含 StageCode，否则两条锚点在字典建立阶段就撞键。
+    // ═══════════════════════════════════════════════════════════════════════════════
+
+    /// <summary>一条锚点规格：StageCode / OperationCode / 资源 / 锁定窗 / 锁定量。</summary>
+    private readonly record struct AnchorSpec(
+        string StageCode, string OperationCode, int ResourceId,
+        DateTime LockedStart, DateTime LockedEnd, decimal LockedQty);
+
+    /// <summary>一条工艺路径上的工序定义：Stage / 工序码 / 资源 / 部门 / 标准工时。</summary>
+    private readonly record struct OpSpec(
+        string StageCode, string OperationCode, int ResourceId, int DepartmentId, decimal LeadMinutes = 60m);
+
+    /// <summary>
+    /// 依赖边。⚠ 契约 `RoutingDependency` **只有 From/ToOperationCode + 单值 ProductionDepartmentId**
+    ///   （无 StageCode）⇒ 同码跨 Stage 的边端点消解不唯一，**连不出边**。本夹具只用不同工序码连边。
+    /// </summary>
+    private readonly record struct DepSpec(string FromOperationCode, string ToOperationCode, int DepartmentId);
+
+    /// <summary>
+    /// 造「锁定锚点几何」：显式给出工序集 + 依赖边 + 锁定锚点 + 需求。
+    ///
+    /// ⚠ 本夹具必须遵守的两条**实测确认**的图裁剪规则（否则锚点会静默解不出身份）：
+    ///   ① `PhaseOneConstraintBuilder.BuildReachableStages` 只保留**从根工序可达**的 Stage
+    ///      （`CollectReachableStagesForPath` 走依赖邻接表）⇒ **无依赖边时只有根工序所在 Stage 进图**，
+    ///      另一个 Stage 的工序被整条剔除 ⇒ 该 Stage 的锁定锚点在 Phase2 反查节点时落空。
+    ///   ② 同工序码跨 Stage 且同部门时，`ResolveNodeKey` 消解不唯一 ⇒ 边被丢弃 ⇒ 等价于①。
+    ///   ⇒ 要让两个 Stage 的**同名**工序同时进图，只能让它们**同为根工序**（不连边）。
+    /// </summary>
+    private static DomainSolveRequest BuildLockedGeometry(
+        IReadOnlyList<OpSpec> ops,
+        IReadOnlyList<DepSpec> deps,
+        IReadOnlyList<AnchorSpec> anchors,
+        IReadOnlyList<DemandSpec2> demands,
+        string? startStageCode = null,
+        string? startOperationCode = null,
+        string direction = "FORWARD")
+    {
+        var routingOps = new List<RoutingOperation>();
+        var elig = new List<OperationResourceEligibility>();
+        var resources = new List<ResourceDefinition>();
+        var calendars = new List<ResourceCalendarSlot>();
+        var stageDepts = new List<MaterialStageDepartmentContextDto>();
+
+        foreach (var op in ops)
+        {
+            routingOps.Add(new RoutingOperation
+            {
+                MaterialId = MaterialId, ProductionDepartmentId = op.DepartmentId,
+                RouteCode = "RTA", PathId = 1,
+                OperationCode = op.OperationCode, StageCode = op.StageCode,
+                StandardDuration = op.LeadMinutes, OperationPlanningMode = "FINITE_RESOURCE"
+            });
+            elig.Add(new OperationResourceEligibility
+            {
+                MaterialId = MaterialId, ProductionDepartmentId = op.DepartmentId,
+                RouteCode = "RTA", PathId = 1,
+                OperationCode = op.OperationCode, ResourceId = op.ResourceId, Priority = 1, CapacityFactor = 1m
+            });
+            if (resources.All(r => r.ResourceId != op.ResourceId))
+            {
+                resources.Add(new ResourceDefinition
+                {
+                    ResourceId = op.ResourceId, ResourceCode = $"R{op.ResourceId}", FactoryCode = "F1", Capacity = 1m
+                });
+                calendars.Add(new ResourceCalendarSlot
+                {
+                    ResourceId = op.ResourceId, Start = PlanningStart, End = PlanningEnd, IsAvailable = true
+                });
+            }
+            if (stageDepts.All(s => !string.Equals(s.StageCode, op.StageCode, StringComparison.Ordinal)))
+            {
+                stageDepts.Add(new MaterialStageDepartmentContextDto
+                {
+                    MaterialId = MaterialId, StageCode = op.StageCode, ProductionDepartmentId = op.DepartmentId
+                });
+            }
+        }
+
+        return new DomainSolveRequest
+        {
+            PlanVersionId = 1,
+            DomainKey = "DOMAIN",
+            PlanningStart = PlanningStart,
+            PlanningEnd = PlanningEnd,
+            LogicalProductionDemands = demands.Select(d => new LogicalProductionDemand
+            {
+                LogicalDemandKey = d.Key, PlanVersionId = 1L, DomainKey = "DOMAIN",
+                AllocationSequence = d.Seq, DemandKey = d.Key, MaterialId = MaterialId, FactoryId = 1,
+                NetOutputQty = d.Qty, PlannedProcessQty = d.Qty,
+                RequiredAvailableTime = d.Due ?? PlanningStart.AddDays(20), DemandSequence = d.Seq,
+                RouteCode = d.RouteCode, PathId = d.PathId,
+                StartStageCode = startStageCode, StartOperationCode = startOperationCode,
+                IsContinuation = d.IsContinuation, NoSplitMerge = d.IsContinuation
+            }).ToList(),
+            RoutingOperations = routingOps,
+            RoutingDependencies = deps.Select(dp => new RoutingDependency
+            {
+                MaterialId = MaterialId, ProductionDepartmentId = dp.DepartmentId,
+                RouteCode = "RTA", PathId = 1,
+                FromOperationCode = dp.FromOperationCode, ToOperationCode = dp.ToOperationCode,
+                DependencyType = "ES", LagTime = 0m, IsActive = true
+            }).ToList(),
+            OperationResourceEligibility = elig,
+            MaterialStageDepartmentContexts = stageDepts,
+            ExecutionConstraints = anchors.Select(a => new ExecutionConstraint
+            {
+                DraftId = demands[0].Key,
+                ResourceId = a.ResourceId,
+                LockedStart = a.LockedStart,
+                LockedEnd = a.LockedEnd,
+                ConstraintType = "MANUAL",
+                StageCode = a.StageCode,
+                OperationCode = a.OperationCode,
+                LockedQuantity = a.LockedQty
+            }).ToList(),
+            Resources = resources,
+            CalendarSlots = calendars,
+            StrategySnapshot = new SolverStrategySnapshot
+            {
+                Parameters = new FiniteCapacityParameters
+                {
+                    SchedulingDirection = direction,
+                    AllowMerge = false
+                },
+                BatchPolicies = TestBatchPolicy.Permissive(MaterialId, allowMerge: false)
+            }
+        };
+    }
+
+    /// <summary>
+    /// P0-02 反证（复审 §五.2）：**同 DraftId、不同 Stage、同名 OperationCode** 的两条锁定约束
+    ///   ⇒ 必须正确建索引并产出结果，**不得**在字典建立阶段抛重复 Key 异常。
+    ///
+    /// 整改前：`ToDictionary(ec => (ec.DraftId, ec.OperationCode))` ⇒ 两条 "OP10" 撞键 ⇒
+    ///   `ArgumentException`（且 SolveAsync 未做受控 Fail Closed）⇒ 本用例以异常失败。
+    /// 整改后：键域含 `StageCode` ⇒ 两条锚点各自建索引、各自原地继承为 Task。
+    /// </summary>
+    [Fact]
+    public async Task 锁定键域_同DraftId不同Stage同名Operation_不撞键且两条锚点均保留()
+    {
+        // 几何：同一 Route/Path 内**两个 Stage 各一道同名 OP10**，二者**同为根工序**（不连边）。
+        //   ① 同为根 ⇒ 两个 Stage 都在 `BuildReachableStages` 的可达集合内 ⇒ 两个节点都进图
+        //      （若只有一个 Stage 进图，第二条锚点会因「图中无该 (StageCode, OperationCode) 节点」
+        //        走技术失败，那是**另一种**结果，不能证明键域正确）。
+        //   ② 同名不同 Stage ⇒ `OperationNodeKey.Of(Stage, Op)` 是两个不同节点，可各自反查。
+        //   ③ 两条锁定约束 `(DraftId=D1, OP10)` 在**旧二键字典**下撞键 ⇒ `ArgumentException`。
+        var anchors = new[]
+        {
+            new AnchorSpec("STAGE1", "OP10", 1, PlanningStart, PlanningStart.AddMinutes(30), 1m),
+            new AnchorSpec("STAGE2", "OP10", 2, PlanningStart.AddMinutes(30), PlanningStart.AddMinutes(60), 1m)
+        };
+        var demands = new[] { new DemandSpec2("D1", 1, 1m, "RTA", 1, Due: PlanningStart.AddDays(5)) };
+        var ops = new[]
+        {
+            new OpSpec("STAGE1", "OP10", 1, DeptId, 30m),
+            new OpSpec("STAGE2", "OP10", 2, DeptId, 30m)
+        };
+
+        var result = await _solver.SolveAsync(
+            BuildLockedGeometry(ops, Array.Empty<DepSpec>(), anchors, demands));
+
+        // ① 不抛异常、受控返回。
+        Assert.True(result.Success, result.ErrorMessage);
+
+        // ② 两条锚点**各自**原地保留为 Task（未被静默抹除、未被合并）。
+        Assert.Equal(2, result.FinalTasks.Count);
+        var s1 = result.FinalTasks.Single(t => t.StageCode == "STAGE1");
+        var s2 = result.FinalTasks.Single(t => t.StageCode == "STAGE2");
+        Assert.Equal(PlanningStart, s1.PlannedStartTime);
+        Assert.Equal(PlanningStart.AddMinutes(30), s1.PlannedEndTime);
+        Assert.Equal(PlanningStart.AddMinutes(30), s2.PlannedStartTime);
+        Assert.Equal(PlanningStart.AddMinutes(60), s2.PlannedEndTime);
+
+        // ③ 全量锁定（各锚点均覆盖全量 ⇒ 覆盖量 = max = 1 = 需求量）⇒ 无剩余份额需排。
+        Assert.DoesNotContain("D1", result.UnscheduledTasks.Select(u => u.DraftId));
+    }
+
+    /// <summary>
+    /// P0-03 反证（复审 §五.3 前半）：**同一执行批在多个 Operation 上重叠的锁定量不得重复扣除**。
+    ///
+    /// 几何（复审原文举例）：需求 2 件；两道工序（`STAGE1/OP10 → STAGE2/OP20`，不同工序码才连得出边）
+    ///   各锁 1 件 —— 这是**同一执行批沿工序流动的同一份**数量。
+    ///   · 整改前（`Sum`）：覆盖量 = 1 + 1 = 2 = 需求量 ⇒ 「剩余 0」⇒ **静默漏排**（只有 2 条锚点 Task）。
+    ///   · 整改后（`Max`）：覆盖量 = max(1, 1) = 1 ⇒ 剩余 1 件**必须被排下**（共 4 条 D1 Task：
+    ///     2 条锚点 + 剩余 1 件沿两道工序各 1 条）。
+    /// </summary>
+    [Fact]
+    public async Task 锁定覆盖量_同批多工序重叠_不得重复扣()
+    {
+        var anchors = new[]
+        {
+            new AnchorSpec("STAGE1", "OP10", 1, PlanningStart, PlanningStart.AddMinutes(30), 1m),
+            new AnchorSpec("STAGE2", "OP20", 2, PlanningStart.AddMinutes(30), PlanningStart.AddMinutes(60), 1m)
+        };
+        // 需求 2 件（锚点各报 1 件 ⇒ 重叠的**同一份**数量）。
+        var demands = new[] { new DemandSpec2("D1", 1, 2m, "RTA", 1, Due: PlanningStart.AddDays(5)) };
+        var ops = new[]
+        {
+            new OpSpec("STAGE1", "OP10", 1, DeptId, 30m),
+            new OpSpec("STAGE2", "OP20", 2, DeptId, 30m)
+        };
+        var deps = new[] { new DepSpec("OP10", "OP20", DeptId) };
+
+        var result = await _solver.SolveAsync(
+            BuildLockedGeometry(ops, deps, anchors, demands, startStageCode: "STAGE1", startOperationCode: "OP10"));
+
+        Assert.True(result.Success, result.ErrorMessage);
+
+        // 反证核心：剩余 1 件必须被排下 ⇒ D1 共有 4 条 Task（2 条锚点 + 剩余 1 件沿 2 道工序）。
+        //   整改前 `Sum` ⇒ 覆盖量 2 = 需求量 ⇒ 「剩余 0」⇒ 只有 2 条 ⇒ 本断言**红**。
+        var d1Tasks = result.FinalTasks.Where(t => t.SourceDraftId == "D1").ToList();
+        Assert.Equal(4, d1Tasks.Count);
+
+        // 数量闭合（Phase5 已硬校验）：逐工序 Σ = 需求 2 件。
+        Assert.Equal(2m, d1Tasks.Where(t => t.StageCode == "STAGE1").Sum(t => t.Quantity));
+        Assert.Equal(2m, d1Tasks.Where(t => t.StageCode == "STAGE2").Sum(t => t.Quantity));
+
+        // 新排的那条 STAGE1 工序承载剩余 1 件，且**不得早于**锁定锚点（锚点 [P, P+30] 原地不动）。
+        var scheduled = d1Tasks.Where(t => t.StageCode == "STAGE1" && t.PlannedStartTime != PlanningStart).ToList();
+        Assert.Single(scheduled);
+        Assert.Equal(1m, scheduled[0].Quantity);
+        Assert.True(scheduled[0].PlannedStartTime >= PlanningStart.AddMinutes(30),
+            $"新排工序不得与锁定锚点重叠，实际起点 {scheduled[0].PlannedStartTime:HH:mm}");
+
+        // 锚点原地不动。
+        var anchor = d1Tasks.Single(t => t.StageCode == "STAGE1" && t.PlannedStartTime == PlanningStart);
+        Assert.Equal(PlanningStart.AddMinutes(30), anchor.PlannedEndTime);
+        Assert.Equal(1m, anchor.Quantity);
+    }
+
+    /// <summary>
+    /// P0-03 反证（复审 §五.3 后半）：**独立 Slice 必须各自正确计量**。
+    ///   两个需求（各自独立 `LogicalDemandKey`/`AllocationSequence`）各带一条全量锁定锚点
+    ///   ⇒ 各自判为「全量锁定 ⇒ 无剩余」，互不串量、互不误扣。
+    /// </summary>
+    [Fact]
+    public async Task 锁定覆盖量_独立Slice各自计量_互不串量()
+    {
+        var anchors = new[]
+        {
+            new AnchorSpec("STAGE1", "OP10", 1, PlanningStart, PlanningStart.AddMinutes(30), 1m)
+        };
+        var demands = new[]
+        {
+            new DemandSpec2("D1", 1, 1m, "RTA", 1, Due: PlanningStart.AddDays(5)),
+            new DemandSpec2("D2", 2, 1m, "RTA", 1, Due: PlanningStart.AddDays(5))
+        };
+        var ops = new[] { new OpSpec("STAGE1", "OP10", 1, DeptId, 30m) };
+
+        var result = await _solver.SolveAsync(
+            BuildLockedGeometry(ops, Array.Empty<DepSpec>(), anchors, demands));
+
+        Assert.True(result.Success, result.ErrorMessage);
+
+        // D1 全量锁定 ⇒ 其锚点原地保留；D2 无锁定 ⇒ 其 1 件必须被排下。
+        Assert.Single(result.FinalTasks.Where(t => t.SourceDraftId == "D1"));
+        Assert.Single(result.FinalTasks.Where(t => t.SourceDraftId == "D2"));
     }
 
     /// <summary>

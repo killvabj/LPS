@@ -244,7 +244,7 @@ internal static class SchedulingDirectionResolver
     internal static decimal TotalLeadMinutes(IReadOnlyList<OperationNode> operations)
         => operations.Count == 0 ? 0m : operations.Sum(o => o.StandardDuration);
 
-    /// <summary>该需求是否存在锁定任务（`LockedTasks` 键为 `(DraftId, OperationCode)`，按 DraftId 归属需求）。</summary>
+    /// <summary>该需求是否存在锁定任务（`LockedTasks` 键为 `(DraftId, StageCode, OperationCode)`，按 DraftId 归属需求）。</summary>
     private static bool HasLockedAnchor(LogicalProductionDemand demand, ConstraintContext constraints)
         => constraints.LockedTasks.Keys.Any(k => string.Equals(k.DraftId, demand.LogicalDemandKey, StringComparison.Ordinal)
                                                  || string.Equals(k.DraftId, demand.DemandKey, StringComparison.Ordinal));

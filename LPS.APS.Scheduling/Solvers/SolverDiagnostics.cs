@@ -57,6 +57,14 @@ internal static class SolverDiagnostics
         /// <summary>Phase5 `OptimizeSetupSequences`（Setup 序列优化）**门控放行并进入优化体**的次数。</summary>
         public long Phase5SetupOptimizationRuns;
 
+        /// <summary>
+        /// Phase5 `OptimizeSegment`（**资源 × 连续生产窗口 × 固定锚点间可移动段**）**真正进入有界局部优化体**
+        ///   的段数 —— 即「段内 ≥2 个 Task 且全部可移动」的段。
+        ///   与 <see cref="Phase5SetupOptimizationRuns"/> 的区别：后者只说明「整 Run 未被否决」，
+        ///   本计数说明「**确实有一个可重排的段被送进优化体**」（P1-02 验收：混合方向下 FORWARD 段必须可达）。
+        /// </summary>
+        public long Phase5SetupSegmentsOptimized;
+
         /// <summary>Phase 1（硬约束构建）耗时 ms。</summary>
         public long Phase1Ms;
 
@@ -207,6 +215,12 @@ internal static class SolverDiagnostics
     internal static void CountPhase5SetupOptimizationRun()
     {
         if (Current.Value is { } c) c.Phase5SetupOptimizationRuns++;
+    }
+
+    /// <summary>Phase5 `OptimizeSegment` 真正进入有界局部优化体（可重排段）时 +1。纯观测，不参与判定。</summary>
+    internal static void CountPhase5SetupSegmentOptimized()
+    {
+        if (Current.Value is { } c) c.Phase5SetupSegmentsOptimized++;
     }
 
     // ══════════════════════════════════════════════════════════════════

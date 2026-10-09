@@ -42,7 +42,26 @@ public class FiniteCapacitySolver : IFiniteCapacityScheduler
         // ═══════════════════════════════════════════════
         var phase1 = new PhaseOneConstraintBuilder();
         var p1 = SolverDiagnostics.StartPhase();
-        var constraints = phase1.BuildConstraints(request);
+        ConstraintContext constraints;
+        try
+        {
+            constraints = phase1.BuildConstraints(request);
+        }
+        catch (SolverInputContractException ex)
+        {
+            // P0-02（0号位 2026-10-09《APS_V1_2_20261009.md》§三）：输入无法满足冻结契约的唯一标识要求
+            //   ⇒ **受控 Fail Closed**（不向外抛未处理异常、**不静默抹除锚点**）。
+            SolverDiagnostics.EndPhase(p1, 1);
+            return await Task.FromResult(new DomainSolveResult
+            {
+                Success = false,
+                ErrorMessage = "输入契约不满足（Fail Closed）：" + ex.Message,
+                Summary = new SolveSummary
+                {
+                    ElapsedMs = (long)(DateTime.UtcNow - startTime).TotalMilliseconds
+                }
+            });
+        }
         SolverDiagnostics.EndPhase(p1, 1);
 
         // ═══════════════════════════════════════════════
@@ -50,7 +69,26 @@ public class FiniteCapacitySolver : IFiniteCapacityScheduler
         // ═══════════════════════════════════════════════
         var phase2 = new PhaseTwoInitialScheduler();
         var p2 = SolverDiagnostics.StartPhase();
-        var scheduleResult = phase2.Schedule(request, constraints);
+        InitialScheduleResult scheduleResult;
+        try
+        {
+            scheduleResult = phase2.Schedule(request, constraints);
+        }
+        catch (SolverInputContractException ex)
+        {
+            // P0-03（0号位 2026-10-09《APS_V1_2_20261009.md》§三）：Phase2 发现**锁定数量闭合不自洽**
+            //   （锁定覆盖量超出需求总量）时同样走**受控 Fail Closed**，不带着负的剩余数量继续排程。
+            SolverDiagnostics.EndPhase(p2, 2);
+            return await Task.FromResult(new DomainSolveResult
+            {
+                Success = false,
+                ErrorMessage = "输入契约不满足（Fail Closed）：" + ex.Message,
+                Summary = new SolveSummary
+                {
+                    ElapsedMs = (long)(DateTime.UtcNow - startTime).TotalMilliseconds
+                }
+            });
+        }
         SolverDiagnostics.EndPhase(p2, 2);
 
         // ═══════════════════════════════════════════════

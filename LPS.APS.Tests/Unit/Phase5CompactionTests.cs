@@ -326,6 +326,108 @@ public class Phase5CompactionTests
         Assert.Equal(0, backwardRuns[1]);
     }
 
+    // ════════════════════════════════════════════════════════════
+    // ⑦ P1-02 验收反证（0号位 2026-10-09《APS_V1_2_20261009.md》§三 P1-02 / §五.5）
+    //    「混合 AUTO 场景：至少两个独立资源，一个 BACKWARD 一个 FORWARD；
+    //      验证后者 Setup 优化**确实可达**且前者**保持不动**。」
+    //
+    //    整改前：`OptimizeSetupSequences` 只要**任一需求非 FORWARD** 就整 Run 返回
+    //      ⇒ 别的资源上的倒排锚点剥夺了本资源独立 FORWARD 段的优化机会（超出冻结资源窗口范围）。
+    //    整改后：非 FORWARD 需求整体并入 `immovable` ⇒ 只作**段边界锚点**（不跨锚点重排、锚点不动），
+    //      本资源上的独立 FORWARD 段照常进入有界局部优化体。
+    //
+    //    观测手段：`SolverDiagnostics` 计数器（internal，非契约，纯观测，见该类文档）：
+    //      · `Phase5SetupOptimizationRuns` —— 整 Run 是否被放行进入优化体；
+    //      · `Phase5SetupSegmentsOptimized` —— **确实有一个「≥2 可移动 Task」的段**被送进优化体
+    //        （本验收的关键观测：它把「整 Run 放行」与「FORWARD 段真可达」区分开）。
+    //
+    //    鉴别力（整改前必红）：整改前混合场景整 Run 被否决 ⇒ 两个计数器均为 0 ⇒ 第一组断言失败。
+    // ════════════════════════════════════════════════════════════
+    [Fact]
+    public async Task 混合方向_独立FORWARD段可达优化_BACKWARD锚点保持不动()
+    {
+        // D1（material 1 / res1）：双工序同资源、`0 ≤ slack ≤ lead`（无交期信号 ⇒ 自决 BACKWARD）。
+        //   倒排落点 = 交期对齐（末工序结束 = 交期），**明显晚于**最早可行位 [Day, Day+120]
+        //   ⇒ 「未被前拉」在本夹具是**可鉴别**的（若被错误纳入优化/压实，起点会掉到 Day）。
+        // D2（material 2 / res2）：双工序同资源、交期宽松（slack ≫ lead ⇒ DUE_LOOSE ⇒ 自决 FORWARD）。
+        // 两资源日历互不重叠 ⇒ 两条段完全独立。
+        DomainSolveRequest Make(bool includeForward)
+        {
+            var demands = new List<LogicalProductionDemand>
+            {
+                Simple("D1", 1, 1, 1m, Day.AddMinutes(200))
+            };
+            var ops = new List<RoutingOperation> { Op(1, "OP10", 60m, 0m), Op(1, "OP20", 60m, 0m) };
+            var deps = new List<RoutingDependency> { Dep(1, "OP10", "OP20") };
+            var els = new List<OperationResourceEligibility> { El(1, "OP10", 1), El(1, "OP20", 1) };
+            var resources = new List<ResourceDefinition> { Res(1, "R1", (Day.AddDays(-1), Day.AddDays(29))) };
+            var cal = new Dictionary<int, (DateTime, DateTime)[]>
+            {
+                [1] = new[] { (Day.AddDays(-1), Day.AddDays(29)) }
+            };
+
+            if (includeForward)
+            {
+                demands.Add(Simple("D2", 2, 2, 1m, Day.AddDays(20)));
+                ops.Add(Op(2, "OP10", 60m, 0m));
+                ops.Add(Op(2, "OP20", 60m, 0m));
+                deps.Add(Dep(2, "OP10", "OP20"));
+                els.Add(El(2, "OP10", 2));
+                els.Add(El(2, "OP20", 2));
+                resources.Add(Res(2, "R2", (Day, Day.AddDays(29))));
+                cal[2] = new[] { (Day, Day.AddDays(29)) };
+            }
+
+            return Build(demands, ops, deps, els, resources, cal, direction: "AUTO");
+        }
+
+        long mixedRuns, mixedSegments;
+        DomainSolveResult mixed;
+        using (var scope = SolverDiagnostics.BeginScope())
+        {
+            mixed = await _solver.SolveAsync(Make(includeForward: true));
+            Assert.True(mixed.Success, mixed.ErrorMessage);
+            mixedRuns = scope.Counters.Phase5SetupOptimizationRuns;
+            mixedSegments = scope.Counters.Phase5SetupSegmentsOptimized;
+        }
+
+        // ① 整 Run 未被否决（整改前 = 0 ⇒ 红）。
+        Assert.True(mixedRuns >= 1, $"混合方向下整 Run 未进入序列优化体（计数器={mixedRuns}）—— 全 Run 一票否决未撤销");
+
+        // ② **FORWARD 段确实可达**：res2 上 D2 的 2 条可移动 Task 构成一个真段 ⇒ 段计数器必须 ≥1。
+        //    （整改前 = 0；且若整改只「放行整 Run」而未把非 FORWARD 需求登记为不可移动，
+        //      res1 的 BACKWARD 段也会被当作可重排段 ⇒ 计数会 > 1，同样不满足本断言。）
+        Assert.Equal(1, mixedSegments);
+
+        // ③ BACKWARD 锚点**保持不动**：D1 仍锚在交期（末工序结束 = 交期 Day+200），且**未被前拉**
+        //    （倒排起点 Day+80 明显晚于最早可行位 Day —— 若被错误纳入优化/压实，起点会掉到 Day）。
+        var d1 = mixed.FinalTasks.Where(t => t.SourceDraftId == "D1").OrderBy(t => t.PlannedStartTime).ToList();
+        Assert.Equal(2, d1.Count);
+        Assert.Equal(Day.AddMinutes(80), d1[0].PlannedStartTime);
+        Assert.Equal(Day.AddMinutes(140), d1[0].PlannedEndTime);
+        Assert.Equal(Day.AddMinutes(200), d1[1].PlannedEndTime);
+
+        // ④ 反向护栏：**只有 BACKWARD 需求**时，优化体虽被放行（Task 数 ≥2），但**没有任何可重排段**
+        //    ⇒ 段计数器必须为 0。本护栏证明 ② 的 1 确实来自「FORWARD 段可达」，而非「计数器恒 ≥1」。
+        //    同时校验 D1 在两种场景下**位置完全一致** ⇒ 混合场景没有扰动 BACKWARD 段。
+        long backOnlyRuns, backOnlySegments;
+        DomainSolveResult only;
+        using (var scope = SolverDiagnostics.BeginScope())
+        {
+            only = await _solver.SolveAsync(Make(includeForward: false));
+            Assert.True(only.Success, only.ErrorMessage);
+            backOnlyRuns = scope.Counters.Phase5SetupOptimizationRuns;
+            backOnlySegments = scope.Counters.Phase5SetupSegmentsOptimized;
+        }
+
+        Assert.True(backOnlyRuns >= 1, $"仅 BACKWARD 时优化体未被放行（计数器={backOnlyRuns}）—— ④ 护栏失效");
+        Assert.Equal(0, backOnlySegments);
+
+        var d1Only = only.FinalTasks.Where(t => t.SourceDraftId == "D1").OrderBy(t => t.PlannedStartTime).ToList();
+        Assert.Equal(d1Only.Select(t => t.PlannedStartTime), d1.Select(t => t.PlannedStartTime));
+        Assert.Equal(d1Only.Select(t => t.PlannedEndTime), d1.Select(t => t.PlannedEndTime));
+    }
+
     // ─────────────────────────── 构造辅助 ───────────────────────────
 
     private static LogicalProductionDemand D1() => new LogicalProductionDemand

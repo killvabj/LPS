@@ -648,15 +648,16 @@ internal class PhaseFiveCompression
     {
         // §17：白天 Candidate 局部优先，不做全天序列重排
         if (request.CandidateContext != null) return;
-        // V1 口径：仅 FORWARD（BACKWARD JIT 锚点需倒排模拟器，待 0号位 背书后扩展——与 CompactGaps 门控一致）。
-        // P1 整改（0号位 2026-10-09《未命名的Markdown文件 (3)(1).md》§一 第 3 行）：判据由 Run 级原始值
-        //   改为 **全量需求自决方向**。为什么这里必须**整 Run 一致**而不能像压实那样逐 Task 放行：
-        //   序列优化是**整资源段的前向模拟重排**（`SegmentSimulation` + `ResourceProductTimeline`），
-        //   段内若混有 BACKWARD/MIXED 的 JIT 倒排锚点，前向重排会把它前拉 ⇒ 过早生产。
-        //   ⇒ 只要存在任一非 FORWARD 需求即整体跳过（保守）；全量 FORWARD 时才执行（Run 级 AUTO 下亦得以进入）。
-        if (request.LogicalProductionDemands.Any(d => !IsForwardDemand(d.LogicalDemandKey, request, constraints))) return;
-        SolverDiagnostics.CountPhase5SetupOptimizationRun();
+        // ── P1-02（0号位 2026-10-09《APS_V1_2_20261009.md》§三）：**撤销「全 Run 一票否决」** ──
+        //   复审判词：Setup V1 要求在「**资源 × 连续生产窗口 × 固定锚点间可移动段**」做**有界局部**优化；
+        //   别的资源上的倒排锚点**不应当然剥夺本资源独立 FORWARD 段**的优化机会；未排下、无 Task 的需求
+        //   也不应禁止所有可行资源段优化。此前「任一非 FORWARD 需求 ⇒ 整 Run 返回」**超出冻结资源窗口范围**。
+        //   整改：改**分段保护** —— 非 FORWARD 需求（JIT 倒排锚点）的 Task 一律并入 `immovable`
+        //   ⇒ 它们成为**段边界锚点**（下方 `OptimizeSegment` 不跨锚点重排、锚点本身不动），
+        //     本资源上的独立 FORWARD 段照常参与有界局部优化。判据与 `CompactGaps` 同源（`IsForwardDemand`）。
+        // 计数口径 = **实际进入优化体**（有 ≥2 个 Task 可重排）；< 2 时无序列可优化 ⇒ 不计（不是「进入优化体」）。
         if (tasks.Count < 2) return;
+        SolverDiagnostics.CountPhase5SetupOptimizationRun();
 
         // CompactGaps 可能已移动 Task（压实只维护自身占用图、未同步产品时间线）→
         // 从当前任务集合重建时间线，保证段首前产品查询基于最新位置。
@@ -671,6 +672,17 @@ internal class PhaseFiveCompression
         var stopwatch = System.Diagnostics.Stopwatch.StartNew();
 
         var immovable = PhaseFourLocalRepair.IdentifyImmovableTasks(request, tasks);
+
+        // P1-02：非 FORWARD 需求（JIT 倒排锚点）整体登记为不可移动 ⇒ 作**段边界锚点**，绝不跨段重排 / 不前拉。
+        //   （撤销全 Run 一票否决后，局部保护改由本行 + 既有「段按锚点切分」共同达成。）
+        foreach (var t in tasks)
+        {
+            if (!IsForwardDemand(t.SourceDraftId, request, constraints))
+            {
+                immovable.Add(t.FinalDraftId);
+            }
+        }
+
         var demandByKey = request.LogicalProductionDemands.ToDictionary(d => d.LogicalDemandKey);
         var occupancy = PhaseFourLocalRepair.BuildResourceOccupancy(tasks, constraints);
         // P1-02 性能加固：段预计算的 deadline/floor 查询走三重索引（消除每 Task 全表扫描）
@@ -763,6 +775,11 @@ internal class PhaseFiveCompression
         System.Diagnostics.Stopwatch stopwatch)
     {
         var segmentIds = segment.Select(t => t.FinalDraftId).ToHashSet();
+
+        // P1-02 验收观测（0号位 2026-10-09《APS_V1_2_20261009.md》§五.5）：本段**确实进入**有界局部优化体。
+        //   段由调用方保证「≥2 个 Task 且全部可移动（不含锚点）」⇒ 混合方向下 FORWARD 独立段可达此处；
+        //   BACKWARD/MIXED 需求整体在 `immovable` 内 ⇒ 只会作**锚点**切分，不会形成本调用。纯观测，不参与判定。
+        SolverDiagnostics.CountPhase5SetupSegmentOptimized();
         var segmentLowerBound = prevAnchor != null ? prevAnchor.PlannedEndTime : window.Start;
 
         // ── 预计算段内 Task 的 floor/deadline（全部冻结为原计划口径）──
