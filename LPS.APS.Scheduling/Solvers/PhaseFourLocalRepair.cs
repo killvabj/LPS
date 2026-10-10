@@ -690,6 +690,21 @@ internal class PhaseFourLocalRepair
                 repairedBatchCount++;
                 result.RepairedTasks.AddRange(repairedTasks);
 
+                // ── NEW-P1-01（0号位 2026-10-09《APS_V1_4_20261009.md》§三）：**Phase4 修复批亦须留批级方向痕** ──
+                //   复审判词（成立）：Phase2 只在**有胜出候选**时登记 `ResolvedBatchDirections`；未落定批
+                //   （所有 Routing 试排均不成功）无方向留痕，Phase4 修复出的 Task 虽带批键却查不到批级方向
+                //   ⇒ Phase5 回落需求级/Run 级 ⇒ 可能误动或误锁该批。
+                //   **不变量（代码可证）**：Phase4 的**全部**放置路径都是**正排** —— 两处逐批修复循环
+                //   （`RepairWithPropagation` / `RepairUnscheduledDemands`）均经 `TryResourceSwitch` 以
+                //   `earliestStart` 为下界、只调 `FindForwardSlot`（本文件放置调用 `:319`/`:1105`/`:1569` 全为
+                //   `FindForwardSlot`，**无任何倒排/交期锚定路径**）⇒ 修复批的**实际落定方向唯一且恒为
+                //   `FORWARD`**。故此处登记**本批实际方向**（可追溯到本批键），而非回落猜测。
+                //   已落定批不在修复单元内（`ExpandRepairUnits` 只取 `FailedExecutionBatches`）⇒ `TryAdd`
+                //   保证不覆盖 Phase2 的既有登记（零回归）。
+                //   ⚠ 不得改变冻结的 Route/Path/批身份：取图走 `TryGetBatchRoutingGraph(unitBatchKey, ...)`
+                //      （批键 → 本批路径 → 需求固定路径 → 唯一那条），本处只登记方向、不动任何身份字段。
+                constraints.ResolvedBatchDirections.TryAdd(unitBatchKey, SchedulingDirectionResolver.Forward);
+
                 // P0-08：修复出连续份额时登记完成时间，供后续同 PI 自由份额做下界。
                 if (unitDemand.IsContinuation && !string.IsNullOrEmpty(unitDemand.ProductionInstructionNo))
                 {
@@ -801,6 +816,21 @@ internal class PhaseFourLocalRepair
 
                 repairedBatchCount++;
                 result.RepairedTasks.AddRange(repairedTasks);
+
+                // ── NEW-P1-01（0号位 2026-10-09《APS_V1_4_20261009.md》§三）：**Phase4 修复批亦须留批级方向痕** ──
+                //   复审判词（成立）：Phase2 只在**有胜出候选**时登记 `ResolvedBatchDirections`；未落定批
+                //   （所有 Routing 试排均不成功）无方向留痕，Phase4 修复出的 Task 虽带批键却查不到批级方向
+                //   ⇒ Phase5 回落需求级/Run 级 ⇒ 可能误动或误锁该批。
+                //   **不变量（代码可证）**：Phase4 的**全部**放置路径都是**正排** —— 两处逐批修复循环
+                //   （`RepairWithPropagation` / `RepairUnscheduledDemands`）均经 `TryResourceSwitch` 以
+                //   `earliestStart` 为下界、只调 `FindForwardSlot`（本文件放置调用 `:319`/`:1105`/`:1569` 全为
+                //   `FindForwardSlot`，**无任何倒排/交期锚定路径**）⇒ 修复批的**实际落定方向唯一且恒为
+                //   `FORWARD`**。故此处登记**本批实际方向**（可追溯到本批键），而非回落猜测。
+                //   已落定批不在修复单元内（`ExpandRepairUnits` 只取 `FailedExecutionBatches`）⇒ `TryAdd`
+                //   保证不覆盖 Phase2 的既有登记（零回归）。
+                //   ⚠ 不得改变冻结的 Route/Path/批身份：取图走 `TryGetBatchRoutingGraph(unitBatchKey, ...)`
+                //      （批键 → 本批路径 → 需求固定路径 → 唯一那条），本处只登记方向、不动任何身份字段。
+                constraints.ResolvedBatchDirections.TryAdd(unitBatchKey, SchedulingDirectionResolver.Forward);
 
                 // P0-08：修复出连续份额时登记完成时间，供后续同 PI 自由份额做下界。
                 if (unitDemand.IsContinuation && !string.IsNullOrEmpty(unitDemand.ProductionInstructionNo))

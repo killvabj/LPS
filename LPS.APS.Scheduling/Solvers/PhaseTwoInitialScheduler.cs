@@ -260,11 +260,25 @@ internal class PhaseTwoInitialScheduler
                 //
                 //   并行多 Slice 的**独立性**由独立 Demand（各自 LogicalDemandKey / AllocationSequence）表达，
                 //   外层逐需求循环已保证每个 Slice 各计一次；同需求内不存在「独立 Slice」这一载体。
-                //   ⚠ 残余歧义（如实登记，属 2号位 输入契约缺口，不自行造字段）：
+                //
+                //   ⚠ **未闭合的输入契约缺口**（如实登记，属 2号位 职责，本号位不自行造字段、不造假判据）：
                 //     契约未提供**分量身份**（Slice/Batch 键）与**按工序序的产量语义**（YIELD 下各工序净产出
-                //     本应逐工序不同）。当前口径在「同需求单批流动」前提下确定；若输入实际含同需求多批
-                //     部分重叠，覆盖量为**保守下界**（宁少扣、多排一个可被资源/时间约束显式暴露的 Task，
-                //     也不静默少排）—— 该形态需 2号位 提供分量身份后才能精确计量。
+                //     本应逐工序不同）。当前口径仅在「同需求单批流动」前提下成立；若输入实际含同需求多批
+                //     部分重叠，`Max` **低估**覆盖 ⇒ **多排**。
+                //     **0号位 2026-10-09《APS_V1_4_20261009.md》§三 CONTRACT-P0 明判**：
+                //       「**不能用『保守多排』定义为合法业务结果**；制造计划多排与漏排一样属于数量真相违规。」
+                //     ⇒ 故此处**不得**把 `Max` 当作已达标口径 —— 本形态**未闭合**，件已出致 2号位
+                //       （《APS_V1_20261009_锁定分量身份与跨Stage同名工序依赖边_1号位致2号位_技术说明》§三 G-2）。
+                //     **为何不能自行落 Fail Closed**（本号位已逐路核验）：
+                //       ① 两处载体（`Core/Dto/DomainSolveRequest.cs:272-294` `ExecutionConstraint` 与本文件
+                //          `LockedTaskConstraint`）**均无**分量身份字段；
+                //       ② 唯一候选判别器 `TaskKey` **不可用** —— 其语义是「跨轮次识别同一 Task」
+                //          （`DomainSolveRequest.cs:293`），且本模型**每工序各自一个 Task** ⇒ 同一份单批锁定的
+                //          `OP10`/`OP20` 两条记录 `TaskKey` **本就不同** ⇒ 相异不能推出「分量相异」（会误杀合法输入）；
+                //       ③ 数量相等/相异两个方向**都不成立**（复审例子：两个独立锁定批**各 3 件**，数量相等）；
+                //       ④ 「同一需求 >1 条锁定记录一律 Fail Closed」会**误杀**契约允许的
+                //          「多个 Operation 指向同一份数量」合法形态。
+                //     ⇒ 唯一不误判且不造假字段的处置 = 请求 2号位 消歧（件已出，等待回执）。
                 var lockedNetOutputQty = demandLockedTasks.Count == 0
                     ? 0m
                     : demandLockedTasks.Max(t => t.LockedNetOutputQty ?? t.LockedQuantity ?? demand.NetOutputQty);
@@ -272,15 +286,38 @@ internal class PhaseTwoInitialScheduler
                     ? 0m
                     : demandLockedTasks.Max(t => t.LockedPlannedProcessQty ?? t.LockedQuantity ?? demand.PlannedProcessQty);
 
-                // ── P0-03（0号位 2026-10-09《APS_V1_3_20261009.md》§三）：**超界校验必须先于「全量锁定直接跳过」** ──
-                //   复审判词（成立）：旧实现把负值校验放在 `if (lockedNetOutputQty >= demand.NetOutputQty) continue;`
-                //   **之后** ⇒ `lockedNetOutputQty > demand.NetOutputQty` 时必先 `continue`，
-                //   专门的 Fail Closed 分支**不可达**（净产出刚好等于需求、而加工量超额时同样先被跳过）。
-                //   现顺序（§六.1「超量锁定先受控 Fail Closed，再判断全量覆盖」）：
-                //     ① 任一覆盖量**超出**其需求总量 ⇒ 立即受控 Fail Closed（口径不自洽）；
-                //     ② 净产出**全量覆盖**（此时加工量必未超量）⇒ 跳过排程（既有语义，零回归）；
-                //     ③ 其余 ⇒ 部分锁定，排剩余份额。
-                //   ① 之后 `remaining*` 恒 ≥ 0 ⇒ 不再需要独立的负值分支（原分支已被本步取代）。
+                // ── P0-03（0号位 2026-10-09《APS_V1_3_20261009.md》§三）+ NEW-P1-02（《APS_V1_4_20261009.md》§三）
+                //    **锁定数量的完整输入有效性判定必须先于「完全锁定直接跳过」** ──
+                //   复审判词（成立）：旧实现把校验放在 `if (lockedNetOutputQty >= demand.NetOutputQty) continue;`
+                //   **之后** ⇒ 超界/负量都必先 `continue`，Fail Closed 分支**不可达**。
+                //   现顺序（V1_3 §六.1「先受控 Fail Closed，再判断全量覆盖」）：
+                //     ① **非负**：任一锁定记录任一锁定量为负 ⇒ 受控 Fail Closed。
+                //        （V1_4 §三 NEW-P1-02 点名的漏检：`需求净产出=10 / 锁定净产出=-1` 曾被算成「剩余 11」
+                //          而在本闸门放行 ⇒ 不得以 Phase5 事后检查替代输入校验。）
+                //     ② **上界**：任一覆盖量**超出**其需求总量 ⇒ 受控 Fail Closed（口径不自洽）。
+                //     ③ **双数量一致性**（只判「可排程性」，**不推导良率**——V1_4 §三「不能仅凭数值大小推导
+                //        良率关系」）：
+                //        - 净产出**仍有剩余**、加工量**已无剩余** ⇒ 剩余净产出无任何加工承载 ⇒ 计划**不可表达** ⇒ Fail Closed；
+                //        - 净产出**已无剩余**、加工量**仍有剩余** ⇒ 只有一侧全量覆盖，该组合的业务语义未经
+                //          2号位 书面定义 ⇒ **不擅自当作合法而跳过** ⇒ Fail Closed（待契约后按其口径放行）。
+                //     ④ 仅当**两类覆盖量均全量**（各 `>=` 其需求总量）才是「完全锁定」⇒ 跳过排程。
+                //   依据 V1_3 §三：「覆盖量**严格等于**已声明需求且**其它量也合法**才能跳过」。
+                var negativeLockRecord = demandLockedTasks.FirstOrDefault(t =>
+                    (t.LockedQuantity ?? 0m) < 0m
+                    || (t.LockedNetOutputQty ?? 0m) < 0m
+                    || (t.LockedPlannedProcessQty ?? 0m) < 0m);
+                if (negativeLockRecord != null || lockedNetOutputQty < 0m || lockedPlannedProcessQty < 0m)
+                {
+                    throw new SolverInputContractException(
+                        "锁定数量输入非法：锁定量为负（口径不自洽）。" +
+                        $"LogicalDemandKey={demand.LogicalDemandKey}, " +
+                        $"锁定量={negativeLockRecord?.LockedQuantity}, " +
+                        $"锁定净产出={negativeLockRecord?.LockedNetOutputQty}, " +
+                        $"锁定加工量={negativeLockRecord?.LockedPlannedProcessQty}, " +
+                        $"锁定工序={negativeLockRecord?.StageCode}/{negativeLockRecord?.OperationCode}, " +
+                        $"聚合净产出覆盖={lockedNetOutputQty}, 聚合加工量覆盖={lockedPlannedProcessQty}");
+                }
+
                 if (lockedNetOutputQty > demand.NetOutputQty || lockedPlannedProcessQty > demand.PlannedProcessQty)
                 {
                     throw new SolverInputContractException(
@@ -290,10 +327,26 @@ internal class PhaseTwoInitialScheduler
                         $"PlannedProcessQty={demand.PlannedProcessQty}, 锁定加工量覆盖={lockedPlannedProcessQty}");
                 }
 
-                // 净产出全量覆盖 ⇒ 完全锁定，跳过排程（不产新 Task；锚点由 Phase2 物化保留）。
-                if (lockedNetOutputQty >= demand.NetOutputQty)
+                var netFullyCovered = lockedNetOutputQty >= demand.NetOutputQty;
+                var procFullyCovered = lockedPlannedProcessQty >= demand.PlannedProcessQty;
+
+                // ④ 两类覆盖量**均全量** ⇒ 完全锁定，跳过排程（不产新 Task；锚点由 Phase2 物化保留）。
+                if (netFullyCovered && procFullyCovered)
                 {
                     continue;
+                }
+
+                // ③ 只覆盖一侧 ⇒ 口径不自洽 / 语义未定 ⇒ 受控 Fail Closed（**不得**静默跳过或静默排剩余）。
+                if (netFullyCovered != procFullyCovered)
+                {
+                    var which = netFullyCovered
+                        ? "净产出已全量覆盖、加工量仍有剩余（该组合语义未经 2号位 契约定义）"
+                        : "净产出仍有剩余、加工量已无剩余（剩余净产出无加工承载）";
+                    throw new SolverInputContractException(
+                        "锁定数量口径不一致：" + which + "。" +
+                        $"LogicalDemandKey={demand.LogicalDemandKey}, " +
+                        $"NetOutputQty={demand.NetOutputQty}, 锁定净产出覆盖={lockedNetOutputQty}, " +
+                        $"PlannedProcessQty={demand.PlannedProcessQty}, 锁定加工量覆盖={lockedPlannedProcessQty}");
                 }
 
                 // 部分锁定：计算剩余数量，创建剩余需求对象

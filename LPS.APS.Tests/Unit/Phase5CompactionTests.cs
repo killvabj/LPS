@@ -304,12 +304,16 @@ public class Phase5CompactionTests
         Assert.True(auto[0] >= 1, $"AUTO 自决 FORWARD 却未进入压实（计数器={auto[0]}）—— 衔接断裂");
         Assert.True(auto[1] >= 1, $"AUTO 自决 FORWARD 却未进入序列优化（计数器={auto[1]}）—— 衔接断裂");
 
-        // 反向护栏：AUTO 自决为 BACKWARD（交期紧贴起点 ⇒ DUE_TIGHT）⇒ 两项均**不得**进入。
+        // 反向护栏：AUTO 自决为 BACKWARD ⇒ 两项均**不得**进入。
+        //   ⚠ 几何必须让**倒排可行**：`0 ≤ slack ≤ lead`（无交期信号 ⇒ 默认 BACKWARD）且倒排起点 ≥ PlanningStart。
+        //     若交期紧到 `slack < 0`（DUE_TIGHT），倒排起点会早于 PlanningStart ⇒ **Phase2 倒排失败、Phase4 正排修复**
+        //     该批 ⇒ 依 NEW-P1-01（0号位 2026-10-09《APS_V1_4_20261009.md》§三）该修复批按 **FORWARD** 参与优化
+        //     ⇒ 本护栏在此几何下**本就不该**断言 0（该情形另立反证，见 `Phase5BatchDirectionTests`）。
         long[] backwardRuns;
         using (var scope = SolverDiagnostics.BeginScope())
         {
             var rb = _solver.SolveAsync(Build(
-                demands: new[] { Simple("D1", 1, 1, 1m, Day.AddMinutes(30)) },
+                demands: new[] { Simple("D1", 1, 1, 1m, Day.AddMinutes(90)) },
                 ops: new[] { Op(1, "OP10", 60m, 0m) },
                 deps: Array.Empty<RoutingDependency>(),
                 els: new[] { El(1, "OP10", 1) },

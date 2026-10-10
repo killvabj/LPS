@@ -1256,6 +1256,83 @@ public class PhaseTwoRoutingCandidateTests
         Assert.DoesNotContain("D1", result.UnscheduledTasks.Select(u => u.DraftId));
     }
 
+    // ════════════════════════════════════════════════════════════════════════════
+    // NEW-P1-02 反证（0号位 2026-10-09《APS_V1_4_20261009.md》§三 NEW-P1-02）：
+    //   「锁定数量输入有效性只校验上界，未履行既有『非负 / 口径一致性』检查」——
+    //   判词点名的漏检：`需求净产出=10、锁定净产出=-1` 会被算成「剩余 11」而在输入闸门放行。
+    //   整改：① 非负 ② 上界 ③ 双数量一致性（只判可排程性、**不推导良率**）④ 仅双量全量才跳过。
+    //   三组反证均走完整 `SolveAsync`。整改前 ① ② ③ 全部以「静默排剩余 / 静默跳过」通过 ⇒ 本三项必红。
+    // ════════════════════════════════════════════════════════════════════════════
+
+    /// <summary>① 负量：`需求净产出=10 / 锁定净产出=-1` ⇒ 必须在**输入闸门**受控 Fail Closed
+    ///   （整改前算出「剩余 11」并继续排程 ⇒ 本用例红）。</summary>
+    [Fact]
+    public async Task NEW_P1_02_锁定量为负_受控FailClosed()
+    {
+        var anchors = new[]
+        {
+            new AnchorSpec("STAGE1", "OP10", 1, PlanningStart, PlanningStart.AddMinutes(30), -1m,
+                LockedNetOutputQty: -1m, LockedPlannedProcessQty: -1m)
+        };
+        var demands = new[] { new DemandSpec2("D1", 1, 10m, "RTA", 1, Due: PlanningStart.AddDays(5)) };
+        var ops = new[] { new OpSpec("STAGE1", "OP10", 1, DeptId, 30m) };
+
+        var result = await _solver.SolveAsync(
+            BuildLockedGeometry(ops, Array.Empty<DepSpec>(), anchors, demands));
+
+        Assert.False(result.Success);
+        Assert.Contains("Fail Closed", result.ErrorMessage);
+        Assert.Contains("锁定量为负", result.ErrorMessage);
+        Assert.Empty(result.FinalTasks);
+    }
+
+    /// <summary>② 双数量一致性 —— 净产出**已全量**、加工量仍有剩余（只覆盖一侧）⇒ 语义未经 2号位 定义
+    ///   ⇒ 受控 Fail Closed（整改前直接跳过 ⇒ 本用例红）。</summary>
+    [Fact]
+    public async Task NEW_P1_02_净产出全量_加工量部分_受控FailClosed()
+    {
+        var anchors = new[]
+        {
+            new AnchorSpec("STAGE1", "OP10", 1, PlanningStart, PlanningStart.AddMinutes(30), 10m,
+                LockedNetOutputQty: 10m, LockedPlannedProcessQty: 4m)
+        };
+        var demands = new[] { new DemandSpec2("D1", 1, 10m, "RTA", 1, Due: PlanningStart.AddDays(5)) };
+        var ops = new[] { new OpSpec("STAGE1", "OP10", 1, DeptId, 30m) };
+
+        var result = await _solver.SolveAsync(
+            BuildLockedGeometry(ops, Array.Empty<DepSpec>(), anchors, demands));
+
+        Assert.False(result.Success);
+        Assert.Contains("Fail Closed", result.ErrorMessage);
+        Assert.Contains("口径不一致", result.ErrorMessage);
+        Assert.Contains("净产出已全量覆盖", result.ErrorMessage);
+        Assert.Empty(result.FinalTasks);
+    }
+
+    /// <summary>③ 双数量一致性 —— 净产出**仍有剩余**、加工量已无剩余 ⇒ 剩余净产出无加工承载
+    ///   （计划不可表达）⇒ 受控 Fail Closed（整改前会以 `PlannedProcessQty=0` 排零时长 Task ⇒ 本用例红）。</summary>
+    [Fact]
+    public async Task NEW_P1_02_加工量全量_净产出部分_受控FailClosed()
+    {
+        var anchors = new[]
+        {
+            new AnchorSpec("STAGE1", "OP10", 1, PlanningStart, PlanningStart.AddMinutes(30), 10m,
+                LockedNetOutputQty: 4m, LockedPlannedProcessQty: 10m)
+        };
+        var demands = new[] { new DemandSpec2("D1", 1, 10m, "RTA", 1, Due: PlanningStart.AddDays(5)) };
+        var ops = new[] { new OpSpec("STAGE1", "OP10", 1, DeptId, 30m) };
+
+        var result = await _solver.SolveAsync(
+            BuildLockedGeometry(ops, Array.Empty<DepSpec>(), anchors, demands));
+
+        Assert.False(result.Success);
+        Assert.Contains("Fail Closed", result.ErrorMessage);
+        Assert.Contains("口径不一致", result.ErrorMessage);
+        Assert.Contains("加工量已无剩余", result.ErrorMessage);
+        Assert.Empty(result.FinalTasks);
+    }
+
+
     /// <summary>
     /// ③ P0-05 反证锁：`IsContinuation=true` 但 **RouteCode / PathId / ContinuationKey / StartOperationCode
     ///    全缺** ⇒ 必须 Fail Closed（Unscheduled），**禁止**退化成「无固定路径 ⇒ 自由候选选路」。
