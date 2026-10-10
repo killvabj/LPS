@@ -505,6 +505,10 @@ internal class PhaseThreeDiagnostics
     /// <summary>
     /// 计算资源利用率
     /// </summary>
+    /// <remarks>
+    /// OWN-P0-01（2026-10-10）：<paramref name="planningEnd"/> **不再参与分母计算**（90 天非资源时间终点），
+    /// 形参**保留仅为签名一致**（与 <c>PhaseTwoInitialScheduler.FindForwardSlot</c> 同惯例），避免改动调用点。
+    /// </remarks>
     private Dictionary<int, decimal> CalculateResourceUtilization(
         List<FinalTaskDraft> tasks,
         ConstraintContext constraints,
@@ -528,9 +532,17 @@ internal class PhaseThreeDiagnostics
             var availableMinutes = 0.0;
             if (constraints.ResourceCalendars.TryGetValue(resourceId, out var calendar))
             {
+                // ── OWN-P0-01 连带一致性修正（0号位 2026-10-10《APS_V1_1_20261010.md》§三）──
+                //   90 天是**需求进入本轮求解的范围**，**不是资源时间终点**（与 `FindForwardSlot` 同口径）。
+                //   P0-01 修复后任务可合法落在 90 天之后 ⇒ 若分母只统计 `[planningStart, planningEnd]` 内的窗，
+                //   利用率会被**高估**（可 > 1，误判瓶颈 / 误判产能短缺根因）。
+                //   现按**真实维护日历**统计：取与 `[planningStart, ∞)` 相交的窗，窗起点裁到 `planningStart`。
+                //   ⚠ 本项**仅影响诊断展示与根因归类**，不参与可行性 / 搜索 / Merge / Repair / Unscheduled 判定
+                //     ⇒ 不属复审 §三 点名的整改面，此处为**连带口径一致性**修正。
+                //   · 窗完全落在 `[planningStart, planningEnd]` 内（既有测试的常见几何）⇒ 新旧逐字相同（零回归）。
                 availableMinutes = calendar
-                    .Where(c => c.Start >= planningStart && c.End <= planningEnd)
-                    .Sum(c => (c.End - c.Start).TotalMinutes);
+                    .Where(c => c.End > planningStart)
+                    .Sum(c => (c.End - (c.Start > planningStart ? c.Start : planningStart)).TotalMinutes);
             }
 
             if (availableMinutes > 0)
