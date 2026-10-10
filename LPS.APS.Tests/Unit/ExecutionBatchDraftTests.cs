@@ -360,11 +360,13 @@ public class ExecutionBatchDraftTests
         Assert.Contains("B010_PI_QUANTITY_CONTRACT_PENDING", pending.ConflictReason);
 
         // ③ 前置③成立且 PI 剩余量足量 ⇒ 兜底成立：一个 Stage 执行批候选、Q_C 原值
+        //   ⚠ V1_4 NEW-03：门禁的唯一性键 = PI 号 × 物料 × **工厂**（`Demand()` 夹具 `FactoryId = 1`）
+        //     ⇒ 事实行必须**显式**声明同厂，否则按「异厂同号 PI 不作本厂来源」拒（本夹具补全，非放宽判据）。
         var facts = new[]
         {
             new PiRemainingFact
             {
-                ProductionInstructionNo = "PI-1", MaterialId = MaterialId,
+                ProductionInstructionNo = "PI-1", MaterialId = MaterialId, FactoryId = 1,
                 PiQuantity = 100m, PiReceivedQty = 20m, PiRemainingQty = 80m
             }
         };
@@ -385,7 +387,7 @@ public class ExecutionBatchDraftTests
         {
             new PiRemainingFact
             {
-                ProductionInstructionNo = "PI-1", MaterialId = MaterialId,
+                ProductionInstructionNo = "PI-1", MaterialId = MaterialId, FactoryId = 1,
                 PiQuantity = 20m, PiReceivedQty = 0m, PiRemainingQty = 20m
             }
         };
