@@ -919,5 +919,142 @@ public class ProductionInstructionPositionCalculatorTests
         Assert.That(nextOp.IsUnlocated, Is.True);
         Assert.That(nextOp.StartStageCode, Is.EqualTo("CN_ASSY"));
     }
+
+    /// <summary>
+    /// 诉求1 恢复（2026-10-10）：有 Routing、但 DAG 前沿为空（"前道完工、后道未开工"）时，
+    /// StartOperationCode=null，但 StartOperationName 必须承载工序名，供 2号位 按「名→码」反查。
+    /// 用真实形态 PI 14946237：活塞挤压(M103) 已完工、组装(M102) 未开工。
+    /// </summary>
+    [Test]
+    public async Task DagFrontierEmpty_ShouldEmitStartOperationName()
+    {
+        var input = new ProductionInstructionPositionInput
+        {
+            ProductionInstructionNo = "14946237",
+            MaterialId = 163118,
+            MaterialCode = "FINAL_FG-CDM3B20-50",
+            FactoryId = 1,
+            FactoryCode = "CN",
+            ErpRemainingQty = 27m,
+            StageProgress = new[]
+            {
+                new StageProgressFact { StageCode = "CN_ASSY", StageSequence = 1, GoodCompletedQty = 27m, SnapshotId = 1 }
+            },
+            OperationProgress = new[]
+            {
+                // 活塞挤压：已完工（RemainingQty=0）
+                new OperationProgressFact
+                {
+                    OperationCode = "M103", OperationName = "活塞挤压", StageCode = "CN_ASSY",
+                    MESWorkOrderNo = "014946237092989", PlannedQty = 27m, GoodQty = 27m, RemainingQty = 0m
+                },
+                // 组装：未开工（GoodQty=0、RemainingQty>0）⇒ 不构成 DAG 前沿候选
+                new OperationProgressFact
+                {
+                    OperationCode = "M102", OperationName = "组装", StageCode = "CN_ASSY",
+                    MESWorkOrderNo = "014946237092989", PlannedQty = 27m, GoodQty = 0m, RemainingQty = 27m
+                }
+            },
+            RoutingOperations = new[]
+            {
+                new RoutingOperationFact { OperationCode = "M103", OperationName = "活塞挤压", StageCode = "CN_ASSY", RouteCode = "配品,活塞挤压,组装" },
+                new RoutingOperationFact { OperationCode = "M102", OperationName = "组装", StageCode = "CN_ASSY", RouteCode = "配品,活塞挤压,组装" }
+            },
+            RoutingDependencies = new[]
+            {
+                new RoutingDependencyFact { FromOperationCode = "M103", ToOperationCode = "M102", RouteCode = "配品,活塞挤压,组装" }
+            },
+            WorkOrders = new[]
+            {
+                new WorkOrderSnapshotFact
+                {
+                    ProductionInstructionNo = "14946237", MESWorkOrderNo = "014946237092989",
+                    MaterialCode = "FINAL_FG-CDM3B20-50", PlannedQty = 27m,
+                    WorkOrderStatus = "IN_PROGRESS", DataCutoffTime = DateTime.UtcNow
+                }
+            },
+            StagePath = new[]
+            {
+                new StagePathFact { StageCode = "CN_ASSY", StageSequence = 1, IsStartStage = true }
+            }
+        };
+
+        var results = await _calculator.CalculateProductionInstructionPositionsAsync(new[] { input }, new FrozenFactParameters(), CancellationToken.None);
+        var result = results.First();
+
+        var ctx = result.ExistingExecutionContexts.Single();
+
+        // 有 Routing（M103→M102）但前沿为空 ⇒ 无码
+        Assert.That(ctx.StartOperationCode, Is.Null);
+        // 但名必须传出（诉求1 恢复：这是 2号位 反查的唯一可用输入）
+        Assert.That(ctx.StartOperationName, Is.EqualTo("组装"));
+
+        // slice 级同样承载（2号位 消费的是 Slices[]）
+        var slice = ctx.Slices.Single();
+        Assert.That(slice.StartOperationCode, Is.Null);
+        Assert.That(slice.StartOperationName, Is.EqualTo("组装"));
+        Assert.That(slice.StartStageCode, Is.EqualTo("CN_ASSY"));
+    }
+
+    /// <summary>
+    /// 诉求1 范围界定：**无 Routing**（RoutingDependencies==0）= 无 APS 路由可反查的 StageLeadTimeParam 降级域，
+    /// 即使中间态选出了工序（前道完工、后道未开工），也**不吐 StartOperationName**（保持原样），码同样为 null。
+    /// </summary>
+    [Test]
+    public async Task NoRouting_ShouldNotEmitStartOperationName()
+    {
+        var input = new ProductionInstructionPositionInput
+        {
+            ProductionInstructionNo = "PI-NOROUTE-001",
+            MaterialId = 1020,
+            MaterialCode = "MAT-NOROUTE",
+            FactoryId = 1,
+            FactoryCode = "CN",
+            ErpRemainingQty = 27m,
+            StageProgress = new[]
+            {
+                new StageProgressFact { StageCode = "CN_ASSY", StageSequence = 1, GoodCompletedQty = 27m, SnapshotId = 1 }
+            },
+            OperationProgress = new[]
+            {
+                // 与"有 Routing、前沿为空"完全相同的中间态，唯一差别是**没有 Routing 数据**
+                new OperationProgressFact
+                {
+                    OperationCode = "OP-A", OperationName = "活塞挤压", StageCode = "CN_ASSY",
+                    MESWorkOrderNo = "WO-001", PlannedQty = 27m, GoodQty = 27m, RemainingQty = 0m
+                },
+                new OperationProgressFact
+                {
+                    OperationCode = "OP-B", OperationName = "组装", StageCode = "CN_ASSY",
+                    MESWorkOrderNo = "WO-001", PlannedQty = 27m, GoodQty = 0m, RemainingQty = 27m
+                }
+            },
+            // 无 RoutingOperations / RoutingDependencies
+            WorkOrders = new[]
+            {
+                new WorkOrderSnapshotFact
+                {
+                    ProductionInstructionNo = "PI-NOROUTE-001", MESWorkOrderNo = "WO-001",
+                    MaterialCode = "MAT-NOROUTE", PlannedQty = 27m,
+                    WorkOrderStatus = "IN_PROGRESS", DataCutoffTime = DateTime.UtcNow
+                }
+            },
+            StagePath = new[]
+            {
+                new StagePathFact { StageCode = "CN_ASSY", StageSequence = 1, IsStartStage = true }
+            }
+        };
+
+        var results = await _calculator.CalculateProductionInstructionPositionsAsync(new[] { input }, new FrozenFactParameters(), CancellationToken.None);
+        var result = results.First();
+
+        var ctx = result.ExistingExecutionContexts.Single();
+        Assert.That(ctx.StartOperationCode, Is.Null);
+        Assert.That(ctx.StartOperationName, Is.Null); // 无 Routing 不吐名（保持原样）
+
+        var slice = ctx.Slices.Single();
+        Assert.That(slice.StartOperationCode, Is.Null);
+        Assert.That(slice.StartOperationName, Is.Null);
+    }
 }
 

@@ -368,14 +368,19 @@ public class ExecutionBatchDraftTests
                 PiQuantity = 100m, PiReceivedQty = 20m, PiRemainingQty = 80m
             }
         };
+        // V1_3 F-02：Stage 合法自由量是**独立**事实（不得以 PiRemainingQty 冒充）⇒ 必须显式给上下文。
+        var stageCtx = new PhaseTwoInitialScheduler.PiStageQuantityContext(
+            ProductionInstructionNo: "PI-1", MaterialId: MaterialId,
+            StageCode: "STAGE1", StageFreeEligibleQty: 80m);
         var legal = PhaseTwoInitialScheduler.FormExecutionBatches(
-            Demand(netQty: 30m, piNo: "PI-1"), policy: null, piFacts: facts);
+            Demand(netQty: 30m, piNo: "PI-1"), policy: null, piFacts: facts, piStageContext: stageCtx);
         Assert.True(legal.IsLegal, legal.ConflictReason);
         var single = Assert.Single(legal.Batches);
         Assert.Equal(30m, single.NetOutputQty);
         Assert.Equal(30m, single.PlannedProcessQty);
 
         // ④ Q_C 超出 PI 权威剩余量 ⇒ 显式记录未满足，不静默截断
+        //   ⚠ Stage 自由量给**足**（80）⇒ 越限只可能来自 PI 量限本身，本用例才**判别在数量**上。
         var shortFacts = new[]
         {
             new PiRemainingFact
@@ -385,10 +390,11 @@ public class ExecutionBatchDraftTests
             }
         };
         var over = PhaseTwoInitialScheduler.FormExecutionBatches(
-            Demand(netQty: 30m, piNo: "PI-1"), policy: null, piFacts: shortFacts);
+            Demand(netQty: 30m, piNo: "PI-1"), policy: null, piFacts: shortFacts, piStageContext: stageCtx);
         Assert.False(over.IsLegal);
         Assert.True(over.IsPiContractPending);
         Assert.Empty(over.Batches);
+        Assert.Contains("PI_LEGAL_QTY_OVER_LIMIT", over.ConflictReason);
 
         // ⑤ 配置存在但无效（Min>Max）⇒ 不得冒充「无匹配」⇒ 不适用兜底
         var invalid = PhaseTwoInitialScheduler.FormExecutionBatches(

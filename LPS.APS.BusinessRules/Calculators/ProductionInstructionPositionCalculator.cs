@@ -1286,6 +1286,7 @@ public class ProductionInstructionPositionCalculator : IProductionInstructionPos
                             {
                                 StartStageCode = startStageCode,
                                 StartOperationCode = f.OpCode,
+                                StartOperationName = f.OpName,
                                 SliceQty = progressOp.RemainingQty,
                                 LastReportResourceCode = progressOp.LastReportResourceCode
                             });
@@ -1316,6 +1317,7 @@ public class ProductionInstructionPositionCalculator : IProductionInstructionPos
                 {
                     StartStageCode = startStageCode,
                     StartOperationCode = null,
+                    StartOperationName = null, // 无工序进度数据：无名可取
                     SliceQty = stageSliceQty,
                     LastReportResourceCode = null,
                     IssueCode = stageFact == null ? "UNLOCATED_STAGE" : (hasIssue ? "STAGE_ONLY" : null)
@@ -1332,6 +1334,7 @@ public class ProductionInstructionPositionCalculator : IProductionInstructionPos
                     {
                         StartStageCode = s.StartStageCode,
                         StartOperationCode = s.StartOperationCode,
+                        StartOperationName = s.StartOperationName,
                         SliceQty = capped,
                         LastReportResourceCode = s.LastReportResourceCode,
                         IssueCode = s.IssueCode
@@ -1341,6 +1344,7 @@ public class ProductionInstructionPositionCalculator : IProductionInstructionPos
             // 兼容投影：工单级单值字段 = 唯一 Slice 镜像（N=1）；N>1 时为 null + 总量
             var derivedRemainingQty = slices.Sum(s => s.SliceQty);
             var startOperationCode = slices.Count == 1 ? slices[0].StartOperationCode : null;
+            var startOperationName = slices.Count == 1 ? slices[0].StartOperationName : null;
             var lastReportResourceCode = slices.Count == 1 ? slices[0].LastReportResourceCode
                 : slices.LastOrDefault()?.LastReportResourceCode;
 
@@ -1358,6 +1362,7 @@ public class ProductionInstructionPositionCalculator : IProductionInstructionPos
                 WorkOrderStatus = wo.WorkOrderStatus,
                 StartStageCode = startStageCode,
                 StartOperationCode = startOperationCode,
+                StartOperationName = startOperationName,
                 ProductionDepartmentId = productionDepartmentId,
                 RouteCode = routeCode,
                 PathId = null,
@@ -1397,6 +1402,10 @@ public class ProductionInstructionPositionCalculator : IProductionInstructionPos
         var slices = new List<ExistingExecutionSliceDto>();
         var remainingOps = operations.Where(op => op.RemainingQty > 0).ToList();
 
+        // 诉求1 恢复的范围界定：只有存在 APS Routing 时，工序名才有反查意义（"有 Routing、前沿为空"形态）。
+        // 无 Routing（RoutingDependencies==0）= 无 APS 路由可反查的 StageLeadTimeParam 降级域 ⇒ 不吐名、保持原样。
+        bool emitOperationName = input.RoutingDependencies.Count > 0;
+
         if (remainingOps.Count == 0)
         {
             // 工序层全部完成，但 Stage 层可能仍有剩余 → Stage 级兜底
@@ -1407,6 +1416,7 @@ public class ProductionInstructionPositionCalculator : IProductionInstructionPos
             {
                 StartStageCode = startStageCode ?? string.Empty,
                 StartOperationCode = null,
+                StartOperationName = null, // Stage 级兜底：无剩余工序名（形态②）
                 SliceQty = AllocateStageRemaining(stageFact, wo, totalPlannedQty, workOrderCount, erpFallbackTotal),
                 LastReportResourceCode = operations.LastOrDefault()?.LastReportResourceCode,
                 IssueCode = stageFact == null ? "UNLOCATED_STAGE" : null
@@ -1421,6 +1431,7 @@ public class ProductionInstructionPositionCalculator : IProductionInstructionPos
             {
                 StartStageCode = startStageCode ?? string.Empty,
                 StartOperationCode = null, // 中间态手上只有 OperationName，无 APS 码；由 2号位 按 RouteCode+名 反查（v1.7）
+                StartOperationName = emitOperationName ? frontier.OperationName : null, // 诉求1：仅"有 Routing、前沿为空"时吐名供反查
                 SliceQty = frontier.RemainingQty,
                 LastReportResourceCode = frontier.LastReportResourceCode
             });
@@ -1437,6 +1448,7 @@ public class ProductionInstructionPositionCalculator : IProductionInstructionPos
             {
                 StartStageCode = startStageCode ?? string.Empty,
                 StartOperationCode = null, // 同上，中间态无 APS 码
+                StartOperationName = emitOperationName ? frontier.OperationName : null, // 同上，仅"有 Routing"吐名
                 SliceQty = frontier.RemainingQty,
                 LastReportResourceCode = frontier.LastReportResourceCode
             });
@@ -1452,6 +1464,7 @@ public class ProductionInstructionPositionCalculator : IProductionInstructionPos
                 {
                     StartStageCode = startStageCode ?? string.Empty,
                     StartOperationCode = null, // 中间态无 APS 码
+                    StartOperationName = emitOperationName ? f.OperationName : null, // 各 Slice 各带各的名（仅"有 Routing"）
                     SliceQty = f.RemainingQty,
                     LastReportResourceCode = f.LastReportResourceCode
                 });
@@ -1466,6 +1479,7 @@ public class ProductionInstructionPositionCalculator : IProductionInstructionPos
         {
             StartStageCode = startStageCode ?? string.Empty,
             StartOperationCode = null,
+            StartOperationName = null, // 无法唯一定位 → 不传名（避免误导反查）
             SliceQty = remainingOps.Sum(op => op.RemainingQty),
             LastReportResourceCode = frontierCandidates.LastOrDefault()?.LastReportResourceCode
                 ?? operations.LastOrDefault()?.LastReportResourceCode,

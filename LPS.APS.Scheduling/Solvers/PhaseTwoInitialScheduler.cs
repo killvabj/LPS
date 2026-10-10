@@ -1733,12 +1733,17 @@ internal class PhaseTwoInitialScheduler
     /// ② 该资源上的窗**互不重叠**（⇒ `End` 随 `Start` 非降）—— 由「找槽只在空档落位」
     ///    与「Merge 先冲突检查再改写」保证；读取端据此才敢整体跳过某段前缀。
     /// ⚠ Phase4 自建占用表、自用其 slot finder，**不在本变更范围**（其占比仅 3.5%）。
+    /// ── 2026-10-10 V1_3 F-01 整改（0号位 裁决 F-01）──
+    /// 「有序插入」意味着**新窗可能落在列表中间**（倒排 / 合批落定即如此），因此**按数量截尾的回滚是错的**。
+    /// 本方法新增可选 <paramref name="insertLog"/>：每次成功插入后登记 `(资源, 窗)` **身份**，
+    /// 供 <see cref="RollbackInsertedOccupancyWindows"/> **按身份**精确撤销（见其注释）。
     /// </summary>
-    private static void AddOccupancyWindow(
+    internal static void AddOccupancyWindow(
         Dictionary<int, List<TimeWindow>> occupancy,
         Dictionary<int, List<TimeWindow>>? pristine,
         int resourceId,
-        TimeWindow window)
+        TimeWindow window,
+        List<(int ResourceId, TimeWindow Window)>? insertLog = null)
     {
         EnsureOwned(occupancy, pristine, resourceId);
 
@@ -1752,6 +1757,9 @@ internal class PhaseTwoInitialScheduler
             else hi = mid;
         }
         list.Insert(lo, window);
+
+        // F-01：登记插入**身份**（不是位置、不是数量）——回滚只认这一条，绝不截尾。
+        insertLog?.Add((resourceId, window));
     }
 
     /// <summary>合批份额深拷贝（候选试排隔离用）。</summary>
@@ -1782,7 +1790,8 @@ internal class PhaseTwoInitialScheduler
         DateTime dynamicMaterialFloor,
         StageOverlapParams stageOverlap,
         string? batchDraftKey = null,
-        Dictionary<int, List<TimeWindow>>? occupancyPristine = null)   // 2026-10-08 COW：透传给写占用表的工序
+        Dictionary<int, List<TimeWindow>>? occupancyPristine = null,   // 2026-10-08 COW：透传给写占用表的工序
+        List<(int ResourceId, TimeWindow Window)>? occupancyInsertLog = null)   // 2026-10-10 V1_3 F-01：插入身份日志（透传给写占用表的工序）
     {
         var tasks = new List<FinalTaskDraft>();
 
@@ -1821,30 +1830,30 @@ internal class PhaseTwoInitialScheduler
 
         if (direction == "BACKWARD")
         {
-            tasks = ScheduleBackward(demand, operations, routingGraph, constraints, resourceOccupancy, planningStart, planningEnd, dynamicMaterialFloor, stageOverlap, batchDraftKey, occupancyPristine);
+            tasks = ScheduleBackward(demand, operations, routingGraph, constraints, resourceOccupancy, planningStart, planningEnd, dynamicMaterialFloor, stageOverlap, batchDraftKey, occupancyPristine, occupancyInsertLog);
         }
         else if (direction == "FORWARD")
         {
-            tasks = ScheduleForward(demand, operations, routingGraph, constraints, resourceOccupancy, planningStart, planningEnd, dynamicMaterialFloor, stageOverlap, batchDraftKey, occupancyPristine);
+            tasks = ScheduleForward(demand, operations, routingGraph, constraints, resourceOccupancy, planningStart, planningEnd, dynamicMaterialFloor, stageOverlap, batchDraftKey, occupancyPristine, occupancyInsertLog);
         }
         else if (direction == "MIXED")
         {
             // MIXED：先尝试倒排，失败则转正排（§八 8.3 Mixed模式）。
             //   本分支**只**服务显式 MIXED；`AUTO` 已在上方按 B-005 自决为具体方向或（信号冲突时）MIXED。
-            tasks = ScheduleBackward(demand, operations, routingGraph, constraints, resourceOccupancy, planningStart, planningEnd, dynamicMaterialFloor, stageOverlap, batchDraftKey, occupancyPristine);
+            tasks = ScheduleBackward(demand, operations, routingGraph, constraints, resourceOccupancy, planningStart, planningEnd, dynamicMaterialFloor, stageOverlap, batchDraftKey, occupancyPristine, occupancyInsertLog);
             if (tasks.Count == 0)
             {
-                tasks = ScheduleForward(demand, operations, routingGraph, constraints, resourceOccupancy, planningStart, planningEnd, dynamicMaterialFloor, stageOverlap, batchDraftKey, occupancyPristine);
+                tasks = ScheduleForward(demand, operations, routingGraph, constraints, resourceOccupancy, planningStart, planningEnd, dynamicMaterialFloor, stageOverlap, batchDraftKey, occupancyPristine, occupancyInsertLog);
             }
         }
         else
         {
             // 未知 Direction：2号位 投影侧 `SolverStrategyModeMap.ToDirection` 已对未知枚举防御为 "BACKWARD"，
             // 故此处理论不可达；万一到达，保持历史行为（等效 MIXED），**不改变结果**。
-            tasks = ScheduleBackward(demand, operations, routingGraph, constraints, resourceOccupancy, planningStart, planningEnd, dynamicMaterialFloor, stageOverlap, batchDraftKey, occupancyPristine);
+            tasks = ScheduleBackward(demand, operations, routingGraph, constraints, resourceOccupancy, planningStart, planningEnd, dynamicMaterialFloor, stageOverlap, batchDraftKey, occupancyPristine, occupancyInsertLog);
             if (tasks.Count == 0)
             {
-                tasks = ScheduleForward(demand, operations, routingGraph, constraints, resourceOccupancy, planningStart, planningEnd, dynamicMaterialFloor, stageOverlap, batchDraftKey, occupancyPristine);
+                tasks = ScheduleForward(demand, operations, routingGraph, constraints, resourceOccupancy, planningStart, planningEnd, dynamicMaterialFloor, stageOverlap, batchDraftKey, occupancyPristine, occupancyInsertLog);
             }
         }
 
@@ -1866,7 +1875,8 @@ internal class PhaseTwoInitialScheduler
         DateTime dynamicMaterialFloor,
         StageOverlapParams stageOverlap,
         string? batchDraftKey = null,
-        Dictionary<int, List<TimeWindow>>? occupancyPristine = null)   // 2026-10-08 COW：透传
+        Dictionary<int, List<TimeWindow>>? occupancyPristine = null,   // 2026-10-08 COW：透传
+        List<(int ResourceId, TimeWindow Window)>? occupancyInsertLog = null)   // 2026-10-10 V1_3 F-01：插入身份日志（透传）
     {
         var tasks = new List<FinalTaskDraft>();
         var currentEndTime = constraints.EffectiveDue(demand);   // M5 第一批：倒排锚用覆盖交期
@@ -2005,7 +2015,7 @@ internal class PhaseTwoInitialScheduler
                     // 更新资源占用：从Setup开始到End结束
                     // 2026-10-08 COW + 有序插入：先脱钩，再按 Start 二分定位插入（维持读端可二分的不变式）
                     AddOccupancyWindow(resourceOccupancy, occupancyPristine, resourceId,
-                        new TimeWindow(foundSlot.Value.Start, foundSlot.Value.End));
+                        new TimeWindow(foundSlot.Value.Start, foundSlot.Value.End), occupancyInsertLog);
                     constraints.ProductTimeline.Place(resourceId, foundSlot.Value.End, demand.MaterialId);
 
                     // P0-17修复：应用Routing LagTime到前序工序的结束时间约束
@@ -2051,7 +2061,8 @@ internal class PhaseTwoInitialScheduler
         DateTime dynamicMaterialFloor,
         StageOverlapParams stageOverlap,
         string? batchDraftKey = null,
-        Dictionary<int, List<TimeWindow>>? occupancyPristine = null)   // 2026-10-08 COW：透传
+        Dictionary<int, List<TimeWindow>>? occupancyPristine = null,   // 2026-10-08 COW：透传
+        List<(int ResourceId, TimeWindow Window)>? occupancyInsertLog = null)   // 2026-10-10 V1_3 F-01：插入身份日志（透传）
     {
         var tasks = new List<FinalTaskDraft>();
 
@@ -2202,7 +2213,7 @@ internal class PhaseTwoInitialScheduler
 
                     // 资源占用从Setup开始
                     // 2026-10-08 COW + 有序插入（正排写点；天然追加到末尾 ⇒ 退化为 O(1)）
-                    AddOccupancyWindow(resourceOccupancy, occupancyPristine, resourceId, occSlot);
+                    AddOccupancyWindow(resourceOccupancy, occupancyPristine, resourceId, occSlot, occupancyInsertLog);
                     constraints.ProductTimeline.Place(resourceId, occSlot.End, demand.MaterialId);
 
                     // 第4轮C2修复：记录该Operation的实际完成时间，供后续工序使用
@@ -2944,6 +2955,129 @@ internal class PhaseTwoInitialScheduler
     }
 
     /// <summary>
+    /// V1_3 F-02/F-03：**PI 合法量门禁的消费形状**（1号位 消费点）。
+    ///
+    ///   B-009 合法量 = `min(配置 Max, `**`PI Original`**`, `**`PI Remaining`**`, `**`StageFreeEligibleQty − 同PI同Stage已占量`**`)`。
+    ///   其中前两项可由 <see cref="PiRemainingFact"/> 直接得到；**后两项只有上游能给**，由本记录承载：
+    ///     · <see cref="StageFreeEligibleQty"/> —— 该 (PI × Stage) 的 **Stage 合法自由可用量**；
+    ///     · <see cref="AlreadyCommittedQty"/> —— **同 PI 同 Stage 已承诺 / 已形成批**的累计量（累计口径）。
+    ///
+    ///   ⚠ 裁决 F-02 明文：**不得以 `PiRemainingFact.PiRemainingQty` 冒充 `StageFreeEligibleQty`**
+    ///     —— 前者是 PI 层面的剩余量，与「Stage 合法自由量」是**两个不同的量**，混用会静默放大可用量。
+    ///   ⚠ 本记录是 1号位 侧的**消费形状**：**不是**新实体、**不是**新表、**不新增/修改任何 Core 契约字段**
+    ///     （字段形态由 Owner 按既有 1↔2 合同收口；装载归 2号位 / 5号位，见 AUD-1-D04）。
+    /// </summary>
+    public sealed record PiStageQuantityContext(
+        string ProductionInstructionNo,
+        int MaterialId,
+        string StageCode,
+        decimal StageFreeEligibleQty,
+        decimal AlreadyCommittedQty = 0m);
+
+    /// <summary>
+    /// V1_3 F-02/F-03：**B-009 统一合法量门禁**（1号位 消费点，批形成前执行）。
+    ///
+    /// 返回 `null` ⇒ 通过（或本需求**无明确 PI 来源** ⇒ B-009 的 PI 量限**不适用**）。
+    /// 返回非 `null` ⇒ 拒绝原因 —— 调用方按既有「显式未满足 / 契约问题」机制 Fail Closed，**不得静默截断 Q**。
+    ///
+    /// 判定顺序（任一不满足即拒，且**不猜测、不取首条**）：
+    ///   ① **PI 权威行必须唯一** —— 0 行 = 事实缺失；≥2 行 = **来源不唯一**（裁决 F-02「来源不唯一」）。
+    ///      旧实现 `break` 取首条，会在多行时**静默选定一条**（本次整改点）。
+    ///   ② **Stage 位置必须可信** —— 上下文缺失 / PI 或物料不匹配 / `StageCode` 为空
+    ///      ⇒ **位置未知**，显式未满足（裁决 F-02「位置未知须显式未满足」）。
+    ///   ③ 合法量 = `min(PI Original, PI Remaining, StageFreeEligibleQty − 已占量, 配置 Max)`；
+    ///      需求量 **严格大于** 合法量 ⇒ 越限（**边界相等合法**，且**绝不静默截断到合法量**）。
+    ///
+    /// ⚠ 本方法**不读** <c>Policy.MaxExecutionBatchQty</c> 之外的任何业务旧列，也不以任何默认值顶替缺失量。
+    /// </summary>
+    internal static string? EvaluatePiLegalQuantityGate(
+        decimal quantity,
+        string? productionInstructionNo,
+        int materialId,
+        IReadOnlyList<PiRemainingFact>? piFacts,
+        PiStageQuantityContext? stageContext,
+        decimal? configuredMax)
+    {
+        // 无明确 PI 来源 ⇒ B-009 的 PI 量限不适用（与 B-010 末句「无明确 PI 来源不适用该兜底」同向）。
+        if (string.IsNullOrWhiteSpace(productionInstructionNo)) return null;
+        if (quantity <= 0m) return null;
+
+        var piNo = productionInstructionNo!;
+
+        // ── ① 唯一性：禁止取首条 ──
+        PiRemainingFact? unique = null;
+        var matched = 0;
+        if (piFacts is not null)
+        {
+            foreach (var f in piFacts)
+            {
+                if (string.Equals(f.ProductionInstructionNo, piNo, StringComparison.Ordinal)
+                    && f.MaterialId == materialId)
+                {
+                    matched++;
+                    unique ??= f;
+                }
+            }
+        }
+
+        if (matched == 0)
+        {
+            return $"PI_LEGAL_QTY_CONTRACT_PENDING：需求 PI={piNo} × 物料 {materialId} 在求解输入中找不到 PI 权威行"
+                 + "（PI Original / PI Remaining 不可得）⇒ 无法判定合法量，显式未满足";
+        }
+
+        if (matched > 1)
+        {
+            return $"PI_LEGAL_QTY_CONTRACT_PENDING：需求 PI={piNo} × 物料 {materialId} 匹配到 {matched} 行 PI 权威事实"
+                 + "⇒ 来源**不唯一**，不得任取其一，显式未满足";
+        }
+
+        var pi = unique!;
+
+        // ── ② Stage 位置可信性 ──
+        if (stageContext is null)
+        {
+            return $"PI_LEGAL_QTY_CONTRACT_PENDING：需求 PI={piNo} × 物料 {materialId} 缺 Stage 合法自由量上下文"
+                 + "⇒ **位置未知**，不得以 PI Remaining 冒充 Stage 自由量（F-02），显式未满足";
+        }
+
+        if (!string.Equals(stageContext.ProductionInstructionNo, piNo, StringComparison.Ordinal)
+            || stageContext.MaterialId != materialId)
+        {
+            return "PI_LEGAL_QTY_CONTRACT_PENDING：Stage 合法自由量上下文与需求不匹配"
+                 + $"（上下文 PI={stageContext.ProductionInstructionNo} × 物料 {stageContext.MaterialId}，"
+                 + $"需求 PI={piNo} × 物料 {materialId}）⇒ 位置不可信，显式未满足";
+        }
+
+        if (string.IsNullOrWhiteSpace(stageContext.StageCode))
+        {
+            return $"PI_LEGAL_QTY_CONTRACT_PENDING：需求 PI={piNo} 的 Stage 合法自由量**缺 StageCode**"
+                 + "⇒ 位置未知，显式未满足";
+        }
+
+        // ── ③ 合法量 = min(配置 Max, PI Original, PI Remaining, StageFree − 同PI同Stage已占) ──
+        var stageFree = stageContext.StageFreeEligibleQty - stageContext.AlreadyCommittedQty;
+        if (stageFree < 0m) stageFree = 0m;
+
+        var cap = pi.PiQuantity;
+        if (pi.PiRemainingQty < cap) cap = pi.PiRemainingQty;
+        if (stageFree < cap) cap = stageFree;
+        if (configuredMax.HasValue && configuredMax.Value < cap) cap = configuredMax.Value;
+
+        if (quantity > cap)
+        {
+            return $"PI_LEGAL_QTY_OVER_LIMIT：需求量 {quantity} 超出合法可用量 {cap}"
+                 + $"（= min(PI Original {pi.PiQuantity}, PI Remaining {pi.PiRemainingQty},"
+                 + $" Stage 合法自由 {stageFree}［Stage {stageContext.StageCode}：自由 {stageContext.StageFreeEligibleQty}"
+                 + $" − 同PI同Stage已占 {stageContext.AlreadyCommittedQty}］"
+                 + (configuredMax.HasValue ? $", 配置 Max {configuredMax.Value}" : string.Empty)
+                 + "））⇒ 按 B-009/B-010 显式记录未满足，**不静默截断 Q**";
+        }
+
+        return null;
+    }
+
+    /// <summary>
     /// 执行批形成（P0-01/P0-02）—— 0号位 指定链路的第一环：`Free Slice → Batch Policy → 1..N ExecutionBatchDraft`。
     ///
     /// 硬约束（任何策略都不得推翻）：
@@ -2963,7 +3097,8 @@ internal class PhaseTwoInitialScheduler
     public static ExecutionBatchFormation FormExecutionBatches(
         LogicalProductionDemand demand,
         BatchPolicyRuleSnapshot? policy,
-        IReadOnlyList<PiRemainingFact>? piFacts = null)   // AUD-1-006 / B-010：PI 权威剩余事实（**当前调用方未投影 ⇒ null**，见 AUD-1-D04）
+        IReadOnlyList<PiRemainingFact>? piFacts = null,        // AUD-1-006 / B-010：PI 权威事实（**当前调用方未投影 ⇒ null**，见 AUD-1-D04）
+        PiStageQuantityContext? piStageContext = null)          // V1_3 F-02/F-03：Stage 合法自由量上下文（**当前调用方未投影 ⇒ null**）
     {
         var plan = DecideExecutionBatchPlan(demand, policy);
         if (!plan.IsLegal)
@@ -2977,7 +3112,7 @@ internal class PhaseTwoInitialScheduler
             //     的 `BATCH_POLICY_CONFLICT` 一律走原路径，不适用兜底。
             if (plan.IsMissingPolicy)
             {
-                var b010 = TryFormConservativePiBatch(demand, piFacts);
+                var b010 = TryFormConservativePiBatch(demand, piFacts, piStageContext);
                 if (b010 is not null)
                 {
                     return b010;
@@ -2990,7 +3125,53 @@ internal class PhaseTwoInitialScheduler
                 : ExecutionBatchFormation.Conflict(plan.ConflictReason!);
         }
 
-        return BuildBatchFormation(demand, policy, plan.Count, validateDomain: true);
+        // V1_3 F-03：正常 Policy 路径同样过 B-009 统一合法量门禁（不再只给 B-010 兜底装门禁）。
+        return ApplyPiLegalQuantityGate(
+            demand, policy, piFacts, piStageContext,
+            BuildBatchFormation(demand, policy, plan.Count, validateDomain: true));
+    }
+
+    /// <summary>
+    /// V1_3 F-03：把 B-009 合法量门禁套到**正常 Policy 路径**产出的批上。
+    ///
+    /// 【为什么「输入已投影」才强制、「输入未投影」不拦截】
+    ///   `piFacts is null` ⇒ B-009 的输入（PI Original / PI Remaining）**整体未投影进求解** ⇒ 门禁**不可评估**。
+    ///   此时按 Fail Closed 会把**每一条 PI 来源需求**都拦下 ⇒ 求解器产出 0 Task ——
+    ///   这不是任何冻结文档要求的规则，而是**发明**一条新失败模式（0号位 §8「不要求重新冻结业务」）。
+    ///   ⇒ 未投影时**不拦截**，但用 <see cref="SolverDiagnostics"/> 计数器**显式登记缺口**（可观测、不静默）。
+    ///   反之，**输入一旦投影，门禁即强制**：唯一性 / Stage 位置 / 合法量任一不满足 ⇒ Fail Closed。
+    ///   ⚠ 本口径已在回执中如实声明：生产态该门禁**当前不可达**（调用点传 `piFacts: null`），
+    ///     缺口归 2号位 装载（AUD-1-D04），1号位 **不宣称** B-009 生产态已达标（不降目标、如实陈述）。
+    /// </summary>
+    private static ExecutionBatchFormation ApplyPiLegalQuantityGate(
+        LogicalProductionDemand demand,
+        BatchPolicyRuleSnapshot? policy,
+        IReadOnlyList<PiRemainingFact>? piFacts,
+        PiStageQuantityContext? stageContext,
+        ExecutionBatchFormation formation)
+    {
+        if (!formation.IsLegal) return formation;
+
+        if (piFacts is null)
+        {
+            SolverDiagnostics.CountPiLegalQuantityGateUnevaluated();
+            return formation;
+        }
+
+        decimal total = 0m;
+        foreach (var b in formation.Batches)
+        {
+            total += b.NetOutputQty;
+        }
+
+        var reason = EvaluatePiLegalQuantityGate(
+            total, demand.ProductionInstructionNo, demand.MaterialId,
+            piFacts, stageContext, policy?.MaxExecutionBatchQty);
+
+        if (reason is null) return formation;
+
+        SolverDiagnostics.CountPiLegalQuantityGateBlocked();
+        return ExecutionBatchFormation.Conflict(reason);
     }
 
     /// <summary>
@@ -3015,11 +3196,21 @@ internal class PhaseTwoInitialScheduler
     ///   ⇒ 返回 <see cref="ExecutionBatchFormation.PiQuantityContractPending"/>，把原因精确登记为
     ///     **契约待核**（而非笼统的 `BATCH_POLICY_MISSING`），并维持 Fail Closed。
     ///
+    /// ── 2026-10-10 V1_3 F-02 整改（0号位 裁决 F-02）──
+    ///   旧实现的两处缺陷已修：
+    ///     · **取首条**：`foreach … break` 在多行匹配时**静默选定一条** ⇒ 改为**唯一性强制**（≥2 行即拒）；
+    ///     · **以 `PiRemainingQty` 冒充 Stage 自由量**：旧实现只卡 `PiRemainingQty`，且注释把
+    ///       「Stage 合法自由量」直接等同于 PI 剩余量 ⇒ 改为消费**独立的**
+    ///       <see cref="PiStageQuantityContext.StageFreeEligibleQty"/>（**不得混用**），
+    ///       并纳入 **PI Original** 与**同 PI 同 Stage 已占量**（B-009 完整四元量限）。
+    ///   ⇒ 判定统一收敛到 <see cref="EvaluatePiLegalQuantityGate"/>（B-009 与 B-010 共用同一门禁）。
+    ///
     /// 返回 `null` ⇒ **不适用**该兜底（无明确 PI 来源 / 非正数量）⇒ 调用方走原 `BATCH_POLICY_MISSING`。
     /// </summary>
     private static ExecutionBatchFormation? TryFormConservativePiBatch(
         LogicalProductionDemand demand,
-        IReadOnlyList<PiRemainingFact>? piFacts)
+        IReadOnlyList<PiRemainingFact>? piFacts,
+        PiStageQuantityContext? piStageContext)
     {
         // 前置①：唯一明确真实 MTS PI 来源（无 PI 来源 ⇒ 不适用兜底，走原 Fail Closed）
         if (string.IsNullOrWhiteSpace(demand.ProductionInstructionNo))
@@ -3034,36 +3225,19 @@ internal class PhaseTwoInitialScheduler
             return null;
         }
 
-        // 前置③：PI 权威剩余量事实（**当前调用方未投影 ⇒ 恒 null**，AUD-1-D04）
-        PiRemainingFact? piFact = null;
-        if (piFacts is not null)
-        {
-            foreach (var f in piFacts)
-            {
-                if (string.Equals(f.ProductionInstructionNo, demand.ProductionInstructionNo, StringComparison.Ordinal)
-                    && f.MaterialId == demand.MaterialId)
-                {
-                    piFact = f;
-                    break;
-                }
-            }
-        }
+        // 前置③：**唯一真实 MTS PI 来源 + Stage 合法自由量可靠** —— 收敛到 V1_3 统一门禁判定
+        //   （唯一性 / Stage 位置可信 / 合法量 = min(PI Original, PI Remaining, StageFree − 同PI同Stage已占)）。
+        //   B-010 兜底**不伪造** Min/Max/Preferred ⇒ `configuredMax: null`（不得把配置上限当兜底上限）。
+        var reason = EvaluatePiLegalQuantityGate(
+            qc, demand.ProductionInstructionNo, demand.MaterialId,
+            piFacts, piStageContext, configuredMax: null);
 
-        if (piFact is null)
+        if (reason is not null)
         {
             return ExecutionBatchFormation.PiQuantityContractPending(
                 "B010_PI_QUANTITY_CONTRACT_PENDING：C 桶需求在 Solver 输入中找不到有效 Batch Policy（BATCH_POLICY_MISSING），"
-                + "且 B-010 条件化保守兜底所需的前置③「Stage 合法自由量可靠」无法验证 —— "
-                + "PI 权威剩余量事实（PiRemainingFact.PiRemainingQty）**未投影进 DomainSolveRequest**"
-                + "（AUD-1-D04，归 2号位 装载）⇒ 不得凭空造批，维持 Fail Closed");
-        }
-
-        // 前置③成立：以 PI 权威剩余量约束 Q_C —— **不得扩大、不得静默截断**（B-010）。
-        if (qc > piFact.PiRemainingQty)
-        {
-            return ExecutionBatchFormation.PiQuantityContractPending(
-                $"B010_PI_QUANTITY_CONTRACT_PENDING：C 桶需求 Q_C={qc} 超出 PI {piFact.ProductionInstructionNo} "
-                + $"权威剩余量 {piFact.PiRemainingQty} ⇒ 按 B-010「超出合法可用量须显式记录未满足」，不静默截断，维持 Fail Closed");
+                + "且 B-010 条件化保守兜底所需的前置③「唯一真实 MTS PI 来源 + Stage 合法自由量可靠」未全部成立 —— "
+                + reason);
         }
 
         // 适用 ⇒ **一个** Stage 执行批候选（Q_C 原值，不伪造 Min/Max/Preferred、不额外优化拆合）。
@@ -3196,12 +3370,23 @@ internal class PhaseTwoInitialScheduler
     internal static SolverBatchBudget ResolveSolverBatchBudget(DomainSolveRequest? request)
     {
         var split = request?.StrategySnapshot?.SolverStrategy?.Split;
-        if (split is not null)
-        {
-            return SolverBatchBudget.FromSplitParams(split.MaxOptimizationSplitCount);
-        }
+        var budget = split is not null
+            ? SolverBatchBudget.FromSplitParams(split.MaxOptimizationSplitCount)
+            : SolverBatchBudget.VersionedSafeDefault;
 
-        return SolverBatchBudget.VersionedSafeDefault;
+        // ── V1_3 F-04：把**实际生效**的技术预算登记进 Run 快照（版本 / 取源 / 两个生效值）──
+        //   0号位 裁决 F-04：「记录 Solver 有效技术预算的 Run 快照 / 追踪证据；检验输入变化、默认和
+        //   业务旧列变化互不串联。」⇒ 本处是**唯一**解析点，写一次即代表本 Run 全量生效值。
+        //   ⚠ 只登记本对象（纯 `SolverDiagnostics`，非契约 DTO）⇒ 不新增表、不改契约、不要求重新冻结业务。
+        //   ⚠ 业务旧列（`BatchPolicyRuleSnapshot.MaxOptimizationSplitCount` / `MaxBatchCandidates`）
+        //     **不在**本路径上 ⇒ 改动它们不会改变本快照（B-007 单源可追溯，见 F-04 反证测试）。
+        SolverDiagnostics.RecordSolverBatchBudget(
+            SolverBatchBudget.BudgetVersion,
+            budget.Source,
+            budget.MaxOptimizationSplitCount,
+            budget.MaxBatchCandidates);
+
+        return budget;
     }
 
     /// <summary>
@@ -3936,6 +4121,18 @@ internal class PhaseTwoInitialScheduler
                 //   ⇒ **本轮不放宽**：放宽会把既有逐工序量**静默同质化**（重跑只带一个 `PlannedProcessQty`），
                 //     比保守不合批更坏。逐工序量要真实保留，需**逐工序数量载体**（1↔2 契约缺口，与 AUD-1-D04 同族）。
                 //     已登记为契约项，**不降目标**（不把「放宽后能合批」当作达标）。
+                //
+                // ── 2026-10-10 V1_3 F-05 更正（0号位《APS_V1_3_20261010.md》§3）──
+                //   复审判词：「保留真实逐工序量而不是凭本地等量构造推定本业务可验收。」
+                //   ⚠ **上段①不得被读作「本业务可验收」的证据**：
+                //     「1号位 产出的批构造上均匀 ⇒ 本判据对 V1 自身数据恒真」是**关于我们本地产物的陈述**，
+                //     **不是**「实施包 v1.7 :44『各 Operation 的实际剩余/预计加工量可因报工、良率等不同』
+                //     这一业务事实已被满足」的证明。把前者当后者 = 以**本地等量构造**推定**业务可验收**（F-05 所指）。
+                //   ⚠ 真实逐工序量在本设计下**无处承载**：`ExecutionBatchDraft` 只有**一个**
+                //     `PlannedProcessQty`（需求级），逐工序差异**没有载体** ⇒ 一旦上游喂入真实差异量，
+                //     本判据会把**合法批**保守排除 —— 这是**能力缺口**，不是「已通过」。
+                //   ⇒ 冻结要求**继续有效**（不降目标、不注销）：逐工序真实量的载体归 **1↔2 契约**
+                //     （2号位 装载 / 0号位 若需改契约则改契约），1号位 侧**不宣称**本项业务已达标。
                 if (t.Quantity != anchorTask.Quantity || t.PlannedProcessQty != anchorTask.PlannedProcessQty)
                 {
                     matched = false; break;
@@ -4299,32 +4496,37 @@ internal class PhaseTwoInitialScheduler
             }
         }
 
-        // ── AUD-1-003（0号位 2026-10-10《APS_V1_2_20261010.md》§3，P0/CONFIRMED）修复：**失败试排的全状态回滚** ──
-        //   缺陷：`ScheduleForward` / `ScheduleBackward` **每排下一道工序就立刻**写 `resourceOccupancy`
-        //     （`AddOccupancyWindow`）与 `ProductTimeline`（`Place`）；后续工序无槽即返回**空集合**。
-        //     旧实现在**真实表**上重跑，失败时只 `RestoreStageBatchSnapshot` 把原批加回，
-        //     **前序工序新增的占用/时间线登记被遗留** ⇒ 资源上出现「没有 Task 对应的幽灵占用」
-        //     （INV-CAL-001 CONFIRMED；后续需求看到虚假占用、被误判排不下）。
-        //   修法 = **水位回滚**。前提：本次重跑对占用表/时间线**只追加、从不删除**既有窗
-        //     （`ScheduleForward`/`ScheduleBackward` 的全部写入点均为 append；删窗只发生在
-        //      `TryMergeDemandIntoTask`，而它不被 `ScheduleDemandOperations` 调用）。
-        //     · 占用表：记录「每资源当前窗数」⇒ 失败即截断回水位、并移除试排新建的资源键；
-        //     · 产品时间线：试排前 `Clone()` 一份 ⇒ 失败即整体换回（`RestoreStageBatchSnapshot`
-        //       随后把被移出的原批时间线登记按原值 `Place` 回来）。
-        var occupancyWatermark = CaptureOccupancyWatermark(resourceOccupancy);
+        // ── V1_3 F-01（0号位 2026-10-10《APS_V1_3_20261010.md》§3，REWORK/BLOCKED）修复：**按插入身份回滚** ──
+        //   上轮（AUD-1-003）已建「失败试排全状态回滚」，但**回滚方式本身是错的**（本轮 F-01）：
+        //     旧实现记「每资源当前窗数」，失败时 `RemoveRange(count, Count-count)` **截尾**。
+        //     而占用表是**有序插入**（`AddOccupancyWindow` 二分定位）—— 倒排 / 合批落定会把新窗插进
+        //     列表**中间**；此时截尾删掉的是**列表尾部的旧合法窗**，试排新增的中间窗反而留下 ⇒
+        //     既产生幽灵占用（INV-CAL-001 依旧未消），又**丢失既有合法占用**（新缺陷，后果更重）。
+        //   修法 = **跟踪实际插入窗身份**（裁决 F-01 整改方向原话：「以快照精确还原或跟踪实际插入窗
+        //     身份删除，禁止继续只按数量截尾；保持时间排序与 COW 语义。」）：
+        //     · `occupancyInsertLog` 由 `AddOccupancyWindow` 逐次登记 `(资源, 窗)` **身份**；
+        //     · 失败 / 违约时 `RollbackInsertedOccupancyWindows` **逆序按值身份**精确移除；
+        //     · 资源键清理依据**试排前的键集**（`CaptureOccupancyResourceIds`），不再依赖窗数。
+        //   ⚠ 不把「COW 通常隔离试排」当作允许真实落定失败时残留状态的理由：真实落定路径
+        //     （`TryMergeDemandIntoStageBatch` 由 3611 行以**真实表**调用）非克隆，**必须**按身份回滚；
+        //     试排克隆表上回滚是无害的（克隆随即丢弃），保持同一代码路径以便联验。
+        var occupancyBaselineResourceIds = CaptureOccupancyResourceIds(resourceOccupancy);
+        var occupancyInsertLog = new List<(int ResourceId, TimeWindow Window)>();
         var timelineBeforeRerun = constraints.ProductTimeline.Clone();
 
         // ── 重跑完整排程：同一 Path、同一批键、完整 Operation 链 ──
         combinedTasks = ScheduleDemandOperations(
             combinedDemand, operations, routingGraph, direction, constraints,
             resourceOccupancy, planningStart, planningEnd, dynamicMaterialFloor, stageOverlap,
-            targetKey, occupancyPristine);
+            targetKey, occupancyPristine, occupancyInsertLog);
 
         // 失败 ⇒ 原样恢复（不留下任何半成品状态），回落独立排程。
         if (combinedTasks.Count == 0)
         {
-            // AUD-1-003：先清掉试排新增的占用/时间线（水位回滚），再恢复被移出的原批。
-            RollbackOccupancyToWatermark(resourceOccupancy, occupancyWatermark);
+            // V1_3 F-01：按插入身份精确撤销试排写入（含**中间插入**），再恢复被移出的原批。
+            SolverDiagnostics.CountOccupancyRollbackUnmatched(
+                RollbackInsertedOccupancyWindows(
+                    resourceOccupancy, occupancyBaselineResourceIds, occupancyInsertLog));
             constraints.ProductTimeline = timelineBeforeRerun;
             RestoreStageBatchSnapshot(
                 scheduledTasks, removedTasks, removedWindows, removedTimeline, removedShares,
@@ -4346,8 +4548,10 @@ internal class PhaseTwoInitialScheduler
         var worsensCurrent = dueCurrent != DateTime.MaxValue && combinedEnd > dueCurrent;
         if (worsensAnchor || worsensCurrent)
         {
-            // AUD-1-003：本路径的试排**已成功**（`combinedTasks` 非空）⇒ 其占用/时间线写入必须整体回滚。
-            RollbackOccupancyToWatermark(resourceOccupancy, occupancyWatermark);
+            // V1_3 F-01：本路径试排**已成功**（`combinedTasks` 非空）⇒ 其占用/时间线写入必须按身份整体回滚。
+            SolverDiagnostics.CountOccupancyRollbackUnmatched(
+                RollbackInsertedOccupancyWindows(
+                    resourceOccupancy, occupancyBaselineResourceIds, occupancyInsertLog));
             constraints.ProductTimeline = timelineBeforeRerun;
             RestoreStageBatchSnapshot(
                 scheduledTasks, removedTasks, removedWindows, removedTimeline, removedShares,
@@ -4460,44 +4664,92 @@ internal class PhaseTwoInitialScheduler
     }
 
     /// <summary>
-    /// AUD-1-003：占用表**新增窗水位** —— 记录每资源当前窗数，供失败试排精确回滚。
-    /// 前提：被观测的试排对占用表**只追加、从不删除既有窗**（见 <see cref="TryMergeDemandIntoStageBatch"/> 注释）。
+    /// V1_3 F-01：占用表**基线资源键集** —— 试排前记录已存在的资源键，供回滚判定「哪些键是试排新建的」。
+    /// ⚠ 旧实现（按「每资源窗数」记水位、回滚时截尾）**已被 0号位 裁决判为缺陷（F-01）**：
+    /// 有序插入会把新窗插到列表**中间**，按数量截尾会删掉**旧的合法窗**、留下**新窗幽灵**。
+    /// 现改为**按插入身份**回滚（见 <see cref="RollbackInsertedOccupancyWindows"/>），本方法只负责键集。
     /// </summary>
-    private static Dictionary<int, int> CaptureOccupancyWatermark(
+    internal static HashSet<int> CaptureOccupancyResourceIds(
         Dictionary<int, List<TimeWindow>> occupancy)
     {
-        var watermark = new Dictionary<int, int>(occupancy.Count);
-        foreach (var (resourceId, windows) in occupancy)
+        var ids = new HashSet<int>();
+        foreach (var resourceId in occupancy.Keys)
         {
-            watermark[resourceId] = windows.Count;
+            ids.Add(resourceId);
         }
-        return watermark;
+        return ids;
     }
 
     /// <summary>
-    /// AUD-1-003：把占用表回滚到 <see cref="CaptureOccupancyWatermark"/> 记录的水位。
-    ///   ① 水位中**没有**的资源键 = 试排新建 ⇒ 整键移除（回到「该资源无占用」的初态）；
-    ///   ② 水位中**有**的资源 = 既有 ⇒ 截断回原窗数（有序不变式天然保持）。
-    /// 调用方随后用 <see cref="RestoreStageBatchSnapshot"/> 把被移出的原批窗按原值加回。
+    /// V1_3 F-01：按**插入身份**精确回滚试排期间写入的占用窗。0号位 裁决 F-01 整改方向：
+    /// 「以快照精确还原或**跟踪实际插入窗身份删除**，禁止继续只按数量截尾；保持时间排序与 COW 语义。」
+    ///   · 逆序处理 <paramref name="insertLog"/>，每条按其 `(资源, 窗)` **值身份**在有序表中二分定位并移除；
+    ///     <see cref="TimeWindow"/> 是值结构，且同一资源上的窗**互不重叠** ⇒ 值身份即唯一身份，移除无歧义。
+    ///   · 逆序是必要的：同资源多次插入时后插的窗可能排在先插的窗之前，逆序保证每步都在「当前表」中命中。
+    ///   · 条目找不到 ⇒ 说明该窗并非本次插入（不应发生）⇒ **不静默跳过**：计入返回值供调用方观测，
+    ///     **绝不退化为「删别的窗来凑数」**。
+    ///   · 收尾：资源键**不在** <paramref name="baselineResourceIds"/> 中且已清空 ⇒ 整键移除（回到「该资源无占用」初态）；
+    ///     在基线中 ⇒ 保留空列表（调用方随后由 <see cref="RestoreStageBatchSnapshot"/> 把原批窗按原值加回）。
+    /// 有序不变式：全程只做「有序表内定位 + 移除」，不破坏 `Start` 升序。
     /// </summary>
-    private static void RollbackOccupancyToWatermark(
+    /// <returns>**未命中**（日志中的窗在表中不存在）的条目数 —— 正常恒为 0；非 0 说明有代码绕过本日志写占用表。</returns>
+    internal static int RollbackInsertedOccupancyWindows(
         Dictionary<int, List<TimeWindow>> occupancy,
-        Dictionary<int, int> watermark)
+        HashSet<int> baselineResourceIds,
+        List<(int ResourceId, TimeWindow Window)> insertLog)
     {
-        foreach (var resourceId in occupancy.Keys.ToList())
+        var unmatched = 0;
+        for (var i = insertLog.Count - 1; i >= 0; i--)
         {
-            if (!watermark.TryGetValue(resourceId, out var count))
+            var (resourceId, window) = insertLog[i];
+            if (!occupancy.TryGetValue(resourceId, out var windows))
             {
-                occupancy.Remove(resourceId);
+                unmatched++;
                 continue;
             }
 
-            var windows = occupancy[resourceId];
-            if (windows.Count > count)
+            var index = IndexOfWindow(windows, window);
+            if (index < 0)
             {
-                windows.RemoveRange(count, windows.Count - count);
+                unmatched++;
+                continue;
+            }
+
+            windows.RemoveAt(index);
+        }
+
+        foreach (var resourceId in occupancy.Keys.ToList())
+        {
+            if (occupancy[resourceId].Count == 0 && !baselineResourceIds.Contains(resourceId))
+            {
+                occupancy.Remove(resourceId);
             }
         }
+
+        return unmatched;
+    }
+
+    /// <summary>
+    /// 有序窗表中的**值身份**定位（`(Start, End)` 精确相等）；未命中返回 -1。二分，O(log W)。
+    /// ⚠ 下界条件必须是**严格**字典序 `<`（`w &lt; window` 才右移）。
+    ///   若写成 `&lt;=`（= 与 <see cref="AddOccupancyWindow"/> 的**插入**下界同形），遇到**相等**窗还会继续右移
+    ///   ⇒ 正好**越过**目标 ⇒ 永远返回 -1 ⇒ 回滚全部「未命中」而**一条也不撤销**
+    ///   （实测：V1_3 F-01 判别性单测 5 例中 4 例因此红，`unmatched == 日志条数`）。
+    ///   插入端用 `&lt;=` 是对的（等值窗插在其后、保持稳定），**查找端必须用 `&lt;`** —— 两端条件形状相似但语义相反。
+    /// </summary>
+    private static int IndexOfWindow(List<TimeWindow> windows, TimeWindow window)
+    {
+        int lo = 0, hi = windows.Count;
+        while (lo < hi)
+        {
+            var mid = (lo + hi) / 2;
+            var w = windows[mid];
+            if (w.Start < window.Start || (w.Start == window.Start && w.End < window.End)) lo = mid + 1;
+            else hi = mid;
+        }
+        return lo < windows.Count && windows[lo].Start == window.Start && windows[lo].End == window.End
+            ? lo
+            : -1;
     }
 
     /// <summary>

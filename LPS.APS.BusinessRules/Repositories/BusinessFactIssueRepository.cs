@@ -58,7 +58,15 @@ WHERE 1=1
     AND (@Severity IS NULL OR Severity = @Severity)
     AND (@ReviewStatus IS NULL OR ReviewStatus = @ReviewStatus)
     AND (@HasFactories = 0 OR COALESCE(ExpectedFactory, ActualFactory) IN @AllowedFactories)
-ORDER BY CreatedAt DESC
+ORDER BY
+    CASE Severity
+        WHEN 'ERROR' THEN 0
+        WHEN 'CRITICAL' THEN 0
+        WHEN 'WARN' THEN 1
+        WHEN 'INFO' THEN 2
+        ELSE 3
+    END,
+    CreatedAt DESC
 OFFSET @Skip ROWS FETCH NEXT @Take ROWS ONLY";
 
         var parameters = new
@@ -124,7 +132,15 @@ WHERE 1=1
     AND (@Severity IS NULL OR m.Severity = @Severity)
     AND (@ReviewStatus IS NULL OR m.ReviewStatus = @ReviewStatus)
     AND (@HasFactories = 0 OR pc.FactoryCode IN @AllowedFactories)
-ORDER BY m.CreatedAt DESC
+ORDER BY
+    CASE m.Severity
+        WHEN 'ERROR' THEN 0
+        WHEN 'CRITICAL' THEN 0
+        WHEN 'WARN' THEN 1
+        WHEN 'INFO' THEN 2
+        ELSE 3
+    END,
+    m.CreatedAt DESC
 OFFSET @Skip ROWS FETCH NEXT @Take ROWS ONLY";
 
         var parameters = new
@@ -178,11 +194,102 @@ OFFSET @Skip ROWS FETCH NEXT @Take ROWS ONLY";
             allIssues.AddRange(mscIssues);
         }
 
-        // 按CreatedAt降序排序，分页
+        // severity 优先排序（ERROR/CRITICAL → WARN → INFO → 其它），再按 CreatedAt 降序；分页
         return allIssues
-            .OrderByDescending(i => i.CreatedAt)
+            .OrderBy(i => i.Severity == "ERROR" || i.Severity == "CRITICAL" ? 0
+                        : i.Severity == "WARN" ? 1
+                        : i.Severity == "INFO" ? 2
+                        : 3)
+            .ThenByDescending(i => i.CreatedAt)
             .Skip(skip)
             .Take(take)
             .ToList();
+    }
+
+    /// <summary>BOM Workset Issues 命中总数（同查询1 WHERE，不含分页）</summary>
+    public async Task<int> CountBomWorksetIssuesAsync(
+        string? materialCode = null,
+        string? severity = null,
+        string? reviewStatus = null,
+        CancellationToken ct = default,
+        IReadOnlySet<string>? allowedFactories = null)
+    {
+        if (allowedFactories is { Count: 0 })
+            return 0;
+        var hasFactories = allowedFactories is { Count: > 0 };
+
+        var sql = @"
+SELECT COUNT(*)
+FROM MES_APS_BOM_Workset_Issues
+WHERE 1=1
+    AND (@MaterialCode IS NULL OR ParentMaterialCode = @MaterialCode OR ChildMaterialCode = @MaterialCode)
+    AND (@Severity IS NULL OR Severity = @Severity)
+    AND (@ReviewStatus IS NULL OR ReviewStatus = @ReviewStatus)
+    AND (@HasFactories = 0 OR COALESCE(ExpectedFactory, ActualFactory) IN @AllowedFactories)";
+
+        var parameters = new
+        {
+            MaterialCode = materialCode,
+            Severity = severity,
+            ReviewStatus = reviewStatus,
+            HasFactories = hasFactories,
+            AllowedFactories = allowedFactories
+        };
+
+        return await _connectionManager.QueryFirstOrDefaultAsync<int>(
+            sql, parameters, CommandType.Text, DatabaseId.ODS, commandTimeout: 30);
+    }
+
+    /// <summary>MaterialStageDeptContext Issues 命中总数（同查询2 WHERE，不含分页）</summary>
+    public async Task<int> CountMaterialStageContextIssuesAsync(
+        string? materialCode = null,
+        string? severity = null,
+        string? reviewStatus = null,
+        CancellationToken ct = default,
+        IReadOnlySet<string>? allowedFactories = null)
+    {
+        if (allowedFactories is { Count: 0 })
+            return 0;
+        var hasFactories = allowedFactories is { Count: > 0 };
+
+        var sql = @"
+SELECT COUNT(*)
+FROM MaterialStageDeptContext_Issues m
+LEFT JOIN ext_MES_ProcessCode_View pc
+    ON pc.StageCode = m.StageCode
+WHERE 1=1
+    AND (@MaterialCode IS NULL OR m.MaterialCode = @MaterialCode)
+    AND (@Severity IS NULL OR m.Severity = @Severity)
+    AND (@ReviewStatus IS NULL OR m.ReviewStatus = @ReviewStatus)
+    AND (@HasFactories = 0 OR pc.FactoryCode IN @AllowedFactories)";
+
+        var parameters = new
+        {
+            MaterialCode = materialCode,
+            Severity = severity,
+            ReviewStatus = reviewStatus,
+            HasFactories = hasFactories,
+            AllowedFactories = allowedFactories
+        };
+
+        return await _connectionManager.QueryFirstOrDefaultAsync<int>(
+            sql, parameters, CommandType.Text, DatabaseId.APS, commandTimeout: 30);
+    }
+
+    /// <summary>聚合命中总数 = BOM Workset Issues + MaterialStageDeptContext Issues（与 QueryAllAsync 同过滤，分页前）</summary>
+    public async Task<int> CountAllAsync(
+        string? source = null,
+        string? materialCode = null,
+        string? severity = null,
+        string? reviewStatus = null,
+        CancellationToken ct = default,
+        IReadOnlySet<string>? allowedFactories = null)
+    {
+        var total = 0;
+        if (string.IsNullOrEmpty(source) || source == "BOM_WORKSET")
+            total += await CountBomWorksetIssuesAsync(materialCode, severity, reviewStatus, ct, allowedFactories);
+        if (string.IsNullOrEmpty(source) || source == "MATERIAL_STAGE_CONTEXT")
+            total += await CountMaterialStageContextIssuesAsync(materialCode, severity, reviewStatus, ct, allowedFactories);
+        return total;
     }
 }

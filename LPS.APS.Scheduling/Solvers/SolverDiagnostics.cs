@@ -65,6 +65,40 @@ internal static class SolverDiagnostics
         /// </summary>
         public long Phase5SetupSegmentsOptimized;
 
+        /// <summary>
+        /// V1_3 F-01：合批落定失败 / 交期违约时，按插入身份回滚占用表**未命中**的条目数累计。
+        ///   **正常恒为 0** —— 非 0 说明有代码路径绕过 <c>AddOccupancyWindow</c> 的 `insertLog` 直写占用表
+        ///   （⇒ 该窗不会被回滚 ⇒ 幽灵占用）。纯观测、不参与任何业务判定。
+        /// </summary>
+        public long OccupancyRollbackUnmatched;
+
+        /// <summary>
+        /// V1_3 F-03：B-009 合法量门禁**因输入整体未投影而不可评估**的批形成次数累计
+        ///   （`piFacts is null`）。纯观测、不参与任何业务判定；**非 0 即表示生产态该门禁不可达**。
+        /// </summary>
+        public long PiLegalQuantityGateUnevaluated;
+
+        /// <summary>V1_3 F-03：B-009 合法量门禁**判越限/事实不可信并 Fail Closed**的次数。纯观测。</summary>
+        public long PiLegalQuantityGateBlocked;
+
+        /// <summary>
+        /// V1_3 F-04：本 Run **实际生效**的 <c>SolverBatchBudget</c> 快照 —— 版本号
+        ///   （<c>SolverBatchBudget/v1</c>）、取源（`…:SplitParams` / `…:default`）与两个**生效值**。
+        ///   供「Run 快照 / 追踪证据」逐 Run 复现「到底用了什么技术预算」。
+        ///   ⚠ 只记录**实际生效值**；业务旧列（`BatchPolicyRuleSnapshot.MaxOptimizationSplitCount` /
+        ///     `MaxBatchCandidates`）**不参与**，改动它们不得改变本快照（B-007 单源可追溯）。
+        /// </summary>
+        public string? SolverBatchBudgetVersion;
+
+        /// <summary>V1_3 F-04：本 Run 生效技术预算的**取源**标识（单源可追溯）。</summary>
+        public string? SolverBatchBudgetSource;
+
+        /// <summary>V1_3 F-04：本 Run 生效的 `MaxOptimizationSplitCount`。</summary>
+        public long SolverBatchBudgetMaxOptimizationSplitCount;
+
+        /// <summary>V1_3 F-04：本 Run 生效的 `MaxBatchCandidates`。</summary>
+        public long SolverBatchBudgetMaxBatchCandidates;
+
         /// <summary>Phase 1（硬约束构建）耗时 ms。</summary>
         public long Phase1Ms;
 
@@ -221,6 +255,38 @@ internal static class SolverDiagnostics
     internal static void CountPhase5SetupSegmentOptimized()
     {
         if (Current.Value is { } c) c.Phase5SetupSegmentsOptimized++;
+    }
+
+    /// <summary>V1_3 F-01：按插入身份回滚占用表时**未命中**条目数 +n。纯观测，不参与判定。</summary>
+    internal static void CountOccupancyRollbackUnmatched(int n)
+    {
+        if (n > 0 && Current.Value is { } c) c.OccupancyRollbackUnmatched += n;
+    }
+
+    /// <summary>V1_3 F-03：B-009 合法量门禁因输入未投影而不可评估 +1。纯观测，不参与判定。</summary>
+    internal static void CountPiLegalQuantityGateUnevaluated()
+    {
+        if (Current.Value is { } c) c.PiLegalQuantityGateUnevaluated++;
+    }
+
+    /// <summary>V1_3 F-03：B-009 合法量门禁判越限/事实不可信并 Fail Closed +1。纯观测，不参与判定。</summary>
+    internal static void CountPiLegalQuantityGateBlocked()
+    {
+        if (Current.Value is { } c) c.PiLegalQuantityGateBlocked++;
+    }
+
+    /// <summary>
+    /// V1_3 F-04：登记本 Run **实际生效**的技术预算快照（版本 / 取源 / 两个生效值）。
+    /// 幂等 —— 同一 Run 内每次解析写入同一组值；未开 scope 时零开销。
+    /// </summary>
+    internal static void RecordSolverBatchBudget(
+        string version, string source, int maxOptimizationSplitCount, int maxBatchCandidates)
+    {
+        if (Current.Value is not { } c) return;
+        c.SolverBatchBudgetVersion = version;
+        c.SolverBatchBudgetSource = source;
+        c.SolverBatchBudgetMaxOptimizationSplitCount = maxOptimizationSplitCount;
+        c.SolverBatchBudgetMaxBatchCandidates = maxBatchCandidates;
     }
 
     // ══════════════════════════════════════════════════════════════════

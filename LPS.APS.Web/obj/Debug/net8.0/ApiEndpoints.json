@@ -141,19 +141,19 @@
         "IsRequired": false
       },
       {
-        "Name": "skip",
+        "Name": "pageIndex",
         "Type": "System.Int32",
         "IsRequired": false
       },
       {
-        "Name": "take",
+        "Name": "pageSize",
         "Type": "System.Int32",
         "IsRequired": false
       }
     ],
     "ReturnTypes": [
       {
-        "Type": "LPS.APS.Shared.Models.ApiResponse\u00601[[System.Collections.Generic.List\u00601[[LPS.APS.Core.Dto.BusinessFactIssueDto, LPS.APS.Core, Version=1.0.0.0, Culture=neutral, PublicKeyToken=null]], System.Private.CoreLib, Version=8.0.0.0, Culture=neutral, PublicKeyToken=7cec85d7bea7798e]]",
+        "Type": "LPS.APS.Shared.Models.ApiResponse\u00601[[LPS.APS.Core.Dto.PageResult\u00601[[LPS.APS.Core.Dto.BusinessFactIssueDto, LPS.APS.Core, Version=1.0.0.0, Culture=neutral, PublicKeyToken=null]], LPS.APS.Core, Version=1.0.0.0, Culture=neutral, PublicKeyToken=null]]",
         "MediaTypes": [
           "text/plain",
           "application/json",
