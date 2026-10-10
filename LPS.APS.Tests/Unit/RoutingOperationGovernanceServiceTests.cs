@@ -26,6 +26,7 @@ namespace LPS.APS.Tests.Unit;
 public class RoutingOperationGovernanceServiceTests
 {
     private readonly Mock<IAuditLogRepository> _auditRepo = new();
+    private readonly Mock<IDataScopeService> _dataScope = new();
 
     private static Mock<DatabaseConnectionManager> CreateConnectionMock()
     {
@@ -39,7 +40,7 @@ public class RoutingOperationGovernanceServiceTests
     }
 
     private RoutingOperationGovernanceService CreateService(Mock<DatabaseConnectionManager> connection)
-        => new(connection.Object, _auditRepo.Object, Mock.Of<ILogger<RoutingOperationGovernanceService>>());
+        => new(connection.Object, _auditRepo.Object, _dataScope.Object, Mock.Of<ILogger<RoutingOperationGovernanceService>>());
 
     // ---------- 构造守卫 ----------
 
@@ -47,7 +48,7 @@ public class RoutingOperationGovernanceServiceTests
     public void 构造_connectionManager为null_抛ArgumentNullException()
     {
         Action act = () => new RoutingOperationGovernanceService(
-            null!, _auditRepo.Object, Mock.Of<ILogger<RoutingOperationGovernanceService>>());
+            null!, _auditRepo.Object, _dataScope.Object, Mock.Of<ILogger<RoutingOperationGovernanceService>>());
 
         act.Should().Throw<ArgumentNullException>().WithParameterName("connectionManager");
     }
@@ -56,16 +57,25 @@ public class RoutingOperationGovernanceServiceTests
     public void 构造_auditLogRepository为null_抛ArgumentNullException()
     {
         Action act = () => new RoutingOperationGovernanceService(
-            CreateConnectionMock().Object, null!, Mock.Of<ILogger<RoutingOperationGovernanceService>>());
+            CreateConnectionMock().Object, null!, _dataScope.Object, Mock.Of<ILogger<RoutingOperationGovernanceService>>());
 
         act.Should().Throw<ArgumentNullException>().WithParameterName("auditLogRepository");
+    }
+
+    [Fact]
+    public void 构造_dataScopeService为null_抛ArgumentNullException()
+    {
+        Action act = () => new RoutingOperationGovernanceService(
+            CreateConnectionMock().Object, _auditRepo.Object, null!, Mock.Of<ILogger<RoutingOperationGovernanceService>>());
+
+        act.Should().Throw<ArgumentNullException>().WithParameterName("dataScopeService");
     }
 
     [Fact]
     public void 构造_logger为null_抛ArgumentNullException()
     {
         Action act = () => new RoutingOperationGovernanceService(
-            CreateConnectionMock().Object, _auditRepo.Object, null!);
+            CreateConnectionMock().Object, _auditRepo.Object, _dataScope.Object, null!);
 
         act.Should().Throw<ArgumentNullException>().WithParameterName("logger");
     }

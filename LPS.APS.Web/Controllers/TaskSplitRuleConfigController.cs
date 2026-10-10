@@ -73,7 +73,7 @@ public class TaskSplitRuleConfigController : ControllerBase
     {
         try
         {
-            var data = await _service.ListAsync(materialId, productionDepartmentId, isActive, pageIndex, pageSize, ct);
+            var data = await _service.ListAsync(materialId, productionDepartmentId, isActive, GetCurrentUserId(), pageIndex, pageSize, ct);
             return Ok(ApiResponse<PageResult<TaskSplitRuleConfigDto>>.Success(data));
         }
         catch (Exception ex)

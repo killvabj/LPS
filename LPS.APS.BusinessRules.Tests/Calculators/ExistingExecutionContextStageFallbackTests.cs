@@ -346,6 +346,146 @@ public class ExistingExecutionContextStageFallbackTests
     }
 
     /// <summary>
+    /// 诉求2 §四①：无 StageProgress 行（信息缺口）→ 不判 0，改走 ERP 兜底总量
+    /// 场景：PI 无任何 Stage 行，但有 IN_PROGRESS 工单；ErpRemainingQty=400
+    /// 期望：DerivedRemainingQty = 400（兜底总量 = ErpRemainingQty − 已定位量 = 400 − 0）
+    /// </summary>
+    [Test]
+    public async Task ErpFallback_NoStageRow_UsesErpRemainingNotZero()
+    {
+        var input = new ProductionInstructionPositionInput
+        {
+            ProductionInstructionNo = "PI-001",
+            MaterialId = 1001,
+            MaterialCode = "MAT-001",
+            FactoryId = 5001,
+            FactoryCode = "CN",
+            ErpRemainingQty = 400m,
+            StageProgress = Array.Empty<StageProgressFact>(),
+            OperationProgress = Array.Empty<OperationProgressFact>(),
+            WorkOrders = new[]
+            {
+                new WorkOrderSnapshotFact
+                {
+                    ProductionInstructionNo = "PI-001", MESWorkOrderNo = "WO-001",
+                    MaterialCode = "MAT-001", PlannedQty = 1000m,
+                    WorkOrderStatus = "IN_PROGRESS", DataCutoffTime = DateTime.UtcNow
+                }
+            },
+            StagePath = new[]
+            {
+                new StagePathFact { StageCode = "CN_ASSY", StageSequence = 1, IsStartStage = true }
+            }
+        };
+
+        var results = await _calculator.CalculateProductionInstructionPositionsAsync(
+            new[] { input }, new FrozenFactParameters(), CancellationToken.None);
+
+        var ctx = results.First().ExistingExecutionContexts.Single();
+
+        // 核心：无 Stage 行 ≠ 0，兜底 = ErpRemainingQty − 已定位量（0）= 400
+        Assert.That(ctx.DerivedRemainingQty, Is.EqualTo(400m));
+        Assert.That(ctx.StartOperationCode, Is.Null);
+        Assert.That(ctx.StartStageCode, Is.EqualTo("CN_ASSY"));
+        // §四④：兜底份额可区分标记（复用 UNLOCATED_STAGE）
+        Assert.That(ctx.Slices.Single().IssueCode, Is.EqualTo("UNLOCATED_STAGE"));
+    }
+
+    /// <summary>
+    /// 诉求2 §四③/④：双工单、无 Stage 行、ErpRemainingQty=1999（不可整除）→ 向下取整不放大
+    /// WO-A PlannedQty=1000, WO-B PlannedQty=1000 → 各 floor(1999×1000/2000)=floor(999.5)=999
+    /// （PlannedQty=1000 > 999，故工单上限不截断）
+    /// 期望：ΣE = 1998 ≤ ErpRemainingQty(1999)，不放大
+    /// </summary>
+    [Test]
+    public async Task ErpFallback_NoStageRow_TwoWorkOrders_FloorNotAmplify()
+    {
+        var input = new ProductionInstructionPositionInput
+        {
+            ProductionInstructionNo = "PI-001",
+            MaterialId = 1001,
+            MaterialCode = "MAT-001",
+            FactoryId = 5001,
+            FactoryCode = "CN",
+            ErpRemainingQty = 1999m,
+            StageProgress = Array.Empty<StageProgressFact>(),
+            OperationProgress = Array.Empty<OperationProgressFact>(),
+            WorkOrders = new[]
+            {
+                new WorkOrderSnapshotFact
+                {
+                    ProductionInstructionNo = "PI-001", MESWorkOrderNo = "WO-A",
+                    MaterialCode = "MAT-001", PlannedQty = 1000m,
+                    WorkOrderStatus = "IN_PROGRESS", DataCutoffTime = DateTime.UtcNow
+                },
+                new WorkOrderSnapshotFact
+                {
+                    ProductionInstructionNo = "PI-001", MESWorkOrderNo = "WO-B",
+                    MaterialCode = "MAT-001", PlannedQty = 1000m,
+                    WorkOrderStatus = "IN_PROGRESS", DataCutoffTime = DateTime.UtcNow
+                }
+            },
+            StagePath = new[]
+            {
+                new StagePathFact { StageCode = "CN_ASSY", StageSequence = 1, IsStartStage = true }
+            }
+        };
+
+        var results = await _calculator.CalculateProductionInstructionPositionsAsync(
+            new[] { input }, new FrozenFactParameters(), CancellationToken.None);
+
+        var contexts = results.First().ExistingExecutionContexts;
+        var woA = contexts.Single(c => c.MESWorkOrderNo == "WO-A");
+        var woB = contexts.Single(c => c.MESWorkOrderNo == "WO-B");
+
+        Assert.That(woA.DerivedRemainingQty, Is.EqualTo(999m));
+        Assert.That(woB.DerivedRemainingQty, Is.EqualTo(999m));
+        // §四④：ΣE ≤ ErpRemainingQty，向下取整不放大
+        Assert.That(woA.DerivedRemainingQty + woB.DerivedRemainingQty, Is.EqualTo(1998m).And.LessThanOrEqualTo(1999m));
+    }
+
+    /// <summary>
+    /// 诉求2 §四①：有 Stage 行且 RemainingQty<=0（真做完）→ 仍判 0（不受兜底影响）
+    /// 场景：有 Stage 行但 RemainingQty=0 且工序已完成
+    /// </summary>
+    [Test]
+    public async Task ErpFallback_StageRowPresentButComplete_StaysZero()
+    {
+        var input = BuildInput(
+            workOrders: new[]
+            {
+                new WorkOrderSnapshotFact
+                {
+                    ProductionInstructionNo = "PI-001", MESWorkOrderNo = "WO-001",
+                    MaterialCode = "MAT-001", PlannedQty = 1000m,
+                    WorkOrderStatus = "IN_PROGRESS", DataCutoffTime = DateTime.UtcNow
+                }
+            },
+            operationProgress: new[]
+            {
+                new OperationProgressFact
+                {
+                    OperationCode = "OP-A", OperationName = "装配", StageCode = "CN_ASSY",
+                    MESWorkOrderNo = "WO-001", PlannedQty = 1000m, GoodQty = 1000m, RemainingQty = 0m
+                }
+            },
+            stageProgress: new[]
+            {
+                new StageProgressFact
+                {
+                    StageCode = "CN_ASSY", GoodCompletedQty = 1000m,
+                    PlannedQty = 1000m, RemainingQty = 0m, StageSequence = 1
+                }
+            });
+
+        var results = await _calculator.CalculateProductionInstructionPositionsAsync(
+            new[] { input }, new FrozenFactParameters(), CancellationToken.None);
+
+        var ctx = results.First().ExistingExecutionContexts.Single();
+        Assert.That(ctx.DerivedRemainingQty, Is.EqualTo(0m));
+    }
+
+    /// <summary>
     /// 构造最小输入（ErpRemainingQty 取 Stage GoodCompleted+Remaining 使 Position 闭合）
     /// </summary>
     private static ProductionInstructionPositionInput BuildInput(

@@ -11,10 +11,13 @@ namespace LPS.APS.Application.Services;
 /// </summary>
 public interface ITaskSplitRuleConfigGovernanceService
 {
-    /// <summary>分页列出执行批拆分规则（可按物料/生产部门/启用态过滤；R2 标准分页契约，4号位 2026-10-08 提请）。</summary>
+    /// <summary>分页列出执行批拆分规则（可按物料/生产部门/启用态过滤；R2 标准分页契约，4号位 2026-10-08 提请）。
+    /// P0-01（0号位 审核 2026-10-09）：以受信主体 Business Scope 约束——Global 不过滤；非 Global 按 Department 授权部门
+    /// IN 约束 COUNT + 列表（Auth §9.3）；无授权 → fail-closed 空页；显式越权部门 → 403。</summary>
     /// <param name="materialId">物料 Id（可选精确匹配）</param>
-    /// <param name="productionDepartmentId">生产部门 Id（可选精确匹配）</param>
+    /// <param name="productionDepartmentId">生产部门 Id（可选精确匹配；越权 → 403）</param>
     /// <param name="isActive">启用态过滤（null = 全部）</param>
+    /// <param name="actorUserId">登录用户 Id（受信主体，Scope 约束来源）</param>
     /// <param name="pageIndex">页码（1 基，&lt; 1 强制归 1）</param>
     /// <param name="pageSize">每页条数（1~200，超限截断；默认 20）</param>
     /// <param name="ct">取消令牌</param>
@@ -23,6 +26,7 @@ public interface ITaskSplitRuleConfigGovernanceService
         int? materialId,
         int? productionDepartmentId,
         bool? isActive,
+        int actorUserId,
         int pageIndex = 1,
         int pageSize = 20,
         CancellationToken ct = default);

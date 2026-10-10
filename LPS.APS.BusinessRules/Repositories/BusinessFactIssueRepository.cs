@@ -73,8 +73,10 @@ OFFSET @Skip ROWS FETCH NEXT @Take ROWS ONLY";
             Take = take
         };
 
+        // MES_APS_BOM_Workset_Issues 属 ODS 集成层（MES_Integration，随 MES_APS_BOM_Workset 同库），非 APS_Production。
+        // 此前误用 DatabaseId.APS → 查错库 → "对象名无效" 500（4号位 2026-10-10 报）。
         var results = await _connectionManager.QueryAsync<BusinessFactIssueDto>(
-            sql, parameters, CommandType.Text, DatabaseId.APS, commandTimeout: 30);
+            sql, parameters, CommandType.Text, DatabaseId.ODS, commandTimeout: 30);
 
         return results.ToList();
     }

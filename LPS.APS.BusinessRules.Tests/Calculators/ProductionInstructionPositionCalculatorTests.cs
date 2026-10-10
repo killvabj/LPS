@@ -683,5 +683,241 @@ public class ProductionInstructionPositionCalculatorTests
         // 验证 RECEIVED_SHIPPING_IN_PI_POSITION Issue
         Assert.That(result.Issues.Any(i => i.IssueType == "RECEIVED_SHIPPING_IN_PI_POSITION"), Is.True);
     }
+
+    /// <summary>
+    /// U03（TECH-03 §八）：PI 剩余 600，各互斥 Position 合计 550 ⇒ 额外 UNLOCATED 50，最终合计 600。
+    /// 互斥位置由 Stage 累计差分得出：S10(累计550) − S20(累计300) = S10 250；S20 = 300；合计 550。
+    /// </summary>
+    [Test]
+    public async Task U03_MutuallyExclusivePositions550_UnlocatedFills50_TotalCloses600()
+    {
+        var input = new ProductionInstructionPositionInput
+        {
+            ProductionInstructionNo = "PI-U03-001",
+            MaterialId = 1003,
+            FactoryId = 1,
+            ErpRemainingQty = 600m,
+            StageProgress = new[]
+            {
+                new StageProgressFact { StageCode = "S10", StageSequence = 1, GoodCompletedQty = 550m, SnapshotId = 1 },
+                new StageProgressFact { StageCode = "S20", StageSequence = 2, GoodCompletedQty = 300m, SnapshotId = 2 }
+            },
+            StagePath = new[]
+            {
+                new StagePathFact { StageCode = "S10", StageSequence = 1, IsStartStage = true },
+                new StagePathFact { StageCode = "S20", StageSequence = 2 }
+            }
+        };
+
+        var results = await _calculator.CalculateProductionInstructionPositionsAsync(new[] { input }, new FrozenFactParameters(), CancellationToken.None);
+        var result = results.First();
+
+        // 差分消重后的互斥位置合计 = 550（S10 250 + S20 300）
+        var located = result.Positions.Where(p => p.PositionType != PositionType.UNLOCATED).ToList();
+        Assert.That(located.Sum(p => p.Quantity), Is.EqualTo(550m));
+
+        // 缺口 50 归 UNLOCATED，最终总量闭合到 600
+        var unlocated = result.Positions.First(p => p.PositionType == PositionType.UNLOCATED);
+        Assert.That(unlocated.Quantity, Is.EqualTo(50m));
+        Assert.That(result.Positions.Sum(p => p.Quantity), Is.EqualTo(600m));
+        Assert.That(result.IsSuccess, Is.True);
+    }
+
+    /// <summary>
+    /// U05（TECH-03 §八）：PI 剩余 600，两个 Stage 原始累计各 500、指向同一批重叠数量。
+    /// 断言：不得直接 MAX/SUM 当 PI 总量；Stage 差分消重后互斥位置合计 ≤ 600（本例 = 500，非 SUM=1000）。
+    /// </summary>
+    [Test]
+    public async Task U05_OverlappingMultiStageRawValues_DedupedByDiff_NotSummed()
+    {
+        var input = new ProductionInstructionPositionInput
+        {
+            ProductionInstructionNo = "PI-U05-001",
+            MaterialId = 1005,
+            FactoryId = 1,
+            ErpRemainingQty = 600m,
+            StageProgress = new[]
+            {
+                // 两个 Stage 原始累计各 500：S20 是最后一段，S10 = 500 − 500 = 0（重叠，不记录）
+                new StageProgressFact { StageCode = "S10", StageSequence = 1, GoodCompletedQty = 500m, SnapshotId = 1 },
+                new StageProgressFact { StageCode = "S20", StageSequence = 2, GoodCompletedQty = 500m, SnapshotId = 2 }
+            },
+            StagePath = new[]
+            {
+                new StagePathFact { StageCode = "S10", StageSequence = 1, IsStartStage = true },
+                new StagePathFact { StageCode = "S20", StageSequence = 2 }
+            }
+        };
+
+        var results = await _calculator.CalculateProductionInstructionPositionsAsync(new[] { input }, new FrozenFactParameters(), CancellationToken.None);
+        var result = results.First();
+
+        // 差分消重：互斥位置合计 500（不是 SUM 1000），且 ≤ ERP 总量 600
+        var located = result.Positions.Where(p => p.PositionType != PositionType.UNLOCATED).ToList();
+        Assert.That(located.Sum(p => p.Quantity), Is.EqualTo(500m));
+        Assert.That(located.Sum(p => p.Quantity), Is.LessThanOrEqualTo(600m));
+
+        // 总量仍闭合到入参 600（缺口 100 归 UNLOCATED），Stage 原始值不扩大 PI 总量
+        var unlocated = result.Positions.First(p => p.PositionType == PositionType.UNLOCATED);
+        Assert.That(unlocated.Quantity, Is.EqualTo(100m));
+        Assert.That(result.Positions.Sum(p => p.Quantity), Is.EqualTo(600m));
+        Assert.That(result.IsSuccess, Is.True);
+    }
+
+    /// <summary>
+    /// U04（TECH-03 §八）：PI 剩余 600，但互斥位置算出 650（Stage S10=600 ＋ 异 Stage 的 XC=50 未被扣）。
+    /// 断言：不把较大的位置结果当成新 PI 总量（仍以入参 600 为准）；超量记 QUANTITY_OVERFLOW、不静默、不截断。
+    /// </summary>
+    [Test]
+    public async Task U04_ExclusivePositionsExceedErp_ShouldIssueOverflowNotSilent()
+    {
+        var input = new ProductionInstructionPositionInput
+        {
+            ProductionInstructionNo = "PI-U04-001",
+            MaterialId = 1004,
+            FactoryId = 1,
+            ErpRemainingQty = 600m,
+            StageProgress = new[]
+            {
+                new StageProgressFact { StageCode = "S10", StageSequence = 1, GoodCompletedQty = 600m, SnapshotId = 1 }
+            },
+            // XC 关联 S20（无 S20 的 Stage 位置），故不被 Stage 去重扣除 ⇒ 互斥位置合计 = 600 + 50 = 650
+            XcFacts = new[]
+            {
+                new XcFact
+                {
+                    XcWarehouseCode = "XC-WAREHOUSE-01",
+                    RelatedStageCode = "S20",
+                    Quantity = 50m,
+                    AvailableTime = DateTime.Now,
+                    SourceDocument = "XC-DOC-U04"
+                }
+            },
+            StagePath = new[]
+            {
+                new StagePathFact { StageCode = "S10", StageSequence = 1, IsStartStage = true }
+            }
+        };
+
+        var results = await _calculator.CalculateProductionInstructionPositionsAsync(new[] { input }, new FrozenFactParameters(), CancellationToken.None);
+        var result = results.First();
+
+        // 超量：不静默、不截断，位置合计仍如实 = 650（异常由 Issue 暴露，而非被悄悄改小）
+        Assert.That(result.Positions.Sum(p => p.Quantity), Is.EqualTo(650m));
+
+        // 错误不静默：QUANTITY_OVERFLOW 登记，超出量 50
+        var overflow = result.Issues.FirstOrDefault(i => i.IssueType == "QUANTITY_OVERFLOW");
+        Assert.That(overflow, Is.Not.Null);
+        Assert.That(overflow.AffectedQuantity, Is.EqualTo(50m));
+
+        // 总量不闭合到入参 600 ⇒ IsSuccess=false（不把 650 当成新 PI 总量）
+        Assert.That(result.IsSuccess, Is.False);
+    }
+
+    /// <summary>
+    /// U14（TECH-03 §八）：同 PI 一个 MES WO 多个 Slice —— 多个 Slice 保持同一 WO 身份；
+    /// Position / NextOperation 数量**不重叠扩张**（Σ 均为 PI 总量，不因多 Slice 翻倍）。
+    /// </summary>
+    [Test]
+    public async Task U14_SameWorkOrderMultiSlice_PositionAndNextOpNotOverlapExpanded()
+    {
+        var input = new ProductionInstructionPositionInput
+        {
+            ProductionInstructionNo = "PI-U14-001",
+            MaterialId = 1014,
+            MaterialCode = "MAT-U14",
+            FactoryId = 1,
+            FactoryCode = "CN",
+            ErpRemainingQty = 500m,
+            StageProgress = new[]
+            {
+                new StageProgressFact { StageCode = "CN_ASSY", StageSequence = 1, GoodCompletedQty = 500m, SnapshotId = 1 }
+            },
+            // 同一 WO 两道平行工序各有剩余 → 中间态多 Slice
+            OperationProgress = new[]
+            {
+                new OperationProgressFact
+                {
+                    OperationCode = "OP-A", OperationName = "挤丝", StageCode = "CN_ASSY",
+                    MESWorkOrderNo = "WO-001", PlannedQty = 500m, GoodQty = 200m, RemainingQty = 300m
+                },
+                new OperationProgressFact
+                {
+                    OperationCode = "OP-B", OperationName = "磨削", StageCode = "CN_ASSY",
+                    MESWorkOrderNo = "WO-001", PlannedQty = 500m, GoodQty = 300m, RemainingQty = 200m
+                }
+            },
+            WorkOrders = new[]
+            {
+                new WorkOrderSnapshotFact
+                {
+                    ProductionInstructionNo = "PI-U14-001", MESWorkOrderNo = "WO-001",
+                    MaterialCode = "MAT-U14", PlannedQty = 500m,
+                    WorkOrderStatus = "IN_PROGRESS", DataCutoffTime = DateTime.UtcNow
+                }
+            },
+            StagePath = new[]
+            {
+                new StagePathFact { StageCode = "CN_ASSY", StageSequence = 1, IsStartStage = true }
+            }
+        };
+
+        var results = await _calculator.CalculateProductionInstructionPositionsAsync(new[] { input }, new FrozenFactParameters(), CancellationToken.None);
+        var result = results.First();
+
+        // Position 侧：总量闭合（不因多 Slice 扩张）
+        Assert.That(result.Positions.Sum(p => p.Quantity), Is.EqualTo(500m));
+
+        // 同一 WO 的多 Slice：结构正确、Σ 不重叠扩张（=500，非 2×500）
+        var ctx = result.ExistingExecutionContexts.Single();
+        Assert.That(ctx.MESWorkOrderNo, Is.EqualTo("WO-001"));
+        Assert.That(ctx.Slices.Count, Is.EqualTo(2));
+        Assert.That(ctx.Slices.Sum(s => s.SliceQty), Is.EqualTo(500m));
+        Assert.That(ctx.Slices.All(s => s.StartStageCode == "CN_ASSY"), Is.True);
+
+        // NextOperation 侧：Σ SliceQty = Position 总量（不重叠扩张）
+        Assert.That(result.NextOperationContexts.Sum(c => c.SliceQty), Is.EqualTo(500m));
+    }
+
+    /// <summary>
+    /// U17（TECH-03 §八）：PI 总量可信但**无任何有效位置事实**（无 Stage/XC/Transit/库存）⇒
+    /// 按既有 UNLOCATED 降级：单个 UNLOCATED 承载全量、总量仍闭合、UNLOCATED 保守返回最早 Stage。
+    /// </summary>
+    [Test]
+    public async Task U17_NoValidPositionButTrustedTotal_UnlocatedFallback()
+    {
+        var input = new ProductionInstructionPositionInput
+        {
+            ProductionInstructionNo = "PI-U17-001",
+            MaterialId = 1017,
+            MaterialCode = "MAT-U17",
+            FactoryId = 1,
+            FactoryCode = "CN",
+            ErpRemainingQty = 600m,
+            StageProgress = Array.Empty<StageProgressFact>(),
+            OperationProgress = Array.Empty<OperationProgressFact>(),
+            WorkOrders = Array.Empty<WorkOrderSnapshotFact>(),
+            StagePath = new[]
+            {
+                new StagePathFact { StageCode = "CN_ASSY", StageSequence = 1, IsStartStage = true }
+            }
+        };
+
+        var results = await _calculator.CalculateProductionInstructionPositionsAsync(new[] { input }, new FrozenFactParameters(), CancellationToken.None);
+        var result = results.First();
+
+        // 无任何位置事实 → 单个 UNLOCATED 承载全量，总量仍闭合到可信入参
+        Assert.That(result.Positions.Count, Is.EqualTo(1));
+        var unlocated = result.Positions.Single();
+        Assert.That(unlocated.PositionType, Is.EqualTo(PositionType.UNLOCATED));
+        Assert.That(unlocated.IsUnlocated, Is.True);
+        Assert.That(unlocated.Quantity, Is.EqualTo(600m));
+        Assert.That(result.IsSuccess, Is.True);
+
+        // NextOperation：UNLOCATED 保守返回最早 Stage（IsStartStage）
+        var nextOp = result.NextOperationContexts.Single();
+        Assert.That(nextOp.IsUnlocated, Is.True);
+        Assert.That(nextOp.StartStageCode, Is.EqualTo("CN_ASSY"));
+    }
 }
 

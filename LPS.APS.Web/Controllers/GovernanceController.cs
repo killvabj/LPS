@@ -109,7 +109,7 @@ public class GovernanceController : ControllerBase
     [HttpPost("rule-set/version")]
     public async Task<IActionResult> CreateRuleSetVersion([FromBody] RuleSetVersion version, CancellationToken ct)
     {
-        var created = await _governanceService.CreateRuleSetVersionAsync(version, GetCurrentUserCode(), ct);
+        var created = await _governanceService.CreateRuleSetVersionAsync(version, GetCurrentUserCode(), GetCurrentUserId(), ct);
         return CreatedAtAction(nameof(GetRuleSetVersion), new { versionId = created.Id }, ApiResponse<RuleSetVersion>.Success(created));
     }
 
@@ -121,7 +121,7 @@ public class GovernanceController : ControllerBase
     {
         try
         {
-            await _governanceService.UpdateRuleSetVersionAsync(versionId, version, ct);
+            await _governanceService.UpdateRuleSetVersionAsync(versionId, version, GetCurrentUserId(), ct);
             return Ok(ApiResponse<RuleSetVersion>.Success(version));
         }
         catch (InvalidOperationException ex)
@@ -165,7 +165,7 @@ public class GovernanceController : ControllerBase
     [HttpPost("parameter-set/version")]
     public async Task<IActionResult> CreateParameterSetVersion([FromBody] ParameterSetVersion version, CancellationToken ct)
     {
-        var created = await _governanceService.CreateParameterSetVersionAsync(version, GetCurrentUserCode(), ct);
+        var created = await _governanceService.CreateParameterSetVersionAsync(version, GetCurrentUserCode(), GetCurrentUserId(), ct);
         return CreatedAtAction(nameof(GetParameterSetVersion), new { versionId = created.Id }, ApiResponse<ParameterSetVersion>.Success(created));
     }
 
@@ -177,7 +177,7 @@ public class GovernanceController : ControllerBase
     {
         try
         {
-            await _governanceService.UpdateParameterSetVersionAsync(versionId, version, ct);
+            await _governanceService.UpdateParameterSetVersionAsync(versionId, version, GetCurrentUserId(), ct);
             return Ok(ApiResponse<ParameterSetVersion>.Success(version));
         }
         catch (InvalidOperationException ex)
@@ -422,7 +422,7 @@ public class GovernanceController : ControllerBase
     [HttpPost("strategy-profile/version")]
     public async Task<IActionResult> CreateStrategyProfileVersion([FromBody] StrategyProfileVersion version, CancellationToken ct)
     {
-        var created = await _governanceService.CreateStrategyProfileVersionAsync(version, GetCurrentUserCode(), ct);
+        var created = await _governanceService.CreateStrategyProfileVersionAsync(version, GetCurrentUserCode(), GetCurrentUserId(), ct);
         return CreatedAtAction(nameof(GetStrategyProfileVersion), new { versionId = created.Id }, ApiResponse<StrategyProfileVersion>.Success(created));
     }
 
@@ -434,7 +434,7 @@ public class GovernanceController : ControllerBase
     {
         try
         {
-            await _governanceService.UpdateStrategyProfileVersionAsync(versionId, version, ct);
+            await _governanceService.UpdateStrategyProfileVersionAsync(versionId, version, GetCurrentUserId(), ct);
             return Ok(ApiResponse<StrategyProfileVersion>.Success(version));
         }
         catch (InvalidOperationException ex)

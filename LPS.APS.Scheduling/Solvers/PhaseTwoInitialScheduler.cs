@@ -514,6 +514,9 @@ internal class PhaseTwoInitialScheduler
             // P0-01：按 `(MaterialId, StartStageCode→Dept)` **键控**解析本需求的 ⑧块 Batch Policy。
             var batchPolicy = ResolveExecutionBatchPolicy(actualDemand, request, constraints);
 
+            // AUD-1-006：`piFacts` 传 null —— `PiRemainingFact` 尚未投影进 `DomainSolveRequest`
+            //   （AUD-1-D04，归 2号位 装载）。一旦 2号位 投影，此处换成 `request.PiRemainingFacts` 即可
+            //   激活 B-010 兜底（分支已就位，见 `TryFormConservativePiBatch`），**不需要再改 1号位 结构**。
             var formation = FormExecutionBatches(actualDemand, batchPolicy);
 
             // P0-02：**无合法批方案**（Min/Max/AllowSplit 冲突）⇒ 本需求 fail-closed（不排），与既有
@@ -530,6 +533,10 @@ internal class PhaseTwoInitialScheduler
                 //   Phase5 据此给出口 Reason（§十二：C 桶无有效策略 ⇒ `BATCH_POLICY_MISSING`、0 FinalTask）。
                 var failureReason = formation.IsMissingPolicy ? "BATCH_POLICY_MISSING" : "BATCH_POLICY_CONFLICT";
                 result.BatchPolicyHardFailures[demand.LogicalDemandKey] = failureReason;
+                // AUD-1-006：`formation.IsPiContractPending` ⇒ B-010 保守兜底**适用条件成立但前置事实缺失**
+                //   ⇒ 原因文本自带 `B010_PI_QUANTITY_CONTRACT_PENDING`（与笼统「无策略」可区分）。
+                //   出口码仍为 `BATCH_POLICY_MISSING`：ReasonCode 值域是**冻结封闭集**（`PhaseThreeDiagnostics`
+                //   权威 15 码），1号位 **不新增码**；契约待核信息走原因文本 / 报告，不改冻结值域。
                 if (formation.IsMissingPolicy)
                 {
                     result.BatchPolicyMissingDemandKeys.Add($"[{demand.LogicalDemandKey}] {formation.ConflictReason}");
@@ -612,11 +619,14 @@ internal class PhaseTwoInitialScheduler
 
             // ── P1-01（0号位 2026-10-07《未命名的Markdown文件 (7).md》§八）：有界优化候选择优 ──
             //   结构上有界候选（≤5）：合法不拆 / 合法 2 批 / 合法 3 批 / Preferred 附近切分；
-            //   受 `MaxOptimizationSplitCount` / `MaxBatchCandidates` **上限约束**（只收不放，不新增默认值）。
+            //   受**技术预算** `SolverBatchBudget` 上限约束（只收不放，不新增业务默认值）。
+            //   ⚠ AUD-1-005：预算**取自 `ResolveSolverBatchBudget(request)`**（正式参数版本载体 / 1号位 版本化
+            //     安全默认），**不再读业务 `batchPolicy` 的 `MaxOptimizationSplitCount` / `MaxBatchCandidates`**。
             //   候选 == 1（V1 常态：无策略 / A/B / 唯一合法批数）⇒ **不进入择优**，与既有逐字一致（零回归）。
             //   择优复用**已有的** Direction + Routing + Resource + Calendar + Setup 联合评价（`RunBatchPlan` 试跑），
             //   四层目标 + 批数 tiebreak；**无改善时基线（nMin）胜出** ⇒ 既有行为不被改写。
-            var planCandidates = EnumerateLegalBatchPlanCandidates(actualDemand, batchPolicy, formation);
+            var planCandidates = EnumerateLegalBatchPlanCandidates(
+                actualDemand, batchPolicy, formation, ResolveSolverBatchBudget(request));
             if (planCandidates.Count > 1)
             {
                 formation = SelectBestBatchPlan(
@@ -2621,6 +2631,10 @@ internal class PhaseTwoInitialScheduler
         var start = backward ? anchorTime - duration : anchorTime;
         var end = backward ? anchorTime : anchorTime + duration;
 
+        // AUD-1-002：执行批身份（跨 Stage 工序链）与 **Stage 执行批身份**（Stage 内 MES 批）分开 —— 见 StageExecutionBatchKey 注释。
+        var executionBatchDraftKey = batchDraftKey ?? ExecutionBatchKey(demand.LogicalDemandKey);
+        var producesStageBatchKey = ProducesStageExecutionBatchKey(demand);
+
         return new FinalTaskDraft
         {
             FinalDraftId = Guid.NewGuid().ToString(),
@@ -2646,7 +2660,12 @@ internal class PhaseTwoInitialScheduler
             // 非资源工序 Task 同样属该执行批 ⇒ 与资源 Task 共 Key（v1.6：FinalTask 一律回传）。
             // P0-02：键域为 (需求键, 批序号)；批键由本批入参给定，缺省即 1 号批。
             ContinuationKey = demand.ContinuationKey,
-            ExecutionBatchDraftKey = batchDraftKey ?? ExecutionBatchKey(demand.LogicalDemandKey)
+            ExecutionBatchDraftKey = executionBatchDraftKey,
+            // AUD-1-002：Stage 内 MES 执行批身份（C 桶给值、A/B 留空）；**不是**上面那个跨 Stage 链键。
+            StageExecutionBatchDraftKey = producesStageBatchKey
+                ? StageExecutionBatchKey(executionBatchDraftKey, operation.StageCode)
+                : null,
+            StageExecutionBatchQty = producesStageBatchKey ? demand.NetOutputQty : null
         };
     }
 
@@ -2665,6 +2684,36 @@ internal class PhaseTwoInitialScheduler
     /// </summary>
     public static string ExecutionBatchKey(string logicalDemandKey, int batchOrdinal = 1)
         => $"EB|{logicalDemandKey}|{batchOrdinal:D3}";
+
+    /// <summary>
+    /// **Stage 执行批归组键**（T-002 / T-005；AUD-1-002，0号位 2026-10-10《APS_V1_2_20261010.md》§3）。
+    ///
+    /// 【为什么必须与 <see cref="ExecutionBatchKey"/> 分开】
+    ///   · `ExecutionBatchDraftKey` = **一条完整 Routing Path 的跨 Stage 工序链**身份
+    ///     （一个执行批只允许一条完整 Path ⇒ 链上 N 条 Operation FinalTask 共享同一键）—— 1号位 的排程身份；
+    ///   · `StageExecutionBatchDraftKey` = **Stage 内** MES 执行批身份（T-002：「TaskNo 是 **Stage 内** MES
+    ///     执行批的 APS 跨版本业务身份」），2号位 据此归组 `TaskNo` / MES 工单；
+    ///   · **T-003：一个 TaskNo 绑定一个 `MESWorkOrderNo`，MES 工单不跨 Stage。**
+    ///
+    /// 旧实现**从未给该字段赋值**（恒 null）⇒ 跨 Stage 的三道工序共用一个 `ExecutionBatchDraftKey`，
+    ///   报告据此宣称「三工序共批交 2号位生成**一个** MES 工单」—— **与 T-003 直接冲突**。
+    ///
+    /// 【取值】`SEB|{ExecutionBatchDraftKey}|{StageCode}`：随执行批身份（不同批必不同键）且按 Stage 分域。
+    ///   ⇒ 同 Stage 的 N 条 Operation Task 共享一个 Stage 键（**正例**）；跨 Stage 必得**不同**键（**反例**）。
+    /// </summary>
+    public static string StageExecutionBatchKey(string executionBatchDraftKey, string? stageCode)
+        => $"SEB|{executionBatchDraftKey}|{stageCode ?? string.Empty}";
+
+    /// <summary>
+    /// AUD-1-002：本需求是否**产出 Stage 执行批键**。
+    ///   · C 桶（非 A/B）⇒ **是** —— B-003：C 桶由 1号位 在 **Stage Execution Batch 层级**作 Batch Decision；
+    ///   · A/B（`IsContinuation` / `NoSplitMerge`）⇒ **否** —— 既存 MES 执行批不参与普通拆合批，
+    ///     与 3号位 落库口径逐字一致：「C 桶由 1号位 给 Stage 执行批键（**A/B 桶留空**）」
+    ///     （`PeggingOrchestrator.cs:666`）。
+    /// 桶判据与 `TryMergeOrSchedule` / `DecideExecutionBatchPlan` 的 A/B 闸**同源**（只认 `IsContinuation` / `NoSplitMerge`）。
+    /// </summary>
+    private static bool ProducesStageExecutionBatchKey(LogicalProductionDemand demand)
+        => !demand.IsContinuation && !demand.NoSplitMerge;
 
     // ─────────────────────────────────────────────────────────────────────────
     // P0-03（0号位 2026-10-07《未命名的Markdown文件 (7).md》§六）：原
@@ -2697,14 +2746,14 @@ internal class PhaseTwoInitialScheduler
     /// 解析需求对应的 ⑧块 Batch Policy（**P0-01 整改**，0号位 2026-10-07《未命名的Markdown文件 (7).md》§四）。
     ///
     /// **键域 = Material + ProductionDepartment**（冻结 B-001；`TaskSplitRuleConfig` / `BatchPolicyRuleSnapshot` 同口径）。
-    /// 解析顺序：
+    /// 解析顺序（**AUD-1-004 整改后只剩「精确命中」一条**）：
     ///   ① `(demand.MaterialId, deptId)` **精确命中** —— deptId 由 `(MaterialId, StartStageCode)` 从
     ///      `DomainSolveRequest.MaterialStageDepartmentContexts` 反查，**与既有「部门锁定」同口径，不另造部门、不跨部门选优**；
-    ///   ② 未命中 ⇒ `(demand.MaterialId, ProductionDepartmentId == null)` 的 **Material 级默认**（⑧块 DTO 自带语义）；
-    ///   ③ 仍无命中 ⇒ `null`（**缺策略**）。⚠ P0-01 后 `null` **不再**意味着「不拆、恒 1 批」：
+    ///   ② 未精确命中 ⇒ `null`（**缺策略**）。⚠ P0-01 后 `null` **不再**意味着「不拆、恒 1 批」：
     ///      C 桶需求一律判 `BATCH_POLICY_MISSING` 并 **Fail Closed**（见 `DecideExecutionBatchPlan`）。
     ///
     /// **禁止**回落到「全局默认批量策略」—— 0号位 (7).md §十一 第 3 条明文：1号位不得自行创造全局默认策略。
+    /// **禁止**把 `ProductionDepartmentId == null` 的历史记录当 Material 级默认 —— 见 AUD-1-004 整改注释。
     /// </summary>
     internal static BatchPolicyRuleSnapshot? ResolveExecutionBatchPolicy(
         LogicalProductionDemand demand,
@@ -2741,14 +2790,17 @@ internal class PhaseTwoInitialScheduler
             }
         }
 
-        foreach (var p in constraints.ExecutionBatchPolicies)
-        {
-            if (p.MaterialId == demand.MaterialId && p.ProductionDepartmentId == null)
-            {
-                return p;
-            }
-        }
-
+        // ── AUD-1-004（0号位 2026-10-10《APS_V1_2_20261010.md》§3，P0/CONFIRMED）修复 ──
+        //   原「② `(MaterialId, ProductionDepartmentId == null)` 的 Material 级默认」兜底**已删除**。
+        //
+        //   理由（B-001 / B-006 / v5.1.10 收口④）：正式生效的 Batch Policy 只按
+        //     `MaterialId + **明确** ProductionDepartmentId` **精确匹配**；`ProductionDepartmentId == null`
+        //     的行是**历史兼容**记录，**不得**在 Solver 里重新变成「对所有部门生效」的默认策略 ——
+        //     那等于 1号位 自造了一条业务上不存在的生效规则（§十一 第 3 条同向：不得自造默认策略）。
+        //     投影端（2/3号位）已按 `HasValue` 排除 NULL 部门行；此处再兜底会把它们**复活**。
+        //
+        //   ⇒ 未精确命中即 `null`（缺策略）⇒ C 桶走 `BATCH_POLICY_MISSING` Fail Closed
+        //     （见 `DecideExecutionBatchPlan`），**不静默套用历史默认**；历史 NULL 记录仍由 3号位 治理链追溯。
         return null;
     }
 
@@ -2867,7 +2919,8 @@ internal class PhaseTwoInitialScheduler
         bool IsLegal,
         string? ConflictReason,
         IReadOnlyList<ExecutionBatchDraft> Batches,
-        bool IsMissingPolicy)
+        bool IsMissingPolicy,
+        bool IsPiContractPending = false)   // AUD-1-006：B-010 保守兜底的**前置事实**（PI 权威剩余量）未投影
     {
         public static ExecutionBatchFormation Legal(IReadOnlyList<ExecutionBatchDraft> batches)
             => new(true, null, batches, false);
@@ -2878,6 +2931,16 @@ internal class PhaseTwoInitialScheduler
         /// <summary>P0-01：缺有效 Batch Policy（`BATCH_POLICY_MISSING`）。</summary>
         public static ExecutionBatchFormation Missing(string reason)
             => new(false, reason, Array.Empty<ExecutionBatchDraft>(), true);
+
+        /// <summary>
+        /// AUD-1-006 / B-010：C 桶缺策略、**且**符合「唯一明确真实 MTS PI 来源」的保守兜底条件，
+        ///   但兜底所需的 **PI 权威剩余量事实未投影进求解输入**（`AUD-1-D04`，归 2号位 装载）
+        ///   ⇒ 按 B-010「超出合法可用量须**显式记录未满足**、不得扩大/静默截断 Q」的保守方向，
+        ///   **不凭空造批**，维持 Fail Closed 并把原因精确登记为契约待核（而非笼统的「无策略」）。
+        /// 仍属 HardFailure（与 `Missing` 同类：Phase4 不得进入普通 Local Repair）。
+        /// </summary>
+        public static ExecutionBatchFormation PiQuantityContractPending(string reason)
+            => new(false, reason, Array.Empty<ExecutionBatchDraft>(), true, IsPiContractPending: true);
     }
 
     /// <summary>
@@ -2899,11 +2962,28 @@ internal class PhaseTwoInitialScheduler
     /// </summary>
     public static ExecutionBatchFormation FormExecutionBatches(
         LogicalProductionDemand demand,
-        BatchPolicyRuleSnapshot? policy)
+        BatchPolicyRuleSnapshot? policy,
+        IReadOnlyList<PiRemainingFact>? piFacts = null)   // AUD-1-006 / B-010：PI 权威剩余事实（**当前调用方未投影 ⇒ null**，见 AUD-1-D04）
     {
         var plan = DecideExecutionBatchPlan(demand, policy);
         if (!plan.IsLegal)
         {
+            // ── AUD-1-006（0号位 2026-10-10《APS_V1_2_20261010.md》§3，P0/CONFIRMED）──
+            //   B-010 条件化保守兜底：**仅**「唯一明确真实 MTS PI 来源、Stage 合法自由量可靠、
+            //   且 Policy **完全无匹配**」的 C 桶，允许按 Q_C 一次性保守组织一个 Stage 执行批候选，
+            //   受 PI 量限；**不能普遍一律 Fail Closed**。⇒ 缺策略时先评估该分支，再决定是否 Fail Closed。
+            //   ⚠ 「已有配置无效」**不得**冒充「无匹配」（B-010 末句）—— 本分支只在 `IsMissingPolicy`
+            //     （= 精确匹配与（已删除的）Material 级默认均未命中）时进入；`IsMissingPolicy=false`
+            //     的 `BATCH_POLICY_CONFLICT` 一律走原路径，不适用兜底。
+            if (plan.IsMissingPolicy)
+            {
+                var b010 = TryFormConservativePiBatch(demand, piFacts);
+                if (b010 is not null)
+                {
+                    return b010;
+                }
+            }
+
             // P0-01：缺策略（`BATCH_POLICY_MISSING`）与冲突（`BATCH_POLICY_CONFLICT`）分列，供出口给不同 Reason。
             return plan.IsMissingPolicy
                 ? ExecutionBatchFormation.Missing(plan.ConflictReason!)
@@ -2911,6 +2991,91 @@ internal class PhaseTwoInitialScheduler
         }
 
         return BuildBatchFormation(demand, policy, plan.Count, validateDomain: true);
+    }
+
+    /// <summary>
+    /// AUD-1-006 / B-010：C 桶「缺策略」时的**条件化保守兜底**评估。
+    ///
+    /// B-010 逐字前置（三条**同时**成立才适用，缺一即不适用该兜底）：
+    ///   ① **唯一明确真实 MTS PI 来源** —— `demand.ProductionInstructionNo` 非空
+    ///      （B-010 末句：「**无明确 PI 来源不适用该兜底**」）；
+    ///   ② **Policy 完全无匹配** —— 由调用点保证（仅 `IsMissingPolicy` 进入）；
+    ///   ③ **Stage 合法自由量可靠** —— 需 PI 权威剩余量（`PiRemainingFact.PiRemainingQty`，
+    ///      `Core/Dto/PiRemainingFact.cs`：`max(PiQuantity − ReceivedQty, 0)`）与 Stage 自由余额。
+    ///
+    /// 适用 ⇒ 按 `Q_C = demand.NetOutputQty` 组织**一个** Stage 执行批候选：
+    ///   · **不伪造**物料级 Min/Max/Preferred（B-010）；
+    ///   · **不额外优化拆合**（B-010）；
+    ///   · `Q` **不得扩大、不得静默截断**（B-010）—— 超出 PI 合法可用量必须**显式记录未满足**。
+    ///
+    /// ⚠ 本 Run 的 ③ **无载体**：`PiRemainingFact` 已存在于 Core，但**未投影进 `DomainSolveRequest`**
+    ///   （全仓 grep：`LPS.APS.Scheduling` 零命中；AUD-1-D04 归 2号位 装载）
+    ///   ⇒ 1号位 **无法验证**「Stage 合法自由量可靠」这一前置 ⇒ **不得凭空造批**
+    ///   （遵 [[lps-no-lowering-targets-redline]]：做不到直说，不把「替代路径」当达标）
+    ///   ⇒ 返回 <see cref="ExecutionBatchFormation.PiQuantityContractPending"/>，把原因精确登记为
+    ///     **契约待核**（而非笼统的 `BATCH_POLICY_MISSING`），并维持 Fail Closed。
+    ///
+    /// 返回 `null` ⇒ **不适用**该兜底（无明确 PI 来源 / 非正数量）⇒ 调用方走原 `BATCH_POLICY_MISSING`。
+    /// </summary>
+    private static ExecutionBatchFormation? TryFormConservativePiBatch(
+        LogicalProductionDemand demand,
+        IReadOnlyList<PiRemainingFact>? piFacts)
+    {
+        // 前置①：唯一明确真实 MTS PI 来源（无 PI 来源 ⇒ 不适用兜底，走原 Fail Closed）
+        if (string.IsNullOrWhiteSpace(demand.ProductionInstructionNo))
+        {
+            return null;
+        }
+
+        // 非正数量不构成合法批（与 `DecideExecutionBatchPlan` 同口径），不适用兜底。
+        decimal qc = demand.NetOutputQty;
+        if (qc <= 0m)
+        {
+            return null;
+        }
+
+        // 前置③：PI 权威剩余量事实（**当前调用方未投影 ⇒ 恒 null**，AUD-1-D04）
+        PiRemainingFact? piFact = null;
+        if (piFacts is not null)
+        {
+            foreach (var f in piFacts)
+            {
+                if (string.Equals(f.ProductionInstructionNo, demand.ProductionInstructionNo, StringComparison.Ordinal)
+                    && f.MaterialId == demand.MaterialId)
+                {
+                    piFact = f;
+                    break;
+                }
+            }
+        }
+
+        if (piFact is null)
+        {
+            return ExecutionBatchFormation.PiQuantityContractPending(
+                "B010_PI_QUANTITY_CONTRACT_PENDING：C 桶需求在 Solver 输入中找不到有效 Batch Policy（BATCH_POLICY_MISSING），"
+                + "且 B-010 条件化保守兜底所需的前置③「Stage 合法自由量可靠」无法验证 —— "
+                + "PI 权威剩余量事实（PiRemainingFact.PiRemainingQty）**未投影进 DomainSolveRequest**"
+                + "（AUD-1-D04，归 2号位 装载）⇒ 不得凭空造批，维持 Fail Closed");
+        }
+
+        // 前置③成立：以 PI 权威剩余量约束 Q_C —— **不得扩大、不得静默截断**（B-010）。
+        if (qc > piFact.PiRemainingQty)
+        {
+            return ExecutionBatchFormation.PiQuantityContractPending(
+                $"B010_PI_QUANTITY_CONTRACT_PENDING：C 桶需求 Q_C={qc} 超出 PI {piFact.ProductionInstructionNo} "
+                + $"权威剩余量 {piFact.PiRemainingQty} ⇒ 按 B-010「超出合法可用量须显式记录未满足」，不静默截断，维持 Fail Closed");
+        }
+
+        // 适用 ⇒ **一个** Stage 执行批候选（Q_C 原值，不伪造 Min/Max/Preferred、不额外优化拆合）。
+        return ExecutionBatchFormation.Legal(new[]
+        {
+            new ExecutionBatchDraft(
+                ExecutionBatchKey(demand.LogicalDemandKey, 1),
+                demand.LogicalDemandKey,
+                Ordinal: 1,
+                NetOutputQty: qc,
+                PlannedProcessQty: demand.PlannedProcessQty)
+        });
     }
 
     /// <summary>
@@ -2977,6 +3142,69 @@ internal class PhaseTwoInitialScheduler
     }
 
     /// <summary>
+    /// 1号位 Solver **技术预算**（B-007 / AUD-1-005，0号位 2026-10-10《APS_V1_2_20261010.md》§3）。
+    ///
+    /// 为什么单列一个类型：这两个上限是 **Solver 有界搜索的技术预算**，**不是业务拆合批上限**
+    ///   （B-007 逐字：「是 1号位 Solver 有界搜索技术预算，**不再按 Material+部门由车间维护**」；
+    ///     「经验值 3/8 **不是统一业务上限**」）。它们**不得**再以业务 `BatchPolicyRuleSnapshot` 的
+    ///   `MaxOptimizationSplitCount` / `MaxBatchCandidates` 列作为运行单一真相（v5.1.10 收口①：
+    ///   该两列投影恒 null、**主链不得消费**，仅追溯）。
+    ///
+    /// 取源（按 B-007「有效值与运行版本应**单源可追溯**」）：
+    ///   ① **正式参数版本载体（若存在）**：⑤ `SolverStrategyBlock.Split.MaxOptimizationSplitCount`
+    ///      （`FrozenStrategySnapshot.cs` 清单 31；由 3号位 冻结、2号位 在 Run 冻结上下文装载）；
+    ///   ② 无正式载体可用的那一项 ⇒ **1号位 有界、可追溯的版本化安全默认**（<see cref="VersionedSafeDefault"/>）。
+    ///
+    /// ⚠ `MaxBatchCandidates` **当前无正式参数版本载体**（`SplitParams` 只有 `MaxOptimizationSplitCount`；
+    ///   `CandidateGuardrailBlock.SplitAlternatives` 语义为「拆分备选数」、已被 Phase4 消费，**不得挪用**）
+    ///   ⇒ 走 ②，并登记为待 2/3号位 提供正式载体的契约项。
+    /// ⚠ **硬 Max 强制拆出的基线批不受本预算限制**（B-007：「不能让预算限制硬 Max 强制拆批」）。
+    /// </summary>
+    public readonly record struct SolverBatchBudget(
+        int MaxOptimizationSplitCount,
+        int MaxBatchCandidates,
+        string Source)
+    {
+        /// <summary>预算版本号（B-007：运行版本应单源可追溯）。</summary>
+        public const string BudgetVersion = "SolverBatchBudget/v1";
+
+        /// <summary>版本化安全默认 —— 优化性拆分批数上限（有界、可追溯；**非**业务上限）。</summary>
+        public const int DefaultMaxOptimizationSplitCount = 3;
+
+        /// <summary>版本化安全默认 —— 单问题最多评估候选数（含基线）。</summary>
+        public const int DefaultMaxBatchCandidates = 8;
+
+        /// <summary>无正式载体时的版本化安全默认（B-007 ②）。</summary>
+        public static SolverBatchBudget VersionedSafeDefault { get; } = new(
+            DefaultMaxOptimizationSplitCount,
+            DefaultMaxBatchCandidates,
+            $"{BudgetVersion}:default");
+
+        /// <summary>来源自正式参数版本载体（⑤ `SolverStrategy.Split`）。</summary>
+        public static SolverBatchBudget FromSplitParams(int maxOptimizationSplitCount) => new(
+            maxOptimizationSplitCount < 0 ? DefaultMaxOptimizationSplitCount : maxOptimizationSplitCount,
+            DefaultMaxBatchCandidates,
+            $"{BudgetVersion}:SplitParams");
+    }
+
+    /// <summary>
+    /// AUD-1-005：解析本 Run 的 <see cref="SolverBatchBudget"/>。
+    ///   ① ⑤ `SolverStrategy.Split.MaxOptimizationSplitCount`（正式参数版本载体，若存在）⇒ 用之；
+    ///   ② 否则 ⇒ <see cref="SolverBatchBudget.VersionedSafeDefault"/>。
+    /// **绝不**读业务 `BatchPolicyRuleSnapshot` 的两列。
+    /// </summary>
+    internal static SolverBatchBudget ResolveSolverBatchBudget(DomainSolveRequest? request)
+    {
+        var split = request?.StrategySnapshot?.SolverStrategy?.Split;
+        if (split is not null)
+        {
+            return SolverBatchBudget.FromSplitParams(split.MaxOptimizationSplitCount);
+        }
+
+        return SolverBatchBudget.VersionedSafeDefault;
+    }
+
+    /// <summary>
     /// P1-01（0号位 2026-10-07《未命名的Markdown文件 (7).md》§八）：**有界优化候选**批方案枚举。
     ///
     /// 候选（**结构上有界，≤5**，不新增任何默认值）：
@@ -2985,11 +3213,12 @@ internal class PhaseTwoInitialScheduler
     ///   · 合法 **2 批** / 合法 **3 批**；
     ///   · `PreferredBatchQty` **附近切分**（`nPref = round(Qty / PreferredBatchQty)`，越界即丢弃）。
     ///
-    /// 两个上限**只收不放**（0号位 §八「候选数量受 MaxOptimizationSplitCount、MaxBatchCandidates 约束」）：
+    /// 两个上限**只收不放**，且**来源已按 AUD-1-005 整改**（0号位 2026-10-10《APS_V1_2_20261010.md》§3）：
     ///   · `MaxOptimizationSplitCount`：**仅限制优化性拆分**（批数 &gt; 基线者），不限制硬 Max 强制拆出的基线批数
     ///     （与 DTO 注释逐字一致：「不限制硬 Max 强制拆分」）；
     ///   · `MaxBatchCandidates`：单问题最多评估候选数（**含基线**）。
-    ///   `null` ⇒ 该上限不生效（候选仍由**结构**保证有界）。
+    ///   ⚠ 二者**一律来自入参 `budget`**（`SolverBatchBudget`），**不再从业务 `BatchPolicyRuleSnapshot` 读取**
+    ///     —— 后者两列自 v5.1.10 收口① 起恒 null 且**主链不得消费**（B-007）。
     ///
     /// 每个优化候选都要过 <see cref="BuildBatchFormation"/> 的**合法域复核**；越域者**丢弃该候选**
     ///   （不得因一个优化候选越界就把整个需求判冲突 —— 基线不受影响）。
@@ -3002,7 +3231,8 @@ internal class PhaseTwoInitialScheduler
     internal static List<ExecutionBatchFormation> EnumerateLegalBatchPlanCandidates(
         LogicalProductionDemand demand,
         BatchPolicyRuleSnapshot? policy,
-        ExecutionBatchFormation baseline)
+        ExecutionBatchFormation baseline,
+        SolverBatchBudget? budget = null)   // AUD-1-005：技术预算**入参**（不再从业务 policy 读）；缺省 = 版本化安全默认
     {
         var list = new List<ExecutionBatchFormation> { baseline };
 
@@ -3043,16 +3273,18 @@ internal class PhaseTwoInitialScheduler
             TryAdd(ClampToPositiveInt(Math.Round(qty / pref, MidpointRounding.AwayFromZero)));   // Preferred 附近
         }
 
-        // 上限①：优化性拆分（批数 > 基线）受 MaxOptimizationSplitCount 限制；基线不受限（硬 Max 强制拆分）。
-        if (policy.MaxOptimizationSplitCount is int capSplit)
-        {
-            counts.RemoveAll(c => c > baselineCount && c > capSplit);
-        }
+        // ── 技术预算来源（AUD-1-005 整改）：**入参 `budget`**，绝不读业务 `policy` 的两列 ──
+        //   `policy.MaxOptimizationSplitCount` / `policy.MaxBatchCandidates` 自 v5.1.10 收口①（2026-10-09 生效）
+        //   起投影恒 null 且**主链不得消费**（B-007）；旧写法把它们当运行预算 = 让历史业务列重新变成生效默认。
+        var solverBudget = budget ?? SolverBatchBudget.VersionedSafeDefault;
 
-        // 上限②：候选总数受 MaxBatchCandidates 限制（基线恒保留 ⇒ 可容纳的优化候选 = cap - 1）。
-        if (policy.MaxBatchCandidates is int capCand && capCand > 0)
+        // 上限①：优化性拆分（批数 > 基线）受预算限制；**基线不受限**（硬 Max 强制拆分不得被技术预算压制）。
+        counts.RemoveAll(c => c > baselineCount && c > solverBudget.MaxOptimizationSplitCount);
+
+        // 上限②：候选总数受预算限制（基线恒保留 ⇒ 可容纳的优化候选 = cap - 1）。
+        if (solverBudget.MaxBatchCandidates > 0)
         {
-            int allowed = Math.Max(0, capCand - 1);
+            int allowed = Math.Max(0, solverBudget.MaxBatchCandidates - 1);
             if (counts.Count > allowed)
             {
                 counts = counts.Take(allowed).ToList();
@@ -3133,6 +3365,10 @@ internal class PhaseTwoInitialScheduler
 
         // P0-04修复：补齐FinalTaskDraft必需字段，Duration已使用 StandardDuration × PlannedProcessQty ÷ CapacityFactor
 
+        // AUD-1-002：执行批身份（跨 Stage 工序链）与 **Stage 执行批身份**（Stage 内 MES 批）分开 —— 见 StageExecutionBatchKey 注释。
+        var executionBatchDraftKey = batchDraftKey ?? ExecutionBatchKey(demand.LogicalDemandKey);
+        var producesStageBatchKey = ProducesStageExecutionBatchKey(demand);
+
         return new FinalTaskDraft
         {
             FinalDraftId = Guid.NewGuid().ToString(),
@@ -3160,7 +3396,13 @@ internal class PhaseTwoInitialScheduler
             ContinuationKey = demand.ContinuationKey,
             // ExecutionBatchDraftKey：同一执行批下多 Operation 共 Key。
             // P0-02：键域为 (需求键, 批序号)，**不再由 Route/Path 派生**；批键由本批入参给定，缺省即 1 号批。
-            ExecutionBatchDraftKey = batchDraftKey ?? ExecutionBatchKey(demand.LogicalDemandKey)
+            ExecutionBatchDraftKey = executionBatchDraftKey,
+            // AUD-1-002：Stage 内 MES 执行批身份（C 桶给值、A/B 留空）；**不是**上面那个跨 Stage 链键。
+            //   T-003：MES 工单不跨 Stage ⇒ 跨 Stage 的三道工序必得**三个不同** Stage 键。
+            StageExecutionBatchDraftKey = producesStageBatchKey
+                ? StageExecutionBatchKey(executionBatchDraftKey, operation.StageCode)
+                : null,
+            StageExecutionBatchQty = producesStageBatchKey ? demand.NetOutputQty : null
         };
     }
 
@@ -3256,7 +3498,10 @@ internal class PhaseTwoInitialScheduler
         //   ⚠ 目标必须是**另一条需求**（`LogicalDemandKey` 不同）：同需求的不同执行批是**拆批**的两半，
         //     把两半再合回会静默撤销拆批、并可能突破该需求 Batch Policy 的 Max ⇒ 不在本次开放范围（如实登记）。
         //   ⚠ 载体用**当前正式生效**的 `ExecutionBatchDraftKey`（1号位 生成、Phase4/Phase5 已消费）；
-        //     2026-10-08 候选文件新增的 `StageExecutionBatchDraftKey` 属**预检项**，本号位不新建批次平台。
+        //     **AUD-1-002 整改后**：`StageExecutionBatchDraftKey` **已由本号位产出**（`CreateTask` /
+        //       `CreateNonResourceTask` / 本方法单工序 Merge 三处，C 桶给值、A/B 留空），
+        //       与 `ExecutionBatchDraftKey` **不是同一字段** —— 前者 Stage 内 MES 批身份、后者跨 Stage 链身份。
+        //       仍**不新建批次平台、不新增 Core 字段**（复用 2026-10-08 已存在的 Core 载体）。
         if (operations.Count > 1)
         {
             var stageBatches = FindMergeableStageBatches(
@@ -3298,18 +3543,61 @@ internal class PhaseTwoInitialScheduler
             var separateSetup = separateProduced.Sum(t => t.SetupTime);
 
             // 候选 B：Stage 合批（在**同一初始上下文**的另一套隔离副本上）。
-            constraints.ProductTimeline = realTimeline.Clone();
-            var mrgOccupancy = CloneOccupancy(resourceOccupancy, out var mrgOccupancyPristine);
-            var mrgTasks = new List<FinalTaskDraft>(scheduledTasks);
-            var mrgShares = CloneShares(allocationTaskShare);
-            var mergedRepresentative = TryMergeDemandIntoStageBatch(
-                demand, operations, routingGraph, direction, stageBatches[0], constraints,
-                mrgOccupancy, mrgTasks, mrgShares, demandByKey,
-                planningStart, planningEnd, dynamicMaterialFloor, stageOverlap, mrgOccupancyPristine,
-                out var mergedCombinedTasks);
-            var mergedSetup = mergedCombinedTasks.Sum(t => t.SetupTime);
+            // ── AUD-1-R01（0号位 2026-10-10《APS_V1_2_20261010.md》§4，RISK_UNVERIFIED）修复：**逐锚点试排** ──
+            //   复审判词（本号位核对：**成立**）：旧实现只试 `stageBatches[0]`（`scheduledTasks` 中出现最早的
+            //   那个合法合批目标）⇒ 存在**多个合法锚点**（或替代 Path 提供多个同形目标）时，可能漏掉业务更优方案。
+            //   修法 = **每个合法锚点各形成一份合批候选**（一锚点一候选，**不枚举锚点组合** —— 与复审
+            //   「不自动要求穷举全部组合」一致），全部候选与「独立排程」在**同一冻结四层目标**下逐个比较，
+            //   取最优者落定。比较口径与 `SelectBestBatchPlan` / `PreferStageMerge` **同源**，不新增加权目标函数。
+            //   每个候选都在**同一初始上下文**上试排：`ProductTimeline` 重新 `Clone()`、`TraceNotes` 回退到水位。
+            var bestAnchorIndex = -1;                 // -1 = 独立排程胜出（= 该分支整改前的回落行为）
+            FinalTaskDraft? bestMergeRepresentative = null;
+            var bestMergeSetup = 0m;
 
-            // 试排回滚：还原真实时间线 + 按水位清掉两份试排的 Setup 追踪（落定重跑会重写恰好一份）。
+            for (var anchorIndex = 0; anchorIndex < stageBatches.Count; anchorIndex++)
+            {
+                constraints.ProductTimeline = realTimeline.Clone();
+                if (constraints.TraceNotes.Count > traceNotesWatermark)
+                {
+                    constraints.TraceNotes.RemoveRange(
+                        traceNotesWatermark, constraints.TraceNotes.Count - traceNotesWatermark);
+                }
+
+                var mrgOccupancy = CloneOccupancy(resourceOccupancy, out var mrgOccupancyPristine);
+                var mrgTasks = new List<FinalTaskDraft>(scheduledTasks);
+                var mrgShares = CloneShares(allocationTaskShare);
+                var anchorRepresentative = TryMergeDemandIntoStageBatch(
+                    demand, operations, routingGraph, direction, stageBatches[anchorIndex], constraints,
+                    mrgOccupancy, mrgTasks, mrgShares, demandByKey,
+                    planningStart, planningEnd, dynamicMaterialFloor, stageOverlap, mrgOccupancyPristine,
+                    out var anchorCombinedTasks);
+                var anchorSetup = anchorCombinedTasks.Sum(t => t.SetupTime);
+
+                // 当前擂主：首轮 = 独立排程候选；其后 = 已胜出的合批候选（同一冻结四层目标下两两比较）。
+                var incumbentFeasible = bestAnchorIndex >= 0
+                    ? bestMergeRepresentative is not null
+                    : separateProduced.Count > 0;
+                var incumbentEnd = bestAnchorIndex >= 0
+                    ? bestMergeRepresentative?.PlannedEndTime ?? DateTime.MinValue
+                    : separateEnd;
+                var incumbentSetup = bestAnchorIndex >= 0 ? bestMergeSetup : separateSetup;
+
+                if (PreferStageMerge(
+                        separateFeasible: incumbentFeasible,
+                        separateEnd: incumbentEnd,
+                        separateSetup: incumbentSetup,
+                        mergeFeasible: anchorRepresentative is not null,
+                        mergeEnd: anchorRepresentative?.PlannedEndTime ?? DateTime.MinValue,
+                        mergeSetup: anchorSetup,
+                        demand, constraints, direction))
+                {
+                    bestAnchorIndex = anchorIndex;
+                    bestMergeRepresentative = anchorRepresentative;
+                    bestMergeSetup = anchorSetup;
+                }
+            }
+
+            // 试排回滚：还原真实时间线 + 按水位清掉**全部**试排的 Setup 追踪（落定重跑会重写恰好一份）。
             constraints.ProductTimeline = realTimeline;
             if (constraints.TraceNotes.Count > traceNotesWatermark)
             {
@@ -3317,19 +3605,11 @@ internal class PhaseTwoInitialScheduler
                     traceNotesWatermark, constraints.TraceNotes.Count - traceNotesWatermark);
             }
 
-            var preferMerge = PreferStageMerge(
-                separateFeasible: separateProduced.Count > 0,
-                separateEnd, separateSetup,
-                mergeFeasible: mergedRepresentative is not null,
-                mergeEnd: mergedRepresentative?.PlannedEndTime ?? DateTime.MinValue,
-                mergedSetup,
-                demand, constraints, direction);
-
             // 落定：胜者在**真实上下文**上重跑（独立排程与试排同一调用；合批走真实表 + 自身快照）。
-            if (preferMerge)
+            if (bestAnchorIndex >= 0)
             {
                 var landed = TryMergeDemandIntoStageBatch(
-                    demand, operations, routingGraph, direction, stageBatches[0], constraints,
+                    demand, operations, routingGraph, direction, stageBatches[bestAnchorIndex], constraints,
                     resourceOccupancy, scheduledTasks, allocationTaskShare, demandByKey,
                     planningStart, planningEnd, dynamicMaterialFloor, stageOverlap, occupancyPristine,
                     out _);
@@ -3413,6 +3693,10 @@ internal class PhaseTwoInitialScheduler
     ///
     /// ⚠ 两个候选同属一条需求、同一 Routing 候选、同一 Direction ⇒ 第 ③ 层不存在「两方方向不同不可比」的情形
     ///   （该判平条件只出现在跨 Routing 候选比较里）。
+    ///
+    /// AUD-1-R01（2026-10-10）复用：本方法对入参只做「A 是否劣于 B」的**两两比较**，与 A/B 各自是谁无关
+    ///   ⇒ 同一套冻结四层目标被直接复用于「**当前擂主 vs 下一个合法锚点候选**」的逐个擂台比较
+    ///   （首轮擂主 = 独立排程候选）。判平（⑤）取「不换擂主」= 保守，语义与「判平取独立排程」一致。
     /// </summary>
     private static bool PreferStageMerge(
         bool separateFeasible,
@@ -3634,6 +3918,24 @@ internal class PhaseTwoInitialScheduler
                 if (!string.Equals(t.SourceDraftId, sourceKey, StringComparison.Ordinal)) { matched = false; break; }
 
                 // ⑦ 批内数量一致（构造不变式；不一致 ⇒ 不是可合批的完整批）。
+                //
+                // ── AUD-1-R02（0号位 2026-10-10《APS_V1_2_20261010.md》§4，RISK_UNVERIFIED）**核对结论：V1 不过度拒绝** ──
+                //   复审疑点：「Stage 内不同 Operation 的 `PlannedProcessQty` 若真实不同，本处要求批内完全相等，
+                //     可能错拒合法批」（实施包 v1.7 `:44`：「各 Operation 的实际剩余/预计加工量可因报工、良率等不同」）。
+                //
+                //   实测/源码核对（两条）：
+                //     ① **1号位 产出的同批 Task 逐工序恒等** —— `CreateTask` / `CreateNonResourceTask` 一律取
+                //        `PlannedProcessQty = demand.PlannedProcessQty`、`Quantity = demand.NetOutputQty`；
+                //        `TryMergeDemandIntoStageBatch` 重跑完整链 ⇒ 同样均匀。⇒ 由 `FormExecutionBatches` 形成的
+                //        批**构造上均匀**，本判据**不可能**拒绝它（对 V1 自身数据是恒真守卫）。
+                //     ② 唯一可造成批内不均的路径 = **单工序 Merge 并入已归批目标**（`TryMergeDemandIntoTask`
+                //        改写 `Quantity`/`PlannedProcessQty`；`requireIdentityPreserving = multiBatch` ⇒ 单批需求
+                //        可命中）。此时本判据把该批**保守排除**为合批目标 —— **不丢需求**（该需求仍独立排程），
+                //        也**不改写**既有逐工序量。⇒ 不是「错拒」，是「拒绝改写无法表达的逐工序差异」。
+                //
+                //   ⇒ **本轮不放宽**：放宽会把既有逐工序量**静默同质化**（重跑只带一个 `PlannedProcessQty`），
+                //     比保守不合批更坏。逐工序量要真实保留，需**逐工序数量载体**（1↔2 契约缺口，与 AUD-1-D04 同族）。
+                //     已登记为契约项，**不降目标**（不把「放宽后能合批」当作达标）。
                 if (t.Quantity != anchorTask.Quantity || t.PlannedProcessQty != anchorTask.PlannedProcessQty)
                 {
                     matched = false; break;
@@ -3812,6 +4114,15 @@ internal class PhaseTwoInitialScheduler
         }
 
         // 创建合并后的新Task（因为FinalTaskDraft属性是init-only，不能修改已有对象）
+        // AUD-1-002：执行批身份（跨 Stage 工序链）与 **Stage 执行批身份**（Stage 内 MES 批）分开 —— 见 StageExecutionBatchKey 注释。
+        //   本条路径只处理**同一 Stage、同一 Operation** 的 Task 合并（`FindMergeableTasks` 按 StageCode+OperationCode 匹配），
+        //   故 Stage 身份沿用目标即可；目标无 Stage 键（历史/未归组）时按合并后执行批键 + 本 Stage 派生。
+        var mergedExecutionBatchKey = targetTask.ExecutionBatchDraftKey ?? batchDraftKey;
+        var mergedStageBatchKey = targetTask.StageExecutionBatchDraftKey
+            ?? (mergedExecutionBatchKey is not null && ProducesStageExecutionBatchKey(demand)
+                ? StageExecutionBatchKey(mergedExecutionBatchKey, targetTask.StageCode)
+                : null);
+
         var mergedTask = new FinalTaskDraft
         {
             FinalDraftId = targetTask.FinalDraftId, // 保持相同的DraftId
@@ -3840,7 +4151,12 @@ internal class PhaseTwoInitialScheduler
             ContinuationKey = targetTask.ContinuationKey,
             // P1-01：目标未归批 ⇒ 合并结果采用**本批键**（执行批身份不丢）；目标已归批 ⇒ 沿用目标键
             //   （`FindMergeableTasks` 在 requireIdentityPreserving 下已把「已归批目标」挡掉）。
-            ExecutionBatchDraftKey = targetTask.ExecutionBatchDraftKey ?? batchDraftKey
+            ExecutionBatchDraftKey = mergedExecutionBatchKey,
+            // AUD-1-002：Stage 内 MES 执行批身份（与上面的跨 Stage 链键**不是同一字段**）。
+            StageExecutionBatchDraftKey = mergedStageBatchKey,
+            StageExecutionBatchQty = mergedStageBatchKey is null
+                ? null
+                : targetTask.Quantity + demand.NetOutputQty
         };
 
         // 找到targetTask在scheduledTasks中的索引，替换为mergedTask
@@ -3983,6 +4299,21 @@ internal class PhaseTwoInitialScheduler
             }
         }
 
+        // ── AUD-1-003（0号位 2026-10-10《APS_V1_2_20261010.md》§3，P0/CONFIRMED）修复：**失败试排的全状态回滚** ──
+        //   缺陷：`ScheduleForward` / `ScheduleBackward` **每排下一道工序就立刻**写 `resourceOccupancy`
+        //     （`AddOccupancyWindow`）与 `ProductTimeline`（`Place`）；后续工序无槽即返回**空集合**。
+        //     旧实现在**真实表**上重跑，失败时只 `RestoreStageBatchSnapshot` 把原批加回，
+        //     **前序工序新增的占用/时间线登记被遗留** ⇒ 资源上出现「没有 Task 对应的幽灵占用」
+        //     （INV-CAL-001 CONFIRMED；后续需求看到虚假占用、被误判排不下）。
+        //   修法 = **水位回滚**。前提：本次重跑对占用表/时间线**只追加、从不删除**既有窗
+        //     （`ScheduleForward`/`ScheduleBackward` 的全部写入点均为 append；删窗只发生在
+        //      `TryMergeDemandIntoTask`，而它不被 `ScheduleDemandOperations` 调用）。
+        //     · 占用表：记录「每资源当前窗数」⇒ 失败即截断回水位、并移除试排新建的资源键；
+        //     · 产品时间线：试排前 `Clone()` 一份 ⇒ 失败即整体换回（`RestoreStageBatchSnapshot`
+        //       随后把被移出的原批时间线登记按原值 `Place` 回来）。
+        var occupancyWatermark = CaptureOccupancyWatermark(resourceOccupancy);
+        var timelineBeforeRerun = constraints.ProductTimeline.Clone();
+
         // ── 重跑完整排程：同一 Path、同一批键、完整 Operation 链 ──
         combinedTasks = ScheduleDemandOperations(
             combinedDemand, operations, routingGraph, direction, constraints,
@@ -3992,6 +4323,9 @@ internal class PhaseTwoInitialScheduler
         // 失败 ⇒ 原样恢复（不留下任何半成品状态），回落独立排程。
         if (combinedTasks.Count == 0)
         {
+            // AUD-1-003：先清掉试排新增的占用/时间线（水位回滚），再恢复被移出的原批。
+            RollbackOccupancyToWatermark(resourceOccupancy, occupancyWatermark);
+            constraints.ProductTimeline = timelineBeforeRerun;
             RestoreStageBatchSnapshot(
                 scheduledTasks, removedTasks, removedWindows, removedTimeline, removedShares,
                 resourceOccupancy, occupancyPristine, constraints, allocationTaskShare);
@@ -4012,6 +4346,9 @@ internal class PhaseTwoInitialScheduler
         var worsensCurrent = dueCurrent != DateTime.MaxValue && combinedEnd > dueCurrent;
         if (worsensAnchor || worsensCurrent)
         {
+            // AUD-1-003：本路径的试排**已成功**（`combinedTasks` 非空）⇒ 其占用/时间线写入必须整体回滚。
+            RollbackOccupancyToWatermark(resourceOccupancy, occupancyWatermark);
+            constraints.ProductTimeline = timelineBeforeRerun;
             RestoreStageBatchSnapshot(
                 scheduledTasks, removedTasks, removedWindows, removedTimeline, removedShares,
                 resourceOccupancy, occupancyPristine, constraints, allocationTaskShare);
@@ -4029,12 +4366,47 @@ internal class PhaseTwoInitialScheduler
         //     「锚点需求 × 整批数量 50」，而该需求的声明量只有 30 ⇒ 误报「数量未闭合」。
         //     （实际落到 AllocationTaskShare 的仍只有**末端** Task —— `GenerateAllocationShares` 用
         //       `downstreamTasks` 过滤，与 `mergeLineage` 的登记范围无关。）
+        // ── AUD-1-001（0号位 2026-10-10《APS_V1_2_20261010.md》§3，P0/CONFIRMED）修复 ──
+        //   **按需求取「一份」规范构成，不得按 Operation 累加物理份额。**
+        //
+        //   缺陷：被移出批的 N 条 Operation Task **各自**登记同一份需求构成（这是 Phase5 逐 (需求 × 工序)
+        //     闭合所必需的，见上方注释）；但旧写法把 `removedShares` **逐条** AddRange 进新批份额，
+        //     同一份份额于是被算了 N 遍。静态反例（裁决 §3 原文场景）：
+        //       A30+B20 先合成 50 件批（3 工序，每 Task 各持 [A30,B20]）⇒ 再合 C10 时
+        //       removedShares = [(t1,[A30,B20]),(t2,[A30,B20]),(t3,[A30,B20])]
+        //       ⇒ 旧写法得 B20×3 + C10 = 70，而新批 Task 数量只有 60
+        //       ⇒ Phase5 `ValidateHardResult` 的逐 (需求×工序) 闭合校验必然失真/误报
+        //         （B 份额膨胀、A 锚点份额被淹没）。
+        //
+        //   正解：按 `DemandKey` **去重**取一份规范构成（各 Operation 副本同值，首见即取 —— 同一份份额
+        //     在同一执行批内**只可按需求真实归属计一次**，B-003 / INV-QTY-001 / INV-OUT-001），
+        //     再映射到新批**每条** Task（保证 Phase5 逐工序闭合仍可展开）。
         var shareList = new List<(string DemandKey, decimal ShareQty)>();
+        var seenShareDemandKeys = new HashSet<string>(StringComparer.Ordinal);
         foreach (var (_, shares) in removedShares)
         {
-            shareList.AddRange(shares);
+            foreach (var (demandKey, shareQty) in shares)
+            {
+                if (seenShareDemandKeys.Add(demandKey))
+                {
+                    shareList.Add((demandKey, shareQty));
+                }
+            }
         }
-        shareList.Add((demand.LogicalDemandKey, demand.NetOutputQty));
+
+        // 本需求自身份额：同键不得重复累加（`FindMergeableStageBatches` 已保证目标批属**另一条需求**，
+        //   此处仅为防御性合并 —— 真同键时按数量相加，绝不静默丢份额）。
+        var currentShareIdx = shareList.FindIndex(
+            s => string.Equals(s.DemandKey, demand.LogicalDemandKey, StringComparison.Ordinal));
+        if (currentShareIdx >= 0)
+        {
+            shareList[currentShareIdx] =
+                (demand.LogicalDemandKey, shareList[currentShareIdx].ShareQty + demand.NetOutputQty);
+        }
+        else
+        {
+            shareList.Add((demand.LogicalDemandKey, demand.NetOutputQty));
+        }
 
         foreach (var combinedTask in combinedTasks)
         {
@@ -4084,6 +4456,47 @@ internal class PhaseTwoInitialScheduler
         foreach (var (index, task) in removedTasks)
         {
             scheduledTasks.Insert(index < scheduledTasks.Count ? index : scheduledTasks.Count, task);
+        }
+    }
+
+    /// <summary>
+    /// AUD-1-003：占用表**新增窗水位** —— 记录每资源当前窗数，供失败试排精确回滚。
+    /// 前提：被观测的试排对占用表**只追加、从不删除既有窗**（见 <see cref="TryMergeDemandIntoStageBatch"/> 注释）。
+    /// </summary>
+    private static Dictionary<int, int> CaptureOccupancyWatermark(
+        Dictionary<int, List<TimeWindow>> occupancy)
+    {
+        var watermark = new Dictionary<int, int>(occupancy.Count);
+        foreach (var (resourceId, windows) in occupancy)
+        {
+            watermark[resourceId] = windows.Count;
+        }
+        return watermark;
+    }
+
+    /// <summary>
+    /// AUD-1-003：把占用表回滚到 <see cref="CaptureOccupancyWatermark"/> 记录的水位。
+    ///   ① 水位中**没有**的资源键 = 试排新建 ⇒ 整键移除（回到「该资源无占用」的初态）；
+    ///   ② 水位中**有**的资源 = 既有 ⇒ 截断回原窗数（有序不变式天然保持）。
+    /// 调用方随后用 <see cref="RestoreStageBatchSnapshot"/> 把被移出的原批窗按原值加回。
+    /// </summary>
+    private static void RollbackOccupancyToWatermark(
+        Dictionary<int, List<TimeWindow>> occupancy,
+        Dictionary<int, int> watermark)
+    {
+        foreach (var resourceId in occupancy.Keys.ToList())
+        {
+            if (!watermark.TryGetValue(resourceId, out var count))
+            {
+                occupancy.Remove(resourceId);
+                continue;
+            }
+
+            var windows = occupancy[resourceId];
+            if (windows.Count > count)
+            {
+                windows.RemoveRange(count, windows.Count - count);
+            }
         }
     }
 

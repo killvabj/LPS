@@ -1233,6 +1233,15 @@ public class ProductionInstructionPositionCalculator : IProductionInstructionPos
         // 2号位 v2.1 §四：Stage 级 RemainingQty 按工单 PlannedQty 比例拆分的分母
         var totalPlannedQty = inProgressWorkOrders.Sum(w => w.PlannedQty);
 
+        // 诉求2 §四②：ERP 兜底总量 = max(ErpRemainingQty − Σ已定位 Position 量, 0)，不得与已定位重复计
+        decimal locatedQty = finalPositions
+            .Where(p => p.PositionType != PositionType.UNLOCATED)
+            .Sum(p => p.Quantity);
+        decimal erpFallbackTotal = Math.Max(input.ErpRemainingQty - locatedQty, 0m);
+        System.Diagnostics.Debug.Assert(
+            erpFallbackTotal >= 0m && erpFallbackTotal <= input.ErpRemainingQty,
+            $"[EECTX] PI={input.ProductionInstructionNo}: ERP兜底总量{erpFallbackTotal}越界(ErpRemainingQty={input.ErpRemainingQty})");
+
         foreach (var wo in inProgressWorkOrders)
         {
             // 39-0 裁决 §四/§八：退出 OrderBy(OperationSequence)，改用三档降级判定
@@ -1285,13 +1294,13 @@ public class ProductionInstructionPositionCalculator : IProductionInstructionPos
                     else
                     {
                         // DAG 无结果（无匹配/前驱条件不满足）→ 降级到中间态
-                        slices = BuildIntermediateSlices(operations, startStageCode, input, wo, totalPlannedQty, inProgressWorkOrders.Count, ref hasIssue, ref issueDesc);
+                        slices = BuildIntermediateSlices(operations, startStageCode, input, wo, totalPlannedQty, inProgressWorkOrders.Count, erpFallbackTotal, ref hasIssue, ref issueDesc);
                     }
                 }
                 else
                 {
                     // 无 Routing 数据 → 中间态
-                    slices = BuildIntermediateSlices(operations, startStageCode, input, wo, totalPlannedQty, inProgressWorkOrders.Count, ref hasIssue, ref issueDesc);
+                    slices = BuildIntermediateSlices(operations, startStageCode, input, wo, totalPlannedQty, inProgressWorkOrders.Count, erpFallbackTotal, ref hasIssue, ref issueDesc);
                 }
             }
             else
@@ -1300,7 +1309,7 @@ public class ProductionInstructionPositionCalculator : IProductionInstructionPos
                 var stageFact = input.StageProgress
                     .Where(sp => sp.StageCode == startStageCode)
                     .FirstOrDefault();
-                var stageSliceQty = AllocateStageRemaining(stageFact, wo, totalPlannedQty, inProgressWorkOrders.Count);
+                var stageSliceQty = AllocateStageRemaining(stageFact, wo, totalPlannedQty, inProgressWorkOrders.Count, erpFallbackTotal);
                 stageSliceQty = Math.Min(stageSliceQty, wo.PlannedQty);
                 stageSliceQty = Math.Max(stageSliceQty, 0);
                 slices.Add(new ExistingExecutionSliceDto
@@ -1309,7 +1318,7 @@ public class ProductionInstructionPositionCalculator : IProductionInstructionPos
                     StartOperationCode = null,
                     SliceQty = stageSliceQty,
                     LastReportResourceCode = null,
-                    IssueCode = hasIssue ? "STAGE_ONLY" : null
+                    IssueCode = stageFact == null ? "UNLOCATED_STAGE" : (hasIssue ? "STAGE_ONLY" : null)
                 });
             }
 
@@ -1381,6 +1390,7 @@ public class ProductionInstructionPositionCalculator : IProductionInstructionPos
         WorkOrderSnapshotFact wo,
         decimal totalPlannedQty,
         int workOrderCount,
+        decimal erpFallbackTotal,
         ref bool hasIssue,
         ref string? issueDesc)
     {
@@ -1397,8 +1407,9 @@ public class ProductionInstructionPositionCalculator : IProductionInstructionPos
             {
                 StartStageCode = startStageCode ?? string.Empty,
                 StartOperationCode = null,
-                SliceQty = AllocateStageRemaining(stageFact, wo, totalPlannedQty, workOrderCount),
-                LastReportResourceCode = operations.LastOrDefault()?.LastReportResourceCode
+                SliceQty = AllocateStageRemaining(stageFact, wo, totalPlannedQty, workOrderCount, erpFallbackTotal),
+                LastReportResourceCode = operations.LastOrDefault()?.LastReportResourceCode,
+                IssueCode = stageFact == null ? "UNLOCATED_STAGE" : null
             });
             return slices;
         }
@@ -1464,14 +1475,19 @@ public class ProductionInstructionPositionCalculator : IProductionInstructionPos
     }
 
     /// <summary>
-    /// Stage 级 RemainingQty 按工单 PlannedQty 比例拆分（2号位 v2.1 §四 + 残留口径修复）
+    /// Stage 级 RemainingQty 按工单 PlannedQty 比例拆分（2号位 v2.1 §四 + 诉求2 兜底拆分口径）
     ///
     /// StageProgress.RemainingQty 是 PI 级、工单 1:N；逐工单独立输出时必须拆分，
     /// 否则同 PI 内多工单各取全量会导致 ΣE 超 Stage 剩余。
     ///
-    /// 规则：
-    /// - Stage 无剩余（null 或 RemainingQty ≤ 0）→ 0
-    /// - totalPlannedQty > 0 → RemainingQty × wo.PlannedQty / totalPlannedQty（先乘后除避免精度损失）
+    /// 两种「0」不合并（诉求2 §四①）：
+    /// - stageFact == null（无该 PI-Stage 行）= 信息缺口 → 走 ERP 兜底（erpFallbackTotal，已扣已定位量）
+    /// - stageFact != null && RemainingQty <= 0 = 该 Stage 确实做完 → 判 0 正确，不动
+    ///
+    /// 分摊规则（诉求2 §四③/④）：
+    /// - 兜底总量已在调用侧扣减过已定位 Position 量，故此处直接按工单 PlannedQty 比例分摊
+    /// - 向下取整、不放大，保证 ΣE ≤ ErpRemainingQty
+    /// - totalPlannedQty > 0 → qty × wo.PlannedQty / totalPlannedQty（先乘后除避免精度损失）
     /// - totalPlannedQty = 0（异常）→ 均分
     ///
     /// 两处调用（「全部完成」分支 + 「无工序数据」分支）共用同一口径，保证混现时 ΣE 闭合。
@@ -1480,17 +1496,29 @@ public class ProductionInstructionPositionCalculator : IProductionInstructionPos
         StageProgressFact? stageFact,
         WorkOrderSnapshotFact wo,
         decimal totalPlannedQty,
-        int workOrderCount)
+        int workOrderCount,
+        decimal erpFallbackTotal)
     {
-        if (stageFact == null || stageFact.RemainingQty <= 0)
+        // 诉求2 §四①：有行且真的做完 → 判 0
+        if (stageFact != null && stageFact.RemainingQty <= 0)
             return 0;
 
-        if (totalPlannedQty > 0)
-            return stageFact.RemainingQty * wo.PlannedQty / totalPlannedQty;
+        // 诉求2 §四①：无行 = 信息缺口 → ERP 兜底（erpFallbackTotal 已在调用侧扣减已定位量，≤ ErpRemainingQty）
+        // 诉求2 §四③：随行有 RemainingQty>0 的工单按 PlannedQty 比例分摊
+        decimal qty = stageFact?.RemainingQty ?? erpFallbackTotal;
+        bool isErpFallback = stageFact == null;
 
-        return workOrderCount > 0
-            ? stageFact.RemainingQty / workOrderCount
-            : 0;
+        if (qty <= 0)
+            return 0;
+
+        decimal allocated;
+        if (totalPlannedQty > 0)
+            allocated = qty * wo.PlannedQty / totalPlannedQty;
+        else
+            allocated = workOrderCount > 0 ? qty / workOrderCount : 0;
+
+        // 诉求2 §四④：向下取整、不放大（仅兜底分支；有真实 Stage 行时保留原始精度防 ΣE 缩水）
+        return isErpFallback ? Math.Floor(allocated) : allocated;
     }
 
     /// <summary>

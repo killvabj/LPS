@@ -21,7 +21,10 @@ public static class TaskSplitRuleConfigProjector
 
     /// <summary>
     /// 把 active + 生效区间内规则投影为快照（去审计字段 Id/Created/Updated/IsActive + 兼容字段，仅业务键 + 参数）。
-    /// 生效区间以 asOf 判定（发布时传入，默认当前 UTC）；IsActive=false、超出生效窗或 ProductionDepartmentId 为 NULL 的行排除
+    /// 生效区间以 asOf 判定（发布时传入，默认当前 UTC），采用**半开区间 [EffectiveFrom, EffectiveTo)**——
+    /// P0-04（0号位 审核 2026-10-09）：与治理写路径有效期排重（严格 &lt; 判定相切不重叠）保持一致——
+    /// 相切窗口 [10:00,11:00) + [11:00,12:00) 同一瞬间至多一条有效，杜绝投影重复键；
+    /// IsActive=false、超出生效窗或 ProductionDepartmentId 为 NULL 的行排除
     /// （v5.1.10 收口④：NULL 部门历史记录不默认为所有部门的生效规则，仅显式部门规则入快照）。
     /// v5.1.10 收口①（2026-10-09 生效）：不再投 MaxOptimizationSplitCount/MaxBatchCandidates（1号位 Solver 技术预算）
     /// 与 BottleneckSplitStrategy/NonBottleneckStrategy（历史兼容列，V1 主链不得消费拆/合批倾向）——
@@ -36,7 +39,7 @@ public static class TaskSplitRuleConfigProjector
             .Where(r => r.IsActive
                 && r.ProductionDepartmentId.HasValue
                 && (r.EffectiveFrom is null || r.EffectiveFrom <= now)
-                && (r.EffectiveTo is null || r.EffectiveTo >= now))
+                && (r.EffectiveTo is null || r.EffectiveTo > now))
             .Select(r => new BatchPolicyRuleSnapshot
             {
                 MaterialId = r.MaterialId,

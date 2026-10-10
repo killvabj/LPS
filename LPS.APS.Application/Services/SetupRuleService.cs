@@ -1,3 +1,4 @@
+using LPS.APS.Core.Authorization;
 using LPS.APS.Core.DTOs.Setup;
 using LPS.APS.Core.Entities.APS;
 using LPS.APS.Core.Entities.Auth;
@@ -43,6 +44,7 @@ public sealed class SetupRuleService : ISetupRuleService
     private readonly IAuditLogRepository _auditLogRepository;
     private readonly IGovernanceVersionService _governanceVersionService;
     private readonly ISetupUncoveredStatRepository _setupUncoveredStatRepository;
+    private readonly IDataScopeService _dataScopeService;
     private readonly SetupTransitionRuleConflictValidator _conflictValidator = new();
 
     public SetupRuleService(
@@ -50,13 +52,15 @@ public sealed class SetupRuleService : ISetupRuleService
         IMasterDataLookupRepository masterDataLookup,
         IAuditLogRepository auditLogRepository,
         IGovernanceVersionService governanceVersionService,
-        ISetupUncoveredStatRepository setupUncoveredStatRepository)
+        ISetupUncoveredStatRepository setupUncoveredStatRepository,
+        IDataScopeService dataScopeService)
     {
         _versionRepository = versionRepository;
         _masterDataLookup = masterDataLookup;
         _auditLogRepository = auditLogRepository;
         _governanceVersionService = governanceVersionService;
         _setupUncoveredStatRepository = setupUncoveredStatRepository;
+        _dataScopeService = dataScopeService;
     }
 
     /// <inheritdoc />
@@ -93,6 +97,8 @@ public sealed class SetupRuleService : ISetupRuleService
     public async Task<SetupRuleDto> CreateExactAsync(SetupRuleExactInput input, int actorUserId, string actorUserCode, CancellationToken ct = default)
     {
         ValidateExactInput(input);
+        // P1-04：SetupTransitionRule.ProductionDepartmentId 即业务范围维度——写路径经部门码 EnsureInScopeAsync(Department)，越界 403。
+        await EnsureDepartmentScopeAsync(input.ProductionDepartmentId, actorUserId, ct);
         var version = await GetVersionForWriteAsync(input.RuleSetVersionId, ct);
 
         var existing = SetupTransitionRuleProjector.ExtractRules(version.ContentSnapshotJson);
@@ -121,6 +127,8 @@ public sealed class SetupRuleService : ISetupRuleService
         rule.Id = SetupTransitionRuleProjector.BuildRuleId(input.RuleSetVersionId, maxSeq + 1);
 
         var rules = new List<SetupTransitionRule>(existing) { rule };
+        // P1-03：审计前置预检（跨库无 2PC）——审计库不可写则整操作失败、业务零变更。
+        await _auditLogRepository.EnsureWritableAsync(ct);
         await PersistRulesAsync(version, rules, ActionCreate, rule.Id, rule, null, Describe(rule), actorUserId, actorUserCode, ct);
 
         return await ProjectAsync(rule, version.Status, new MasterDataCodeCache(_masterDataLookup, ct));
@@ -130,6 +138,8 @@ public sealed class SetupRuleService : ISetupRuleService
     public async Task<SetupRuleDto> CreateDefaultAsync(SetupRuleDefaultInput input, int actorUserId, string actorUserCode, CancellationToken ct = default)
     {
         ValidateDefaultInput(input);
+        // P1-04：同 CreateExact——部门业务范围校验，越界 403。
+        await EnsureDepartmentScopeAsync(input.ProductionDepartmentId, actorUserId, ct);
         var version = await GetVersionForWriteAsync(input.RuleSetVersionId, ct);
 
         var existing = SetupTransitionRuleProjector.ExtractRules(version.ContentSnapshotJson);
@@ -156,6 +166,8 @@ public sealed class SetupRuleService : ISetupRuleService
         rule.Id = SetupTransitionRuleProjector.BuildRuleId(input.RuleSetVersionId, maxSeq + 1);
 
         var rules = new List<SetupTransitionRule>(existing) { rule };
+        // P1-03：审计前置预检（跨库无 2PC）——审计库不可写则整操作失败、业务零变更。
+        await _auditLogRepository.EnsureWritableAsync(ct);
         await PersistRulesAsync(version, rules, ActionCreate, rule.Id, rule, null, Describe(rule), actorUserId, actorUserCode, ct);
 
         return await ProjectAsync(rule, version.Status, new MasterDataCodeCache(_masterDataLookup, ct));
@@ -170,6 +182,10 @@ public sealed class SetupRuleService : ISetupRuleService
             ?? throw new ResourceNotFoundException($"换型规则不存在（Id={id}）。");
         EnsureSameTypeAndVersion(existing, SetupTransitionRuleType.Exact, input.RuleSetVersionId);
 
+        // P1-04：老归属 + 新归属分别校验（防 IDOR 式跨部门记录迁移——仅授权 A 的用户不得把 B 部门规则改到 A）。
+        await EnsureDepartmentScopeAsync(existing.ProductionDepartmentId, actorUserId, ct);
+        await EnsureDepartmentScopeAsync(input.ProductionDepartmentId, actorUserId, ct);
+
         var version = await GetVersionForWriteAsync(existing.RuleSetVersionId, ct);
 
         var updated = BuildUpdated(existing, input.ProductionDepartmentId, input.StageCode, input.OperationCode,
@@ -179,6 +195,8 @@ public sealed class SetupRuleService : ISetupRuleService
         EnsureNoConflict(all, updated, excludingId: id);
 
         var rules = all.Select(r => r.Id == id ? updated : r).ToList();
+        // P1-03：审计前置预检（同 Create）。
+        await _auditLogRepository.EnsureWritableAsync(ct);
         await PersistRulesAsync(version, rules, ActionUpdate, id, updated, existing, Describe(updated), actorUserId, actorUserCode, ct);
 
         return await ProjectAsync(updated, version.Status, new MasterDataCodeCache(_masterDataLookup, ct));
@@ -193,6 +211,10 @@ public sealed class SetupRuleService : ISetupRuleService
             ?? throw new ResourceNotFoundException($"换型规则不存在（Id={id}）。");
         EnsureSameTypeAndVersion(existing, SetupTransitionRuleType.Default, input.RuleSetVersionId);
 
+        // P1-04：老归属 + 新归属分别校验（同 UpdateExact，防跨部门迁移）。
+        await EnsureDepartmentScopeAsync(existing.ProductionDepartmentId, actorUserId, ct);
+        await EnsureDepartmentScopeAsync(input.ProductionDepartmentId, actorUserId, ct);
+
         var version = await GetVersionForWriteAsync(existing.RuleSetVersionId, ct);
 
         var updated = BuildUpdated(existing, input.ProductionDepartmentId, input.StageCode, input.OperationCode,
@@ -202,6 +224,8 @@ public sealed class SetupRuleService : ISetupRuleService
         EnsureNoConflict(all, updated, excludingId: id);
 
         var rules = all.Select(r => r.Id == id ? updated : r).ToList();
+        // P1-03：审计前置预检（同 Create）。
+        await _auditLogRepository.EnsureWritableAsync(ct);
         await PersistRulesAsync(version, rules, ActionUpdate, id, updated, existing, Describe(updated), actorUserId, actorUserCode, ct);
 
         return await ProjectAsync(updated, version.Status, new MasterDataCodeCache(_masterDataLookup, ct));
@@ -213,11 +237,16 @@ public sealed class SetupRuleService : ISetupRuleService
         var existing = await GetRuleByIdAsync(id, ct)
             ?? throw new ResourceNotFoundException($"换型规则不存在（Id={id}）。");
 
+        // P1-04：删除亦须目标部门在业务 Scope 内（防越权删除他部门规则）。
+        await EnsureDepartmentScopeAsync(existing.ProductionDepartmentId, actorUserId, ct);
+
         var version = await GetVersionForWriteAsync(existing.RuleSetVersionId, ct);
 
         var rules = SetupTransitionRuleProjector.ExtractRules(version.ContentSnapshotJson)
             .Where(r => r.Id != id)
             .ToList();
+        // P1-03：审计前置预检（同 Create/Update）。
+        await _auditLogRepository.EnsureWritableAsync(ct);
         await PersistRulesAsync(version, rules, ActionDelete, id, null, existing, Describe(existing), actorUserId, actorUserCode, ct);
     }
 
@@ -560,6 +589,22 @@ public sealed class SetupRuleService : ISetupRuleService
         var (ruleSetVersionId, _) = SetupTransitionRuleProjector.ParseRuleId(id);
         var version = await GetVersionOrThrowAsync(ruleSetVersionId, ct);
         return SetupTransitionRuleProjector.ExtractRules(version.ContentSnapshotJson).FirstOrDefault(r => r.Id == id);
+    }
+
+    /// <summary>
+    /// A2/P1-04 Department Scope：写路径经部门码（IMasterDataLookupRepository 回带，无直连 DB）调
+    /// EnsureInScopeAsync(Department)。部门不存在 → 404（ResourceNotFoundException）；越界 → ScopeViolationException（Controller 映射 403）。
+    /// 依据：SetupTransitionRule.ProductionDepartmentId 即业务范围维度（实体注释），冻结 Auth §9.4「目标对象须在业务 Scope 内」。
+    /// </summary>
+    private async Task EnsureDepartmentScopeAsync(int departmentId, int actorUserId, CancellationToken ct)
+    {
+        var deptCode = await _masterDataLookup.GetDepartmentCodeAsync(departmentId, ct);
+        if (string.IsNullOrWhiteSpace(deptCode))
+        {
+            throw new ResourceNotFoundException($"生产部门（ProductionDepartment.Id={departmentId}）不存在。");
+        }
+
+        await _dataScopeService.EnsureInScopeAsync(actorUserId, DataScopeTypes.Department, deptCode, ct);
     }
 
     /// <summary>

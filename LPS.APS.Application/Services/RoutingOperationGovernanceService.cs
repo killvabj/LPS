@@ -1,5 +1,6 @@
 using System.Data;
 using Dapper;
+using LPS.APS.Core.Authorization;
 using LPS.APS.Core.DTOs.Governance;
 using LPS.APS.Core.Entities.Auth;
 using LPS.APS.Core.Exceptions;
@@ -24,16 +25,39 @@ public sealed class RoutingOperationGovernanceService : IRoutingOperationGoverna
 
     private readonly DatabaseConnectionManager _connectionManager;
     private readonly IAuditLogRepository _auditLogRepository;
+    private readonly IDataScopeService _dataScopeService;
     private readonly ILogger<RoutingOperationGovernanceService> _logger;
 
     public RoutingOperationGovernanceService(
         DatabaseConnectionManager connectionManager,
         IAuditLogRepository auditLogRepository,
+        IDataScopeService dataScopeService,
         ILogger<RoutingOperationGovernanceService> logger)
     {
         _connectionManager = connectionManager ?? throw new ArgumentNullException(nameof(connectionManager));
         _auditLogRepository = auditLogRepository ?? throw new ArgumentNullException(nameof(auditLogRepository));
+        _dataScopeService = dataScopeService ?? throw new ArgumentNullException(nameof(dataScopeService));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+    }
+
+    /// <summary>
+    /// P1-04 Department Scope：目标工序部门码（ProductionDepartment.DeptCode）调 EnsureInScopeAsync(Department)。
+    /// 部门不存在 → 404（ResourceNotFoundException）；越界 → ScopeViolationException（Controller 映射 403）。
+    /// 依据：RoutingOperation.ProductionDepartmentId 即业务范围维度（工序节点属生产部门），冻结 Auth §9.4「目标对象须在业务 Scope 内」。
+    /// </summary>
+    private async Task EnsureDepartmentScopeAsync(int departmentId, int actorUserId, CancellationToken ct)
+    {
+        var deptCode = await _connectionManager.QueryFirstOrDefaultAsync<string?>(
+            "SELECT DeptCode FROM ProductionDepartment WHERE Id = @Id",
+            new { Id = departmentId },
+            db: DatabaseId.APS);
+
+        if (string.IsNullOrWhiteSpace(deptCode))
+        {
+            throw new ResourceNotFoundException($"生产部门（ProductionDepartment.Id={departmentId}）不存在。");
+        }
+
+        await _dataScopeService.EnsureInScopeAsync(actorUserId, DataScopeTypes.Department, deptCode, ct);
     }
 
     /// <inheritdoc />
@@ -87,6 +111,12 @@ public sealed class RoutingOperationGovernanceService : IRoutingOperationGoverna
         {
             throw new ResourceNotFoundException($"工序（RoutingOperation.Id={operationId}）不存在。");
         }
+
+        // P1-04：写路径须目标工序部门在业务 Scope 内（越界 403）。
+        await EnsureDepartmentScopeAsync(existing.ProductionDepartmentId, actorUserId, ct);
+
+        // P1-03：审计前置预检（跨库无 2PC）——审计库不可写则整操作失败、业务零变更。
+        await _auditLogRepository.EnsureWritableAsync(ct);
 
         var updatedAt = DateTime.Now;
         await _connectionManager.ExecuteAsync(

@@ -60,6 +60,38 @@ public class TaskSplitRuleConfigProjectorTests
     }
 
     [Fact]
+    public void Project_半开区间_EffectiveTo等于asOf_已过期排除()
+    {
+        // P0-04（0号位 审核）：投影与治理写路径统一半开 [EffectiveFrom, EffectiveTo)——截止点恰好等于 asOf 视为已过期。
+        var now = new DateTime(2026, 10, 9, 11, 0, 0);
+        var rules = new[]
+        {
+            Rule(id: 1, materialId: 100, deptId: 900, effectiveFrom: now.AddHours(-1), effectiveTo: now),
+            Rule(id: 2, materialId: 200, deptId: 900, effectiveFrom: now, effectiveTo: now.AddHours(1)),
+        };
+
+        var result = TaskSplitRuleConfigProjector.Project(rules, asOf: now);
+
+        result.Should().ContainSingle().Which.MaterialId.Should().Be(200);
+    }
+
+    [Fact]
+    public void Project_半开区间_相切窗口同一瞬间至多一条有效()
+    {
+        // P0-04：相切窗口 [10:00,11:00) + [11:00,12:00) 在 11:00 恰好只命中第二条（杜绝投影重复键）。
+        var now = new DateTime(2026, 10, 9, 11, 0, 0);
+        var rules = new[]
+        {
+            Rule(id: 1, materialId: 100, deptId: 900, effectiveFrom: now.AddHours(-1), effectiveTo: now),
+            Rule(id: 2, materialId: 200, deptId: 900, effectiveFrom: now, effectiveTo: now.AddHours(1)),
+        };
+
+        var result = TaskSplitRuleConfigProjector.Project(rules, asOf: now);
+
+        result.Should().ContainSingle().Which.MaterialId.Should().Be(200);
+    }
+
+    [Fact]
     public void Project_投影业务键与参数_去审计兼容字段_4技术字段恒null()
     {
         // v5.1.10 收口①②：实体上即便有历史 4 字段值，投影快照亦恒 null（不投 Solver 技术预算/策略列，主链不得消费）。

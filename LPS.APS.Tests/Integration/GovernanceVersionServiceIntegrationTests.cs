@@ -235,7 +235,7 @@ public class GovernanceVersionServiceIntegrationTests : IDisposable
                     },
                 ],
             }),
-        }, "IntegrationTest");
+        }, "IntegrationTest", _testActorUserId);
         forkRuleSet.Id.Should().BeGreaterThan(0);                      // 落库返新 Id
         forkRuleSet.Status.Should().Be(GovernanceVersionStatus.Draft); // 强制 DRAFT
 
@@ -252,7 +252,7 @@ public class GovernanceVersionServiceIntegrationTests : IDisposable
             ParameterSetId = _testParameterSetId,
             VersionCode = $"FORK-P-{_now:yyyyMMddHHmmss}",
             SolverStrategyJson = JsonSerializer.Serialize(new SolverStrategyBlock { Mode = SolverStrategyMode.Backward, OnTimeTarget = new OnTimeTargetParams { TargetPercent = 85 }, Setup = new SetupParams() }),
-        }, "IntegrationTest");
+        }, "IntegrationTest", _testActorUserId);
         forkParamSet.Id.Should().BeGreaterThan(0);
         forkParamSet.Status.Should().Be(GovernanceVersionStatus.Draft);
 
@@ -271,7 +271,7 @@ public class GovernanceVersionServiceIntegrationTests : IDisposable
             RuleSetVersionId = forkRuleSet.Id,
             ParameterSetVersionId = forkParamSet.Id,
             IsDefault = false,
-        }, "IntegrationTest");
+        }, "IntegrationTest", _testActorUserId);
         forkSpv.Id.Should().BeGreaterThan(0);
 
         // 清理 fork 产物由 Dispose 统一删（沿用 _testStrategyProfileId 主键 + 级联记录）
@@ -330,7 +330,7 @@ public class GovernanceVersionServiceIntegrationTests : IDisposable
                     }
                 }
             }),
-        });
+        }, _testActorUserId);
 
         var updated = await _service.GetRuleSetVersionAsync(_testRuleSetVersionId);
         // 投影 JSON 为默认编码（非 ASCII 转义为 \uXXXX），按块反序列化后断言解码值，避免转义串比对误判
@@ -442,7 +442,7 @@ public class GovernanceVersionServiceIntegrationTests : IDisposable
                     }
                 }
             }),
-        }, "IntegrationTest");
+        }, "IntegrationTest", _testActorUserId);
         _testRuleSetVersionId = ruleSetVersion.Id;
 
         // 版本表：ParameterSetVersion —— 服务层 CRUD，五主题 JSON 归一化到 ContentSnapshotJson
@@ -486,7 +486,7 @@ public class GovernanceVersionServiceIntegrationTests : IDisposable
                 MaxRepairAttempts = 7,
                 MaxPropagationRounds = 12,
             }),
-        }, "IntegrationTest");
+        }, "IntegrationTest", _testActorUserId);
         _testParameterSetVersionId = parameterSetVersion.Id;
 
         // 版本表：StrategyProfileVersion —— 服务层 CRUD（引用上面两版本，IsDefault=1；Create 保留 IsDefault、强制 DRAFT）
@@ -497,7 +497,7 @@ public class GovernanceVersionServiceIntegrationTests : IDisposable
             RuleSetVersionId = _testRuleSetVersionId,
             ParameterSetVersionId = _testParameterSetVersionId,
             IsDefault = true,
-        }, "IntegrationTest");
+        }, "IntegrationTest", _testActorUserId);
         _testStrategyProfileVersionId = spv.Id;
     }
 
