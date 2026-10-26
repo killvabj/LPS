@@ -4,13 +4,15 @@
  * 命名约定：
  *  - common.ts          公共类型与枚举（ApiResponse、TaskStatus 5 值、PlanVersionStatus 等）
  *  - schedule.ts        排程查询 DTO（已与后端对齐，GanttData/PlanVersionSummary/ScheduleSummary）
- *  - overview.ts        排产总览 DTO（占位，等 3 号位落地）
+ *  - overview.ts        排产总览 DTO（已对齐 5号位 OverviewController 真实端点）
  *  - order.ts           订单详情 DTO（占位）
  *  - ctp.ts             CTP / 插单评估 DTO（占位）
  *  - candidate.ts       Candidate 对比与确认 DTO（占位）
  *  - explanation.ts     异常与原因解释 DTO（占位）
  *  - pi.ts              PI Position / 供给追溯 DTO（占位）
- *  - rule.ts            规则与参数维护 DTO（占位）
+ *  - peggingTrace.ts    Supply/Pegging 追溯 DTO（已对齐 5号位 PeggingTraceController）
+ *  - rule.ts            规则集（RuleSet）DTO（已与后端 GovernanceController 对齐）
+ *  - parameterSet.ts    参数集（ParameterSet）DTO（独立主表，与规则集平行）
  *  - run.ts             运行 / 版本 / MES 下发状态 DTO（占位）
  *  - mes.ts             （暂未单独拆分 MES，与 run.ts 中的 MesEligibilityDto 合用）
  *  - auth.ts            认证 DTO（已与后端对齐）
@@ -22,6 +24,9 @@
  *  - audit.ts            审计日志 DTO（U42 / §22.6 Audit / §二十四）
  *  - opm.ts              OPM 工艺规划模式 DTO（3号位 2026-09-23 T1 交付）
  *  - resourceCalendar.ts 设备资源日历 + 人工能力槽 DTO（v1.3 冻结方案 + 5号位 2026-09-24 对接函）
+ *  - productionWorkCalendar.ts 工厂/部门上级工作日历 DTO（v1.4 专项 G1 候选 + 5号位 2026-10-13 对接函）
+ *  - material.ts         物料主数据查询 DTO（lookup 端点；Opm.vue / Domain.vue 等页面用）
+ *  - taskSplitRuleConfig.ts 执行批拆分规则 / Batch Policy 批量策略 DTO（3号位 2026-10-07 v1.0 契约）
  *  - backend-aligned.ts 后端 Core DTO 类型对齐（只读参考）
  */
 
@@ -33,7 +38,9 @@ export * from './ctp'
 export * from './candidate'
 export * from './explanation'
 export * from './pi'
+export * from './peggingTrace'
 export * from './rule'
+export * from './parameterSet'
 export * from './run'
 export * from './auth'
 export * from './manualEta'
@@ -45,4 +52,7 @@ export * from './setup'
 export * from './audit'
 export * from './opm'
 export * from './resourceCalendar'
+export * from './productionWorkCalendar'
+export * from './material'
+export * from './taskSplitRuleConfig'
 export * from './backend-aligned'

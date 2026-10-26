@@ -1,6 +1,9 @@
 using LPS.APS.Core.Dto;
+using LPS.APS.Core.DTOs.Governance;
 using LPS.APS.Engine.Data;
+using Microsoft.Extensions.Logging;
 using System.Data;
+using System.Text.Json;
 
 namespace LPS.APS.Application.Services.Query;
 
@@ -11,13 +14,102 @@ namespace LPS.APS.Application.Services.Query;
 public class OverviewQueryRepository : IOverviewQueryRepository
 {
     private readonly DatabaseConnectionManager _connectionManager;
+    private readonly ILogger<OverviewQueryRepository>? _logger;
 
-    public OverviewQueryRepository(DatabaseConnectionManager connectionManager)
+    public OverviewQueryRepository(DatabaseConnectionManager connectionManager, ILogger<OverviewQueryRepository>? logger = null)
     {
         _connectionManager = connectionManager ?? throw new ArgumentNullException(nameof(connectionManager));
+        _logger = logger;
     }
 
-    public async Task<OverviewActivePlanDto?> GetActivePlanAsync(
+    // ───── candidate-summary 的 ScopeJson 投影（13 v1.8 §五；4号位 10-19 六字段请求）─────
+
+    /// <summary>
+    /// 读侧容忍属性名大小写。**不挂 JsonStringEnumConverter**（4号位 10-19 §3.3 更正）：
+    /// BusinessTriggerType/PriorityMode 带类型级 EnumMemberJsonConverter（读契约字面量 SCREAMING_SNAKE），
+    /// 类型属性优先于 options；此处再挂全局 converter 是误导性死配置。
+    /// </summary>
+    private static readonly JsonSerializerOptions ScopeReadOptions = new()
+    {
+        PropertyNameCaseInsensitive = true,
+    };
+
+    /// <summary>枚举 → 契约字面量（走类型级 EnumMember converter；ToString 会给 PascalCase 成员名，非契约值）。</summary>
+    private static string? EnumLiteral(object? enumValue)
+        => enumValue is null ? null : JsonSerializer.SerializeToElement(enumValue, ScopeReadOptions).GetString();
+
+    /// <summary>行类型（DTO 为 sealed，不继承）：字段与 SELECT 列一一对应，ScopeJsonRaw 仅内部用、不出响应。</summary>
+    private sealed class CandidateBriefRow
+    {
+        public int PlanVersionId { get; set; }
+        public string VersionCode { get; set; } = string.Empty;
+        public string? DomainKey { get; set; }
+        public DateTime CreatedAt { get; set; }
+        public string? CreatedByUserName { get; set; }
+        public string? Status { get; set; }
+        public int? SourceScheduleRunId { get; set; }
+        public string? RunType { get; set; }
+        public int? BasePlanVersionId { get; set; }
+        public string? BaseVersionCode { get; set; }
+        public bool CanActivate { get; set; }
+        public string? ScopeJsonRaw { get; set; }
+    }
+
+    /// <summary>
+    /// 单行映射。降级原则（列表接口，降级优于失败）：ScopeJson 缺失/坏 JSON → 仅该行五投影字段 null + Warning，
+    /// 一条脏 Run 不打挂整页（同 10-19 全局收口对"一端点 500"的零容忍口径）。
+    /// </summary>
+    private CandidateBriefDto MapCandidateBrief(CandidateBriefRow r)
+    {
+        string? trigger = null, priorityMode = null;
+        int? orderCount = null, taskCount = null, resourceCount = null;
+
+        if (!string.IsNullOrWhiteSpace(r.ScopeJsonRaw))
+        {
+            try
+            {
+                var v2 = JsonSerializer.Deserialize<ScopeJsonV2>(r.ScopeJsonRaw, ScopeReadOptions);
+                if (v2 is not null)
+                {
+                    // 显式 null 列表→0：STJ 遇 `"xxx": null` 会覆盖 [] 初始值；NRE 不是 JsonException、本闸接不住
+                    //   （4号位 10-19 §二 漏口修复；此处 0 =「载荷存在但没有目标」，与外层「无载荷=null」不冲突）
+                    orderCount = v2.OrderTargets?.Count ?? 0;
+                    taskCount = v2.TaskTargets?.Count ?? 0;
+                    resourceCount = v2.ChangedResourceIds?.Distinct().Count() ?? 0;   // 资源个数（去重），非任务数
+                    trigger = System.Enum.IsDefined(v2.Trigger) ? EnumLiteral(v2.Trigger) : null;  // 缺/未定义值(如默认0)→null，不透出"0"（4号位 §三）
+                    priorityMode = EnumLiteral(v2.PriorityMode);           // null 直传，禁兜底 NORMAL
+                }
+            }
+            catch (JsonException ex)
+            {
+                _logger?.LogWarning(ex,
+                    "candidate-summary: PlanVersion {PvId} 来源 Run {RunId} 的 ScopeJson 反序列化失败，五投影字段置 null",
+                    r.PlanVersionId, r.SourceScheduleRunId);
+            }
+        }
+
+        return new CandidateBriefDto
+        {
+            PlanVersionId = r.PlanVersionId,
+            VersionCode = r.VersionCode,
+            DomainKey = r.DomainKey,
+            CreatedAt = r.CreatedAt,
+            CreatedByUserName = r.CreatedByUserName,
+            Status = r.Status,
+            SourceScheduleRunId = r.SourceScheduleRunId,
+            RunType = r.RunType,
+            BasePlanVersionId = r.BasePlanVersionId,
+            BaseVersionCode = r.BaseVersionCode,
+            CanActivate = r.CanActivate,
+            BusinessTriggerType = trigger,
+            PriorityMode = priorityMode,
+            OrderTargetCount = orderCount,
+            TaskTargetCount = taskCount,
+            ChangedResourceCount = resourceCount,
+        };
+    }
+
+    public async Task<List<OverviewActivePlanDto>> GetActivePlanAsync(
         string? domainKey = null,
         CancellationToken ct = default,
         IReadOnlySet<string>? allowedDomains = null)
@@ -26,18 +118,22 @@ public class OverviewQueryRepository : IOverviewQueryRepository
         // 否则 Dapper 会把所有 @AllowedDomains 扩成 (@p1,@p2)，产生非法 "@(@p1,@p2) IS NULL" → SqlException 4145（4号位 pmc 视角 active-plan 500 根因）。
         // 分治：null=global(无域过滤)；空集=有 scope 无 Domain 授权(fail-closed 返空)；非空=IN 过滤。
         if (allowedDomains is { Count: 0 })
-            return null;
+            return new List<OverviewActivePlanDto>();
 
-        var baseSql = @"SELECT TOP 1
+        // R1-a（2026-10-15）：由 TOP 1 单条 → 按 Domain 列表（冻结模型「每 Domain 至多一个生效版本」，
+        // 由 PlanVersion 的 UQ 索引（谓词 Status='ACTIVE'）保证，故 ACTIVE 行数 = 生效 Domain 数，无需去重。
+        // 供 4号位「各 Domain 生效版本一览」卡片使用；单条场景取 [0]。
+        var baseSql = @"SELECT
     Id AS PlanVersionId,
     VersionCode,
     DomainKey,
+    Status,
     PlanHorizonStart,
     PlanHorizonEnd,
     ActivatedAt,
     SourceScheduleRunId,
-    TotalTasks,
-    TotalOrders,
+    ISNULL(TotalTasks, 0) AS TotalTasks,
+    ISNULL(TotalOrders, 0) AS TotalOrders,
     CreatedAt
 FROM PlanVersion
 WHERE Status = 'ACTIVE'
@@ -48,47 +144,26 @@ WHERE Status = 'ACTIVE'
         if (allowedDomains is null)
         {
             sql = baseSql + @"
-ORDER BY ActivatedAt DESC";
+ORDER BY ActivatedAt DESC, Id DESC";
             parameters = new { DomainKey = domainKey };
         }
         else
         {
             sql = baseSql + @"
     AND DomainKey IN @AllowedDomains
-ORDER BY ActivatedAt DESC";
+ORDER BY ActivatedAt DESC, Id DESC";
             parameters = new { DomainKey = domainKey, AllowedDomains = allowedDomains };
         }
 
         var results = await _connectionManager.QueryAsync<OverviewActivePlanDto>(
             sql, parameters, CommandType.Text, DatabaseId.APS, commandTimeout: 10);
 
-        return results.FirstOrDefault();
+        return results.ToList();
     }
 
-    public async Task<OverviewTaskSummaryDto> GetTaskSummaryAsync(
-        int planVersionId,
-        CancellationToken ct = default)
-    {
-        var sql = @"
-SELECT
-    @PlanVersionId AS PlanVersionId,
-    COUNT(*) AS TotalTasks,
-    SUM(CASE WHEN Status = 'COMPLETED' AND PlannedEndTime <= GETDATE() THEN 1 ELSE 0 END) AS OnTimeCount,
-    SUM(CASE WHEN Status = 'COMPLETED' AND PlannedEndTime > GETDATE() THEN 1 ELSE 0 END) AS DelayedCount,
-    SUM(CASE WHEN Status = 'IN_PROGRESS' AND IsCriticalPath = 1 THEN 1 ELSE 0 END) AS RiskCount,
-    SUM(CASE WHEN Status = 'PENDING' OR Status = 'QUEUED' THEN 1 ELSE 0 END) AS UnscheduledCount,
-    SUM(CASE WHEN Status = 'ESTIMATED' THEN 1 ELSE 0 END) AS EstimatedOnlyCount,
-    SUM(CASE WHEN Status NOT IN ('COMPLETED', 'IN_PROGRESS', 'PENDING', 'QUEUED', 'ESTIMATED') THEN 1 ELSE 0 END) AS OtherCount
-FROM Task
-WHERE PlanVersionId = @PlanVersionId";
-
-        var parameters = new { PlanVersionId = planVersionId };
-
-        var results = await _connectionManager.QueryAsync<OverviewTaskSummaryDto>(
-            sql, parameters, CommandType.Text, DatabaseId.APS, commandTimeout: 30);
-
-        return results.FirstOrDefault() ?? new OverviewTaskSummaryDto { PlanVersionId = planVersionId };
-    }
+    // 【2026-10-16 下线】GetTaskSummaryAsync 已移除（连同 OverviewTaskSummaryDto）。
+    //   原因见 OverviewController 头注：6 字段中 4 个恒 0/不可判（Task.Status 字面量超冻结值域、
+    //   Task 表无实际时间列），订单维度 KPI 已由 4号位 改走 order-query/summary。
 
     public async Task<List<OverviewResourceBottleneckDto>> GetResourceBottleneckAsync(
         int planVersionId,
@@ -104,9 +179,13 @@ SELECT TOP (@TopN)
     r.ResourceName,
     r.ResourceType,
     COUNT(*) AS TaskCount,
-    SUM(ISNULL(t.Duration, 0)) / 3600.0 AS TotalPlannedHours,
+    -- Duration 库值单位=分钟（2号位 PeggingOrchestrator 落库口径 TotalMinutes）。
+    -- 原 /3600.0 按秒换算 → 少算 60 倍（5号位 10-17 发现并知会）。改为 /60.0 换算为小时。
+    SUM(ISNULL(t.Duration, 0)) / 60.0 AS TotalPlannedHours,
     NULL AS UtilizationRate,
-    0 AS IsBottleneck
+    -- C2-a（4号位 10-19）：原 0 AS IsBottleneck 把「未判定」谎报成「判定为非瓶颈」。
+    -- 判定归 2号位 正式 Query（见上方注释），5号位无数据源 ⇒ 与 UtilizationRate 同型改 NULL（键省略=诚实未判定）。
+    CAST(NULL AS BIT) AS IsBottleneck
 FROM Task t
 INNER JOIN Resource r ON r.Id = t.ResourceId
 WHERE t.PlanVersionId = @PlanVersionId
@@ -116,10 +195,52 @@ ORDER BY TotalPlannedHours DESC";
 
         var parameters = new { PlanVersionId = planVersionId, TopN = topN };
 
-        var results = await _connectionManager.QueryAsync<OverviewResourceBottleneckDto>(
-            sql, parameters, CommandType.Text, DatabaseId.APS, commandTimeout: 30);
+        var results = (await _connectionManager.QueryAsync<OverviewResourceBottleneckDto>(
+            sql, parameters, CommandType.Text, DatabaseId.APS, commandTimeout: 30)).ToList();
 
-        return results.ToList();
+        if (results.Count == 0)
+            return results;
+
+        // R6（2026-10-16，口径 = 本级 OFF）：
+        //   资源级日历 ResourceCalendarSlot.AvailableFlag = 0 的窗口 = 该设备"明确停机"时段，
+        //   限定在该 PlanVersion 的计划范围内（半开区间求交：Start < HorizonEnd AND End > HorizonStart）。
+        //   一次 IN 取回后内存分组，避免 N+1。命中索引 IX_ResourceCalendarSlot_Resource_Time(ResourceId, StartTime, EndTime)。
+        //   ⚠️ 不含部门/工厂级继承 OFF（口径 b"三级合并"未采用）。
+        var resourceIds = results.Select(r => r.ResourceId).ToList();
+        var offWindows = await _connectionManager.QueryAsync<ResourceOffWindowRow>(@"
+SELECT
+    rc.ResourceId,
+    rc.StartTime AS [From],
+    rc.EndTime   AS [To],
+    rc.Remark    AS Reason
+FROM ResourceCalendarSlot rc
+INNER JOIN PlanVersion pv ON pv.Id = @PlanVersionId
+WHERE rc.AvailableFlag = 0
+    AND rc.ResourceId IN @ResourceIds
+    AND rc.StartTime < pv.PlanHorizonEnd
+    AND rc.EndTime   > pv.PlanHorizonStart
+ORDER BY rc.ResourceId, rc.StartTime",
+            new { PlanVersionId = planVersionId, ResourceIds = resourceIds },
+            CommandType.Text, DatabaseId.APS, commandTimeout: 30);
+
+        var byResource = offWindows
+            .GroupBy(w => w.ResourceId)
+            .ToDictionary(g => g.Key, g => g.ToList());
+
+        foreach (var row in results)
+        {
+            if (!byResource.TryGetValue(row.ResourceId, out var list))
+                continue;
+
+            row.UnavailableWindows.AddRange(list.Select(w => new OverviewUnavailableWindowDto
+            {
+                From = w.From,
+                To = w.To,
+                Reason = w.Reason
+            }));
+        }
+
+        return results;
     }
 
     public async Task<OverviewCandidateSummaryDto> GetCandidateSummaryAsync(
@@ -128,7 +249,7 @@ ORDER BY TotalPlannedHours DESC";
         // Candidate 列表 + 反查 ScheduleRun（Base 依 P0-04 权威落盘：SourceScheduleRunId → Run.BasePlanVersionId）
         // CanActivate = §12.3 前置：Candidate.BasePlanVersionId 仍为当前 Domain ACTIVE。
         // 边界：列表项仅承载候选元信息；Base vs Candidate 差集/Diff 由 3号位 ScheduleQueryService 提供，5号位不在此重复计算。
-        var candidates = (await _connectionManager.QueryAsync<CandidateBriefDto>(@"
+        var candidates = (await _connectionManager.QueryAsync<CandidateBriefRow>(@"
 SELECT
     pv.Id                                      AS PlanVersionId,
     pv.VersionCode                             AS VersionCode,
@@ -139,6 +260,8 @@ SELECT
     pv.SourceScheduleRunId                     AS SourceScheduleRunId,
     sr.RunType                                 AS RunType,
     sr.BasePlanVersionId                       AS BasePlanVersionId,
+    bpv.VersionCode                            AS BaseVersionCode,
+    sr.ScopeJson                               AS ScopeJsonRaw,   -- 投影五字段在 C# 侧解析；列存在(08 DDL:8700 NVARCHAR(MAX))，夹具 Run 全 NULL 属预期
     CAST(CASE WHEN sr.BasePlanVersionId IS NOT NULL
                AND EXISTS (SELECT 1 FROM PlanVersion b
                             WHERE b.Id = sr.BasePlanVersionId
@@ -147,13 +270,24 @@ SELECT
          THEN 1 ELSE 0 END AS BIT)             AS CanActivate
 FROM PlanVersion pv
 LEFT JOIN ScheduleRun sr ON sr.Id = pv.SourceScheduleRunId
-WHERE pv.VersionCategory = 'CANDIDATE'
-ORDER BY pv.CreatedAt DESC", null, CommandType.Text, DatabaseId.APS, commandTimeout: 10)).ToList();
+LEFT JOIN PlanVersion bpv ON bpv.Id = sr.BasePlanVersionId
+WHERE pv.Status = 'CANDIDATE'   -- 生命周期判定只看 Status（2号位 10-15 口径：VersionCategory 仅用于激活门禁身份，不参与状态判定）
+ORDER BY pv.CreatedAt DESC, pv.Id", null, CommandType.Text, DatabaseId.APS, commandTimeout: 10))
+            .Select(MapCandidateBrief).ToList();
 
         return new OverviewCandidateSummaryDto
         {
             PendingCount = candidates.Count,
             Candidates = candidates
         };
+    }
+
+    /// <summary>R6 内部行：资源级 OFF 窗口（Dapper 投影用，不对外）</summary>
+    private sealed class ResourceOffWindowRow
+    {
+        public int ResourceId { get; init; }
+        public DateTime From { get; init; }
+        public DateTime To { get; init; }
+        public string? Reason { get; init; }
     }
 }

@@ -2,15 +2,24 @@ using System.Data;
 using System.Text.Json;
 using Dapper;
 using LPS.APS.Application.Services.Dto;
+using LPS.APS.BusinessRules.Loaders;
+using LPS.APS.BusinessRules.Models;
+using LPS.APS.BusinessRules.Repositories;
 using LPS.APS.Core.Dto;
 using LPS.APS.Core.DTOs.Governance;
 using LPS.APS.Core.Models;
+using LPS.APS.Core.Rules;
 using LPS.APS.Core.Interfaces;
 using LPS.APS.Core.Models.Scheduling;
 using LPS.APS.Engine.Data;
 using LPS.APS.Scheduling.Algorithms;
 using LPS.APS.Shared.Models;
 using Microsoft.Extensions.Logging;
+// ⚠ 用别名而非 `using LPS.APS.Core.Entities.APS;`：该命名空间里有实体 `Task`，
+//   整体引入会与 `System.Threading.Tasks.Task` 二义（CS0104），本文件多处 async 方法签名会炸。
+using ProductionWorkCalendarSlot = LPS.APS.Core.Entities.APS.ProductionWorkCalendarSlot;
+// ⚠ 同上：别名引入 PlanVersion 实体（`ReplaceActiveAsync` 的入参类型），避免整体引入该命名空间。
+using PlanVersionEntity = LPS.APS.Core.Entities.APS.PlanVersion;
 
 namespace LPS.APS.Application.Services;
 
@@ -35,12 +44,44 @@ public class SchedulingOrchestrator : ISchedulingOrchestrator
     /// </summary>
     private const int SqlServerInParameterLimit = 2000;
 
+    // ══ PlanVersion 生命周期状态（**冻结词表** 07 §4.2:3532：BUILDING / CANDIDATE / ACTIVE / ARCHIVED / FAILED）══
+    // 【2026-10-15 词表对齐】原 D7 词表 Created / Computed / ComputeFailed 按冻结文档改名：
+    //   Created → BUILDING、Computed → CANDIDATE、ComputeFailed → FAILED。
+    //   `Computing` 冻结未细分，但本仓**必须保留**（它是发令枪的领取闸门，见 RunSchedulingAutoAsync 注释），
+    //   视为 BUILDING 期间的子状态。详见台账 §T-1037。
+    // 顺带修掉一个真 bug：本类原写 `ComputeFailed`，而 RunLifecycleService 的域级判定读 `FAILED`
+    //   ⇒ 失败域永远判不出来（落到 `_ => RUNNING`）。改名后写读同值，该 bug 自愈。
+    /// <summary>壳已建、待发令枪领取。</summary>
+    private const string PlanVersionBuildingStatus = "BUILDING";
+    /// <summary>本域已被领取、正在计算（BUILDING 的子状态；**不可与 BUILDING 合并**）。</summary>
+    private const string PlanVersionComputingStatus = "Computing";
+    /// <summary>计算成功、待采用（白天候选的终态；夜间全量成功直接跳到 ACTIVE）。</summary>
+    private const string PlanVersionCandidateStatus = "CANDIDATE";
+    /// <summary>已正式采用（每域单一 ACTIVE，唯一索引 UQ_PlanVersion_OneActivePerDomain 兜底）。</summary>
+    private const string PlanVersionActiveStatus = "ACTIVE";
+    /// <summary>被同域新版本顶替。</summary>
+    private const string PlanVersionArchivedStatus = "ARCHIVED";
+    /// <summary>计算失败。</summary>
+    private const string PlanVersionFailedStatus = "FAILED";
+    /// <summary>夜间全量运行类型 —— **唯一**可自动正式采用（Status→ACTIVE）的 RunType。</summary>
+    private const string FullScheduleRunType = "FULL_SCHEDULE";
+
     private readonly DatabaseConnectionManager _connectionManager;
     private readonly ISnapshotService _snapshotService;
     private readonly IPeggingOrchestrator _peggingOrchestrator;
     private readonly IScheduleRunService _scheduleRunService;
     private readonly LPS.APS.Engine.Services.Sync.IOrderLoadingService _orderLoadingService;
     private readonly LPS.APS.Engine.Services.Sync.IBomRealtimeExpandService _bomRealtimeExpandService;
+    /// <summary>
+    /// 【2026-10-15 新增】夜间全量成功自动采用（Status→ACTIVE）复用 <c>ReplaceActiveAsync</c> ——
+    /// 「同域旧 ACTIVE 归档 + 本版本置 ACTIVE」的单事务单点实现，与 3号位 人工激活**同一条路径**，
+    /// 避免在本类里另写一份归档 SQL 造成口径漂移（唯一索引 UQ_PlanVersion_OneActivePerDomain 由它兜底）。
+    /// </summary>
+    private readonly IPlanVersionRepository _planVersionRepository;
+    // 1.5b 管道供给装载与 Pegging 同源同口径：同一个 5号位 装载器 + 同一个三级链计算器 + 同一份冻结策略快照。
+    private readonly ITimedSupplyFactLoader _timedSupplyFactLoader;
+    private readonly IProcurementManualEtaRepository _procurementManualEtaRepo;
+    private readonly IFrozenStrategySnapshotProvider _frozenStrategySnapshotProvider;
     private readonly ILogger<SchedulingOrchestrator> _logger;
 
     public SchedulingOrchestrator(
@@ -50,6 +91,10 @@ public class SchedulingOrchestrator : ISchedulingOrchestrator
         IScheduleRunService scheduleRunService,
         LPS.APS.Engine.Services.Sync.IOrderLoadingService orderLoadingService,
         LPS.APS.Engine.Services.Sync.IBomRealtimeExpandService bomRealtimeExpandService,
+        IPlanVersionRepository planVersionRepository,
+        ITimedSupplyFactLoader timedSupplyFactLoader,
+        IProcurementManualEtaRepository procurementManualEtaRepo,
+        IFrozenStrategySnapshotProvider frozenStrategySnapshotProvider,
         ILogger<SchedulingOrchestrator> logger)
     {
         _connectionManager = connectionManager ?? throw new ArgumentNullException(nameof(connectionManager));
@@ -58,18 +103,31 @@ public class SchedulingOrchestrator : ISchedulingOrchestrator
         _scheduleRunService = scheduleRunService ?? throw new ArgumentNullException(nameof(scheduleRunService));
         _orderLoadingService = orderLoadingService ?? throw new ArgumentNullException(nameof(orderLoadingService));
         _bomRealtimeExpandService = bomRealtimeExpandService ?? throw new ArgumentNullException(nameof(bomRealtimeExpandService));
+        _planVersionRepository = planVersionRepository ?? throw new ArgumentNullException(nameof(planVersionRepository));
+        _timedSupplyFactLoader = timedSupplyFactLoader ?? throw new ArgumentNullException(nameof(timedSupplyFactLoader));
+        _procurementManualEtaRepo = procurementManualEtaRepo ?? throw new ArgumentNullException(nameof(procurementManualEtaRepo));
+        _frozenStrategySnapshotProvider = frozenStrategySnapshotProvider ?? throw new ArgumentNullException(nameof(frozenStrategySnapshotProvider));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
     }
 
     /// <inheritdoc />
     public async Task<SchedulingRunResult> RunSchedulingAutoAsync(CancellationToken cancellationToken = default)
     {
-        _logger.LogInformation("排程发令枪：自动查找待排 FULL_SCHEDULE ScheduleRun（RUNNING + 有 Created PlanVersion）");
+        _logger.LogInformation("排程发令枪：自动查找待排 FULL_SCHEDULE ScheduleRun（RUNNING + 有 BUILDING PlanVersion）");
 
         // 原子领取：领取粒度从「单个 PlanVersion」上移为「ScheduleRun」。
         // 分域后一个 ScheduleRun 对应多个 PlanVersion（每 Domain 一个，由 NightlyBatch Step3 创建），
-        // 此处锁定 RUNNING 且仍有 Created PlanVersion 的 ScheduleRun，避免多 Worker 重复领取同一 Run。
+        // 此处锁定 RUNNING 且仍有 BUILDING PlanVersion 的 ScheduleRun，避免多 Worker 重复领取同一 Run。
         // RunType='FULL_SCHEDULE' 过滤：仅领夜间正式排程；白天候选（MANUAL_RESCHEDULE 等）由 3号位 显式触发，不得被发令枪误领。
+        //
+        // ⚠️ 为什么 EXISTS 判的是 `Status='BUILDING'`（冻结词表）而不是别的值 —— 这不是进度显示，是**领取闸门**：
+        //   · ScheduleRun 在跑的过程中 `Status` 恒为 'RUNNING'（ScheduleRunService 只写 COMPLETED/PARTIAL_SUCCESS/FAILED 三个终态）
+        //     ⇒ 光靠 `sr.Status='RUNNING'` **挡不住**第二个 Worker 领走同一个 Run。
+        //   · `WITH (UPDLOCK, READPAST, ROWLOCK)` 只在领取事务期间互斥，事务一提交锁就放。
+        //   ⇒ 真正的防重复领取，靠的就是「域一旦开跑就不再是 BUILDING」这一条：
+        //     ExecuteDomainAsync 领到域后立刻把它写成 `Computing`，EXISTS 随即转假。
+        //   ⚠️ 因此 `Computing` 这个值**不可与 BUILDING 合并**（冻结词表未细分它，但本仓必须保留）——
+        //     合并后已开跑的 Run 的 EXISTS 恒真，多 Worker 会重复领取并重跑整个 Run。详见台账 §T-1037。
         var scheduleRun = await _connectionManager.QueryFirstOrDefaultAsync<ScheduleRunQueryDto>(
             @"SELECT TOP 1 sr.Id, sr.DataCutoffTime, sr.StrategyProfileVersionId
               FROM ScheduleRun sr WITH (UPDLOCK, READPAST, ROWLOCK)
@@ -77,14 +135,14 @@ public class SchedulingOrchestrator : ISchedulingOrchestrator
                 AND sr.RunType = 'FULL_SCHEDULE'
                 AND EXISTS (
                     SELECT 1 FROM PlanVersion pv
-                    WHERE pv.SourceScheduleRunId = sr.Id AND pv.Status = 'Created'
+                    WHERE pv.SourceScheduleRunId = sr.Id AND pv.Status = 'BUILDING'
                 )
               ORDER BY sr.CreatedAt DESC",
             db: DatabaseId.APS);
 
         if (scheduleRun == null)
         {
-            _logger.LogInformation("未找到待排 FULL_SCHEDULE ScheduleRun（RUNNING + 有 Created PlanVersion），跳过本次触发");
+            _logger.LogInformation("未找到待排 FULL_SCHEDULE ScheduleRun（RUNNING + 有 BUILDING PlanVersion），跳过本次触发");
             return new SchedulingRunResult { IsSuccess = true, ErrorMessage = "无待排 ScheduleRun" };
         }
 
@@ -132,184 +190,233 @@ public class SchedulingOrchestrator : ISchedulingOrchestrator
             return new SchedulingRunResult { IsSuccess = false, ErrorMessage = "ExpectedDomainKeysJson 为空 Domain 集合" };
         }
 
-        // 【2026-09-29 重入守卫，对应回执 §5.3】本方法现有两个调用方 ⇒ 同一 Run 可能被先后执行两次
-        //   （例：发令枪已跑完，恢复又显式调一次）。若**全部**预期 Domain 的 PlanVersion 已达终态，
-        //   则跳过整段 Domain 执行，只补一次收口 —— 这同时兜住「全部 Domain 跑完但收口前崩溃」导致
-        //   Run 永久卡在 RUNNING 的情形（否则那种 Run 再也领不走）。
-        //   · 为什么是「全终态才跳过」而不是「逐域跳过已达终态的 Domain」：逐域跳过会丢掉已成功域的
-        //     sharedResourceOccupancy（FULL §9 跨域资源占用），后续 Domain 会排进已被占用的窗口 —— 那比
-        //     重跑更糟。全终态跳过时一个 Domain 都不执行，该上下文无人消费，故无此副作用。
-        //   · ⚠️ 边界：只覆盖「先后调用」，**不覆盖两个调用方同时在飞的并发**（那需要执行级锁，见回执 §5.3）。
-        var terminalPlanVersions = (await _connectionManager.QueryAsync<PlanVersionInfoDto>(
-            @"SELECT DomainKey, Status FROM PlanVersion
-              WHERE SourceScheduleRunId = @RunId AND Status IN ('Computed', 'ComputeFailed')",
-            new { RunId = scheduleRunId },
-            db: DatabaseId.APS)).ToList();
-
+        // 【2026-10-14 §T-1014q ① ②】Run 级收口兜底：进入执行区后，任何中断（异常 / 取消令牌穿出）都必须让 Run 落到终态，
+        //   否则 Run 永久停在 RUNNING —— 发令枪只领「有 Created 域」的 Run、恢复端点只收 FAILED，卡在 Computing 的 Run
+        //   两条路都领不走（同款自述见 RunLifecycleService 的 P1-03 §5.4 注释）。
+        //   落终态一律用 finalizeToken(=None)：客户端断连 / 请求取消也能落库（同候选路径 RunLifecycleService.CreateCandidateRunAsync 的既有做法）。
+        var finalizeToken = CancellationToken.None;
         var runStopwatch = System.Diagnostics.Stopwatch.StartNew();
-
-        // 只认**预期 Domain** 的终态 PV（若 Run 上存在多余/陈旧 PV，不得据此判定「已跑完」）。
-        // 用 HashSet 在内存里取交集，不用 SQL 的 IN @list —— 规避装载层踩过的 2100 参数上限坑。
-        var expectedDomainSet = new HashSet<string>(domainKeys, StringComparer.OrdinalIgnoreCase);
-        var computedDomains = terminalPlanVersions
-            .Where(p => p.Status == "Computed" && expectedDomainSet.Contains(p.DomainKey))
-            .Select(p => p.DomainKey).Distinct().ToList();
-        var terminalFailed = terminalPlanVersions
-            .Where(p => p.Status != "Computed" && expectedDomainSet.Contains(p.DomainKey))
-            .Select(p => p.DomainKey).Distinct().ToList();
-
-        if (computedDomains.Count + terminalFailed.Count >= domainKeys.Count)
+        try
         {
-            // 从终态 PV 反推成功/失败数，走**同一个**收口方法 ⇒ 收口语义与正常路径单点、不会漂移
-            _logger.LogWarning(
-                "ScheduleRun {RunId} 的全部 {Total} 个 Domain 已达终态（Computed={Computed}, 失败={Failed}），跳过重跑、仅补收口",
-                scheduleRunId, domainKeys.Count, computedDomains.Count, terminalFailed.Count);
+            // 【2026-09-29 重入守卫，对应回执 §5.3】本方法现有两个调用方 ⇒ 同一 Run 可能被先后执行两次
+            //   （例：发令枪已跑完，恢复又显式调一次）。若**全部**预期 Domain 的 PlanVersion 已达终态，
+            //   则跳过整段 Domain 执行，只补一次收口 —— 这同时兜住「全部 Domain 跑完但收口前崩溃」导致
+            //   Run 永久卡在 RUNNING 的情形（否则那种 Run 再也领不走）。
+            //   · 为什么是「全终态才跳过」而不是「逐域跳过已达终态的 Domain」：逐域跳过会丢掉已成功域的
+            //     sharedResourceOccupancy（FULL §9 跨域资源占用），后续 Domain 会排进已被占用的窗口 —— 那比
+            //     重跑更糟。全终态跳过时一个 Domain 都不执行，该上下文无人消费，故无此副作用。
+            //   · ⚠️ 边界：只覆盖「先后调用」，**不覆盖两个调用方同时在飞的并发**（那需要执行级锁，见回执 §5.3）。
+            // 终态集合（冻结词表）：CANDIDATE=白天候选算成功、ACTIVE=夜间算成功且已自动采用、
+            //   ARCHIVED=已被同域新版本顶替（曾成功）、FAILED=算失败。
+            var terminalPlanVersions = (await _connectionManager.QueryAsync<PlanVersionInfoDto>(
+                @"SELECT DomainKey, Status FROM PlanVersion
+                  WHERE SourceScheduleRunId = @RunId
+                    AND Status IN ('CANDIDATE', 'ACTIVE', 'ARCHIVED', 'FAILED')",
+                new { RunId = scheduleRunId },
+                db: DatabaseId.APS)).ToList();
+
+            // 只认**预期 Domain** 的终态 PV（若 Run 上存在多余/陈旧 PV，不得据此判定「已跑完」）。
+            // 用 HashSet 在内存里取交集，不用 SQL 的 IN @list —— 规避装载层踩过的 2100 参数上限坑。
+            var expectedDomainSet = new HashSet<string>(domainKeys, StringComparer.OrdinalIgnoreCase);
+            var computedDomains = terminalPlanVersions
+                .Where(p => (p.Status == PlanVersionCandidateStatus
+                             || p.Status == PlanVersionActiveStatus
+                             || p.Status == PlanVersionArchivedStatus)
+                            && expectedDomainSet.Contains(p.DomainKey))
+                .Select(p => p.DomainKey).Distinct().ToList();
+            var terminalFailed = terminalPlanVersions
+                .Where(p => p.Status == PlanVersionFailedStatus && expectedDomainSet.Contains(p.DomainKey))
+                .Select(p => p.DomainKey).Distinct().ToList();
+
+            if (computedDomains.Count + terminalFailed.Count >= domainKeys.Count)
+            {
+                // 从终态 PV 反推成功/失败数，走**同一个**收口方法 ⇒ 收口语义与正常路径单点、不会漂移
+                _logger.LogWarning(
+                    "ScheduleRun {RunId} 的全部 {Total} 个 Domain 已达终态（Computed={Computed}, 失败={Failed}），跳过重跑、仅补收口",
+                    scheduleRunId, domainKeys.Count, computedDomains.Count, terminalFailed.Count);
+
+                runStopwatch.Stop();
+                var reentryDurationSeconds = (int)(runStopwatch.ElapsedMilliseconds / 1000);
+                await CloseOutRunAsync(scheduleRunId, domainKeys.Count, computedDomains.Count, terminalFailed, reentryDurationSeconds, finalizeToken);
+
+                return new SchedulingRunResult
+                {
+                    IsSuccess        = computedDomains.Count == domainKeys.Count,
+                    ScheduledCount   = 0,
+                    UnscheduledCount = terminalFailed.Count,
+                    ElapsedMs        = runStopwatch.ElapsedMilliseconds,
+                    ErrorMessage     = computedDomains.Count == domainKeys.Count
+                        ? "该 ScheduleRun 的全部 Domain 已达终态，已跳过重跑"
+                        : $"该 ScheduleRun 已达终态：成功 {computedDomains.Count}/{domainKeys.Count}，失败 Domain={string.Join(",", terminalFailed)}"
+                };
+            }
+
+            var domainResults = new List<SchedulingRunResult>(domainKeys.Count);
+            var succeededCount = 0;
+            var failedDomainKeys = new List<string>();
+
+            // 域间依赖（真实 DomainKey 口径，§5/§7/§15/§23）：依赖边 → 拓扑执行序 + 传递上游闭包。
+            // Domain_Dependency 空（V1 现状）时两者均退化：执行序=冻结顺序、闭包为空（不阻断）。
+            var dependencyEdges = await LoadDomainDependencyEdgesAsync(domainKeys, cancellationToken);
+            var orderedDomainKeys = OrderDomainsTopologically(domainKeys, dependencyEdges);
+            var upstreamClosure = BuildUpstreamClosure(dependencyEdges, domainKeys);
+
+            // FULL §9：前序 Domain 成功后的共享 Resource 占用块（逐 Domain 累积，传给后续 Domain 作不可用时间窗）
+            var sharedResourceOccupancy = new List<ResourceBlock>();
+
+            // 壳盘点（**只作归因诊断，不参与执行决策**）。
+            // 为何要单独盘点：缺壳的真实因由**随路径而异** ——
+            //   夜间/候选路径：装载阶段就没建壳；恢复路径（P1-03）：3号位 建壳未按「一域一壳 + 与 Run 同事务」建全。
+            // 原措辞一律记「装载缺口」，会把排查引向错误阶段（恢复缺壳与装载阶段无关）。见 §5.4 同族的 P1-03 接线。
+            // 该查询同时暴露「同一 DomainKey 多个壳」：下面执行侧取 `TOP 1 … ORDER BY Id DESC`，
+            // 多出来的壳不会被任何一次执行认领 ⇒ **永久停在 Created**（建壳若不幂等就会踩到）。
+            var shellCounts = (await _connectionManager.QueryAsync<DomainShellCount>(
+                @"SELECT DomainKey, COUNT(*) AS ShellCount
+                  FROM PlanVersion
+                  WHERE SourceScheduleRunId = @RunId
+                  GROUP BY DomainKey",
+                new { RunId = scheduleRunId },
+                db: DatabaseId.APS)).ToList();
+
+            var shelledDomainSet = new HashSet<string>(
+                shellCounts.Select(s => s.DomainKey!).Where(k => !string.IsNullOrEmpty(k)),
+                StringComparer.OrdinalIgnoreCase);
+
+            var missingShellDomains = orderedDomainKeys.Where(d => !shelledDomainSet.Contains(d)).ToList();
+            var duplicateShellDomains = shellCounts
+                .Where(s => s.ShellCount > 1 && !string.IsNullOrEmpty(s.DomainKey))
+                .Select(s => $"{s.DomainKey}×{s.ShellCount}")
+                .ToList();
+
+            if (missingShellDomains.Count > 0 || duplicateShellDomains.Count > 0)
+            {
+                _logger.LogError(
+                    "[{RunId}] PlanVersion 壳盘点异常：预期 {Total} 个 Domain，壳行数={ShellRows}，缺壳={Missing}，重复壳={Dup}。" +
+                    "请核对建壳步骤（一域一壳 + 与 Run 同事务）",
+                    scheduleRunId, orderedDomainKeys.Count, shellCounts.Sum(s => s.ShellCount),
+                    missingShellDomains.Count == 0 ? "无" : string.Join(",", missingShellDomains),
+                    duplicateShellDomains.Count == 0 ? "无" : string.Join(",", duplicateShellDomains));
+            }
+
+            // R03-02 跨域守恒：Run 级物理供给消耗账本（Key=PhysicalSourceKey，Value=已消耗量）。
+            // 只在内存中存在，不落库、不回写 InventoryBalance.AllocatedQty。
+            // FULL 模式下前序**成功** Domain 的合法消耗由后续 Domain 继承；失败 Domain 的消耗按快照回滚，
+            // 不得占用其它 Domain 的供给（失败域的分配结果本就不落库，账本必须与之一致）。
+            var crossDomainPhysicalConsumed = new Dictionary<string, decimal>(StringComparer.Ordinal);
+
+            // 逐 Domain 串行执行（依赖顺序 = Domain_Dependency 拓扑序；无依赖边时降级为 ExpectedDomainKeysJson 冻结顺序）
+            foreach (var domainKey in orderedDomainKeys)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+
+                var planVersion = await _connectionManager.QueryFirstOrDefaultAsync<PlanVersionInfoDto>(
+                    @"SELECT TOP 1 Id, VersionCode, DomainKey, PlanHorizonStart, PlanHorizonEnd
+                      FROM PlanVersion
+                      WHERE SourceScheduleRunId = @RunId AND DomainKey = @DomainKey
+                      ORDER BY Id DESC",
+                    new { RunId = scheduleRunId, DomainKey = domainKey },
+                    db: DatabaseId.APS);
+
+                if (planVersion == null)
+                {
+                    // 预期 Domain 无对应 PlanVersion 壳。**不再武断归因为「装载缺口」** —— 因由随路径而异
+                    // （装载阶段未建 / 恢复建壳未建全），上方壳盘点已给出该 Run 的权威诊断，这里只引用它。
+                    _logger.LogError(
+                        "[{RunId}] Domain {DomainKey} 无对应 PlanVersion 壳 ⇒ 计入失败（本 Run 缺壳={Missing}，诊断见上方壳盘点日志）",
+                        scheduleRunId, domainKey,
+                        missingShellDomains.Count == 0 ? "无" : string.Join(",", missingShellDomains));
+                    failedDomainKeys.Add(domainKey);
+                    continue;
+                }
+
+                // 依赖感知阻断：仅当本 Domain 直接/间接依赖某个已失败上游时才阻断（§5/§7/§15/§23），
+                // 而非一刀切阻断所有后续 Domain。
+                if (failedDomainKeys.Count > 0
+                    && upstreamClosure.TryGetValue(domainKey, out var upstreams)
+                    && upstreams.Overlaps(failedDomainKeys))
+                {
+                    await BlockDomainAsync(planVersion.Id);
+                    _logger.LogWarning(
+                        "[{RunId}] Domain {DomainKey} 因上游失败被阻断: PlanVersionId={PlanVersionId}，失败上游={Upstream}",
+                        scheduleRunId, domainKey, planVersion.Id, string.Join(",", failedDomainKeys));
+                    domainResults.Add(new SchedulingRunResult
+                    {
+                        PlanVersionId = planVersion.Id,
+                        VersionCode   = planVersion.VersionCode,
+                        IsSuccess     = false,
+                        ErrorMessage  = $"上游 Domain 失败被阻断（失败上游={string.Join(",", failedDomainKeys)}）"
+                    });
+                    failedDomainKeys.Add(domainKey);
+                    continue;
+                }
+
+                // 失败回滚锚点：本 Domain 的消耗若因失败不落库，账本也不能留下痕迹
+                var consumptionSnapshot = new Dictionary<string, decimal>(
+                    crossDomainPhysicalConsumed, StringComparer.Ordinal);
+
+                var result = await ExecuteDomainAsync(
+                    planVersion.Id, scheduleRunId, run.DataCutoffTime, run.StrategyProfileVersionId,
+                    sharedResourceOccupancy, sourcePlanVersionId: null, scope: null,
+                    cancellationToken: cancellationToken,
+                    crossDomainPhysicalConsumed: crossDomainPhysicalConsumed);
+                domainResults.Add(result);
+
+                if (result.IsSuccess)
+                {
+                    succeededCount++;
+                    // FULL §9：成功 Domain 的 FinalTask 共享 Resource 占用区间，累积进 Run 级上下文
+                    if (result.EmittedResourceBlocks.Count > 0)
+                        sharedResourceOccupancy.AddRange(result.EmittedResourceBlocks);
+                }
+                else
+                {
+                    failedDomainKeys.Add(domainKey);
+
+                    // R03-02：失败 Domain 的物理消耗回滚到本域执行前
+                    crossDomainPhysicalConsumed.Clear();
+                    foreach (var kv in consumptionSnapshot)
+                        crossDomainPhysicalConsumed[kv.Key] = kv.Value;
+                }
+            }
 
             runStopwatch.Stop();
-            var reentryDurationSeconds = (int)(runStopwatch.ElapsedMilliseconds / 1000);
-            await CloseOutRunAsync(scheduleRunId, domainKeys.Count, computedDomains.Count, terminalFailed, reentryDurationSeconds, cancellationToken);
+            var durationSeconds = (int)(runStopwatch.ElapsedMilliseconds / 1000);
+
+            // ScheduleRun 终态收口（与重入路径共用 CloseOutRunAsync ⇒ 三态语义单点，不会两处漂移）
+            await CloseOutRunAsync(scheduleRunId, domainKeys.Count, succeededCount, failedDomainKeys, durationSeconds, finalizeToken);
+
+            _logger.LogInformation(
+                "排程执行完成: ScheduleRunId={RunId}, Domain={DomainCount}, 成功={Succeeded}/{Total}, 耗时={Elapsed}ms",
+                scheduleRunId, domainKeys.Count, succeededCount, domainKeys.Count, runStopwatch.ElapsedMilliseconds);
 
             return new SchedulingRunResult
             {
-                IsSuccess        = computedDomains.Count == domainKeys.Count,
-                ScheduledCount   = 0,
-                UnscheduledCount = terminalFailed.Count,
+                IsSuccess        = succeededCount == domainKeys.Count,
+                ScheduledCount   = domainResults.Where(r => r.IsSuccess).Sum(r => r.ScheduledCount),
+                UnscheduledCount = domainResults.Count(r => !r.IsSuccess),
                 ElapsedMs        = runStopwatch.ElapsedMilliseconds,
-                ErrorMessage     = computedDomains.Count == domainKeys.Count
-                    ? "该 ScheduleRun 的全部 Domain 已达终态，已跳过重跑"
-                    : $"该 ScheduleRun 已达终态：成功 {computedDomains.Count}/{domainKeys.Count}，失败 Domain={string.Join(",", terminalFailed)}"
+                ErrorMessage     = succeededCount == domainKeys.Count ? null : $"部分 Domain 失败：成功 {succeededCount}/{domainKeys.Count}"
             };
         }
-
-        var domainResults = new List<SchedulingRunResult>(domainKeys.Count);
-        var succeededCount = 0;
-        var failedDomainKeys = new List<string>();
-
-        // 域间依赖（真实 DomainKey 口径，§5/§7/§15/§23）：依赖边 → 拓扑执行序 + 传递上游闭包。
-        // Domain_Dependency 空（V1 现状）时两者均退化：执行序=冻结顺序、闭包为空（不阻断）。
-        var dependencyEdges = await LoadDomainDependencyEdgesAsync(domainKeys, cancellationToken);
-        var orderedDomainKeys = OrderDomainsTopologically(domainKeys, dependencyEdges);
-        var upstreamClosure = BuildUpstreamClosure(dependencyEdges, domainKeys);
-
-        // FULL §9：前序 Domain 成功后的共享 Resource 占用块（逐 Domain 累积，传给后续 Domain 作不可用时间窗）
-        var sharedResourceOccupancy = new List<ResourceBlock>();
-
-        // 壳盘点（**只作归因诊断，不参与执行决策**）。
-        // 为何要单独盘点：缺壳的真实因由**随路径而异** ——
-        //   夜间/候选路径：装载阶段就没建壳；恢复路径（P1-03）：3号位 建壳未按「一域一壳 + 与 Run 同事务」建全。
-        // 原措辞一律记「装载缺口」，会把排查引向错误阶段（恢复缺壳与装载阶段无关）。见 §5.4 同族的 P1-03 接线。
-        // 该查询同时暴露「同一 DomainKey 多个壳」：下面执行侧取 `TOP 1 … ORDER BY Id DESC`，
-        // 多出来的壳不会被任何一次执行认领 ⇒ **永久停在 Created**（建壳若不幂等就会踩到）。
-        var shellCounts = (await _connectionManager.QueryAsync<DomainShellCount>(
-            @"SELECT DomainKey, COUNT(*) AS ShellCount
-              FROM PlanVersion
-              WHERE SourceScheduleRunId = @RunId
-              GROUP BY DomainKey",
-            new { RunId = scheduleRunId },
-            db: DatabaseId.APS)).ToList();
-
-        var shelledDomainSet = new HashSet<string>(
-            shellCounts.Select(s => s.DomainKey!).Where(k => !string.IsNullOrEmpty(k)),
-            StringComparer.OrdinalIgnoreCase);
-
-        var missingShellDomains = orderedDomainKeys.Where(d => !shelledDomainSet.Contains(d)).ToList();
-        var duplicateShellDomains = shellCounts
-            .Where(s => s.ShellCount > 1 && !string.IsNullOrEmpty(s.DomainKey))
-            .Select(s => $"{s.DomainKey}×{s.ShellCount}")
-            .ToList();
-
-        if (missingShellDomains.Count > 0 || duplicateShellDomains.Count > 0)
+        catch (Exception ex)
         {
-            _logger.LogError(
-                "[{RunId}] PlanVersion 壳盘点异常：预期 {Total} 个 Domain，壳行数={ShellRows}，缺壳={Missing}，重复壳={Dup}。" +
-                "请核对建壳步骤（一域一壳 + 与 Run 同事务）",
-                scheduleRunId, orderedDomainKeys.Count, shellCounts.Sum(s => s.ShellCount),
-                missingShellDomains.Count == 0 ? "无" : string.Join(",", missingShellDomains),
-                duplicateShellDomains.Count == 0 ? "无" : string.Join(",", duplicateShellDomains));
+            // 落 FAILED（finalizeToken 不受请求取消影响）以便被既有恢复通道接住；
+            // 落库失败不得掩盖原始异常（rollback/落库异常掩码是已知陷阱）。
+            _logger.LogError(ex, "ScheduleRun {RunId} 执行中断，落 FAILED 供恢复：ElapsedMs={ElapsedMs}",
+                scheduleRunId, runStopwatch.ElapsedMilliseconds);
+            try
+            {
+                await _scheduleRunService.FailAsync(
+                    scheduleRunId, (int)(runStopwatch.ElapsedMilliseconds / 1000),
+                    $"执行中断（未走完收口）：{ex.Message}", CancellationToken.None);
+            }
+            catch (Exception landEx)
+            {
+                _logger.LogError(landEx, "ScheduleRun {RunId} 执行中断后落 FAILED 失败（原始异常见上）", scheduleRunId);
+            }
+
+            throw;
         }
-
-        // 逐 Domain 串行执行（依赖顺序 = Domain_Dependency 拓扑序；无依赖边时降级为 ExpectedDomainKeysJson 冻结顺序）
-        foreach (var domainKey in orderedDomainKeys)
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-
-            var planVersion = await _connectionManager.QueryFirstOrDefaultAsync<PlanVersionInfoDto>(
-                @"SELECT TOP 1 Id, VersionCode, DomainKey, PlanHorizonStart, PlanHorizonEnd
-                  FROM PlanVersion
-                  WHERE SourceScheduleRunId = @RunId AND DomainKey = @DomainKey
-                  ORDER BY Id DESC",
-                new { RunId = scheduleRunId, DomainKey = domainKey },
-                db: DatabaseId.APS);
-
-            if (planVersion == null)
-            {
-                // 预期 Domain 无对应 PlanVersion 壳。**不再武断归因为「装载缺口」** —— 因由随路径而异
-                // （装载阶段未建 / 恢复建壳未建全），上方壳盘点已给出该 Run 的权威诊断，这里只引用它。
-                _logger.LogError(
-                    "[{RunId}] Domain {DomainKey} 无对应 PlanVersion 壳 ⇒ 计入失败（本 Run 缺壳={Missing}，诊断见上方壳盘点日志）",
-                    scheduleRunId, domainKey,
-                    missingShellDomains.Count == 0 ? "无" : string.Join(",", missingShellDomains));
-                failedDomainKeys.Add(domainKey);
-                continue;
-            }
-
-            // 依赖感知阻断：仅当本 Domain 直接/间接依赖某个已失败上游时才阻断（§5/§7/§15/§23），
-            // 而非一刀切阻断所有后续 Domain。
-            if (failedDomainKeys.Count > 0
-                && upstreamClosure.TryGetValue(domainKey, out var upstreams)
-                && upstreams.Overlaps(failedDomainKeys))
-            {
-                await BlockDomainAsync(planVersion.Id);
-                _logger.LogWarning(
-                    "[{RunId}] Domain {DomainKey} 因上游失败被阻断: PlanVersionId={PlanVersionId}，失败上游={Upstream}",
-                    scheduleRunId, domainKey, planVersion.Id, string.Join(",", failedDomainKeys));
-                domainResults.Add(new SchedulingRunResult
-                {
-                    PlanVersionId = planVersion.Id,
-                    VersionCode   = planVersion.VersionCode,
-                    IsSuccess     = false,
-                    ErrorMessage  = $"上游 Domain 失败被阻断（失败上游={string.Join(",", failedDomainKeys)}）"
-                });
-                failedDomainKeys.Add(domainKey);
-                continue;
-            }
-
-            var result = await ExecuteDomainAsync(
-                planVersion.Id, scheduleRunId, run.DataCutoffTime, run.StrategyProfileVersionId,
-                sharedResourceOccupancy, sourcePlanVersionId: null, scope: null, cancellationToken: cancellationToken);
-            domainResults.Add(result);
-
-            if (result.IsSuccess)
-            {
-                succeededCount++;
-                // FULL §9：成功 Domain 的 FinalTask 共享 Resource 占用区间，累积进 Run 级上下文
-                if (result.EmittedResourceBlocks.Count > 0)
-                    sharedResourceOccupancy.AddRange(result.EmittedResourceBlocks);
-            }
-            else
-            {
-                failedDomainKeys.Add(domainKey);
-            }
-        }
-
-        runStopwatch.Stop();
-        var durationSeconds = (int)(runStopwatch.ElapsedMilliseconds / 1000);
-
-        // ScheduleRun 终态收口（与重入路径共用 CloseOutRunAsync ⇒ 三态语义单点，不会两处漂移）
-        await CloseOutRunAsync(scheduleRunId, domainKeys.Count, succeededCount, failedDomainKeys, durationSeconds, cancellationToken);
-
-        _logger.LogInformation(
-            "排程执行完成: ScheduleRunId={RunId}, Domain={DomainCount}, 成功={Succeeded}/{Total}, 耗时={Elapsed}ms",
-            scheduleRunId, domainKeys.Count, succeededCount, domainKeys.Count, runStopwatch.ElapsedMilliseconds);
-
-        return new SchedulingRunResult
-        {
-            IsSuccess        = succeededCount == domainKeys.Count,
-            ScheduledCount   = domainResults.Where(r => r.IsSuccess).Sum(r => r.ScheduledCount),
-            UnscheduledCount = domainResults.Count(r => !r.IsSuccess),
-            ElapsedMs        = runStopwatch.ElapsedMilliseconds,
-            ErrorMessage     = succeededCount == domainKeys.Count ? null : $"部分 Domain 失败：成功 {succeededCount}/{domainKeys.Count}"
-        };
     }
 
     /// <summary>
@@ -378,90 +485,113 @@ public class SchedulingOrchestrator : ISchedulingOrchestrator
         if (run == null)
             throw new InvalidOperationException($"ScheduleRun 不存在: ScheduleRunId={scheduleRunId}");
 
-        // M4：反查 Run 冻结 ScopeJson（白天候选局部重排范围载荷），反序列化为强类型 ScopeJsonV2。
-        // null/空 = FULL 语义（旧调用兼容，不校验）；序列化口径 = 字符串码（JsonStringEnumConverter），3号位 写入。
-        var scope = string.IsNullOrWhiteSpace(run.ScopeJson)
-            ? null
-            : JsonSerializer.Deserialize<ScopeJsonV2>(run.ScopeJson);
-
-        // 【白天候选】订单池准备（2026-09-28）：Candidate 壳（RunLifecycleService.CreateCandidateRunAsync）
-        // 只建 ScheduleRun + PlanVersion、**不装订单**；而 ExecuteDomainAsync 是按本 planVersionId 装载订单的，
-        // 故跑之前必须把活跃订单压进本 Candidate PlanVersion（否则订单为空 → 空结果）。
-        // 幂等：sp_SyncOrdersToPartitionTable 有 NOT EXISTS(OrderNo, PlanVersionId) 保护，重复调用只补增量。
-        // 失败不静默：记错误日志后继续（下游会因无订单产出空结果，日志可定位）。
+        // 【2026-10-14 §T-1014q ① ②】同 ExecuteRunAsync：本入口（白天候选 / 联调真跑）进入执行区后也必须让 Run 落终态，
+        //   否则 Run 永久 RUNNING（恢复端点只收 FAILED、发令枪只领 FULL_SCHEDULE 且有 Created 域的 Run，两条路都接不着）。
+        var finalizeToken = CancellationToken.None;
         try
         {
-            var loadedOrders = await _orderLoadingService.LoadOrdersToPartitionTableAsync(planVersionId, cancellationToken);
+            // M4：反查 Run 冻结 ScopeJson（白天候选局部重排范围载荷），反序列化为强类型 ScopeJsonV2。
+            // null/空 = FULL 语义（旧调用兼容，不校验）；序列化口径 = 字符串码（JsonStringEnumConverter），3号位 写入。
+            var scope = string.IsNullOrWhiteSpace(run.ScopeJson)
+                ? null
+                : JsonSerializer.Deserialize<ScopeJsonV2>(run.ScopeJson);
+
+            // 【白天候选】订单池准备（2026-09-28）：Candidate 壳（RunLifecycleService.CreateCandidateRunAsync）
+            // 只建 ScheduleRun + PlanVersion、**不装订单**；而 ExecuteDomainAsync 是按本 planVersionId 装载订单的，
+            // 故跑之前必须把活跃订单压进本 Candidate PlanVersion（否则订单为空 → 空结果）。
+            // 幂等：sp_SyncOrdersToPartitionTable 有 NOT EXISTS(OrderNo, PlanVersionId) 保护，重复调用只补增量。
+            // 失败不静默：记错误日志后继续（下游会因无订单产出空结果，日志可定位）。
+            try
+            {
+                var loadedOrders = await _orderLoadingService.LoadOrdersToPartitionTableAsync(planVersionId, cancellationToken);
+                _logger.LogInformation(
+                    "白天候选订单池准备：PlanVersionId={PlanVersionId}，本次装载 {Loaded} 条订单",
+                    planVersionId, loadedOrders);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex,
+                    "白天候选订单池准备失败：PlanVersionId={PlanVersionId}（候选将因无订单而产出空结果，请检查该 PV 的 DomainKey/DomainDefinition）",
+                    planVersionId);
+            }
+
+            // 【白天候选】BOM 实时展开接线（2026-10-08，2号位）。
+            //   口径 = 5号位 回执 v1.0（2026-09-24）+ 本号位《白天BOM实时展开方案致5号位》§一：
+            //     ① 范围 = ScopeJson.OrderTargets[].OrderCanonicalId（本次局部重排的对象集），**只补缺口**
+            //        （服务内部先按白天天次查 MES_API_BOM_Request_Detail、已存在的跳过 ⇒ 幂等）；
+            //     ② 5号位 加护1：`sp_ExpandBOMRealtime_vNext` 前置校验 `MES_BOM_Edge_RefreshLog` 非 COMPLETED 会 RAISERROR ——
+            //        **必须捕获转可解释结果、不得硬失败** ⇒ 此处 try/catch 记日志后继续（Pegging 仍可用夜间存量 BOM）。
+            //   ⚠️ 边界：本方法仅为「白天候选」入口；夜间正式排程的 BOM 由 NightlyBatchOrchestrator 走接货链，不经此处。
+            try
+            {
+                var targetOrderCanonicalIds = scope?.OrderTargets
+                    .Select(t => t.OrderCanonicalId)
+                    .Where(id => id > 0)
+                    .Distinct()
+                    .ToList() ?? new List<long>();
+
+                if (targetOrderCanonicalIds.Count > 0)
+                {
+                    var expandResult = await _bomRealtimeExpandService.EnsureExpandedAsync(targetOrderCanonicalIds, cancellationToken);
+                    _logger.LogInformation(
+                        "白天候选 BOM 实时展开：目标订单={Requested}，补写 Detail={Inserted}，展开={Expanded}，结果行={Rows}，Issue={Issues}",
+                        expandResult.RequestedOrders, expandResult.DetailInserted,
+                        expandResult.ExpandedOrders, expandResult.ExpandedRowCount, expandResult.Issues.Count);
+                    if (expandResult.Issues.Count > 0)
+                        _logger.LogWarning("白天候选 BOM 实时展开 Issue（不阻断）：{Issues}", string.Join(" | ", expandResult.Issues));
+                }
+                else
+                {
+                    _logger.LogInformation(
+                        "白天候选 BOM 实时展开：ScopeJson.OrderTargets 为空（非局部重排场景），跳过实时展开、沿用夜间已展开 BOM。PlanVersionId={PlanVersionId}",
+                        planVersionId);
+                }
+            }
+            catch (Exception ex)
+            {
+                // 加护1：不得硬失败 —— 实时展开失败不阻断候选（沿用夜间存量 BOM），记错便于定位。
+                _logger.LogError(ex, "白天候选 BOM 实时展开失败（不阻断候选，沿用夜间已展开 BOM）。PlanVersionId={PlanVersionId}", planVersionId);
+            }
+
+            var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+            var result = await ExecuteDomainAsync(
+                planVersionId, scheduleRunId, run.DataCutoffTime, run.StrategyProfileVersionId ?? strategyProfileVersionId,
+                upstreamResourceBlocks: null, sourcePlanVersionId: run.BasePlanVersionId, scope, cancellationToken);
+            stopwatch.Stop();
+            var durationSeconds = (int)(stopwatch.ElapsedMilliseconds / 1000);
+
+            if (result.IsSuccess)
+            {
+                await _scheduleRunService.CompleteAsync(scheduleRunId, durationSeconds, finalizeToken);
+            }
+            else
+            {
+                await _scheduleRunService.FailAsync(scheduleRunId, durationSeconds, result.ErrorMessage ?? "排程失败", finalizeToken);
+            }
+
             _logger.LogInformation(
-                "白天候选订单池准备：PlanVersionId={PlanVersionId}，本次装载 {Loaded} 条订单",
-                planVersionId, loadedOrders);
+                "白天候选执行收口: ScheduleRunId={RunId}, PlanVersionId={PlanVersionId}, IsSuccess={Success}, 耗时={Elapsed}ms",
+                scheduleRunId, planVersionId, result.IsSuccess, stopwatch.ElapsedMilliseconds);
+
+            return result;
         }
         catch (Exception ex)
         {
             _logger.LogError(ex,
-                "白天候选订单池准备失败：PlanVersionId={PlanVersionId}（候选将因无订单而产出空结果，请检查该 PV 的 DomainKey/DomainDefinition）",
-                planVersionId);
-        }
-
-        // 【白天候选】BOM 实时展开接线（2026-10-08，2号位）。
-        //   口径 = 5号位 回执 v1.0（2026-09-24）+ 本号位《白天BOM实时展开方案致5号位》§一：
-        //     ① 范围 = ScopeJson.OrderTargets[].OrderCanonicalId（本次局部重排的对象集），**只补缺口**
-        //        （服务内部先按白天天次查 MES_API_BOM_Request_Detail、已存在的跳过 ⇒ 幂等）；
-        //     ② 5号位 加护1：`sp_ExpandBOMRealtime_vNext` 前置校验 `MES_BOM_Edge_RefreshLog` 非 COMPLETED 会 RAISERROR ——
-        //        **必须捕获转可解释结果、不得硬失败** ⇒ 此处 try/catch 记日志后继续（Pegging 仍可用夜间存量 BOM）。
-        //   ⚠️ 边界：本方法仅为「白天候选」入口；夜间正式排程的 BOM 由 NightlyBatchOrchestrator 走接货链，不经此处。
-        try
-        {
-            var targetOrderCanonicalIds = scope?.OrderTargets
-                .Select(t => t.OrderCanonicalId)
-                .Where(id => id > 0)
-                .Distinct()
-                .ToList() ?? new List<long>();
-
-            if (targetOrderCanonicalIds.Count > 0)
+                "候选/联调运行执行中断，落 FAILED 供恢复：ScheduleRunId={RunId} PlanVersionId={PlanVersionId}",
+                scheduleRunId, planVersionId);
+            try
             {
-                var expandResult = await _bomRealtimeExpandService.EnsureExpandedAsync(targetOrderCanonicalIds, cancellationToken);
-                _logger.LogInformation(
-                    "白天候选 BOM 实时展开：目标订单={Requested}，补写 Detail={Inserted}，展开={Expanded}，结果行={Rows}，Issue={Issues}",
-                    expandResult.RequestedOrders, expandResult.DetailInserted,
-                    expandResult.ExpandedOrders, expandResult.ExpandedRowCount, expandResult.Issues.Count);
-                if (expandResult.Issues.Count > 0)
-                    _logger.LogWarning("白天候选 BOM 实时展开 Issue（不阻断）：{Issues}", string.Join(" | ", expandResult.Issues));
+                await _scheduleRunService.FailAsync(
+                    scheduleRunId, 0, $"执行中断（未走完收口）：{ex.Message}", CancellationToken.None);
             }
-            else
+            catch (Exception landEx)
             {
-                _logger.LogInformation(
-                    "白天候选 BOM 实时展开：ScopeJson.OrderTargets 为空（非局部重排场景），跳过实时展开、沿用夜间已展开 BOM。PlanVersionId={PlanVersionId}",
-                    planVersionId);
+                _logger.LogError(landEx, "落 FAILED 失败（原始异常见上）：ScheduleRunId={RunId}", scheduleRunId);
             }
-        }
-        catch (Exception ex)
-        {
-            // 加护1：不得硬失败 —— 实时展开失败不阻断候选（沿用夜间存量 BOM），记错便于定位。
-            _logger.LogError(ex, "白天候选 BOM 实时展开失败（不阻断候选，沿用夜间已展开 BOM）。PlanVersionId={PlanVersionId}", planVersionId);
-        }
 
-        var stopwatch = System.Diagnostics.Stopwatch.StartNew();
-        var result = await ExecuteDomainAsync(
-            planVersionId, scheduleRunId, run.DataCutoffTime, run.StrategyProfileVersionId ?? strategyProfileVersionId,
-            upstreamResourceBlocks: null, sourcePlanVersionId: run.BasePlanVersionId, scope, cancellationToken);
-        stopwatch.Stop();
-        var durationSeconds = (int)(stopwatch.ElapsedMilliseconds / 1000);
-
-        if (result.IsSuccess)
-        {
-            await _scheduleRunService.CompleteAsync(scheduleRunId, durationSeconds, cancellationToken);
+            throw;
         }
-        else
-        {
-            await _scheduleRunService.FailAsync(scheduleRunId, durationSeconds, result.ErrorMessage ?? "排程失败", cancellationToken);
-        }
-
-        _logger.LogInformation(
-            "白天候选执行收口: ScheduleRunId={RunId}, PlanVersionId={PlanVersionId}, IsSuccess={Success}, 耗时={Elapsed}ms",
-            scheduleRunId, planVersionId, result.IsSuccess, stopwatch.ElapsedMilliseconds);
-
-        return result;
     }
 
     /// <summary>
@@ -478,7 +608,8 @@ public class SchedulingOrchestrator : ISchedulingOrchestrator
         IReadOnlyList<ResourceBlock>? upstreamResourceBlocks,
         int? sourcePlanVersionId = null,
         ScopeJsonV2? scope = null,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        IDictionary<string, decimal>? crossDomainPhysicalConsumed = null)
     {
         _logger.LogInformation("排程开始: PlanVersionId={PlanVersionId}, ScheduleRunId={RunId}",
             planVersionId, scheduleRunId);
@@ -486,16 +617,23 @@ public class SchedulingOrchestrator : ISchedulingOrchestrator
 
         try
         {
-            // 获取计划版本信息
+            // 获取计划版本信息（含 VersionCategory 与来源 Run 的 RunType —— 后者是「夜间自动采用」的唯一判据）
             var planVersion = await _connectionManager.QueryFirstOrDefaultAsync<PlanVersionInfoDto>(
-                "SELECT Id, VersionCode, DomainKey, PlanHorizonStart, PlanHorizonEnd FROM PlanVersion WHERE Id = @Id",
+                @"SELECT pv.Id, pv.VersionCode, pv.DomainKey, pv.PlanHorizonStart, pv.PlanHorizonEnd,
+                         pv.VersionCategory, sr.RunType
+                  FROM PlanVersion pv
+                  LEFT JOIN ScheduleRun sr ON sr.Id = pv.SourceScheduleRunId
+                  WHERE pv.Id = @Id",
                 new { Id = planVersionId },
                 db: DatabaseId.APS);
 
             if (planVersion == null)
                 throw new InvalidOperationException($"计划版本不存在: PlanVersionId={planVersionId}");
 
-            // 更新状态为 Computing
+            // 状态 → Computing（冻结词表里 BUILDING 期间的子状态）。
+            // ⚠️ 这一步同时是**发令枪领取闸门**的关闸动作：本域一旦变成 Computing，
+            //    RunSchedulingAutoAsync 的 `EXISTS(... Status='BUILDING')` 立即转假，别的 Worker 不会再领走同一 Run。
+            //    ⇒ 该值不可省、不可与 BUILDING 合并（合并后已开跑的 Run 的 EXISTS 恒真 ⇒ 重复领取并重跑）。
             await _connectionManager.ExecuteAsync(
                 "UPDATE PlanVersion SET Status = 'Computing' WHERE Id = @Id",
                 new { Id = planVersionId },
@@ -522,6 +660,9 @@ public class SchedulingOrchestrator : ISchedulingOrchestrator
             context.DataCutoffTime = dataCutoffTime;
             if (strategyProfileVersionId.HasValue)
                 await LoadStrategyConfigAsync(context, strategyProfileVersionId.Value, cancellationToken);
+            // 1.5b 管道供给：**必须放在策略配置之后** —— 三级链的 DefaultPurchaseLt / ArrivalToUsableOffsets
+            //   来自冻结策略快照，快照未装载时算不出 AvailableTime（见 LoadPipelineSupplyAsync 注释）。
+            await LoadPipelineSupplyAsync(context, cancellationToken);
             contextStopwatch.Stop();
             _logger.LogInformation(
                 "[{PlanVersionId}] 沙盘装载完成: Tasks={TaskCount}, Resources={ResourceCount}, MESKeys={MESCount}, 耗时={ContextMs}ms",
@@ -534,8 +675,15 @@ public class SchedulingOrchestrator : ISchedulingOrchestrator
             // 事项四（§5.3.1 基线快照）：候选需求侧订单数据源钉 BasePlanVersionId（sourcePlanVersionId），
             // 不随执行时刻 ACTIVE 漂移；FULL 场景 sourcePlanVersionId=null，回退为自身 planVersionId。
             var demandSourcePlanVersionId = sourcePlanVersionId ?? planVersionId;
+            // 需求根集合 = 本域订单 − 厂间出荷指示（SH）行。
+            // 冻结正文逐字（Pegging v1.6 §4.1/§12.1；业务基线 v1.13 §40.1）：
+            //   「SH订单本身不作为普通顶层Demand重复进入第一层」「它在目标侧作为SH单一Supply」。
+            // 排除判据与供给侧入池判据**同源**（`LoadInterFactoryShipmentsAsync` 的谓词：
+            //   `CustomerSegment=N'INTER_FACTORY' AND OrderType='SALES_ORDER'`），避免两侧口径漂移。
             var allOrderIds = (await _connectionManager.QueryAsync<long>(
-                "SELECT Id FROM [Order] WHERE PlanVersionId = @PlanVersionId",
+                $@"SELECT Id FROM [Order]
+                  WHERE PlanVersionId = @PlanVersionId
+                    AND NOT (ISNULL(OrderType, N'') = N'SALES_ORDER' AND ISNULL(CustomerSegment, N'') = N'{CustomerSegmentCodes.InterFactory}')",
                 new { PlanVersionId = demandSourcePlanVersionId },
                 db: DatabaseId.APS)).ToList();
 
@@ -554,17 +702,28 @@ public class SchedulingOrchestrator : ISchedulingOrchestrator
             // Candidate 场景装载「其它 Domain 当前 ACTIVE 在共享 Resource 上的占用」作为 ExternalDomainResourceBlocks（§11）。
             var isCandidate = sourcePlanVersionId.HasValue;
             IReadOnlyList<ResourceBlock>? externalDomainResourceBlocks = null;
+            IDictionary<string, decimal>? externalDomainInventoryOccupation = null;
             if (isCandidate)
             {
                 externalDomainResourceBlocks = await LoadExternalDomainResourceBlocksAsync(
                     planVersion.DomainKey, context, sourcePlanVersionId!.Value, planVersionId, cancellationToken);
                 _logger.LogInformation(
                     "[{PlanVersionId}] Candidate 外部 Domain 占用块: {Count} 条", planVersionId, externalDomainResourceBlocks.Count);
+
+                // R03-02：候选不得释放其它 Domain 现行 ACTIVE 的**库存**占用。
+                // 与上一行同源同谓词（Status='ACTIVE'、排除自身与 Base、排除本域），只是取的是量不是时间。
+                externalDomainInventoryOccupation = await LoadExternalDomainInventoryOccupationAsync(
+                    planVersion.DomainKey, sourcePlanVersionId!.Value, planVersionId, cancellationToken);
+                _logger.LogInformation(
+                    "[{PlanVersionId}] Candidate 外部 Domain 库存占用: 聚合键 {KeyCount} 个 / Σ{Qty}",
+                    planVersionId, externalDomainInventoryOccupation.Count,
+                    externalDomainInventoryOccupation.Values.Sum());
             }
 
             var peggingRequest = BuildPeggingRequest(
                 planVersionId, planVersion.DomainKey, allOrderIds, context, upstreamResourceBlocks,
-                isCandidate, sourcePlanVersionId, externalDomainResourceBlocks);
+                isCandidate, sourcePlanVersionId, externalDomainResourceBlocks,
+                crossDomainPhysicalConsumed, externalDomainInventoryOccupation);
             var peggingResults = (await _peggingOrchestrator.ExecuteBatchPeggingWorkflowAsync(
                 peggingRequest, cancellationToken)).ToList();
 
@@ -598,11 +757,58 @@ public class SchedulingOrchestrator : ISchedulingOrchestrator
             // 阶段5: 更新PlanVersion状态 + 更新 ScheduleRun
             // ═══════════════════════════════════════════
             var isSuccess = peggingFailed.Count == 0;
-            var finalStatus = isSuccess ? "Computed" : "ComputeFailed";
-            await _connectionManager.ExecuteAsync(
-                "UPDATE PlanVersion SET Status = @Status, ComputedAt = GETDATE() WHERE Id = @Id",
-                new { Id = planVersionId, Status = finalStatus },
-                db: DatabaseId.APS);
+            // 【2026-10-15 词表对齐 + 夜间自动采用】冻结 07 §4.5:3744/3745 —— 域成功终态按 RunType 分：
+            //   · 夜间全量 FULL_SCHEDULE ⇒ ACTIVE（**自动正式采用**，无需人工确认）
+            //   · 白天候选（MANUAL_RESCHEDULE / LOCAL_RESCHEDULE / INSERT_ORDER_WHATIF）⇒ CANDIDATE（等 3号位 人工确认后激活）
+            //   · 失败 ⇒ FAILED（与 RunLifecycleService 的域级判定同值，此前写 ComputeFailed 导致失败域永远判不出来）
+            var isNightlyFullRun = string.Equals(planVersion.RunType, FullScheduleRunType, StringComparison.Ordinal);
+            var autoActivate = isSuccess && isNightlyFullRun;
+
+            if (autoActivate)
+            {
+                // 先落算完时间与统计（**不动 Status**）—— 若先置 ACTIVE 再归档，中途会出现两行同域 ACTIVE 撞唯一索引。
+                //
+                // 【2026-10-19 补齐 TotalOrders/TotalTasks】冻结 07 §4.2：`TotalOrders`=本次排程处理的订单数、
+                //   `TotalTasks`=本次排程生成的任务数。此前**全仓无任何写入点** ⇒ 两列恒 NULL，而
+                //   `OverviewQueryRepository`「各 Domain 生效版本一览」直接 `ISNULL(TotalTasks,0)` 读它们 ⇒ 恒 0。
+                //   口径与 `ScheduleQueryService` 汇总端点**同一式**：按 `PlanVersionId` 计数两张业务表
+                //   （不用内存 `totalTasks`：那是跨域累计值，且失败域拿不到）。计数放在状态迁移之前，
+                //   保证版本一旦可见（ACTIVE/CANDIDATE/FAILED）统计即已就位。
+                await _connectionManager.ExecuteAsync(
+                    @"UPDATE PlanVersion
+                         SET ComputedAt  = GETDATE(),
+                             TotalTasks  = (SELECT COUNT(1) FROM [Task]  WHERE PlanVersionId = @Id),
+                             TotalOrders = (SELECT COUNT(1) FROM [Order] WHERE PlanVersionId = @Id)
+                       WHERE Id = @Id",
+                    new { Id = planVersionId },
+                    db: DatabaseId.APS);
+
+                // 再交给 ReplaceActiveAsync 完成「同域旧 ACTIVE 归档 + 本行置 ACTIVE」——
+                // 单事务单点，与 3号位 人工激活走**同一条路径**，唯一索引 UQ_PlanVersion_OneActivePerDomain 兜底。
+                await _planVersionRepository.ReplaceActiveAsync(
+                    new PlanVersionEntity { Id = planVersionId, DomainKey = planVersion.DomainKey },
+                    actor: "SYSTEM",
+                    activatedAt: DateTime.Now,
+                    cancellationToken);
+
+                _logger.LogInformation(
+                    "[{PlanVersionId}] 夜间全量（RunType={RunType}）域 {DomainKey} 计算成功 ⇒ 自动正式采用（Status=ACTIVE）",
+                    planVersionId, planVersion.RunType, planVersion.DomainKey);
+            }
+            else
+            {
+                var finalStatus = isSuccess ? PlanVersionCandidateStatus : PlanVersionFailedStatus;
+                // 统计同 autoActivate 分支（口径见上）：失败域也落真实计数，便于「排了但没成功」的版本被查到量。
+                await _connectionManager.ExecuteAsync(
+                    @"UPDATE PlanVersion
+                         SET Status      = @Status,
+                             ComputedAt  = GETDATE(),
+                             TotalTasks  = (SELECT COUNT(1) FROM [Task]  WHERE PlanVersionId = @Id),
+                             TotalOrders = (SELECT COUNT(1) FROM [Order] WHERE PlanVersionId = @Id)
+                       WHERE Id = @Id",
+                    new { Id = planVersionId, Status = finalStatus },
+                    db: DatabaseId.APS);
+            }
 
             // ═══════════════════════════════════════════
             // 阶段6: 快照封存（§2.6）
@@ -682,7 +888,7 @@ public class SchedulingOrchestrator : ISchedulingOrchestrator
             try
             {
                 await _connectionManager.ExecuteAsync(
-                    "UPDATE PlanVersion SET Status = 'ComputeFailed' WHERE Id = @Id",
+                    "UPDATE PlanVersion SET Status = 'FAILED' WHERE Id = @Id",
                     new { Id = planVersionId },
                     db: DatabaseId.APS);
 
@@ -706,12 +912,12 @@ public class SchedulingOrchestrator : ISchedulingOrchestrator
     }
 
     /// <summary>
-    /// 将本 Domain 的 PlanVersion 标记为「因上游失败被阻断」（ComputeFailed，与真实计算失败同终态；阻断原因记录在日志与 ScheduleRun.ErrorMessage）。
+    /// 将本 Domain 的 PlanVersion 标记为「因上游失败被阻断」（FAILED，与真实计算失败同终态；阻断原因记录在日志与 ScheduleRun.ErrorMessage）。
     /// </summary>
     private async Task BlockDomainAsync(int planVersionId)
     {
         await _connectionManager.ExecuteAsync(
-            "UPDATE PlanVersion SET Status = 'ComputeFailed' WHERE Id = @Id",
+            "UPDATE PlanVersion SET Status = 'FAILED' WHERE Id = @Id",
             new { Id = planVersionId },
             db: DatabaseId.APS);
     }
@@ -719,20 +925,25 @@ public class SchedulingOrchestrator : ISchedulingOrchestrator
     /// <summary>
     /// 阶段1: 装载排程沙盘（从APS库读取数据组装 SchedulingContext）
     /// 
-    /// 子步骤（2号位端到端通路）：
-    ///   1.1 订单加载          → context.Orders（供2号位Pegging使用）
-    ///   1.2 BOM 加载          → 保留接口（V1 不真装载 BOM，由 5号位 Pegging 真正消费）
-    ///   1.3 物料属性           → 订单加载时 JOIN Material 取得 ProductFamilyId/LLC
-    ///   1.4 资源 + 日历        → context.Resources / context.ResourceCalendars（日历 V1 默认 7x24）
-    ///   1.5 库存装载           → context.InventorySupplies（从 InventoryBalance）
-    ///   1.6 Task 拆批          → 按 RoutingOperation 把每个 Order 拆为 N 个 SchedulingTask
-    ///                           + 批量 INSERT 到 [Task] 表（阶段4 回写需要真实 TaskId）
+    /// 子步骤（2号位端到端通路，**2026-10-13 按代码更正**）：
+    ///   1.1~1.3 订单 / BOM / 物料属性 —— **不在本方法内**：订单集由阶段2 直接 SQL 读取
+    ///                            （`SELECT Id FROM [Order] WHERE PlanVersionId=…`）；
+    ///                            `context.Orders` 全仓无赋值点；BOM 与物料属性由 Pegging 侧装载
+    ///   1.4 资源 + 日历        → context.Resources / context.ResourceCalendars
+    ///                            （⚠ 原注「日历 V1 默认 7x24」**已作废**，且与本文件下方 `:803-806` 自相矛盾：
+    ///                             现只加载 `ResourceCalendarSlot` 真实可用窗口，**无日历行＝该资源不可用**）
+    ///   1.5 库存装载           → context.InventorySupplies（InventoryBalance 一手库存）
+    ///   1.5b 管道供给          → context.InventorySupplies（SupplyFact_Pipeline 追加）
+    ///                            ⚠ **不在本方法内**：三级链要用冻结策略快照，故由调用方在
+    ///                            `LoadStrategyConfigAsync` 之后调 `LoadPipelineSupplyAsync`（见其注释）
+    ///   1.6 Task 拆批          → **已废弃、代码显式跳过**（`:759-761`）：不再预拆批，
+    ///                            改由 PeggingOrchestrator 在 1号位 求解后按 `solveResult.FinalTasks` 落库
+    ///                            （⚠ 原注「按 RoutingOperation 拆为 N 个 SchedulingTask ＋ 批量 INSERT 到 [Task] 表」
+    ///                             **与代码不符，已改**）
+    ///   1.7 MES 进度           → context.MESRemainingQty（按 ScheduleRunId 读 StageProgressSnapshot）
     /// 
-    /// V1 保守策略（5号位 Pegging 接入后可替换）：
-    ///   - 无真 Pegging：Order 数量直接分配到 Task（一 Order 一 Task 链）
-    ///   - 无 BOM 下钻：只处理订单物料自身的工艺路线
-    ///   - 无批量切分：整订单数量 × StandardDuration 作为 Task 工时
-    ///   - 资源指派：按 OperationResourceEligibility 取默认资源
+    /// 【历史块已删·2026-10-13】原「V1 保守策略（无真 Pegging／无 BOM 下钻／无批量切分／默认资源指派）」
+    ///   描述的是 Pegging 接入**之前**的过渡态；Pegging 已实装（`PeggingOrchestrator`），该块整体作废。
     /// </summary>
     private async Task<SchedulingContext> LoadSchedulingContextAsync(
         PlanVersionInfoDto planVersion,
@@ -751,7 +962,7 @@ public class SchedulingOrchestrator : ISchedulingOrchestrator
         await LoadResourcesAndCalendarAsync(context, cancellationToken);
         _logger.LogInformation("[{PlanVersionId}] 1.4 资源加载: {Count}", planVersion.Id, context.Resources.Count);
 
-        // 1.5 库存双源汇聚（§2.5.2）
+        // 1.5 一手库存装载（§2.5.2）
         await LoadInventoryAsync(context, cancellationToken);
         _logger.LogInformation("[{PlanVersionId}] 1.5 库存加载: {Count} 个(物料+产品族+工厂) 组合",
             planVersion.Id, context.InventorySupplies.Count);
@@ -760,13 +971,11 @@ public class SchedulingOrchestrator : ISchedulingOrchestrator
         // v5.1.2冻结设计（§3.1）：批次拆分由1号位IFiniteCapacityScheduler执行
         _logger.LogInformation("[{PlanVersionId}] 1.6 跳过预拆批（Task将由Pegging生成）", planVersion.Id);
 
-        // 1.7 MES 进度快照装载（按 ScheduleRunId 从 StageProgressSnapshot 读 RemainingQty）
-        if (scheduleRunId > 0)
-        {
-            await LoadMESProgressAsync(context, scheduleRunId, cancellationToken);
-            _logger.LogInformation("[{PlanVersionId}] 1.7 MES进度装载: {Count} 条",
-                planVersion.Id, context.MESRemainingQty.Count);
-        }
+        // 1.7 MES 进度快照装载（源 Run 由 SnapshotRunResolver 解析，不再用本 Run 号裸读）
+        // 白天候选 / FAILED 恢复路径传 scheduleRunId=0，裸读恒 0 行 ⇒ MESRemainingQty 恒空。
+        await LoadMESProgressAsync(context, planVersion.Id, cancellationToken);
+        _logger.LogInformation("[{PlanVersionId}] 1.7 MES进度装载: {Count} 条",
+            planVersion.Id, context.MESRemainingQty.Count);
 
         return context;
     }
@@ -776,17 +985,25 @@ public class SchedulingOrchestrator : ISchedulingOrchestrator
     // ═══════════════════════════════════════════════════════════════════════════
 
     /// <summary>
-    /// 1.7 从 StageProgressSnapshot 装载 MES 进度（按 ScheduleRunId 分区）
+    /// 1.7 从 StageProgressSnapshot 装载 MES 进度
     /// 1号位用 MESRemainingQty 决定每道工序实际还需排多少量
+    ///
+    /// 读哪一批快照由 <see cref="SnapshotRunResolver"/> 决定（0号位《PM回复1009-1》§三 A-Q1/A-Q2/A-Q3）：
+    /// 夜间 FULL = 本 Run；白天候选 / FAILED 恢复 = 沿 Base 链继承「有三类完整快照」的源 Run。
+    /// 与 PeggingOrchestrator 的 StageProgressSnapshot 读点同一解析器；断链 / 成环 / Base 缺失由解析器 fail-closed。
+    /// 调用方传入的 scheduleRunId 不参与选源（候选路径本来就是 0）。
     /// </summary>
-    private async Task LoadMESProgressAsync(SchedulingContext context, int scheduleRunId, CancellationToken ct)
+    private async Task LoadMESProgressAsync(SchedulingContext context, int planVersionId, CancellationToken ct)
     {
+        var snapshotRunId = await SnapshotRunResolver.ResolveSnapshotRunIdAsync(
+            _connectionManager, planVersionId, _logger, ct);
+
         var rows = await _connectionManager.QueryAsync<MESProgressLoadDto>(
             @"SELECT ProductionInstructionNo, MaterialCode, StageCode, RemainingQty
               FROM StageProgressSnapshot
               WHERE ScheduleRunId = @ScheduleRunId
                 AND RemainingQty  > 0",
-            new { ScheduleRunId = scheduleRunId },
+            new { ScheduleRunId = snapshotRunId },
             db: DatabaseId.APS);
 
         foreach (var r in rows)
@@ -799,9 +1016,23 @@ public class SchedulingOrchestrator : ISchedulingOrchestrator
 
     /// <summary>
     /// 1.4 加载资源 + 日历
-    /// V1 日历策略：7x24 连续可用（计划期全覆盖）；待专门的 ResourceCalendar 装载服务落地后替换
+    ///
+    /// ⚠ 旧注释「V1 日历策略：7x24 连续可用（计划期全覆盖）」**已作废**，与下方实现直接矛盾：
+    ///   PM 0923 §九 已取消 730 天 7×24 合成，改为**只加载 `ResourceCalendarSlot` 真实可用窗口、无日历行=该资源不可用**。
+    ///   《APS V1｜2026-10-12 冻结文档修改指导 v1.1》§1.1.6 进一步**取消**「日历缺段一律按 8 小时工作日」的独立兜底：
+    ///   **不强制 8 小时、不猜 08:00—16:00、不按自然日一律 8 小时或 7×24 补产能**。
+    ///   目标形态（§1.1.5／§3.1）＝**三级继承：工厂实际工作日历 → 生产部门日历 → 设备资源／人工能力槽日历**；
+    ///   显式停机/禁用/休息/维修**不得**被上级继承复活；**三级均无可信来源 ⇒ 记录覆盖不足、不产生 Slot**。
+    ///   🔴 **三级继承尚未实现**（当前只读资源级窗口），属《指导v1.1》§3.3 要求 2号位 先行**盘点**的项（§七.5）。
     /// </summary>
-    private async Task LoadResourcesAndCalendarAsync(SchedulingContext context, CancellationToken ct)
+    /// <remarks>
+    /// 2026-10-13：由 `private` 改 **`internal`**，**仅供 `LPS.APS.Tests`（`InternalsVisibleTo`）复用**。
+    ///   动机：`LoadToPosition1AuditTest` 自建 `SchedulingContext` 时只赋了 StrategyProfileVersionId/DataCutoffTime/PlanHorizon*，
+    ///   导致装给 1号位 的 `Resources`/`CalendarSlots` **恒为 0**（而生产非 0）⇒ 探针在资源轴上不具代表性。
+    ///   让探针**调用本方法（生产同一份代码）**而不是自己复刻一份查询，避免又造一个漂移源。
+    ///   **不改任何行为**：签名语义、SQL、日志逐字不变。
+    /// </remarks>
+    internal async Task LoadResourcesAndCalendarAsync(SchedulingContext context, CancellationToken ct)
     {
         var resources = await _connectionManager.QueryAsync<ResourceLoadDto>(
             @"SELECT
@@ -822,15 +1053,57 @@ public class SchedulingOrchestrator : ISchedulingOrchestrator
                 AND r.Status = 'AVAILABLE'",
             db: DatabaseId.APS);
 
-        // PM 0923 §九：取消 730 天 7×24 合成；只加载 ResourceCalendarSlot 真实可用窗口，无日历行=该资源不可用。
+        // 1号位 回执 §四 提请：S4 取消 730 天合成后，真实日历覆盖 = 正排物理上限。
+        // 软边界（正排不受 PlanningEnd 约束）要求日历铺到「兜底日期 = PlanHorizonEnd + 180 天」。
+        // 常量已提到 `SchedulingHorizonPolicy`（G-2 的工厂/部门 WORK 窗口必须用**同一个值**，见该类注释）。
+
+        // ── 三级日历·上两级（工厂 / 生产部门）—— 2026-10-13 接入；此前 `ProductionWorkCalendarSlot` 在 .cs 里**零引用** ──
+        // ⚠ 2026-10-13 实测更正：本表**已不是 0 行**。5号位 当日 13:48/13:52/13:58（本地）三批共落 47 行，
+        //   `SourceSystem='TEST'`：工厂 2/3/4/5/6 的「周一至周五 WORK 08:00–17:00 / 周六日 OFF」各 7 行、
+        //   部门 963 同型 7 行，另 5 行是按 `WorkDate` 的节假日/调休 fixture（含 `AllowLowerOverride`／`IsAuthorizedOverride`），
+        //   全部 `EffectiveFrom=2026-10-13`。
+        //   ⇒ `ResourceCalendarResolver` 的**等价快路径（`UpperLevelFactsPresent=false`）自即日起不再命中**，
+        //     三级继承在真实数据上**已生效**：生效日及以后资源日历被上级裁剪为周一至周五，生效日之前不裁剪。
+        //     量级对齐（PV2 探针 `CalendarSlots`=4,423,641）：按「生效日前全留 + 生效日起只留周一至周五」建模 = 4,422,856，
+        //     差 785 与上述 5 行按日 fixture（补一个周六、一个周日）同量级 ⇒ 数字可解释，非装载异常。
+        //   ⚠ 本表**直接喂给 1号位 的载荷**（`ResourceCalendars` → `CalendarSlots`），增删行会改变排程输入。
+        //     表主 = 5号位；我方只加载、不治理。
+        //   ⚠ 另注：该批行 `CreatedAt/UpdatedAt` 为 **UTC**（05:48/05:52/05:58，较本地早 8 小时），
+        //     与 APS「时间戳一律本地、禁 UTC」的约定不一致 —— 属 5号位 铺数侧口径，仅记录。
+        var upperCalendarRows = await _connectionManager.QueryAsync<ProductionWorkCalendarSlot>(
+            @"SELECT Id, ScopeType, FactoryId, ProductionDepartmentId, WorkDate, WeekdayIso,
+                     StartAt, EndAt, WorkState, AllowLowerOverride, IsAuthorizedOverride,
+                     SourceSystem, SourceReference, EffectiveFrom, EffectiveTo, IsActive
+                FROM ProductionWorkCalendarSlot
+               WHERE IsActive = 1",
+            db: DatabaseId.APS);
+
+        // PM 0923 §九：取消 730 天 7×24 合成；只加载真实窗口，无日历行=该资源不可用。
+        // ⚠ 2026-10-13 改：**不再只取 `AvailableFlag=1`**。`AvailableFlag=0` 是「资源级显式 OFF（停机/维修）」，
+        //   属 RC-006「资源自身明确 OFF 为硬排除」，必须交给解析器作**例外裁剪**，不能在这里静默丢掉。
+        //   （实测全表 `AvailableFlag=0` 为 0 行 ⇒ 本改动当前不改变任何结果，只把语义摆正。）
         var calendarRows = await _connectionManager.QueryAsync<ResourceCalendarSlotLoadDto>(
             @"SELECT ResourceId, StartTime, EndTime, AvailableFlag
-                FROM ResourceCalendarSlot
-               WHERE AvailableFlag = 1",
+                FROM ResourceCalendarSlot",
             db: DatabaseId.APS);
-        var realCalendars = calendarRows
+        var ownCalendars = calendarRows
             .GroupBy(c => c.ResourceId)
-            .ToDictionary(g => g.Key, g => g.Select(c => new TimeWindow(c.StartTime, c.EndTime)).ToList());
+            .ToDictionary(
+                g => g.Key,
+                g => g.Select(c => new ResourceCalendarResolver.LevelWindow
+                {
+                    Start = c.StartTime,
+                    End = c.EndTime,
+                    IsAvailable = c.AvailableFlag
+                }).ToList());
+
+        // 部门 → 工厂：人工能力槽主档只有 ProductionDepartmentId，要解析工厂级日历必须再上溯一层。
+        var departmentFactoryMap = (await _connectionManager.QueryAsync<DepartmentFactoryLoadDto>(
+            @"SELECT Id, FactoryId FROM ProductionDepartment",
+            db: DatabaseId.APS))
+            .ToDictionary(x => x.Id, x => x.FactoryId);
+
+        var calendarInputs = new List<ResourceCalendarResolver.ResourceCalendarInput>();
 
         foreach (var r in resources)
         {
@@ -850,11 +1123,16 @@ public class SchedulingOrchestrator : ISchedulingOrchestrator
             });
 
             // PM 0923 §九：无有效日历=不可用（设备+人工统一）；铺天数=5号位，2号位 只加载不合成。
-            // 有 ResourceCalendarSlot 真实可用窗口才写入；无日历行则该资源不产出日历（=不可用）。
-            if (realCalendars.TryGetValue(r.ResourceId, out var windows) && windows.Count > 0)
+            // 2026-10-13：本级窗口（含 OFF）交给三级解析器统一合成，不再在此直接写 ResourceCalendars。
+            calendarInputs.Add(new ResourceCalendarResolver.ResourceCalendarInput
             {
-                context.ResourceCalendars[resIdStr] = windows;
-            }
+                Key = resIdStr,
+                FactoryId = r.FactoryId,
+                DepartmentId = r.ProductionDepartmentId,
+                OwnWindows = ownCalendars.TryGetValue(r.ResourceId, out var windows)
+                    ? windows
+                    : Array.Empty<ResourceCalendarResolver.LevelWindow>()
+            });
         }
 
         // ── 人工能力槽装载 + 运行时投影（PM 0923 资源模型裁决）──
@@ -867,17 +1145,38 @@ public class SchedulingOrchestrator : ISchedulingOrchestrator
                WHERE IsActive = 1",
             db: DatabaseId.APS);
 
+        // 同上：人工槽 `AvailableFlag=0` 同样是「本级显式 OFF」，交给解析器裁剪，不在此丢弃。
         var manualSlotCalendarRows = await _connectionManager.QueryAsync<ManualCapacitySlotCalendarLoadDto>(
             @"SELECT ManualSlotId, StartTime, EndTime, AvailableFlag
-                FROM ManualCapacitySlotCalendar
-               WHERE AvailableFlag = 1",
+                FROM ManualCapacitySlotCalendar",
             db: DatabaseId.APS);
         var manualCalendars = manualSlotCalendarRows
             .GroupBy(c => c.ManualSlotId)
-            .ToDictionary(g => g.Key, g => g.Select(c => new TimeWindow(c.StartTime, c.EndTime)).ToList());
+            .ToDictionary(
+                g => g.Key,
+                g => g.Select(c => new ResourceCalendarResolver.LevelWindow
+                {
+                    Start = c.StartTime,
+                    End = c.EndTime,
+                    IsAvailable = c.AvailableFlag
+                }).ToList());
+
+        var rejectedManualSlots = 0;
+        var rejectedManualSlotSamples = new List<string>(5);
 
         foreach (var slot in manualSlots)
         {
+            // 【2026-10-17 J14-08】越界槽**不入 Solver**：`1e9 + ManualSlotId` 溢出后是负数，
+            //   而落库拆键判据 `IsManualSlotId(id) = id >= 1e9` 对负数恒假 ⇒ 负数会被当作真实设备写进
+            //   `Task.ResourceId`（死分支）。原「仅告警、照常合成」正是把这个死分支造出来 ⇒ 改为跳过。
+            if (!SolverResourceProjection.IsWithinManualSlotRange(slot.ManualSlotId))
+            {
+                rejectedManualSlots++;
+                if (rejectedManualSlotSamples.Count < 5)
+                    rejectedManualSlotSamples.Add($"{slot.ManualSlotId}@{slot.ProductionDepartmentId}/{slot.OperationName}");
+                continue;
+            }
+
             var syntheticIdStr = (SolverResourceProjection.ManualSlotResourceOffset + slot.ManualSlotId).ToString();
 
             context.Resources.Add(new SchedulingResource
@@ -893,18 +1192,82 @@ public class SchedulingOrchestrator : ISchedulingOrchestrator
             });
 
             // 无 ManualCapacitySlotCalendar 行 = 不可用（与设备同口径，PM §九）。
-            if (manualCalendars.TryGetValue(slot.ManualSlotId, out var windows) && windows.Count > 0)
+            // 2026-10-13：同上，改交三级解析器；人工槽的工厂由「部门→工厂」上溯得到。
+            calendarInputs.Add(new ResourceCalendarResolver.ResourceCalendarInput
             {
-                context.ResourceCalendars[syntheticIdStr] = windows;
-            }
+                Key = syntheticIdStr,
+                FactoryId = departmentFactoryMap.TryGetValue(slot.ProductionDepartmentId, out var deptFactoryId)
+                    ? deptFactoryId
+                    : (int?)null,
+                DepartmentId = slot.ProductionDepartmentId,
+                OwnWindows = manualCalendars.TryGetValue(slot.ManualSlotId, out var windows)
+                    ? windows
+                    : Array.Empty<ResourceCalendarResolver.LevelWindow>()
+            });
         }
+
+        if (rejectedManualSlots > 0)
+        {
+            _logger.LogWarning(
+                "[Scheduling] 越界人工槽已拒绝入 Solver（J14-08）：{Count}/{Total} 个槽的 ManualSlotId 越界，"
+                + "合成 ResourceId 会溢出 int ⇒ 不投影资源、不建日历。样本：{Samples}",
+                rejectedManualSlots,
+                manualSlots.Count(),
+                string.Join("; ", rejectedManualSlotSamples));
+        }
+
+        // ── 三级继承合成（工厂 → 生产部门 → 设备/人工槽）：逐片「交集 / 例外裁剪」，绝不时段相加 ──
+        // 口径：规则清单 v1.7 RC-001/RC-002/RC-006/RC-007；日历专项 v1.4 §2/§4/§5；06 接口 §18。
+        var calendarResolution = ResourceCalendarResolver.Resolve(
+            upperCalendarRows.ToList(),
+            calendarInputs,
+            context.PlanHorizonStart,
+            context.PlanHorizonEnd.AddDays(SchedulingHorizonPolicy.SoftBoundaryCalendarBufferDays));
+
+        foreach (var (resourceKey, windows) in calendarResolution.Calendars)
+            context.ResourceCalendars[resourceKey] = windows.Select(w => new TimeWindow(w.Start, w.End)).ToList();
+
+        if (!calendarResolution.UpperLevelFactsPresent)
+        {
+            _logger.LogInformation(
+                "[ResourceCalendar] 上级日历（ProductionWorkCalendarSlot）无事实行 ⇒ 按资源级口径解析（等价于两级全 MISSING 的三级结果）。"
+                + "日历资源数={WithCalendar}，无窗口={Without}。工厂/部门 OFF 与继承将在 5号位 铺数后自动生效。",
+                calendarResolution.Calendars.Count, calendarResolution.ResourcesWithoutAnyWindow);
+        }
+        else
+        {
+            _logger.LogInformation(
+                "[ResourceCalendar] 三级继承已生效：日历资源数={WithCalendar}（其中继承上级={Inherited}），无窗口={Without}；"
+                + "窗口来源片数 工厂={FromFactory}／部门={FromDept}／资源={FromResource}。",
+                calendarResolution.Calendars.Count, calendarResolution.ResourcesWithInheritedWindow,
+                calendarResolution.ResourcesWithoutAnyWindow,
+                calendarResolution.WindowCountFromFactory, calendarResolution.WindowCountFromDepartment,
+                calendarResolution.WindowCountFromResource);
+        }
+
+        if (calendarResolution.ConflictDayCount > 0)
+            _logger.LogWarning(
+                "[ResourceCalendar] 同层日历矛盾被整日拒绝 {Days} 个（资源×日）：WORK↔WORK 或 OFF↔OFF 部分重叠。"
+                + "按 RC-006 拒绝形成无证据窗口，不猜；请 3号位 治理侧核对发布校验。",
+                calendarResolution.ConflictDayCount);
+
+        if (calendarResolution.ResourcesWithUnreliableOwnership > 0)
+            _logger.LogWarning(
+                "[ResourceCalendar] {Count} 个资源的工厂/部门归属不可靠（缺 FactoryId 或 ProductionDepartmentId），"
+                + "其上级日历无法解析 —— 按专项 v1.4 §1「归属不可靠时拒绝形成无证据的合法窗口」只按本级口径处理，并留此诊断。",
+                calendarResolution.ResourcesWithUnreliableOwnership);
+
+        if (calendarResolution.ResourcesWithoutAnyWindow > 0)
+            _logger.LogWarning(
+                "[ResourceCalendar] {Count} 个资源三级均无合法可排窗口 ⇒ 不产生 Slot（RC-007：绝不补 8h / 7×24）。",
+                calendarResolution.ResourcesWithoutAnyWindow);
 
         // 1号位 回执 §四 提请：S4 取消 730 天合成后，真实日历覆盖 = 正排物理上限。
         // 软边界（正排不受 PlanningEnd 约束）要求日历铺到「兜底日期 = PlanHorizonEnd + 180 天」；
         // 覆盖不足则正排末端找不到槽 → 静默落 Unscheduled。此处只打诊断日志（非硬报错），
         // 铺天数属 5号位 数据维护（PM 0923 §九/§十），2号位 只加载 + 出证据。
-        const int softBoundaryCalendarBufferDays = 180;
-        var horizonFloor = context.PlanHorizonEnd.AddDays(softBoundaryCalendarBufferDays);
+        // （常量已提到 `SchedulingHorizonPolicy`，与 G-2 的工厂/部门 WORK 窗口共用同一个值。）
+        var horizonFloor = context.PlanHorizonEnd.AddDays(SchedulingHorizonPolicy.SoftBoundaryCalendarBufferDays);
         var allCalendarWindows = context.ResourceCalendars.Values.SelectMany(w => w).ToList();
         if (allCalendarWindows.Count == 0)
         {
@@ -924,17 +1287,19 @@ public class SchedulingOrchestrator : ISchedulingOrchestrator
             {
                 _logger.LogWarning(
                     "[ResourceCalendar] 资源日历最大末端 {MaxCalEnd:O} 未覆盖软边界兜底日期 {HorizonFloor:O}（PlanHorizonEnd+{BufferDays} 天，正排不受 PlanningEnd 约束）；可能静默落 Unscheduled（1号位 回执 §四）。请 5号位 核对铺天数。",
-                    maxCalEnd, horizonFloor, softBoundaryCalendarBufferDays);
+                    maxCalEnd, horizonFloor, SchedulingHorizonPolicy.SoftBoundaryCalendarBufferDays);
             }
         }
     }
 
     /// <summary>
-    /// 1.5 从 InventoryBalance + SupplyFact_Pipeline 全量装载库存到 SchedulingContext.InventorySupplies
+    /// 1.5 从 InventoryBalance 装载一手库存到 SchedulingContext.InventorySupplies
     ///
     /// 装载内容（2号位职责）：
-    ///   1. INVENTORY：从 InventoryBalance 读取现有库存（ERP + MES 合并后的可用量）
-    ///   2. PIPELINE：从 SupplyFact_Pipeline 读取在途/管道供给（v5.1.3 统一供给事实层）
+    ///   INVENTORY：从 InventoryBalance 读取现有库存（ERP + MES 合并后的可用量）
+    ///
+    /// ⚠ 管道供给（SupplyFact_Pipeline）**不在本方法内** —— 见 <see cref="LoadPipelineSupplyAsync"/>：
+    ///   它要算 AvailableTime 三级链，依赖冻结策略快照，必须排在 LoadStrategyConfigAsync 之后。
     ///
     /// ⚠️ 【待对齐 5号位 — B 项越界】
     ///   当前 sp_SyncInventorySnapshot 里硬编码了"双源互斥判定 + InventoryAvailabilityRule 筛选"，
@@ -945,7 +1310,6 @@ public class SchedulingOrchestrator : ISchedulingOrchestrator
     /// </summary>
     private async Task LoadInventoryAsync(SchedulingContext context, CancellationToken ct)
     {
-        // ── 1. 装载现有库存（INVENTORY）──
         var balances = await _connectionManager.QueryAsync<InventoryLoadDto>(
             @"SELECT MaterialCode, ProductFamilyId, FactoryId, AvailableQty
               FROM InventoryBalance
@@ -957,45 +1321,115 @@ public class SchedulingOrchestrator : ISchedulingOrchestrator
             var key = SchedulingContext.BuildInventoryKey(b.MaterialCode, b.ProductFamilyId, b.FactoryId);
             context.InventorySupplies[key] = b.AvailableQty;
         }
+    }
 
-        // ── 2. 装载管道供给（PIPELINE）——来源：SupplyFact_Pipeline ──
-        // AvailableTime 已改由 2号位运行时 EtaInvariant 三级链计算（sp_SyncPipelineSupply 不再落库 AvailableTime）。
-        // V1 排程装载侧暂以原始 ETA 事实做计划期过滤（Manual ETA / Arrival-to-Usable Offset 精算待与 Pegging 对齐后接入）。
-        var inTransits = await _connectionManager.QueryAsync<InTransitLoadDto>(
-            @"SELECT
-                  sfp.MaterialCode,
-                  sfp.ProductFamilyId,
-                  sfp.FactoryId,
-                  sfp.Quantity       AS AvailableQty,
-                  sfp.ETA            AS EstimatedArrivalTime
-              FROM SupplyFact_Pipeline sfp
-              WHERE sfp.IsActive = 1
-                AND sfp.Quantity > 0
-                AND (sfp.ETA IS NULL OR sfp.ETA <= @PlanHorizonEnd)",
-            new { PlanHorizonEnd = context.PlanHorizonEnd },
-            db: DatabaseId.APS);
-
-        foreach (var it in inTransits)
+    /// <summary>
+    /// 1.5b 管道供给装载（SupplyFact_Pipeline）→ 并入 SchedulingContext.InventorySupplies。
+    ///
+    /// 【为什么单独一个方法、为什么必须排在策略配置之后】
+    ///   到货时点不再直接用原始 `sfp.ETA`，而是走与 Pegging **完全同一套**口径：
+    ///     5号位 `ITimedSupplyFactLoader`（同一 SQL、同一 SupplyType 白名单）
+    ///     → `AvailableTimeCalculator`（3号位 EtaInvariant 三级链 Manual &gt; ERP &gt; ReleaseDate+DefaultLT，
+    ///        再加 Arrival-to-Usable Offset）
+    ///   三级链的两项参数（`Procurement.DefaultPurchaseLt` / `ArrivalToUsableOffsets`）来自**冻结策略快照**，
+    ///   快照由 `LoadStrategyConfigAsync` 装载 ⇒ 本方法必须在它之后调用，否则算不出 AvailableTime。
+    ///
+    /// 【行为差异（有意）】
+    ///   · 旧口径：`ETA IS NULL` 的行**无条件放行**（现网 18,291 行），且不叠 Arrival-to-Usable Offset；
+    ///   · 新口径：`ETA` 为空的行回落到 `ReleaseDate + DefaultPurchaseLt`，并按算出的 AvailableTime 与
+    ///     `PlanHorizonEnd` 比较 ⇒ 计划期外的管道供给**不再计入**本次排程的可用量。
+    ///   三级链**全空**（无 Manual、无 ETA、无 LT 规则或无 ReleaseDate）时仍以 null 计入 —— 这与 Pegging
+    ///   现行处置一致（0号位 2026-10-16 §三-1 已明确「是否改为不可承诺」属待裁语义，本轮不改）。
+    ///
+    /// 【无冻结策略版本时】
+    ///   直接跳过并不回退到原始 ETA：Pegging 在 `StrategyProfileVersionId` 为空时本就 fail-fast 抛错
+    ///   （`PeggingOrchestrator` 步骤1），回退只会让两条路径口径分叉、且这次运行最终仍会失败。
+    /// </summary>
+    private async Task LoadPipelineSupplyAsync(SchedulingContext context, CancellationToken ct)
+    {
+        var profileVersionId = context.StrategyProfileVersionId;
+        if (profileVersionId is not { } versionId || versionId <= 0)
         {
-            var key = SchedulingContext.BuildInventoryKey(it.MaterialCode, it.ProductFamilyId, it.FactoryId);
-
-            if (context.InventorySupplies.ContainsKey(key))
-                context.InventorySupplies[key] += it.AvailableQty;
-            else
-                context.InventorySupplies[key] = it.AvailableQty;
+            _logger.LogWarning(
+                "[{PlanVersionId}] 1.5b 管道供给跳过：SchedulingContext.StrategyProfileVersionId 为空，" +
+                "无法解析 DefaultPurchaseLt / ArrivalToUsableOffsets ⇒ 不回退原始 sfp.ETA，" +
+                "管道供给本次不计入 InventorySupplies（Pegging 同条件下会 fail-fast）",
+                context.PlanVersionId);
+            return;
         }
+
+        var frozenSnapshot = await _frozenStrategySnapshotProvider.GetFrozenStrategySnapshotAsync(versionId, ct);
+        var manualEtaMap = AvailableTimeCalculator.BuildManualEtaMap(
+            await _procurementManualEtaRepo.GetActiveOverridesAsync(ct));
+
+        // 空 scope = 不按物料/工厂收窄（与 Pegging 同一调用形状）。`DataCutoffTime` 该装载器不参与过滤，
+        // 期界判定统一由下面的 AvailableTime vs PlanHorizonEnd 完成。
+        var rawFacts = await _timedSupplyFactLoader.LoadRawFactsAsync(new SupplyFactScope(), ct);
+
+        var admitted = 0;
+        var outOfHorizon = 0;
+        var forbidden = 0;
+        var noTime = 0;
+        var admittedOnNullEta = 0;
+
+        foreach (var fact in rawFacts)
+        {
+            // 同一道身份闸：冻结禁令类型不得作为独立 Supply（判据与 Pegging 同一函数，不另写一份）。
+            if (PeggingOrchestrator.IsForbiddenStandaloneSupplyType(fact.SupplyType))
+            {
+                forbidden++;
+                continue;
+            }
+
+            // 逾期重估基准 = 本 Run 数据截止时点（ScheduleRun.DataCutoffTime，编排层已落到 context）。
+            // 与下面 PlanHorizonEnd 的期界过滤是**两件事**：前者判「是否逾期」，后者判「落在计划窗内否」。
+            var availableAt = AvailableTimeCalculator.Compute(
+                fact, manualEtaMap, frozenSnapshot, context.DataCutoffTime ?? DateTime.Now);
+            if (availableAt.HasValue && availableAt.Value > context.PlanHorizonEnd)
+            {
+                outOfHorizon++;
+                continue;
+            }
+            if (!availableAt.HasValue) noTime++;
+            if (!fact.Eta.HasValue) admittedOnNullEta++;
+
+            // ⚠ ProductFamilyId 固定 0，与改动前**逐键等价**：旧 SQL 直接取 `sfp.ProductFamilyId`，
+            //   而该列现网 382,939 行**100% 为 NULL**，Dapper 映射到 int 即 0。
+            //   ⚠ 另注（已登记、本轮不改）：一手库存键用的是真实 ProductFamilyId（InventoryBalance 0 空、10 个族），
+            //   所以管道供给落在 `code|0|factory`，与库存键**不重合** —— 是否应改为按物料真实族拼键属语义变更，
+            //   会直接改变 1号位 可拿到的供给量，须先量后裁，不得在本轮顺手改。
+            var key = SchedulingContext.BuildInventoryKey(fact.MaterialCode, 0, fact.FactoryId);
+            context.InventorySupplies[key] = context.InventorySupplies.GetValueOrDefault(key) + fact.RemainingQty;
+            admitted++;
+        }
+
+        _logger.LogInformation(
+            "[{PlanVersionId}] 1.5b 管道供给装载: 原始 {Raw} 条 / 入池 {Admitted} 条 / " +
+            "超计划期剔除 {OutOfHorizon} / 禁令类型拦截 {Forbidden} / 三级链全空 {NoTime} / 其中原始ETA为空 {NullEta}",
+            context.PlanVersionId, rawFacts.Count, admitted, outOfHorizon, forbidden, noTime, admittedOnNullEta);
+
+        if (forbidden > 0)
+            _logger.LogWarning(
+                "[{PlanVersionId}] 1.5b 管道供给: {Count} 条 SupplyType 属冻结禁令（INTERPLANT_IN_TRANSIT），已拦截不入池",
+                context.PlanVersionId, forbidden);
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
-    // v5.1.2 架构变更说明：
-    // GenerateAndPersistTasksAsync 和 BulkInsertTasksAsync 方法已废弃
+    // v5.1.2 架构变更说明（**2026-10-13 按代码更正**）：
+    // `GenerateAndPersistTasksAsync` / `BulkInsertTasksAsync` **两个方法已从本文件删除**
+    //   （不是「保留待废弃」——全仓已无这两个标识符，仅本注释曾提及）。
     //
-    // 原因：Task 表的 INSERT 职责已转移至 PeggingOrchestrator（2号位）
-    //       - PeggingOrchestrator 在供需匹配阶段生成 TaskDraft 并落库
-    //       - SchedulingOrchestrator 只负责 UPDATE Task 表（填充时间/资源分配结果）
-    //       - 这样避免了重复落库，保证了 Task 与 PeggingSupplyAllocation 的事务一致性
+    // 原因：Task 表的写入职责已整体转移至 PeggingOrchestrator（2号位）
+    //       - PeggingOrchestrator 在 1号位 求解**之后**、按 `solveResult.FinalTasks` 落库；
+    //         Task 的时间 / 资源 / 数量随 INSERT **一次写入**（`PeggingOrchestrator.cs:677-683`）
+    //       - ⚠ 本文件对 `[Task]` **只有跑前幂等清理 DELETE（`:505-511`），没有任何 INSERT / UPDATE**。
+    //         原注「SchedulingOrchestrator 只负责 UPDATE Task 表（填充时间/资源分配结果）」
+    //         **与代码不符（全文件无 `UPDATE [Task]`），已删**。
+    //       - 这样避免了重复落库，保证 Task 与 PeggingSupplyAllocation 的事务一致性
     //
-    // 详见：PeggingOrchestrator.PersistDomainAndPeggingInTransactionAsync (line 238-280)
+    // 详见：`PeggingOrchestrator.PersistDomainAndPeggingInTransactionAsync`
+    //       （`LPS.APS.Application/Services/PeggingOrchestrator.cs:541`；
+    //         ⚠ 原注「line 238-280」为行号漂移，已改）
     // ═══════════════════════════════════════════════════════════════════════════
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -1075,7 +1509,9 @@ public class SchedulingOrchestrator : ISchedulingOrchestrator
         IReadOnlyList<ResourceBlock>? upstreamResourceBlocks,
         bool isCandidate,
         int? basePlanVersionId,
-        IReadOnlyList<ResourceBlock>? externalDomainResourceBlocks)
+        IReadOnlyList<ResourceBlock>? externalDomainResourceBlocks,
+        IDictionary<string, decimal>? crossDomainPhysicalConsumed = null,
+        IDictionary<string, decimal>? externalDomainInventoryOccupation = null)
     {
         var now = DateTime.Now;
         var orderIds = allOrderIds;
@@ -1098,6 +1534,10 @@ public class SchedulingOrchestrator : ISchedulingOrchestrator
                 .Distinct()
                 .ToList(),
             UpstreamResourceBlocks = upstreamResourceBlocks,
+            // R03-02：跨域物理消耗账本（FULL 逐域串行时透传；Candidate / 单域入口为 null）
+            UpstreamPhysicalConsumption = crossDomainPhysicalConsumed,
+            // R03-02：Candidate 侧跨 Run 的库存占用（聚合键；FULL / 单域入口为 null）
+            UpstreamAggregateConsumption = externalDomainInventoryOccupation,
             MaxBomDepth       = 10,
             TimeoutSeconds    = 300,
             // P0-04：Candidate 模式（sourcePlanVersionId != null）→ CANDIDATE；否则 FULL_RUN。
@@ -1153,7 +1593,7 @@ public class SchedulingOrchestrator : ISchedulingOrchestrator
         if (resourceIds.Count == 0)
             return Array.Empty<ResourceBlock>();
 
-        // VersionCategory = 'ACTIVE' 为身份口径（D7 词表：身份看 VersionCategory），Status 只表达执行进度。
+        // 口径回退（2026-10-15，B）：正式采用记在 Status='ACTIVE'（冻结 DDL 08:8723 逐字／08:4057 唯一索引谓词同列）。
         //
         // 【2026-09-29 分片】`resourceIds` = 本 Domain 的资源清单。FACTORY_FAMILY 域可覆盖到接近 `Resource` 全表量级
         //   （实测 `Resource` 共 7,768 行）⇒ 远超 2100。Dapper 把 `IN @ResourceIds` 展开成**逐个参数**，
@@ -1167,7 +1607,7 @@ public class SchedulingOrchestrator : ISchedulingOrchestrator
                 @"SELECT t.ResourceId, t.PlannedStartTime, t.PlannedEndTime, pv.DomainKey, pv.Id AS SourcePlanVersionId
                   FROM [Task] t
                   JOIN PlanVersion pv ON pv.Id = t.PlanVersionId
-                  WHERE pv.VersionCategory = 'ACTIVE'
+                  WHERE pv.Status = 'ACTIVE'
                     AND pv.Id NOT IN (@CurrentPlanVersionId, @BasePlanVersionId)
                     AND pv.DomainKey <> @CurrentDomainKey
                     AND t.ResourceId IN @ResourceIds
@@ -1219,6 +1659,72 @@ public class SchedulingOrchestrator : ISchedulingOrchestrator
         if (blockSourcePlanVersionId == currentPlanVersionId || blockSourcePlanVersionId == basePlanVersionId)
             return true;
         return false;
+    }
+
+    /// <summary>
+    /// R03-02（Candidate 侧，「甲」口径）：装载「其它 Domain 当前 ACTIVE 计划版本已在**库存**上占用的总量」。
+    ///
+    /// 与 <see cref="LoadExternalDomainResourceBlocksAsync"/> 同源同谓词（`pv.Status='ACTIVE'`、排除自身与
+    /// Base 计划版本、排除本域），只是取的是**量**不是时间窗。
+    ///
+    /// 为什么只能按 `(物料, 工厂, 类型)` 聚合、不能按批次：
+    ///   `PeggingSupplyAllocation` 没有物理键列，库存行 `SupplyWarehouseCode`/`SupplyDocumentNo` 实测全为空，
+    ///   `SupplySourceId` 跨批会变 ⇒ 跨 Run 无法把「别的域吃了哪一批」回连出来。聚合后**总量守恒**成立，
+    ///   批次归属不精确（详见 <see cref="PeggingExecutionRequest.UpstreamAggregateConsumption"/>）。
+    ///
+    /// 只装 `INVENTORY`：库存各批可用时间同为「立即可用」，聚合扣减不改可行性；采购/在途逐批时点不同，
+    /// 按聚合扣会把 A 批的占用挪到 B 批的时点上。
+    /// </summary>
+    private async Task<IDictionary<string, decimal>> LoadExternalDomainInventoryOccupationAsync(
+        string currentDomainKey,
+        int basePlanVersionId,
+        int currentPlanVersionId,
+        CancellationToken cancellationToken)
+    {
+        // 不按 resourceIds 分片：分组维度是物料×工厂×类型，参数只有 3 个标量。
+        // 行数 = 其它 ACTIVE 域的库存分配聚合组数，实测（2026-10-25）全库 ACTIVE 分配仅 16 行 / 16 组。
+        var rows = await _connectionManager.QueryAsync<ExternalDomainInventoryRow>(
+            @"SELECT pv.DomainKey,
+                     pv.Id        AS SourcePlanVersionId,
+                     a.MaterialCode,
+                     a.SupplyFactoryCode,
+                     a.SupplyType,
+                     SUM(a.AllocatedQty) AS OccupiedQty
+              FROM PeggingSupplyAllocation a
+              JOIN PlanVersion pv ON pv.Id = a.PlanVersionId
+              WHERE pv.Status = 'ACTIVE'
+                AND pv.Id NOT IN (@CurrentPlanVersionId, @BasePlanVersionId)
+                AND pv.DomainKey <> @CurrentDomainKey
+                AND a.SupplyType = N'INVENTORY'
+                AND a.AllocatedQty > 0
+              GROUP BY pv.DomainKey, pv.Id, a.MaterialCode, a.SupplyFactoryCode, a.SupplyType",
+            new
+            {
+                CurrentPlanVersionId = currentPlanVersionId,
+                BasePlanVersionId    = basePlanVersionId,
+                CurrentDomainKey     = currentDomainKey,
+            },
+            db: DatabaseId.APS);
+
+        // 双保险：SQL 已排除本域/自身版本/基线版本，此处再以纯函数兜底（与外部资源块同一判据）。
+        var occupation = new Dictionary<string, decimal>(StringComparer.Ordinal);
+        foreach (var r in rows)
+        {
+            if (IsSelfOrBaselineExternalBlock(
+                    r.DomainKey, r.SourcePlanVersionId, currentDomainKey, currentPlanVersionId, basePlanVersionId))
+                continue;
+
+            if (!Enum.TryParse<Core.Enum.SupplySourceType>(r.SupplyType, ignoreCase: true, out var sourceType))
+                continue;   // 词表外的类型不参与扣减（宁可少扣也不误扣到别的类型）
+
+            var key = PeggingOrchestrator.BuildAggregateConsumptionKey(
+                r.MaterialCode, r.SupplyFactoryCode, sourceType);
+
+            occupation.TryGetValue(key, out var current);
+            occupation[key] = current + r.OccupiedQty;
+        }
+
+        return occupation;
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -1368,6 +1874,13 @@ public class SchedulingOrchestrator : ISchedulingOrchestrator
         public bool AvailableFlag { get; set; }
     }
 
+    /// <summary>部门 → 工厂 上溯（人工能力槽只有 ProductionDepartmentId，解析工厂级日历需再上一层）。</summary>
+    private class DepartmentFactoryLoadDto
+    {
+        public int Id { get; set; }
+        public int FactoryId { get; set; }
+    }
+
     private class ManualCapacitySlotLoadDto
     {
         public int ManualSlotId { get; set; }
@@ -1392,14 +1905,8 @@ public class SchedulingOrchestrator : ISchedulingOrchestrator
         public decimal AvailableQty { get; set; }
     }
 
-    private class InTransitLoadDto
-    {
-        public string MaterialCode { get; set; } = string.Empty;
-        public int ProductFamilyId { get; set; }
-        public int FactoryId { get; set; }
-        public decimal AvailableQty { get; set; }
-        public DateTime? EstimatedArrivalTime { get; set; }
-    }
+    // 【已删除 · 2026-10-25】`InTransitLoadDto`：管道供给改走 5号位 ITimedSupplyFactLoader（RawProcurementFact），
+    //   本类原有的 `ProductFamilyId` 直取已无消费点；固定资产键的说明见 LoadPipelineSupplyAsync。
 
     private class OperationEligibilityDto
     {
@@ -1456,6 +1963,17 @@ public class SchedulingOrchestrator : ISchedulingOrchestrator
         public DateTime PlannedEndTime { get; set; }
         public string DomainKey { get; set; } = string.Empty;
         public int SourcePlanVersionId { get; set; }
+    }
+
+    /// <summary>R03-02（Candidate）：其它 ACTIVE 域在某个「物料×工厂×供给类型」上已占用的量。</summary>
+    private class ExternalDomainInventoryRow
+    {
+        public string DomainKey { get; set; } = string.Empty;
+        public int SourcePlanVersionId { get; set; }
+        public string MaterialCode { get; set; } = string.Empty;
+        public string? SupplyFactoryCode { get; set; }
+        public string SupplyType { get; set; } = string.Empty;
+        public decimal OccupiedQty { get; set; }
     }
 
     private class MESProgressLoadDto

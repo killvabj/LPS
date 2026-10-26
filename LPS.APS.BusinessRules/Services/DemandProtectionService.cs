@@ -34,7 +34,9 @@ public class DemandProtectionService
         int take = 100,
         CancellationToken ct = default)
     {
-        if (take <= 0 || take > 500) take = 100;
+        // 越界夹上限不静默回落（4号位 10-19 R2 同型扫描批修）。
+        if (take <= 0) take = 100;
+        if (take > 500) take = 500;
 
         return await _repository.QueryAsync(
             demandKey, supplyKey, lockType, status, skip, take, ct);

@@ -37,7 +37,7 @@ public class SetupRuleController : ControllerBase
     private string GetCurrentUserCode()
         => User.FindFirst(ClaimTypes.Name)?.Value ?? string.Empty;
 
-    /// <summary>统一错误映射：422 数据红线 / 404 不存在 / 400 状态红线与参数；未知异常上抛由框架处理（500）</summary>
+    /// <summary>统一错误映射：422 数据红线 / 404 不存在 / 400 状态红线与参数 / 403 业务范围越界；未知异常上抛由框架处理（500）</summary>
     private IActionResult HandleError(Exception ex, string action)
     {
         _logger.LogWarning(ex, "Setup 换型规则 {Action} 失败", action);
@@ -45,6 +45,8 @@ public class SetupRuleController : ControllerBase
         {
             SetupRuleDataRedLineException data => UnprocessableEntity(ApiResponse.Fail(422, data.Message)),
             ResourceNotFoundException missing => NotFound(ApiResponse.Fail(404, missing.Message)),
+            // 3-NEW-P1-02（0号位 再审核）：Scope 越界必须映射 403（原未知异常走 500），与 TaskSplitRuleConfigController / StageLeadTimeParamController 一致。
+            ScopeViolationException scope => StatusCode(403, ApiResponse.Fail(403, scope.Message)),
             InvalidOperationException state => BadRequest(ApiResponse.Fail(400, state.Message)),
             _ => throw ex,
         };
@@ -64,7 +66,7 @@ public class SetupRuleController : ControllerBase
 
         try
         {
-            var data = await _setupRuleService.ListAsync(ruleSetVersionId, SetupTransitionRuleType.Exact, ct);
+            var data = await _setupRuleService.ListAsync(ruleSetVersionId, SetupTransitionRuleType.Exact, GetCurrentUserId(), ct);
             return Ok(ApiResponse<IReadOnlyList<SetupRuleDto>>.Success(data));
         }
         catch (Exception ex)
@@ -137,7 +139,7 @@ public class SetupRuleController : ControllerBase
 
         try
         {
-            var data = await _setupRuleService.ListAsync(ruleSetVersionId, SetupTransitionRuleType.Default, ct);
+            var data = await _setupRuleService.ListAsync(ruleSetVersionId, SetupTransitionRuleType.Default, GetCurrentUserId(), ct);
             return Ok(ApiResponse<IReadOnlyList<SetupRuleDto>>.Success(data));
         }
         catch (Exception ex)
@@ -230,7 +232,7 @@ public class SetupRuleController : ControllerBase
 
         try
         {
-            var dto = await _setupRuleService.GetEligibilityAsync(operationCode.Trim(), materialIdValue, toMaterialIdValue, ct);
+            var dto = await _setupRuleService.GetEligibilityAsync(operationCode.Trim(), materialIdValue, toMaterialIdValue, GetCurrentUserId(), ct);
             return Ok(ApiResponse<OperationResourceEligibilityDto>.Success(dto));
         }
         catch (Exception ex)
@@ -267,7 +269,7 @@ public class SetupRuleController : ControllerBase
 
         try
         {
-            var dto = await _setupRuleService.GetDiffAsync(id, otherVersionId, ct);
+            var dto = await _setupRuleService.GetDiffAsync(id, otherVersionId, GetCurrentUserId(), ct);
             return Ok(ApiResponse<SetupDiffDto>.Success(dto));
         }
         catch (Exception ex)
@@ -296,14 +298,14 @@ public class SetupRuleController : ControllerBase
 
     #region 主数据 Code→Id 读（Setup 三 Dialog 数据源；3号位 直接读源表，红线 #4 返回列表）
 
-    /// <summary>部门下拉（masterId=Id，code=DeptCode；search 模糊 DeptCode）</summary>
+    /// <summary>部门下拉（masterId=Id，code=DeptCode；search 模糊 DeptCode；limit 默认 200，缺省行为不变）</summary>
     [Authorize(Policy = PermissionCodes.SetupView)]
     [HttpGet("lookups/departments")]
-    public async Task<IActionResult> LookupDepartments([FromQuery] string? search, CancellationToken ct)
+    public async Task<IActionResult> LookupDepartments([FromQuery] string? search, CancellationToken ct, [FromQuery] int limit = 200)
     {
         try
         {
-            var data = await _setupRuleService.LookupDepartmentsAsync(search, ct);
+            var data = await _setupRuleService.LookupDepartmentsAsync(search, limit, ct);
             return Ok(ApiResponse<IReadOnlyList<DepartmentLookupItem>>.Success(data));
         }
         catch (Exception ex)
@@ -312,14 +314,14 @@ public class SetupRuleController : ControllerBase
         }
     }
 
-    /// <summary>设备下拉（masterId=Id，code=ResourceCode；search 模糊 ResourceCode/ResourceName）</summary>
+    /// <summary>设备下拉（masterId=Id，code=ResourceCode；search 模糊 ResourceCode/ResourceName；limit 默认 200，缺省行为不变）</summary>
     [Authorize(Policy = PermissionCodes.SetupView)]
     [HttpGet("lookups/resources")]
-    public async Task<IActionResult> LookupResources([FromQuery] string? search, CancellationToken ct)
+    public async Task<IActionResult> LookupResources([FromQuery] string? search, CancellationToken ct, [FromQuery] int limit = 200)
     {
         try
         {
-            var data = await _setupRuleService.LookupResourcesAsync(search, ct);
+            var data = await _setupRuleService.LookupResourcesAsync(search, limit, ct);
             return Ok(ApiResponse<IReadOnlyList<ResourceLookupItem>>.Success(data));
         }
         catch (Exception ex)
@@ -328,14 +330,14 @@ public class SetupRuleController : ControllerBase
         }
     }
 
-    /// <summary>物料下拉（masterId=Material.Id，code=MaterialCode；search 模糊 MaterialCode/MaterialName/Spec；activeOnly=true 仅活动）</summary>
+    /// <summary>物料下拉（masterId=Material.Id，code=MaterialCode；search 模糊 MaterialCode/MaterialName/Spec；activeOnly=true 仅活动；limit 默认 200，缺省行为不变）</summary>
     [Authorize(Policy = PermissionCodes.SetupView)]
     [HttpGet("lookups/materials")]
-    public async Task<IActionResult> LookupMaterials([FromQuery] string? search, CancellationToken ct, [FromQuery] bool activeOnly = false)
+    public async Task<IActionResult> LookupMaterials([FromQuery] string? search, CancellationToken ct, [FromQuery] bool activeOnly = false, [FromQuery] int limit = 200)
     {
         try
         {
-            var data = await _setupRuleService.LookupMaterialsAsync(search, activeOnly, ct);
+            var data = await _setupRuleService.LookupMaterialsAsync(search, activeOnly, limit, ct);
             return Ok(ApiResponse<IReadOnlyList<MaterialLookupItem>>.Success(data));
         }
         catch (Exception ex)

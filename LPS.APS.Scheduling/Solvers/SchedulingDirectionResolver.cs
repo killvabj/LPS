@@ -32,19 +32,26 @@ namespace LPS.APS.Scheduling.Solvers;
 ///   · RequiredAvailableTime → <c>LogicalProductionDemand.RequiredAvailableTime</c>（Due）
 ///   · Slack → **派生量**（见 <see cref="ComputeSlackMinutes"/>），非契约字段
 ///   · Resource → <c>PreferredResourceCode</c> / <c>PreferredResourceId</c> / <c>FallbackResourceId</c>
-///   · DemandGoal → ⚠ **无载体** —— 见下方「已知缺口」
+///   · DemandGoal → <c>LogicalProductionDemand.DemandGoal</c>（2026-10-12 载体落地；1号位 R-5 接线 2026-10-13）
 ///
-/// 【已知缺口：DemandGoal 载体缺失（**不降目标，如实登记**）】
-///   冻结侧 `DemandGoal` 是**已定义**概念：规则清单 v1.5 `P-006`「V1 DemandGoal 包含
+/// 【DemandGoal 载体状态（2026-10-13 更新；原「载体缺失」缺口已关闭）】
+///   冻结侧 `DemandGoal` 是**已定义**概念：规则清单 `P-006`「V1 DemandGoal 包含
 ///   <c>CUSTOMER_COMMITMENT</c> 与 <c>INVENTORY_REPLENISHMENT</c>」（源：Pegging v1.6），
-///   且 `P-008` 要求 Pegging **传播** DemandGoal。但**全仓 grep 证实**：
-///   <c>LPS.APS.Core/Dto/LogicalProductionDemand.cs</c> **没有** DemandGoal 属性，
-///   全 C# 代码库对 `DemandGoal` / `CUSTOMER_COMMITMENT` / `INVENTORY_REPLENISHMENT` **零命中**。
-///   ⇒ 该项**不可达**，属 **2号位（Pegging 传播 Owner）的输入缺口**，**不是** 1号位 可自造字段
-///     （自造 = 造字段，且 0号位 §十 明确禁止）。
-///   处理方式：本类保留 <c>demandGoal</c> 形参（**函数参数，非契约字段**）与两条完整判据，
-///     使该上下文一旦到位即可**零改动生效**；生产路径当前传 <c>null</c>，并在信号里记
-///     <see cref="SignalDemandGoalAbsent"/> ⇒ **缺口在决策记录里可见，绝不静默**。
+///   且 `P-008` 要求 Pegging **传播** DemandGoal。
+///   历史：2026-10-08 时 <c>LogicalProductionDemand</c> **无** DemandGoal 属性，全 C# 零命中 ⇒
+///     本类按「**载体缺失**」处置（保留形参与判据、生产路径传 <c>null</c>、信号记缺口）。
+///   **现状（已变）**：该字段 **2026-10-12 已落地**（`LogicalProductionDemand.cs:243`，
+///     **正是 1号位 点名的字段**，0号位 裁决 DG-01／DG-03.4／DG-05）；2号位 已在 Pegging 侧
+///     **原样传播**（`PeggingOrchestrator.cs:2842` / `:2886`）；1号位 生产路径 **2026-10-13 已接线**
+///     为 `demandGoal: demand.DemandGoal`（R-5）。
+///   ✅ **2026-10-13 取值链已投产**（2号位 `PeggingOrchestrator.FillDemandGoalsAsync`，`:250` 调用；
+///     `LogicalProductionDemand.cs:236-241` 原「当前恒 null」段已**作废**）⇒ 判据 6 **已真正生效**：
+///     客户承诺（O 行非跨厂）走 `CUSTOMER_COMMITMENT` ⇒ **反向（交期驱动）**；P 行走
+///     `INVENTORY_REPLENISHMENT` ⇒ 正向。⇒ **Direction 自决结果自此可能由 FORWARD 变 BACKWARD**；
+///     端到端鉴别性反证见 `PhaseTwoRoutingCandidateTests.AUTO_DemandGoal非空_端到端确实改变方向`。
+///     仍缺值时（跨厂 SH 未落地／血缘无法唯一确定）记 <see cref="SignalDemandGoalAbsent"/>，**不猜**。
+///   处理方式不变：缺值 ⇒ 在信号里记 <see cref="SignalDemandGoalAbsent"/>
+///     ⇒ **缺口在决策记录里可见，绝不静默**（生产路径另经 `SolveTraceNotes` 出口，见 `PhaseTwoInitialScheduler`）。
 ///
 /// 【与 MIXED 的关系】0号位 §三：「`AUTO == MIXED` 不能再作为最终 V1 实现」；`MIXED` 本身
 ///   「可以作为人工/策略明确模式继续保留」⇒ **MIXED 保持字面语义不变**（先倒排、失败转正排），
@@ -72,7 +79,7 @@ internal static class SchedulingDirectionResolver
     internal const string SignalNoContext = "NO_CONTEXT_SIGNAL";
     internal const string SignalConflicting = "CONFLICTING_SIGNALS";
 
-    // ── DemandGoal 冻结取值（P-006；载体缺失，见类注释）──
+    // ── DemandGoal 冻结取值（P-006；载体与取值链**均已投产**，见类注释）──
     internal const string GoalCustomerCommitment = "CUSTOMER_COMMITMENT";
     internal const string GoalInventoryReplenishment = "INVENTORY_REPLENISHMENT";
 
@@ -169,7 +176,7 @@ internal static class SchedulingDirectionResolver
         // ── 判据 6：DemandGoal —— 客户承诺（交期驱动）vs 库存补充（非交期驱动）──
         if (string.IsNullOrEmpty(demandGoal))
         {
-            // 载体缺失（P-008 传播未达）：**记录缺口**，不静默、不猜。
+            // 取值缺失（**2026-10-13 起为个案缺口**：跨厂 SH 未落地／血缘无法唯一确定）：**记录缺口**，不静默、不猜。
             signals.Add(SignalDemandGoalAbsent);
         }
         else if (string.Equals(demandGoal, GoalCustomerCommitment, StringComparison.Ordinal))

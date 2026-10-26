@@ -1,42 +1,53 @@
 <script setup lang="ts">
 /**
- * APS V1 4号位 — 订单/需求计划（页面 2 / U03 / U04 / U05）
+ * APS V1 4号位 — 订单/需求计划（页面 2）
  *
- * 4号位文档第 5 节约束：
- *  - 顶部展示 5 种订单摘要状态聚合
- *  - 列表支持按 status / productFamily / factory / orderNo 模糊筛选
- *  - 行点击弹出 Drawer，展示 4 块详情：basic / pegging / tasks / reasons
- *  - ESTIMATED_ONLY 状态必须在表格+Drawer 中显著展示 ESTIMATED_BADGE_TEXT（4号位文档第 7 节 / U07）
- *  - Task 状态仅展示 5 种枚举值（4号位文档第 6 节）
- *  - U05：NetQty 与 PlannedProcessQty 不混淆
+ * 冻结依据：
+ *  - `06 v1.38 §7.2`：5号位向4号位提供「订单/需求计划」查询
+ *  - `13 v1.8 §七`：用户输出展示含「订单计划」；`§十一` 禁止页面内计算排程结果
+ *  - Order.Status 值域取「数据流向」口径：`07:3474` 的 `Order_Canonical.Status`
+ *    = `OPEN/CLOSED/CANCELLED`，`sp_SyncOrdersToPartitionTable` 原样复制进 `[Order].Status`
+ *    （`07:3611` 另有 6 值写法，与复制逻辑冲突，待 0号位 澄清；见 `types/common.ts`）
+ *  - `07:2666` DelayStatus 值域 `ON_TIME/FIRST_DELAY/REPEATED_DELAY`
+ *    （与 Status 是两个独立维度，禁止混用）
+ *
+ * 2026-10-17 按 5号位 回执整页重做（此前页面挂在一份自拟 DTO 上）：
+ *  - 列表字段按真实 `OrderListItemDto`（`id` / `quantity` / `mtS_InstructionNo` / `priority` …）
+ *  - 详情按真实 `{order, pegging, tasks}`（**没有 reasons 键**）
+ *  - 硬编码的工厂 / 产品族 / 客户下拉（`F-SUZ-01`、`INJECTION`、`CUST-001` 等）全部删除 ——
+ *    dev 实库是 `CN` / `CYL` / 中文客户名，与那份列表**零重合**，按它筛必然空
+ *  - 「风险」卡下线（`riskCount` 查的是另一张表，实测恒 0，区分不了「无风险」与「无数据」）
+ *  - 「未排」卡下线（后端 SQL 写死 `CAST(0 AS INT)`，是字面量不是查出来的数）
  *
  * 写接口：本页查询部分只读；**唯一写入口 = §10A.1「已有订单提前」**
  * （EXISTING_ORDER_ADVANCE → POST /api/governance/run/candidate，Policy aps.plan.run）
- * @see 冻结文档《4号位页面与业务操作开发实施包 v1.4》§十A（L595-672）
+ * @see 4号位实施包 v1.4 §十A
  */
 
 import { computed, onMounted, ref, watch } from 'vue'
-import dayjs from 'dayjs'
 import { storeToRefs } from 'pinia'
 import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { useOrderStore } from '@/store/modules/aps/order'
 import { useDomainStore } from '@/store/modules/aps/domain'
-import { useOverviewStore } from '@/store/modules/aps/overview'
 import { useApsAuthStore } from '@/store/modules/aps/auth'
-import { constrainOptionsByScope } from '@/store/modules/aps/scope'
 import { triggerBusinessEntry } from '@/api/aps-v1'
-import type { BusinessEntrySubmission, OrderBasicInfo } from '@/api/aps-v1'
-import DomainUnavailableBadge from './components/DomainUnavailableBadge.vue'
+import { formatUtcDateTime, formatUtcMonthDay, formatUtcMonthDayHM } from '@/utils/datetime'
+import type { BusinessEntrySubmission, OrderListItemDto } from '@/api/aps-v1'
 import OrderAdvanceDialog from './components/OrderAdvanceDialog.vue'
 import {
-  ORDER_SUMMARY_STATUS_LABELS,
-  ESTIMATED_BADGE_TEXT,
+  ORDER_STATUS_LABELS,
+  ORDER_DELAY_STATUSES,
+  ORDER_DELAY_STATUS_LABELS,
+  ORDER_STATUS_FILTER_OPTIONS,
+  PLAN_VERSION_STATUS_LABELS,
+  REASON_CODE_LABELS,
+  normalizeOrderStatus,
   type DomainKey,
-  type OrderSummaryStatus,
-  type PeggingSupplyLine,
-  type SupplyType,
-  type TaskLockMarker
+  type OrderDelayStatus,
+  type OrderStatusDisplay,
+  type ReasonCode,
+  type SupplyType
 } from '@/api/aps-v1/types'
 
 import {
@@ -54,8 +65,7 @@ import {
   ElSelect,
   ElTable,
   ElTableColumn,
-  ElTag,
-  ElTooltip
+  ElTag
 } from 'element-plus'
 
 const orderStore = useOrderStore()
@@ -67,32 +77,82 @@ const {
   listLoading,
   listError,
   summary,
+  uncalculatedCount,
   currentDetail,
   detailLoading,
   detailError,
-  query
+  versions,
+  versionsLoading,
+  planVersionId
 } = storeToRefs(orderStore)
 
 const drawerVisible = ref(false)
 
-// ===== 订单状态颜色（与 Overview 一致） =====
-const ORDER_STATUS_COLORS: Record<OrderSummaryStatus, string> = {
+// ===== 延迟状态配色（冻结 07:2666 三值；未知值走 defaultColor 降级）=====
+const DELAY_COLORS: Record<OrderDelayStatus, string> = {
   ON_TIME: '#059669',
-  AT_RISK: '#f59e0b',
-  DELAYED: '#ef4444',
-  UNSCHEDULED: '#94a3b8',
-  ESTIMATED_ONLY: '#8b5cf6'
+  FIRST_DELAY: '#ef4444',
+  REPEATED_DELAY: '#c2410c'
 }
-const ORDER_STATUS_ORDER: OrderSummaryStatus[] = [
-  'ON_TIME',
-  'AT_RISK',
-  'DELAYED',
-  'ESTIMATED_ONLY',
-  'UNSCHEDULED'
-]
+const DELAY_TAG_TYPE: Record<OrderDelayStatus, 'success' | 'danger' | 'warning'> = {
+  ON_TIME: 'success',
+  FIRST_DELAY: 'danger',
+  REPEATED_DELAY: 'warning'
+}
 
-// ===== Pegging 维度常量 =====
-const SUPPLY_LABEL: Record<SupplyType, string> = {
+/** 延迟状态未知值降级：原样显示、不做枚举校验（实库可能出现冻结词表外的值） */
+function delayLabel(raw: string | undefined): string {
+  if (!raw) return '—'
+  return ORDER_DELAY_STATUS_LABELS[raw as OrderDelayStatus] ?? raw
+}
+function delayColor(raw: string | undefined): string {
+  return DELAY_COLORS[raw as OrderDelayStatus] ?? '#94a3b8'
+}
+function delayTagType(raw: string | undefined): 'success' | 'danger' | 'warning' | 'info' {
+  return DELAY_TAG_TYPE[raw as OrderDelayStatus] ?? 'info'
+}
+
+/**
+ * 主因代码标签 —— 复用冻结 `07 v5.1.13 §八.1` 的 15 码字典，与甘特页 / CTP 页同一口径
+ * （不维护第二套自拟码表）。
+ *
+ * ⚠️ dev 2026-10-19 实测：绝大多数返回值**不在**冻结 15 码内（`BATCH_POLICY_MISSING`、中文散文等），
+ * 而冻结 07:4935 明文禁止这两类。故未入字典一律降级成「待核对·<原值>」——
+ * 摆出原值是诚实，臆造中文名才是造假（该漂移已出函 5号位，前端不替它兜底成正式码）。
+ */
+function delayReasonLabel(code: string | undefined): string {
+  if (!code) return '—'
+  return REASON_CODE_LABELS[code as ReasonCode] ?? `待核对·${code}`
+}
+/** 延期时长 → 天/小时两态（后端给的是自然小时小数；`!= null` 而非真值判断，0 与「无值」是两态） */
+function delayHoursText(hours: number | undefined): string {
+  if (hours == null) return ''
+  const abs = Math.abs(hours)
+  if (abs < 24) return `超期 ${abs.toFixed(1)} 小时`
+  return `超期 ${(abs / 24).toFixed(1)} 天`
+}
+
+/** 订单状态标签：按冻结 07:3611 六值词表渲染（实库 `Open` 归一回历史遗留 `OPEN`）；仍不认识则原样显示 */
+function statusLabel(raw: string): string {
+  const norm = normalizeOrderStatus(raw)
+  return norm ? ORDER_STATUS_LABELS[norm] : raw
+}
+const ORDER_STATUS_TAG: Record<OrderStatusDisplay, 'success' | 'info' | 'warning' | 'primary'> = {
+  NEW: 'info',
+  PLANNED: 'primary',
+  CONFIRMED: 'success',
+  IN_PROGRESS: 'success',
+  COMPLETED: 'info',
+  CANCELLED: 'warning',
+  OPEN: 'success'
+}
+function statusTagType(raw: string): 'success' | 'info' | 'warning' | 'primary' {
+  const norm = normalizeOrderStatus(raw)
+  return norm ? ORDER_STATUS_TAG[norm] : 'info'
+}
+
+// ===== Pegging 供应类型标签（冻结 07 的 9 类 SupplyType；未知值原样显示）=====
+const SUPPLY_LABELS: Record<SupplyType, string> = {
   INVENTORY: '库存',
   PI: 'PI 在制',
   PO: 'PO 在途',
@@ -103,33 +163,22 @@ const SUPPLY_LABEL: Record<SupplyType, string> = {
   PLANNED_PRODUCTION: '计划生产',
   PLANNING_PURCHASE_PLACEHOLDER: '采购估算（占位）'
 }
+const supplyLabel = (raw: string | undefined): string =>
+  raw ? (SUPPLY_LABELS[raw as SupplyType] ?? raw) : '—'
 
-const FACT_TAG_TYPE: Record<
-  PeggingSupplyLine['factType'],
-  'success' | 'warning' | 'info' | 'primary'
-> = {
-  FACT: 'success',
-  RESULT: 'primary',
-  ESTIMATED: 'warning',
-  RECOMMENDATION: 'info'
+/** 任务状态：冻结 TASK_STATUSES 5 态（common.ts），未知值原样显示 */
+const TASK_STATUS_LABELS: Record<string, string> = {
+  PLANNED: '已排产',
+  RELEASED: '已释放',
+  IN_PROGRESS: '执行中',
+  COMPLETED: '已完成',
+  CANCELLED: '已取消'
 }
 
-/** 锁定标记（4号位文档第 6 节：EXECUTION / FIRM / FROZEN） */
-const LOCK_LABEL: Record<TaskLockMarker, string> = {
-  EXECUTION: '执行锁定',
-  FIRM: '已确认',
-  FROZEN: '冻结'
-}
-const LOCK_TAG_TYPE: Record<TaskLockMarker, 'danger' | 'warning' | 'info'> = {
-  EXECUTION: 'danger',
-  FIRM: 'warning',
-  FROZEN: 'info'
-}
-
-/** Domain 选项（v1.2 Domain专项：从 useDomainStore.activeDomains 派生，含 ALL）
- *  U41：按 apsAuth.dataScope.domainKeys 收敛——非空(受限)时仅含授权 Domain，空(global)时全量 */
-const domainStore = useDomainStore()
 const apsAuth = useApsAuthStore()
+const domainStore = useDomainStore()
+
+/** Domain 选项：从真实 domainStore 派生（非 mock 时即后端 Domain 列表），U41 按 dataScope 收敛 */
 const DOMAIN_OPTIONS = computed<Array<{ value: DomainKey | 'ALL'; label: string }>>(() => {
   const all = domainStore.activeDomains.map((d) => ({ value: d.domainKey, label: d.domainName }))
   const allowed = apsAuth.dataScope.domainKeys as readonly string[]
@@ -137,153 +186,129 @@ const DOMAIN_OPTIONS = computed<Array<{ value: DomainKey | 'ALL'; label: string 
   return [{ value: 'ALL' as const, label: '全部' }, ...list]
 })
 
-/** U41：Factory / ProductFamily 筛选下拉
- *  baseline = global 用户全量；受限用户由 constrainOptionsByScope 收敛到 dataScope 白名单。
- *  （冻结 v1.4 L1463：不允许选择未授权 Factory/ProductFamily/Domain） */
-const FACTORY_BASE = [
-  { value: 'F-SUZ-01', label: '苏州厂 F-SUZ-01' },
-  { value: 'F-CDG-02', label: '成都厂 F-CDG-02' },
-  { value: 'F-BJ-01', label: '北京厂 F-BJ-01' }
-]
-const PRODUCT_FAMILY_BASE = [
-  { value: 'INJECTION', label: '注塑 (INJECTION)' },
-  { value: 'ASSEMBLY', label: '装配 (ASSEMBLY)' },
-  { value: 'TEST', label: '测试 (TEST)' }
-]
-const FACTORY_OPTIONS = computed(() =>
-  constrainOptionsByScope(FACTORY_BASE, apsAuth.dataScope.factoryCodes)
+// ===== 筛选输入（全部对应后端真实 Query 参数）=====
+const orderNoInput = ref('')
+const piInput = ref('')
+const materialInput = ref('')
+/** 客户：无 distinct 端点，且后端是 `CustomerName LIKE %x%` ⇒ 自由文本，不造下拉选项 */
+const customerNameInput = ref('')
+/** 工厂 / 产品族：后端是**精确匹配**（`f.Code =` / `pf.Code =`），无 distinct 端点 ⇒ 自由文本 */
+const factoryCodeInput = ref('')
+const productFamilyInput = ref('')
+const dueDateRange = ref<[string, string] | undefined>()
+const domainCode = ref<string | undefined>()
+const delayStatusInput = ref<OrderDelayStatus | undefined>()
+const statusInput = ref<OrderStatusDisplay | undefined>()
+
+watch(
+  [orderNoInput, piInput, materialInput, customerNameInput, factoryCodeInput, productFamilyInput],
+  () => {
+    orderStore.setFilter({
+      orderNo: orderNoInput.value || undefined,
+      productionInstructionNo: piInput.value || undefined,
+      materialCode: materialInput.value || undefined,
+      customerName: customerNameInput.value || undefined,
+      factoryCode: factoryCodeInput.value || undefined,
+      productFamilyCode: productFamilyInput.value || undefined
+    })
+    void orderStore.loadList(true)
+  }
 )
-const PRODUCT_FAMILY_OPTIONS = computed(() =>
-  constrainOptionsByScope(PRODUCT_FAMILY_BASE, apsAuth.dataScope.productFamilyCodes)
-)
 
-/** 客户下拉（4号位文档第 5 节：客户维度过滤） */
-const CUSTOMER_OPTIONS = [
-  { value: 'CUST-001', label: '示例客户-华东' },
-  { value: 'CUST-002', label: '示例客户-华南' },
-  { value: 'CUST-003', label: '示例客户-华北' },
-  { value: 'CUST-004', label: '示例客户-海外' },
-  { value: 'CUST-005', label: '示例客户-西南' }
-]
-
-// ===== KPI 卡片（5 种订单状态） =====
-const summaryItems = computed(() => {
-  const items = summary.value ?? []
-  const map = new Map(items.map((it) => [it.status, it.count]))
-  return ORDER_STATUS_ORDER.map((status) => ({
-    status,
-    label: ORDER_SUMMARY_STATUS_LABELS[status],
-    count: map.get(status) ?? 0,
-    color: ORDER_STATUS_COLORS[status]
-  }))
-})
-const totalOrders = computed(() => summaryItems.value.reduce((s, i) => s + i.count, 0))
-
-// ===== KPI 单击直接套用为表格过滤 =====
-const activeStatusFilter = computed<OrderSummaryStatus | undefined>(() => query.value.delayStatus)
-
-function applyStatusFilter(status?: OrderSummaryStatus): void {
-  orderStore.setFilter({ delayStatus: status })
-  orderStore.loadList(true)
-}
-
-function clearAllFilters(): void {
-  orderStore.clearFilter()
-  orderStore.loadList(true)
-}
-
-// ===== 表格：搜索 / 工厂 / 产品族 =====
-const searchInput = ref(query.value.orderNo ?? '')
-const piInput = ref(query.value.productionInstructionNo ?? '')
-const materialInput = ref(query.value.materialCode ?? '')
-const customerCode = ref<string | undefined>(query.value.customerCode)
-const dueDateRange = ref<[string, string] | undefined>(
-  query.value.dueDateFrom && query.value.dueDateTo
-    ? [query.value.dueDateFrom, query.value.dueDateTo]
-    : undefined
-)
-const planVersionInput = ref(query.value.planVersionId ? String(query.value.planVersionId) : '')
-const domainCode = ref<string | undefined>(query.value.domainKey)
-
-/**
- * 必填 planVersionId（5号位 2026-09-23《order-query 分页契约修正回执》§一）
- *  - 后端 OrderQueryController.QueryOrders 签名 `[FromQuery] int planVersionId` 非空、无默认值 = 必填
- *  - UI 输入框标 required（红框拦截）
- *  - 默认值：onMounted 从 overviewApi.getOverview().activeVersions[0].planVersionId 取
- *  - store 层校验兜底（缺 planVersionId 时 loadList 不发请求）
- */
-const planVersionInputRequired = computed<boolean>(() => {
-  const num = Number(planVersionInput.value)
-  return !planVersionInput.value || !Number.isFinite(num) || num <= 0
-})
-
-watch(searchInput, (v) => {
-  orderStore.setFilter({ orderNo: v || undefined })
-})
-watch(piInput, (v) => {
-  orderStore.setFilter({ productionInstructionNo: v || undefined })
-})
-watch(materialInput, (v) => {
-  orderStore.setFilter({ materialCode: v || undefined })
-})
-watch(planVersionInput, (v) => {
-  const num = Number(v)
-  orderStore.setFilter({
-    planVersionId: v && Number.isFinite(num) && num > 0 ? num : undefined
-  })
-})
-
-function onCustomerChange(v: string): void {
-  customerCode.value = v || undefined
-  orderStore.setFilter({ customerCode: v || undefined })
-  orderStore.loadList(true)
-}
 function onDueRangeChange(v: [string, string] | null | undefined): void {
   dueDateRange.value = v ?? undefined
-  orderStore.setFilter({
-    dueDateFrom: v?.[0],
-    dueDateTo: v?.[1]
-  })
-  orderStore.loadList(true)
+  orderStore.setFilter({ dueDateFrom: v?.[0], dueDateTo: v?.[1] })
+  void orderStore.loadList(true)
 }
+
 function onDomainChange(v: string): void {
   const val = v && v !== 'ALL' ? v : undefined
   domainCode.value = val
   orderStore.setFilter({ domainKey: val })
-  orderStore.loadList(true)
+  void orderStore.loadList(true)
 }
 
-function onSearchSubmit(): void {
-  // 必填 planVersionId（5号位 2026-09-23 回执）：用户主动提交时校验
-  if (planVersionInputRequired.value) {
-    ElMessage.warning(
-      'PlanVersionId 必填（订单按 PlanVersion 分区），请输入有效数字或等待总览自动填充'
-    )
-    return
-  }
-  orderStore.loadList(true)
+function onDelayStatusChange(v: OrderDelayStatus | undefined): void {
+  delayStatusInput.value = v
+  orderStore.setFilter({ delayStatus: v })
+  void orderStore.loadList(true)
 }
+
+function onStatusChange(v: OrderStatusDisplay | undefined): void {
+  statusInput.value = v
+  orderStore.setFilter({ status: v })
+  void orderStore.loadList(true)
+}
+
+function onVersionChange(v: number): void {
+  void orderStore.setPlanVersion(v)
+}
+
 function onResetSearch(): void {
-  searchInput.value = ''
+  orderNoInput.value = ''
   piInput.value = ''
   materialInput.value = ''
-  customerCode.value = undefined
+  customerNameInput.value = ''
+  factoryCodeInput.value = ''
+  productFamilyInput.value = ''
   dueDateRange.value = undefined
-  // 必填 planVersionId：重置时回到默认兜底（不空），避免后续查询触发 400
-  const fallbackId = orderStore.defaultPlanVersionId
-  planVersionInput.value = fallbackId !== null ? String(fallbackId) : ''
   domainCode.value = undefined
-  clearAllFilters()
+  delayStatusInput.value = undefined
+  statusInput.value = undefined
+  orderStore.clearFilter()
+  void orderStore.loadList(true)
 }
+
+// ===== 版本下拉标签 =====
+function versionLabel(id: number): string {
+  const v = versions.value.find((x) => x.id === id)
+  return v ? `${v.versionCode}（${PLAN_VERSION_STATUS_LABELS[v.status] ?? v.status}）` : String(id)
+}
+
+/** 顶部版本摘要（真实版本的时间窗 / 状态），别让用户对着一串裸 id 猜 */
+const currentVersionLabel = computed(() => {
+  const v = orderStore.currentVersion
+  if (!v) return ''
+  const s =
+    v.planHorizonStart && v.planHorizonEnd
+      ? ` ｜ 时间窗 ${formatUtcMonthDay(v.planHorizonStart)} ~ ${formatUtcMonthDay(v.planHorizonEnd)}`
+      : ''
+  return `${v.domainKey ?? ''} ｜ 版本 #${v.id}${s}`
+})
+
+// ===== KPI（全部取 /api/order-query/summary 的服务端聚合）=====
+const totalCount = computed(() => summary.value?.totalCount ?? null)
+const kpis = computed(() => {
+  const s = summary.value
+  if (!s) return []
+  const items = [
+    { key: 'total', label: '订单总数', value: s.totalCount, color: '#334155' },
+    { key: 'ontime', label: '未延迟', value: s.onTimeCount, color: DELAY_COLORS.ON_TIME },
+    { key: 'delayed', label: '延迟', value: s.delayedCount, color: DELAY_COLORS.FIRST_DELAY }
+  ]
+  // 「未计算」= DelayStatus 为 NULL 的行。2026-10-17 起全表已回填（NULL=0），
+  // 常驻一张 0 卡片只是噪音 ⇒ 只有真的存在未计算行时才显示（既暴露问题，也不天天摆 0）。
+  if (uncalculatedCount.value > 0) {
+    items.push({
+      key: 'unknown',
+      label: '未计算',
+      value: uncalculatedCount.value,
+      color: '#94a3b8'
+    })
+  }
+  return items
+})
+const kpiRatio = (v: number): number =>
+  totalCount.value && totalCount.value > 0 ? Math.round((v / totalCount.value) * 100) : 0
 
 // ===== 页码 =====
 function onPageChange(p: number): void {
   orderStore.setPage({ pageIndex: p })
-  orderStore.loadList()
+  void orderStore.loadList()
 }
 function onSizeChange(s: number): void {
   orderStore.setPage({ pageIndex: 1, pageSize: s })
-  orderStore.loadList()
+  void orderStore.loadList()
 }
 
 // ===== 行点击：打开抽屉 =====
@@ -294,52 +319,42 @@ async function openDetail(orderId: number): Promise<void> {
 function closeDetail(): void {
   drawerVisible.value = false
 }
-
-/** 多选列点击不打开抽屉（避免勾选即弹详情） */
-function onRowClick(row: OrderBasicInfo, column?: { type?: string }): void {
+function onRowClick(row: OrderListItemDto, column?: { type?: string }): void {
   if (column?.type === 'selection') return
-  void openDetail(row.orderId)
+  void openDetail(row.id)
 }
 
-/* ===== §10A.1 已有订单提前（EXISTING_ORDER_ADVANCE） =====
- * 冻结文档《APS_V1_4号位页面与业务操作开发实施包 v1.4》§十A（L595-672）：
- * 本页提供 5 个独立中文业务入口中的 1 个；无"万能局部调整"入口。
- * 契约：LOCAL_RESCHEDULE × MANUAL_ADJUSTMENT；PriorityMode 可选 NORMAL/EXPEDITE；
- *       载荷 orderTargets[]{ orderCanonicalId, manualTargetDueDate }
- * 端点权限码：aps.plan.run（与 Gantt 侧 4 入口同一码）
- */
+// ===== §10A.1 已有订单提前（EXISTING_ORDER_ADVANCE）=====
 const router = useRouter()
 const canPlanRun = computed(() => apsAuth.has('aps.plan.run'))
 
 const advanceVisible = ref(false)
 const advanceSubmitting = ref(false)
-const selectedOrders = ref<OrderBasicInfo[]>([])
+const selectedOrders = ref<OrderListItemDto[]>([])
 const tableRef = ref<InstanceType<typeof ElTable> | null>(null)
 
-/** Dialog 候选行（仅取所需字段；OrderCanonicalId 自动带入由 Dialog watch 处理） */
+/** Dialog 候选行（仅取所需字段；orderCanonicalId 自动带入由 Dialog watch 处理） */
 const advanceCandidates = computed(() =>
   list.value.map((o) => ({
-    orderId: o.orderId,
+    orderId: o.id,
     orderNo: o.orderNo,
-    orderCanonicalId: o.orderCanonicalId, // B4 已落地（B4 SQL 补列）；Dialog 自动带入
+    orderCanonicalId: o.orderCanonicalId,
     materialCode: o.materialCode,
     customerName: o.customerName,
     customerDueDate: o.customerDueDate
   }))
 )
 
-/** Dialog Domain 选项（剔除"全部"；已按 U41 dataScope 收敛） */
 const advanceDomainOptions = computed<DomainKey[]>(() =>
   DOMAIN_OPTIONS.value.filter((o) => o.value !== 'ALL').map((o) => o.value as DomainKey)
 )
 
-/** Dialog 默认 Domain：当前筛选 Domain，否则首个授权 Domain */
 const advanceDefaultDomain = computed<DomainKey | undefined>(() => {
   if (domainCode.value) return domainCode.value
   return advanceDomainOptions.value[0]
 })
 
-function onOrderSelectionChange(rows: OrderBasicInfo[]): void {
+function onOrderSelectionChange(rows: OrderListItemDto[]): void {
   selectedOrders.value = rows
 }
 
@@ -381,62 +396,44 @@ async function submitOrderAdvance(payload: BusinessEntrySubmission): Promise<voi
   }
 }
 
-// ===== 工具：截止日期显示 =====
+/** 交期显示（后端 DateTime 无时区后缀 → 按 UTC 解析，见 utils/datetime） */
 function fmtDue(due: string): string {
-  const dueMs = new Date(due).getTime()
-  const nowMs = Date.now()
-  const days = Math.round((dueMs - nowMs) / 86400000)
-  if (days >= 0) return `${dayjs(due).format('MM-DD')}（剩 ${days} 天）`
-  return `${dayjs(due).format('MM-DD')}（已过 ${-days} 天）`
+  const dueMs = new Date(`${due}Z`).getTime()
+  if (Number.isNaN(dueMs)) return due
+  const days = Math.round((dueMs - Date.now()) / 86400000)
+  const text = formatUtcMonthDay(due)
+  return days >= 0 ? `${text}（剩 ${days} 天）` : `${text}（已过 ${-days} 天）`
 }
+const isOverdue = (due: string): boolean => new Date(`${due}Z`).getTime() < Date.now()
 
-// 详情里 Pegging 列表是否含有"估算占位"行
-const peggingHasEstimated = computed(() =>
-  (currentDetail.value?.pegging ?? []).some((p) => p.factType === 'ESTIMATED')
-)
-
-// 详情里 reasons 列表
-const REASON_LABELS: Record<string, string> = {
-  MATERIAL_SHORTAGE: '物料短缺',
-  CAPACITY_INSUFFICIENT: '产能不足',
-  PREDECESSOR_DELAY: '前序延迟',
-  FIRM_FROZEN: '固化冻结',
-  CROSS_DOMAIN_BLOCK: '跨域阻断',
-  PURCHASE_ESTIMATED_RISK: '采购估算风险',
-  OTHER: '其他'
-}
+const detailOrder = computed(() => currentDetail.value?.order ?? null)
+const detailPegging = computed(() => currentDetail.value?.pegging ?? [])
+const detailTasks = computed(() => currentDetail.value?.tasks ?? [])
 
 // ===== 加载入口 =====
-// 必填 planVersionId（5号位 2026-09-23 回执）：onMounted 先取 active-plan 兜底值，再触发列表 + summary
-const overviewStore = useOverviewStore()
 onMounted(async () => {
-  // 1) 取排产总览 → 默认 PlanVersionId（activeVersions[0]）
-  await overviewStore.load().catch(() => {
-    /* 静默：loadList 校验会兜底提示 */
-  })
-  const activeVersions = overviewStore.data?.activeVersions ?? []
-  const fallbackId = activeVersions.length > 0 ? activeVersions[0].planVersionId : null
-  orderStore.setDefaultPlanVersionId(fallbackId)
-  // 2) 同步到 UI 输入框（仅当用户未手填）
-  if (!planVersionInput.value && fallbackId !== null) {
-    planVersionInput.value = String(fallbackId)
-  }
-  // 3) 触发列表 + summary
-  await Promise.all([orderStore.loadList(), orderStore.loadSummary()])
+  await orderStore.loadVersions()
+  await orderStore.refresh(true)
 })
 </script>
 
 <template>
   <div class="aps-order">
-    <!-- ===== 顶部 ===== -->
-    <div class="page-header">
-      <div>
-        <h2 class="page-title">订单 / 需求计划</h2>
-        <p class="page-sub">按订单检索排产详情，支持打开 Pegging / 任务 / 原因</p>
+    <!-- ===== 版本选择 + 写入口 ===== -->
+    <div class="toolbar">
+      <ElSelect
+        :model-value="planVersionId ?? undefined"
+        placeholder="选择计划版本"
+        class="version-select"
+        filterable
+        :loading="versionsLoading"
+        @change="onVersionChange"
+      >
+        <ElOption v-for="v in versions" :key="v.id" :label="versionLabel(v.id)" :value="v.id" />
+      </ElSelect>
+      <div class="toolbar-meta">
+        <span v-if="currentVersionLabel" class="muted">{{ currentVersionLabel }}</span>
       </div>
-      <ElButton :loading="listLoading" @click="orderStore.loadList()">
-        <Icon icon="vi-ep:refresh" /> 刷新
-      </ElButton>
       <!-- §10A.1 已有订单提前：5 个独立中文业务入口中的本页唯一入口 -->
       <ElButton
         type="warning"
@@ -459,80 +456,39 @@ onMounted(async () => {
       :title="`加载失败：${listError}`"
     />
 
-    <!-- ===== KPI 卡片 ===== -->
-    <div class="kpi-row">
-      <div
-        v-for="item in summaryItems"
-        :key="item.status"
-        class="kpi-card"
-        :class="{ active: activeStatusFilter === item.status }"
-        :style="{ borderTopColor: item.color }"
-        @click="applyStatusFilter(activeStatusFilter === item.status ? undefined : item.status)"
-      >
-        <div class="kpi-label">{{ item.label }}</div>
-        <div class="kpi-value" :style="{ color: item.color }">{{ item.count }}</div>
-        <div class="kpi-ratio">
-          {{ totalOrders > 0 ? Math.round((item.count / totalOrders) * 100) : 0 }}%
-          <span v-if="activeStatusFilter === item.status" class="active-tip">已选中</span>
-        </div>
-      </div>
-      <div class="kpi-card total">
-        <div class="kpi-label">订单合计</div>
-        <div class="kpi-value">{{ totalOrders }}</div>
-        <div class="kpi-ratio">
-          <a
-            v-if="activeStatusFilter"
-            href="javascript:;"
-            @click.stop="applyStatusFilter(undefined)"
-            >清空筛选</a
-          >
-          <span v-else>5 类汇总</span>
-        </div>
+    <!-- ===== KPI（取 /summary 服务端聚合；取不到整块空态）===== -->
+    <div v-if="kpis.length" class="kpi-row">
+      <div v-for="k in kpis" :key="k.key" class="kpi-card" :style="{ borderTopColor: k.color }">
+        <div class="kpi-label">{{ k.label }}</div>
+        <div class="kpi-value" :style="{ color: k.color }">{{ k.value }}</div>
+        <div class="kpi-ratio">{{ kpiRatio(k.value) }}%</div>
       </div>
     </div>
 
     <!-- ===== 过滤栏 ===== -->
     <ElCard class="filter-bar">
       <div class="filter-row">
+        <ElInput v-model="orderNoInput" placeholder="订单号" clearable class="filter-sm" />
+        <ElInput v-model="piInput" placeholder="MTS 生产指令号" clearable class="filter-sm" />
+        <ElInput v-model="materialInput" placeholder="物料编码" clearable class="filter-sm" />
         <ElInput
-          v-model="searchInput"
-          placeholder="订单号 ORD-2026-0001"
+          v-model="customerNameInput"
+          placeholder="客户名称（模糊）"
           clearable
-          class="filter-search"
-          @keyup.enter="onSearchSubmit"
-        >
-          <template #prefix>
-            <Icon icon="vi-ep:search" />
-          </template>
-        </ElInput>
-        <ElInput
-          v-model="piInput"
-          placeholder="生产指令 PI-00001"
-          clearable
-          class="filter-search-sm"
-          @keyup.enter="onSearchSubmit"
+          class="filter-sm"
         />
         <ElInput
-          v-model="materialInput"
-          placeholder="物料 M-001"
+          v-model="factoryCodeInput"
+          placeholder="工厂编码（精确）"
           clearable
-          class="filter-search-sm"
-          @keyup.enter="onSearchSubmit"
+          class="filter-sm"
         />
-        <ElSelect
-          :model-value="customerCode"
-          placeholder="客户"
+        <ElInput
+          v-model="productFamilyInput"
+          placeholder="产品族编码（精确）"
           clearable
-          class="filter-select"
-          @change="onCustomerChange"
-        >
-          <ElOption
-            v-for="c in CUSTOMER_OPTIONS"
-            :key="c.value"
-            :label="c.label"
-            :value="c.value"
-          />
-        </ElSelect>
+          class="filter-sm"
+        />
         <ElDatePicker
           v-model="dueDateRange"
           type="daterange"
@@ -543,64 +499,42 @@ onMounted(async () => {
           class="filter-date"
           @change="onDueRangeChange"
         />
-        <ElInput
-          v-model="planVersionInput"
-          placeholder="计划版本 ID（必填，自动取自总览）"
-          clearable
-          class="filter-search-sm"
-          :class="{ 'filter-search-sm-required': planVersionInputRequired }"
-          @keyup.enter="onSearchSubmit"
-        >
-          <template #prefix>
-            <span class="required-mark" title="必填">*</span>
-          </template>
-        </ElInput>
         <ElSelect
-          :model-value="query.domainKey ?? domainCode ?? 'ALL'"
-          placeholder="排程域"
+          :model-value="delayStatusInput"
+          placeholder="延迟状态"
           clearable
+          class="filter-select-sm"
+          @change="onDelayStatusChange"
+        >
+          <ElOption
+            v-for="d in ORDER_DELAY_STATUSES"
+            :key="d"
+            :label="ORDER_DELAY_STATUS_LABELS[d]"
+            :value="d"
+          />
+        </ElSelect>
+        <ElSelect
+          :model-value="statusInput"
+          placeholder="订单状态"
+          clearable
+          class="filter-select-sm"
+          @change="onStatusChange"
+        >
+          <ElOption
+            v-for="s in ORDER_STATUS_FILTER_OPTIONS"
+            :key="s"
+            :label="ORDER_STATUS_LABELS[s]"
+            :value="s"
+          />
+        </ElSelect>
+        <ElSelect
+          :model-value="domainCode ?? 'ALL'"
+          placeholder="排程域"
           class="filter-select-sm"
           @change="onDomainChange"
         >
           <ElOption v-for="d in DOMAIN_OPTIONS" :key="d.value" :label="d.label" :value="d.value" />
         </ElSelect>
-        <DomainUnavailableBadge />
-        <ElSelect
-          :model-value="query.productFamilyCode"
-          placeholder="产品族"
-          clearable
-          class="filter-select-sm"
-          @change="
-            (v: string) => {
-              orderStore.setFilter({ productFamilyCode: v || undefined })
-              orderStore.loadList(true)
-            }
-          "
-        >
-          <ElOption
-            v-for="p in PRODUCT_FAMILY_OPTIONS"
-            :key="p.value"
-            :label="p.label"
-            :value="p.value"
-          />
-        </ElSelect>
-        <ElSelect
-          :model-value="query.factoryCode"
-          placeholder="工厂"
-          clearable
-          class="filter-select-sm"
-          @change="
-            (v: string) => {
-              orderStore.setFilter({ factoryCode: v || undefined })
-              orderStore.loadList(true)
-            }
-          "
-        >
-          <ElOption v-for="f in FACTORY_OPTIONS" :key="f.value" :label="f.label" :value="f.value" />
-        </ElSelect>
-        <ElButton type="primary" :disabled="planVersionInputRequired" @click="onSearchSubmit">
-          <Icon icon="vi-ep:search" /> 查询
-        </ElButton>
         <ElButton @click="onResetSearch">重置</ElButton>
       </div>
     </ElCard>
@@ -619,80 +553,77 @@ onMounted(async () => {
         :data="list"
         stripe
         size="small"
-        row-key="orderId"
+        row-key="id"
         empty-text="暂无订单"
         @row-click="onRowClick"
         @selection-change="onOrderSelectionChange"
       >
         <ElTableColumn type="selection" width="44" :selectable="() => canPlanRun" />
-        <ElTableColumn prop="orderNo" label="订单号" min-width="170" />
-        <ElTableColumn prop="materialCode" label="物料" min-width="160">
+        <ElTableColumn prop="orderNo" label="订单号" min-width="130" show-overflow-tooltip />
+        <ElTableColumn prop="mtS_InstructionNo" label="MTS 指令号" width="110" />
+        <ElTableColumn prop="materialCode" label="物料编码" min-width="160" show-overflow-tooltip />
+        <ElTableColumn label="客户" min-width="130" show-overflow-tooltip>
           <template #default="{ row }">
-            <span>{{ row.materialCode }}</span>
-            <span class="muted"> / {{ row.materialName }}</span>
+            <span v-if="row.customerName">{{ row.customerName }}</span>
+            <span v-else class="muted">—</span>
           </template>
         </ElTableColumn>
-        <ElTableColumn prop="customerName" label="客户" min-width="130" />
-        <ElTableColumn prop="factoryCode" label="工厂" min-width="120" />
-        <ElTableColumn prop="productFamilyCode" label="族" width="100" />
-        <ElTableColumn prop="orderQty" label="数量" width="100" align="right">
+        <ElTableColumn prop="productFamilyCode" label="产品族" width="90" />
+        <ElTableColumn prop="factoryCode" label="工厂" width="80" />
+        <ElTableColumn prop="quantity" label="数量" width="100" align="right">
           <template #default="{ row }">
-            <span>{{ row.orderQty }}</span>
+            <span>{{ row.quantity }}</span>
             <span class="muted"> {{ row.uom }}</span>
           </template>
         </ElTableColumn>
-        <ElTableColumn label="交期" width="160">
+        <ElTableColumn label="客户交期" width="150">
           <template #default="{ row }">
-            <span :class="{ overdue: new Date(row.customerDueDate).getTime() < Date.now() }">
+            <span :class="{ overdue: isOverdue(row.customerDueDate) }">
               {{ fmtDue(row.customerDueDate) }}
             </span>
           </template>
         </ElTableColumn>
-        <ElTableColumn prop="prioritySegmentCode" label="优先级" width="80" align="center">
+        <ElTableColumn prop="priority" label="优先级" width="80" align="right" />
+        <ElTableColumn label="订单状态" width="90" align="center">
           <template #default="{ row }">
-            <ElTag
-              size="small"
-              :type="
-                row.prioritySegmentCode === 'P1'
-                  ? 'danger'
-                  : row.prioritySegmentCode === 'P2'
-                    ? 'warning'
-                    : 'info'
-              "
-            >
-              {{ row.prioritySegmentCode }}
-            </ElTag>
+            <ElTag size="small" :type="statusTagType(row.status)">{{
+              statusLabel(row.status)
+            }}</ElTag>
           </template>
         </ElTableColumn>
-        <ElTableColumn label="状态" width="160">
+        <ElTableColumn label="延迟状态" width="100" align="center">
           <template #default="{ row }">
             <ElTag
               size="small"
               effect="light"
+              :type="delayTagType(row.delayStatus)"
               :style="{
-                background: ORDER_STATUS_COLORS[row.status as OrderSummaryStatus],
+                background: delayColor(row.delayStatus),
                 color: '#fff',
-                borderColor: ORDER_STATUS_COLORS[row.status as OrderSummaryStatus]
+                borderColor: delayColor(row.delayStatus)
               }"
             >
-              {{ ORDER_SUMMARY_STATUS_LABELS[row.status as OrderSummaryStatus] }}
+              {{ delayLabel(row.delayStatus) }}
             </ElTag>
-            <ElTooltip
-              v-if="row.status === 'ESTIMATED_ONLY'"
-              :content="ESTIMATED_BADGE_TEXT"
-              placement="top"
-            >
-              <Icon class="est-icon" icon="vi-mdi:alert-decagram" />
-            </ElTooltip>
+            <div v-if="delayHoursText(row.delayHours)" class="muted delay-hours">
+              {{ delayHoursText(row.delayHours) }}
+            </div>
           </template>
         </ElTableColumn>
-        <ElTableColumn label="操作" width="80" align="center" fixed="right">
+        <ElTableColumn label="延期原因" width="180" show-overflow-tooltip>
           <template #default="{ row }">
-            <a href="javascript:;" @click.stop="openDetail(row.orderId)">详情</a>
+            <span :class="{ 'reason-unchecked': !!row.primaryReasonCode }">
+              {{ delayReasonLabel(row.primaryReasonCode) }}
+            </span>
+          </template>
+        </ElTableColumn>
+        <ElTableColumn label="操作" width="70" align="center" fixed="right">
+          <template #default="{ row }">
+            <a href="javascript:;" @click.stop="openDetail(row.id)">详情</a>
           </template>
         </ElTableColumn>
         <template #empty>
-          <ElEmpty description="暂无订单" />
+          <ElEmpty description="该计划版本下没有订单" />
         </template>
       </ElTable>
       <div class="pager-row">
@@ -700,7 +631,7 @@ onMounted(async () => {
           v-model:current-page="pageIndex"
           v-model:page-size="pageSize"
           :total="listTotal"
-          :page-sizes="[10, 20, 50]"
+          :page-sizes="[20, 50, 100, 200]"
           layout="total, sizes, prev, pager, next, jumper"
           background
           @current-change="onPageChange"
@@ -710,279 +641,196 @@ onMounted(async () => {
     </ElCard>
 
     <!-- ===== 详情 Drawer ===== -->
-    <ElDrawer
-      v-model="drawerVisible"
-      size="540px"
-      direction="rtl"
-      :destroy-on-close="false"
-      @close="closeDetail"
-    >
+    <ElDrawer v-model="drawerVisible" size="620px" direction="rtl" @close="closeDetail">
       <template #header>
         <div class="drawer-head">
           <span class="drawer-title">订单详情</span>
-          <span v-if="currentDetail" class="drawer-sub">
-            {{ currentDetail.basic.orderNo }}
-          </span>
+          <span v-if="detailOrder" class="drawer-sub">{{ detailOrder.orderNo }}</span>
         </div>
       </template>
-      <template v-if="currentDetail">
-        <ElAlert
-          v-if="peggingHasEstimated"
-          type="warning"
-          :closable="false"
-          show-icon
-          class="drawer-est-alert"
-          :title="ESTIMATED_BADGE_TEXT"
-        />
 
-        <!-- ===== basic ===== -->
+      <div v-if="detailLoading" class="drawer-loading"></div>
+
+      <template v-else-if="detailOrder">
+        <!-- ===== 订单基本信息 ===== -->
         <div class="detail-section">
           <h4 class="section-title">基本信息</h4>
           <ElDescriptions :column="2" size="small" border>
-            <ElDescriptionsItem label="订单号">{{
-              currentDetail.basic.orderNo
-            }}</ElDescriptionsItem>
-            <ElDescriptionsItem label="生产指令">{{
-              currentDetail.basic.productionInstructionNo
-            }}</ElDescriptionsItem>
-            <ElDescriptionsItem label="物料">
-              {{ currentDetail.basic.materialCode }} / {{ currentDetail.basic.materialName }}
+            <ElDescriptionsItem label="订单号">{{ detailOrder.orderNo }}</ElDescriptionsItem>
+            <ElDescriptionsItem label="MTS 指令号">
+              {{ detailOrder.mtS_InstructionNo ?? '—' }}
+            </ElDescriptionsItem>
+            <ElDescriptionsItem label="物料编码">
+              {{ detailOrder.materialCode }}
             </ElDescriptionsItem>
             <ElDescriptionsItem label="客户">
-              {{ currentDetail.basic.customerName }}
+              {{ detailOrder.customerName ?? '—' }}
             </ElDescriptionsItem>
-            <ElDescriptionsItem label="工厂">{{
-              currentDetail.basic.factoryCode
-            }}</ElDescriptionsItem>
-            <ElDescriptionsItem label="产品族">{{
-              currentDetail.basic.productFamilyCode
-            }}</ElDescriptionsItem>
+            <ElDescriptionsItem label="客户类别">
+              {{ detailOrder.customerSegment ?? '—' }}
+            </ElDescriptionsItem>
+            <ElDescriptionsItem label="工厂">
+              {{ detailOrder.factoryCode ?? '—' }}
+            </ElDescriptionsItem>
+            <ElDescriptionsItem label="产品族">
+              {{ detailOrder.productFamilyCode ?? '—' }}
+            </ElDescriptionsItem>
+            <ElDescriptionsItem label="排程域">
+              {{ detailOrder.domainKey ?? '—' }}
+            </ElDescriptionsItem>
             <ElDescriptionsItem label="订单数量">
-              {{ currentDetail.basic.orderQty }} {{ currentDetail.basic.uom }}
+              {{ detailOrder.quantity }} {{ detailOrder.uom }}
+            </ElDescriptionsItem>
+            <ElDescriptionsItem label="优先级">
+              {{ detailOrder.priority }}
             </ElDescriptionsItem>
             <ElDescriptionsItem label="客户交期">
-              {{ dayjs(currentDetail.basic.customerDueDate).format('YYYY-MM-DD HH:mm') }}
+              {{ formatUtcDateTime(detailOrder.customerDueDate) }}
             </ElDescriptionsItem>
-            <ElDescriptionsItem label="优先级段">{{
-              currentDetail.basic.prioritySegmentCode
-            }}</ElDescriptionsItem>
-            <ElDescriptionsItem label="状态">
-              <ElTag
-                size="small"
-                effect="light"
-                :style="{
-                  background: ORDER_STATUS_COLORS[currentDetail.basic.status],
-                  color: '#fff',
-                  borderColor: ORDER_STATUS_COLORS[currentDetail.basic.status]
-                }"
-              >
-                {{ ORDER_SUMMARY_STATUS_LABELS[currentDetail.basic.status] }}
+            <ElDescriptionsItem label="承诺交期">
+              {{ formatUtcDateTime(detailOrder.promisedDate) }}
+            </ElDescriptionsItem>
+            <ElDescriptionsItem label="订单状态">
+              <ElTag size="small" :type="statusTagType(detailOrder.status)">
+                {{ statusLabel(detailOrder.status) }}
               </ElTag>
             </ElDescriptionsItem>
-            <ElDescriptionsItem label="计划版本">
-              {{ currentDetail.basic.planVersionId ?? '-' }}
-              <span v-if="currentDetail.basic.planVersionStatus" class="muted">
-                ({{ currentDetail.basic.planVersionStatus }})
-              </span>
+            <ElDescriptionsItem label="延迟状态">
+              <ElTag size="small" :type="delayTagType(detailOrder.delayStatus)">
+                {{ delayLabel(detailOrder.delayStatus) }}
+              </ElTag>
             </ElDescriptionsItem>
-            <ElDescriptionsItem label="排程域">{{
-              currentDetail.basic.domainKey ?? '-'
-            }}</ElDescriptionsItem>
+            <ElDescriptionsItem label="APS 预计完成">
+              {{ formatUtcDateTime(detailOrder.plannedCompletionTime) }}
+            </ElDescriptionsItem>
+            <ElDescriptionsItem label="延期时长">
+              {{ delayHoursText(detailOrder.delayHours) || '—' }}
+            </ElDescriptionsItem>
+            <ElDescriptionsItem label="延期原因" :span="2">
+              <span :class="{ 'reason-unchecked': !!detailOrder.primaryReasonCode }">{{
+                delayReasonLabel(detailOrder.primaryReasonCode)
+              }}</span>
+            </ElDescriptionsItem>
+            <ElDescriptionsItem label="订单类型">
+              {{ detailOrder.orderType }}
+            </ElDescriptionsItem>
+            <ElDescriptionsItem label="BOM 版本">
+              {{ detailOrder.bomno ?? '—' }}
+            </ElDescriptionsItem>
           </ElDescriptions>
         </div>
 
-        <!-- ===== pegging ===== -->
+        <!-- ===== Pegging 供应承接 ===== -->
         <div class="detail-section">
-          <h4 class="section-title"> Pegging 供应承接 </h4>
-          <ElTable :data="currentDetail.pegging" size="small" border>
-            <ElTableColumn label="来源类型" min-width="120">
-              <template #default="{ row }">
-                {{ SUPPLY_LABEL[row.supplyType as SupplyType] || row.supplyType }}
-              </template>
+          <h4 class="section-title">Pegging 供应承接</h4>
+          <ElTable :data="detailPegging" size="small" border>
+            <ElTableColumn prop="allocationSequence" label="序号" width="60" align="right" />
+            <ElTableColumn label="来源类型" min-width="110">
+              <template #default="{ row }">{{ supplyLabel(row.supplyType) }}</template>
             </ElTableColumn>
-            <ElTableColumn prop="supplyKey" label="供应 Key" min-width="110" />
-            <ElTableColumn prop="allocatedQty" label="承接数量" width="90" align="right">
+            <ElTableColumn prop="materialCode" label="物料" min-width="140" show-overflow-tooltip />
+            <ElTableColumn prop="allocatedQty" label="承接数量" width="90" align="right" />
+            <ElTableColumn prop="supplyFactoryCode" label="来源工厂" width="90" />
+            <ElTableColumn prop="supplyWarehouseCode" label="来源仓库" width="100" />
+            <ElTableColumn label="单据" min-width="120" show-overflow-tooltip>
               <template #default="{ row }">
-                <span :class="{ 'est-qty': row.factType === 'ESTIMATED' }">
-                  {{ row.allocatedQty }}
+                <span v-if="row.supplyDocumentNo">
+                  {{ row.supplyDocumentNo }}
+                  <span v-if="row.supplyDocumentType" class="muted">
+                    / {{ row.supplyDocumentType }}</span
+                  >
                 </span>
+                <span v-else class="muted">—</span>
               </template>
             </ElTableColumn>
-            <ElTableColumn label="就绪时间" width="150">
+            <ElTableColumn label="ETA" width="130">
               <template #default="{ row }">
-                {{ row.availableTime ? dayjs(row.availableTime).format('YYYY-MM-DD HH:mm') : '-' }}
+                {{ formatUtcDateTime(row.eta) }}
               </template>
             </ElTableColumn>
-            <ElTableColumn label="履约承诺" width="100">
+            <ElTableColumn label="可用时间" width="130">
               <template #default="{ row }">
-                <ElTag
-                  v-if="row.commitment"
-                  size="small"
-                  :type="row.commitment === 'COMMITMENT' ? 'success' : 'info'"
-                  effect="light"
-                >
-                  {{
-                    row.commitment === 'COMMITMENT'
-                      ? '已承诺'
-                      : row.commitment === 'NONE'
-                        ? '无承诺'
-                        : row.commitment
-                  }}
-                </ElTag>
-                <span v-else class="muted">-</span>
+                {{ formatUtcDateTime(row.knownAvailableTime) }}
               </template>
             </ElTableColumn>
-            <ElTableColumn label="置信度" width="80">
-              <template #default="{ row }">
-                <ElTag
-                  v-if="row.confidence"
-                  size="small"
-                  :type="
-                    row.confidence === 'HIGH'
-                      ? 'success'
-                      : row.confidence === 'LOW'
-                        ? 'danger'
-                        : 'warning'
-                  "
-                  effect="plain"
-                >
-                  {{ row.confidence }}
-                </ElTag>
-                <span v-else class="muted">-</span>
-              </template>
-            </ElTableColumn>
-            <ElTableColumn label="信息分类" width="100">
-              <template #default="{ row }">
-                <ElTag
-                  size="small"
-                  :type="FACT_TAG_TYPE[row.factType as keyof typeof FACT_TAG_TYPE]"
-                >
-                  {{ row.factType }}
-                </ElTag>
-              </template>
-            </ElTableColumn>
-            <ElTableColumn label="硬锁" width="60" align="center">
-              <template #default="{ row }">
-                <ElTag v-if="row.isHardLocked" size="small" type="warning">锁</ElTag>
-                <span v-else>-</span>
-              </template>
-            </ElTableColumn>
+            <ElTableColumn prop="commitmentStatus" label="履约承诺" width="90" />
+            <ElTableColumn prop="supplyMode" label="供应方式" width="90" />
+            <template #empty>
+              <ElEmpty description="该订单暂无 Pegging 承接记录" :image-size="60" />
+            </template>
           </ElTable>
         </div>
 
-        <!-- ===== tasks ===== -->
+        <!-- ===== 生产任务 ===== -->
         <div class="detail-section">
-          <h4 class="section-title"> 生产任务 </h4>
-          <ElTable :data="currentDetail.tasks" size="small" border>
-            <ElTableColumn prop="taskNo" label="任务号" width="90" />
-            <ElTableColumn label="阶段" width="80">
+          <h4 class="section-title">生产任务</h4>
+          <ElTable :data="detailTasks" size="small" border>
+            <ElTableColumn prop="taskNo" label="任务号" width="110" show-overflow-tooltip />
+            <ElTableColumn label="工序" width="120">
               <template #default="{ row }">
-                <ElTag v-if="row.stageCode" size="small" effect="plain">
-                  {{ row.stageCode }}
-                </ElTag>
-                <span v-else class="muted">-</span>
+                {{ row.operationCode ?? '—' }} (Seq {{ row.operationSeq }})
               </template>
             </ElTableColumn>
-            <ElTableColumn label="工序" width="90">
+            <ElTableColumn label="资源" min-width="120" show-overflow-tooltip>
               <template #default="{ row }">
-                {{ row.operationCode }} (Seq {{ row.operationSeq }})
+                {{ row.resourceName ?? row.resourceCode ?? '—' }}
               </template>
             </ElTableColumn>
-            <ElTableColumn prop="resourceCode" label="资源" width="70" />
-            <ElTableColumn label="开始" width="140">
-              <template #default="{ row }">
-                {{ row.startTime ? dayjs(row.startTime).format('MM-DD HH:mm') : '-' }}
-              </template>
-            </ElTableColumn>
-            <ElTableColumn label="结束" width="140">
-              <template #default="{ row }">
-                {{ row.endTime ? dayjs(row.endTime).format('MM-DD HH:mm') : '-' }}
-              </template>
-            </ElTableColumn>
-            <ElTableColumn label="净产出" width="90" align="right">
-              <template #default="{ row }">
-                <span class="hl-num">{{ row.netQty }}</span> {{ row.uom }}
-              </template>
-            </ElTableColumn>
+            <ElTableColumn prop="quantity" label="净产出" width="80" align="right" />
             <ElTableColumn label="计划加工" width="90" align="right">
               <template #default="{ row }">
-                <span :class="{ 'hl-warn': row.plannedProcessQty !== row.netQty }">
-                  {{ row.plannedProcessQty }}
-                </span>
-                {{ row.uom }}
-              </template>
-            </ElTableColumn>
-            <ElTableColumn label="状态" width="80">
-              <template #default="{ row }">
-                <ElTag size="small">
-                  {{ row.status }}
-                </ElTag>
-              </template>
-            </ElTableColumn>
-            <ElTableColumn label="锁定" width="80" align="center">
-              <template #default="{ row }">
-                <ElTag
-                  v-if="row.lockMarker"
-                  size="small"
-                  :type="LOCK_TAG_TYPE[row.lockMarker]"
-                  effect="plain"
-                >
-                  {{ LOCK_LABEL[row.lockMarker] }}
-                </ElTag>
-                <span v-else class="muted">-</span>
-              </template>
-            </ElTableColumn>
-            <ElTableColumn label="任务份额" min-width="120">
-              <template #default="{ row }">
-                <span v-if="!row.taskShares?.length" class="muted">-</span>
-                <span v-else>
-                  {{ row.taskShares[0].orderNo }}
-                  <span class="muted">({{ row.taskShares[0].shareQty }})</span>
+                <span :class="{ 'hl-warn': row.plannedProcessQty !== row.quantity }">
+                  {{ row.plannedProcessQty ?? '—' }}
                 </span>
               </template>
             </ElTableColumn>
+            <ElTableColumn label="开始" width="125">
+              <template #default="{ row }">
+                {{ formatUtcMonthDayHM(row.plannedStartTime) }}
+              </template>
+            </ElTableColumn>
+            <ElTableColumn label="结束" width="125">
+              <template #default="{ row }">
+                {{ formatUtcMonthDayHM(row.plannedEndTime) }}
+              </template>
+            </ElTableColumn>
+            <ElTableColumn label="状态" width="90">
+              <template #default="{ row }">
+                <ElTag size="small">{{ TASK_STATUS_LABELS[row.status] ?? row.status }}</ElTag>
+              </template>
+            </ElTableColumn>
+            <ElTableColumn label="关键路径" width="80" align="center">
+              <template #default="{ row }">
+                <ElTag v-if="row.isCriticalPath" size="small" type="danger">关键</ElTag>
+                <span v-else class="muted">—</span>
+              </template>
+            </ElTableColumn>
+            <ElTableColumn label="锁定" width="60" align="center">
+              <template #default="{ row }">
+                <ElTag v-if="row.isLocked" size="small" type="warning">锁</ElTag>
+                <span v-else class="muted">—</span>
+              </template>
+            </ElTableColumn>
+            <template #empty>
+              <ElEmpty description="该订单暂无生产任务" :image-size="60" />
+            </template>
           </ElTable>
           <p class="u05-hint">
-            净产出 <span class="hl-num">净产出量</span> 与计划加工
-            <span class="hl-warn">计划加工量</span> 是两个不同口径：
-            计划加工含良率损耗，净产出为最终交付数量。
+            净产出与计划加工是两个不同口径：计划加工含良率损耗，净产出为最终交付数量。
           </p>
         </div>
+      </template>
 
-        <!-- ===== reasons ===== -->
-        <div class="detail-section">
-          <h4 class="section-title"> 原因解释 </h4>
-          <div v-if="!currentDetail.reasons.length" class="muted empty-tip">
-            当前订单无解释信息
-          </div>
-          <div v-else class="reason-list">
-            <div v-for="(r, idx) in currentDetail.reasons" :key="idx" class="reason-item">
-              <ElTag size="small" type="danger" effect="light">
-                {{ REASON_LABELS[r.reasonCode] || r.reasonCode }}
-              </ElTag>
-              <div class="reason-desc">{{ r.description }}</div>
-              <div v-if="r.rootCause" class="reason-root"> 根因：{{ r.rootCause }} </div>
-              <div v-if="r.relatedObjectRef" class="reason-rel">
-                关联对象：<code>{{ r.relatedObjectRef }}</code>
-              </div>
-            </div>
-          </div>
-        </div>
-      </template>
-      <template v-else>
-        <div v-loading="detailLoading" class="drawer-loading">
-          <ElEmpty v-if="!detailLoading" :description="detailError || '请选择订单查看详情'" />
-        </div>
-      </template>
+      <ElEmpty v-else :description="detailError || '请选择订单查看详情'" />
     </ElDrawer>
 
-    <!-- ===== §10A.1 已有订单提前 Dialog（EXISTING_ORDER_ADVANCE） ===== -->
+    <!-- ===== §10A.1 已有订单提前 Dialog（EXISTING_ORDER_ADVANCE）===== -->
     <OrderAdvanceDialog
       :visible="advanceVisible"
       :submitting="advanceSubmitting"
       :domain-options="advanceDomainOptions"
       :orders="advanceCandidates"
-      :preselected-order-ids="selectedOrders.map((o) => o.orderId)"
+      :preselected-order-ids="selectedOrders.map((o) => o.id)"
       :default-domain-key="advanceDefaultDomain"
       @update:visible="(v) => (advanceVisible = v)"
       @submit="submitOrderAdvance"
@@ -1000,55 +848,49 @@ onMounted(async () => {
   gap: 16px;
 }
 
-.page-header {
+.toolbar {
   display: flex;
-  justify-content: space-between;
-  align-items: flex-end;
+  gap: 12px;
+  align-items: center;
 
-  .page-title {
-    margin: 0;
-    font-size: 20px;
-    font-weight: 600;
-    color: #1e293b;
+  .version-select {
+    width: 380px;
   }
 
-  .page-sub {
-    margin: 4px 0 0;
+  .toolbar-meta {
+    flex: 1;
     font-size: 12px;
-    color: #94a3b8;
   }
 }
 
-.hint-bar {
-  :deep(.el-alert__title) {
-    font-weight: 600;
-  }
+.muted {
+  color: #94a3b8;
+}
 
-  .hint-text {
-    margin-left: 8px;
-    font-size: 13px;
-    color: #475569;
-  }
+.delay-hours {
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+/* 未入冻结 15 码字典的主因码：中性灰，不与正式码同色，避免被当成已确认原因 */
+.reason-unchecked {
+  color: #94a3b8;
+  font-style: italic;
 }
 
 .kpi-row {
   display: grid;
-  grid-template-columns: repeat(6, 1fr);
+  /* 卡片数会随「未计算」一项增减，用 auto-fit 避免留空格 */
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
   gap: 12px;
 }
 
 .kpi-card {
   padding: 14px 16px;
-  cursor: pointer;
   background: #fff;
   border-top: 3px solid #94a3b8;
   border-radius: 8px;
   box-shadow: 0 1px 4px rgb(0 0 0 / 6%);
-  transition: box-shadow 0.2s;
-
-  &:hover {
-    box-shadow: 0 4px 12px rgb(0 0 0 / 10%);
-  }
 
   .kpi-label {
     font-size: 12px;
@@ -1066,27 +908,6 @@ onMounted(async () => {
     margin-top: 2px;
     font-size: 11px;
     color: #cbd5e1;
-
-    .active-tip {
-      margin-left: 6px;
-      font-weight: 600;
-      color: #3b82f6;
-    }
-  }
-
-  &.active {
-    box-shadow:
-      0 0 0 2px #3b82f6 inset,
-      0 4px 12px rgb(59 130 246 / 18%);
-  }
-
-  &.total {
-    cursor: default;
-    background: #f1f5f9;
-
-    .kpi-value {
-      color: #475569;
-    }
   }
 }
 
@@ -1101,24 +922,16 @@ onMounted(async () => {
   flex-wrap: wrap;
 }
 
-.filter-search {
-  width: 240px;
-}
-
-.filter-search-sm {
-  width: 160px;
-}
-
-.filter-select {
-  width: 170px;
+.filter-sm {
+  width: 175px;
 }
 
 .filter-select-sm {
-  width: 130px;
+  width: 145px;
 }
 
 .filter-date {
-  width: 260px;
+  width: 250px;
 }
 
 .table-card {
@@ -1146,35 +959,14 @@ onMounted(async () => {
   justify-content: flex-end;
 }
 
-.muted {
-  color: #94a3b8;
-}
-
-.est-icon {
-  margin-left: 6px;
-  color: #8b5cf6;
-  vertical-align: middle;
-  cursor: pointer;
-}
-
-.est-qty {
+.overdue {
   font-weight: 600;
-  color: #8b5cf6;
-}
-
-.hl-num {
-  font-weight: 600;
-  color: #059669;
+  color: #ef4444;
 }
 
 .hl-warn {
   font-weight: 600;
   color: #f59e0b;
-}
-
-.overdue {
-  font-weight: 600;
-  color: #ef4444;
 }
 
 .u05-hint {
@@ -1190,8 +982,8 @@ onMounted(async () => {
 
 .drawer-head {
   display: flex;
-  align-items: center;
   gap: 12px;
+  align-items: baseline;
 
   .drawer-title {
     font-size: 16px;
@@ -1203,10 +995,6 @@ onMounted(async () => {
     font-size: 12px;
     color: #94a3b8;
   }
-}
-
-.drawer-est-alert {
-  margin-bottom: 12px;
 }
 
 .detail-section {
@@ -1223,54 +1011,7 @@ onMounted(async () => {
   }
 }
 
-.empty-tip {
-  padding: 12px;
-  background: #f8fafc;
-  border-radius: 4px;
-}
-
-.reason-list {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-
-.reason-item {
-  padding: 10px 12px;
-  background: #fef2f2;
-  border-left: 3px solid #ef4444;
-  border-radius: 4px;
-
-  .reason-desc {
-    margin-top: 6px;
-    font-size: 13px;
-    color: #1e293b;
-  }
-
-  .reason-root {
-    margin-top: 4px;
-    font-size: 12px;
-    color: #475569;
-  }
-
-  .reason-rel {
-    margin-top: 4px;
-    font-size: 12px;
-    color: #94a3b8;
-
-    code {
-      padding: 1px 4px;
-      font-family: 'Courier New', monospace;
-      background: #f1f5f9;
-      border-radius: 2px;
-    }
-  }
-}
-
 .drawer-loading {
-  display: flex;
   height: 200px;
-  justify-content: center;
-  align-items: center;
 }
 </style>

@@ -120,6 +120,42 @@ export interface DomainListQuery {
   factoryId?: number
 }
 
+/**
+ * 排程域依赖 DTO（G7：GET /api/governance-query/domain-dependencies）
+ *
+ * 数据源：Domain_Dependency（2号位 每日 01:50 跨产品族血缘扫描产物，全量刷新）
+ * 字段口径依据：冻结文档《07 APS 数据库字段说明文档》§B.1
+ *  - UpstreamDomainCode / DownstreamDomainCode：**真实 DomainKey**（不是 ProductFamily）
+ *  - ChildMaterialCode：关联半成品物料（Material.MaterialCode）
+ *  - DefaultLeadTimeDays：**兼容缓存字段**；0 = 尚未按真实工厂/Stage 转运 LT 派生。
+ *    ⇒ 前端不得把固定 2 天当权威，也不得把 0 渲染成「0 天提前期」
+ */
+export interface DomainDependencyDto {
+  /** 上游排程域键（被依赖方） */
+  upstreamDomainCode: string
+  /** 下游排程域键（依赖方） */
+  downstreamDomainCode: string
+  /** 关联半成品物料编码 */
+  childMaterialCode: string
+  /** 默认提前期天数（兼容缓存；0 = 未派生，非「0 天」） */
+  defaultLeadTimeDays: number
+  /** 扫描时间戳 */
+  scannedAt: IsoDateTime
+}
+
+/**
+ * 依赖方向（后端语义，勿反）
+ *  - upstream   本域是下游 → 查本域**依赖谁**（本域的上游）
+ *  - downstream 本域是上游 → 查**谁依赖本域**（本域的下游）
+ */
+export type DomainDependencyDirection = 'upstream' | 'downstream'
+
+/** 域依赖查询参数（domainCode 省略 = 全部；direction 省略 = 全部方向） */
+export interface DomainDependencyQuery {
+  domainCode?: string
+  direction?: DomainDependencyDirection
+}
+
 /* ==================== Mock 规范键（前后端约定） ==================== */
 
 /**

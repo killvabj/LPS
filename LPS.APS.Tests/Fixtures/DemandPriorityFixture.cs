@@ -37,7 +37,7 @@ public static class DemandPriorityFixture
                         {
                             new SegmentSortField { Field = DemandField.RemainingTimeHours, Direction = SortDirection.Asc }
                         },
-                        StableTieBreakFields = new List<string> { "OrderId" }
+                        StableTieBreakFields = new List<TieBreakField> { TieBreakField.DEMANDKEY }
                     },
                     new PrioritySegment
                     {

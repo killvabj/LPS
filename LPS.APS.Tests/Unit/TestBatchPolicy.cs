@@ -8,8 +8,12 @@ namespace LPS.APS.Tests.Unit;
 /// 单元测试用**宽松** Batch Policy 构造器。
 ///
 /// 背景（0号位 2026-10-08《未命名的Markdown文件 (1)(1).md》§四 P0-01）：
-///   C 桶需求在 Solver 输入中**找不到有效 Batch Policy** 时必须 `BATCH_POLICY_MISSING` **Fail Closed**，
+///   C 桶需求在 Solver 输入中**找不到有效 Batch Policy** 时必须 **Fail Closed**，
 ///   不得再被静默降级成「不拆、恒 1 批」的隐藏业务默认。
+///   ⚠ **2026-10-13 纠正**（0号位《未命名的Markdown文件4.md》§3.2／§3.3）：出口码**分两态** ——
+///     仅当 2号位 交付**可信业务键核对结果**、已证明「确无规则」时才判 `BATCH_POLICY_MISSING`；
+///     现行载荷无状态位、**不可证缺配** ⇒ 一律判 `BATCH_POLICY_STATE_UNAVAILABLE`（状态不可获得），
+///     **不得**在信息不完整时把未知自动升级为确定的 `MISSING`。两者同为 Fail Closed。
 ///   ⇒ 既有夹具（只为验证 Direction/Routing/Setup/压实/连续性等**非批决策**能力而写）
 ///     必须**显式**给出一条有效策略，否则一律 fail-closed。
 ///
@@ -26,12 +30,14 @@ namespace LPS.APS.Tests.Unit;
 ///   裁词（0号位《APS_V1_2_20261010.md》§3 AUD-1-004）：冻结 B-001/B-006 —— 生效规则按
 ///     `MaterialId + **明确** ProductionDepartmentId` **精确匹配**；历史 `NULL` 部门只作**兼容**，
 ///     **不得**在 Solver 里重新变成「Material 级默认」。
-///   真实装载侧同口径：3号位 `TaskSplitRuleConfigProjector.Project` 已按 v5.1.10 收口④
-///     **排除** `ProductionDepartmentId is null` 的行 ⇒ 快照里**不存在** NULL 部门规则。
+///   真实装载侧同口径：治理写路径 Create/Update 强制 `ProductionDepartmentId` 必填（v5.1.10 收口④），
+///     `TaskSplitRuleConfig` 表不存在 NULL 部门规则；⑧投影已退休、装载由 2号位 表直读。
 ///   ⇒ 夹具过去靠 NULL 行「覆盖任意部门」的写法**在真实数据下不成立**（那正是被判 P0 的兜底），
 ///     故本构造器改为**显式部门**：调用方必须传本夹具真实使用的部门号，
 ///     且被排需求必须带 `StartStageCode`（真实由 2号位 `FillStartStageCodes` 回填），
-///     否则 `ResolveExecutionBatchPolicy` 解析不出部门 ⇒ 如实 `BATCH_POLICY_MISSING`。
+///     否则 `ResolveExecutionBatchPolicy` 解析不出部门 ⇒ 状态**不可获得** ⇒ 如实
+///     `BATCH_POLICY_STATE_UNAVAILABLE`（2026-10-13 纠正：**不是** `BATCH_POLICY_MISSING` ——
+///     不可证缺配不得升级为 `MISSING`，见 0号位《未命名的Markdown文件4.md》§3.2／§3.3）。
 /// </summary>
 internal static class TestBatchPolicy
 {

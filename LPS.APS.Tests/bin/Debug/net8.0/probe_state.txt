@@ -1,0 +1,24 @@
+### P1 有Routing+链+提前期_未排下 success=True err=
+  FACT key=D1 terminal=<null> completion=09-01 00:00 segs=0 []
+  FinalTasks=0 Unsched=1
+  NOTE FINITE_RESOURCE_CANDIDATE_ABSENT key=D1 :: 候选 Path 的 `FINITE_RESOURCE` 工序**无合法资源候选** —— 该候选 Path 该工序**无任何资源资格行**（Eligibility 缺项／空集合）；MaterialId=1, RouteCode=RT, PathId=1, StageCode=STAGE1, OperationCode=OP10。该候选 Path **不成立**（Phase2 逐候选试排自然淘汰），**不**升级为整域输入失败；若该需求全部候选 Path 均如此，按既有未排语义出口（保留净量/身份/诊断，**不伪造批次**，**不补** 8h/7×24 日历）。
+  NOTE DEMAND_COMPLETION_TIME_UNAVAILABLE key=D1 :: 该 Demand **无末端真实 Task（未排下）**，且其 `StageTimings` 为空 —— 或该物料纯无 Routing 且无任何提前期段，或该物料**有真实 Routing** 而其无 Routing Stage 提前期属**候选口径**已按第七轮 §八.3 抑制 ⇒ `CompletionTime`/`AvailableTime` 退化为 `PlanningStart`，**不是**已排/预计完工/供给可用时间，**不得**作为承诺或数量闭合依据；真实未排原因见 `UnscheduledTasks`。
+### P2 纯无Routing+链+提前期_未排下 success=True err=
+  FACT key=D1 terminal=<null> completion=09-01 00:00 segs=0 []
+  FinalTasks=0 Unsched=1
+  NOTE DEMAND_COMPLETION_TIME_UNAVAILABLE key=D1 :: 该 Demand **无末端真实 Task（未排下）**，且其 `StageTimings` 为空 —— 或该物料纯无 Routing 且无任何提前期段，或该物料**有真实 Routing** 而其无 Routing Stage 提前期属**候选口径**已按第七轮 §八.3 抑制 ⇒ `CompletionTime`/`AvailableTime` 退化为 `PlanningStart`，**不是**已排/预计完工/供给可用时间，**不得**作为承诺或数量闭合依据；真实未排原因见 `UnscheduledTasks`。
+### P3 多Path_固定Path1_已排下 success=True err=
+  FACT key=D1 terminal=d650ef19-26b6-4d03-bd76-32238b4919ca completion=09-01 07:10 segs=1 [STAGE2+7h]
+  FinalTasks=1 Unsched=0
+  NOTE FINITE_RESOURCE_CANDIDATE_ABSENT key=D1 :: 候选 Path 的 `FINITE_RESOURCE` 工序**无合法资源候选** —— 该候选 Path 该工序**无任何资源资格行**（Eligibility 缺项／空集合）；MaterialId=1, RouteCode=RT, PathId=2, StageCode=STAGE1, OperationCode=OP10。该候选 Path **不成立**（Phase2 逐候选试排自然淘汰），**不**升级为整域输入失败；若该需求全部候选 Path 均如此，按既有未排语义出口（保留净量/身份/诊断，**不伪造批次**，**不补** 8h/7×24 日历）。
+  NOTE FINITE_RESOURCE_CANDIDATE_ABSENT key=D1 :: 候选 Path 的 `FINITE_RESOURCE` 工序**无合法资源候选** —— 该候选 Path 该工序**无任何资源资格行**（Eligibility 缺项／空集合）；MaterialId=1, RouteCode=RT, PathId=2, StageCode=STAGE2, OperationCode=OP20。该候选 Path **不成立**（Phase2 逐候选试排自然淘汰），**不**升级为整域输入失败；若该需求全部候选 Path 均如此，按既有未排语义出口（保留净量/身份/诊断，**不伪造批次**，**不补** 8h/7×24 日历）。
+  NOTE INITIAL_SETUP_STATE key=D1 :: 当前资源无可追溯上一产品，按初始设备状态处理，Setup=0。
+### P4 部分净量_窗口只够4分钟 success=True err=
+  FACT key=D1 terminal=<null> completion=09-01 00:00 segs=0 []
+  FinalTasks=0 Unsched=1
+  NOTE DEMAND_COMPLETION_TIME_UNAVAILABLE key=D1 :: 该 Demand **无末端真实 Task（未排下）**，且其 `StageTimings` 为空 —— 或该物料纯无 Routing 且无任何提前期段，或该物料**有真实 Routing** 而其无 Routing Stage 提前期属**候选口径**已按第七轮 §八.3 抑制 ⇒ `CompletionTime`/`AvailableTime` 退化为 `PlanningStart`，**不是**已排/预计完工/供给可用时间，**不得**作为承诺或数量闭合依据；真实未排原因见 `UnscheduledTasks`。
+  SHARES=
+### P5 部分净量_强制拆批Max6_窗口6分钟 success=False err=[Phase5] 硬约束校验失败: Task 238587ec-f623-4f8b-aee4-6340971e6f36 的 ΣShare=10 超过 Quantity=3.3333
+  FinalTasks=0 Unsched=0
+  NOTE INITIAL_SETUP_STATE key=D1 :: 当前资源无可追溯上一产品，按初始设备状态处理，Setup=0。
+  SHARES=

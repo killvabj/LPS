@@ -201,19 +201,21 @@ describe('heuristic 元数据（§2.2）', () => {
     assert.equal(isSensitive('plainField'), false)
   })
 
-  it('isEditable: "default*" 开头 → false；其他 → true', () => {
-    assert.equal(isEditable('defaultPurchaseLT'), false)
+  // 2026-10-22 更正：原「default* 出厂锁定 / *threshold* 是百分比」是按名字猜的，
+  // 冻结文档无此概念（RemainingTimeThresholdHours 是小时不是百分比）⇒ 已撤，改为不按名字猜。
+  it('isEditable: 无注册绑定时一律可编辑（不按 default* 猜只读）', () => {
+    assert.equal(isEditable('defaultPurchaseLT'), true)
     assert.equal(isEditable('planningYield'), true)
     assert.equal(isEditable('DemandThreshold'), true)
   })
 
-  it('inferType: 类型推断', () => {
+  it('inferType: 只按值类型推断（不按键名猜 PERCENT/DURATION）', () => {
     assert.equal(inferType('a', true), 'BOOLEAN')
     assert.equal(inferType('a', 'hello'), 'STRING')
-    assert.equal(inferType('planningYield', 0.95), 'PERCENT')
-    assert.equal(inferType('demandThreshold', 0.5), 'PERCENT')
-    assert.equal(inferType('crossDomainBuffer', 4), 'DURATION')
-    assert.equal(inferType('leadtime', 7), 'DURATION')
+    assert.equal(inferType('planningYield', 0.95), 'NUMBER')
+    assert.equal(inferType('demandThreshold', 0.5), 'NUMBER')
+    assert.equal(inferType('crossDomainBuffer', 4), 'NUMBER')
+    assert.equal(inferType('leadtime', 7), 'NUMBER')
     assert.equal(inferType('plainCount', 42), 'NUMBER')
   })
 })

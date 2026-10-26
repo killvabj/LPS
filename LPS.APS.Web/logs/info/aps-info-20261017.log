@@ -1,0 +1,139 @@
+[2026-10-17 10:57:25.875] [] ========================================
+[2026-10-17 10:57:25.910] [] LPS.APS 应用程序启动中...
+[2026-10-17 10:57:25.912] [] ========================================
+[2026-10-17 10:57:27.064] [LPS.APS.Engine.Services.Auth.PermissionSeedService] 播种权限码成功: aps.parameter.publish
+[2026-10-17 10:57:27.091] [] LPS.APS 应用程序启动完成
+[2026-10-17 10:57:27.306] [Microsoft.Hosting.Lifetime] Now listening on: https://localhost:7044
+[2026-10-17 10:57:27.307] [Microsoft.Hosting.Lifetime] Now listening on: http://localhost:5163
+[2026-10-17 10:57:27.404] [Microsoft.Hosting.Lifetime] Application started. Press Ctrl+C to shut down.
+[2026-10-17 10:57:27.405] [Microsoft.Hosting.Lifetime] Hosting environment: Development
+[2026-10-17 10:57:27.405] [Microsoft.Hosting.Lifetime] Content root path: D:\WorkSpace_LocalLib\Windsurf WorkSpace\LPS_SVN\LPS.APS.Web
+[2026-10-17 11:09:28.870] [] ========================================
+[2026-10-17 11:09:28.903] [] LPS.APS 应用程序启动中...
+[2026-10-17 11:09:28.904] [] ========================================
+[2026-10-17 11:09:29.795] [] LPS.APS 应用程序启动完成
+[2026-10-17 11:09:29.969] [Microsoft.Hosting.Lifetime] Now listening on: https://localhost:7044
+[2026-10-17 11:09:29.970] [Microsoft.Hosting.Lifetime] Now listening on: http://localhost:5163
+[2026-10-17 11:09:30.056] [Microsoft.Hosting.Lifetime] Application started. Press Ctrl+C to shut down.
+[2026-10-17 11:09:30.056] [Microsoft.Hosting.Lifetime] Hosting environment: Development
+[2026-10-17 11:09:30.056] [Microsoft.Hosting.Lifetime] Content root path: D:\WorkSpace_LocalLib\Windsurf WorkSpace\LPS_SVN\LPS.APS.Web
+[2026-10-17 11:52:27.105] [] ========================================
+[2026-10-17 11:52:27.141] [] LPS.APS 应用程序启动中...
+[2026-10-17 11:52:27.142] [] ========================================
+[2026-10-17 11:52:28.210] [] LPS.APS 应用程序启动完成
+[2026-10-17 11:52:28.408] [Microsoft.Hosting.Lifetime] Now listening on: https://localhost:7044
+[2026-10-17 11:52:28.409] [Microsoft.Hosting.Lifetime] Now listening on: http://localhost:5163
+[2026-10-17 11:52:28.515] [Microsoft.Hosting.Lifetime] Application started. Press Ctrl+C to shut down.
+[2026-10-17 11:52:28.515] [Microsoft.Hosting.Lifetime] Hosting environment: Development
+[2026-10-17 11:52:28.516] [Microsoft.Hosting.Lifetime] Content root path: D:\WorkSpace_LocalLib\Windsurf WorkSpace\LPS_SVN\LPS.APS.Web
+[2026-10-17 14:09:12.365] [] ========================================
+[2026-10-17 14:09:12.398] [] LPS.APS 应用程序启动中...
+[2026-10-17 14:09:12.398] [] ========================================
+[2026-10-17 14:09:12.720] [] LPS.APS 应用程序启动失败
+System.AggregateException: Some services are not able to be constructed (Error while validating the service descriptor 'ServiceType: System.IEquatable`1[LPS.APS.Engine.Services.Sync.BomNightBatchResolver+PushRecord] Lifetime: Scoped ImplementationType: LPS.APS.Engine.Services.Sync.BomNightBatchResolver+PushRecord': Unable to resolve service for type 'System.String' while attempting to activate 'LPS.APS.Engine.Services.Sync.BomNightBatchResolver+PushRecord'.) (Error while validating the service descriptor 'ServiceType: System.IEquatable`1[LPS.APS.Engine.Services.Sync.BomNightBatchResolver+Resolution] Lifetime: Scoped ImplementationType: LPS.APS.Engine.Services.Sync.BomNightBatchResolver+Resolution': Unable to resolve service for type 'System.Boolean' while attempting to activate 'LPS.APS.Engine.Services.Sync.BomNightBatchResolver+Resolution'.)
+ ---> System.InvalidOperationException: Error while validating the service descriptor 'ServiceType: System.IEquatable`1[LPS.APS.Engine.Services.Sync.BomNightBatchResolver+PushRecord] Lifetime: Scoped ImplementationType: LPS.APS.Engine.Services.Sync.BomNightBatchResolver+PushRecord': Unable to resolve service for type 'System.String' while attempting to activate 'LPS.APS.Engine.Services.Sync.BomNightBatchResolver+PushRecord'.
+ ---> System.InvalidOperationException: Unable to resolve service for type 'System.String' while attempting to activate 'LPS.APS.Engine.Services.Sync.BomNightBatchResolver+PushRecord'.
+   at Microsoft.Extensions.DependencyInjection.ServiceLookup.CallSiteFactory.CreateArgumentCallSites(ServiceIdentifier serviceIdentifier, Type implementationType, CallSiteChain callSiteChain, ParameterInfo[] parameters, Boolean throwIfCallSiteNotFound)
+   at Microsoft.Extensions.DependencyInjection.ServiceLookup.CallSiteFactory.CreateConstructorCallSite(ResultCache lifetime, ServiceIdentifier serviceIdentifier, Type implementationType, CallSiteChain callSiteChain)
+   at Microsoft.Extensions.DependencyInjection.ServiceLookup.CallSiteFactory.CreateExact(ServiceDescriptor descriptor, ServiceIdentifier serviceIdentifier, CallSiteChain callSiteChain, Int32 slot)
+   at Microsoft.Extensions.DependencyInjection.ServiceLookup.CallSiteFactory.TryCreateExact(ServiceDescriptor descriptor, ServiceIdentifier serviceIdentifier, CallSiteChain callSiteChain, Int32 slot)
+   at Microsoft.Extensions.DependencyInjection.ServiceLookup.CallSiteFactory.GetCallSite(ServiceDescriptor serviceDescriptor, CallSiteChain callSiteChain)
+   at Microsoft.Extensions.DependencyInjection.ServiceProvider.ValidateService(ServiceDescriptor descriptor)
+   --- End of inner exception stack trace ---
+   at Microsoft.Extensions.DependencyInjection.ServiceProvider.ValidateService(ServiceDescriptor descriptor)
+   at Microsoft.Extensions.DependencyInjection.ServiceProvider..ctor(ICollection`1 serviceDescriptors, ServiceProviderOptions options)
+   --- End of inner exception stack trace ---
+   at Microsoft.Extensions.DependencyInjection.ServiceProvider..ctor(ICollection`1 serviceDescriptors, ServiceProviderOptions options)
+   at Microsoft.Extensions.DependencyInjection.ServiceCollectionContainerBuilderExtensions.BuildServiceProvider(IServiceCollection services, ServiceProviderOptions options)
+   at Microsoft.Extensions.Hosting.HostApplicationBuilder.Build()
+   at Microsoft.AspNetCore.Builder.WebApplicationBuilder.Build()
+   at Program.<Main>$(String[] args) in D:\WorkSpace_LocalLib\Windsurf WorkSpace\LPS_SVN\LPS.APS.Web\Program.cs:line 298
+ ---> (Inner Exception #1) System.InvalidOperationException: Error while validating the service descriptor 'ServiceType: System.IEquatable`1[LPS.APS.Engine.Services.Sync.BomNightBatchResolver+Resolution] Lifetime: Scoped ImplementationType: LPS.APS.Engine.Services.Sync.BomNightBatchResolver+Resolution': Unable to resolve service for type 'System.Boolean' while attempting to activate 'LPS.APS.Engine.Services.Sync.BomNightBatchResolver+Resolution'.
+ ---> System.InvalidOperationException: Unable to resolve service for type 'System.Boolean' while attempting to activate 'LPS.APS.Engine.Services.Sync.BomNightBatchResolver+Resolution'.
+   at Microsoft.Extensions.DependencyInjection.ServiceLookup.CallSiteFactory.CreateArgumentCallSites(ServiceIdentifier serviceIdentifier, Type implementationType, CallSiteChain callSiteChain, ParameterInfo[] parameters, Boolean throwIfCallSiteNotFound)
+   at Microsoft.Extensions.DependencyInjection.ServiceLookup.CallSiteFactory.CreateConstructorCallSite(ResultCache lifetime, ServiceIdentifier serviceIdentifier, Type implementationType, CallSiteChain callSiteChain)
+   at Microsoft.Extensions.DependencyInjection.ServiceLookup.CallSiteFactory.CreateExact(ServiceDescriptor descriptor, ServiceIdentifier serviceIdentifier, CallSiteChain callSiteChain, Int32 slot)
+   at Microsoft.Extensions.DependencyInjection.ServiceLookup.CallSiteFactory.TryCreateExact(ServiceDescriptor descriptor, ServiceIdentifier serviceIdentifier, CallSiteChain callSiteChain, Int32 slot)
+   at Microsoft.Extensions.DependencyInjection.ServiceLookup.CallSiteFactory.GetCallSite(ServiceDescriptor serviceDescriptor, CallSiteChain callSiteChain)
+   at Microsoft.Extensions.DependencyInjection.ServiceProvider.ValidateService(ServiceDescriptor descriptor)
+   --- End of inner exception stack trace ---
+   at Microsoft.Extensions.DependencyInjection.ServiceProvider.ValidateService(ServiceDescriptor descriptor)
+   at Microsoft.Extensions.DependencyInjection.ServiceProvider..ctor(ICollection`1 serviceDescriptors, ServiceProviderOptions options)<---
+
+[2026-10-17 14:10:48.547] [] ========================================
+[2026-10-17 14:10:48.580] [] LPS.APS 应用程序启动中...
+[2026-10-17 14:10:48.581] [] ========================================
+[2026-10-17 14:10:48.886] [] LPS.APS 应用程序启动失败
+System.AggregateException: Some services are not able to be constructed (Error while validating the service descriptor 'ServiceType: System.IEquatable`1[LPS.APS.Engine.Services.Sync.BomNightBatchResolver+PushRecord] Lifetime: Scoped ImplementationType: LPS.APS.Engine.Services.Sync.BomNightBatchResolver+PushRecord': Unable to resolve service for type 'System.String' while attempting to activate 'LPS.APS.Engine.Services.Sync.BomNightBatchResolver+PushRecord'.) (Error while validating the service descriptor 'ServiceType: System.IEquatable`1[LPS.APS.Engine.Services.Sync.BomNightBatchResolver+Resolution] Lifetime: Scoped ImplementationType: LPS.APS.Engine.Services.Sync.BomNightBatchResolver+Resolution': Unable to resolve service for type 'System.Boolean' while attempting to activate 'LPS.APS.Engine.Services.Sync.BomNightBatchResolver+Resolution'.)
+ ---> System.InvalidOperationException: Error while validating the service descriptor 'ServiceType: System.IEquatable`1[LPS.APS.Engine.Services.Sync.BomNightBatchResolver+PushRecord] Lifetime: Scoped ImplementationType: LPS.APS.Engine.Services.Sync.BomNightBatchResolver+PushRecord': Unable to resolve service for type 'System.String' while attempting to activate 'LPS.APS.Engine.Services.Sync.BomNightBatchResolver+PushRecord'.
+ ---> System.InvalidOperationException: Unable to resolve service for type 'System.String' while attempting to activate 'LPS.APS.Engine.Services.Sync.BomNightBatchResolver+PushRecord'.
+   at Microsoft.Extensions.DependencyInjection.ServiceLookup.CallSiteFactory.CreateArgumentCallSites(ServiceIdentifier serviceIdentifier, Type implementationType, CallSiteChain callSiteChain, ParameterInfo[] parameters, Boolean throwIfCallSiteNotFound)
+   at Microsoft.Extensions.DependencyInjection.ServiceLookup.CallSiteFactory.CreateConstructorCallSite(ResultCache lifetime, ServiceIdentifier serviceIdentifier, Type implementationType, CallSiteChain callSiteChain)
+   at Microsoft.Extensions.DependencyInjection.ServiceLookup.CallSiteFactory.CreateExact(ServiceDescriptor descriptor, ServiceIdentifier serviceIdentifier, CallSiteChain callSiteChain, Int32 slot)
+   at Microsoft.Extensions.DependencyInjection.ServiceLookup.CallSiteFactory.TryCreateExact(ServiceDescriptor descriptor, ServiceIdentifier serviceIdentifier, CallSiteChain callSiteChain, Int32 slot)
+   at Microsoft.Extensions.DependencyInjection.ServiceLookup.CallSiteFactory.GetCallSite(ServiceDescriptor serviceDescriptor, CallSiteChain callSiteChain)
+   at Microsoft.Extensions.DependencyInjection.ServiceProvider.ValidateService(ServiceDescriptor descriptor)
+   --- End of inner exception stack trace ---
+   at Microsoft.Extensions.DependencyInjection.ServiceProvider.ValidateService(ServiceDescriptor descriptor)
+   at Microsoft.Extensions.DependencyInjection.ServiceProvider..ctor(ICollection`1 serviceDescriptors, ServiceProviderOptions options)
+   --- End of inner exception stack trace ---
+   at Microsoft.Extensions.DependencyInjection.ServiceProvider..ctor(ICollection`1 serviceDescriptors, ServiceProviderOptions options)
+   at Microsoft.Extensions.DependencyInjection.ServiceCollectionContainerBuilderExtensions.BuildServiceProvider(IServiceCollection services, ServiceProviderOptions options)
+   at Microsoft.Extensions.Hosting.HostApplicationBuilder.Build()
+   at Microsoft.AspNetCore.Builder.WebApplicationBuilder.Build()
+   at Program.<Main>$(String[] args) in D:\WorkSpace_LocalLib\Windsurf WorkSpace\LPS_SVN\LPS.APS.Web\Program.cs:line 298
+ ---> (Inner Exception #1) System.InvalidOperationException: Error while validating the service descriptor 'ServiceType: System.IEquatable`1[LPS.APS.Engine.Services.Sync.BomNightBatchResolver+Resolution] Lifetime: Scoped ImplementationType: LPS.APS.Engine.Services.Sync.BomNightBatchResolver+Resolution': Unable to resolve service for type 'System.Boolean' while attempting to activate 'LPS.APS.Engine.Services.Sync.BomNightBatchResolver+Resolution'.
+ ---> System.InvalidOperationException: Unable to resolve service for type 'System.Boolean' while attempting to activate 'LPS.APS.Engine.Services.Sync.BomNightBatchResolver+Resolution'.
+   at Microsoft.Extensions.DependencyInjection.ServiceLookup.CallSiteFactory.CreateArgumentCallSites(ServiceIdentifier serviceIdentifier, Type implementationType, CallSiteChain callSiteChain, ParameterInfo[] parameters, Boolean throwIfCallSiteNotFound)
+   at Microsoft.Extensions.DependencyInjection.ServiceLookup.CallSiteFactory.CreateConstructorCallSite(ResultCache lifetime, ServiceIdentifier serviceIdentifier, Type implementationType, CallSiteChain callSiteChain)
+   at Microsoft.Extensions.DependencyInjection.ServiceLookup.CallSiteFactory.CreateExact(ServiceDescriptor descriptor, ServiceIdentifier serviceIdentifier, CallSiteChain callSiteChain, Int32 slot)
+   at Microsoft.Extensions.DependencyInjection.ServiceLookup.CallSiteFactory.TryCreateExact(ServiceDescriptor descriptor, ServiceIdentifier serviceIdentifier, CallSiteChain callSiteChain, Int32 slot)
+   at Microsoft.Extensions.DependencyInjection.ServiceLookup.CallSiteFactory.GetCallSite(ServiceDescriptor serviceDescriptor, CallSiteChain callSiteChain)
+   at Microsoft.Extensions.DependencyInjection.ServiceProvider.ValidateService(ServiceDescriptor descriptor)
+   --- End of inner exception stack trace ---
+   at Microsoft.Extensions.DependencyInjection.ServiceProvider.ValidateService(ServiceDescriptor descriptor)
+   at Microsoft.Extensions.DependencyInjection.ServiceProvider..ctor(ICollection`1 serviceDescriptors, ServiceProviderOptions options)<---
+
+[2026-10-17 14:15:28.259] [] ========================================
+[2026-10-17 14:15:28.291] [] LPS.APS 应用程序启动中...
+[2026-10-17 14:15:28.292] [] ========================================
+[2026-10-17 14:15:28.564] [] LPS.APS 应用程序启动失败
+System.AggregateException: Some services are not able to be constructed (Error while validating the service descriptor 'ServiceType: System.IEquatable`1[LPS.APS.Engine.Services.Sync.BomNightBatchResolver+PushRecord] Lifetime: Scoped ImplementationType: LPS.APS.Engine.Services.Sync.BomNightBatchResolver+PushRecord': Unable to resolve service for type 'System.String' while attempting to activate 'LPS.APS.Engine.Services.Sync.BomNightBatchResolver+PushRecord'.) (Error while validating the service descriptor 'ServiceType: System.IEquatable`1[LPS.APS.Engine.Services.Sync.BomNightBatchResolver+Resolution] Lifetime: Scoped ImplementationType: LPS.APS.Engine.Services.Sync.BomNightBatchResolver+Resolution': Unable to resolve service for type 'System.Boolean' while attempting to activate 'LPS.APS.Engine.Services.Sync.BomNightBatchResolver+Resolution'.)
+ ---> System.InvalidOperationException: Error while validating the service descriptor 'ServiceType: System.IEquatable`1[LPS.APS.Engine.Services.Sync.BomNightBatchResolver+PushRecord] Lifetime: Scoped ImplementationType: LPS.APS.Engine.Services.Sync.BomNightBatchResolver+PushRecord': Unable to resolve service for type 'System.String' while attempting to activate 'LPS.APS.Engine.Services.Sync.BomNightBatchResolver+PushRecord'.
+ ---> System.InvalidOperationException: Unable to resolve service for type 'System.String' while attempting to activate 'LPS.APS.Engine.Services.Sync.BomNightBatchResolver+PushRecord'.
+   at Microsoft.Extensions.DependencyInjection.ServiceLookup.CallSiteFactory.CreateArgumentCallSites(ServiceIdentifier serviceIdentifier, Type implementationType, CallSiteChain callSiteChain, ParameterInfo[] parameters, Boolean throwIfCallSiteNotFound)
+   at Microsoft.Extensions.DependencyInjection.ServiceLookup.CallSiteFactory.CreateConstructorCallSite(ResultCache lifetime, ServiceIdentifier serviceIdentifier, Type implementationType, CallSiteChain callSiteChain)
+   at Microsoft.Extensions.DependencyInjection.ServiceLookup.CallSiteFactory.CreateExact(ServiceDescriptor descriptor, ServiceIdentifier serviceIdentifier, CallSiteChain callSiteChain, Int32 slot)
+   at Microsoft.Extensions.DependencyInjection.ServiceLookup.CallSiteFactory.TryCreateExact(ServiceDescriptor descriptor, ServiceIdentifier serviceIdentifier, CallSiteChain callSiteChain, Int32 slot)
+   at Microsoft.Extensions.DependencyInjection.ServiceLookup.CallSiteFactory.GetCallSite(ServiceDescriptor serviceDescriptor, CallSiteChain callSiteChain)
+   at Microsoft.Extensions.DependencyInjection.ServiceProvider.ValidateService(ServiceDescriptor descriptor)
+   --- End of inner exception stack trace ---
+   at Microsoft.Extensions.DependencyInjection.ServiceProvider.ValidateService(ServiceDescriptor descriptor)
+   at Microsoft.Extensions.DependencyInjection.ServiceProvider..ctor(ICollection`1 serviceDescriptors, ServiceProviderOptions options)
+   --- End of inner exception stack trace ---
+   at Microsoft.Extensions.DependencyInjection.ServiceProvider..ctor(ICollection`1 serviceDescriptors, ServiceProviderOptions options)
+   at Microsoft.Extensions.DependencyInjection.ServiceCollectionContainerBuilderExtensions.BuildServiceProvider(IServiceCollection services, ServiceProviderOptions options)
+   at Microsoft.Extensions.Hosting.HostApplicationBuilder.Build()
+   at Microsoft.AspNetCore.Builder.WebApplicationBuilder.Build()
+   at Program.<Main>$(String[] args) in D:\WorkSpace_LocalLib\Windsurf WorkSpace\LPS_SVN\LPS.APS.Web\Program.cs:line 298
+ ---> (Inner Exception #1) System.InvalidOperationException: Error while validating the service descriptor 'ServiceType: System.IEquatable`1[LPS.APS.Engine.Services.Sync.BomNightBatchResolver+Resolution] Lifetime: Scoped ImplementationType: LPS.APS.Engine.Services.Sync.BomNightBatchResolver+Resolution': Unable to resolve service for type 'System.Boolean' while attempting to activate 'LPS.APS.Engine.Services.Sync.BomNightBatchResolver+Resolution'.
+ ---> System.InvalidOperationException: Unable to resolve service for type 'System.Boolean' while attempting to activate 'LPS.APS.Engine.Services.Sync.BomNightBatchResolver+Resolution'.
+   at Microsoft.Extensions.DependencyInjection.ServiceLookup.CallSiteFactory.CreateArgumentCallSites(ServiceIdentifier serviceIdentifier, Type implementationType, CallSiteChain callSiteChain, ParameterInfo[] parameters, Boolean throwIfCallSiteNotFound)
+   at Microsoft.Extensions.DependencyInjection.ServiceLookup.CallSiteFactory.CreateConstructorCallSite(ResultCache lifetime, ServiceIdentifier serviceIdentifier, Type implementationType, CallSiteChain callSiteChain)
+   at Microsoft.Extensions.DependencyInjection.ServiceLookup.CallSiteFactory.CreateExact(ServiceDescriptor descriptor, ServiceIdentifier serviceIdentifier, CallSiteChain callSiteChain, Int32 slot)
+   at Microsoft.Extensions.DependencyInjection.ServiceLookup.CallSiteFactory.TryCreateExact(ServiceDescriptor descriptor, ServiceIdentifier serviceIdentifier, CallSiteChain callSiteChain, Int32 slot)
+   at Microsoft.Extensions.DependencyInjection.ServiceLookup.CallSiteFactory.GetCallSite(ServiceDescriptor serviceDescriptor, CallSiteChain callSiteChain)
+   at Microsoft.Extensions.DependencyInjection.ServiceProvider.ValidateService(ServiceDescriptor descriptor)
+   --- End of inner exception stack trace ---
+   at Microsoft.Extensions.DependencyInjection.ServiceProvider.ValidateService(ServiceDescriptor descriptor)
+   at Microsoft.Extensions.DependencyInjection.ServiceProvider..ctor(ICollection`1 serviceDescriptors, ServiceProviderOptions options)<---
+
+[2026-10-17 14:16:48.990] [] ========================================
+[2026-10-17 14:16:49.022] [] LPS.APS 应用程序启动中...
+[2026-10-17 14:16:49.023] [] ========================================
+[2026-10-17 14:16:49.898] [] LPS.APS 应用程序启动完成
+[2026-10-17 14:16:50.071] [Microsoft.Hosting.Lifetime] Now listening on: https://localhost:7044
+[2026-10-17 14:16:50.073] [Microsoft.Hosting.Lifetime] Now listening on: http://localhost:5163
+[2026-10-17 14:16:50.158] [Microsoft.Hosting.Lifetime] Application started. Press Ctrl+C to shut down.
+[2026-10-17 14:16:50.158] [Microsoft.Hosting.Lifetime] Hosting environment: Development
+[2026-10-17 14:16:50.159] [Microsoft.Hosting.Lifetime] Content root path: D:\WorkSpace_LocalLib\Windsurf WorkSpace\LPS_SVN\LPS.APS.Web

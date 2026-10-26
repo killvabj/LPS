@@ -1,4 +1,5 @@
 using System.Reflection;
+using LPS.APS.Core.Extensions;
 using Microsoft.Extensions.DependencyInjection;
 
 namespace LPS.APS.Application.Extensions;
@@ -22,7 +23,9 @@ public static class ApplicationServiceExtensions
                     t.Namespace != null &&
                     t.Namespace.StartsWith("LPS.APS.Application.Services") &&
                     !t.Namespace.StartsWith("LPS.APS.Application.Services.Fixtures") &&
-                    t.DeclaringType == null))
+                    // 嵌套／异常／record 排除：record 天生实现 IEquatable<T>，会被 AsImplementedInterfaces 当服务注册，
+                    // ValidateOnBuild 因构造参数无法解析而启动失败（谓词与 Engine 侧扫描共用，见 ServiceScanFilters）。
+                    ServiceScanFilters.IsServiceCandidate(t)))
                 .AsImplementedInterfaces()
                 .WithScopedLifetime()
         );

@@ -97,7 +97,7 @@ SELECT
     PONo, [LineNo], MaterialId, MaterialCode, ReceivingWarehouse,
     ManualEta, IsActive, UpdatedBy, UpdatedAt, CreatedBy, CreatedAt, Remark
 FROM ProcurementManualEtaOverride" + whereSql + @"
-ORDER BY UpdatedAt DESC
+ORDER BY UpdatedAt DESC, PONo, [LineNo]   -- tiebreaker：业务键定序（全链清扫）
 OFFSET @Skip ROWS FETCH NEXT @Take ROWS ONLY";
 
         var pagedParameters = new
@@ -142,7 +142,7 @@ SELECT
     ManualEta, IsActive, UpdatedBy, UpdatedAt, CreatedBy, CreatedAt, Remark
 FROM ProcurementManualEtaOverride
 WHERE IsActive = 1
-ORDER BY UpdatedAt DESC";
+ORDER BY UpdatedAt DESC, PONo, [LineNo]";   // 同口径定序：非分页导出，防并列序漂移
 
         var results = await _connectionManager.QueryAsync<ProcurementManualEtaOverride>(
             sql,

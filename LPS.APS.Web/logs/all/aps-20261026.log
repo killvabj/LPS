@@ -1,0 +1,65 @@
+[2026-10-26 08:08:20.949 INF] [] ========================================
+[2026-10-26 08:08:20.981 INF] [] LPS.APS 应用程序启动中...
+[2026-10-26 08:08:20.983 INF] [] ========================================
+[2026-10-26 08:08:21.208 FTL] [] LPS.APS 应用程序启动失败
+System.AggregateException: Some services are not able to be constructed (Error while validating the service descriptor 'ServiceType: System.IAsyncDisposable Lifetime: Scoped ImplementationType: LPS.APS.Application.Services.ComputeStageProgressMonitor': A suitable constructor for type 'LPS.APS.Application.Services.ComputeStageProgressMonitor' could not be located. Ensure the type is concrete and services are registered for all parameters of a public constructor.)
+ ---> System.InvalidOperationException: Error while validating the service descriptor 'ServiceType: System.IAsyncDisposable Lifetime: Scoped ImplementationType: LPS.APS.Application.Services.ComputeStageProgressMonitor': A suitable constructor for type 'LPS.APS.Application.Services.ComputeStageProgressMonitor' could not be located. Ensure the type is concrete and services are registered for all parameters of a public constructor.
+ ---> System.InvalidOperationException: A suitable constructor for type 'LPS.APS.Application.Services.ComputeStageProgressMonitor' could not be located. Ensure the type is concrete and services are registered for all parameters of a public constructor.
+   at Microsoft.Extensions.DependencyInjection.ServiceLookup.CallSiteFactory.CreateConstructorCallSite(ResultCache lifetime, ServiceIdentifier serviceIdentifier, Type implementationType, CallSiteChain callSiteChain)
+   at Microsoft.Extensions.DependencyInjection.ServiceLookup.CallSiteFactory.CreateExact(ServiceDescriptor descriptor, ServiceIdentifier serviceIdentifier, CallSiteChain callSiteChain, Int32 slot)
+   at Microsoft.Extensions.DependencyInjection.ServiceLookup.CallSiteFactory.TryCreateExact(ServiceDescriptor descriptor, ServiceIdentifier serviceIdentifier, CallSiteChain callSiteChain, Int32 slot)
+   at Microsoft.Extensions.DependencyInjection.ServiceLookup.CallSiteFactory.GetCallSite(ServiceDescriptor serviceDescriptor, CallSiteChain callSiteChain)
+   at Microsoft.Extensions.DependencyInjection.ServiceProvider.ValidateService(ServiceDescriptor descriptor)
+   --- End of inner exception stack trace ---
+   at Microsoft.Extensions.DependencyInjection.ServiceProvider.ValidateService(ServiceDescriptor descriptor)
+   at Microsoft.Extensions.DependencyInjection.ServiceProvider..ctor(ICollection`1 serviceDescriptors, ServiceProviderOptions options)
+   --- End of inner exception stack trace ---
+   at Microsoft.Extensions.DependencyInjection.ServiceProvider..ctor(ICollection`1 serviceDescriptors, ServiceProviderOptions options)
+   at Microsoft.Extensions.DependencyInjection.ServiceCollectionContainerBuilderExtensions.BuildServiceProvider(IServiceCollection services, ServiceProviderOptions options)
+   at Microsoft.Extensions.Hosting.HostApplicationBuilder.Build()
+   at Microsoft.AspNetCore.Builder.WebApplicationBuilder.Build()
+   at Program.<Main>$(String[] args) in D:\WorkSpace_LocalLib\Windsurf WorkSpace\LPS_SVN\LPS.APS.Web\Program.cs:line 301
+[2026-10-26 10:52:25.486 INF] [] ========================================
+[2026-10-26 10:52:25.515 INF] [] LPS.APS 应用程序启动中...
+[2026-10-26 10:52:25.515 INF] [] ========================================
+[2026-10-26 10:52:26.289 INF] [] LPS.APS 应用程序启动完成
+[2026-10-26 10:52:26.295 DBG] [Microsoft.Extensions.Hosting.Internal.Host] Hosting starting
+[2026-10-26 10:52:26.442 INF] [Microsoft.Hosting.Lifetime] Now listening on: https://localhost:7044
+[2026-10-26 10:52:26.443 INF] [Microsoft.Hosting.Lifetime] Now listening on: http://localhost:5163
+[2026-10-26 10:52:26.525 INF] [Microsoft.Hosting.Lifetime] Application started. Press Ctrl+C to shut down.
+[2026-10-26 10:52:26.527 INF] [Microsoft.Hosting.Lifetime] Hosting environment: Development
+[2026-10-26 10:52:26.528 INF] [Microsoft.Hosting.Lifetime] Content root path: D:\WorkSpace_LocalLib\Windsurf WorkSpace\LPS_SVN\LPS.APS.Web
+[2026-10-26 10:52:26.530 DBG] [Microsoft.Extensions.Hosting.Internal.Host] Hosting started
+[2026-10-26 11:18:06.813 INF] [] ========================================
+[2026-10-26 11:18:06.842 INF] [] LPS.APS 应用程序启动中...
+[2026-10-26 11:18:06.843 INF] [] ========================================
+[2026-10-26 11:18:07.585 INF] [] LPS.APS 应用程序启动完成
+[2026-10-26 11:18:07.590 DBG] [Microsoft.Extensions.Hosting.Internal.Host] Hosting starting
+[2026-10-26 11:18:07.735 INF] [Microsoft.Hosting.Lifetime] Now listening on: https://localhost:7044
+[2026-10-26 11:18:07.748 INF] [Microsoft.Hosting.Lifetime] Now listening on: http://localhost:5163
+[2026-10-26 11:18:07.821 INF] [Microsoft.Hosting.Lifetime] Application started. Press Ctrl+C to shut down.
+[2026-10-26 11:18:07.822 INF] [Microsoft.Hosting.Lifetime] Hosting environment: Development
+[2026-10-26 11:18:07.822 INF] [Microsoft.Hosting.Lifetime] Content root path: D:\WorkSpace_LocalLib\Windsurf WorkSpace\LPS_SVN\LPS.APS.Web
+[2026-10-26 11:18:07.822 DBG] [Microsoft.Extensions.Hosting.Internal.Host] Hosting started
+[2026-10-26 13:21:08.251 INF] [] ========================================
+[2026-10-26 13:21:08.279 INF] [] LPS.APS 应用程序启动中...
+[2026-10-26 13:21:08.280 INF] [] ========================================
+[2026-10-26 13:21:09.007 INF] [] LPS.APS 应用程序启动完成
+[2026-10-26 13:21:09.011 DBG] [Microsoft.Extensions.Hosting.Internal.Host] Hosting starting
+[2026-10-26 13:21:09.154 INF] [Microsoft.Hosting.Lifetime] Now listening on: https://localhost:7044
+[2026-10-26 13:21:09.155 INF] [Microsoft.Hosting.Lifetime] Now listening on: http://localhost:5163
+[2026-10-26 13:21:09.229 INF] [Microsoft.Hosting.Lifetime] Application started. Press Ctrl+C to shut down.
+[2026-10-26 13:21:09.230 INF] [Microsoft.Hosting.Lifetime] Hosting environment: Development
+[2026-10-26 13:21:09.230 INF] [Microsoft.Hosting.Lifetime] Content root path: D:\WorkSpace_LocalLib\Windsurf WorkSpace\LPS_SVN\LPS.APS.Web
+[2026-10-26 13:21:09.231 DBG] [Microsoft.Extensions.Hosting.Internal.Host] Hosting started
+[2026-10-26 13:33:17.805 INF] [] ========================================
+[2026-10-26 13:33:17.834 INF] [] LPS.APS 应用程序启动中...
+[2026-10-26 13:33:17.834 INF] [] ========================================
+[2026-10-26 13:33:18.557 INF] [] LPS.APS 应用程序启动完成
+[2026-10-26 13:33:18.562 DBG] [Microsoft.Extensions.Hosting.Internal.Host] Hosting starting
+[2026-10-26 13:33:18.706 INF] [Microsoft.Hosting.Lifetime] Now listening on: https://localhost:7044
+[2026-10-26 13:33:18.707 INF] [Microsoft.Hosting.Lifetime] Now listening on: http://localhost:5163
+[2026-10-26 13:33:18.786 INF] [Microsoft.Hosting.Lifetime] Application started. Press Ctrl+C to shut down.
+[2026-10-26 13:33:18.786 INF] [Microsoft.Hosting.Lifetime] Hosting environment: Development
+[2026-10-26 13:33:18.786 INF] [Microsoft.Hosting.Lifetime] Content root path: D:\WorkSpace_LocalLib\Windsurf WorkSpace\LPS_SVN\LPS.APS.Web
+[2026-10-26 13:33:18.787 DBG] [Microsoft.Extensions.Hosting.Internal.Host] Hosting started

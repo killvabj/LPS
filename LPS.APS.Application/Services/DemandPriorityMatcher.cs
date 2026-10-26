@@ -145,7 +145,9 @@ public sealed class DemandPriorityMatcher
         {
             foreach (var tieBreakField in segment.StableTieBreakFields)
             {
-                orderedQuery = orderedQuery.ThenBy(d => GetTieBreakValue(d, tieBreakField));
+                // Tie-break 已强类型化（B3 v1.2 §3）：本类只被测试消费，按词表名透传即可，
+                // 未命中其内部 switch 时仍回落 OrderId，与强类型化之前逐字同行为。
+                orderedQuery = orderedQuery.ThenBy(d => GetTieBreakValue(d, tieBreakField.ToString()));
             }
         }
 

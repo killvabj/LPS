@@ -30,7 +30,7 @@ const mockCtpResult = (input: CtpInput): CtpResultDto => {
       mainBottleneck: '当前产能充足，无瓶颈',
       reasons: [
         {
-          reasonCode: 'MATERIAL_AVAILABLE',
+          reasonCode: 'MATERIAL_SHORTAGE',
           description: '物料 M-001 现存库存 + PI 在制可满足需求',
           isEstimated: false,
           relatedRef: 'INV-M-001'
@@ -78,13 +78,13 @@ const mockCtpResult = (input: CtpInput): CtpResultDto => {
       mainBottleneck: 'MC01 注塑机产能不足（已 92% 利用）',
       reasons: [
         {
-          reasonCode: 'CAPACITY_LIMIT',
+          reasonCode: 'RESOURCE_CAPACITY_WAIT',
           description: 'MC01 在 9 月 5 日~7 日无空闲窗口',
           isEstimated: false,
           relatedRef: 'MC01'
         },
         {
-          reasonCode: 'MATERIAL_AVAILABLE',
+          reasonCode: 'MATERIAL_SHORTAGE',
           description: 'PO-2026-9981 采购估算 9 月 15 日才到',
           isEstimated: true,
           relatedRef: 'PO-2026-9981'
@@ -117,13 +117,13 @@ const mockCtpResult = (input: CtpInput): CtpResultDto => {
       mainBottleneck: '跨 Domain 链式 WHATIF — INJECTION 产能不足导致下游 ASSEMBLY/TEST 顺延',
       reasons: [
         {
-          reasonCode: 'CROSS_DOMAIN_HANDOFF',
+          reasonCode: 'CROSS_ORG_HANDOFF',
           description: 'INJECTION 完成日 9 月 18 日 → ASSEMBLY 9 月 20 日 → TEST 9 月 22 日',
           isEstimated: false,
           relatedRef: 'INJECTION→ASSEMBLY→TEST'
         },
         {
-          reasonCode: 'MATERIAL_AVAILABLE',
+          reasonCode: 'MATERIAL_SHORTAGE',
           description: 'M-005 部分依赖 PO 估算入库',
           isEstimated: true,
           relatedRef: 'PO-2026-7770'

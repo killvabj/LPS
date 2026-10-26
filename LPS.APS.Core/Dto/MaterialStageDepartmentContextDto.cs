@@ -33,8 +33,12 @@ public sealed class MaterialStageDepartmentContextDto
 ///   ② **每步带 `StageSeq` 数值**（不是只有数组下标隐含先后）。
 ///   `Stages` 已按 `StageSeq` 升序排列，`StageSeq` 亦随步携带，两条前提同时满足。
 ///
-/// 【粒度】同一物料在本次 BOM 里 ROOT ∪ EDGE 的 Stage 取并集；同一 StageCode 取**最小 StageSeq**
-///   （与 PE 侧 `MIN(StageSeq)` 口径一致）。
+/// 【粒度 —— 2026-10-16 J12-02 订正】**每物料恰好一条真实链**，按 `StageScopeType` 隔离后收敛：
+///   作为子件被父件消耗的物料取 **EDGE** 链、须自身完工的取 **ROOT** 链（`07 v5.1.13 :724` 两式）；
+///   同 scope 内多条不一致 ⇒ **取最长**（`:722`／`:415`）并告警。
+///   ⚠ 原口径「ROOT ∪ EDGE 取并集 + 同 StageCode 取 `MIN(StageSeq)`」**已废除** —— 它是**静默并集**，
+///   违反 `07 :416`／`:723`「必须按 `StageScopeType` 区分查询（不得混查EDGE+ROOT）」。
+///   收敛在载体侧（2号位 `EffectiveStageChainResolver`）完成，故本 DTO **不承载** scope 字段。
 /// 【谁产出/谁消费】2号位 从本次 BOM 上下文装载 → 1号位 消费。
 /// </summary>
 public sealed class StageSequenceChain
@@ -100,7 +104,16 @@ public sealed class StageLeadTimeFact
     public string StageCode { get; init; } = string.Empty;
 
     /// <summary>
-    /// 提前期（小时）。换算口径：LeadTimeHours &gt; 0 时取之，否则按 LeadTimeDays × 24 折算。
+    /// 提前期（**小时；装载侧已折算完成**）。
+    ///
+    /// 【填值口径（在 2号位 装载侧，不在消费侧）】源行 `LeadTimeHours &gt; 0` ⇒ 直接取小时值；否则（含 NULL）
+    ///   由装载侧按 `LeadTimeDays × 24` 折算后填进本字段（`PeggingOrchestrator.LoadStageLeadTimesAsync`）。
+    ///   消费侧**只读本字段**，**不得再乘任何系数** —— 再乘一次就是把折算做两遍。
+    ///
+    /// 【`0` 是合法命中值，不是「缺值」】实测 4 行 `*_FINAL`（BJ/CN/SH/TJ 完工）`LeadTimeDays = 0.00` ⇒
+    ///   命中就是命中，按实际命中级产出 `LeadTimeHours = 0`。**「没命中」由 `MatchLevel = STAGE_LEADTIME_MISSING`
+    ///   表达，与数值无关**；见到 `0` 不要回头去 `LeadTimeDays` 再折算（那会走出一个本不存在的参考日）。
+    ///   （1号位 2026-10-25 R04 会签回执 §一 提请：本注释原「否则」半句与类头 2026-09-29 更正相互打架。）
     /// </summary>
     public decimal LeadTimeHours { get; init; }
 

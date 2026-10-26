@@ -137,6 +137,43 @@ public class SolverStrategyValidatorTests
     }
 
     [Fact]
+    public void E4_BottleneckMode_数字越界_拒绝()
+    {
+        // Arrange —— 数字越界反序列化场景（4号位 2026-10-22 G1：越界 BottleneckMode 会静默按 Auto 执行，发布期须拦截）
+        var block = new SolverStrategyBlock();
+        block.BottleneckMode = (DynamicBottleneckMode)99;
+
+        // Act
+        var result = _validator.Validate(block);
+
+        // Assert
+        result.IsValid.Should().BeFalse();
+        result.Errors.Should().Contain(e => e.Contains("DynamicBottleneckMode"));
+    }
+
+    [Fact]
+    public void E4_BottleneckMode_合法四值_校验通过()
+    {
+        // Arrange —— 合法四值逐一通过
+        var values = new[]
+        {
+            DynamicBottleneckMode.Auto,
+            DynamicBottleneckMode.PreferAnchor,
+            DynamicBottleneckMode.ForceAnchor,
+            DynamicBottleneckMode.NotAnchor
+        };
+
+        foreach (var mode in values)
+        {
+            // Act
+            var result = _validator.Validate(new SolverStrategyBlock { BottleneckMode = mode });
+
+            // Assert
+            result.IsValid.Should().BeTrue($"BottleneckMode={mode} 应合法：{result.GetErrorMessage()}");
+        }
+    }
+
+    [Fact]
     public void E4_SetupSearchBudget_低于100_拒绝()
     {
         // Arrange —— 有界搜索预算低于允许下限（1号位 2026-09-20 提值：[100, 5000]）

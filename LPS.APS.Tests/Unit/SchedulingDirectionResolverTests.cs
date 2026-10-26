@@ -12,7 +12,7 @@ namespace LPS.APS.Tests.Unit;
 ///
 /// 覆盖 0号位 点名的四类 AUTO 场景：
 ///   ① 明显倒排场景 ② 明显正排场景 ③ 连续份额场景 ④ Slack / 物料 / 资源导致 Direction 变化场景。
-/// 另覆盖：Firm/Frozen/Lock 硬锚点、DemandGoal 判据（含**载体缺失不静默**）、无上下文默认。
+/// 另覆盖：Firm/Frozen/Lock 硬锚点、DemandGoal 判据（含**取值缺失不静默**）、无上下文默认。
 ///
 /// 直接驱动 <see cref="SchedulingDirectionResolver.Resolve"/>（纯函数、确定性），
 /// 与 E2E 几何断言（<c>PhaseTwoRoutingCandidateTests</c>）互补：
@@ -196,12 +196,14 @@ public class SchedulingDirectionResolverTests
     }
 
     // ════════════════════════════════════════════════════════════
-    // DemandGoal 判据（P-006 两值）——含**载体缺失不静默**
+    // DemandGoal 判据（P-006 两值）——含**取值缺失不静默**
     // ════════════════════════════════════════════════════════════
     [Fact]
-    public void DemandGoal_载体缺失_登记缺口信号且不猜()
+    public void DemandGoal_取值缺失_登记缺口信号且不猜()
     {
-        // 生产路径当前恒传 null（LogicalProductionDemand 无该字段）
+        // **2026-10-13 更正**：生产路径取值链**已投产**（2号位 `PeggingOrchestrator.FillDemandGoalsAsync`，
+        // `:250` 调用）⇒ 本用例的 `demandGoal: null` 代表**个案缺口**（跨厂 SH 未落地／血缘无法唯一确定），
+        // **不再是**系统性恒 null；端到端路径见 `PhaseTwoRoutingCandidateTests.AUTO_DemandGoal非空_端到端确实改变方向`。
         var decision = SchedulingDirectionResolver.Resolve(
             Demand(due: Start.AddDays(30)), Ops60(), Ctx(), Start, NoMaterialFloor, demandGoal: null);
 

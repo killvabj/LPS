@@ -64,10 +64,27 @@ function unwrap<T>(raw: unknown): T {
 
 export interface RequestOptions {
   url: string
-  params?: Record<string, unknown>
+  /**
+   * 查询参数。传 `URLSearchParams` 可保留**重复键**（如 `resourceIds=1&resourceIds=2`）——
+   * 后端签名是 `int[]` 时只认这种形式：axios 默认的 `resourceIds[]=1` 会被 ASP.NET Core
+   * **静默忽略**（实测返回全量），逗号分隔则 422。
+   */
+  params?: Record<string, unknown> | URLSearchParams
   data?: unknown
   headers?: Record<string, string>
   responseType?: 'json' | 'blob' | 'arraybuffer' | 'text'
+  /** 单请求超时（ms），不传则走实例默认 30000 */
+  timeout?: number
+  /** 关闭全局错误 toast，由调用方自行呈现。用于后端 message 含内部术语、需改写为大白话的端点 */
+  silent?: boolean
+}
+
+/** 随 axios config 透传的标记（axios 的 config 类型无索引签名，需自行声明） */
+type SilentRequest = { silent?: boolean }
+
+/** 只在显式 silent 时下发标记，避免每个 config 都多一个无用字段 */
+function silentConfig(opts: RequestOptions): SilentRequest {
+  return opts.silent ? { silent: true } : {}
 }
 
 /** 标记是否正在 refresh（防止多个 401 同时触发 refresh 风暴） */
@@ -95,7 +112,10 @@ function createInstance(): AxiosInstance {
   instance.interceptors.response.use(
     (res: AxiosResponse) => res,
     async (error: AxiosError<ApiResponse<unknown>>) => {
-      const original = error.config as InternalAxiosRequestConfig & { _retried?: boolean }
+      const original = error.config as InternalAxiosRequestConfig & {
+        _retried?: boolean
+      } & SilentRequest
+      const silent = original?.silent === true
       const status = error.response?.status
       const respData = error.response?.data as ApiResponse<unknown> | undefined
       const isAuthEndpoint =
@@ -123,13 +143,22 @@ function createInstance(): AxiosInstance {
 
       // 业务错误：解包成 ApiError 抛给上层
       if (respData && !isApsSuccessCode(respData.code)) {
+        // 响应体可能不是 ApiResponse（如后端 5xx 直接吐 text/plain 的 .NET 异常文本），
+        // 那时 code/message/traceId 全都没有 ⇒ 业务码退回 HTTP 状态码，
+        // 否则上层会拼出 "[undefined] Request failed with status code 500" 这种没人看得懂的提示
+        const payload = respData as {
+          code?: number
+          message?: string
+          traceId?: string
+          timestamp?: string
+        }
         const apiErr = new ApiError(
-          respData.message || error.message,
-          respData.code,
-          respData.traceId,
-          respData.timestamp
+          payload.message || error.message,
+          payload.code ?? status ?? 500,
+          payload.traceId,
+          payload.timestamp
         )
-        if (respData.message) ElMessage.error(respData.message)
+        if (respData.message && !silent) ElMessage.error(respData.message)
         return Promise.reject(apiErr)
       }
 
@@ -146,7 +175,7 @@ function createInstance(): AxiosInstance {
       }
 
       // 其他 4xx（已由上面 respData 处理过）→ 不再 fallback
-      ElMessage.error(error.message || '请求失败')
+      if (!silent) ElMessage.error(error.message || '请求失败')
       return Promise.reject(error)
     }
   )
@@ -223,21 +252,27 @@ export const apsHttp = {
     const res = await apsAxios.get<unknown, AxiosResponse<ApiResponse<T>>>(opts.url, {
       params: opts.params,
       headers: opts.headers,
-      responseType: opts.responseType
+      responseType: opts.responseType,
+      timeout: opts.timeout,
+      ...silentConfig(opts)
     })
     return unwrap<T>(res)
   },
   async post<T>(opts: RequestOptions): Promise<T> {
     const res = await apsAxios.post<unknown, AxiosResponse<ApiResponse<T>>>(opts.url, opts.data, {
       params: opts.params,
-      headers: opts.headers
+      headers: opts.headers,
+      timeout: opts.timeout,
+      ...silentConfig(opts)
     })
     return unwrap<T>(res)
   },
   async put<T>(opts: RequestOptions): Promise<T> {
     const res = await apsAxios.put<unknown, AxiosResponse<ApiResponse<T>>>(opts.url, opts.data, {
       params: opts.params,
-      headers: opts.headers
+      headers: opts.headers,
+      timeout: opts.timeout,
+      ...silentConfig(opts)
     })
     return unwrap<T>(res)
   },
@@ -246,7 +281,9 @@ export const apsHttp = {
       params: opts.params,
       headers: opts.headers,
       data: opts.data,
-      responseType: opts.responseType
+      responseType: opts.responseType,
+      timeout: opts.timeout,
+      ...silentConfig(opts)
     })
     return unwrap<T>(res)
   }

@@ -61,7 +61,7 @@ WHERE p.PlanVersionId = @PlanVersionId
     AND (@PositionType IS NULL OR p.PositionType = @PositionType)
     AND (@StageCode IS NULL OR p.CurrentStageCode = @StageCode OR p.NextStageCode = @StageCode)
     AND (@HasFactories = 0 OR o.SourceFactoryId IN @AllowedFactories)
-ORDER BY p.ProductionInstructionNo, p.PositionType
+ORDER BY p.ProductionInstructionNo, p.PositionType, p.Id   -- tiebreaker：同 PI 同类型可多行，分页需唯一尾键（全链清扫）
 OFFSET @Skip ROWS FETCH NEXT @Take ROWS ONLY";
 
         var parameters = new

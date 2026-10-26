@@ -1,0 +1,284 @@
+[2026-10-13 09:30:15.530] [] ========================================
+[2026-10-13 09:30:15.567] [] LPS.APS 应用程序启动中...
+[2026-10-13 09:30:15.568] [] ========================================
+[2026-10-13 09:30:16.651] [] LPS.APS 应用程序启动完成
+[2026-10-13 09:30:16.896] [Microsoft.Hosting.Lifetime] Now listening on: https://localhost:7044
+[2026-10-13 09:30:16.897] [Microsoft.Hosting.Lifetime] Now listening on: http://localhost:5163
+[2026-10-13 09:30:16.995] [Microsoft.Hosting.Lifetime] Application started. Press Ctrl+C to shut down.
+[2026-10-13 09:30:16.996] [Microsoft.Hosting.Lifetime] Hosting environment: Development
+[2026-10-13 09:30:16.996] [Microsoft.Hosting.Lifetime] Content root path: D:\WorkSpace_LocalLib\Windsurf WorkSpace\LPS_SVN\LPS.APS.Web
+[2026-10-13 11:49:16.349] [] ========================================
+[2026-10-13 11:49:16.384] [] LPS.APS 应用程序启动中...
+[2026-10-13 11:49:16.385] [] ========================================
+[2026-10-13 11:49:17.711] [] LPS.APS 应用程序启动完成
+[2026-10-13 11:49:17.919] [Microsoft.Hosting.Lifetime] Now listening on: https://localhost:7044
+[2026-10-13 11:49:17.920] [Microsoft.Hosting.Lifetime] Now listening on: http://localhost:5163
+[2026-10-13 11:49:18.009] [Microsoft.Hosting.Lifetime] Application started. Press Ctrl+C to shut down.
+[2026-10-13 11:49:18.010] [Microsoft.Hosting.Lifetime] Hosting environment: Development
+[2026-10-13 11:49:18.010] [Microsoft.Hosting.Lifetime] Content root path: D:\WorkSpace_LocalLib\Windsurf WorkSpace\LPS_SVN\LPS.APS.Web
+[2026-10-13 14:24:09.874] [] ========================================
+[2026-10-13 14:24:09.912] [] LPS.APS 应用程序启动中...
+[2026-10-13 14:24:09.912] [] ========================================
+[2026-10-13 14:24:11.152] [] LPS.APS 应用程序启动完成
+[2026-10-13 14:24:11.378] [Microsoft.Hosting.Lifetime] Now listening on: https://localhost:7044
+[2026-10-13 14:24:11.380] [Microsoft.Hosting.Lifetime] Now listening on: http://localhost:5163
+[2026-10-13 14:24:11.477] [Microsoft.Hosting.Lifetime] Application started. Press Ctrl+C to shut down.
+[2026-10-13 14:24:11.478] [Microsoft.Hosting.Lifetime] Hosting environment: Development
+[2026-10-13 14:24:11.478] [Microsoft.Hosting.Lifetime] Content root path: D:\WorkSpace_LocalLib\Windsurf WorkSpace\LPS_SVN\LPS.APS.Web
+[2026-10-13 14:51:04.759] [] ========================================
+[2026-10-13 14:51:04.796] [] LPS.APS 应用程序启动中...
+[2026-10-13 14:51:04.797] [] ========================================
+[2026-10-13 14:51:05.329] [] LPS.APS 应用程序启动失败
+System.AggregateException: Some services are not able to be constructed (Error while validating the service descriptor 'ServiceType: System.IEquatable`1[LPS.APS.Application.Services.AnchorDiagnostic] Lifetime: Scoped ImplementationType: LPS.APS.Application.Services.AnchorDiagnostic': Unable to resolve service for type 'System.Int64' while attempting to activate 'LPS.APS.Application.Services.AnchorDiagnostic'.) (Error while validating the service descriptor 'ServiceType: System.IEquatable`1[LPS.APS.Application.Services.FenceParameters] Lifetime: Scoped ImplementationType: LPS.APS.Application.Services.FenceParameters': Unable to resolve service for type 'System.DateTime' while attempting to activate 'LPS.APS.Application.Services.FenceParameters'.) (Error while validating the service descriptor 'ServiceType: System.IEquatable`1[LPS.APS.Application.Services.FenceResolution] Lifetime: Scoped ImplementationType: LPS.APS.Application.Services.FenceResolution': Unable to resolve service for type 'LPS.APS.Application.Services.FenceParameters' while attempting to activate 'LPS.APS.Application.Services.FenceResolution'.)
+ ---> System.InvalidOperationException: Error while validating the service descriptor 'ServiceType: System.IEquatable`1[LPS.APS.Application.Services.AnchorDiagnostic] Lifetime: Scoped ImplementationType: LPS.APS.Application.Services.AnchorDiagnostic': Unable to resolve service for type 'System.Int64' while attempting to activate 'LPS.APS.Application.Services.AnchorDiagnostic'.
+ ---> System.InvalidOperationException: Unable to resolve service for type 'System.Int64' while attempting to activate 'LPS.APS.Application.Services.AnchorDiagnostic'.
+   at Microsoft.Extensions.DependencyInjection.ServiceLookup.CallSiteFactory.CreateArgumentCallSites(ServiceIdentifier serviceIdentifier, Type implementationType, CallSiteChain callSiteChain, ParameterInfo[] parameters, Boolean throwIfCallSiteNotFound)
+   at Microsoft.Extensions.DependencyInjection.ServiceLookup.CallSiteFactory.CreateConstructorCallSite(ResultCache lifetime, ServiceIdentifier serviceIdentifier, Type implementationType, CallSiteChain callSiteChain)
+   at Microsoft.Extensions.DependencyInjection.ServiceLookup.CallSiteFactory.CreateExact(ServiceDescriptor descriptor, ServiceIdentifier serviceIdentifier, CallSiteChain callSiteChain, Int32 slot)
+   at Microsoft.Extensions.DependencyInjection.ServiceLookup.CallSiteFactory.TryCreateExact(ServiceDescriptor descriptor, ServiceIdentifier serviceIdentifier, CallSiteChain callSiteChain, Int32 slot)
+   at Microsoft.Extensions.DependencyInjection.ServiceLookup.CallSiteFactory.GetCallSite(ServiceDescriptor serviceDescriptor, CallSiteChain callSiteChain)
+   at Microsoft.Extensions.DependencyInjection.ServiceProvider.ValidateService(ServiceDescriptor descriptor)
+   --- End of inner exception stack trace ---
+   at Microsoft.Extensions.DependencyInjection.ServiceProvider.ValidateService(ServiceDescriptor descriptor)
+   at Microsoft.Extensions.DependencyInjection.ServiceProvider..ctor(ICollection`1 serviceDescriptors, ServiceProviderOptions options)
+   --- End of inner exception stack trace ---
+   at Microsoft.Extensions.DependencyInjection.ServiceProvider..ctor(ICollection`1 serviceDescriptors, ServiceProviderOptions options)
+   at Microsoft.Extensions.DependencyInjection.ServiceCollectionContainerBuilderExtensions.BuildServiceProvider(IServiceCollection services, ServiceProviderOptions options)
+   at Microsoft.Extensions.Hosting.HostApplicationBuilder.Build()
+   at Microsoft.AspNetCore.Builder.WebApplicationBuilder.Build()
+   at Program.<Main>$(String[] args) in D:\WorkSpace_LocalLib\Windsurf WorkSpace\LPS_SVN\LPS.APS.Web\Program.cs:line 270
+ ---> (Inner Exception #1) System.InvalidOperationException: Error while validating the service descriptor 'ServiceType: System.IEquatable`1[LPS.APS.Application.Services.FenceParameters] Lifetime: Scoped ImplementationType: LPS.APS.Application.Services.FenceParameters': Unable to resolve service for type 'System.DateTime' while attempting to activate 'LPS.APS.Application.Services.FenceParameters'.
+ ---> System.InvalidOperationException: Unable to resolve service for type 'System.DateTime' while attempting to activate 'LPS.APS.Application.Services.FenceParameters'.
+   at Microsoft.Extensions.DependencyInjection.ServiceLookup.CallSiteFactory.CreateArgumentCallSites(ServiceIdentifier serviceIdentifier, Type implementationType, CallSiteChain callSiteChain, ParameterInfo[] parameters, Boolean throwIfCallSiteNotFound)
+   at Microsoft.Extensions.DependencyInjection.ServiceLookup.CallSiteFactory.CreateConstructorCallSite(ResultCache lifetime, ServiceIdentifier serviceIdentifier, Type implementationType, CallSiteChain callSiteChain)
+   at Microsoft.Extensions.DependencyInjection.ServiceLookup.CallSiteFactory.CreateExact(ServiceDescriptor descriptor, ServiceIdentifier serviceIdentifier, CallSiteChain callSiteChain, Int32 slot)
+   at Microsoft.Extensions.DependencyInjection.ServiceLookup.CallSiteFactory.TryCreateExact(ServiceDescriptor descriptor, ServiceIdentifier serviceIdentifier, CallSiteChain callSiteChain, Int32 slot)
+   at Microsoft.Extensions.DependencyInjection.ServiceLookup.CallSiteFactory.GetCallSite(ServiceDescriptor serviceDescriptor, CallSiteChain callSiteChain)
+   at Microsoft.Extensions.DependencyInjection.ServiceProvider.ValidateService(ServiceDescriptor descriptor)
+   --- End of inner exception stack trace ---
+   at Microsoft.Extensions.DependencyInjection.ServiceProvider.ValidateService(ServiceDescriptor descriptor)
+   at Microsoft.Extensions.DependencyInjection.ServiceProvider..ctor(ICollection`1 serviceDescriptors, ServiceProviderOptions options)<---
+
+ ---> (Inner Exception #2) System.InvalidOperationException: Error while validating the service descriptor 'ServiceType: System.IEquatable`1[LPS.APS.Application.Services.FenceResolution] Lifetime: Scoped ImplementationType: LPS.APS.Application.Services.FenceResolution': Unable to resolve service for type 'LPS.APS.Application.Services.FenceParameters' while attempting to activate 'LPS.APS.Application.Services.FenceResolution'.
+ ---> System.InvalidOperationException: Unable to resolve service for type 'LPS.APS.Application.Services.FenceParameters' while attempting to activate 'LPS.APS.Application.Services.FenceResolution'.
+   at Microsoft.Extensions.DependencyInjection.ServiceLookup.CallSiteFactory.CreateArgumentCallSites(ServiceIdentifier serviceIdentifier, Type implementationType, CallSiteChain callSiteChain, ParameterInfo[] parameters, Boolean throwIfCallSiteNotFound)
+   at Microsoft.Extensions.DependencyInjection.ServiceLookup.CallSiteFactory.CreateConstructorCallSite(ResultCache lifetime, ServiceIdentifier serviceIdentifier, Type implementationType, CallSiteChain callSiteChain)
+   at Microsoft.Extensions.DependencyInjection.ServiceLookup.CallSiteFactory.CreateExact(ServiceDescriptor descriptor, ServiceIdentifier serviceIdentifier, CallSiteChain callSiteChain, Int32 slot)
+   at Microsoft.Extensions.DependencyInjection.ServiceLookup.CallSiteFactory.TryCreateExact(ServiceDescriptor descriptor, ServiceIdentifier serviceIdentifier, CallSiteChain callSiteChain, Int32 slot)
+   at Microsoft.Extensions.DependencyInjection.ServiceLookup.CallSiteFactory.GetCallSite(ServiceDescriptor serviceDescriptor, CallSiteChain callSiteChain)
+   at Microsoft.Extensions.DependencyInjection.ServiceProvider.ValidateService(ServiceDescriptor descriptor)
+   --- End of inner exception stack trace ---
+   at Microsoft.Extensions.DependencyInjection.ServiceProvider.ValidateService(ServiceDescriptor descriptor)
+   at Microsoft.Extensions.DependencyInjection.ServiceProvider..ctor(ICollection`1 serviceDescriptors, ServiceProviderOptions options)<---
+
+[2026-10-13 15:15:43.079] [] ========================================
+[2026-10-13 15:15:43.117] [] LPS.APS 应用程序启动中...
+[2026-10-13 15:15:43.117] [] ========================================
+[2026-10-13 15:15:43.592] [] LPS.APS 应用程序启动失败
+System.AggregateException: Some services are not able to be constructed (Error while validating the service descriptor 'ServiceType: System.IEquatable`1[LPS.APS.Application.Services.AnchorDiagnostic] Lifetime: Scoped ImplementationType: LPS.APS.Application.Services.AnchorDiagnostic': Unable to resolve service for type 'System.Int64' while attempting to activate 'LPS.APS.Application.Services.AnchorDiagnostic'.) (Error while validating the service descriptor 'ServiceType: System.IEquatable`1[LPS.APS.Application.Services.FenceParameters] Lifetime: Scoped ImplementationType: LPS.APS.Application.Services.FenceParameters': Unable to resolve service for type 'System.DateTime' while attempting to activate 'LPS.APS.Application.Services.FenceParameters'.) (Error while validating the service descriptor 'ServiceType: System.IEquatable`1[LPS.APS.Application.Services.FenceResolution] Lifetime: Scoped ImplementationType: LPS.APS.Application.Services.FenceResolution': Unable to resolve service for type 'LPS.APS.Application.Services.FenceParameters' while attempting to activate 'LPS.APS.Application.Services.FenceResolution'.)
+ ---> System.InvalidOperationException: Error while validating the service descriptor 'ServiceType: System.IEquatable`1[LPS.APS.Application.Services.AnchorDiagnostic] Lifetime: Scoped ImplementationType: LPS.APS.Application.Services.AnchorDiagnostic': Unable to resolve service for type 'System.Int64' while attempting to activate 'LPS.APS.Application.Services.AnchorDiagnostic'.
+ ---> System.InvalidOperationException: Unable to resolve service for type 'System.Int64' while attempting to activate 'LPS.APS.Application.Services.AnchorDiagnostic'.
+   at Microsoft.Extensions.DependencyInjection.ServiceLookup.CallSiteFactory.CreateArgumentCallSites(ServiceIdentifier serviceIdentifier, Type implementationType, CallSiteChain callSiteChain, ParameterInfo[] parameters, Boolean throwIfCallSiteNotFound)
+   at Microsoft.Extensions.DependencyInjection.ServiceLookup.CallSiteFactory.CreateConstructorCallSite(ResultCache lifetime, ServiceIdentifier serviceIdentifier, Type implementationType, CallSiteChain callSiteChain)
+   at Microsoft.Extensions.DependencyInjection.ServiceLookup.CallSiteFactory.CreateExact(ServiceDescriptor descriptor, ServiceIdentifier serviceIdentifier, CallSiteChain callSiteChain, Int32 slot)
+   at Microsoft.Extensions.DependencyInjection.ServiceLookup.CallSiteFactory.TryCreateExact(ServiceDescriptor descriptor, ServiceIdentifier serviceIdentifier, CallSiteChain callSiteChain, Int32 slot)
+   at Microsoft.Extensions.DependencyInjection.ServiceLookup.CallSiteFactory.GetCallSite(ServiceDescriptor serviceDescriptor, CallSiteChain callSiteChain)
+   at Microsoft.Extensions.DependencyInjection.ServiceProvider.ValidateService(ServiceDescriptor descriptor)
+   --- End of inner exception stack trace ---
+   at Microsoft.Extensions.DependencyInjection.ServiceProvider.ValidateService(ServiceDescriptor descriptor)
+   at Microsoft.Extensions.DependencyInjection.ServiceProvider..ctor(ICollection`1 serviceDescriptors, ServiceProviderOptions options)
+   --- End of inner exception stack trace ---
+   at Microsoft.Extensions.DependencyInjection.ServiceProvider..ctor(ICollection`1 serviceDescriptors, ServiceProviderOptions options)
+   at Microsoft.Extensions.DependencyInjection.ServiceCollectionContainerBuilderExtensions.BuildServiceProvider(IServiceCollection services, ServiceProviderOptions options)
+   at Microsoft.Extensions.Hosting.HostApplicationBuilder.Build()
+   at Microsoft.AspNetCore.Builder.WebApplicationBuilder.Build()
+   at Program.<Main>$(String[] args) in D:\WorkSpace_LocalLib\Windsurf WorkSpace\LPS_SVN\LPS.APS.Web\Program.cs:line 270
+ ---> (Inner Exception #1) System.InvalidOperationException: Error while validating the service descriptor 'ServiceType: System.IEquatable`1[LPS.APS.Application.Services.FenceParameters] Lifetime: Scoped ImplementationType: LPS.APS.Application.Services.FenceParameters': Unable to resolve service for type 'System.DateTime' while attempting to activate 'LPS.APS.Application.Services.FenceParameters'.
+ ---> System.InvalidOperationException: Unable to resolve service for type 'System.DateTime' while attempting to activate 'LPS.APS.Application.Services.FenceParameters'.
+   at Microsoft.Extensions.DependencyInjection.ServiceLookup.CallSiteFactory.CreateArgumentCallSites(ServiceIdentifier serviceIdentifier, Type implementationType, CallSiteChain callSiteChain, ParameterInfo[] parameters, Boolean throwIfCallSiteNotFound)
+   at Microsoft.Extensions.DependencyInjection.ServiceLookup.CallSiteFactory.CreateConstructorCallSite(ResultCache lifetime, ServiceIdentifier serviceIdentifier, Type implementationType, CallSiteChain callSiteChain)
+   at Microsoft.Extensions.DependencyInjection.ServiceLookup.CallSiteFactory.CreateExact(ServiceDescriptor descriptor, ServiceIdentifier serviceIdentifier, CallSiteChain callSiteChain, Int32 slot)
+   at Microsoft.Extensions.DependencyInjection.ServiceLookup.CallSiteFactory.TryCreateExact(ServiceDescriptor descriptor, ServiceIdentifier serviceIdentifier, CallSiteChain callSiteChain, Int32 slot)
+   at Microsoft.Extensions.DependencyInjection.ServiceLookup.CallSiteFactory.GetCallSite(ServiceDescriptor serviceDescriptor, CallSiteChain callSiteChain)
+   at Microsoft.Extensions.DependencyInjection.ServiceProvider.ValidateService(ServiceDescriptor descriptor)
+   --- End of inner exception stack trace ---
+   at Microsoft.Extensions.DependencyInjection.ServiceProvider.ValidateService(ServiceDescriptor descriptor)
+   at Microsoft.Extensions.DependencyInjection.ServiceProvider..ctor(ICollection`1 serviceDescriptors, ServiceProviderOptions options)<---
+
+ ---> (Inner Exception #2) System.InvalidOperationException: Error while validating the service descriptor 'ServiceType: System.IEquatable`1[LPS.APS.Application.Services.FenceResolution] Lifetime: Scoped ImplementationType: LPS.APS.Application.Services.FenceResolution': Unable to resolve service for type 'LPS.APS.Application.Services.FenceParameters' while attempting to activate 'LPS.APS.Application.Services.FenceResolution'.
+ ---> System.InvalidOperationException: Unable to resolve service for type 'LPS.APS.Application.Services.FenceParameters' while attempting to activate 'LPS.APS.Application.Services.FenceResolution'.
+   at Microsoft.Extensions.DependencyInjection.ServiceLookup.CallSiteFactory.CreateArgumentCallSites(ServiceIdentifier serviceIdentifier, Type implementationType, CallSiteChain callSiteChain, ParameterInfo[] parameters, Boolean throwIfCallSiteNotFound)
+   at Microsoft.Extensions.DependencyInjection.ServiceLookup.CallSiteFactory.CreateConstructorCallSite(ResultCache lifetime, ServiceIdentifier serviceIdentifier, Type implementationType, CallSiteChain callSiteChain)
+   at Microsoft.Extensions.DependencyInjection.ServiceLookup.CallSiteFactory.CreateExact(ServiceDescriptor descriptor, ServiceIdentifier serviceIdentifier, CallSiteChain callSiteChain, Int32 slot)
+   at Microsoft.Extensions.DependencyInjection.ServiceLookup.CallSiteFactory.TryCreateExact(ServiceDescriptor descriptor, ServiceIdentifier serviceIdentifier, CallSiteChain callSiteChain, Int32 slot)
+   at Microsoft.Extensions.DependencyInjection.ServiceLookup.CallSiteFactory.GetCallSite(ServiceDescriptor serviceDescriptor, CallSiteChain callSiteChain)
+   at Microsoft.Extensions.DependencyInjection.ServiceProvider.ValidateService(ServiceDescriptor descriptor)
+   --- End of inner exception stack trace ---
+   at Microsoft.Extensions.DependencyInjection.ServiceProvider.ValidateService(ServiceDescriptor descriptor)
+   at Microsoft.Extensions.DependencyInjection.ServiceProvider..ctor(ICollection`1 serviceDescriptors, ServiceProviderOptions options)<---
+
+[2026-10-13 15:19:02.980] [] ========================================
+[2026-10-13 15:19:03.018] [] LPS.APS 应用程序启动中...
+[2026-10-13 15:19:03.018] [] ========================================
+[2026-10-13 15:19:03.563] [] LPS.APS 应用程序启动失败
+System.AggregateException: Some services are not able to be constructed (Error while validating the service descriptor 'ServiceType: System.IEquatable`1[LPS.APS.Application.Services.AnchorDiagnostic] Lifetime: Scoped ImplementationType: LPS.APS.Application.Services.AnchorDiagnostic': Unable to resolve service for type 'System.Int64' while attempting to activate 'LPS.APS.Application.Services.AnchorDiagnostic'.) (Error while validating the service descriptor 'ServiceType: System.IEquatable`1[LPS.APS.Application.Services.FenceParameters] Lifetime: Scoped ImplementationType: LPS.APS.Application.Services.FenceParameters': Unable to resolve service for type 'System.DateTime' while attempting to activate 'LPS.APS.Application.Services.FenceParameters'.) (Error while validating the service descriptor 'ServiceType: System.IEquatable`1[LPS.APS.Application.Services.FenceResolution] Lifetime: Scoped ImplementationType: LPS.APS.Application.Services.FenceResolution': Unable to resolve service for type 'LPS.APS.Application.Services.FenceParameters' while attempting to activate 'LPS.APS.Application.Services.FenceResolution'.)
+ ---> System.InvalidOperationException: Error while validating the service descriptor 'ServiceType: System.IEquatable`1[LPS.APS.Application.Services.AnchorDiagnostic] Lifetime: Scoped ImplementationType: LPS.APS.Application.Services.AnchorDiagnostic': Unable to resolve service for type 'System.Int64' while attempting to activate 'LPS.APS.Application.Services.AnchorDiagnostic'.
+ ---> System.InvalidOperationException: Unable to resolve service for type 'System.Int64' while attempting to activate 'LPS.APS.Application.Services.AnchorDiagnostic'.
+   at Microsoft.Extensions.DependencyInjection.ServiceLookup.CallSiteFactory.CreateArgumentCallSites(ServiceIdentifier serviceIdentifier, Type implementationType, CallSiteChain callSiteChain, ParameterInfo[] parameters, Boolean throwIfCallSiteNotFound)
+   at Microsoft.Extensions.DependencyInjection.ServiceLookup.CallSiteFactory.CreateConstructorCallSite(ResultCache lifetime, ServiceIdentifier serviceIdentifier, Type implementationType, CallSiteChain callSiteChain)
+   at Microsoft.Extensions.DependencyInjection.ServiceLookup.CallSiteFactory.CreateExact(ServiceDescriptor descriptor, ServiceIdentifier serviceIdentifier, CallSiteChain callSiteChain, Int32 slot)
+   at Microsoft.Extensions.DependencyInjection.ServiceLookup.CallSiteFactory.TryCreateExact(ServiceDescriptor descriptor, ServiceIdentifier serviceIdentifier, CallSiteChain callSiteChain, Int32 slot)
+   at Microsoft.Extensions.DependencyInjection.ServiceLookup.CallSiteFactory.GetCallSite(ServiceDescriptor serviceDescriptor, CallSiteChain callSiteChain)
+   at Microsoft.Extensions.DependencyInjection.ServiceProvider.ValidateService(ServiceDescriptor descriptor)
+   --- End of inner exception stack trace ---
+   at Microsoft.Extensions.DependencyInjection.ServiceProvider.ValidateService(ServiceDescriptor descriptor)
+   at Microsoft.Extensions.DependencyInjection.ServiceProvider..ctor(ICollection`1 serviceDescriptors, ServiceProviderOptions options)
+   --- End of inner exception stack trace ---
+   at Microsoft.Extensions.DependencyInjection.ServiceProvider..ctor(ICollection`1 serviceDescriptors, ServiceProviderOptions options)
+   at Microsoft.Extensions.DependencyInjection.ServiceCollectionContainerBuilderExtensions.BuildServiceProvider(IServiceCollection services, ServiceProviderOptions options)
+   at Microsoft.Extensions.Hosting.HostApplicationBuilder.Build()
+   at Microsoft.AspNetCore.Builder.WebApplicationBuilder.Build()
+   at Program.<Main>$(String[] args) in D:\WorkSpace_LocalLib\Windsurf WorkSpace\LPS_SVN\LPS.APS.Web\Program.cs:line 270
+ ---> (Inner Exception #1) System.InvalidOperationException: Error while validating the service descriptor 'ServiceType: System.IEquatable`1[LPS.APS.Application.Services.FenceParameters] Lifetime: Scoped ImplementationType: LPS.APS.Application.Services.FenceParameters': Unable to resolve service for type 'System.DateTime' while attempting to activate 'LPS.APS.Application.Services.FenceParameters'.
+ ---> System.InvalidOperationException: Unable to resolve service for type 'System.DateTime' while attempting to activate 'LPS.APS.Application.Services.FenceParameters'.
+   at Microsoft.Extensions.DependencyInjection.ServiceLookup.CallSiteFactory.CreateArgumentCallSites(ServiceIdentifier serviceIdentifier, Type implementationType, CallSiteChain callSiteChain, ParameterInfo[] parameters, Boolean throwIfCallSiteNotFound)
+   at Microsoft.Extensions.DependencyInjection.ServiceLookup.CallSiteFactory.CreateConstructorCallSite(ResultCache lifetime, ServiceIdentifier serviceIdentifier, Type implementationType, CallSiteChain callSiteChain)
+   at Microsoft.Extensions.DependencyInjection.ServiceLookup.CallSiteFactory.CreateExact(ServiceDescriptor descriptor, ServiceIdentifier serviceIdentifier, CallSiteChain callSiteChain, Int32 slot)
+   at Microsoft.Extensions.DependencyInjection.ServiceLookup.CallSiteFactory.TryCreateExact(ServiceDescriptor descriptor, ServiceIdentifier serviceIdentifier, CallSiteChain callSiteChain, Int32 slot)
+   at Microsoft.Extensions.DependencyInjection.ServiceLookup.CallSiteFactory.GetCallSite(ServiceDescriptor serviceDescriptor, CallSiteChain callSiteChain)
+   at Microsoft.Extensions.DependencyInjection.ServiceProvider.ValidateService(ServiceDescriptor descriptor)
+   --- End of inner exception stack trace ---
+   at Microsoft.Extensions.DependencyInjection.ServiceProvider.ValidateService(ServiceDescriptor descriptor)
+   at Microsoft.Extensions.DependencyInjection.ServiceProvider..ctor(ICollection`1 serviceDescriptors, ServiceProviderOptions options)<---
+
+ ---> (Inner Exception #2) System.InvalidOperationException: Error while validating the service descriptor 'ServiceType: System.IEquatable`1[LPS.APS.Application.Services.FenceResolution] Lifetime: Scoped ImplementationType: LPS.APS.Application.Services.FenceResolution': Unable to resolve service for type 'LPS.APS.Application.Services.FenceParameters' while attempting to activate 'LPS.APS.Application.Services.FenceResolution'.
+ ---> System.InvalidOperationException: Unable to resolve service for type 'LPS.APS.Application.Services.FenceParameters' while attempting to activate 'LPS.APS.Application.Services.FenceResolution'.
+   at Microsoft.Extensions.DependencyInjection.ServiceLookup.CallSiteFactory.CreateArgumentCallSites(ServiceIdentifier serviceIdentifier, Type implementationType, CallSiteChain callSiteChain, ParameterInfo[] parameters, Boolean throwIfCallSiteNotFound)
+   at Microsoft.Extensions.DependencyInjection.ServiceLookup.CallSiteFactory.CreateConstructorCallSite(ResultCache lifetime, ServiceIdentifier serviceIdentifier, Type implementationType, CallSiteChain callSiteChain)
+   at Microsoft.Extensions.DependencyInjection.ServiceLookup.CallSiteFactory.CreateExact(ServiceDescriptor descriptor, ServiceIdentifier serviceIdentifier, CallSiteChain callSiteChain, Int32 slot)
+   at Microsoft.Extensions.DependencyInjection.ServiceLookup.CallSiteFactory.TryCreateExact(ServiceDescriptor descriptor, ServiceIdentifier serviceIdentifier, CallSiteChain callSiteChain, Int32 slot)
+   at Microsoft.Extensions.DependencyInjection.ServiceLookup.CallSiteFactory.GetCallSite(ServiceDescriptor serviceDescriptor, CallSiteChain callSiteChain)
+   at Microsoft.Extensions.DependencyInjection.ServiceProvider.ValidateService(ServiceDescriptor descriptor)
+   --- End of inner exception stack trace ---
+   at Microsoft.Extensions.DependencyInjection.ServiceProvider.ValidateService(ServiceDescriptor descriptor)
+   at Microsoft.Extensions.DependencyInjection.ServiceProvider..ctor(ICollection`1 serviceDescriptors, ServiceProviderOptions options)<---
+
+[2026-10-13 15:19:51.359] [] ========================================
+[2026-10-13 15:19:51.402] [] LPS.APS 应用程序启动中...
+[2026-10-13 15:19:51.403] [] ========================================
+[2026-10-13 15:19:51.982] [] LPS.APS 应用程序启动失败
+System.AggregateException: Some services are not able to be constructed (Error while validating the service descriptor 'ServiceType: System.IEquatable`1[LPS.APS.Application.Services.AnchorDiagnostic] Lifetime: Scoped ImplementationType: LPS.APS.Application.Services.AnchorDiagnostic': Unable to resolve service for type 'System.Int64' while attempting to activate 'LPS.APS.Application.Services.AnchorDiagnostic'.) (Error while validating the service descriptor 'ServiceType: System.IEquatable`1[LPS.APS.Application.Services.FenceParameters] Lifetime: Scoped ImplementationType: LPS.APS.Application.Services.FenceParameters': Unable to resolve service for type 'System.DateTime' while attempting to activate 'LPS.APS.Application.Services.FenceParameters'.) (Error while validating the service descriptor 'ServiceType: System.IEquatable`1[LPS.APS.Application.Services.FenceResolution] Lifetime: Scoped ImplementationType: LPS.APS.Application.Services.FenceResolution': Unable to resolve service for type 'LPS.APS.Application.Services.FenceParameters' while attempting to activate 'LPS.APS.Application.Services.FenceResolution'.)
+ ---> System.InvalidOperationException: Error while validating the service descriptor 'ServiceType: System.IEquatable`1[LPS.APS.Application.Services.AnchorDiagnostic] Lifetime: Scoped ImplementationType: LPS.APS.Application.Services.AnchorDiagnostic': Unable to resolve service for type 'System.Int64' while attempting to activate 'LPS.APS.Application.Services.AnchorDiagnostic'.
+ ---> System.InvalidOperationException: Unable to resolve service for type 'System.Int64' while attempting to activate 'LPS.APS.Application.Services.AnchorDiagnostic'.
+   at Microsoft.Extensions.DependencyInjection.ServiceLookup.CallSiteFactory.CreateArgumentCallSites(ServiceIdentifier serviceIdentifier, Type implementationType, CallSiteChain callSiteChain, ParameterInfo[] parameters, Boolean throwIfCallSiteNotFound)
+   at Microsoft.Extensions.DependencyInjection.ServiceLookup.CallSiteFactory.CreateConstructorCallSite(ResultCache lifetime, ServiceIdentifier serviceIdentifier, Type implementationType, CallSiteChain callSiteChain)
+   at Microsoft.Extensions.DependencyInjection.ServiceLookup.CallSiteFactory.CreateExact(ServiceDescriptor descriptor, ServiceIdentifier serviceIdentifier, CallSiteChain callSiteChain, Int32 slot)
+   at Microsoft.Extensions.DependencyInjection.ServiceLookup.CallSiteFactory.TryCreateExact(ServiceDescriptor descriptor, ServiceIdentifier serviceIdentifier, CallSiteChain callSiteChain, Int32 slot)
+   at Microsoft.Extensions.DependencyInjection.ServiceLookup.CallSiteFactory.GetCallSite(ServiceDescriptor serviceDescriptor, CallSiteChain callSiteChain)
+   at Microsoft.Extensions.DependencyInjection.ServiceProvider.ValidateService(ServiceDescriptor descriptor)
+   --- End of inner exception stack trace ---
+   at Microsoft.Extensions.DependencyInjection.ServiceProvider.ValidateService(ServiceDescriptor descriptor)
+   at Microsoft.Extensions.DependencyInjection.ServiceProvider..ctor(ICollection`1 serviceDescriptors, ServiceProviderOptions options)
+   --- End of inner exception stack trace ---
+   at Microsoft.Extensions.DependencyInjection.ServiceProvider..ctor(ICollection`1 serviceDescriptors, ServiceProviderOptions options)
+   at Microsoft.Extensions.DependencyInjection.ServiceCollectionContainerBuilderExtensions.BuildServiceProvider(IServiceCollection services, ServiceProviderOptions options)
+   at Microsoft.Extensions.Hosting.HostApplicationBuilder.Build()
+   at Microsoft.AspNetCore.Builder.WebApplicationBuilder.Build()
+   at Program.<Main>$(String[] args) in D:\WorkSpace_LocalLib\Windsurf WorkSpace\LPS_SVN\LPS.APS.Web\Program.cs:line 270
+ ---> (Inner Exception #1) System.InvalidOperationException: Error while validating the service descriptor 'ServiceType: System.IEquatable`1[LPS.APS.Application.Services.FenceParameters] Lifetime: Scoped ImplementationType: LPS.APS.Application.Services.FenceParameters': Unable to resolve service for type 'System.DateTime' while attempting to activate 'LPS.APS.Application.Services.FenceParameters'.
+ ---> System.InvalidOperationException: Unable to resolve service for type 'System.DateTime' while attempting to activate 'LPS.APS.Application.Services.FenceParameters'.
+   at Microsoft.Extensions.DependencyInjection.ServiceLookup.CallSiteFactory.CreateArgumentCallSites(ServiceIdentifier serviceIdentifier, Type implementationType, CallSiteChain callSiteChain, ParameterInfo[] parameters, Boolean throwIfCallSiteNotFound)
+   at Microsoft.Extensions.DependencyInjection.ServiceLookup.CallSiteFactory.CreateConstructorCallSite(ResultCache lifetime, ServiceIdentifier serviceIdentifier, Type implementationType, CallSiteChain callSiteChain)
+   at Microsoft.Extensions.DependencyInjection.ServiceLookup.CallSiteFactory.CreateExact(ServiceDescriptor descriptor, ServiceIdentifier serviceIdentifier, CallSiteChain callSiteChain, Int32 slot)
+   at Microsoft.Extensions.DependencyInjection.ServiceLookup.CallSiteFactory.TryCreateExact(ServiceDescriptor descriptor, ServiceIdentifier serviceIdentifier, CallSiteChain callSiteChain, Int32 slot)
+   at Microsoft.Extensions.DependencyInjection.ServiceLookup.CallSiteFactory.GetCallSite(ServiceDescriptor serviceDescriptor, CallSiteChain callSiteChain)
+   at Microsoft.Extensions.DependencyInjection.ServiceProvider.ValidateService(ServiceDescriptor descriptor)
+   --- End of inner exception stack trace ---
+   at Microsoft.Extensions.DependencyInjection.ServiceProvider.ValidateService(ServiceDescriptor descriptor)
+   at Microsoft.Extensions.DependencyInjection.ServiceProvider..ctor(ICollection`1 serviceDescriptors, ServiceProviderOptions options)<---
+
+ ---> (Inner Exception #2) System.InvalidOperationException: Error while validating the service descriptor 'ServiceType: System.IEquatable`1[LPS.APS.Application.Services.FenceResolution] Lifetime: Scoped ImplementationType: LPS.APS.Application.Services.FenceResolution': Unable to resolve service for type 'LPS.APS.Application.Services.FenceParameters' while attempting to activate 'LPS.APS.Application.Services.FenceResolution'.
+ ---> System.InvalidOperationException: Unable to resolve service for type 'LPS.APS.Application.Services.FenceParameters' while attempting to activate 'LPS.APS.Application.Services.FenceResolution'.
+   at Microsoft.Extensions.DependencyInjection.ServiceLookup.CallSiteFactory.CreateArgumentCallSites(ServiceIdentifier serviceIdentifier, Type implementationType, CallSiteChain callSiteChain, ParameterInfo[] parameters, Boolean throwIfCallSiteNotFound)
+   at Microsoft.Extensions.DependencyInjection.ServiceLookup.CallSiteFactory.CreateConstructorCallSite(ResultCache lifetime, ServiceIdentifier serviceIdentifier, Type implementationType, CallSiteChain callSiteChain)
+   at Microsoft.Extensions.DependencyInjection.ServiceLookup.CallSiteFactory.CreateExact(ServiceDescriptor descriptor, ServiceIdentifier serviceIdentifier, CallSiteChain callSiteChain, Int32 slot)
+   at Microsoft.Extensions.DependencyInjection.ServiceLookup.CallSiteFactory.TryCreateExact(ServiceDescriptor descriptor, ServiceIdentifier serviceIdentifier, CallSiteChain callSiteChain, Int32 slot)
+   at Microsoft.Extensions.DependencyInjection.ServiceLookup.CallSiteFactory.GetCallSite(ServiceDescriptor serviceDescriptor, CallSiteChain callSiteChain)
+   at Microsoft.Extensions.DependencyInjection.ServiceProvider.ValidateService(ServiceDescriptor descriptor)
+   --- End of inner exception stack trace ---
+   at Microsoft.Extensions.DependencyInjection.ServiceProvider.ValidateService(ServiceDescriptor descriptor)
+   at Microsoft.Extensions.DependencyInjection.ServiceProvider..ctor(ICollection`1 serviceDescriptors, ServiceProviderOptions options)<---
+
+[2026-10-13 15:20:23.130] [] ========================================
+[2026-10-13 15:20:23.170] [] LPS.APS 应用程序启动中...
+[2026-10-13 15:20:23.171] [] ========================================
+[2026-10-13 15:20:23.607] [] LPS.APS 应用程序启动失败
+System.AggregateException: Some services are not able to be constructed (Error while validating the service descriptor 'ServiceType: System.IEquatable`1[LPS.APS.Application.Services.AnchorDiagnostic] Lifetime: Scoped ImplementationType: LPS.APS.Application.Services.AnchorDiagnostic': Unable to resolve service for type 'System.Int64' while attempting to activate 'LPS.APS.Application.Services.AnchorDiagnostic'.) (Error while validating the service descriptor 'ServiceType: System.IEquatable`1[LPS.APS.Application.Services.FenceParameters] Lifetime: Scoped ImplementationType: LPS.APS.Application.Services.FenceParameters': Unable to resolve service for type 'System.DateTime' while attempting to activate 'LPS.APS.Application.Services.FenceParameters'.) (Error while validating the service descriptor 'ServiceType: System.IEquatable`1[LPS.APS.Application.Services.FenceResolution] Lifetime: Scoped ImplementationType: LPS.APS.Application.Services.FenceResolution': Unable to resolve service for type 'LPS.APS.Application.Services.FenceParameters' while attempting to activate 'LPS.APS.Application.Services.FenceResolution'.)
+ ---> System.InvalidOperationException: Error while validating the service descriptor 'ServiceType: System.IEquatable`1[LPS.APS.Application.Services.AnchorDiagnostic] Lifetime: Scoped ImplementationType: LPS.APS.Application.Services.AnchorDiagnostic': Unable to resolve service for type 'System.Int64' while attempting to activate 'LPS.APS.Application.Services.AnchorDiagnostic'.
+ ---> System.InvalidOperationException: Unable to resolve service for type 'System.Int64' while attempting to activate 'LPS.APS.Application.Services.AnchorDiagnostic'.
+   at Microsoft.Extensions.DependencyInjection.ServiceLookup.CallSiteFactory.CreateArgumentCallSites(ServiceIdentifier serviceIdentifier, Type implementationType, CallSiteChain callSiteChain, ParameterInfo[] parameters, Boolean throwIfCallSiteNotFound)
+   at Microsoft.Extensions.DependencyInjection.ServiceLookup.CallSiteFactory.CreateConstructorCallSite(ResultCache lifetime, ServiceIdentifier serviceIdentifier, Type implementationType, CallSiteChain callSiteChain)
+   at Microsoft.Extensions.DependencyInjection.ServiceLookup.CallSiteFactory.CreateExact(ServiceDescriptor descriptor, ServiceIdentifier serviceIdentifier, CallSiteChain callSiteChain, Int32 slot)
+   at Microsoft.Extensions.DependencyInjection.ServiceLookup.CallSiteFactory.TryCreateExact(ServiceDescriptor descriptor, ServiceIdentifier serviceIdentifier, CallSiteChain callSiteChain, Int32 slot)
+   at Microsoft.Extensions.DependencyInjection.ServiceLookup.CallSiteFactory.GetCallSite(ServiceDescriptor serviceDescriptor, CallSiteChain callSiteChain)
+   at Microsoft.Extensions.DependencyInjection.ServiceProvider.ValidateService(ServiceDescriptor descriptor)
+   --- End of inner exception stack trace ---
+   at Microsoft.Extensions.DependencyInjection.ServiceProvider.ValidateService(ServiceDescriptor descriptor)
+   at Microsoft.Extensions.DependencyInjection.ServiceProvider..ctor(ICollection`1 serviceDescriptors, ServiceProviderOptions options)
+   --- End of inner exception stack trace ---
+   at Microsoft.Extensions.DependencyInjection.ServiceProvider..ctor(ICollection`1 serviceDescriptors, ServiceProviderOptions options)
+   at Microsoft.Extensions.DependencyInjection.ServiceCollectionContainerBuilderExtensions.BuildServiceProvider(IServiceCollection services, ServiceProviderOptions options)
+   at Microsoft.Extensions.Hosting.HostApplicationBuilder.Build()
+   at Microsoft.AspNetCore.Builder.WebApplicationBuilder.Build()
+   at Program.<Main>$(String[] args) in D:\WorkSpace_LocalLib\Windsurf WorkSpace\LPS_SVN\LPS.APS.Web\Program.cs:line 270
+ ---> (Inner Exception #1) System.InvalidOperationException: Error while validating the service descriptor 'ServiceType: System.IEquatable`1[LPS.APS.Application.Services.FenceParameters] Lifetime: Scoped ImplementationType: LPS.APS.Application.Services.FenceParameters': Unable to resolve service for type 'System.DateTime' while attempting to activate 'LPS.APS.Application.Services.FenceParameters'.
+ ---> System.InvalidOperationException: Unable to resolve service for type 'System.DateTime' while attempting to activate 'LPS.APS.Application.Services.FenceParameters'.
+   at Microsoft.Extensions.DependencyInjection.ServiceLookup.CallSiteFactory.CreateArgumentCallSites(ServiceIdentifier serviceIdentifier, Type implementationType, CallSiteChain callSiteChain, ParameterInfo[] parameters, Boolean throwIfCallSiteNotFound)
+   at Microsoft.Extensions.DependencyInjection.ServiceLookup.CallSiteFactory.CreateConstructorCallSite(ResultCache lifetime, ServiceIdentifier serviceIdentifier, Type implementationType, CallSiteChain callSiteChain)
+   at Microsoft.Extensions.DependencyInjection.ServiceLookup.CallSiteFactory.CreateExact(ServiceDescriptor descriptor, ServiceIdentifier serviceIdentifier, CallSiteChain callSiteChain, Int32 slot)
+   at Microsoft.Extensions.DependencyInjection.ServiceLookup.CallSiteFactory.TryCreateExact(ServiceDescriptor descriptor, ServiceIdentifier serviceIdentifier, CallSiteChain callSiteChain, Int32 slot)
+   at Microsoft.Extensions.DependencyInjection.ServiceLookup.CallSiteFactory.GetCallSite(ServiceDescriptor serviceDescriptor, CallSiteChain callSiteChain)
+   at Microsoft.Extensions.DependencyInjection.ServiceProvider.ValidateService(ServiceDescriptor descriptor)
+   --- End of inner exception stack trace ---
+   at Microsoft.Extensions.DependencyInjection.ServiceProvider.ValidateService(ServiceDescriptor descriptor)
+   at Microsoft.Extensions.DependencyInjection.ServiceProvider..ctor(ICollection`1 serviceDescriptors, ServiceProviderOptions options)<---
+
+ ---> (Inner Exception #2) System.InvalidOperationException: Error while validating the service descriptor 'ServiceType: System.IEquatable`1[LPS.APS.Application.Services.FenceResolution] Lifetime: Scoped ImplementationType: LPS.APS.Application.Services.FenceResolution': Unable to resolve service for type 'LPS.APS.Application.Services.FenceParameters' while attempting to activate 'LPS.APS.Application.Services.FenceResolution'.
+ ---> System.InvalidOperationException: Unable to resolve service for type 'LPS.APS.Application.Services.FenceParameters' while attempting to activate 'LPS.APS.Application.Services.FenceResolution'.
+   at Microsoft.Extensions.DependencyInjection.ServiceLookup.CallSiteFactory.CreateArgumentCallSites(ServiceIdentifier serviceIdentifier, Type implementationType, CallSiteChain callSiteChain, ParameterInfo[] parameters, Boolean throwIfCallSiteNotFound)
+   at Microsoft.Extensions.DependencyInjection.ServiceLookup.CallSiteFactory.CreateConstructorCallSite(ResultCache lifetime, ServiceIdentifier serviceIdentifier, Type implementationType, CallSiteChain callSiteChain)
+   at Microsoft.Extensions.DependencyInjection.ServiceLookup.CallSiteFactory.CreateExact(ServiceDescriptor descriptor, ServiceIdentifier serviceIdentifier, CallSiteChain callSiteChain, Int32 slot)
+   at Microsoft.Extensions.DependencyInjection.ServiceLookup.CallSiteFactory.TryCreateExact(ServiceDescriptor descriptor, ServiceIdentifier serviceIdentifier, CallSiteChain callSiteChain, Int32 slot)
+   at Microsoft.Extensions.DependencyInjection.ServiceLookup.CallSiteFactory.GetCallSite(ServiceDescriptor serviceDescriptor, CallSiteChain callSiteChain)
+   at Microsoft.Extensions.DependencyInjection.ServiceProvider.ValidateService(ServiceDescriptor descriptor)
+   --- End of inner exception stack trace ---
+   at Microsoft.Extensions.DependencyInjection.ServiceProvider.ValidateService(ServiceDescriptor descriptor)
+   at Microsoft.Extensions.DependencyInjection.ServiceProvider..ctor(ICollection`1 serviceDescriptors, ServiceProviderOptions options)<---
+
+[2026-10-13 15:28:19.854] [] ========================================
+[2026-10-13 15:28:19.921] [] LPS.APS 应用程序启动中...
+[2026-10-13 15:28:19.922] [] ========================================
+[2026-10-13 15:28:21.960] [] LPS.APS 应用程序启动完成
+[2026-10-13 15:28:22.448] [Microsoft.Hosting.Lifetime] Now listening on: https://localhost:7044
+[2026-10-13 15:28:22.450] [Microsoft.Hosting.Lifetime] Now listening on: http://localhost:5163
+[2026-10-13 15:28:22.622] [Microsoft.Hosting.Lifetime] Application started. Press Ctrl+C to shut down.
+[2026-10-13 15:28:22.622] [Microsoft.Hosting.Lifetime] Hosting environment: Development
+[2026-10-13 15:28:22.623] [Microsoft.Hosting.Lifetime] Content root path: D:\WorkSpace_LocalLib\Windsurf WorkSpace\LPS_SVN\LPS.APS.Web
+[2026-10-13 15:41:11.105] [] ========================================
+[2026-10-13 15:41:11.174] [] LPS.APS 应用程序启动中...
+[2026-10-13 15:41:11.175] [] ========================================
+[2026-10-13 15:41:13.468] [] LPS.APS 应用程序启动完成
+[2026-10-13 15:41:13.899] [Microsoft.Hosting.Lifetime] Now listening on: https://localhost:7044
+[2026-10-13 15:41:13.901] [Microsoft.Hosting.Lifetime] Now listening on: http://localhost:5163
+[2026-10-13 15:41:14.075] [Microsoft.Hosting.Lifetime] Application started. Press Ctrl+C to shut down.
+[2026-10-13 15:41:14.076] [Microsoft.Hosting.Lifetime] Hosting environment: Development
+[2026-10-13 15:41:14.077] [Microsoft.Hosting.Lifetime] Content root path: D:\WorkSpace_LocalLib\Windsurf WorkSpace\LPS_SVN\LPS.APS.Web
+[2026-10-13 16:39:56.267] [] ========================================
+[2026-10-13 16:39:56.316] [] LPS.APS 应用程序启动中...
+[2026-10-13 16:39:56.316] [] ========================================
+[2026-10-13 16:39:57.574] [] LPS.APS 应用程序启动完成
+[2026-10-13 16:39:57.810] [Microsoft.Hosting.Lifetime] Now listening on: https://localhost:7044
+[2026-10-13 16:39:57.811] [Microsoft.Hosting.Lifetime] Now listening on: http://localhost:5163
+[2026-10-13 16:39:57.910] [Microsoft.Hosting.Lifetime] Application started. Press Ctrl+C to shut down.
+[2026-10-13 16:39:57.910] [Microsoft.Hosting.Lifetime] Hosting environment: Development
+[2026-10-13 16:39:57.910] [Microsoft.Hosting.Lifetime] Content root path: D:\WorkSpace_LocalLib\Windsurf WorkSpace\LPS_SVN\LPS.APS.Web

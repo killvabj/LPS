@@ -1,33 +1,25 @@
 <script setup lang="ts">
 /**
- * APS V1 4号位 — PI Position / 供给追溯（页面 7 / U16 / U17 / U18）
+ * APS V1 4号位 — PI 位置（`/api/pi-position`）
  *
- * 4号位文档第 13 节约束：
- *  - 6 类 PositionType：ERP_REMAINING / PRODUCTION / TRANSIT / WAITING / UNLOCATED / CROSS_STAGE
- *  - 9 类 SupplyType：INVENTORY / PI / PO / VMI / ARRIVED_NOT_INBOUND /
- *                   INTERPLANT_TRANSIT / RECEIVED / PLANNED_PRODUCTION / PLANNING_PURCHASE_PLACEHOLDER
- *  - U16：UNLOCATED 必须显示数量 + "不可下发 MES"
- *  - U17：无 PI 规划 Task 显示不可 MES
- *  - U18：依赖 PLANNING_PURCHASE_PLACEHOLDER 的 Task 不允许下 MES
+ * 2026-10-17 重做。原先本页整体建立在一份**手写 8 条 PI** 的假数据上（`PI-2026-0001`…`0008`），
+ * 页面上 13 个字段（ERP 剩余 / 位置合计 / 差异 / 主位置 / 未分配数量 / 采购占位 / 供给数 / MES 资格 …）
+ * 后端一个都没有，且 `mesEligible` 是前端按「无 UNLOCATED + 无占位 = 可下发」推断出来的。
+ * 按 5号位 2026-10-17 回执整块重做：
+ *  - 页面只回答一个问题：**这个 PI 的剩余量现在在哪些位置上**
+ *  - 供给构成（9 类 SupplyType）整块下线 —— 冻结 `07:4123` 明令禁止把 INTERPLANT_TRANSIT 当 Supply 身份，
+ *    且真实供给在 `SupplyFact_Pipeline`、不在本页
+ *  - MES 资格只保留 U16（`positionType === 'UNLOCATED'` → 不可下发），判据取后端字段本身，不推断；
+ *    U17（无 PI 规划任务）/ U18（采购占位）在本页**没有承载字段，不显示**
  *
- * 仅只读页面（阶段 D 部分），所有"修复"动作走 Controller，不直接 UPDATE
+ * 计划版本必填且由用户显式选择（5号位 2026-10-17 回执 §五）：默认取 `/api/schedule/versions` 第一条（最新）。
  */
 
-import { computed, onMounted, watch } from 'vue'
-import dayjs from 'dayjs'
+import { computed, onMounted } from 'vue'
 import { storeToRefs } from 'pinia'
 import { usePiStore } from '@/store/modules/aps/pi'
-import { useDomainStore } from '@/store/modules/aps/domain'
-import { useApsAuthStore } from '@/store/modules/aps/auth'
-import DomainUnavailableBadge from './components/DomainUnavailableBadge.vue'
-import { ESTIMATED_BADGE_TEXT } from '@/api/aps-v1'
-import type {
-  PiPositionType,
-  SupplyType,
-  MesEligibility,
-  DomainKey,
-  PiIssueType
-} from '@/api/aps-v1'
+import { formatUtcDateTime } from '@/utils/datetime'
+import { PI_POSITION_TYPES, PLAN_VERSION_STATUS_LABELS } from '@/api/aps-v1'
 
 import {
   ElAlert,
@@ -39,6 +31,7 @@ import {
   ElEmpty,
   ElInput,
   ElOption,
+  ElPagination,
   ElSelect,
   ElTable,
   ElTableColumn,
@@ -48,283 +41,159 @@ import {
 
 const piStore = usePiStore()
 const {
+  versions,
+  planVersionId,
+  summary,
   list,
-  currentDetail,
+  detailRows,
   detailOpen,
+  currentPiNo,
   filter,
-  loading,
+  pageIndex,
+  pageSize,
+  versionsLoading,
   listLoading,
+  detailLoading,
   error,
-  positionTypeCounts,
-  mesStats,
-  totalCount,
-  issueCount,
+  detailError,
+  totalPositions,
   unlocatedCount,
-  placeholderCount,
-  supplyTypeCounts
+  unlocatedQty,
+  pageIssueRows,
+  hasFilter
 } = storeToRefs(piStore)
 
-/** Non-null 在 drawer v-if 内用 */
-const detailNN = computed(() => currentDetail.value!)
-
-/* ===== 字典 ===== */
-const POSITION_TAG: Record<PiPositionType, 'success' | 'warning' | 'info' | 'primary' | 'danger'> =
-  {
-    ERP_REMAINING: 'info',
-    PRODUCTION: 'success',
-    TRANSIT: 'primary',
-    WAITING: 'warning',
-    UNLOCATED: 'danger',
-    CROSS_STAGE: 'info'
-  }
-const POSITION_LABEL: Record<PiPositionType, string> = {
-  ERP_REMAINING: 'ERP 剩余',
-  PRODUCTION: '生产中',
-  TRANSIT: '在途',
-  WAITING: '等待',
-  UNLOCATED: '未分配',
-  CROSS_STAGE: '跨阶段'
+/* ===== 位置类型字典 =====
+ * 6 值全预留（0号位 裁决中）。未知值降级显示原值、不报错 —— 后端随时可能出现第 7 个值。
+ */
+const POSITION_META: Record<
+  string,
+  { label: string; tag: 'success' | 'warning' | 'info' | 'primary' | 'danger' }
+> = {
+  STAGE_WAITING: { label: 'Stage 在制', tag: 'success' },
+  // 冻结名，与 STAGE_WAITING 同概念（纯名称漂移），后端改回冻结名后本行即生效
+  STAGE_WIP: { label: 'Stage 在制（冻结名）', tag: 'success' },
+  FIRST_STAGE_PENDING: { label: '首工序待开始', tag: 'primary' },
+  XC: { label: '线边仓', tag: 'info' },
+  INTERPLANT_TRANSIT: { label: '跨厂在途', tag: 'primary' },
+  UNLOCATED: { label: '无法定位', tag: 'danger' },
+  // 冻结有、后端未实现；实库 0 行，V1 可能恒不出现
+  WAITING_INBOUND: { label: '等待入库', tag: 'warning' }
 }
 
-const SUPPLY_TAG: Record<SupplyType, 'success' | 'warning' | 'info' | 'primary' | 'danger'> = {
-  INVENTORY: 'success',
-  PI: 'primary',
-  PO: 'info',
-  VMI: 'primary',
-  ARRIVED_NOT_INBOUND: 'warning',
-  INTERPLANT_TRANSIT: 'primary',
-  RECEIVED: 'success',
-  PLANNED_PRODUCTION: 'info',
-  PLANNING_PURCHASE_PLACEHOLDER: 'danger'
+function positionLabel(t: string): string {
+  return POSITION_META[t]?.label ?? t
 }
-const SUPPLY_LABEL: Record<SupplyType, string> = {
-  INVENTORY: '库存',
-  PI: '生产指令',
-  PO: '采购单',
-  VMI: 'VMI 寄售',
-  ARRIVED_NOT_INBOUND: '到货未入库',
-  INTERPLANT_TRANSIT: '跨厂在途',
-  RECEIVED: '已入库',
-  PLANNED_PRODUCTION: '计划生产',
-  PLANNING_PURCHASE_PLACEHOLDER: '采购占位'
+function positionTag(t: string): 'success' | 'warning' | 'info' | 'primary' | 'danger' {
+  return POSITION_META[t]?.tag ?? 'info'
 }
 
-const MES_TAG: Record<MesEligibility, 'success' | 'danger' | 'info'> = {
-  ELIGIBLE: 'success',
-  INELIGIBLE: 'danger',
-  UNKNOWN: 'info'
-}
-const MES_LABEL: Record<MesEligibility, string> = {
-  ELIGIBLE: '可下发',
-  INELIGIBLE: '不可下发',
-  UNKNOWN: '待判定'
+const POSITION_OPTIONS: Array<{ value: string; label: string }> = PI_POSITION_TYPES.map((v) => ({
+  value: v,
+  label: POSITION_META[v].label
+}))
+
+const STATUS_LABEL = PLAN_VERSION_STATUS_LABELS
+function versionLabel(id: number): string {
+  const v = versions.value.find((x) => x.id === id)
+  return v ? `${v.versionCode}（${STATUS_LABEL[v.status]}）` : String(id)
 }
 
-/** Domain 选项（v1.2 Domain专项：从 useDomainStore.activeDomains 派生，含 ALL）
- *  U41：按 apsAuth.dataScope.domainKeys 收敛——非空(受限)时仅含授权 Domain，空(global)时全量 */
-const domainStore = useDomainStore()
-const apsAuth = useApsAuthStore()
-const DOMAIN_OPTIONS = computed<Array<{ value: DomainKey | 'ALL'; label: string }>>(() => {
-  const all = domainStore.activeDomains.map((d) => ({ value: d.domainKey, label: d.domainName }))
-  const allowed = apsAuth.dataScope.domainKeys as readonly string[]
-  const list = allowed.length === 0 ? all : all.filter((o) => allowed.includes(o.value))
-  return [{ value: 'ALL' as const, label: '全部排程域' }, ...list]
-})
+/* ===== U16：无法定位不可下发 MES =====
+ * 判据 = 后端返回的 positionType 本身，不是前端推断（5号位 2026-10-17 回执 §三）。
+ */
+const UNLOCATED = 'UNLOCATED'
+function isUnlocated(t: string): boolean {
+  return t === UNLOCATED
+}
 
-const POSITION_OPTIONS: Array<{ value: PiPositionType | 'ALL'; label: string }> = [
-  { value: 'ALL', label: '全部位置' },
-  { value: 'ERP_REMAINING', label: POSITION_LABEL.ERP_REMAINING },
-  { value: 'PRODUCTION', label: POSITION_LABEL.PRODUCTION },
-  { value: 'TRANSIT', label: POSITION_LABEL.TRANSIT },
-  { value: 'WAITING', label: POSITION_LABEL.WAITING },
-  { value: 'UNLOCATED', label: POSITION_LABEL.UNLOCATED },
-  { value: 'CROSS_STAGE', label: POSITION_LABEL.CROSS_STAGE }
-]
+/* ===== 展示口径 ===== */
+const hasPositions = computed(() => (summary.value?.positionTypeCounts?.length ?? 0) > 0)
+const piCount = computed(() => summary.value?.piCount ?? 0)
+
+/** 单 PI 位置数量合计（详情抽屉用） */
+const detailTotalQty = computed(() => detailRows.value.reduce((s, r) => s + (r.quantity ?? 0), 0))
 
 /* ===== 操作 ===== */
-// 2026-09-17 5号位 回执后：详情端点用 productionInstructionNo（字符串），非 ID
-function selectPi(no: string): void {
-  piStore.loadDetail(no)
+function onVersionChange(id: number): void {
+  piStore.setPlanVersion(id)
 }
-
-function closeDrawer(): void {
-  piStore.closeDetail()
+function onFilterChange(
+  patch: Partial<{
+    productionInstructionNo: string
+    materialCode: string
+    positionType: string
+    stageCode: string
+  }>
+): void {
+  piStore.setFilter(patch)
+  void piStore.loadList()
 }
-
-function onDomainChange(v: DomainKey | 'ALL'): void {
-  piStore.setDomainFilter(v)
-  piStore.loadList()
-}
-function onPositionChange(v: PiPositionType | 'ALL'): void {
-  piStore.setPositionFilter(v)
-  piStore.loadList()
-}
-function onMaterialSearch(v: string): void {
-  // 输入防抖：简化版用 watch
-  piStore.setMaterialFilter(v)
-}
-watch(
-  () => filter.value.materialCode,
-  () => {
-    // 搜索触发列表
-    piStore.loadList()
-  }
-)
 function resetFilters(): void {
   piStore.resetFilter()
-  piStore.loadList()
+  void piStore.refresh()
+}
+function refreshAll(): void {
+  void piStore.refresh()
 }
 
-/* ===== 工具 ===== */
-function varianceText(v: number): string {
-  if (v > 0) return `+${v}`
-  if (v < 0) return `${v}`
-  return '0'
-}
-
-function varianceClass(v: number): string {
-  if (v === 0) return 'variance-zero'
-  if (v > 0) return 'variance-pos'
-  return 'variance-neg'
-}
-
-function elapsed(iso: string): string {
-  const m = dayjs(iso).diff(dayjs(), 'minute')
-  if (Math.abs(m) < 60) return m >= 0 ? `${m} 分钟后` : `${-m} 分钟前`
-  const h = dayjs(iso).diff(dayjs(), 'hour')
-  if (Math.abs(h) < 24) return h >= 0 ? `${h} 小时后` : `${-h} 小时前`
-  const d = dayjs(iso).diff(dayjs(), 'day')
-  return d >= 0 ? `${d} 天后` : `${-d} 天前`
-}
-
-/* ===== Issue 字典 ===== */
-const ISSUE_LABEL: Record<PiIssueType, string> = {
-  UNLOCATED_EXISTS: '未分配数量',
-  NO_PI: '无 PI 规划任务',
-  PLACEHOLDER_DEPENDENCY: '依赖采购占位',
-  CROSS_STAGE_RISK: '跨阶段风险',
-  OTHER: '其他'
-}
-const ISSUE_CLASS: Record<PiIssueType, string> = {
-  UNLOCATED_EXISTS: 'u16-tag',
-  NO_PI: 'u17-tag',
-  PLACEHOLDER_DEPENDENCY: 'u18-tag',
-  CROSS_STAGE_RISK: 'warn-tag',
-  OTHER: 'muted'
-}
-function issueLabel(t: PiIssueType): string {
-  return ISSUE_LABEL[t] ?? t
-}
-function issueClass(t: PiIssueType): string {
-  return ISSUE_CLASS[t] ?? ''
-}
-
-onMounted(() => {
-  piStore.loadList()
+onMounted(async () => {
+  await piStore.loadVersions()
+  await piStore.refresh()
 })
 </script>
 
 <template>
   <div class="aps-pi">
-    <!-- ===== 顶部 ===== -->
-    <div class="page-header">
-      <div>
-        <h2 class="page-title">PI Position / 供给追溯</h2>
-        <p class="page-sub">
-          6 类位置 × 9 类供给；未分配数量与采购占位依赖会自动判定 MES 下发资格
-        </p>
-      </div>
-      <ElButton :loading="listLoading" @click="piStore.loadList">
-        <Icon icon="vi-ep:refresh" /> 刷新列表
-      </ElButton>
-    </div>
-
-    <!-- ===== 业务约束提示 ===== -->
-    <ElAlert type="info" :closable="false" show-icon class="hint-bar">
-      <template #title>使用说明</template>
-      <span class="hint-text">
-        存在未分配数量时会显示具体数量，并标注"不可下发 MES"； 无 PI 规划任务同样标注不可下发 MES；
-        依赖"采购占位"的位置不允许下发 MES。
-      </span>
-    </ElAlert>
-
-    <!-- ===== 错误条 ===== -->
     <ElAlert v-if="error" type="error" :closable="false" show-icon :title="error" />
 
-    <!-- ===== KPI 横条 ===== -->
-    <div class="kpi-strip">
-      <div class="kpi-pill">
-        <span class="pill-label">PI 总数</span>
-        <span class="pill-val">{{ totalCount }}</span>
-      </div>
-      <div class="kpi-pill warn">
-        <span class="pill-label">含问题</span>
-        <span class="pill-val">{{ issueCount }}</span>
-      </div>
-      <div class="kpi-pill danger">
-        <span class="pill-label">未分配数量</span>
-        <span class="pill-val">{{ unlocatedCount }}</span>
-      </div>
-      <div class="kpi-pill placeholder">
-        <span class="pill-label">采购占位依赖</span>
-        <span class="pill-val">{{ placeholderCount }}</span>
-      </div>
-      <div class="kpi-pill ok">
-        <span class="pill-label">MES 可下发</span>
-        <span class="pill-val">{{ mesStats.ELIGIBLE }}</span>
-      </div>
-      <div class="kpi-pill bad">
-        <span class="pill-label">MES 不可下发</span>
-        <span class="pill-val">{{ mesStats.INELIGIBLE }}</span>
-      </div>
-      <div class="kpi-pill muted">
-        <span class="pill-label">MES 待判定</span>
-        <span class="pill-val">{{ mesStats.UNKNOWN }}</span>
-      </div>
-    </div>
-
-    <!-- ===== Position Type 分布条 ===== -->
-    <ElCard class="panel position-panel">
-      <template #header>
-        <span class="panel-title">位置类型分布（按 PI 主位置）</span>
-      </template>
-      <div class="position-grid">
-        <div v-for="(count, type) in positionTypeCounts" :key="type" class="position-cell">
-          <ElTag :type="POSITION_TAG[type as PiPositionType]" effect="dark" size="small">
-            {{ POSITION_LABEL[type as PiPositionType] }}
-          </ElTag>
-          <span class="position-count">{{ count }}</span>
-        </div>
-      </div>
-    </ElCard>
-
-    <!-- ===== 过滤栏 ===== -->
-    <ElCard class="panel filter-panel">
+    <!-- ===== 版本与筛选 ===== -->
+    <ElCard class="panel">
       <div class="filter-row">
         <div class="filter-item">
-          <span class="filter-label">排程域</span>
+          <span class="filter-label">计划版本</span>
           <ElSelect
-            :model-value="filter.domainKey"
-            placeholder="全部"
-            style="width: 160px"
-            @change="onDomainChange"
+            :model-value="planVersionId ?? undefined"
+            placeholder="选择版本"
+            filterable
+            style="width: 300px"
+            :loading="versionsLoading"
+            @change="onVersionChange"
           >
-            <ElOption
-              v-for="opt in DOMAIN_OPTIONS"
-              :key="opt.value"
-              :label="opt.label"
-              :value="opt.value"
-            />
+            <ElOption v-for="v in versions" :key="v.id" :label="versionLabel(v.id)" :value="v.id" />
           </ElSelect>
-          <DomainUnavailableBadge />
+          <ElTooltip content="三个 PI 位置端点都按版本分区，切换版本会重新取数" placement="top">
+            <span class="muted hint">按版本分区</span>
+          </ElTooltip>
         </div>
         <div class="filter-item">
-          <span class="filter-label">主位置</span>
+          <span class="filter-label">生产指示号</span>
+          <ElInput
+            :model-value="filter.productionInstructionNo"
+            placeholder="精确匹配"
+            clearable
+            style="width: 150px"
+            @change="onFilterChange({ productionInstructionNo: $event })"
+          />
+        </div>
+        <div class="filter-item">
+          <span class="filter-label">物料编码</span>
+          <ElInput
+            :model-value="filter.materialCode"
+            placeholder="物料编码"
+            clearable
+            style="width: 190px"
+            @change="onFilterChange({ materialCode: $event })"
+          />
+        </div>
+        <div class="filter-item">
+          <span class="filter-label">位置类型</span>
           <ElSelect
             :model-value="filter.positionType"
             placeholder="全部"
-            style="width: 160px"
-            @change="onPositionChange"
+            clearable
+            style="width: 170px"
+            @change="onFilterChange({ positionType: $event })"
           >
             <ElOption
               v-for="opt in POSITION_OPTIONS"
@@ -335,343 +204,247 @@ onMounted(() => {
           </ElSelect>
         </div>
         <div class="filter-item">
-          <span class="filter-label">物料</span>
+          <span class="filter-label">当前阶段</span>
           <ElInput
-            :model-value="filter.materialCode"
-            placeholder="M-001 / M-002 ..."
-            style="width: 200px"
+            :model-value="filter.stageCode"
+            placeholder="如 BJ_MACH"
             clearable
-            @input="onMaterialSearch"
+            style="width: 140px"
+            @change="onFilterChange({ stageCode: $event })"
           />
         </div>
-        <ElButton @click="resetFilters"> <Icon icon="vi-ep:refresh-left" /> 重置过滤 </ElButton>
+        <ElButton @click="resetFilters"> <Icon icon="vi-ep:refresh-left" /> 重置 </ElButton>
+        <ElButton :loading="listLoading" @click="refreshAll">
+          <Icon icon="vi-ep:refresh" /> 刷新
+        </ElButton>
       </div>
     </ElCard>
 
-    <!-- ===== PI 列表 ===== -->
-    <ElCard class="panel">
-      <template #header>
-        <div class="panel-header">
-          <span>PI 列表</span>
-          <ElTag size="small" effect="plain">{{ list.length }} 个</ElTag>
+    <!-- ===== 未选版本 ===== -->
+    <ElCard v-if="planVersionId == null" class="panel">
+      <ElEmpty description="请先选择一个计划版本" />
+    </ElCard>
+
+    <template v-else>
+      <!-- ===== KPI（全部来自 /summary 服务端聚合，不是当前页条数）===== -->
+      <div class="kpi-strip">
+        <div class="kpi-pill">
+          <span class="pill-label">生产指示数</span>
+          <span class="pill-val">{{ piCount.toLocaleString() }}</span>
         </div>
-      </template>
-      <div v-if="!list.length && !listLoading" class="panel-empty">
-        <ElEmpty description="无符合条件的 PI" />
+        <div class="kpi-pill">
+          <span class="pill-label">位置条数</span>
+          <span class="pill-val">{{ totalPositions.toLocaleString() }}</span>
+        </div>
+        <div class="kpi-pill danger">
+          <span class="pill-label">无法定位（条 / 数量）</span>
+          <span class="pill-val"
+            >{{ unlocatedCount.toLocaleString() }} / {{ unlocatedQty.toLocaleString() }}</span
+          >
+        </div>
       </div>
-      <ElTable v-else :data="list" size="small" border stripe>
-        <ElTableColumn label="PI 号" width="160">
-          <template #default="{ row }">
-            <code class="code-tag">{{ row.productionInstructionNo }}</code>
-          </template>
-        </ElTableColumn>
-        <ElTableColumn label="排程域" width="100">
-          <template #default="{ row }">
-            <ElTag size="small" effect="plain">{{ row.domainKey }}</ElTag>
-          </template>
-        </ElTableColumn>
-        <ElTableColumn prop="materialCode" label="物料" width="100" />
-        <ElTableColumn label="ERP / 位置 / 差异" width="220">
-          <template #default="{ row }">
-            <div class="qty-cell">
-              <span class="qty-erp">ERP {{ row.erpRemainingQty }}</span>
-              <span class="qty-pos">位置 {{ row.positionTotalQty }}</span>
-              <span :class="['qty-var', varianceClass(row.variance)]">
-                {{ varianceText(row.variance) }}
-              </span>
-            </div>
-          </template>
-        </ElTableColumn>
-        <ElTableColumn label="主位置" width="130">
-          <template #default="{ row }">
-            <ElTag :type="POSITION_TAG[row.mainPositionType]" effect="dark" size="small">
-              {{ POSITION_LABEL[row.mainPositionType] }}
+
+      <!-- ===== 位置类型分布（服务端聚合）===== -->
+      <ElCard v-if="hasPositions" class="panel">
+        <template #header>
+          <span class="panel-title">位置类型分布（全版本口径）</span>
+        </template>
+        <div class="position-grid">
+          <div v-for="t in summary!.positionTypeCounts" :key="t.positionType" class="position-cell">
+            <ElTag :type="positionTag(t.positionType)" effect="dark" size="small">
+              {{ positionLabel(t.positionType) }}
             </ElTag>
-          </template>
-        </ElTableColumn>
-        <ElTableColumn label="未分配数量" width="140" align="right">
-          <template #default="{ row }">
-            <span v-if="row.hasUnlocated" class="warn-strong">{{ row.unlocatedQty }}</span>
-            <span v-else class="muted">0</span>
-          </template>
-        </ElTableColumn>
-        <ElTableColumn label="采购占位" width="160" align="right">
-          <template #default="{ row }">
-            <span v-if="row.hasPlaceholderDependency" class="placeholder-strong">
-              {{ row.placeholderQty }}
-            </span>
-            <span v-else class="muted">0</span>
-          </template>
-        </ElTableColumn>
-        <ElTableColumn prop="supplyCount" label="供给数" width="80" align="center" />
-        <ElTableColumn label="MES 资格" width="120" align="center">
-          <template #default="{ row }">
-            <ElTag :type="MES_TAG[row.mesEligible]" size="small" effect="dark">
-              {{ MES_LABEL[row.mesEligible] }}
+            <span class="position-count">{{ t.count.toLocaleString() }}</span>
+            <span class="position-qty">数量 {{ t.totalQuantity.toLocaleString() }}</span>
+          </div>
+        </div>
+      </ElCard>
+
+      <!-- ===== 位置明细 ===== -->
+      <ElCard class="panel">
+        <template #header>
+          <div class="panel-header">
+            <span>位置明细</span>
+            <ElTag size="small" effect="plain">
+              本页 {{ list.length }} 条 / 共 {{ totalPositions.toLocaleString() }} 条
             </ElTag>
-          </template>
-        </ElTableColumn>
-        <ElTableColumn label="问题" width="80" align="center">
-          <template #default="{ row }">
-            <ElTag v-if="row.issueCount > 0" size="small" type="warning">
-              {{ row.issueCount }}
-            </ElTag>
-            <span v-else class="muted">0</span>
-          </template>
-        </ElTableColumn>
-        <ElTableColumn label="更新时间" width="140">
-          <template #default="{ row }">
-            <ElTooltip
-              :content="dayjs(row.updatedAt).format('YYYY-MM-DD HH:mm:ss')"
-              placement="top"
+            <ElTag v-if="hasFilter" size="small" type="warning" effect="plain"
+              >筛选后「共 N 条」仍是全版本口径</ElTag
             >
-              <span class="muted">{{ elapsed(row.updatedAt) }}</span>
-            </ElTooltip>
-          </template>
-        </ElTableColumn>
-        <ElTableColumn label="操作" width="80" align="center" fixed="right">
-          <template #default="{ row }">
+            <ElTag v-if="pageIssueRows > 0" size="small" type="warning" effect="plain">
+              本页带问题码 {{ pageIssueRows }} 条
+            </ElTag>
+          </div>
+        </template>
+        <ElTable v-loading="listLoading" :data="list" size="small" border stripe>
+          <ElTableColumn label="生产指示号" width="150">
+            <template #default="{ row }">
+              <ElButton
+                link
+                type="primary"
+                @click="piStore.openDetail(row.productionInstructionNo)"
+              >
+                <code class="code-tag">{{ row.productionInstructionNo }}</code>
+              </ElButton>
+            </template>
+          </ElTableColumn>
+          <ElTableColumn
+            prop="materialCode"
+            label="物料编码"
+            min-width="200"
+            show-overflow-tooltip
+          />
+          <ElTableColumn label="位置类型" width="180">
+            <template #default="{ row }">
+              <ElTag :type="positionTag(row.positionType)" effect="dark" size="small">
+                {{ positionLabel(row.positionType) }}
+              </ElTag>
+              <ElTag v-if="isUnlocated(row.positionType)" type="danger" size="small" effect="plain">
+                不可下发 MES
+              </ElTag>
+            </template>
+          </ElTableColumn>
+          <ElTableColumn prop="quantity" label="位置数量" width="130" align="right" />
+          <ElTableColumn label="当前阶段" width="120">
+            <template #default="{ row }">
+              <span v-if="row.currentStageCode" class="code-tag">{{ row.currentStageCode }}</span>
+              <span v-else class="muted">—</span>
+            </template>
+          </ElTableColumn>
+          <ElTableColumn label="位置问题码" width="140">
+            <template #default="{ row }">
+              <ElTag v-if="row.issueCode" type="warning" size="small" effect="plain">
+                {{ row.issueCode }}
+              </ElTag>
+              <span v-else class="muted">—</span>
+            </template>
+          </ElTableColumn>
+          <ElTableColumn label="快照时间" width="150">
+            <template #default="{ row }">
+              <span class="muted">{{ formatUtcDateTime(row.createdAt) }}</span>
+            </template>
+          </ElTableColumn>
+          <ElTableColumn label="操作" width="90" align="center" fixed="right">
+            <template #default="{ row }">
+              <ElButton
+                size="small"
+                link
+                type="primary"
+                @click="piStore.openDetail(row.productionInstructionNo)"
+              >
+                <Icon icon="vi-ep:view" /> 位置明细
+              </ElButton>
+            </template>
+          </ElTableColumn>
+        </ElTable>
+
+        <div class="pager">
+          <!--
+            列表端点不返回 total，「共 N 条」只能用 /summary 的全版本口径。
+            筛选后真实命中数未知，故筛选态只给「上一页/下一页」，页数由满页判断 ——
+            宁可少一个翻页入口，也不给一个算错的总页数。
+          -->
+          <template v-if="hasFilter">
             <ElButton
               size="small"
-              link
-              type="primary"
-              @click="selectPi(row.productionInstructionNo)"
+              :disabled="pageIndex <= 1 || listLoading"
+              @click="piStore.setPage(pageIndex - 1)"
             >
-              <Icon icon="vi-ep:view" /> 查看
+              <Icon icon="vi-ep:arrow-left" /> 上一页
+            </ElButton>
+            <span class="pager-text">第 {{ pageIndex }} 页 · 本页 {{ list.length }} 条</span>
+            <ElButton
+              size="small"
+              :disabled="list.length < pageSize || listLoading"
+              @click="piStore.setPage(pageIndex + 1)"
+            >
+              下一页 <Icon icon="vi-ep:arrow-right" />
             </ElButton>
           </template>
-        </ElTableColumn>
-      </ElTable>
-    </ElCard>
+          <ElPagination
+            v-else
+            :current-page="pageIndex"
+            :page-size="pageSize"
+            :total="totalPositions"
+            :page-sizes="[50, 100, 200, 500]"
+            layout="total, sizes, prev, pager, next, jumper"
+            background
+            @current-change="(p: number) => piStore.setPage(p)"
+            @size-change="(s: number) => piStore.setPage(1, s)"
+          />
+        </div>
+      </ElCard>
+    </template>
 
-    <!-- ===== 加载态 ===== -->
-    <div v-if="loading" class="loading-tip">加载 PI 详情中…</div>
-
-    <!-- ===== 详情 Drawer ===== -->
+    <!-- ===== 单 PI 位置明细 Drawer ===== -->
     <ElDrawer
       :model-value="detailOpen"
       direction="rtl"
-      size="900px"
+      size="820px"
       :with-header="false"
-      @update:model-value="closeDrawer"
+      @update:model-value="piStore.closeDetail"
     >
-      <div v-if="currentDetail" class="drawer-body">
-        <!-- 抽屉头 -->
+      <div class="drawer-body">
         <div class="drawer-header">
           <div class="drawer-title">
-            <code class="code-tag">{{ detailNN.productionInstructionNo }}</code>
-            <ElTag :type="POSITION_TAG[detailNN.mainPositionType]" effect="dark" size="small">
-              {{ POSITION_LABEL[detailNN.mainPositionType] }}
-            </ElTag>
-            <ElTag size="small" effect="plain">{{ detailNN.materialCode }}</ElTag>
-            <ElTag size="small" effect="plain">{{ detailNN.domainKey }}</ElTag>
+            <code class="code-tag">{{ currentPiNo }}</code>
+            <span class="muted">该生产指示的全部位置行</span>
           </div>
-          <ElButton @click="closeDrawer"> <Icon icon="vi-ep:close" /> 关闭 </ElButton>
+          <ElButton @click="piStore.closeDetail"> <Icon icon="vi-ep:close" /> 关闭 </ElButton>
         </div>
 
-        <!-- Summary -->
-        <ElDescriptions :column="4" size="small" border>
-          <ElDescriptionsItem label="ERP 剩余">{{ detailNN.erpRemainingQty }}</ElDescriptionsItem>
-          <ElDescriptionsItem label="位置合计">{{ detailNN.positionTotalQty }}</ElDescriptionsItem>
-          <ElDescriptionsItem label="差异">
-            <span :class="varianceClass(detailNN.variance)">{{
-              varianceText(detailNN.variance)
-            }}</span>
-          </ElDescriptionsItem>
-          <ElDescriptionsItem label="供给来源数">{{ detailNN.supplies.length }}</ElDescriptionsItem>
-          <ElDescriptionsItem label="更新于">
-            {{ dayjs(detailNN.updatedAt).format('YYYY-MM-DD HH:mm:ss') }}
-          </ElDescriptionsItem>
-          <ElDescriptionsItem label="问题" :span="3">
-            <ElTag v-if="detailNN.issues.length === 0" type="success" size="small">无</ElTag>
-            <ElTag v-else type="warning" size="small">{{ detailNN.issues.length }} 个</ElTag>
-          </ElDescriptionsItem>
-        </ElDescriptions>
-
-        <!-- Issue 提示 -->
         <ElAlert
-          v-for="(iss, idx) in detailNN.issues"
-          :key="idx"
-          :type="iss.issueType === 'UNLOCATED_EXISTS' ? 'error' : 'warning'"
+          v-if="detailError"
+          type="warning"
           :closable="false"
           show-icon
-          class="issue-alert"
-        >
-          <template #title>
-            <span :class="issueClass(iss.issueType)">{{ issueLabel(iss.issueType) }}</span>
-          </template>
-          {{ iss.message }}
-          <span v-if="iss.relatedSupplyKey" class="issue-ref">#{{ iss.relatedSupplyKey }}</span>
-        </ElAlert>
+          :title="detailError"
+        />
 
-        <!-- 位置明细 -->
-        <ElCard class="panel">
-          <template #header>
-            <span>
-              <Icon icon="vi-mdi:map-marker" />
-              位置明细（{{ detailNN.positions.length }} 行）
-            </span>
-          </template>
-          <div v-if="!detailNN.positions.length" class="panel-empty">
-            <ElEmpty description="无位置数据（不可下发 MES）" />
-          </div>
-          <ElTable v-else :data="detailNN.positions" size="small" border>
-            <ElTableColumn label="位置类型" width="130">
+        <template v-else>
+          <ElDescriptions :column="3" size="small" border>
+            <ElDescriptionsItem label="位置行数">{{ detailRows.length }}</ElDescriptionsItem>
+            <ElDescriptionsItem label="数量合计">{{
+              detailTotalQty.toLocaleString()
+            }}</ElDescriptionsItem>
+            <ElDescriptionsItem label="计划版本">{{ planVersionId }}</ElDescriptionsItem>
+          </ElDescriptions>
+
+          <ElTable v-loading="detailLoading" :data="detailRows" size="small" border>
+            <ElTableColumn label="位置类型" width="170">
               <template #default="{ row }">
-                <ElTag
-                  :type="POSITION_TAG[row.positionType as PiPositionType]"
-                  effect="dark"
-                  size="small"
-                >
-                  {{ POSITION_LABEL[row.positionType as PiPositionType] }}
+                <ElTag :type="positionTag(row.positionType)" effect="dark" size="small">
+                  {{ positionLabel(row.positionType) }}
                 </ElTag>
               </template>
             </ElTableColumn>
-            <ElTableColumn prop="stage" label="阶段" width="120">
+            <ElTableColumn prop="quantity" label="位置数量" width="120" align="right" />
+            <ElTableColumn label="当前阶段" width="110">
               <template #default="{ row }">
-                <span v-if="row.stage" class="code-tag">{{ row.stage }}</span>
+                <span v-if="row.currentStageCode" class="code-tag">{{ row.currentStageCode }}</span>
                 <span v-else class="muted">—</span>
               </template>
             </ElTableColumn>
-            <ElTableColumn label="位置数量" width="120" align="right">
-              <template #default="{ row }">{{ row.positionQty }}</template>
-            </ElTableColumn>
-            <ElTableColumn label="跨工厂" width="90" align="right">
+            <ElTableColumn label="位置问题码" width="130">
               <template #default="{ row }">
-                <span v-if="row.crossFactoryQty">{{ row.crossFactoryQty }}</span>
+                <ElTag v-if="row.issueCode" type="warning" size="small" effect="plain">{{
+                  row.issueCode
+                }}</ElTag>
                 <span v-else class="muted">—</span>
               </template>
             </ElTableColumn>
-            <ElTableColumn label="在途" width="90" align="right">
+            <ElTableColumn label="物料编码" min-width="180" show-overflow-tooltip>
               <template #default="{ row }">
-                <span v-if="row.transitQty">{{ row.transitQty }}</span>
-                <span v-else class="muted">—</span>
+                <span class="code-tag">{{ row.materialCode }}</span>
               </template>
             </ElTableColumn>
-            <ElTableColumn label="等待" width="90" align="right">
+            <ElTableColumn label="快照时间" width="150">
               <template #default="{ row }">
-                <span v-if="row.waitingQty">{{ row.waitingQty }}</span>
-                <span v-else class="muted">—</span>
-              </template>
-            </ElTableColumn>
-            <ElTableColumn label="未分配数量" width="140" align="right">
-              <template #default="{ row }">
-                <span v-if="row.unlocatedQty" class="warn-strong">{{ row.unlocatedQty }}</span>
-                <span v-else class="muted">0</span>
-              </template>
-            </ElTableColumn>
-            <ElTableColumn label="备注" min-width="200">
-              <template #default="{ row }">
-                <span v-if="row.issue" class="warn-strong">{{ row.issue }}</span>
-                <span v-else class="muted">—</span>
+                <span class="muted">{{ formatUtcDateTime(row.createdAt) }}</span>
               </template>
             </ElTableColumn>
           </ElTable>
-        </ElCard>
-
-        <!-- 供给拆解 -->
-        <ElCard class="panel">
-          <template #header>
-            <span>
-              <Icon icon="vi-mdi:truck-delivery-outline" />
-              供给拆解（{{ detailNN.supplies.length }} 条）
-            </span>
-          </template>
-          <div v-if="!detailNN.supplies.length" class="panel-empty">
-            <ElEmpty description="无供给来源" />
-          </div>
-          <ElTable v-else :data="detailNN.supplies" size="small" border>
-            <ElTableColumn label="类型" width="180">
-              <template #default="{ row }">
-                <ElTag :type="SUPPLY_TAG[row.supplyType as SupplyType]" effect="dark" size="small">
-                  {{ SUPPLY_LABEL[row.supplyType as SupplyType] }}
-                </ElTag>
-              </template>
-            </ElTableColumn>
-            <ElTableColumn label="供给编号" min-width="160">
-              <template #default="{ row }">
-                <code class="code-tag">{{ row.supplyKey }}</code>
-              </template>
-            </ElTableColumn>
-            <ElTableColumn label="数量" width="100" align="right" prop="qty" />
-            <ElTableColumn label="可供应时间" width="180">
-              <template #default="{ row }">
-                <span v-if="row.availableTime">
-                  <ElTooltip
-                    :content="dayjs(row.availableTime).format('YYYY-MM-DD HH:mm:ss')"
-                    placement="top"
-                  >
-                    <span
-                      :class="{ 'est-text': row.isPlanningOnlyPlaceholder || row.isNotCommitted }"
-                    >
-                      {{ elapsed(row.availableTime) }}
-                    </span>
-                  </ElTooltip>
-                </span>
-                <span v-else class="muted">—</span>
-              </template>
-            </ElTableColumn>
-            <ElTableColumn label="未承诺" width="130" align="center">
-              <template #default="{ row }">
-                <ElTag v-if="row.isNotCommitted" size="small" type="warning">是</ElTag>
-                <span v-else class="muted">否</span>
-              </template>
-            </ElTableColumn>
-            <ElTableColumn label="估算值" width="140" align="center">
-              <template #default="{ row }">
-                <ElTooltip
-                  v-if="row.isPlanningOnlyPlaceholder"
-                  :content="ESTIMATED_BADGE_TEXT"
-                  placement="top"
-                >
-                  <ElTag
-                    size="small"
-                    effect="dark"
-                    style="background: #8b5cf6; border-color: #8b5cf6"
-                  >
-                    是
-                  </ElTag>
-                </ElTooltip>
-                <span v-else class="muted">否</span>
-              </template>
-            </ElTableColumn>
-            <ElTableColumn label="关联订单" width="160">
-              <template #default="{ row }">
-                <span v-if="row.relatedOrderNo" class="code-tag">{{ row.relatedOrderNo }}</span>
-                <span v-else class="muted">—</span>
-              </template>
-            </ElTableColumn>
-            <ElTableColumn label="说明" min-width="200">
-              <template #default="{ row }">
-                <span v-if="row.description" class="desc-cell">{{ row.description }}</span>
-                <span v-else class="muted">—</span>
-              </template>
-            </ElTableColumn>
-          </ElTable>
-        </ElCard>
-
-        <!-- 供给类型分布 -->
-        <ElCard class="panel">
-          <template #header>
-            <span>
-              <Icon icon="vi-mdi:chart-pie" />
-              供给类型分布
-            </span>
-          </template>
-          <div class="supply-grid">
-            <div
-              v-for="(qty, t) in supplyTypeCounts"
-              :key="t"
-              class="supply-cell"
-              :class="{ zero: qty === 0 }"
-            >
-              <ElTag :type="SUPPLY_TAG[t as SupplyType]" effect="plain" size="small">
-                {{ SUPPLY_LABEL[t as SupplyType] }}
-              </ElTag>
-              <span class="supply-qty">{{ qty }}</span>
-            </div>
-          </div>
-        </ElCard>
+        </template>
       </div>
     </ElDrawer>
   </div>
@@ -687,45 +460,13 @@ onMounted(() => {
   gap: 16px;
 }
 
-.page-header {
-  display: flex;
-  justify-content: space-between;
-  align-items: flex-end;
-
-  .page-title {
-    margin: 0;
-    font-size: 20px;
-    font-weight: 600;
-    color: #1e293b;
-  }
-
-  .page-sub {
-    margin: 4px 0 0;
-    font-size: 12px;
-    color: #94a3b8;
-  }
-}
-
-.hint-bar {
-  :deep(.el-alert__title) {
-    font-weight: 600;
-  }
-
-  .hint-text {
-    margin-left: 8px;
-    font-size: 13px;
-    line-height: 1.8;
-    color: #475569;
-  }
-}
-
 .panel {
   border-radius: 8px;
 }
 
 .panel-header {
   display: flex;
-  justify-content: space-between;
+  gap: 10px;
   align-items: center;
   font-size: 14px;
   font-weight: 600;
@@ -738,12 +479,12 @@ onMounted(() => {
   color: #1e293b;
 }
 
-.panel-empty {
-  padding: 20px 0;
-}
-
 .muted {
   color: #94a3b8;
+}
+
+.hint {
+  font-size: 12px;
 }
 
 .code-tag {
@@ -755,11 +496,24 @@ onMounted(() => {
   border-radius: 3px;
 }
 
-.loading-tip {
-  padding: 30px;
-  font-size: 14px;
-  color: #94a3b8;
-  text-align: center;
+/* 筛选 */
+.filter-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+  align-items: center;
+}
+
+.filter-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+
+  .filter-label {
+    min-width: 56px;
+    font-size: 12px;
+    color: #64748b;
+  }
 }
 
 /* KPI */
@@ -778,28 +532,8 @@ onMounted(() => {
   align-items: center;
   gap: 6px;
 
-  &.warn {
-    background: #fef3c7;
-  }
-
   &.danger {
     background: #fee2e2;
-  }
-
-  &.placeholder {
-    background: #f3e8ff;
-  }
-
-  &.ok {
-    background: #d1fae5;
-  }
-
-  &.bad {
-    background: #fecaca;
-  }
-
-  &.muted {
-    background: #f1f5f9;
   }
 
   .pill-label {
@@ -812,7 +546,7 @@ onMounted(() => {
   }
 }
 
-/* Position 分布 */
+/* 位置类型分布 */
 .position-grid {
   display: grid;
   grid-template-columns: repeat(3, 1fr);
@@ -821,183 +555,58 @@ onMounted(() => {
 
 .position-cell {
   display: flex;
-  justify-content: space-between;
-  align-items: center;
   padding: 10px 14px;
   background: #f8fafc;
   border-radius: 6px;
+  align-items: center;
+  gap: 10px;
 
   .position-count {
+    margin-left: auto;
     font-family: 'Courier New', monospace;
-    font-size: 20px;
+    font-size: 18px;
     font-weight: 700;
     color: #1e293b;
   }
-}
 
-/* 过滤 */
-.filter-panel {
-  padding: 0;
-}
-
-.filter-row {
-  display: flex;
-  gap: 16px;
-  align-items: center;
-  padding: 12px;
-}
-
-.filter-item {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-
-  .filter-label {
-    min-width: 50px;
+  .position-qty {
     font-size: 12px;
-    color: #64748b;
-  }
-}
-
-/* 数量单元格 */
-.qty-cell {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-  font-family: 'Courier New', monospace;
-  font-size: 12px;
-
-  .qty-erp {
     color: #94a3b8;
   }
-
-  .qty-pos {
-    font-weight: 600;
-    color: #1e293b;
-  }
-
-  .qty-var {
-    font-weight: 600;
-  }
 }
 
-.variance-pos {
-  color: #f59e0b;
+.pager {
+  display: flex;
+  padding-top: 12px;
+  gap: 10px;
+  align-items: center;
+  justify-content: flex-end;
 }
 
-.variance-neg {
-  color: #ef4444;
-}
-
-.variance-zero {
-  color: #94a3b8;
-}
-
-/* 警示 */
-.warn-strong {
-  font-weight: 700;
-  color: #ef4444;
-}
-
-.placeholder-strong {
-  font-weight: 700;
-  color: #8b5cf6;
-}
-
-.est-text {
-  font-weight: 600;
-  color: #8b5cf6;
-}
-
-/* Issue 标签 */
-.u16-tag {
-  font-weight: 700;
-  color: #ef4444;
-}
-
-.u17-tag {
-  font-weight: 700;
-  color: #f59e0b;
-}
-
-.u18-tag {
-  font-weight: 700;
-  color: #8b5cf6;
-}
-
-.warn-tag {
-  font-weight: 700;
-  color: #f59e0b;
-}
-
-.issue-ref {
-  margin-left: 6px;
-  font-family: 'Courier New', monospace;
-  font-size: 11px;
+.pager-text {
+  font-size: 12px;
   color: #64748b;
 }
 
 /* Drawer */
 .drawer-body {
   display: flex;
+  padding: 16px 24px 32px;
   flex-direction: column;
   gap: 16px;
-  padding: 16px 24px 32px;
 }
 
 .drawer-header {
   display: flex;
-  justify-content: space-between;
-  align-items: center;
   padding-bottom: 12px;
   border-bottom: 2px solid #e2e8f0;
+  justify-content: space-between;
+  align-items: center;
 
   .drawer-title {
     display: flex;
     gap: 8px;
     align-items: center;
-  }
-}
-
-.issue-alert {
-  margin-bottom: 8px;
-}
-
-.desc-cell {
-  font-size: 12px;
-  line-height: 1.4;
-  color: #475569;
-}
-
-/* Supply 分布 */
-.supply-grid {
-  display: grid;
-  grid-template-columns: repeat(3, 1fr);
-  gap: 8px;
-}
-
-.supply-cell {
-  display: flex;
-  padding: 8px 12px;
-  background: #f8fafc;
-  border-left: 3px solid #3b82f6;
-  border-radius: 4px;
-  justify-content: space-between;
-  align-items: center;
-
-  &.zero {
-    background: #f9fafb;
-    border-left-color: #e5e7eb;
-
-    .supply-qty {
-      color: #94a3b8;
-    }
-  }
-
-  .supply-qty {
-    font-family: 'Courier New', monospace;
-    font-weight: 600;
-    color: #1e293b;
   }
 }
 </style>

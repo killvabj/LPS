@@ -33,7 +33,9 @@ public class ExplanationQueryService
         CancellationToken ct = default)
     {
         if (planVersionId <= 0) throw new ArgumentException("planVersionId is required");
-        if (take <= 0 || take > 500) take = 100;
+        // 越界夹上限不静默回落（4号位 10-19 R2 同型扫描批修）。
+        if (take <= 0) take = 100;
+        if (take > 500) take = 500;
 
         return await _repository.QueryAsync(
             planVersionId, objectType, orderId, taskId,

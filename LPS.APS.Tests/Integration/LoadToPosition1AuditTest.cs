@@ -6,11 +6,13 @@ using System.Threading.Tasks;
 using Xunit;
 using LPS.APS.Application.Services;
 using LPS.APS.Application.Services.Fixtures;
+using LPS.APS.Core.Rules;
 using LPS.APS.Application.Extensions;
 using LPS.APS.BusinessRules.Extensions;
 using LPS.APS.Engine.Data;
 using LPS.APS.Engine.Extensions;
 using LPS.APS.Scheduling.Extensions;
+using LPS.APS.Scheduling.Solvers;
 using LPS.APS.Core.Interfaces;
 using LPS.APS.Core.Dto;
 using LPS.APS.Core.Enum;
@@ -48,6 +50,29 @@ public class LoadToPosition1AuditTest
     private static int TimeoutMinutes =>
         int.TryParse(Environment.GetEnvironmentVariable("APS_AUDIT_TIMEOUT_MIN"), out var v) ? v : 90;
 
+    /// <summary>
+    /// **Candidate 模式通电开关**（2026-10-13 新增）。
+    ///
+    /// 【为什么要它】T-04 两条契约（`DomainSolveRequest.ExecutionConstraints` / `OrderProtections`）的
+    ///   装载侧入口 `PeggingOrchestrator.BuildAnchorPayloadAsync` 有两条早退：
+    ///   `!request.IsCandidate` 或 `!request.BasePlanVersionId.HasValue`。本探针原先硬写
+    ///   `IsCandidate = false` ⇒ 该路径**恒早退**，永远打 `ExecutionConstraints=0 ⚠`，
+    ///   **从没在真实数据上跑过**。要验「交给 1号位 的锚点对不对」，必须让它真的进去。
+    ///
+    /// 【怎么用】`APS_PROBE_CANDIDATE=1`（配合 `APS_PROBE_BASE_PV=&lt;PlanVersionId&gt;`）；
+    ///   不给 `APS_PROBE_BASE_PV` 时 **Base 取本次 `APS_PROBE_PLAN_VERSION`**（同版自比，只为通电，
+    ///   **不是**真实「上一 ACTIVE」语义——实库当前 0 个 ACTIVE，无真实跨版本基座可指）。
+    ///
+    /// 【性质】只改探针请求构造 ⇒ 不影响任何生产代码；仍走 `RunPeggingOnlyAsync`
+    ///   （**不调 Solver、不落库**）。`CandidateContext` 由 `BuildCandidateContextAsync` 正常装配。
+    /// </summary>
+    private static bool CandidateMode =>
+        string.Equals(Environment.GetEnvironmentVariable("APS_PROBE_CANDIDATE"), "1", StringComparison.Ordinal);
+
+    /// <summary>`APS_PROBE_BASE_PV` ⇒ 指定 Base（上一 ACTIVE）PlanVersionId；缺省见 <see cref="CandidateMode"/>。</summary>
+    private static int? BasePvOverride =>
+        int.TryParse(Environment.GetEnvironmentVariable("APS_PROBE_BASE_PV"), out var v) ? v : null;
+
     [Fact(DisplayName = "装载验收：交给 1号位 的 DomainSolveRequest 逐项核对（含连续性分桶）")]
     public async Task LoadToPosition1_PayloadAudit()
     {
@@ -76,18 +101,29 @@ public class LoadToPosition1AuditTest
                 b.AddProvider(new ProbeConsoleLoggerProvider());
         });
         services.AddScoped<DatabaseConnectionManager>();
+        // 2026-10-13 §T-1013x：仅用于**借用生产的资源/日历装载**（`LoadResourcesAndCalendarAsync`，已 internal）
+        //   ⇒ 探针装给 1号位 的 `Resources`/`CalendarSlots` 与生产同源，不再恒 0。
+        services.AddScoped<SchedulingOrchestrator>();
 
         var sp = services.BuildServiceProvider();
         var orchestrator = (PeggingOrchestrator)sp.GetRequiredService<IPeggingOrchestrator>();
         var conn = sp.GetRequiredService<DatabaseConnectionManager>();
+        var schedulingOrchestrator = sp.GetRequiredService<SchedulingOrchestrator>();
 
-        var domainKey = await conn.QueryFirstOrDefaultAsync<string>(
-            "SELECT DomainKey FROM PlanVersion WHERE Id=@p", new { p = PlanVersionId }, db: DatabaseId.APS);
+        // 2026-10-13 §T-1013x 补：**连计划期一起取本 PV 自己的**（原来是写死的 `now..now+90d`）。
+        //   生产建 `SchedulingContext` 用的是 `planVersion.PlanHorizonStart/End`（见 `LoadSchedulingContextAsync`），
+        //   该值经 `BuildSolveRequestAsync` 流进 `DomainSolveRequest.PlanningStart/PlanningEnd` 交给 1号位。
+        //   探针若自造 90 天窗，这行就与生产有差（PV2 实测差 5 天：生产 `2026-10-08..2027-01-06`）⇒ 不具代表性。
+        var pv = await conn.QueryFirstOrDefaultAsync<PlanVersionHorizon>(
+            "SELECT DomainKey, PlanHorizonStart, PlanHorizonEnd FROM PlanVersion WHERE Id=@p",
+            new { p = PlanVersionId }, db: DatabaseId.APS);
+        var domainKey = pv?.DomainKey;
         var orderIds = (await conn.QueryAsync<long>(
             "SELECT Id FROM [Order] WHERE PlanVersionId=@p ORDER BY Id",
             new { p = PlanVersionId }, db: DatabaseId.APS)).ToList();
 
-        Say($"Domain={domainKey} PlanVersionId={PlanVersionId} Orders={orderIds.Count}");
+        Say($"Domain={domainKey} PlanVersionId={PlanVersionId} Orders={orderIds.Count} " +
+            $"计划期={pv?.PlanHorizonStart:yyyy-MM-dd}..{pv?.PlanHorizonEnd:yyyy-MM-dd}（取自 PlanVersion，与生产同源）");
 
         var allOrderCount = orderIds.Count;   // 收窄前 = 本 PV 全量订单数（用于判定是否走了小样本）
 
@@ -113,6 +149,40 @@ public class LoadToPosition1AuditTest
         orderIds = await ScopeOrderIdsAsync(conn, orderIds);
 
         var now = DateTime.Now;
+
+        // ── T-04 两条契约通电（2026-10-13）：Candidate 模式见 CandidateMode 注释 ──
+        var candidate = CandidateMode;
+        var basePv = candidate ? (BasePvOverride ?? PlanVersionId) : (int?)null;
+        if (candidate)
+        {
+            Say($"⚠ **Candidate 模式通电**：IsCandidate=true, BasePlanVersionId={basePv}" +
+                (BasePvOverride is null
+                    ? "（未给 APS_PROBE_BASE_PV ⇒ 取本次 PlanVersionId 同版自比，**仅为通电**，不是真实「上一 ACTIVE」语义）"
+                    : "（显式指定）") +
+                " —— 走 PeggingOrchestrator.BuildAnchorPayloadAsync 全路径；仍不调 Solver、不落库");
+        }
+
+        // ── 2026-10-13 §T-1013x：把 `SchedulingContext` 的资源/日历轴**按生产同一份代码**填上 ──
+        //   此前这里只赋 4 个字段 ⇒ `BuildResourceDefinitions`/`BuildResourceCalendarSlots` 首行判 Count==0 直接返空
+        //   ⇒ 探针打出的 `Resources=0 CalendarSlots=0` 是**假象**（生产非 0），却一度被我登成缺陷。
+        //   现改为调用 `SchedulingOrchestrator.LoadResourcesAndCalendarAsync`（同一份生产实现，不自己复刻 SQL）。
+        //   ⚠ 仍与生产有别、**已核实不流入载荷**的一项：`ScheduleRunId` 探针=0（未建 Run）⇒ `LoadMESProgressAsync`
+        //     不跑、`context.MESRemainingQty` 不填；而 `PeggingOrchestrator` 全文件**不读** `MESRemainingQty`
+        //     /`Orders`/`InventorySupplies`（已 grep 核），故不影响载荷。
+        var schedulingContext = new SchedulingContext
+        {
+            StrategyProfileVersionId = StrategyProfileVersionId,
+            DataCutoffTime           = now,
+            // 与生产一致：用本 PV 自己的计划期（`LoadSchedulingContextAsync` 即取 `planVersion.PlanHorizon*`）。
+            PlanHorizonStart         = pv?.PlanHorizonStart ?? now,
+            PlanHorizonEnd           = pv?.PlanHorizonEnd ?? now.AddDays(90)
+        };
+        // 超时用探针自己的 cts（原来传 `CancellationToken.None` ⇒ 这一步无超时保护，是我引入的疏漏）。
+        using var cts = new CancellationTokenSource(TimeSpan.FromMinutes(TimeoutMinutes));
+        await schedulingOrchestrator.LoadResourcesAndCalendarAsync(schedulingContext, cts.Token);
+        Say($"接通生产资源装载：Resources={schedulingContext.Resources.Count} " +
+            $"带日历资源={schedulingContext.ResourceCalendars.Count}（来自 SchedulingOrchestrator.LoadResourcesAndCalendarAsync）");
+
         var request = new PeggingExecutionRequest
         {
             PlanVersionId      = PlanVersionId,
@@ -125,20 +195,15 @@ public class LoadToPosition1AuditTest
             DefaultStrategy    = PeggingStrategyType.FIFO,
             MaxBomDepth        = 10,
             TimeoutSeconds     = 900,
-            ExecutionMode      = "FULL_RUN",
-            IsCandidate        = false,
-            SchedulingContext  = new SchedulingContext
-            {
-                StrategyProfileVersionId = StrategyProfileVersionId,
-                DataCutoffTime           = now,
-                PlanHorizonStart         = now,
-                PlanHorizonEnd           = now.AddDays(90)
-            }
+            ExecutionMode      = candidate ? "CANDIDATE" : "FULL_RUN",
+            IsCandidate        = candidate,
+            BasePlanVersionId  = basePv,
+            SchedulingContext  = schedulingContext
         };
 
-        using var cts = new CancellationTokenSource(TimeSpan.FromMinutes(TimeoutMinutes));
         // 小样本模式下把 BOM 宇宙一起收窄（否则 5 个订单仍要装整 PV 的 BOM ⇒ 118,151 条 PI 事实 ⇒ 光 5号位
         //   PI Position 计算就 105s，白等）。全量模式（未收窄订单）保持 scopeBomToOrders=false，与生产逐字一致。
+        //   （`cts` 已上移至资源装载之前声明，此处复用同一条。）
         var payload = await orchestrator.RunPeggingOnlyAsync(
             request, cts.Token, scopeBomToOrders: orderIds.Count < allOrderCount);
 
@@ -153,6 +218,522 @@ public class LoadToPosition1AuditTest
         // 分桶切不出的**逐条**证据（2026-10-09）：需求侧 PI 已能全中 PI Position，但 E 恒为 0 ⇒ 把命中的
         //   上下文原样 dump（E / Slices 明细 / Issue），别再从代码推。
         AuditContinuityContexts(payload);
+
+        // §1.4(a) Stage 入口基线自由量（2026-10-12 新增；1号位 B-009 门禁后两项的唯一上游）
+        AuditPiStageBaselines(payload);
+
+        // §DG-05 DemandGoal（2026-10-12 新增；2026-10-13 取值链投产 ⇒ 本段改为**独立重算对账**）
+        //   根订单口径需回查 [Order]（OrderNo / OrderType / CustomerSegment）——**只作独立重算，不是取值规则**。
+        var orderMeta = (await conn.QueryAsync<OrderMetaRow>(
+            @"SELECT Id, ISNULL(OrderNo, N'') AS OrderNo, ISNULL(OrderType, N'') AS OrderType,
+                     ISNULL(CustomerSegment, N'') AS CustomerSegment
+              FROM [Order] WHERE PlanVersionId=@p",
+            new { p = PlanVersionId }, db: DatabaseId.APS))
+            .ToDictionary(r => r.Id);
+        AuditDemandGoal(payload.SolveRequest.LogicalProductionDemands, orderMeta);
+
+        // ── T-04 两条契约的**真实产物**（只有 Candidate 模式才有；FULL 侧恒早退）─────────────────────
+        if (candidate && basePv.HasValue)
+            await AuditAnchorsAsync(conn, payload, basePv.Value);
+    }
+
+    /// <summary>`PlanVersion` 的域键与**自身计划期**（探针据此建 `SchedulingContext`，与生产同源，不再自造 90 天窗）。</summary>
+    private sealed class PlanVersionHorizon
+    {
+        public string DomainKey { get; set; } = string.Empty;
+        public DateTime PlanHorizonStart { get; set; }
+        public DateTime PlanHorizonEnd { get; set; }
+    }
+
+    /// <summary>`[Order]` 行的 Goal 计量用元数据（仅 OrderType / CustomerSegment，不含金额等业务字段）。</summary>
+    private sealed class OrderMetaRow
+    {
+        public long Id { get; set; }
+        public string OrderNo { get; set; } = string.Empty;
+        public string OrderType { get; set; } = string.Empty;
+        public string CustomerSegment { get; set; } = string.Empty;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // §1.4(a) Stage 入口基线自由量（`DomainSolveRequest.PiStageQuantityBaselines`）
+    //
+    // 判读：候选键 − 产行 = **未产行**数。未产行是**设计行为**（缺位置事实／该 Stage 自由量 ≤ 0），
+    //   1号位 侧记「缺 Stage 合法自由量上下文」**显式未满足**，不是静默丢——但差额大时需要看一眼原因。
+    //   四条不变量任一越界即真缺陷（②③④ 尤其：③ 越界 = 毛量超过权威总量根，等于静默放大可用量）。
+    // ─────────────────────────────────────────────────────────────────────
+    private static void AuditPiStageBaselines(PeggingOrchestrator.PeggingPayload payload)
+    {
+        var req  = payload.SolveRequest;
+        var rows = req.PiStageQuantityBaselines ?? Array.Empty<PiStageQuantityBaseline>();
+
+        var piRemaining = req.PiRemainingFacts
+            .GroupBy(f => (f.ProductionInstructionNo, f.MaterialId))
+            .ToDictionary(g => g.Key, g => g.Sum(f => f.PiRemainingQty));
+
+        // 已验证 PI 宇宙（= 事实侧 B-01 业务身份闸门之后的 PI 集合；与装载层 `verifiedPiSet` 同源同口径）。
+        var verifiedPiSet = req.PiRemainingFacts
+            .Select(f => f.ProductionInstructionNo?.Trim() ?? string.Empty)
+            .ToHashSet(StringComparer.Ordinal);
+
+        // 候选键：与装载层同谓词**独立重算**（C 桶 ＋ **PI 落在已验证宇宙内** ＋ 有 StartStageCode）
+        //   ⚠ 2026-10-12 收紧：原谓词只查「PI 号非空」⇒ 把客户订单行（`OrderType='SALES_ORDER'`，挂着 PI 号
+        //     但被 B-01 闸门挡在事实集外）也计进了分母（PV2 实测 21,787，真实 9,324）。
+        //   ⚠ 原谓词里的 `!d.IsUnlocated` 已移除：需求侧该标志是装载层占位、恒 false ⇒ 空过滤（见本方法末尾知会）。
+        var keys = req.LogicalProductionDemands
+            .Where(d => !d.IsContinuation
+                        && !string.IsNullOrWhiteSpace(d.ProductionInstructionNo)
+                        && verifiedPiSet.Contains(d.ProductionInstructionNo!.Trim())
+                        && !string.IsNullOrWhiteSpace(d.StartStageCode))
+            .Select(d => (Pi: d.ProductionInstructionNo!.Trim(), d.MaterialId, Stage: d.StartStageCode.Trim()))
+            .Distinct()
+            .ToList();
+
+        // B-01 身份闸门挡下量：挂了 PI 号、但该 PI 不在权威事实集内（PV2 预期 ≈12,463）。
+        //   这一行是 PM「12,463 为什么没有 PI Position」的现场答案（= 需求侧收了一个事实侧不认的号），别删。
+        var identityGatedOut = req.LogicalProductionDemands
+            .Where(d => !d.IsContinuation
+                        && !string.IsNullOrWhiteSpace(d.ProductionInstructionNo)
+                        && !verifiedPiSet.Contains(d.ProductionInstructionNo!.Trim()))
+            .ToList();
+
+        var rowKeys = rows.Select(r => (r.ProductionInstructionNo, r.MaterialId, r.StageCode)).ToList();
+
+        Say("──────── §1.4(a) Stage 入口基线自由量（1号位 B-009 门禁后两项）────────");
+        Say($"候选键(C桶×PI在权威事实集×有Stage)={keys.Count} 产行={rows.Count} 未产行={keys.Count - rows.Count}");
+        Say($"  └ B-01 身份闸门挡下(挂 PI 号但该 PI 不在事实集内，PV2 预期 ≈12,463)：{identityGatedOut.Count} 条需求" +
+            (identityGatedOut.Count > 0
+                ? $"；样本 {Join(identityGatedOut.Take(MaxSample).Select(d => d.ProductionInstructionNo))}"
+                : ""));
+        Say($"Σ毛量={rows.Sum(r => r.StageFreeEligibleQty)} Σ入口已占={rows.Sum(r => r.AlreadyCommittedQty)} " +
+            $"已占>0 的行={rows.Count(r => r.AlreadyCommittedQty > 0m)}（>0 才证明 A/B 已执行量真装进来了）");
+
+        // ── 归因（2026-10-13 §T-1013y）：Σ已占=0 是「装载漏装 A/B」还是「C桶基线与执行事实结构性不相交」？──
+        //   两个互斥解释，**必须用数据分开**（旧台账把它一口断成「A/B 已执行量未装进来」，那只是**其中一种**可能）：
+        //   ① 结构性不相交：凡 `PiPosition` 带执行上下文的 PI，其需求**必被分桶切成 Continuation** ⇒
+        //      被装载层 `!d.IsContinuation` 过滤掉，**物理上不可能**出现在本基线行里 ⇒ Σ已占=0 是分工结果，非缺陷；
+        //   ② 装载漏装：产行里确有「PI 带执行上下文」的键，却没算出 committed ⇒ **真缺陷**。
+        var ctxPiSet = payload.PiPositions
+            .Where(kv => (kv.Value.ExistingExecutionContexts?.Count ?? 0) > 0)
+            .Select(kv => kv.Key).ToHashSet(StringComparer.Ordinal);
+        var rowPiInCtx = rows.Select(r => r.ProductionInstructionNo)
+            .Distinct(StringComparer.Ordinal).Count(ctxPiSet.Contains);
+        Say($"   └ 归因①产行(去重PI)∩「带执行上下文的PI」={rowPiInCtx}" +
+            (rows.Count == 0 ? "" : rowPiInCtx == 0
+                ? " ⇒ **结构性不相交**（Σ已占=0 是 C桶/A/B 分工结果，非漏装）"
+                : $" ⚠ ⇒ 有 {rowPiInCtx} 个 PI 既在基线上、又带执行上下文 ⇒ **装载漏装，真缺陷**"));
+        //   反向对照：带执行上下文的 PI，其需求是否**清一色**落在 Continuation 侧（C 桶一条不剩）。
+        var ctxPiAsCbucket = req.LogicalProductionDemands.Count(d =>
+            !d.IsContinuation && !string.IsNullOrWhiteSpace(d.ProductionInstructionNo)
+            && ctxPiSet.Contains(d.ProductionInstructionNo!.Trim()));
+        var ctxPiAsCont = req.LogicalProductionDemands.Count(d =>
+            d.IsContinuation && !string.IsNullOrWhiteSpace(d.ProductionInstructionNo)
+            && ctxPiSet.Contains(d.ProductionInstructionNo!.Trim()));
+        Say($"   └ 归因②「带执行上下文的PI」之需求分布：Continuation={ctxPiAsCont} 条 / C桶={ctxPiAsCbucket} 条" +
+            (ctxPiAsCont > 0 && ctxPiAsCbucket == 0
+                ? " ⇒ 全部被切成 Continuation，C 桶一条不剩（与归因①互为佐证）" : ""));
+        //   └ 残留追问：C 桶里那几条「PI 带执行上下文」的需求，为何**也没**产行？（候选键外 / 自由量≤0，两种含义不同）
+        if (ctxPiAsCbucket > 0)
+        {
+            var producedRowKeys = rows.Select(r => (r.ProductionInstructionNo, r.MaterialId, r.StageCode)).ToHashSet();
+            var candidateKeySet = keys.ToHashSet();
+            var ctxCbucket = req.LogicalProductionDemands.Where(d =>
+                !d.IsContinuation && !string.IsNullOrWhiteSpace(d.ProductionInstructionNo)
+                && ctxPiSet.Contains(d.ProductionInstructionNo!.Trim())).ToList();
+            Say($"     残留明细（{ctxCbucket.Count} 条）：" + Join(ctxCbucket.Take(MaxSample).Select(d =>
+            {
+                var k = (d.ProductionInstructionNo!.Trim(), d.MaterialId, (d.StartStageCode ?? string.Empty).Trim());
+                var inKeys = candidateKeySet.Contains(k);
+                var hasRow = producedRowKeys.Contains(k);
+                return $"{k.Item1}/mat={d.MaterialId}/stage='{k.Item3}'/候选键={(inKeys ? "是" : "否")}/产行={(hasRow ? "是" : "否")}";
+            })));
+        }
+
+        Say($"不变量①键唯一: 重复={rowKeys.Count - rowKeys.Distinct().Count()}" +
+            (rowKeys.Count != rowKeys.Distinct().Count()
+                ? " ⚠" + Join(rowKeys.GroupBy(k => k).Where(g => g.Count() > 1)
+                    .Take(MaxSample).Select(g => $"{g.Key.ProductionInstructionNo}/{g.Key.MaterialId}/{g.Key.StageCode}×{g.Count()}"))
+                : ""));
+
+        var badCommitted = rows.Where(r => r.AlreadyCommittedQty < 0m || r.AlreadyCommittedQty > r.StageFreeEligibleQty).ToList();
+        Say($"不变量②入口已占∈[0,毛量]: 越界={badCommitted.Count}" +
+            (badCommitted.Count > 0 ? " ⚠" + Join(badCommitted.Take(MaxSample).Select(
+                r => $"{r.ProductionInstructionNo}/{r.MaterialId}/{r.StageCode} 已占{r.AlreadyCommittedQty}>毛量{r.StageFreeEligibleQty}")) : ""));
+
+        var overRemaining = rows.Where(r =>
+            piRemaining.TryGetValue((r.ProductionInstructionNo, r.MaterialId), out var rem)
+            && r.StageFreeEligibleQty > rem + 0.0001m).ToList();
+        Say($"不变量③毛量≤PI剩余(权威总量根): 越界={overRemaining.Count}" +
+            (overRemaining.Count > 0 ? " ⚠" + Join(overRemaining.Take(MaxSample).Select(
+                r => $"{r.ProductionInstructionNo}/{r.StageCode} 毛量{r.StageFreeEligibleQty}>剩余{piRemaining[(r.ProductionInstructionNo, r.MaterialId)]}")) : ""));
+
+        var noPiFact = rows.Where(r => !piRemaining.ContainsKey((r.ProductionInstructionNo, r.MaterialId))).ToList();
+        Say($"不变量④行能对上 PI 权威事实: 对不上={noPiFact.Count}" +
+            (noPiFact.Count > 0 ? " ⚠" + Join(noPiFact.Take(MaxSample).Select(r => $"{r.ProductionInstructionNo}/{r.MaterialId}")) : ""));
+
+        Say($"样例(最多{MaxSample}): " + Join(rows.Take(MaxSample).Select(
+            r => $"{r.ProductionInstructionNo}/{r.MaterialId}/{r.StageCode} 毛量{r.StageFreeEligibleQty} 已占{r.AlreadyCommittedQty}")));
+
+        // ── §四.3 四项证明（0号位 2026-10-12 逐字：「验证两个操作数的源头关系、同PI/Stage身份、
+        //    无MES工单时合法新PI的处理、A/B已占与C自由量不重复扣减；发现数据矛盾须显式记录，
+        //    不能以取小值掩盖」）──────────────────────────────────────────────────────────────
+        //   本段**独立重算**两个操作数与「未钳制的已占」，不复用产品侧已 clamp 的 DTO 值 —— 否则
+        //   「已占 ≤ 毛量」恒真（钳制使然），证明不了任何东西。
+        var materialCodeByKey = req.PiRemainingFacts
+            .GroupBy(f => (f.ProductionInstructionNo, f.MaterialId))
+            .ToDictionary(g => g.Key, g => g.First().MaterialCode);
+
+        var operands = rows.Select(r =>
+        {
+            payload.PiPositions.TryGetValue(r.ProductionInstructionNo, out var pos);
+            var posQty = pos?.Positions
+                .Where(p => (p.PositionType == PositionType.FIRST_STAGE_PENDING
+                             || p.PositionType == PositionType.STAGE_WAITING)
+                            && string.Equals(p.StageCode, r.StageCode, StringComparison.Ordinal))
+                .Sum(p => p.Quantity) ?? 0m;
+            var nextQty = pos?.NextOperationContexts
+                .Where(c => c.MaterialId == r.MaterialId
+                            && string.Equals(c.StartStageCode, r.StageCode, StringComparison.Ordinal))
+                .Sum(c => c.SliceQty) ?? 0m;
+
+            var rawCommitted = 0m;
+            if (materialCodeByKey.TryGetValue((r.ProductionInstructionNo, r.MaterialId), out var code)
+                && pos is not null)
+            {
+                foreach (var execution in pos.ExistingExecutionContexts)
+                {
+                    if (!string.Equals(execution.MaterialCode, code, StringComparison.OrdinalIgnoreCase))
+                        continue;
+
+                    if (execution.Slices.Count > 0)
+                    {
+                        rawCommitted += execution.Slices
+                            .Where(s => string.Equals(s.StartStageCode, r.StageCode, StringComparison.Ordinal))
+                            .Sum(s => s.SliceQty);
+                    }
+                    else if (string.Equals(execution.StartStageCode, r.StageCode, StringComparison.Ordinal))
+                    {
+                        rawCommitted += execution.DerivedRemainingQty;
+                    }
+                }
+            }
+
+            return (Row: r, PosQty: posQty, NextQty: nextQty, RawCommitted: rawCommitted);
+        }).ToList();
+
+        // ① 源头关系：两个操作数必须读**同一个 PI 的结果对象**（一个 PI = 一个 ProductionInstructionPositionResult，
+        //   Positions / NextOperationContexts / ExistingExecutionContexts 皆挂在该对象上 ⇒ PI 身份由容器保证）。
+        var noPosObj = operands.Count(o => !payload.PiPositions.ContainsKey(o.Row.ProductionInstructionNo));
+        Say($"§四.3① 两算子同源: 产行 {rows.Count} 条，其中取不到同一 PI 结果对象的 {noPosObj} 条" +
+            "（0 ⇒ 位置量与起点量恒为同一 PI 同一对象的两视图）");
+
+        // ② 同 PI/Stage 身份：PI 由容器保证；Stage 两侧都按同一个 stage 值过滤（位置侧 StageCode / 起点侧 StartStageCode）。
+        //   ⚠ 物料身份**只在起点侧可用**（`NextOperationContextDto.MaterialId`）——`PositionSlice` 无物料列，
+        //     ⇒ 若存在「一个 PI 对应多个物料」，① 会跨物料求和而 ② 按物料收窄。故必须把该情形**实测出来**：
+        var multiMaterialPi = payload.PiPositions.Count(kv =>
+            kv.Value.NextOperationContexts.Select(c => c.MaterialId).Distinct().Count() > 1);
+        var multiMaterialPiInRows = operands.Select(o => o.Row.ProductionInstructionNo).Distinct()
+            .Count(pi => payload.PiPositions.TryGetValue(pi, out var p)
+                         && p.NextOperationContexts.Select(c => c.MaterialId).Distinct().Count() > 1);
+        Say($"§四.3② 同PI/Stage身份: PI 由结果对象容器保证；Stage 两侧同一取值。" +
+            $"⚠ 物料身份仅起点侧有 ⇒ 多物料 PI 全库={multiMaterialPi}（产行涉及={multiMaterialPiInRows}）" +
+            "（0 ⇒ 该不对称无实例，不产生跨物料求和）");
+
+        // ③「取 min」到底由谁绑定（证明是**真取小**，而非两个视图恒等 ⇒ min 形同虚设）。
+        var posSmaller = operands.Count(o => o.PosQty < o.NextQty);
+        var nextSmaller = operands.Count(o => o.NextQty < o.PosQty);
+        var equalQty = operands.Count(o => o.PosQty == o.NextQty);
+        Say($"§四.3③ min 绑定方(产行): 位置量更小={posSmaller} 起点量更小={nextSmaller} 相等={equalQty}；" +
+            $"Σ位置量={operands.Sum(o => o.PosQty)} Σ起点量={operands.Sum(o => o.NextQty)} Σ毛量={rows.Sum(r => r.StageFreeEligibleQty)}");
+        //   ③附：合法新 PI 无 MES 工单 ⇒ 量落在 FIRST_STAGE_PENDING（5号位 首 Stage 兜底），
+        //   与 STAGE_WAITING（有 MES 在制）分开计数，用于回答「无 MES 工单时合法新 PI 怎么处理」。
+        var producedPis = operands.Select(o => o.Row.ProductionInstructionNo).ToHashSet(StringComparer.Ordinal);
+        var positionMix = payload.PiPositions.Where(kv => producedPis.Contains(kv.Key))
+            .SelectMany(kv => kv.Value.Positions)
+            .GroupBy(p => p.PositionType.ToString())
+            .Select(g => $"{g.Key}={g.Count()}条/{g.Sum(p => p.Quantity)}")
+            .ToList();
+        Say("§四.3③附 产行 PI 的位置类型构成: " + Join(positionMix));
+
+        // ④ A/B 已占 ⊄ 该 Stage 自由量 的矛盾（**未钳制**原值，钳制前后逐条对比才看得见）。
+        var contradictions = operands
+            .Where(o => o.RawCommitted < 0m || o.RawCommitted > o.Row.StageFreeEligibleQty)
+            .ToList();
+        Say($"§四.3④ 已占⊄毛量 矛盾(未钳制): {contradictions.Count} 条" +
+            (contradictions.Count > 0
+                ? " ⚠" + Join(contradictions.Take(MaxSample).Select(
+                    o => $"{o.Row.ProductionInstructionNo}/{o.Row.MaterialId}/{o.Row.StageCode} 已占{o.RawCommitted} vs 毛量{o.Row.StageFreeEligibleQty}"))
+                : "（0 ⇒ A/B 已执行量确在该 Stage 自由池视图内，取 min 不重复扣减；反之必须交 5号位 核重叠口径）"));
+
+        // 未产行**原因**（独立重算，不依赖产品日志）：无位置事实／该 Stage 位置量为 0／起点量为 0。
+        // 三者的业务含义完全不同：「无位置事实」= 5号位 缺交付；「位置量 0」= 该 Stage 上无待加工实物
+        //（量在 XC／跨厂途中／UNLOCATED）——后者若占多数，说明公式里的位置量口径需要按业务再核。
+        var rowKeySet = rowKeys.ToHashSet();
+        var reasons = new List<(string Key, string Why, decimal PosQty, decimal NextQty)>();
+        foreach (var k in keys.Where(k => !rowKeySet.Contains(k)))
+        {
+            if (!payload.PiPositions.TryGetValue(k.Pi, out var pos) || pos is null)
+            {
+                reasons.Add(($"{k.Pi}/{k.MaterialId}/{k.Stage}", "无位置事实", 0m, 0m));
+                continue;
+            }
+
+            var posQty = pos.Positions
+                .Where(p => (p.PositionType == PositionType.FIRST_STAGE_PENDING
+                             || p.PositionType == PositionType.STAGE_WAITING)
+                            && string.Equals(p.StageCode, k.Stage, StringComparison.Ordinal))
+                .Sum(p => p.Quantity);
+            var nextQty = pos.NextOperationContexts
+                .Where(c => c.MaterialId == k.MaterialId
+                            && string.Equals(c.StartStageCode, k.Stage, StringComparison.Ordinal))
+                .Sum(c => c.SliceQty);
+
+            reasons.Add(($"{k.Pi}/{k.MaterialId}/{k.Stage}",
+                posQty <= 0m ? "该Stage位置量=0" : nextQty <= 0m ? "起点量=0" : "其它",
+                posQty, nextQty));
+        }
+        Say($"未产行原因样本(最多{MaxSample}): " + Join(reasons.Take(MaxSample)
+            .Select(r => $"{r.Key} [{r.Why}] 位={r.PosQty} 起点={r.NextQty}")));
+        Say($"未产行原因分布: " + Join(reasons.GroupBy(r => r.Why).Select(g => $"{g.Key}={g.Count()}")));
+
+        // 候选键 PI 的「量到底在哪」：位置类型分布（条数/数量）。用于判断「该Stage位置量=0」是
+        //   真无实物、还是量被记在 XC／跨厂途中／UNLOCATED（后者说明位置量口径要按业务再核）。
+        var demandPis = keys.Select(k => k.Pi).ToHashSet(StringComparer.Ordinal);
+        Say("候选键 PI 的位置类型分布(条数/数量): " + Join(
+            payload.PiPositions.Where(kv => demandPis.Contains(kv.Key))
+                .SelectMany(kv => kv.Value.Positions)
+                .GroupBy(p => p.PositionType.ToString())
+                .Select(g => $"{g.Key}={g.Count()}/{g.Sum(p => p.Quantity)}")));
+
+        // ── 接线安全性：门禁一旦通电（1号位 换 request.PiRemainingFacts），缺失即 fail-closed ──
+        //   ⚠ 判据必须**逐字复制** 1号位 EvaluatePiLegalQuantityGate 的两条早退，否则数字无意义：
+        //     ① matched == 0 ⇒ PI_LEGAL_QTY_CONTRACT_PENDING（找不到 PI 权威行）
+        //     ② matched >  1 ⇒ PI_LEGAL_QTY_CONTRACT_PENDING（来源不唯一）
+        //     ③ stageContext is null ⇒ PI_LEGAL_QTY_CONTRACT_PENDING（缺 Stage 合法自由量上下文）
+        //   ①② 归 §1.3（PiRemainingFacts）、③ 归 §1.4(a)（本件）。这两条**任一命中即整条需求不成批**。
+        var demandRows = req.LogicalProductionDemands
+            .Where(d => !d.IsContinuation
+                        && !string.IsNullOrWhiteSpace(d.ProductionInstructionNo)
+                        && verifiedPiSet.Contains(d.ProductionInstructionNo!.Trim())
+                        && !string.IsNullOrWhiteSpace(d.StartStageCode))
+            .ToList();
+
+        var unmatchedPi = 0; var ambiguousPi = 0; var missingStageCtx = 0;
+        foreach (var d in demandRows)
+        {
+            var matched = req.PiRemainingFacts.Count(f =>
+                string.Equals(f.ProductionInstructionNo, d.ProductionInstructionNo, StringComparison.Ordinal)
+                && f.MaterialId == d.MaterialId && f.FactoryId == d.FactoryId);
+            if (matched == 0) unmatchedPi++;
+            else if (matched > 1) ambiguousPi++;
+
+            if (!rowKeySet.Contains((d.ProductionInstructionNo!.Trim(), d.MaterialId, d.StartStageCode!.Trim())))
+                missingStageCtx++;
+        }
+        var n = demandRows.Count;
+        Say($"接线安全性（按**需求条数**计，非去重键；C 桶需求 {n} 条）：");
+        Say($"  ① §1.3 PiRemainingFacts 缺行(matched=0) ⇒ 门禁 early-return：{unmatchedPi} 条（{(n == 0 ? 0 : unmatchedPi * 100.0 / n):F1}%）");
+        Say($"  ② §1.3 PiRemainingFacts 来源不唯一(matched>1)：{ambiguousPi} 条");
+        Say($"  ③ §1.4(a) 缺 Stage 上下文(stageContext=null)：{missingStageCtx} 条（{(n == 0 ? 0 : missingStageCtx * 100.0 / n):F1}%）");
+        Say($"  ⇒ 三条任一命中即 PI_LEGAL_QTY_CONTRACT_PENDING（ExecutionBatchFormation.Conflict）＝该需求**不成批**。");
+        Say($"  ⚠ 死条款知会：需求侧 `IsUnlocated` 恒 false（装载层 `IsUnlocated = false // INTEGRATION TODO` 占位）");
+        Say($"     ⇒ 该标志**不能当「已排除 UNLOCATED」的自证**；UNLOCATED 的真实排除靠**公式内位置类型过滤**（非该标志）。");
+        Say($"     ⇒ 2026-10-12 起：装载层谓词与本审计**均已移除** `!d.IsUnlocated`（原为空过滤），此标志**待接线**（未落债）。");
+        Say($"     需求侧 IsUnlocated=true 条数（预期 0）：{req.LogicalProductionDemands.Count(d => d.IsUnlocated)}");
+
+        // ── 2026-10-12 追加：**直接调用 1号位 真实门禁**，量出「逐条 Q ≤ 合法量」的**真实放行率** ──
+        //   背景（用户 2026-10-12 令「你可以测试出来再发」）：发「门禁通电信号」前，把 §一 那个
+        //   「97.7% Stage 上下文覆盖率」这条**上界**，换成通电后的**真实放行 / 拦截条数**。
+        //
+        //   ⚠ 本段**不再复制判据**（上面 ①②③ 是逐字复制 1号位 的两条早退，只够证明「哪些会被 early-return」），
+        //     而是直接调用 `PhaseTwoInitialScheduler.EvaluatePiLegalQuantityGate` ——
+        //     该类 `internal`、方法 `internal static`，`LPS.APS.Scheduling.csproj` 有 `InternalsVisibleTo(LPS.APS.Tests)`
+        //     ⇒ **与生产路径同一份代码**，不存在口径漂移。
+        //
+        //   `configuredMax: null` ＝ **B-010 缺策略兜底口径**（B-010 逐字：兜底**不伪造** Min/Max/Preferred，
+        //     ⇒ 不得把配置上限当兜底上限）。现行 ⑧块源块过期（4 条、MaterialId 全为 1）⇒ C 桶几乎全域
+        //     无命中策略 ⇒ 通电后走的正是这条 B-010 路径，故本口径即**当前库的真实口径**。
+        //   （有策略路径 [仅物料 1] 会再叠一层 `configuredMax = policy.MaxExecutionBatchQty`，本段不覆盖，条数可忽略。）
+        var gateIndex = PhaseTwoInitialScheduler.BuildPiStageQuantityIndex(req.PiStageQuantityBaselines, out var ambiguousKeys);
+        Say($"接线索引（1号位 BuildPiStageQuantityIndex 实调）：可键控={gateIndex.Count} 撞键摘除={ambiguousKeys.Count}" +
+            (ambiguousKeys.Count > 0 ? " ⚠" + Join(ambiguousKeys.Take(MaxSample).Select(k => $"{k.PiNo}/{k.MaterialId}/{k.StageCode}")) : ""));
+
+        int gPass = 0, gNoPiRow = 0, gAmbiguous = 0, gNoStageCtx = 0, gBadStage = 0, gOverLimit = 0, gOther = 0;
+        decimal sumPassQ = 0m, sumOverQ = 0m, sumOverCap = 0m;
+        var overSamples = new List<string>();
+
+        foreach (var d in demandRows)
+        {
+            var ctx = PhaseTwoInitialScheduler.ResolvePiStageContext(
+                gateIndex, d.ProductionInstructionNo, d.MaterialId, d.StartStageCode);
+
+            var reason = PhaseTwoInitialScheduler.EvaluatePiLegalQuantityGate(
+                d.NetOutputQty, d.ProductionInstructionNo, d.MaterialId, d.FactoryId, d.StartStageCode,
+                req.PiRemainingFacts, ctx, configuredMax: null);
+
+            if (reason is null)
+            {
+                gPass++;
+                sumPassQ += d.NetOutputQty;
+                continue;
+            }
+
+            if (reason.Contains("找不到 PI 权威行", StringComparison.Ordinal)) gNoPiRow++;
+            else if (reason.Contains("匹配到", StringComparison.Ordinal)) gAmbiguous++;
+            else if (reason.Contains("缺 Stage 合法自由量上下文", StringComparison.Ordinal)) gNoStageCtx++;
+            else if (reason.Contains("缺 StageCode", StringComparison.Ordinal)
+                     || reason.Contains("目标 Stage 未知", StringComparison.Ordinal)
+                     || reason.Contains("不是本需求目标 Stage", StringComparison.Ordinal)
+                     || reason.Contains("与需求不匹配", StringComparison.Ordinal)) gBadStage++;
+            else if (reason.Contains("PI_LEGAL_QTY_OVER_LIMIT", StringComparison.Ordinal))
+            {
+                gOverLimit++;
+                sumOverQ += d.NetOutputQty;
+                // ⚠ cap 由**1号位 自己写进原因文本**（`需求量 {Q} 超出合法可用量 {cap}`）⇒ 解析原文，
+                //   不自行复算（复算＝复制判据，正是本段要避免的漂移源）。
+                var capText = Between(reason, "超出合法可用量 ", "（");
+                if (decimal.TryParse(capText, System.Globalization.NumberStyles.Any,
+                        System.Globalization.CultureInfo.InvariantCulture, out var cap))
+                {
+                    sumOverCap += cap;
+                }
+                if (overSamples.Count < MaxSample) overSamples.Add($"{d.LogicalDemandKey} Q={d.NetOutputQty} 原因={reason}");
+            }
+            else gOther++;
+        }
+
+        Say("【通电后真实放行率｜实调 1号位 EvaluatePiLegalQuantityGate，configuredMax=null（B-010 口径）】");
+        Say($"  需求条数（C 桶 × PI 在权威事实集 × 有 Stage）={n}");
+        Say($"  ✅ 放行（reason=null）={gPass} 条（{(n == 0 ? 0 : gPass * 100.0 / n):F1}%）ΣQ={sumPassQ}");
+        Say($"  ⛔ 拦截合计={n - gPass} 条（{(n == 0 ? 0 : (n - gPass) * 100.0 / n):F1}%）");
+        Say($"     ├ ② 找不到 PI 权威行(matched=0)：{gNoPiRow} 条");
+        Say($"     ├ ③ 来源不唯一(matched>1)：{gAmbiguous} 条");
+        Say($"     ├ ④ 缺 Stage 合法自由量上下文：{gNoStageCtx} 条");
+        Say($"     ├ ⑤ Stage 身份不匹配/缺 StageCode/目标 Stage 未知：{gBadStage} 条");
+        Say($"     ├ ⑥ **超合法量**（`PI_LEGAL_QTY_OVER_LIMIT`）：{gOverLimit} 条" +
+            $"（ΣQ={sumOverQ} vs Σcap={sumOverCap}，缺口={sumOverQ - sumOverCap}）");
+        Say($"     └ ⑦ 其它：{gOther} 条");
+        Say($"  超量样例(最多{MaxSample})：" + (overSamples.Count > 0 ? Join(overSamples) : "（无）"));
+        Say("  ⇒ ✅ 行 ＝ 通电后**仍能成批**的 C 桶需求；⛔ 行 ＝ 通电后**会被如实拦下**的" +
+            "（拦下时 1号位 出口 Reason 会落 `BATCH_POLICY_CONFLICT`，即其 §七 自报的出口归因缺陷）。");
+        Say("     ⚠ 本段为**逐需求独立判定**（未带 `PiStageCommitLedger` 运行累计账）⇒ 是**上界**：" +
+            "真实运行时同 PI 同 Stage 的后续需求会因前序批已占而进一步收紧。");
+    }
+
+    /// <summary>取 <paramref name="text"/> 中 <paramref name="after"/> 之后、<paramref name="before"/> 之前的子串；取不到 ⇒ 空串。</summary>
+    private static string Between(string text, string after, string before)
+    {
+        var i = text.IndexOf(after, StringComparison.Ordinal);
+        if (i < 0) return string.Empty;
+        i += after.Length;
+        var j = text.IndexOf(before, i, StringComparison.Ordinal);
+        return j < 0 ? text[i..] : text[i..j];
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // §DG-05 `DemandGoal`（0号位 2026-10-12 裁决《DemandGoal与SH整单及关联问题正式裁决回执 v1.0》§一 DG-05）
+    //
+    // ⚠ 2026-10-13 起**取值链已投产**（`PeggingOrchestrator.FillDemandGoalsAsync`）⇒ 本段从
+    //   「载体缺口计量」改为**独立重算对账**：按 `[Order]` 的 `OrderNo` 前缀 ＋ `CustomerSegment`
+    //   在本探针内**独立复算**一遍 Goal，与 2号位 送出的 `demand.DemandGoal` **逐条比对**。
+    //
+    //   为什么必须独立重算（而不是只数「有值/缺值」）：常绿≠有效——只数覆盖率的话，即便取值逻辑
+    //   整个判反（O 行给成补库），本段仍会显示「100% 有值、全部通过」。故本段的**唯一结论**
+    //   是「不一致条数」，该数不为 0 即报缺陷。
+    //
+    //   ⚠ 本段的 OrderType 列**不是**取值规则（DG-02/DG-04 明令不得按 OrderType 硬映射）；
+    //     它只用于**反证**：若按 OrderType 判 Goal 会与按 OrderNo 前缀判产生多少条分歧。
+    // ─────────────────────────────────────────────────────────────────────
+    private static void AuditDemandGoal(
+        IReadOnlyList<LogicalProductionDemand> demands,
+        IReadOnlyDictionary<long, OrderMetaRow> orderMeta)
+    {
+        var n = demands.Count;
+
+        Say("──────── §DG-05 DemandGoal 取值对账（0号位 裁决 §一 DG-05／§2.1–§2.4；2026-10-13 取值链投产）────────");
+
+        // ① 独立重算（判据：OrderNo 前缀 ＋ CustomerSegment；跨厂 SH 按 DG-05 §2.4 **期望留空**）。
+        string? ExpectedGoal(LogicalProductionDemand d, out string cls)
+        {
+            cls = "(根订单不在本 PV)";
+            if (d.OrderId is not { } id || !orderMeta.TryGetValue(id, out var m)
+                || string.IsNullOrWhiteSpace(m.OrderNo))
+                return null;   // 判例 8：血缘无法唯一确定 ⇒ 期望留空
+
+            var isPi = m.OrderNo[0] == 'P' || m.OrderNo[0] == 'p';
+            var isSh = string.Equals(m.CustomerSegment, CustomerSegmentCodes.InterFactory, StringComparison.Ordinal);
+
+            if (isSh)          { cls = "跨厂SH";   return null; }   // 未落地项：期望留空 + 诊断
+            if (isPi)          { cls = "P行(PI)";  return DemandGoalValues.InventoryReplenishment; }
+            cls = "O行(客户)";  return DemandGoalValues.CustomerCommitment;
+        }
+
+        var mismatch = 0;
+        var nullGoal = 0;
+        var shRows = 0;
+        var byClass = new Dictionary<string, int>(StringComparer.Ordinal);
+        var goalCount = new Dictionary<string, int>(StringComparer.Ordinal);
+        var mismatchSample = new List<string>(5);
+
+        foreach (var d in demands)
+        {
+            var expected = ExpectedGoal(d, out var cls);
+            byClass[cls] = byClass.GetValueOrDefault(cls) + 1;
+            if (cls == "跨厂SH") shRows++;
+
+            var actual = d.DemandGoal;
+            var key = string.IsNullOrEmpty(actual) ? "(空)" : actual!;
+            goalCount[key] = goalCount.GetValueOrDefault(key) + 1;
+            if (string.IsNullOrEmpty(actual)) nullGoal++;
+
+            // 双向核：期望有值而实空、期望空而实有值、两边都有但不相等 —— 三种都算不一致。
+            if (!string.Equals(actual ?? string.Empty, expected ?? string.Empty, StringComparison.Ordinal))
+            {
+                mismatch++;
+                if (mismatchSample.Count < MaxSample)
+                    mismatchSample.Add($"应={expected ?? "空"} 实={actual ?? "空"}" +
+                                       $"/rootOrder={d.OrderId}/key={d.LogicalDemandKey}");
+            }
+        }
+
+        Say($"需求切片={n} 条；Goal 取值分布：" + Join(goalCount.OrderByDescending(kv => kv.Value)
+            .Select(kv => $"{kv.Key}={kv.Value}")));
+        Say("  └ 根订单类别剖面（按 OrderNo 前缀 ＋ CustomerSegment **独立复算**）：" +
+            Join(byClass.OrderByDescending(kv => kv.Value).Select(kv => $"{kv.Key}={kv.Value}")));
+        Say($"  └ **对账结论：与独立重算不一致 = {mismatch} 条**（≠0 即缺陷）；其中送出空值 = {nullGoal} 条" +
+            $"（1号位 将按 `DEMAND_GOAL_ABSENT` 登记缺口，不静默）");
+        Say($"  └ 跨厂 SH 行 = {shRows} 条 —— ⚠ **未落地项**：SH-02 要的「被真实上层需求承接」信号" +
+            $"区分不出「SH 供给在目标厂自扣自己那张订单」（实测 PV2 四个 SH 订单 Allocation=4 而需求=0）" +
+            $"⇒ 按 DG-05 §2.4 期望留空；本探针**不断言**其 Goal 具体值。");
+        if (mismatch > 0)
+            Say($"  ⚠ 不一致样例(最多{MaxSample}): " + Join(mismatchSample));
+
+        // ② 反证：若按 OrderType 硬映射 Goal 会分歧多少条（DG-02 明令禁止的写法，此处只作**危害计量**）
+        string? GoalByOrderType(LogicalProductionDemand d)
+            => d.OrderId is { } id && orderMeta.TryGetValue(id, out var m)
+                ? (m.OrderType == "PRODUCTION_INSTRUCTION"
+                    ? DemandGoalValues.InventoryReplenishment
+                    : DemandGoalValues.CustomerCommitment)
+                : null;
+        var byTypeDiff = demands.Count(d =>
+            GoalByOrderType(d) is { } t && !string.IsNullOrEmpty(d.DemandGoal)
+            && !string.Equals(t, d.DemandGoal, StringComparison.Ordinal));
+        Say($"  └ 反证：若按 `OrderType` 硬映射，将有 **{byTypeDiff} 条**与按 OrderNo 前缀的判定分歧" +
+            $"（DG-02/DG-04 明令禁止按 OrderType 硬映射；此数即该写法的误判规模）");
+
+        // ③ 留空样例（逐条带根订单身份）
+        var ordered = demands
+            .Where(d => string.IsNullOrEmpty(d.DemandGoal))
+            .OrderBy(d => d.OrderId).ThenBy(d => d.LogicalDemandKey)
+            .Take(MaxSample)
+            .Select(d =>
+            {
+                var mem = d.OrderId is { } id && orderMeta.TryGetValue(id, out var m) ? m : null;
+                return $"{d.LogicalDemandKey}/mat={d.MaterialId}/PI={d.ProductionInstructionNo ?? "-"}" +
+                       $"/rootOrder={d.OrderId}/OrderNo={mem?.OrderNo ?? "?"}/类型={mem?.OrderType ?? "?"}" +
+                       $"/跨厂={(string.Equals(mem?.CustomerSegment, CustomerSegmentCodes.InterFactory, StringComparison.Ordinal) ? "是" : "否")}" +
+                       $"/NeedBy={d.RequiredAvailableTime:yyyy-MM-dd}/Q={d.NetOutputQty}";
+            });
+        Say($"留空样例(最多{MaxSample}): " + Join(ordered));
     }
 
     /// <summary>
@@ -270,6 +851,208 @@ public class LoadToPosition1AuditTest
             $"（阶段① 子件主档缺行={fromStage1} 个；阶段② 采购件子件无 Routing 补齐；BatchNo={batchNo}）");
         return sample.Count > 0 ? sample : allOrderIds;
     }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // §T-04 两条契约（Candidate 模式）：真实产物 + 连接轴对照 + PI 基数
+    //
+    // 目的（用户口径：「装载给 1号位 的时候数据正确」）：
+    //   ① 让 `BuildAnchorPayloadAsync` **真的跑进去**（此前硬写 `IsCandidate=false` ⇒ 恒早退），
+    //      把 `DomainSolveRequest.ExecutionConstraints` / `OrderProtections` 的**真实产物**打出来；
+    //   ② **独立重算**资格与命中数（不复制产品侧投影器），与产物条数比对 —— 探针必须能证伪自己；
+    //   ③ 量出 item 1（连接轴改「PI + 工序」，`PM回复0908.md` §十）的**唯一未决前置**：
+    //      一个 PI 在本轮需求集里到底对应几条 `LogicalProductionDemand`。
+    // ─────────────────────────────────────────────────────────────────────
+    private static async Task AuditAnchorsAsync(
+        DatabaseConnectionManager conn,
+        PeggingOrchestrator.PeggingPayload payload,
+        int basePv)
+    {
+        var req = payload.SolveRequest;
+        var demands = req.LogicalProductionDemands;
+
+        Say("──────── §T-04 两条契约（Candidate 模式通电）────────");
+        Say($"CandidateContext={(req.CandidateContext is null ? "null ⚠（早退了）" : "非空")} " +
+            $"RunScope={(req.RunScope is null ? "null" : "非空")} BasePlanVersionId={basePv}");
+
+        // ── 输入侧：上一 Base 的 `[Task]` 行 ──
+        var rows = (await conn.QueryAsync<BaseTaskRow>(
+            @"SELECT t.Id AS TaskId, t.OrderId, t.MaterialId, t.StageCode, t.OperationCode,
+                     t.ResourceId, t.PlannedStartTime, t.PlannedEndTime,
+                     t.Quantity, t.PlannedProcessQty, t.TaskNo,
+                     t.MESWorkOrderNo, t.MTS_InstructionNo, t.Status,
+                     o.ProductFamilyId, o.FactoryId
+              FROM [Task] t
+              LEFT JOIN [Order] o ON o.Id = t.OrderId
+              WHERE t.PlanVersionId = @BasePlanVersionId",
+            new { BasePlanVersionId = basePv }, db: DatabaseId.APS)).ToList();
+
+        Say($"Base `[Task]` 行={rows.Count}" +
+            (rows.Count == 0 ? " ⚠（BuildAnchorPayloadAsync 在此早退 ⇒ 两条契约均为空）" : ""));
+        if (rows.Count > 0)
+            Say("  └ Status 分布: " + Join(rows.GroupBy(r => r.Status ?? "<null>").Select(g => $"{g.Key}={g.Count()}")) +
+                $"; MESWorkOrderNo 非空={rows.Count(r => !string.IsNullOrWhiteSpace(r.MESWorkOrderNo))}" +
+                $"; MTS_InstructionNo 非空={rows.Count(r => !string.IsNullOrWhiteSpace(r.MTS_InstructionNo))}");
+
+        // Fence 参数（窗口判定的唯一来源；归 3号位 治理）
+        var fenceRows = (await conn.QueryAsync<FenceConfigRow>(
+            @"SELECT Id, ProductFamilyId, FactoryId, ProcessType, FrozenDays, FirmDays, EffectiveFrom, EffectiveTo
+              FROM FenceConfig", null, db: DatabaseId.APS)).ToList();
+        // `DomainSolveRequest.DataCutoffTime` 是可空 `DateTime?` ⇒ 取值域要先剥空再判 default。
+        var fenceBasis = req.DataCutoffTime is { } cutoff && cutoff != default ? cutoff : DateTime.Now;
+        Say($"FenceConfig 行={fenceRows.Count}" +
+            (fenceRows.Count == 0
+                ? $" ⇒ **无窗口参数**（基准={fenceBasis:yyyy-MM-dd HH:mm}）⇒ 窗口分支一律 Movable，**不自造天数**"
+                : $"，基准={fenceBasis:yyyy-MM-dd HH:mm}"));
+
+        // ── 独立重算：资格 + 两条候选连接轴的命中数（见方法头注释②）──
+        var demandByFour = demands
+            .GroupBy(d => (d.OrderId, d.MaterialId, Norm(d.StartStageCode), Norm(d.StartOperationCode)))
+            .ToDictionary(g => g.Key, g => g.ToList());
+        var demandByPi = demands
+            .Where(d => !string.IsNullOrWhiteSpace(d.ProductionInstructionNo))
+            .GroupBy(d => (Pi: d.ProductionInstructionNo!.Trim(), Norm(d.StartStageCode), Norm(d.StartOperationCode)))
+            .ToDictionary(g => g.Key, g => g.ToList());
+
+        int expected = 0, incomplete = 0, noOrderId = 0;
+        int fourHit = 0, fourUnmatched = 0, fourAmbiguous = 0;
+        int piHit = 0, piUnmatched = 0, piAmbiguous = 0;
+        var seen = new HashSet<(string Draft, string Stage, string Op)>();
+        var consSample = new List<string>();
+
+        foreach (var r in rows)
+        {
+            var stg = Norm(r.StageCode);
+            var op = Norm(r.OperationCode);
+            if (stg.Length == 0 || op.Length == 0 || r.ResourceId is null
+                || r.PlannedStartTime is null || r.PlannedEndTime is null)
+            {
+                incomplete++;
+                continue;
+            }
+
+            FenceResolution res;
+            if (r.OrderId is null)
+            {
+                noOrderId++;
+                res = new FenceResolution(null, FenceConfigResolver.StatusScopeNotFound, "Task 无 OrderId");
+            }
+            else
+            {
+                res = FenceConfigResolver.Resolve(fenceRows, fenceBasis, r.ProductFamilyId ?? 0, r.FactoryId);
+            }
+
+            var band = V1FenceCalculator.Classify(r.PlannedStartTime.Value, res.Parameters);
+            // 消费纯函数（非复制逻辑）—— 判据一变，这里跟着变，不会漂移
+            var qualified = V1AnchorQualifier.IsHardAnchor(r.MESWorkOrderNo, r.Status, band, out var ctype, out _);
+
+            var four = demandByFour.TryGetValue((r.OrderId, r.MaterialId, stg, op), out var f) ? f : null;
+            switch (four?.Count ?? 0)
+            {
+                case 0: fourUnmatched++; break;
+                case 1: fourHit++; break;
+                default: fourAmbiguous++; break;
+            }
+
+            var pi = r.MTS_InstructionNo?.Trim() ?? string.Empty;
+            if (pi.Length == 0)
+            {
+                piUnmatched++;
+            }
+            else
+            {
+                var hits = demandByPi.TryGetValue((pi, stg, op), out var p) ? p : null;
+                switch (hits?.Count ?? 0)
+                {
+                    case 0: piUnmatched++; break;
+                    case 1: piHit++; break;
+                    default: piAmbiguous++; break;
+                }
+            }
+
+            if (!qualified || (four?.Count ?? 0) != 1)
+                continue;
+
+            var d0 = four![0];
+            if (!seen.Add((d0.LogicalDemandKey, stg, op)))
+                continue;
+
+            expected++;
+            if (consSample.Count < MaxSample)
+                consSample.Add($"{d0.LogicalDemandKey} {stg}/{op} res={r.ResourceId} " +
+                               $"{r.PlannedStartTime:MM-dd HH:mm}→{r.PlannedEndTime:MM-dd HH:mm} " +
+                               $"qty={r.Quantity} type={ctype}");
+        }
+
+        Say("── 独立重算（不复用产品侧投影器）──");
+        Say($"  复合键齐备行={rows.Count - incomplete}（缺 Stage/Op/Resource/时间={incomplete}；无 OrderId={noOrderId}）");
+        Say($"  **本应产契约① 锚点={expected}**（与下方实际产物条数比对，不等即缺陷）");
+        Say($"  四元组轴 (OrderId,MaterialId,Stage,Op)：命中1={fourHit} 未命中={fourUnmatched} 歧义={fourAmbiguous}");
+        Say($"  PI轴 (MTS_InstructionNo,Stage,Op)：命中1={piHit} 未命中={piUnmatched} 歧义={piAmbiguous}" +
+            "（Base 侧 PI 全空 ⇒ 该轴天然 0 命中 ⇒ **PI 回写前改轴会全丢锚点**）");
+
+        // ── 实际产物 ──
+        var cons = req.ExecutionConstraints;
+        var prots = req.OrderProtections;
+        Say("── 实际产物 ──");
+        Say($"**契约① ExecutionConstraints={cons.Count}**（独立重算预期={expected}）" +
+            (cons.Count == expected ? " ✅一致" : " ⚠**不一致**"));
+        foreach (var c in cons.Take(MaxSample))
+            Say($"    └DraftId={c.DraftId} {c.StageCode}/{c.OperationCode} res={c.ResourceId} " +
+                $"{c.LockedStart:MM-dd HH:mm}→{c.LockedEnd:MM-dd HH:mm} qty={c.LockedQuantity} " +
+                $"type={c.ConstraintType} TaskKey={c.TaskKey ?? "<null>"}");
+        foreach (var s in consSample) Say($"  ·独立样本 {s}");
+        Say($"**契约② OrderProtections={prots.Count}**" +
+            (prots.Count == 0 ? "（本域无可投保护：无 Firm/Frozen 带、无执行事实）" : ""));
+        foreach (var p in prots.Take(MaxSample))
+            Say($"    └OrderId={p.OrderId} type={p.ProtectionType} reason={p.ProtectionReason}");
+
+        // ── item 1 前置：PI → 本轮需求 的基数（`PM回复0908.md` §十 改轴的唯一未决项）──
+        Say("── item 1 前置：PI → 本轮需求 基数 ──");
+        var withPi = demands.Count(d => !string.IsNullOrWhiteSpace(d.ProductionInstructionNo));
+        var byPi = demands.Where(d => !string.IsNullOrWhiteSpace(d.ProductionInstructionNo))
+            .GroupBy(d => d.ProductionInstructionNo!.Trim(), StringComparer.Ordinal)
+            .Select(g => new { Pi = g.Key, N = g.Count(), Keys = g.Select(x => x.LogicalDemandKey).Distinct().ToList() })
+            .ToList();
+        var multi = byPi.Where(x => x.N > 1).ToList();
+
+        Say($"  需求侧：带 PI 需求={withPi} distinct PI={byPi.Count}");
+        Say($"  **一个 PI 对应 >1 条需求的 PI 数={multi.Count}**" +
+            (multi.Count == 0
+                ? "（0 ⇒ PI 在本轮需求集内唯一 ⇒ 改 PI 轴不会撞 1号位 的 DraftId 唯一性）"
+                : $" ⚠ max={multi.Max(x => x.N)} ⇒ 改轴前必须先定「同 PI 多需求时锚点挂哪条」"));
+        foreach (var m in multi.OrderByDescending(x => x.N).Take(MaxSample))
+            Say($"    └PI={m.Pi} 需求{m.N}条 key={Join(m.Keys.Take(MaxSample))}");
+
+        var basePi = rows.Select(r => r.MTS_InstructionNo?.Trim())
+            .Where(p => !string.IsNullOrWhiteSpace(p))
+            .Distinct(StringComparer.Ordinal)
+            .ToList();
+        Say($"  Base 侧：distinct PI={basePi.Count}" +
+            $"；与需求侧 PI 交集={basePi.Count(p => byPi.Any(x => x.Pi == p))}");
+    }
+
+    /// <summary>`[Task]` 行（本探针独立重算用；只读列）。</summary>
+    private sealed class BaseTaskRow
+    {
+        public long TaskId { get; set; }
+        public long? OrderId { get; set; }
+        public int MaterialId { get; set; }
+        public string? StageCode { get; set; }
+        public string? OperationCode { get; set; }
+        public int? ResourceId { get; set; }
+        public DateTime? PlannedStartTime { get; set; }
+        public DateTime? PlannedEndTime { get; set; }
+        public decimal Quantity { get; set; }
+        public decimal? PlannedProcessQty { get; set; }
+        public string? TaskNo { get; set; }
+        public string? MESWorkOrderNo { get; set; }
+        public string? MTS_InstructionNo { get; set; }
+        public string? Status { get; set; }
+        public int? ProductFamilyId { get; set; }
+        public int? FactoryId { get; set; }
+    }
+
+    private static string Norm(string? s) => (s ?? string.Empty).Trim();
 
     // ─────────────────────────────────────────────────────────────────────
     // §1 载荷规模 + 分桶守恒 + E 重复计
@@ -534,9 +1317,15 @@ public class LoadToPosition1AuditTest
         Say($"StartStageCode 无部门映射的需求={startMiss}/{demands.Count}" +
             $" RequiredStageCode 无部门映射的需求={reqMiss}" + (startMiss > 0 || reqMiss > 0 ? " ⚠（1号位 记 MISSING_PRODUCTION_DEPARTMENT_CONTEXT 并置 Unscheduled）" : ""));
 
-        var noChain = demands.Count(d => !chainByMat.ContainsKey(d.MaterialId));
-        Say($"无 Stage 链的需求物料={noChain}；需求物料数={demands.Select(d => d.MaterialId).Distinct().Count()}" +
-            (noChain > 0 ? " ⚠" : ""));
+        // ⚠ 两个数字必须分开报、不可相除：分子是**需求条数**、分母是**物料数**（2026-10-10 修正）——
+        // 旧写法 `无 Stage 链的需求物料=5661；需求物料数=12513` 会被读成 5661/12513=45%，
+        // 实际物料级缺口只有 132/12513≈1%，132 个料身上压了 5661 条需求。
+        var demandMats = demands.Select(d => d.MaterialId).Distinct().ToList();
+        var noChainMats = demandMats.Count(m => !chainByMat.ContainsKey(m));
+        var noChainDemands = demands.Count(d => !chainByMat.ContainsKey(d.MaterialId));
+        Say($"无 Stage 链：物料={noChainMats}/{demandMats.Count}（{noChainMats * 100.0 / Math.Max(demandMats.Count, 1):F1}%）" +
+            $" 需求条数={noChainDemands}/{demands.Count}（{noChainDemands * 100.0 / Math.Max(demands.Count, 1):F1}%）" +
+            (noChainMats > 0 ? " ⚠" : ""));
 
         Say("──────── §6 求解参数 / 冻结块投影 ────────");
         var p = req.StrategySnapshot.Parameters;
@@ -548,9 +1337,23 @@ public class LoadToPosition1AuditTest
             $"SolverStrategy.Mode={req.StrategySnapshot.SolverStrategy?.Mode.ToString() ?? "(null)"} " +
             $"BatchPolicies={req.StrategySnapshot.BatchPolicies?.Count ?? 0} " +
             $"SetupTransitionRules={req.StrategySnapshot.SetupTransitionRules?.Count ?? 0}");
-        Say($"Resources={req.Resources.Count} CalendarSlots={req.CalendarSlots.Count} ResourceEligibility={req.ResourceEligibility.Count}");
+        // ⚠ 三个 0 里的前两个**曾经是探针假象**，2026-10-13 §T-1013x 已修（勿再当缺陷登）：
+        //   Resources/CalendarSlots 由装载层从 `request.SchedulingContext` 投影（`PeggingOrchestrator.BuildResourceDefinitions`
+        //     /`BuildResourceCalendarSlots`，首行即 `context.Resources.Count == 0 ⇒ 返回空`）；
+        //   旧探针构造 `SchedulingContext` 时**只赋** StrategyProfileVersionId/DataCutoffTime/PlanHorizon* ⇒ **恒 0**，
+        //     生产则由 `SchedulingOrchestrator.LoadResourcesAndCalendarAsync` 填 ⇒ 非 0 ⇒ **探针当时在资源轴上不具代表性**。
+        //   现探针**直接调该生产方法**（已 internal；不自己复刻 SQL，免造漂移源）⇒ 本行不再恒 0，与生产同源。
+        //   ResourceEligibility 是**另一回事、且非缺陷**：该 DTO 字段**已被 1号位 弃用**（`PhaseOneConstraintBuilder` 只留一行
+        //     注释「不再使用旧的 ResourceEligibility」，全 `Scheduling` 零可执行引用），活的是下一行的 OperationResourceEligibility。
+        //   ⚠ **仍与生产有别的一项**：`ScheduleRunId` 探针=0（未建 Run）⇒ 装载侧 `LoadMESProgressAsync` 不跑、`context.MESRemainingQty` 不填。
+        //     但 `PeggingOrchestrator` 只从 context 取 StrategyProfileVersionId/ScheduleRunId/PlanHorizon*/Resources/ResourceCalendars
+        //     （已逐点 grep 核过），**不读 MESRemainingQty** ⇒ 该差异**不流入本载荷**。（注：日志里 `ⓘ`/`⚠` 会显示成 `?`，是控制台编码，非内容丢失。）
+        Say($"Resources={req.Resources.Count} CalendarSlots={req.CalendarSlots.Count} ResourceEligibility={req.ResourceEligibility.Count}" +
+            " [注] 前两者来自生产同源装载；ResourceEligibility 为**弃用字段**（1号位 只读 OperationResourceEligibility）");
         Say($"ExecutionConstraints={req.ExecutionConstraints.Count}" +
-            (req.ExecutionConstraints.Count == 0 ? " ⚠（PM §6.1 指出的未闭合项：本域上一版 ACTIVE 旧块未转锚点）" : ""));
+            (req.ExecutionConstraints.Count == 0
+                ? " [注] **已接线**（2026-10-13 落码）；为 0 是因 Base 无燃料：无 ACTIVE、[Task] 全 PLANNED、FenceConfig 0 行 —— 见 §T-1013w"
+                : ""));
         Say($"CandidateContext={(req.CandidateContext is null ? "null(FULL)" : "非空")} RunScope={(req.RunScope is null ? "null(FULL)" : "非空")} " +
             $"UpstreamDomainResourceBlocks={req.UpstreamDomainResourceBlocks.Count}");
         Say($"窗口: PlanningStart={req.PlanningStart:yyyy-MM-dd HH:mm} PlanningEnd={req.PlanningEnd:yyyy-MM-dd HH:mm} DataCutoffTime={req.DataCutoffTime:yyyy-MM-dd HH:mm}");
@@ -698,5 +1501,5 @@ public class LoadToPosition1AuditTest
         }
     }
 
-    private static string Join(IEnumerable<string> xs) => string.Join(" | ", xs);
+    private static string Join(IEnumerable<string?> xs) => string.Join(" | ", xs);
 }

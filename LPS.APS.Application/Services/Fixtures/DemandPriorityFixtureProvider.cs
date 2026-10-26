@@ -38,7 +38,7 @@ public sealed class DemandPriorityFixtureProvider : IDemandPriorityConfigProvide
             {
                 new PrioritySegmentConfig
                 {
-                    CalculationLayer = 1,
+                    CompetitionRound = 1,
                     SegmentOrder = 1,
                     IsEnabled = true,
                     MatchConditions = new[]
@@ -73,7 +73,7 @@ public sealed class DemandPriorityFixtureProvider : IDemandPriorityConfigProvide
                 },
                 new PrioritySegmentConfig
                 {
-                    CalculationLayer = 1,
+                    CompetitionRound = 1,
                     SegmentOrder = 2,
                     IsEnabled = true,
                     MatchConditions = new[]
@@ -102,7 +102,7 @@ public sealed class DemandPriorityFixtureProvider : IDemandPriorityConfigProvide
                 },
                 new PrioritySegmentConfig
                 {
-                    CalculationLayer = 1,
+                    CompetitionRound = 1,
                     SegmentOrder = 3,
                     IsEnabled = true,
                     MatchConditions = new[]

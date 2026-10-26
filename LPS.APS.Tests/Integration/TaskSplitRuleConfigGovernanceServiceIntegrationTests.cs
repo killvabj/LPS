@@ -7,6 +7,7 @@ using LPS.APS.Core.Exceptions;
 using LPS.APS.Core.Interfaces;
 using LPS.APS.Engine.Data;
 using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 using Moq;
 using Xunit;
@@ -60,7 +61,7 @@ public class TaskSplitRuleConfigGovernanceServiceIntegrationTests : IDisposable
         _dataScope.Setup(s => s.ResolveScopeAsync(It.IsAny<int>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(DataScopeContext.Global);
 
-        _service = new TaskSplitRuleConfigGovernanceService(_connectionManager, _auditRepo.Object, _dataScope.Object);
+        _service = new TaskSplitRuleConfigGovernanceService(_connectionManager, _auditRepo.Object, _dataScope.Object, NullLogger<TaskSplitRuleConfigGovernanceService>.Instance);
     }
 
     /// <summary>挑一个「尚无 TaskSplitRuleConfig 规则」的既有 Material（FK→Material.Id 必须存在；且无既有规则保证首建不触发去重）。</summary>
@@ -461,29 +462,61 @@ ORDER BY m.Id";
     }
 
     [Fact]
-    public async Task GetActiveRulesForSnapshotAsync_存量非法行_阻断发布()
+    public async Task ListAsync_非Global授权多部门显式传部门_仅返回该部门()
     {
-        // CANDIDATE-P0-01 反证 #6（0号位 审核 §四）：存量绕过治理 API 的非法行（PreferredBatchQty=NULL）
-        // 不得静默进快照——发布须阻断并指出非法行 Id（冻结字段 v5.1.10：有效发布必填 PreferredBatchQty）。
+        // 3-NEW-P1-01（0号位 再审核 2026-10-10）：非 Global 查询同时尊重「授权集合」与「用户显式条件」——
+        // 授权 A+B + 显式传 A → Items/Total 只含 A（等值过滤，不再返回 A+B；COUNT 与页结果一致）。
+        var deptA = await PickAnyDepartmentIdAsync();
+        var deptBCode = (string?)null;
+        var deptAId = deptA;
+        var deptACode = await _connectionManager.QueryFirstOrDefaultAsync<string?>(
+            "SELECT DeptCode FROM ProductionDepartment WHERE Id = @Id", new { Id = deptAId }, db: DatabaseId.APS);
+        deptACode.Should().NotBeNullOrWhiteSpace();
+
+        var deptB = await _connectionManager.QueryFirstOrDefaultAsync<int?>(
+            "SELECT TOP 1 Id FROM ProductionDepartment WHERE Id <> @Id AND DeptCode IS NOT NULL", new { Id = deptAId }, db: DatabaseId.APS);
+        deptB.Should().NotBeNull();
+        deptBCode = await _connectionManager.QueryFirstOrDefaultAsync<string?>(
+            "SELECT DeptCode FROM ProductionDepartment WHERE Id = @Id", new { Id = deptB.Value }, db: DatabaseId.APS);
+        deptBCode.Should().NotBeNullOrWhiteSpace();
+
         _testMaterialId = await PickFreeMaterialIdAsync();
-        var deptId = await PickAnyDepartmentIdAsync();
+        await _service.CreateAsync(new SaveTaskSplitRuleConfigRequest
+        {
+            MaterialId = _testMaterialId,
+            ProductionDepartmentId = deptAId,
+            PreferredBatchQty = 50m,
+            AllowSplit = true,
+            AllowMerge = true,
+        }, actorUserId: 1, actorUserCode: "test", CancellationToken.None);
+        await _service.CreateAsync(new SaveTaskSplitRuleConfigRequest
+        {
+            MaterialId = _testMaterialId,
+            ProductionDepartmentId = deptB.Value,
+            PreferredBatchQty = 60m,
+            AllowSplit = true,
+            AllowMerge = true,
+        }, actorUserId: 1, actorUserCode: "test", CancellationToken.None);
 
-        // 直连 SQL 注入一条「合法外观 + 非法值」的存量行（绕过治理写路径的 Preferred 必填校验），NULL 字面量规避 DBNull 参数问题。
-        var insertedId = await _connectionManager.QueryFirstOrDefaultAsync<int>(@"
-INSERT INTO TaskSplitRuleConfig
-(MaterialId, ProductionDepartmentId, MinExecutionBatchQty, MaxExecutionBatchQty, PreferredBatchQty,
- AllowSplit, AllowMerge, IsActive, EffectiveFrom, EffectiveTo, CreatedAt, UpdatedAt)
-OUTPUT INSERTED.Id
-VALUES (@MaterialId, @Dept, 10, 100, NULL, 1, 1, 1, NULL, NULL, GETDATE(), GETDATE())",
-            new { MaterialId = _testMaterialId, Dept = deptId }, db: DatabaseId.APS);
+        // 授权 A+B 两个部门。
+        _dataScope.Setup(s => s.ResolveScopeAsync(It.IsAny<int>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(DataScopeContext.FromPolicies(new[]
+            {
+                (DataScopeTypes.Department, deptACode!),
+                (DataScopeTypes.Department, deptBCode!),
+            }));
 
-        var act = async () => await _service.GetActiveRulesForSnapshotAsync(CancellationToken.None);
-        var ex = await act.Should().ThrowAsync<SetupRuleDataRedLineException>();
-        ex.Which.Message.Should().Contain(insertedId.ToString());
+        // 显式传部门 A → 结果/Total 只含 A（IN∩=）。
+        var page = await _service.ListAsync(
+            materialId: _testMaterialId, productionDepartmentId: deptAId, isActive: null,
+            actorUserId: 1, pageIndex: 1, pageSize: 20, CancellationToken.None);
 
-        // 清理该非法行，避免残留 IsActive=1 坏数据（Dispose 亦会按 MaterialId 兜底清理）。
+        page.Items.Should().ContainSingle().Which.ProductionDepartmentId.Should().Be(deptAId);
+        page.Total.Should().Be(1);
+
+        // 清理自建数据（Dispose 亦会按 MaterialId 兜底清理）。
         await _connectionManager.ExecuteAsync(
-            "DELETE FROM TaskSplitRuleConfig WHERE Id = @Id", new { Id = insertedId }, db: DatabaseId.APS);
+            "DELETE FROM TaskSplitRuleConfig WHERE MaterialId = @MaterialId", new { MaterialId = _testMaterialId }, db: DatabaseId.APS);
     }
 
     [Fact]

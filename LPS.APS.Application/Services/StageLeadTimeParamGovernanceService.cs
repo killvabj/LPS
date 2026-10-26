@@ -103,6 +103,10 @@ public sealed class StageLeadTimeParamGovernanceService : IStageLeadTimeParamGov
         Validate(input);
         await EnsureTargetInScopeAsync(input.FactoryCode, input.ProductionDeptCode, actorUserId, ct);
         await EnsureNotDuplicateAsync(input.FactoryCode, input.StageCode, input.ProductionDeptCode, input.MaterialCode, input.ProductFamilyCode, excludeId: 0);
+        if (input.IsDefault)
+        {
+            await EnsureDefaultUniquenessAsync(input.EffectiveFrom, input.EffectiveTo, excludeId: 0, ct);
+        }
 
         var now = DateTime.Now;
         const string insertSql = @"
@@ -189,6 +193,10 @@ VALUES (@FactoryCode, @StageCode, @ProductionDeptCode, @MaterialCode, @ProductFa
         await EnsureTargetInScopeAsync(input.FactoryCode, input.ProductionDeptCode, actorUserId, ct);
 
         await EnsureNotDuplicateAsync(input.FactoryCode, input.StageCode, input.ProductionDeptCode, input.MaterialCode, input.ProductFamilyCode, excludeId: id);
+        if (input.IsDefault)
+        {
+            await EnsureDefaultUniquenessAsync(input.EffectiveFrom, input.EffectiveTo, excludeId: id, ct);
+        }
 
         var now = DateTime.Now;
         const string updateSql = @"
@@ -374,6 +382,44 @@ WHERE Id = @Id";
         {
             throw new ScopeViolationException(DataScopeTypes.Department, productionDeptCode);
         }
+    }
+
+    /// <summary>
+    /// R09-V-A（六任务对账收口「IsDefault 唯一/冲突校验」，3-P5 治理侧未闭项）：
+    /// 全局阶段默认值（IsDefault=1，三级匹配最低优先级 GLOBAL_STAGE_DEFAULT 兜底）须全局唯一——
+    /// 生效窗重叠内不得存在另一 active 的 IsDefault=1 行，否则 1号位 StageTimingNodeBuilder 全局兜底命中判歧义。
+    /// 载体「直接生效（时间窗）」，窗口两端闭区间、端点相接同一点视为重叠 → 拒绝
+    /// （与 Q8-2 / BatchPolicy A1「唯一有效期窗口」口径一致，不做简单唯一索引，窗口不相交为合法形态）。
+    /// 仅当入参 IsDefault=true 时由写路径调用；excludeId 供 Update 排除自身。
+    /// </summary>
+    private async Task EnsureDefaultUniquenessAsync(
+        DateTime effectiveFrom, DateTime? effectiveTo, int excludeId, CancellationToken ct)
+    {
+        const string sql = "SELECT Id, EffectiveFrom, EffectiveTo FROM StageLeadTimeParam WHERE IsActive = 1 AND IsDefault = 1 AND Id <> @ExcludeId";
+
+        var candidates = await _connectionManager.QueryAsync<StageLeadTimeParamDto>(
+            sql, new { ExcludeId = excludeId }, db: DatabaseId.APS);
+
+        foreach (var cand in candidates)
+        {
+            if (DefaultWindowsOverlap(effectiveFrom, effectiveTo, cand.EffectiveFrom, cand.EffectiveTo))
+            {
+                throw new SetupRuleDataRedLineException("已存在生效窗重叠的全局阶段默认值（IsDefault=1），全局阶段默认（GLOBAL_STAGE_DEFAULT）须唯一。");
+            }
+        }
+    }
+
+    /// <summary>
+    /// R09-V-A 生效窗重叠判定（两端闭区间，端点相接同一点视为重叠 → 返回 true）。
+    /// 仅当一目标准确早于另一目标窗口（严格偏差）才不相交；null= 无界。
+    /// 与 Q8-2 <see cref="GovernanceVersionService"/> 同口径；纯函数，供单元测试锁定业务语义。
+    /// </summary>
+    public static bool DefaultWindowsOverlap(
+        DateTime targetFrom, DateTime? targetTo, DateTime candidateFrom, DateTime? candidateTo)
+    {
+        var targetBeforeCandidate = targetTo != null && targetTo.Value < candidateFrom;
+        var candidateBeforeTarget = candidateTo != null && candidateTo.Value < targetFrom;
+        return !targetBeforeCandidate && !candidateBeforeTarget;
     }
 
     private async Task EnsureNotDuplicateAsync(

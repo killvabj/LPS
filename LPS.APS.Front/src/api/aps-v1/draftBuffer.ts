@@ -19,6 +19,11 @@ import type {
   GovernanceVersionBase
 } from './types/rule'
 import { lookupBinding, hasBinding } from './parameterSetBindings'
+import {
+  lookupParameterEnum,
+  lookupParameterLimits,
+  type ParameterEnumOption
+} from './parameterSetEnums'
 
 /* ===== 类型 ===== */
 
@@ -38,6 +43,11 @@ export interface ParameterRow {
   value: JsonValue
   /** 启发式推断的类型（用于 ElInput/ElSwitch/ElSelect 渲染） */
   type: 'NUMBER' | 'BOOLEAN' | 'STRING' | 'PERCENT' | 'DURATION'
+  /** 内容层枚举可选项（有值时渲染下拉；value 是写回 JSON 的数字序号） */
+  options?: readonly ParameterEnumOption[]
+  /** 数值边界（后端发布校验口径；有值时 ElInputNumber 夹住） */
+  min?: number
+  max?: number
   /** 启发式推断是否敏感 */
   sensitive: boolean
   /** 启发式推断是否可编辑 */
@@ -70,11 +80,15 @@ export function flattenBlocks(blocks: ParameterSetBlocks): ParameterRow[] {
         return
       }
       // primitive 行
+      const limits = lookupParameterLimits(block, path)
       rows.push({
         block,
         path,
         value,
         type: inferType(path[path.length - 1] ?? '', value),
+        options: lookupParameterEnum(block, path),
+        min: limits?.min,
+        max: limits?.max,
         sensitive: isSensitive(path.join('.')),
         editable: isEditable(path.join('.'))
       })
@@ -122,6 +136,12 @@ export function applyEdit(
   if (!row.editable) {
     throw new Error(`[applyEdit] row not editable: ${row.path.join('.')}`)
   }
+  // 枚举行只接受后端枚举序号（写字符串会让后端反序列化判 INVALID_JSON）
+  if (row.options && !row.options.some((o) => o.value === newValue)) {
+    throw new Error(
+      `[applyEdit] value not in enum options: ${row.path.join('.')}=${String(newValue)}`
+    )
+  }
   // 沿 path 钻到末级父节点
   let target: JsonObject = blocks[row.block] as JsonObject
   for (let i = 0; i < row.path.length - 1; i++) {
@@ -150,7 +170,12 @@ export function applyEdit(
  *  - 治理字段：spread governance（不变）
  *  - 显式置 status='DRAFT'（B 设计稿 §2.1 Round 1：代码自证 + 防后端改动连锁）
  *  - 5 JSON 字段：序列化 workingBlocks 各块（空块 → undefined 不报错）
- *  - contentSnapshotJson 不传（后端 service 自行序列化）
+ *  - contentSnapshotJson：**不主动删、不主动改**。10-15 Q2 落地后后端
+ *    `UpdateRuleSetVersionAsync` / `UpdateParameterSetVersionAsync` 已把这列纳入既有回填清单
+ *    （`version.ContentSnapshotJson = existing.ContentSnapshotJson;`），请求体带不带都安全；
+ *    而 ⑦ 换型规则子块（SetupTransitionRules）**只存在这一列里**，若前端把它删掉又碰上后端
+ *    回退到「读路径置空 + 写路径全量采纳」的旧实现，用户保存一次就会清空 DRAFT 上的全部换型规则。
+ *    所以这里保持 spread 原样回传，是当前唯一正确的行为。
  *  - 泛型：G 继承 GovernanceVersionBase（RuleSetVersionGovernance / ParameterSetVersionGovernance 各自适用）
  */
 export function buildPutBody<G extends GovernanceVersionBase>(
@@ -207,23 +232,29 @@ export function isSensitive(keyPath: string): boolean {
 }
 
 /**
- * 启发式推断是否可编辑
- *  - 优先用真实 binding
- *  - fallback：默认都可编辑；"default*" 开头的不可编辑（出厂锁定）
- *  - 已知 editable=false：defaultPurchaseLT 等
+ * 推断是否可编辑
+ *  - 优先用真实 binding（有 schema 时才可信）
+ *  - 无 binding 时**一律可编辑** —— 后端 PUT 是 full-object，五主题不改语义
+ *
+ * ⚠️ 2026-10-22 更正：原 fallback 把 `default*` 开头的键判为「出厂锁定不可编辑」，
+ *   该规则是前端自造的（冻结文档无「只读参数」概念，grep 无命中）⇒ 已撤，不再按名字猜。
  */
 export function isEditable(keyPath: string): boolean {
   if (hasBinding(keyPath)) {
     const b = lookupBinding(keyPath)
     if (b?.editable !== undefined) return b.editable
   }
-  return !keyPath.toLowerCase().startsWith('default')
+  return true
 }
 
 /**
- * 启发式推断参数类型（用于 ElInput/ElSwitch/ElSelect 渲染）
- *  - 优先用真实 binding
- *  - fallback heuristic
+ * 推断参数类型（决定渲染什么控件）
+ *  - 优先用真实 binding（有 schema 时才可信）
+ *  - 无 binding 时**按值本身的 JS 类型**推断，不按键名猜
+ *
+ * ⚠️ 2026-10-22 更正：原 fallback 按键名猜 PERCENT / DURATION
+ *   （`*threshold*`→PERCENT）—— `RemainingTimeThresholdHours: 24` 是**小时**不是百分比，
+ *   猜错会把控件标成百分比 ⇒ 已改为纯值驱动。PERCENT 只可能来自登录过的 binding。
  */
 export function inferType(
   key: string,
@@ -235,12 +266,7 @@ export function inferType(
   }
   if (typeof value === 'boolean') return 'BOOLEAN'
   if (typeof value === 'string') return 'STRING'
-  if (typeof value === 'number') {
-    const k = key.toLowerCase()
-    if (k.includes('yield') || k.includes('threshold')) return 'PERCENT'
-    if (k.includes('buffer') || k.includes('leadtime') || k.includes('duration')) return 'DURATION'
-    return 'NUMBER'
-  }
+  if (typeof value === 'number') return 'NUMBER'
   return 'STRING'
 }
 
@@ -263,13 +289,13 @@ export function parseJsonSafe(json: string | undefined | null): JsonObject {
   return {}
 }
 
-/** 5 块 JSON 字符串 → 解析后的对象（用于 store buffer 初始化） */
+/** 5 块 JSON 字符串 → 解析后的对象（用于 store buffer 初始化；后端列可空，接受 null） */
 export function parseParameterSetBlocks(input: {
-  lockJson?: string
-  supplyJson?: string
-  procurementJson?: string
-  solverStrategyJson?: string
-  candidateGuardrailJson?: string
+  lockJson?: string | null
+  supplyJson?: string | null
+  procurementJson?: string | null
+  solverStrategyJson?: string | null
+  candidateGuardrailJson?: string | null
 }): ParameterSetBlocks {
   return {
     lock: parseJsonSafe(input.lockJson),

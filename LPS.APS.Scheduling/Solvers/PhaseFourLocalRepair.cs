@@ -1,3 +1,4 @@
+using System.Threading;
 using LPS.APS.Core.Dto;
 using LPS.APS.Shared.Models;
 
@@ -23,7 +24,8 @@ internal class PhaseFourLocalRepair
         DomainSolveRequest request,
         InitialScheduleResult scheduleResult,
         DiagnosticsResult diagnostics,
-        ConstraintContext constraints)
+        ConstraintContext constraints,
+        CancellationToken cancellationToken = default)
     {
         var result = new RepairResult();
 
@@ -50,7 +52,7 @@ internal class PhaseFourLocalRepair
         if ((request.CandidateContext?.ChangeSeedKeys != null && request.CandidateContext.ChangeSeedKeys.Count > 0) || hasTaskTargets || hasChangedResources)
         {
             // Candidate模式：影响传播
-            return RepairWithPropagation(request, scheduleResult, diagnostics, constraints, resourceOccupancy);
+            return RepairWithPropagation(request, scheduleResult, diagnostics, constraints, resourceOccupancy, cancellationToken);
         }
         else
         {
@@ -68,7 +70,8 @@ internal class PhaseFourLocalRepair
         InitialScheduleResult scheduleResult,
         DiagnosticsResult diagnostics,
         ConstraintContext constraints,
-        Dictionary<int, List<TimeWindow>> resourceOccupancy)
+        Dictionary<int, List<TimeWindow>> resourceOccupancy,
+        CancellationToken cancellationToken = default)
     {
         var result = new RepairResult();
 
@@ -178,7 +181,9 @@ internal class PhaseFourLocalRepair
         // 修复背景：初始集原未排除锚点，导致「既是锚点又是变化种子」的 Task 会被 relocation 主循环搬走
         //           （该主循环只排连带牺牲者，不查 immovableTasks 自身）。
         // 注：IdentifyImmovableTasks 只认 request.ExecutionConstraints；当前生产侧该字段恒空
-        //     （PeggingOrchestrator.cs:210「当前锚点机制未建……故预留为空」），本保护在锚点通道接通后生效。
+        //     （`PeggingOrchestrator.cs:403-406`「当前锚点机制未建……故预留为空」+ `ExecutionConstraints =
+        //     Array.Empty<ExecutionConstraint>()`；2026-10-12 更正：原引 `:210` 已漂移成 catch 块），
+        //     本保护在锚点通道接通后生效。
         affectedTasks.ExceptWith(immovableTasks);
 
         // 初始化所有已排任务的快照
@@ -309,7 +314,14 @@ internal class PhaseFourLocalRepair
                 // 3. P0-02修复 + item1 接线（阶段二）：日历感知 + 动态 Setup 规则查找（含Setup占用）。
                 // 移动后的 Task 以新位置前产品重解析 Setup（v1.2 §11.1：移动必须重算受影响邻接），
                 // 不再读 RoutingOperation.SetupTime（§1.2/§20.3 废止）。
-                var duration = task.PlannedEndTime - task.PlannedStartTime;
+                // ── Duration-1 收尾（2026-10-26）：这里要的是**有效加工**，不是墙钟跨度 ──
+                //   单窗下两者逐位相等（`End − Start` 恒等于 `TimeSpan.FromMinutes(adjustedDuration)`，
+                //   由 Phase2 正/倒排、拆批、合批、非资源各拼法保证）⇒ **今日零行为变化**；
+                //   跨窗一落（PV195）`End − Start` 会多算中断段 ⇒ 槽长虚胖、把需求白挤到后面，故必须改走字段。
+                //   `null` ＝ 锁定继承 Task（MES 既成事实，无有效加工可算）⇒ 回落原算式，保持锚点原口径。
+                var duration = task.EffectiveProcessMinutes is decimal taskEffectiveProcess
+                    ? TimeSpan.FromMinutes((double)taskEffectiveProcess)
+                    : task.PlannedEndTime - task.PlannedStartTime;
 
                 // 非资源 Task（ResourceId=NULL）不占资源、无槽可找 → 跳过重排（found=null，走"保持原位置"分支）
                 var found = task.ResourceId is int ridSlot
@@ -352,6 +364,10 @@ internal class PhaseFourLocalRepair
                         UOM = task.UOM,
                         PlannedStartTime = newStart,  // 新位置
                         PlannedEndTime = newEnd,      // 新位置
+                        // Duration-1（**最易漏的一类**）：本处是「从已有 task 拷贝」，不是新算。
+                        //   漏拷 ⇒ null ⇒ 单窗下回落值（End−Start）恰好等于真值 ⇒ 测试全绿、只有跨窗才炸。
+                        //   有效加工是不变量：换位置/重算 Setup 都不改它 ⇒ **原样前推**。
+                        EffectiveProcessMinutes = task.EffectiveProcessMinutes,
                         SetupTime = newSetupMinutes,  // item1 接线：新位置规则解析值（§11.1 移动重算）
                         SetupSource = newSetupSource, // SetupSource 填充：新位置命中类型 / 保留原来源
                         Priority = task.Priority,
@@ -635,8 +651,20 @@ internal class PhaseFourLocalRepair
         // P0-08：从已排 Task 反推各 PI 连续份额的完成时间，供修复路径的自由份额做下界。
         var continuityCompletionByPI = BuildContinuityCompletionByPI(request.LogicalProductionDemands, scheduleResult.ScheduledTasks);
 
+        // ── 2026-10-25 运行中进度探针（2号位《单域可复现样本》§7.2）──
+        //   Phase4 的修复单元**逐需求**展开（`ExpandRepairUnits`），单元总数事先不可知 ⇒
+        //   这里按「待修复需求条数」口径报告进度（`Phase4UnitsTotal` = 本轮待修复需求数）。
+        //   纯观测，不参与任何业务判定。
+        SolverDiagnostics.SetPhase4UnitTotal(orderedDemandKeys.Count);
+        int phase4Processed = 0;
+
         foreach (var demandKey in orderedDemandKeys)
         {
+            SolverDiagnostics.SetPhase4UnitProgress(++phase4Processed);
+
+            // 2026-10-26 取消支持（2号位《PV190 第二次现场》§6.3-4）：粒度＝一个修复单元。
+            cancellationToken.ThrowIfCancellationRequested();
+
             var demand = request.LogicalProductionDemands
                 .FirstOrDefault(d => d.LogicalDemandKey == demandKey);
 
@@ -674,6 +702,7 @@ internal class PhaseFourLocalRepair
 
             foreach (var (unitBatchKey, unitDemand) in repairUnits)
             {
+                long swP4Try = SolverDiagnostics.HotspotStart();
                 var repairedTasks = TryResourceSwitch(
                     unitDemand,
                     unitBatchKey,
@@ -681,6 +710,7 @@ internal class PhaseFourLocalRepair
                     resourceOccupancy,
                     request,
                     dynamicMaterialFloor);
+                SolverDiagnostics.HotspotEnd(swP4Try, SolverDiagnostics.Hotspot.Phase4TrySwitch);
 
                 if (repairedTasks.Count == 0)
                 {
@@ -744,6 +774,18 @@ internal class PhaseFourLocalRepair
     /// <summary>
     /// Base/FULL模式：传统修复未排程需求
     /// </summary>
+    /// <summary>
+    /// 2026-10-20 二十四处：按 `LogicalDemandKey` 取需求（索引优先、原线性查找兜底）。
+    ///   `key` 为 null 或索引未命中 ⇒ 回落原 `FirstOrDefault`，与改前**逐字等价**。
+    /// </summary>
+    private static LogicalProductionDemand? FindDemandByLogicalKey(
+        DomainSolveRequest request,
+        Dictionary<string, LogicalProductionDemand> index,
+        string? key)
+        => key is not null && index.TryGetValue(key, out var indexed)
+            ? indexed
+            : request.LogicalProductionDemands.FirstOrDefault(d => d.LogicalDemandKey == key);
+
     private RepairResult RepairUnscheduledDemands(
         DomainSolveRequest request,
         InitialScheduleResult scheduleResult,
@@ -751,6 +793,9 @@ internal class PhaseFourLocalRepair
         Dictionary<int, List<TimeWindow>> resourceOccupancy)
     {
         var result = new RepairResult();
+
+        // 2026-10-20 二十四次定位：Phase4 5.5 s（ΣPhase 的 18.7%）此前**零埋点**，先切三块。纯观测。
+        long swP4Prep = SolverDiagnostics.HotspotStart();
 
         // 块4（任务喂任务）：从已排 Task 反推每个 demand 的完成时间，修复路径据此遵守子件完成下界。
         var demandCompletion = scheduleResult.ScheduledTasks
@@ -760,10 +805,22 @@ internal class PhaseFourLocalRepair
         // P0-08：从已排 Task 反推各 PI 连续份额的完成时间，供修复路径的自由份额做下界。
         var continuityCompletionByPI = BuildContinuityCompletionByPI(request.LogicalProductionDemands, scheduleResult.ScheduledTasks);
 
+        SolverDiagnostics.HotspotEnd(swP4Prep, SolverDiagnostics.Hotspot.Phase4Prep);
+
+        // ── 2026-10-20 二十四处：未排需求按 `LogicalDemandKey` 建一次索引 ──
+        //   旧写法在「未排需求数 × 全部需求数」上做线性 `FirstOrDefault`（16k 档 2,561 × 5,333 ≈ 1,365 万次比较）。
+        //   等价性：索引按 `LogicalProductionDemands` 的**列表次序**插入并 `TryAdd`（先到者胜）
+        //   ⇒ 命中项与 `FirstOrDefault` 的「第一个相等者」**逐字相同**；未命中回落原 `FirstOrDefault`
+        //   （覆盖 `demandKey` 为 null 等索引无法承载的情形），语义零变化。
+        var demandByLogicalKey = new Dictionary<string, LogicalProductionDemand>(StringComparer.Ordinal);
+        foreach (var d0 in request.LogicalProductionDemands)
+        {
+            if (d0.LogicalDemandKey is string k0) demandByLogicalKey.TryAdd(k0, d0);
+        }
+
         foreach (var demandKey in scheduleResult.UnscheduledDemandKeys)
         {
-            var demand = request.LogicalProductionDemands
-                .FirstOrDefault(d => d.LogicalDemandKey == demandKey);
+            var demand = FindDemandByLogicalKey(request, demandByLogicalKey, demandKey);
 
             if (demand == null) continue;
 
@@ -801,6 +858,7 @@ internal class PhaseFourLocalRepair
 
             foreach (var (unitBatchKey, unitDemand) in repairUnits)
             {
+                long swP4Try = SolverDiagnostics.HotspotStart();
                 var repairedTasks = TryResourceSwitch(
                     unitDemand,
                     unitBatchKey,
@@ -808,6 +866,7 @@ internal class PhaseFourLocalRepair
                     resourceOccupancy,
                     request,
                     dynamicMaterialFloor);
+                SolverDiagnostics.HotspotEnd(swP4Try, SolverDiagnostics.Hotspot.Phase4TrySwitch);
 
                 if (repairedTasks.Count == 0)
                 {
@@ -874,9 +933,28 @@ internal class PhaseFourLocalRepair
     }
 
     /// <summary>
-    /// 识别不可移动任务（Execution/Firm/Frozen/Protection）
+    /// 识别不可移动任务。
     /// 文档：§四 4.8 ImmovableFacts
     /// P1-05：internal static 供 Phase5 Gap Compaction 复用（同一套不可移动语义，不另建）。
+    ///
+    /// ⚠ **2026-10-13 就地更正（原标题写「Execution/Firm/Frozen/Protection」= 4 来源，与实现不符）**：
+    ///   本方法**唯一**来源 = <c>request.ExecutionConstraints</c>（**契约①**，锁物理位置）。逐项说明：
+    ///   <list type="bullet">
+    ///     <item><b>Frozen（窗口层 ＋ 执行事实）</b> ⇒ **经契约①进入**。2号位 <c>ExecutionConstraintProjector</c>
+    ///       <c>:217-219</c> 自证：「1号位 消费端实查：<c>IdentifyImmovableTasks</c> 的**唯一**来源就是
+    ///       <c>request.ExecutionConstraints</c>……没有独立的 <c>immovableTasks</c> 入参」。⇒ 本方法无需为
+    ///       窗口层另开入口。</item>
+    ///     <item><b>Firm</b> ⇒ **明确不入**。<c>PM回复0923-1</c> §三.2 逐字「**Firm 不是锁。Firm 不是不可移动。**」
+    ///       ⇒ Firm 走**契约②**只作通报（见下条），**不得**据以禁移。</item>
+    ///     <item><b>Protection（契约② <c>request.OrderProtections</c>）</b> ⇒ **只通报、不约束**。
+    ///       <c>DomainSolveRequest.cs:409</c> 逐字：「**只通报、不约束**：1号位 **不得**据此禁止移动任何 Task」；
+    ///       <c>OrderProtectionType.Frozen</c> 自述「本类型在**契约② 里只作事实通报**；其**物理位置保护**由
+    ///       **契约①**（同订单 Task 的 <c>ExecutionConstraint</c>）承担」。⇒ **本方法刻意不新增
+    ///       <c>OrderProtection</c> 来源**（2号位 已于 2026-10-13 落契约②生产端，见 <c>PeggingOrchestrator.cs:421</c>）。</item>
+    ///   </list>
+    ///   【历史项已关闭】2026-09-23《订单保护事实载体_2号位致1号位_收敛回执》§六 曾拟「<c>IdentifyImmovableTasks</c>
+    ///   新增 <c>OrderProtection</c> 来源」并约「同批联调」；该项已被 **2026-10-13 契约①／②分工**取代
+    ///   （Frozen 的物理保护归契约①）⇒ **不再执行**，非漏做。
     /// </summary>
     internal static HashSet<string> IdentifyImmovableTasks(
         DomainSolveRequest request,
@@ -1111,7 +1189,7 @@ internal class PhaseFourLocalRepair
                     var taskStart = occSlot.Start + TimeSpan.FromMinutes((double)setupMinutes);
                     // SetupSource 填充：解析命中类型 → 大写 5 值（5号位 值契约统一 20260921）
                     var taskSetupSource = SetupOptimizer.SetupOutcomeToSource(setupResolution.Outcome);
-                    scheduledTask = CreateTask(demand, operation, resourceId, taskStart, occSlot.End, setupMinutes, constraints, batchDraftKey, taskSetupSource);
+                    scheduledTask = CreateTask(demand, operation, resourceId, taskStart, occSlot.End, adjustedDuration, setupMinutes, constraints, batchDraftKey, taskSetupSource);
 
                     // 临时占用：从Setup开始
                     if (!resourceOccupancy.ContainsKey(resourceId))
@@ -1349,7 +1427,35 @@ internal class PhaseFourLocalRepair
 
         // 0号位裁决（2026-09-12）：无末期限制 —— 正排不再被 planningEnd 截断，
         // 只受资源日历窗口约束。与 Phase2.FindForwardSlot 口径一致。
-        foreach (var calWindow in calendar.OrderBy(w => w.Start))
+        //
+        // ── 2026-10-20 第五刀（Phase2 同款，此处为 Phase4/Phase5 侧）──
+        //   旧实现**每次调用**都 `calendar.OrderBy(w => w.Start)`：O(C log C) + 一次分配，
+        //   而日历在 `PhaseOneConstraintBuilder.BuildResourceCalendars:1231-1244` 里
+        //   **建的时候就已经 `OrderBy(slot => slot.Start)`**（`:1238`），
+        //   且 `ResourceCalendars` 全仓只有 `:1243` 一处整体赋值、求解内一律只读
+        //   （grep 复核：其余 10 处命中全是 `TryGetValue`）⇒ 这次排序纯属白做。
+        //   `OrderBy` 是**稳定**排序：对**已升序**的序列排序后逐元素相同 ⇒ 直接按原序遍历，
+        //   结果与旧实现**逐位一致**，零行为变化。
+        //   （5 个调用方：本文件 `:321`/`:1126`/`:1590`、`PhaseFiveCompression.cs:783`、
+        //     单测 `ResourceEfficiencyTests.cs:436/443`；签名与可见性均未改。）
+        // ── 2026-10-20 二十五年刀：有序自检**整趟只做一次**（原先每个日历窗各做一次 O(W) 自检）──
+        //   24 次定位实测（16k 档）：Phase4 全部 5,496 ms 里 `Phase4TrySwitch` 占 5,424 ms
+        //   （3,082 次 × 1,760 µs），Prep 只有 4 ms ⇒ 主体就是本条路径上的槽查找。
+        //   本方法每个 (工序 × 合格资源) 调一次，内部再按日历窗逐个 `FindFirstAvailableSlot`；
+        //   而后者每次都要 O(W) 自检 + **从下标 0 起整趟线性扫**（W≈8,673）⇒ 单次约 17 µs。
+        //   现改为：自检提到循环外（一趟一次），且扫描起点用二分定位。
+        //   **等价性**：① 自检与 `OrderBy` 回落逻辑逐字保留（只是次数变少，有序分支结果不变）；
+        //     ② 扫描起点之前的窗必满足 `Start < windowStart`，其 `occ.Start >= cursor + duration` 恒假
+        //        ⇒ 原实现里对它们唯一可能的动作是 `cursor = max(cursor, occ.End)`；
+        //        故只需从「第一个 `End > windowStart` 的窗」起扫（`Start >= windowStart` 的二分位再向前回溯），
+        //        被跳过的窗 `End <= windowStart <= cursor` ⇒ 对 cursor **零影响**，结果逐位一致。
+        var occupied = resourceOccupancy.TryGetValue(resourceId, out var occList) ? occList : null;
+        if (occupied is not null && !IsAscendingByStart(occupied))
+        {
+            occupied = occupied.OrderBy(w => w.Start).ToList();
+        }
+
+        foreach (var calWindow in calendar)
         {
             if (calWindow.End <= earliestStart) continue;
 
@@ -1358,7 +1464,7 @@ internal class PhaseFourLocalRepair
 
             if (windowEnd - windowStart < duration) continue;
 
-            var slot = FindFirstAvailableSlot(windowStart, duration, resourceId, resourceOccupancy);
+            var slot = FindFirstAvailableSlot(windowStart, duration, occupied);
             if (slot.HasValue && slot.Value.End <= windowEnd)
             {
                 return slot;
@@ -1375,19 +1481,36 @@ internal class PhaseFourLocalRepair
     private static TimeWindow? FindFirstAvailableSlot(
         DateTime windowStart,
         TimeSpan duration,
-        int resourceId,
-        Dictionary<int, List<TimeWindow>> resourceOccupancy)
+        List<TimeWindow>? occupied)
     {
-        if (!resourceOccupancy.ContainsKey(resourceId))
+        if (occupied is null)
         {
             return new TimeWindow(windowStart, windowStart + duration);
         }
 
-        var occupied = resourceOccupancy[resourceId].OrderBy(w => w.Start).ToList();
+        // ── 2026-10-20 二十五年刀：**二分定位扫描起点**（有序自检已由 `FindForwardSlot` 整趟做一次）──
+        //   旧实现从下标 0 起整趟线性扫（W≈8,673 ⇒ 每次约 8.7 µs，且每个日历窗都付一次）。
+        //   等价性见 `FindForwardSlot` 的注释：起点之前的窗 `Start < windowStart`
+        //   ⇒ 判断恒假、`cursor` 只在 `occ.End > windowStart` 时才被抬升
+        //   ⇒ 从「第一个 `Start >= windowStart` 的二分位」**向前回溯到不再有 `End > windowStart`** 起扫，
+        //      结果与整趟扫描逐位一致。
+        //   `FindFirstAvailableSlot` 是 private，调用方只有本文件 `FindForwardSlot`。
+        int lo = 0, hi = occupied.Count;
+        while (lo < hi)
+        {
+            var mid = (lo + hi) >> 1;
+            if (occupied[mid].Start < windowStart) lo = mid + 1;
+            else hi = mid;
+        }
+
+        var start = lo;
+        while (start > 0 && occupied[start - 1].End > windowStart) start--;
+
         var cursor = windowStart;
 
-        foreach (var occ in occupied)
+        for (var i = start; i < occupied.Count; i++)
         {
+            var occ = occupied[i];
             if (occ.Start >= cursor + duration)
             {
                 return new TimeWindow(cursor, cursor + duration);
@@ -1396,6 +1519,21 @@ internal class PhaseFourLocalRepair
         }
 
         return new TimeWindow(cursor, cursor + duration);
+    }
+
+    /// <summary>
+    /// 2026-10-20 第五刀（Phase4/Phase5 侧）：占用窗列表是否已按 `Start` 非递减。
+    /// 只做 O(W) 自检，**不改表**（调用方只读）——有序即免掉一次 `OrderBy(...).ToList()` 的排序与分配；
+    /// 无序则调用方回落到原实现，行为不变。
+    /// </summary>
+    private static bool IsAscendingByStart(List<TimeWindow> windows)
+    {
+        for (int i = 1; i < windows.Count; i++)
+        {
+            if (windows[i].Start < windows[i - 1].Start) return false;
+        }
+
+        return true;
     }
 
     /// <summary>
@@ -1410,6 +1548,7 @@ internal class PhaseFourLocalRepair
         int resourceId,
         DateTime start,
         DateTime end,
+        decimal effectiveProcessMinutes,  // Duration-1：有效加工分钟（调用方已算好的 adjustedDuration，**本处不重算**）
         decimal setupMinutes,     // item1 接线（阶段二）：规则解析出的换型分钟
         ConstraintContext constraints,
         string batchDraftKey,     // P0-03：**本批真实归批键**（调用方逐批传入，不由 LogicalDemandKey 反推）
@@ -1439,6 +1578,8 @@ internal class PhaseFourLocalRepair
             UOM = demand.UOM ?? string.Empty,
             PlannedStartTime = start,
             PlannedEndTime = end,
+            // Duration-1：有效加工 = 调用方算出的 adjustedDuration；**不在此重算**（本 DTO 无 StandardDuration/CapacityFactor）
+            EffectiveProcessMinutes = effectiveProcessMinutes,
             SetupTime = setupMinutes,   // item1 接线：规则值（RoutingOperation.SetupTime 已废止，v1.2 §1.2）
             SetupSource = setupSource,  // SetupSource 填充：SetupOutcome → 大写 5 值（2号位 原样落库）
             Priority = demand.DemandSequence,
@@ -1600,7 +1741,7 @@ internal class PhaseFourLocalRepair
                         var splitSetupSource = convergedResolution.HasValue
                             ? SetupOptimizer.SetupOutcomeToSource(convergedResolution.Value.Outcome)
                             : null;
-                        splitTask = CreateSplitTask(demand, operation, resourceId, taskStart, pieceSlot.Value.End, qtyPerSplit, splitQuantity, setupMinutes, constraints, batchDraftKey, splitSetupSource);
+                        splitTask = CreateSplitTask(demand, operation, resourceId, taskStart, pieceSlot.Value.End, adjustedDuration, qtyPerSplit, splitQuantity, setupMinutes, constraints, batchDraftKey, splitSetupSource);
 
                         candidateTasks.Add(splitTask);
 
@@ -1638,6 +1779,7 @@ internal class PhaseFourLocalRepair
         int resourceId,
         DateTime start,
         DateTime end,
+        decimal effectiveProcessMinutes,  // Duration-1：按**拆后**数量算的有效加工分钟（`StandardDuration × qtyPerSplit ÷ CapacityFactor`）
         decimal plannedProcessQty,
         decimal quantity,
         decimal setupMinutes,     // item1 接线（阶段二）：规则解析出的换型分钟
@@ -1666,6 +1808,9 @@ internal class PhaseFourLocalRepair
             UOM = demand.UOM ?? string.Empty,
             PlannedStartTime = start,
             PlannedEndTime = end,
+            // Duration-1（拆批）：乘数＝本件拆后数量 `qtyPerSplit`（已写进上一行 PlannedProcessQty），
+            //   与调用方 `adjustedDuration = StandardDuration × qtyPerSplit ÷ CapacityFactor` 同源
+            EffectiveProcessMinutes = effectiveProcessMinutes,
             SetupTime = setupMinutes,   // item1 接线：规则值（RoutingOperation.SetupTime 已废止，v1.2 §1.2）
             SetupSource = setupSource,  // SetupSource 填充：SetupOutcome → 大写 5 值（2号位 原样落库）
             Priority = demand.DemandSequence,

@@ -1,5 +1,11 @@
 <!--
-  APS V1 4号位 — 策略配置独立维护页（v1.4 §十八.10 / 长期欠账 v1.0/v1.1/v1.2 收口）
+  APS V1 4号位 — 策略包版本独立维护页（v1.6 4号位 补登，待 0号位 拍板；历史引用 v1.4 §十八.10）
+  页面名取冻结文档 07 v5.1.10 §5.6「StrategyProfileVersion（策略包版本表）」的原词，
+  与同组的「规则集版本」「参数集版本」对齐；10-16 起归入菜单分组「策略配置」。
+
+  @see frontNew/docs/project_strategy_profile_audit.md（10-10 审查报告 + 7 项问题）
+  @see lps/LPS.APS.Web/Controllers/GovernanceController.cs（12 端点全在 3号位 控制器）
+  @see lps/LPS.APS.Core/Authorization/PermissionCodes.cs（DDL 三码真值 aps.strategy.{view,edit,publish}）
 
   复用 RBAC 4 页架构（加载 / 过滤 / 表格 / Dialog / 二次确认 / 红线注释 五段式）
   + Rules.vue Publish Dialog 模式（changeReason 必填 + ElMessageBox 二次确认 + ElAlert 红线）
@@ -7,7 +13,7 @@
   布局：
     左侧 Profile 列表（卡片式，含 RunType + IsActive）
     右侧 选中 Profile 后：
-      顶部 KPI（6 态分布 + 已发布数 + 默认数）
+      顶部 KPI（V1 可达状态分布：草稿 / 已发布 / 已退役；预留的提交/批准/归档无写入路径，不展示）
       版本表格（6 态 Tag + 操作列）
       版本详情（Descriptions）
       Diff 面板（选 base + target → loadDiff）
@@ -45,6 +51,8 @@ import {
 } from 'element-plus'
 import {
   STRATEGY_STATUS_META,
+  STRATEGY_VERSION_STATUSES,
+  STRATEGY_V1_REACHABLE_STATUSES,
   type StrategyProfileVersionDto,
   type StrategyVersionDraftInput,
   type StrategyVersionStatus
@@ -297,18 +305,69 @@ const currentStatusText = computed<string>(() => {
   return STRATEGY_STATUS_META[s as StrategyVersionStatus].label
 })
 
+/** RunType 中文标签（冻结 07 v5.1.13 §5.5 五值；可空 = 适用所有运行类型） */
+const RUN_TYPE_LABELS: Record<string, string> = {
+  FULL_SCHEDULE: '全量排产',
+  MANUAL_RESCHEDULE: '人工重排',
+  LOCAL_RESCHEDULE: '局部插单',
+  SIMULATION: '仿真演练',
+  INSERT_ORDER_WHATIF: '插单 WhatIf'
+}
+
 const profileRunTypeLabel = computed<string>(() => {
   const rt = currentProfile.value?.runType
   if (!rt) return '—'
-  const map: Record<string, string> = {
-    FULL_SCHEDULE: '全量排产',
-    MANUAL_RESCHEDULE: '人工重排',
-    LOCAL_RESCHEDULE: '局部插单',
-    SIMULATION: '仿真演练',
-    INSERT_ORDER_WHATIF: '插单 WhatIf'
-  }
-  return map[rt] ?? rt
+  return RUN_TYPE_LABELS[rt] ?? rt
 })
+
+/* ==================== 新建策略包 ==================== */
+
+const createProfileDialog = ref(false)
+const createProfileForm = ref({
+  strategyProfileCode: '',
+  strategyProfileName: '',
+  description: '',
+  runType: ''
+})
+
+function openCreateProfileDialog(): void {
+  createProfileForm.value = {
+    strategyProfileCode: '',
+    strategyProfileName: '',
+    description: '',
+    runType: ''
+  }
+  createProfileDialog.value = true
+}
+
+async function onCreateProfile(): Promise<void> {
+  const id = await store.createProfile({
+    strategyProfileCode: createProfileForm.value.strategyProfileCode,
+    strategyProfileName: createProfileForm.value.strategyProfileName,
+    description: createProfileForm.value.description,
+    runType: createProfileForm.value.runType || null
+  })
+  if (id == null) return
+  createProfileDialog.value = false
+  ElMessage.success('策略包已创建，请为它新建第一个版本')
+  await selectProfile(id)
+}
+
+/**
+ * KPI 只展示 V1 够得着的状态；万一库里真出现了预留状态（手工 SQL / 后端将来补齐审批流），
+ * 仍按实际计数显示，不把真实数据藏起来。
+ */
+const kpiStatuses = computed<StrategyVersionStatus[]>(() => {
+  const reachable = STRATEGY_VERSION_STATUSES.filter((s) =>
+    STRATEGY_V1_REACHABLE_STATUSES.includes(s)
+  )
+  const unexpected = STRATEGY_VERSION_STATUSES.filter(
+    (s) => !STRATEGY_V1_REACHABLE_STATUSES.includes(s) && statusCounts.value[s] > 0
+  )
+  return [...reachable, ...unexpected]
+})
+
+const kpiSpan = computed<number>(() => Math.max(4, Math.floor(24 / kpiStatuses.value.length)))
 
 function formatDateTime(s: string | null | undefined): string {
   return s ? dayjs(s).format('YYYY-MM-DD HH:mm:ss') : '—'
@@ -328,7 +387,7 @@ const statusTagEffect = (s: StrategyVersionStatus): 'light' | 'dark' | 'plain' |
     <!-- 顶部 Header -->
     <div class="page-header">
       <div>
-        <h2 class="page-title">策略配置</h2>
+        <h2 class="page-title">策略包版本</h2>
         <span class="page-subtitle">策略包与版本维护（草稿 / 发布 / 默认版本 / 版本对比）</span>
       </div>
       <ElButton @click="loadAll" :loading="listLoading">刷新求解器策略列表</ElButton>
@@ -347,11 +406,24 @@ const statusTagEffect = (s: StrategyVersionStatus): 'light' | 'dark' | 'plain' |
     </ElAlert>
 
     <ElRow :gutter="16" class="page-body">
-      <!-- 左侧：Profile 列表 -->
+      <!-- 左侧：策略包列表 -->
       <ElCol :span="8">
-        <ElCard shadow="hover" header="策略 Profile 列表">
+        <ElCard shadow="hover">
+          <template #header>
+            <div class="card-head-row">
+              <span>策略包列表</span>
+              <ElTooltip
+                :content="canWrite ? '新建一个策略包（编码创建后不可修改）' : '当前账号无编辑权限'"
+                placement="bottom"
+              >
+                <ElButton size="small" :disabled="!canWrite" @click="openCreateProfileDialog">
+                  新建策略包
+                </ElButton>
+              </ElTooltip>
+            </div>
+          </template>
           <template v-if="profiles.length === 0 && !listLoading">
-            <ElEmpty description="暂无 Profile" :image-size="80" />
+            <ElEmpty description="暂无策略包" :image-size="80" />
           </template>
           <div v-else class="profile-list">
             <div
@@ -391,8 +463,19 @@ const statusTagEffect = (s: StrategyVersionStatus): 'light' | 'dark' | 'plain' |
                 <span class="profile-name-lg">{{ currentProfile.strategyProfileName }}</span>
               </div>
               <div class="profile-head-actions">
-                <ElTooltip content="仅创建草稿版本，不允许其它状态" placement="top">
-                  <ElButton type="primary" :disabled="!canWrite" @click="openCreateDraft">
+                <ElTooltip
+                  :content="
+                    !currentProfile.isActive
+                      ? '策略包已停用，无法新建草稿（7号 §5.5 IsActive=0 = 停用）'
+                      : '仅创建草稿版本，不允许其它状态'
+                  "
+                  placement="top"
+                >
+                  <ElButton
+                    type="primary"
+                    :disabled="!canWrite || !currentProfile.isActive"
+                    @click="openCreateDraft"
+                  >
                     新建草稿
                   </ElButton>
                 </ElTooltip>
@@ -417,12 +500,12 @@ const statusTagEffect = (s: StrategyVersionStatus): 'light' | 'dark' | 'plain' |
             </ElDescriptions>
           </ElCard>
 
-          <!-- KPI 行 -->
+          <!-- KPI 行：只展示 V1 够得着的状态（草稿/已发布/已退役） -->
           <ElRow :gutter="12" class="kpi-row">
-            <ElCol v-for="(meta, key) in STRATEGY_STATUS_META" :key="key" :span="4">
+            <ElCol v-for="key in kpiStatuses" :key="key" :span="kpiSpan">
               <ElCard shadow="never" class="kpi-card">
-                <div class="kpi-label">{{ meta.label }}</div>
-                <div class="kpi-value">{{ statusCounts[key as StrategyVersionStatus] }}</div>
+                <div class="kpi-label">{{ STRATEGY_STATUS_META[key].label }}</div>
+                <div class="kpi-value">{{ statusCounts[key] }}</div>
               </ElCard>
             </ElCol>
           </ElRow>
@@ -473,8 +556,16 @@ const statusTagEffect = (s: StrategyVersionStatus): 'light' | 'dark' | 'plain' |
                   <span v-else>—</span>
                 </template>
               </ElTableColumn>
-              <ElTableColumn prop="ruleSetVersionId" label="规则集版本" width="100" />
-              <ElTableColumn prop="parameterSetVersionId" label="参数集版本" width="100" />
+              <ElTableColumn label="规则集版本" width="160">
+                <template #default="{ row }: { row: StrategyProfileVersionDto }">
+                  {{ row.ruleSetVersionCode ?? '—' }}
+                </template>
+              </ElTableColumn>
+              <ElTableColumn label="参数集版本" width="160">
+                <template #default="{ row }: { row: StrategyProfileVersionDto }">
+                  {{ row.parameterSetVersionCode ?? '—' }}
+                </template>
+              </ElTableColumn>
               <ElTableColumn label="发布时间" width="160">
                 <template #default="{ row }: { row: StrategyProfileVersionDto }">
                   {{ formatDateTime(row.publishedAt) }}
@@ -571,11 +662,11 @@ const statusTagEffect = (s: StrategyVersionStatus): 'light' | 'dark' | 'plain' |
                 >
                 <span v-else>—</span>
               </ElDescriptionsItem>
-              <ElDescriptionsItem label="规则集版本 ID">{{
-                currentVersion.ruleSetVersionId
+              <ElDescriptionsItem label="规则集版本">{{
+                currentVersion.ruleSetVersionCode ?? '—'
               }}</ElDescriptionsItem>
-              <ElDescriptionsItem label="参数集版本 ID">{{
-                currentVersion.parameterSetVersionId
+              <ElDescriptionsItem label="参数集版本">{{
+                currentVersion.parameterSetVersionCode ?? '—'
               }}</ElDescriptionsItem>
               <ElDescriptionsItem label="生效窗口">
                 {{ formatDateTime(currentVersion.effectiveFrom) }} ~
@@ -682,11 +773,11 @@ const statusTagEffect = (s: StrategyVersionStatus): 'light' | 'dark' | 'plain' |
                     {{ STRATEGY_STATUS_META[runTrace.status].label }}
                   </ElTag>
                 </ElDescriptionsItem>
-                <ElDescriptionsItem label="规则集版本 ID">{{
-                  runTrace.ruleSetVersionId
+                <ElDescriptionsItem label="规则集版本">{{
+                  runTrace.ruleSetVersionCode ?? '—'
                 }}</ElDescriptionsItem>
-                <ElDescriptionsItem label="参数集版本 ID">{{
-                  runTrace.parameterSetVersionId
+                <ElDescriptionsItem label="参数集版本">{{
+                  runTrace.parameterSetVersionCode ?? '—'
                 }}</ElDescriptionsItem>
               </ElDescriptions>
               <div class="trace-runs">
@@ -723,6 +814,65 @@ const statusTagEffect = (s: StrategyVersionStatus): 'light' | 'dark' | 'plain' |
       :submitting="actionRunning"
       @submit="handleDraftSubmit"
     />
+
+    <!-- 新建策略包 Dialog（主表；POST /strategy-profile） -->
+    <ElDialog
+      v-model="createProfileDialog"
+      title="新建策略包"
+      width="520px"
+      :close-on-click-modal="false"
+    >
+      <ElForm label-width="100px" size="default">
+        <ElFormItem label="策略包编码 (必填)">
+          <ElInput
+            v-model="createProfileForm.strategyProfileCode"
+            maxlength="50"
+            show-word-limit
+            placeholder="如 FULL_DEFAULT；全库唯一，创建后不能改"
+          />
+        </ElFormItem>
+        <ElFormItem label="策略包名称 (必填)">
+          <ElInput
+            v-model="createProfileForm.strategyProfileName"
+            maxlength="200"
+            placeholder="如 凌晨全量标准策略"
+          />
+        </ElFormItem>
+        <ElFormItem label="适用运行类型">
+          <ElSelect
+            v-model="createProfileForm.runType"
+            clearable
+            placeholder="不选 = 适用所有运行类型"
+          >
+            <ElOption
+              v-for="rt in Object.keys(RUN_TYPE_LABELS)"
+              :key="rt"
+              :label="RUN_TYPE_LABELS[rt]"
+              :value="rt"
+            />
+          </ElSelect>
+        </ElFormItem>
+        <ElFormItem label="描述">
+          <ElInput
+            v-model="createProfileForm.description"
+            type="textarea"
+            :rows="2"
+            placeholder="选填"
+          />
+        </ElFormItem>
+        <ElAlert type="info" :closable="false" show-icon class="d-alert">
+          <template #title>新建后需要再建第一个版本</template>
+          策略包的每个版本必须同时绑定一个已发布的规则集版本和一个已发布的参数集版本，
+          所以新建后请在右侧点「新建草稿」选择这两项。
+        </ElAlert>
+      </ElForm>
+      <template #footer>
+        <ElButton @click="createProfileDialog = false">取消</ElButton>
+        <ElButton type="primary" :loading="actionRunning" @click="onCreateProfile">
+          确认新建
+        </ElButton>
+      </template>
+    </ElDialog>
 
     <!-- Publish Dialog -->
     <ElDialog
@@ -998,5 +1148,11 @@ const statusTagEffect = (s: StrategyVersionStatus): 'light' | 'dark' | 'plain' |
 }
 .d-alert {
   margin-top: 8px;
+}
+
+.card-head-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
 }
 </style>

@@ -1,41 +1,53 @@
 /**
- * APS V1 4号位 — 设备资源日历 + 人工能力槽 API（9 端点）
+ * APS V1 4号位 — 设备资源日历 + 人工能力槽 API（11 端点 + 资源主表）
  *
  * 依据：
  *  - 冻结文档 v1.3《Resource Calendar 资源日历能力补充冻结方案 v1.3》§三/§五/§九
  *  - 5号位 2026-09-24《ResourceCalendar与ManualCapacity接口对接函》
  *
  * 后端（lps/** 只读参照）：
+ *  - ResourceController.cs          Route("api/resource")          （10-12 G1 已闭环）
+ *      GET    /                       aps.resource_calendar.view
  *  - ResourceCalendarController.cs  Route("api/resource-calendar")
- *      POST   /slots                    aps.resource_calendar.edit
- *      GET    /{resourceId}?from&to     aps.resource_calendar.view
+ *      POST   /slots                    aps.resource_calendar.edit   批量铺窗（**覆盖**该区间）
+ *      POST   /slot                     aps.resource_calendar.edit   单条追加（只插不删，重叠 409）
+ *      GET    /{resourceId}             aps.resource_calendar.view   PageResult（pageIndex/pageSize 必传）
+ *      GET    /resolve-preview          aps.resource_calendar.view   三级合并状态预览（WORK/OFF/MISSING）
  *      DELETE /slots/{id}               aps.resource_calendar.delete
  *  - ManualCapacityController.cs    Route("api/manual-capacity")（类级 view 码兜底）
  *      POST   /slots                    aps.manual_capacity.edit
  *      GET    /slots?departmentId&operationName&includeInactive   aps.manual_capacity.view
  *      DELETE /slots/{manualSlotId}     aps.manual_capacity.delete（软删 isActive=0）
- *      POST   /calendar                 aps.manual_capacity.edit
+ *      POST   /calendar                 aps.manual_capacity.edit     批量铺窗（**覆盖**）
+ *      POST   /calendar/single          aps.manual_capacity.edit     单条追加（同设备侧）
  *      GET    /calendar/{manualSlotId}  aps.manual_capacity.view
  *      DELETE /calendar/{id}            aps.manual_capacity.delete（物理删）
  *
- * 已知缺口（已发函 5号位 2026-09-24）：
- *  - G1：无资源主表列表端点 → `listResourceCandidates()` 走**过渡数据源**（计划版本甘特资源池）
- *  - G2：无生产部门列表端点 → `listDepartmentCandidates()` 从过渡资源池去重
- *  - G4：DTO 无 hasCalendar → 状态由"窗口数组空"推导，且仅选中行才查询
- *  - D2：铺窗后端只 INSERT 不删旧窗口 → 前端提示"追加"，不承诺"覆盖"
- *  - D3：from/to 为"完整包含"语义 → V1 不传，前端本地筛选
+ * 已知缺口（10-12 复盘）：
+ *  - G1：无资源主表列表端点 → 10-12 复盘发现 5号位 已落地（lps/LPS.APS.Web/Controllers/ResourceController.cs:34），4号位 已切
+ *  - G2：无生产部门列表端点 → 3号位 已落地（governance/lookups/departments，SetupRuleController.cs:299）
+ *  - G4：DTO 无 hasCalendar → 10-12 已通过 ResourceListItemDto 落地
+ *  - D3：from/to 为"完整包含"语义 → V1 不传
+ *
+ * 2026-10-14 D2 已澄清（5号位 回执《放开一天多条已落地》）：
+ *  - 批量端点实际是**覆盖式**（先 DELETE 该区间旧窗再逐天 INSERT），原「只 INSERT 不删」的判断作废
+ *  - 同时放开「一天多条」：新增单条追加端点（只插不删、重叠 409、相切合法、跨天 400）
  */
 
 import { apsHttp, APS_USE_MOCK, ApiError } from './http'
-import { scheduleApi } from './schedule'
 import type {
+  CalendarWindowPageResult,
   ManualCapacitySlotDto,
+  ManualCapacitySlotPageResult,
   ManualSlotCalendarBulkRequest,
   ManualSlotCalendarDto,
   ManualSlotQuery,
+  Resource,
   ResourceCalendarBulkRequest,
   ResourceCalendarEntryDto,
-  ResourceCandidate
+  ResourceCalendarSingleRequest,
+  ResourceCalendarResolvePreviewDto,
+  ManualSlotCalendarSingleRequest
 } from './types/resourceCalendar'
 import { BULK_DAYS_MAX, BULK_DAYS_MIN } from './types/resourceCalendar'
 
@@ -158,69 +170,82 @@ function assertBulkArgs(days: number, startTime: string, endTime: string): void 
   }
 }
 
-/* ==================== 过渡数据源（G1 / G2 未决） ==================== */
+/* ==================== 资源主表（10-12 收：G1 已闭环） ==================== */
 
-export interface ResourceCandidateResult {
-  list: ResourceCandidate[]
-  /** 过渡数据源标记：true = 来自计划版本甘特资源池（可能遗漏未排资源） */
-  isFallback: boolean
-  /** 过渡数据源所用的计划版本 Id（null = 无可用版本） */
-  planVersionId: number | null
-  /** 过渡数据源说明（UI 直接展示） */
-  note: string
-}
-
-/**
- * 资源（设备）候选列表
- *  ⚠️ 过渡实现：正式端点 `GET /api/resource` 缺失（发函 G1），改从最新计划版本的甘特资源池取
- *  - 优先 ACTIVE 版本，无则取列表第一条
- *  - 只含被排到的资源 → 标注 isFallback 供 UI 明示
+/** 资源（设备）主表列表项（GET /api/resource 5号位 已落地）
+ *  - 数据源：dbo.Resource 镜像表（@see lps/LPS.APS.Core/Entities/Aps/Resource.cs）
+ *  - 端点：lps/LPS.APS.Web/Controllers/ResourceController.cs:34，权限码 ResourceCalendarView
+ *  - dev 10-12 实测：单端点返 7773 records，含 hasCalendar 日历状态
+ *  - 4号位 之前用 `listResourceCandidates` 过渡数据源（从 gantt.resources 派生）+ 缓存
+ *    现已切换到正式端点，过渡实现 + RC21 closure 缓存已撤
  */
-async function listResourceCandidates(): Promise<ResourceCandidateResult> {
-  const versions = await scheduleApi.getVersions(30)
-  const picked =
-    versions.find((v) => v.status === 'ACTIVE') ?? (versions.length > 0 ? versions[0] : undefined)
-  if (!picked) {
-    return {
-      list: [],
-      isFallback: true,
-      planVersionId: null,
-      note: '无可用计划版本，无法带入资源池；请手填资源 Id'
-    }
+const MOCK_RESOURCES: Resource[] = [
+  {
+    resourceId: 1,
+    resourceCode: 'MC01',
+    resourceName: '注塑机-01',
+    resourceType: 'MACHINE',
+    productionDepartmentId: 1,
+    productionDepartmentName: '注塑车间',
+    isActive: true,
+    hasCalendar: true
+  },
+  {
+    resourceId: 2,
+    resourceCode: 'MC02',
+    resourceName: '注塑机-02',
+    resourceType: 'MACHINE',
+    productionDepartmentId: 1,
+    productionDepartmentName: '注塑车间',
+    isActive: true,
+    hasCalendar: false // 演示「未配日历 = 不可排」
+  },
+  {
+    resourceId: 3,
+    resourceCode: 'ASM01',
+    resourceName: '装配线-01',
+    resourceType: 'LINE',
+    productionDepartmentId: 3,
+    productionDepartmentName: '装配车间',
+    isActive: true,
+    hasCalendar: true
   }
-  const gantt = await scheduleApi.getGantt(picked.id)
-  const seen = new Set<number>()
-  const list: ResourceCandidate[] = []
-  gantt.resources.forEach((r) => {
-    if (seen.has(r.resourceId)) return
-    seen.add(r.resourceId)
-    list.push({
-      resourceId: r.resourceId,
-      resourceCode: r.resourceCode,
-      resourceName: r.resourceName,
-      productionDepartmentId: r.productionDepartmentId,
-      productionDepartmentName: r.productionDepartmentName,
-      isFallbackSource: true
+]
+
+async function listResources(
+  opts: { departmentId?: number; includeInactive?: boolean } = {}
+): Promise<Resource[]> {
+  if (APS_USE_MOCK) {
+    await delay(200)
+    return MOCK_RESOURCES.filter((r) => {
+      if (!opts.includeInactive && r.isActive === false) return false
+      if (opts.departmentId != null && r.productionDepartmentId !== opts.departmentId) return false
+      return true
     })
-  })
-  return {
-    list,
-    isFallback: true,
-    planVersionId: picked.id,
-    note: `资源池来自计划版本 ${picked.id}（${picked.versionCode}）的甘特图，仅含已被排到的资源；未列出的资源请用「手填资源 Id」加载`
   }
+  return apsHttp.get<Resource[]>({
+    url: '/api/resource',
+    params: {
+      departmentId: opts.departmentId,
+      includeInactive: opts.includeInactive ?? false
+    }
+  })
 }
 
-/** 生产部门候选（G2 未决：正式端点缺失，从过渡资源池去重） */
+/** 生产部门候选（从资源主表派生：去重 productionDepartmentId + 按 ID 排序）
+ *  - 10-12 改：原 G1 过渡实现（从 gantt 资源池去重）已撤；现直接 listResources → dedup
+ *  - 与正式端点 departmentLookupApi.listDepartments 的差异：本函数仅展示「被资源主表引用」的生产部门
+ *  - 后续若需全量生产部门主数据，调 departmentLookupApi.listDepartments()
+ */
 export interface DepartmentCandidate {
   productionDepartmentId: number
   productionDepartmentName?: string
 }
 
 async function listDepartmentCandidates(): Promise<DepartmentCandidate[]> {
-  const res = await listResourceCandidates()
+  const resources = await listResources()
   const map = new Map<number, DepartmentCandidate>()
-  res.list.forEach((r) => {
+  resources.forEach((r) => {
     if (r.productionDepartmentId == null) return
     if (!map.has(r.productionDepartmentId)) {
       map.set(r.productionDepartmentId, {
@@ -239,7 +264,8 @@ export const resourceCalendarApi = {
 
   /**
    * 批量铺窗（POST /api/resource-calendar/slots）→ 返回生成窗口数
-   *  ⚠️ 后端只 INSERT 不删旧窗口（发函 D2）→ UI 须提示"追加"，不承诺覆盖
+   *  **覆盖式**：后端先删该区间旧窗再逐天 INSERT（5号位 2026-10-14 回执 + 本机代码已确认）
+   *  两个入口分工：批量 = 整段重铺；单条（appendWindow）= 按条增补
    */
   async bulkCreateWindows(req: ResourceCalendarBulkRequest): Promise<number> {
     if (APS_USE_MOCK) {
@@ -265,16 +291,58 @@ export const resourceCalendarApi = {
   },
 
   /**
-   * 查询某设备的全部窗口（GET /api/resource-calendar/{resourceId}）
-   *  ⚠️ from/to 为"窗口完整落在区间内"语义（发函 D3）→ V1 不传，前端本地筛选
+   * 单条窗口追加（POST /api/resource-calendar/slot）→ 返回新行 Id
+   *  - 2026-10-14 5号位「放开一天多条」方向2 落地的端点：**只插不删**
+   *  - 同日重叠 → 409（后端 message 带冲突行 Id/日期/时段）；相切合法；跨天 400
+   *  - 校验顺序：参数 400 → 目标存在 404 → 业务范围 403 → 重叠 409
    */
-  async getWindows(resourceId: number): Promise<ResourceCalendarEntryDto[]> {
+  async appendWindow(req: ResourceCalendarSingleRequest): Promise<number> {
     if (APS_USE_MOCK) {
       await delay(200)
-      return [...(MOCK_DEVICE_WINDOWS[resourceId] ?? [])]
+      if (req.resourceId <= 0) throw new ApiError('资源 Id 必须为正整数', 400)
+      const bucket = MOCK_DEVICE_WINDOWS[req.resourceId] ?? []
+      const clash = bucket.some((w) => req.startTime < w.endTime && w.startTime < req.endTime)
+      if (clash) throw new ApiError('与同日已有窗口时间重叠', 409)
+      const id = (mockDeviceWindowSeq += 1)
+      bucket.push({
+        id,
+        resourceId: req.resourceId,
+        startTime: req.startTime,
+        endTime: req.endTime,
+        availableFlag: req.availableFlag,
+        remark: req.remark
+      })
+      MOCK_DEVICE_WINDOWS[req.resourceId] = bucket
+      return id
     }
-    return apsHttp.get<ResourceCalendarEntryDto[]>({
-      url: `/api/resource-calendar/${resourceId}`
+    return apsHttp.post<number>({ url: '/api/resource-calendar/slot', data: req })
+  },
+
+  /**
+   * 查询某设备的窗口页（GET /api/resource-calendar/{resourceId}）
+   *  - 2026-10-17：后端 10-14 已原地改 `PageResult`（`{items,total,page,pageSize}`）；
+   *    此前前端按裸数组消费 ⇒ 列表被静默截断成 20 行、分页总数失真，现按服务端分页对接
+   *  - `pageIndex`/`pageSize` **必传**：不传即只返回第 1 页
+   *  - `from`/`to` 为"窗口完整落在区间内"语义（发函 D3）→ V1 仍不传
+   */
+  async getWindows(
+    resourceId: number,
+    query: { pageIndex: number; pageSize: number }
+  ): Promise<CalendarWindowPageResult<ResourceCalendarEntryDto>> {
+    if (APS_USE_MOCK) {
+      await delay(200)
+      const all = MOCK_DEVICE_WINDOWS[resourceId] ?? []
+      const start = (query.pageIndex - 1) * query.pageSize
+      return {
+        items: all.slice(start, start + query.pageSize),
+        total: all.length,
+        page: query.pageIndex,
+        pageSize: query.pageSize
+      }
+    }
+    return apsHttp.get<CalendarWindowPageResult<ResourceCalendarEntryDto>>({
+      url: `/api/resource-calendar/${resourceId}`,
+      params: { pageIndex: query.pageIndex, pageSize: query.pageSize }
     })
   },
 
@@ -328,24 +396,40 @@ export const resourceCalendarApi = {
     return apsHttp.post<ManualCapacitySlotDto>({ url: '/api/manual-capacity/slots', data: slot })
   },
 
-  /** 查询人工槽主档（GET /api/manual-capacity/slots）；默认不含软删 */
-  async getSlots(query: ManualSlotQuery = {}): Promise<ManualCapacitySlotDto[]> {
+  /** 查询人工槽主档（GET /api/manual-capacity/slots）；默认不含软删
+   *  5号位 2026-10-12 落地分页：返 ManualCapacitySlotPageResult<ManualCapacitySlotDto>（{items,total,page,pageSize}）
+   *  - 此前返裸数组（dev 15360 records 整页塞 ElTable 卡顿），现在走 PageResult
+   *  - pageSize 默认 20、上限 200（越界回落 20，5号位 实测已含）
+   */
+  async getSlots(
+    query: ManualSlotQuery = {}
+  ): Promise<ManualCapacitySlotPageResult<ManualCapacitySlotDto>> {
+    const page = query.pageIndex ?? 1
+    const size = query.pageSize ?? 20
     if (APS_USE_MOCK) {
       await delay(200)
-      return MOCK_SLOTS.filter((s) => {
+      const all = MOCK_SLOTS.filter((s) => {
         if (!query.includeInactive && !s.isActive) return false
         if (query.departmentId != null && s.productionDepartmentId !== query.departmentId)
           return false
         if (query.operationName && s.operationName !== query.operationName) return false
         return true
       })
+      return {
+        items: all.slice((page - 1) * size, page * size),
+        total: all.length,
+        page,
+        pageSize: size
+      }
     }
-    return apsHttp.get<ManualCapacitySlotDto[]>({
+    return apsHttp.get<ManualCapacitySlotPageResult<ManualCapacitySlotDto>>({
       url: '/api/manual-capacity/slots',
       params: {
         departmentId: query.departmentId,
         operationName: query.operationName,
-        includeInactive: query.includeInactive ?? false
+        includeInactive: query.includeInactive ?? false,
+        pageIndex: page,
+        pageSize: size
       }
     })
   },
@@ -390,14 +474,90 @@ export const resourceCalendarApi = {
     return apsHttp.post<number>({ url: '/api/manual-capacity/calendar', data: req })
   },
 
-  /** 查询某人工槽的全部窗口（GET /api/manual-capacity/calendar/{manualSlotId}） */
-  async getSlotWindows(manualSlotId: number): Promise<ManualSlotCalendarDto[]> {
+  /** 单条追加人工槽窗口（POST /api/manual-capacity/calendar/single）→ 返回新行 Id
+   *  语义与设备侧 `appendWindow` 完全一致（只插不删 / 重叠 409 / 相切合法 / 跨天 400） */
+  async appendSlotWindow(req: ManualSlotCalendarSingleRequest): Promise<number> {
     if (APS_USE_MOCK) {
       await delay(200)
-      return [...(MOCK_SLOT_WINDOWS[manualSlotId] ?? [])]
+      if (req.manualSlotId <= 0) throw new ApiError('人工槽 Id 必须为正整数', 400)
+      const bucket = MOCK_SLOT_WINDOWS[req.manualSlotId] ?? []
+      const clash = bucket.some((w) => req.startTime < w.endTime && w.startTime < req.endTime)
+      if (clash) throw new ApiError('与同日已有窗口时间重叠', 409)
+      const id = (mockSlotWindowSeq += 1)
+      bucket.push({
+        id,
+        manualSlotId: req.manualSlotId,
+        startTime: req.startTime,
+        endTime: req.endTime,
+        availableFlag: req.availableFlag,
+        remark: req.remark
+      })
+      MOCK_SLOT_WINDOWS[req.manualSlotId] = bucket
+      return id
     }
-    return apsHttp.get<ManualSlotCalendarDto[]>({
-      url: `/api/manual-capacity/calendar/${manualSlotId}`
+    return apsHttp.post<number>({ url: '/api/manual-capacity/calendar/single', data: req })
+  },
+
+  /**
+   * 三级合并解析预览（GET /api/resource-calendar/resolve-preview）
+   *  - 5号位 2026-10-14 落地；**只读、不写库、不改任何日历数据**
+   *  - 三级（工厂 → 部门 → 设备）逐时间片继承与显式覆盖后的**最终合法窗口**，
+   *    每片带 `source` = 本片由哪一级 WORK 决定；`OFF` 不可被上级 WORK 复活
+   *  - ⚠️ 只接受设备 `resourceIds`；**无人工槽版本**
+   *  - `endDate` 按 Resolver 语义**含末日**；`resourceIds` 逗号分隔、单次 ≤200
+   */
+  async getResolvePreview(
+    resourceIds: number[],
+    startDate: string,
+    endDate: string
+  ): Promise<ResourceCalendarResolvePreviewDto[]> {
+    if (APS_USE_MOCK) {
+      await delay(200)
+      return resourceIds.map((id) => {
+        const rows = (MOCK_DEVICE_WINDOWS[id] ?? []).filter(
+          (w) =>
+            w.startTime.slice(0, 10) >= startDate &&
+            w.startTime.slice(0, 10) <= endDate &&
+            w.availableFlag
+        )
+        return {
+          resourceId: id,
+          hasAnyWindow: rows.length > 0,
+          status: rows.length > 0 ? ('WORK' as const) : ('MISSING' as const),
+          windows: rows.map((w) => ({
+            start: w.startTime,
+            end: w.endTime,
+            source: 'Resource' as const
+          }))
+        }
+      })
+    }
+    return apsHttp.get<ResourceCalendarResolvePreviewDto[]>({
+      url: '/api/resource-calendar/resolve-preview',
+      params: { resourceIds: resourceIds.join(','), startDate, endDate }
+    })
+  },
+
+  /** 查询某人工槽的窗口页（GET /api/manual-capacity/calendar/{manualSlotId}）
+   *  2026-10-17：同设备端点，后端已改 PageResult（`from`/`to` 本次顺带补齐）；`pageIndex`/`pageSize` 必传 */
+  async getSlotWindows(
+    manualSlotId: number,
+    query: { pageIndex: number; pageSize: number }
+  ): Promise<CalendarWindowPageResult<ManualSlotCalendarDto>> {
+    if (APS_USE_MOCK) {
+      await delay(200)
+      const all = MOCK_SLOT_WINDOWS[manualSlotId] ?? []
+      const start = (query.pageIndex - 1) * query.pageSize
+      return {
+        items: all.slice(start, start + query.pageSize),
+        total: all.length,
+        page: query.pageIndex,
+        pageSize: query.pageSize
+      }
+    }
+    return apsHttp.get<CalendarWindowPageResult<ManualSlotCalendarDto>>({
+      url: `/api/manual-capacity/calendar/${manualSlotId}`,
+      params: { pageIndex: query.pageIndex, pageSize: query.pageSize }
     })
   },
 
@@ -414,12 +574,12 @@ export const resourceCalendarApi = {
     return apsHttp.delete<boolean>({ url: `/api/manual-capacity/calendar/${id}` })
   },
 
-  /* ---------- 过渡数据源（G1 / G2 未决） ---------- */
+  /* ---------- 资源主表（G1 已闭环，正式端点） ---------- */
 
-  /** 资源（设备）候选 —— 过渡实现，见函数注释 */
-  listResourceCandidates,
+  /** 资源（设备）主表列表（GET /api/resource，权限码 ResourceCalendarView） */
+  listResources,
 
-  /** 生产部门候选 —— 过渡实现（从资源池去重） */
+  /** 生产部门候选 —— 从资源主表派生（去重） */
   listDepartmentCandidates
 }
 

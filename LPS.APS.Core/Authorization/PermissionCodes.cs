@@ -50,6 +50,8 @@ public static class PermissionCodes
     public const string ParameterView = "aps.parameter.view";
     /// <summary>编辑参数</summary>
     public const string ParameterEdit = "aps.parameter.edit";
+    /// <summary>发布参数（D-1 新增，0号位 终裁独立授权——不因具有规则发布权限自动获得参数发布能力）</summary>
+    public const string ParameterPublish = "aps.parameter.publish";
     /// <summary>查看策略</summary>
     public const string StrategyView = "aps.strategy.view";
     /// <summary>编辑策略</summary>
@@ -95,6 +97,10 @@ public static class PermissionCodes
     /// <summary>删除人工能力槽</summary>
     public const string ManualCapacityDelete = "aps.manual_capacity.delete";
 
+    // ---------- Domain（排程域定义） ----------
+    /// <summary>维护排程域定义（冻结《Domain 裁决 v1.0》§4.1 系统管理员维护；原误挂 aps.rule.edit，2026-10-25 修正为独立域维护码）</summary>
+    public const string DomainMaintain = "aps.domain.edit";
+
     // ---------- MES ----------
     /// <summary>查看 MES 状态</summary>
     public const string MesView = "aps.mes.view";
@@ -119,14 +125,14 @@ public static class PermissionCodes
     /// <summary>查看审计日志</summary>
     public const string AuditView = "aps.audit.view";
 
-    /// <summary>全部 V1 功能权限点（43 码，供策略注册遍历；34 码基线 + Setup 换型 3 码 + ResourceCalendar 3 码 + ManualCapacity 3 码，后两者为 5号位 权限码申请 2026-09-24 新增）</summary>
+    /// <summary>全部 V1 功能权限点（45 码：44 码基线 + DomainMaintain 域维护 1 码（2026-10-25，冻结《Domain 裁决 v1.0》§4.1 系统管理员维护））</summary>
     public static readonly IReadOnlyList<string> All = new[]
     {
         PlanView, PlanRun, PlanCompare, PlanExport,
         CtpView, PlanCtp, OrderInsertImpact, ReschedulePartial, RescheduleManual,
         CandidateView, CandidateConfirm, CandidateActivate,
         RuleView, RuleMaintain, RulePublish,
-        ParameterView, ParameterEdit,
+        ParameterView, ParameterEdit, ParameterPublish,
         StrategyView, StrategyEdit, StrategyPublish,
         ManualEtaView, ManualEtaMaintain, ManualEtaCancel,
         DemandProtectionView, DemandProtectionRelease,
@@ -134,6 +140,7 @@ public static class PermissionCodes
         ResourceCalendarView, ResourceCalendarEdit, ResourceCalendarDelete,
         ManualCapacityView, ManualCapacityEdit, ManualCapacityDelete,
         MesView, MesControlledOperation,
+        DomainMaintain,
         AuthUserView, AuthManage, AuthRoleView, AuthRoleEdit, AuthPermissionAssign, AuthScopeAssign,
         AuditView
     };

@@ -1,3 +1,5 @@
+using System.Runtime.InteropServices;
+using System.Threading;
 using LPS.APS.Core.Dto;
 using LPS.APS.Shared.Models;
 
@@ -15,13 +17,169 @@ namespace LPS.APS.Scheduling.Solvers;
 internal class PhaseTwoInitialScheduler
 {
     /// <summary>
+    /// 「按 Start 升序」的日历表缓存（2026-10-20 第五刀）。
+    /// 键 = 资源 Id；值 = (源列表引用, 升序列表)。
+    /// 生命周期 = 一次 <see cref="Schedule"/> 调用（方法入口清空），期间 <c>constraints</c> 的日历只读。
+    /// </summary>
+    /// <remarks>
+    /// ── 为什么需要它 ──
+    /// <c>FindForwardSlot</c> 原实现对**每次调用**都执行 <c>calendar.OrderBy(w =&gt; w.Start)</c>：
+    /// 16k 档实测 <c>FindForwardSlot</c> 共 10,286 ms（13.9% ΣPhase）／700,222 次 × 14.69 µs，
+    /// 而其中真正的找槽 <c>FindFirstAvailableSlot</c> 只占 2,284 ms ⇒ **约 8 s 是这次排序**（外加它每次都分配的迭代器/数组）。
+    /// 但日历在 <c>PhaseOneConstraintBuilder.BuildResourceCalendars</c>（<c>:1231-1244</c>）里**建的时候就已经
+    /// <c>OrderBy(slot =&gt; slot.Start)</c> 排好**、且全仓只有 <c>TryGetValue</c> 读、无任何就地写
+    /// （已 grep 复核：<c>ResourceCalendars[</c> 的赋值只在 <c>SchedulingOrchestrator.cs:1173</c> 整体重建，不在求解内）。
+    /// ⇒ 绝大多数调用时表已有序，此时 <c>OrderBy</c> 的结果与**原表逐元素相同**
+    /// （<c>OrderBy</c> 是稳定排序，非递减序列排序后不变）⇒ 可直接用原表，零分配、零排序。
+    /// **只有真的乱序时**才回落到原 <c>OrderBy(...).ToList()</c>（行为与改前逐字一致），且回落结果本身也进缓存。
+    /// 不假设任何写入方维持有序 —— **首次见到某张日历表时自检一次**（O(C)），故对任意输入都保持原语义（零回归）。
+    /// </remarks>
+    private readonly Dictionary<int, (List<TimeWindow> Source, List<TimeWindow> Ascending)> _calendarAscendingCache = new();
+
+    /// <summary>
+    /// 2026-10-20 十九刀：**超热路径的计数器缓存**（纯性能，口径逐字不变）。
+    ///   `AsyncLocal&lt;T&gt;.Value` 每读一次几十纳秒；`FindFirstAvailableSlot` 在 16k 档被调 4,026 万次、
+    ///   每次读 3 次 ⇒ 仅取值就吃掉秒级。本字段在 <see cref="Schedule"/> 入口取一次，
+    ///   之后热路径走 <c>SolverDiagnostics</c> 的 <c>(Counters?)</c> 重载 —— 计数结果一个不差。
+    ///   ⚠ 生命周期 = 一次 `Schedule()` 调用：作用域在 `FiniteCapacitySolver.SolveAsync:47` 建立并覆盖全程，
+    ///   求解期间不会开/关作用域，故缓存一次与每次现读等价。
+    /// </summary>
+    private SolverDiagnostics.Counters? _diag;
+
+    /// <summary>
+    /// 2026-10-25 性能（响应 2号位《真实域 Phase2 性能定位》请求 1）：占用表**键集基线**改为在 Phase2 入口拍**一次**。
+    ///
+    /// 【为什么只拍一次就够 —— 键集在整个 Phase2 恒定，三条独立码证】
+    ///   ① <see cref="InitializeResourceOccupancy"/>（`:1196`）按 `request.Resources` **逐个预建**键；
+    ///   ② <see cref="AddOccupancyWindow"/>（`:2563`）是 `occupancy[resourceId]` **直接索引**、**从不建键**
+    ///      ⇒ 反过来，任何一次删键都会让后续同资源插入抛 `KeyNotFoundException`；
+    ///   ③ 两个克隆点 `CloneOccupancy`（`:2484`）与两处整表采纳（`:1011-1016` / `:1893-1898`）都是**整表拷贝**，键集原样带过。
+    ///
+    /// 【旧写法的代价】每次合批试排都重算一遍全键 `HashSet`：实测 21,865 键、被调 **1,670,389** 次、
+    ///   单次 607 微秒，累计 **1,014.3 秒 = Phase2 的 56.27%**（2号位 2026-10-23 读数，取自本文件埋点）。
+    ///   拿到的却始终是同一个集合。
+    ///
+    /// ⚠ 为 null（未走 `Schedule` 入口，例如单测直调内部方法）⇒ 调用点回落到 `CaptureOccupancyResourceIds` 现算，
+    ///   **语义与原实现逐位相同**，只是不再走热路径。
+    /// </summary>
+    private HashSet<int>? _occupancyBaselineResourceIds;
+
+    /// <summary>
+    /// **2026-10-25 未排原因自报**（响应 2号位《单域可复现样本》：1 条需求产出 0 Task 且槽位检索 **0 次**）。
+    ///
+    /// 【要解决的问题】Phase2 里能让一条需求「0 Task 且一次槽位检索都不做」的出口有**十几条**
+    ///   （`continue` 型 Fail Closed 与 `return new List<FinalTaskDraft>()` 型早退），它们**全都不留任何字** ⇒
+    ///   出口只能落到 Phase5 的泛化 `Phase 2 初始排程失败，Phase 4 修复未成功`，
+    ///   「0 次」到底是「物料不足」「无合格资源」还是「压根没有工序」**分不出来**，而这三者指向完全相反的方向。
+    ///
+    /// 【本表的语义】需求键 → **最后一次尝试**的自报出口正文（后写覆盖）。
+    ///   · 同一需求在一次 `Schedule` 里会被多次尝试（Routing 候选 / 批方案候选 / 倒排失败转正排）
+    ///     ⇒ **只保留最后一次**：不承诺「首次失败原因」，只回答「它最后是怎么退出来的」。
+    ///   · **纯诊断**：只用于 Phase5 出口的 `SolveTraceNote.Message`（人可读正文），
+    ///     **不改任何 `Reason`、不改任何归属、不改 Success、不改任务集合**。
+    /// </summary>
+    private readonly Dictionary<string, string> _phase2BlockedDetails = new(StringComparer.Ordinal);
+
+    /// <summary>
+    /// 登记一条需求在 Phase2 的自报出口正文（**纯诊断**，见 <see cref="_phase2BlockedDetails"/>）。
+    ///   后写覆盖 —— 同一需求多次尝试只保留最后一次。
+    /// </summary>
+    private void RecordPhase2Block(string? demandKey, string text)
+    {
+        if (string.IsNullOrEmpty(demandKey)) return;
+        _phase2BlockedDetails[demandKey!] = text;
+    }
+
+    /// <summary>
+    /// 2026-10-20 十四刀：`BuildBatchGroupsIndex` 的**容器复用**（语义逐字等价，只省分配）。
+    ///   每次重建 = `Clear()` 后按原次序重新填充 ⇒ 枚举序仍等于「首次出现次序」，桶内仍按任务表次序。
+    ///   ⚠ 调用方只读且不逃逸（见该方法注释里的消费点清单）。
+    /// </summary>
+    private readonly Dictionary<string, List<FinalTaskDraft>> _batchGroupsReuse = new(StringComparer.Ordinal);
+
+    /// <summary>2026-10-20 十四刀：`_batchGroupsReuse` 的桶 `List` 池，按序取用，池不够才新建。</summary>
+    private readonly List<List<FinalTaskDraft>> _bucketPool = new();
+
+    /// <summary>2026-10-20 十四刀：本轮重建已从 `_bucketPool` 取用到的位置（每次重建归零）。</summary>
+    private int _bucketPoolUsed;
+
+    /// <summary>
+    /// 2026-10-20 十八刀：`_batchGroupsReuse` 的 **(物料, 工厂) 分桶**，供 `FindMergeableStageBatches`
+    /// 只扫「同物料同工厂」的分组，而不是每需求把全部批分组扫一遍。
+    ///
+    /// 【为什么】`FindMergeableStageBatches` 主循环的第一条**有效**过滤就是
+    ///   `anchorTask.MaterialId != demand.MaterialId` / `FactoryId` 两个 `int` 比较，
+    ///   而它前面已按 `group.Count` 挡掉了大部分。实测（`★候选扫描`）：
+    ///     16k 档 35,548 次扫描 × 平均 4,226 组 = **1.50 亿次**分组迭代（`MergeAnchorScan` 2,153 ms）；
+    ///     40k 档 88,926 次 × 平均 10,400 组 = **9.25 亿次**（19,586 ms = ΣPhaze 的 4.8%）。
+    ///   ⇒ 这是一条 **O(分组数) × O(需求数)** 的项，随规模**平方级**增长。
+    ///
+    /// 【等价性】桶的**插入次序 = 分组首次创建的次序 = `groups.Values` 的枚举次序**
+    ///   （`Dictionary` 无删除 ⇒ 枚举序 = 插入序；本索引在 `AddToGroup` 建组时同步登记）
+    ///   ⇒ 桶内子序列与原「全表扫描后过滤」的命中序列**逐条同序** ⇒ `candidates` 内容与次序**逐字相同**
+    ///   ⇒ 锚点下标、擂台比较次序、留痕全部不变。判据集合一个没动（只是把两条 `int` 比较换成查桶）。
+    ///   ⚠ 仅当 `FindMergeableStageBatches` 拿到的正是 `_batchGroupsReuse`（增量缓存那份）时才启用；
+    ///     拿到别的字典（`useCache:false` 的试排副本）⇒ 回落到原全量扫描，逐字保留旧行为。
+    /// </summary>
+    private readonly Dictionary<(int MaterialId, int FactoryId), List<List<FinalTaskDraft>>> _batchGroupsMfIndex = new();
+
+    /// <summary>
+    /// 2026-10-20 十五刀：`_batchGroupsReuse` 当前对应的**任务表快照**（逐引用），用于判断
+    /// 「相邻两批之间任务表是否只是尾部追加」。每项必须与 `scheduledTasks` 同下标**同一实例**。
+    /// </summary>
+    private readonly List<FinalTaskDraft> _batchGroupsSnapshot = new();
+
+    /// <summary>2026-10-20 十五刀：`_batchGroupsSnapshot` 是否有效（`Schedule()` 入口置 `false`）。</summary>
+    private bool _batchGroupsSnapshotValid;
+
+    /// <summary>
+    /// 2026-10-20 二十七刀：`_batchGroupsSnapshot` 镜像的是**哪一张**任务表（逐引用）。
+    ///   修补/增量两条路径都必须确认「当前改的正是快照所镜像的那张表」，否则一律回落整表重建。
+    /// </summary>
+    private List<FinalTaskDraft>? _batchGroupsSnapshotOwner;
+
+    /// <summary>
+    /// 2026-10-20 二十八刀：**试排覆盖层**是否开启（`SelectBestBatchPlan` 每个候选各开一次）。
+    ///   开启期间允许把试排副本的尾巴临时并进共享批分组索引，回滚见 `RollbackBatchGroupsOverlay`。
+    /// </summary>
+    private bool _batchGroupsOverlayActive;
+
+    /// <summary>2026-10-20 二十八刀：覆盖层里「已有键」在追加前的桶长度（回滚 = 截回该长度）。</summary>
+    private Dictionary<string, int>? _batchGroupsOverlayCounts;
+
+    /// <summary>2026-10-20 二十八刀：覆盖层里「新建的键」及其 `(物料,工厂)`，回滚时整键删除。</summary>
+    private List<(string Key, (int MaterialId, int FactoryId) MfKey)>? _batchGroupsOverlayCreated;
+
+    /// <summary>
     /// 执行初始有限产能排程
     /// </summary>
     public InitialScheduleResult Schedule(
         DomainSolveRequest request,
-        ConstraintContext constraints)
+        ConstraintContext constraints,
+        CancellationToken cancellationToken = default)
     {
+        // 2026-10-20 第五刀：日历升序缓存的生命周期 = 本次 Schedule 调用（本次调用内 constraints.ResourceCalendars 只读）。
+        //   同一实例若被复用（当前两处实例化均为「新建即用一次」），换 Run 换日历也不会读到旧缓存。
+        _calendarAscendingCache.Clear();
+
+        // 2026-10-20 十五刀：批分组索引缓存的生命周期同上一行 —— 跨 `Schedule()` 调用一律作废。
+        _batchGroupsSnapshotValid = false;
+        _batchGroupsSnapshotOwner = null;   // 2026-10-20 二十八刀：归属表一并作废
+
+        // 2026-10-20 十九刀：计数器缓存（见字段注释）。取的是当前作用域那个实例，重载的计数口径与无参版本逐字相同。
+        _diag = SolverDiagnostics.Active;
+
         var result = new InitialScheduleResult();
+
+        // 2026-10-25：未排原因自报的**本轮快照起点** —— Phase4 Fallback 会重跑本方法，
+        //   上一轮的登记不得漏进这一轮（见 `_phase2BlockedDetails`）。
+        _phase2BlockedDetails.Clear();
+
+        // 2026-10-19 四次定位：Phase2「循环外准备段」计时（槽 `SchedulePreamble`）。
+        //   `BatchPlanTrial` 之外那 31%（16k 档 74,612 ms）必须拆开 —— 本槽量循环外，`LandingRun` 量循环内最大嫌疑。
+        //   ⚠ 本计数器为**全 Run 累计**：Phase4 兜底排程（`PhaseFourLocalRepair.cs:614`）也会再调一次本方法，
+        //     其耗时同样计入。分析时须扣除 —— 见基准输出里 `RunBatchPlan总次数` 与 `计热点` 的差额口径。
+        long swPreamble = SolverDiagnostics.HotspotStart();
 
         // ── V1_4 NEW-04：**本 Run 唯一**的「新增 Stage 执行批」累计账 ──
         //   生命周期 = 本次 `Schedule` 调用（= 一次 Run）⇒ 同一 Run 内先后形成的 C 桶 Stage 批
@@ -29,6 +187,13 @@ internal class PhaseTwoInitialScheduler
         //   两条需求 30 / 20、Stage 自由余额 40 ⇒ 逐条过闸但累计 50 越界 ⇒ 必须拦住第二条）。
         //   试排隔离用 `Clone()`；需求未落定时按 `Mark()` / `RollbackTo()` 精确回滚。
         var piStageLedger = new PiStageCommitLedger();
+
+        // ── V1_3 F-03 **接线（2026-10-12 通电）**：B-009 门禁 / B-010 兜底所需的 Stage 输入 ──
+        //   `DomainSolveRequest.PiStageQuantityBaselines`（2号位 r13633 投影）→ `(PI 号, 物料ID, StageCode)`
+        //   索引。**必须在建库外一次性建**（放进逐需求循环会退化成 O(行集 × 需求数)）。
+        //   撞键行由 `BuildPiStageQuantityIndex` 内部**摘除**（裁决 F-02：多行匹配不得静默取一条）。
+        //   空 / 缺 ⇒ 空索引 ⇒ `ResolvePiStageContext` 返回 null ⇒ 门禁按「缺 Stage 上下文」显式未满足。
+        var piStageIndex = BuildPiStageQuantityIndex(request.PiStageQuantityBaselines, out _);
 
         // 获取排程方向参数
         var direction = request.StrategySnapshot.Parameters.SchedulingDirection;
@@ -82,6 +247,8 @@ internal class PhaseTwoInitialScheduler
 
         // 资源占用追踪：ResourceId → 已占用时间窗列表
         var resourceOccupancy = InitializeResourceOccupancy(request.Resources, constraints);
+        // 键集基线只拍一次（键集恒定的三条码证见 `_occupancyBaselineResourceIds` 注释）。
+        _occupancyBaselineResourceIds = resourceOccupancy.Keys.ToHashSet();
 
         // P0-07修复：先将锁定任务直接继承为FinalTask（原地保留）
         // 第8轮P0-01修复：使用LockedQuantity和Stage/Operation，不再写空字符串
@@ -131,7 +298,14 @@ internal class PhaseTwoInitialScheduler
             //   FinalTask。解不出身份（图缺失 / 节点缺失 / 需求缺失）⇒ **不产伪身份 Task**，明确记为未排程
             //   （与需求级 Fail Closed 同一口径：`UnscheduledDemandKeys` + 不产 Task），
             //   **不得**回退 `TryGetSingleRoutingGraph` 猜唯一 Path、**不得**跨 Path 找替代节点。
-            if (lockedNode == null)
+            // ── R2-F ① 补充（0号位 2026-10-14 第七轮 §八.2a）：**模式越域的候选 Path 不得产出任何 Task** ──
+            //   锁定任务若落在一条被**整条排除**的候选 Path 上（Phase1 置 <see cref="RoutingGraph.IsOperationPlanningModeInvalid"/>），
+            //   同样**不产 Task** —— 走本分支既有出口（记 `UnscheduledDemandKeys` + `continue`），
+            //   **不**回落该非法 Path 的图继续排。
+            //   ⚠ 与下方「身份不可恢复」的区别：此处 Path/节点**都在**（身份可恢复），被否掉的是**该 Path 的合法性**
+            //     ⇒ 只记未排 + 由 Phase1 的 **Error 级输入契约 Issue** 承载，**不**置 `TechnicalFailure`
+            //     （置了会把整个 Domain 的 `Success` 打成 false —— 正是 §八.2a 判为「本次证据推不出」的那种传播）。
+            if (lockedNode == null || lockedGraph is { IsOperationPlanningModeInvalid: true })
             {
                 result.UnscheduledDemandKeys.Add(lockedTask.DraftId);
 
@@ -147,17 +321,22 @@ internal class PhaseTwoInitialScheduler
                 //   ⚠ 只**复用**既有载体（`TechnicalFailure` / `TechnicalFailureReason`，与 `:46`/`:354` 同口径），
                 //     **不新增**数据库字段、**不自造** ReasonCode 枚举；真实 Route/Path 输入由 2号位 保证
                 //     （复审 §二 P0-01 明文：「由2号位保证真实Route/Path输入，不需1号位新增数据库字段」）。
-                var identityGap = lockedGraph is null
-                    ? "Route/Path 图缺失"
-                    : "图中无该 (StageCode, OperationCode) 节点";
-                var identityFailure =
-                    $"锁定执行Task身份不可恢复：DraftId={lockedTask.DraftId}, "
-                    + $"MaterialId={(demand is null ? "(对应需求缺失)" : demand.MaterialId.ToString())}, "
-                    + $"StageCode={lockedTask.StageCode}, OperationCode={lockedTask.OperationCode}（{identityGap}）";
-                result.TechnicalFailure = true;
-                result.TechnicalFailureReason = string.IsNullOrEmpty(result.TechnicalFailureReason)
-                    ? identityFailure
-                    : result.TechnicalFailureReason + "；" + identityFailure;
+                // R2-F ①（第七轮 §八.2a）：**模式越域**是另一类输入问题（该候选 Path 整体不合法），
+                //   而身份**可**恢复 ⇒ **不**并入 `TechnicalFailure`（理由见本分支上方说明）。
+                if (lockedNode == null)
+                {
+                    var identityGap = lockedGraph is null
+                        ? "Route/Path 图缺失"
+                        : "图中无该 (StageCode, OperationCode) 节点";
+                    var identityFailure =
+                        $"锁定执行Task身份不可恢复：DraftId={lockedTask.DraftId}, "
+                        + $"MaterialId={(demand is null ? "(对应需求缺失)" : demand.MaterialId.ToString())}, "
+                        + $"StageCode={lockedTask.StageCode}, OperationCode={lockedTask.OperationCode}（{identityGap}）";
+                    result.TechnicalFailure = true;
+                    result.TechnicalFailureReason = string.IsNullOrEmpty(result.TechnicalFailureReason)
+                        ? identityFailure
+                        : result.TechnicalFailureReason + "；" + identityFailure;
+                }
 
                 continue;
             }
@@ -176,7 +355,7 @@ internal class PhaseTwoInitialScheduler
                 TaskType = "PRODUCTION", // P0-16修复：锁定任务仍是生产Task，不是ConstraintType
                 ResourceId = lockedTask.ResourceId,
                 ResourceCode = GetResourceCode(lockedTask.ResourceId, constraints),
-                // P0-01 整改：真实路径身份（反查失败时为 null，不再 DEFAULT/1）
+                // P0-01 整改：真实路径身份取自 OperationNode（非空 string/int）；反查失败已由上方 Fail-Closed 分支拦截（不产 Task）⇒ 本处恒非 null，不回落 DEFAULT/1
                 RouteCode = lockedRouteCode,
                 PathId = lockedPathId,
                 Quantity = lockedTask.LockedNetOutputQty ?? lockedTask.LockedQuantity ?? demand?.NetOutputQty ?? 0m,
@@ -184,11 +363,31 @@ internal class PhaseTwoInitialScheduler
                 UOM = demand?.UOM ?? string.Empty,
                 PlannedStartTime = lockedTask.LockedStart,
                 PlannedEndTime = lockedTask.LockedEnd,
+                // ── Duration-1（1号位 2026-10-26 回执 §六「第 2 类」中的例外）：**锁定继承 Task 不给值** ──
+                //   口径 = `StandardDuration × PlannedProcessQty ÷ CapacityFactor`；本类是 MES **既成事实锚点**：
+                //   起止为给定值、`SetupTime` 恒 0（下一行），没有标准工时解析链可依 ⇒ 重算会与锁定窗自相矛盾。
+                //   锁定窗是否含跨日历中断亦**无法证明** ⇒ **不编值**，保持 null。
+                //   消费侧按契约回落 `PlannedEnd − PlannedStart` 并计数 —— **该计数在本类上非 0 属预期，不是漏拷**。
+                //   另：本路径**并非零产出** —— `request.ExecutionConstraints` 由 2号位 T-04 锚点投影装载
+                //   （`PeggingOrchestrator.BuildAnchorPayloadAsync`），早退只有两条：① 非 Candidate；② 无 `BasePlanVersionId`。
+                //   夜间 FULL 路径因 `BasePlanVersionId` 恒 null 而早退；**Candidate 增量 Run 上会真的产出锁定 Task**
+                //   ⇒ 该缺值计数在 Candidate Run 上非 0 属预期，不是漏拷。
+                EffectiveProcessMinutes = null,
                 SetupTime = 0m,
                 SetupSource = null,   // SetupSource 填充：锁定继承任务无 1号位 Setup 解析来源 → null（2号位 落库留空）
                 Priority = demand?.DemandSequence ?? 0,
                 IsVirtual = false,
-                ExecutionLockId = null, // TODO: 关联ExecutionConstraint.Id
+                // ⚠ ExecutionLockId **恒为 null**（2026-10-12 就地更正；原注「TODO: 关联ExecutionConstraint.Id」误导）：
+                //   ① 全仓**零生成点** —— 本处是**唯一**赋值点，其余（`PhaseFourLocalRepair.cs:365`、
+                //      `PhaseFiveCompression.cs:758` / `:1339`）都只是逐字段**拷贝**上游值 ⇒ 该列在输出 DTO 上恒 null。
+                //   ② 「关联 `ExecutionConstraint.Id`」**当前不可实现** —— `ExecutionConstraint`（`Core/Dto/
+                //      DomainSolveRequest.cs:351`）**没有 `Id` 字段**（只有 `DraftId` / `TaskKey` / `ResourceId` /
+                //      锁定起止 / 数量）⇒ 原 TODO 指向一个**不存在的字段**。
+                //   ③ 生产侧 `request.ExecutionConstraints` **恒空**（`PeggingOrchestrator.cs:403-406`
+                //      「当前锚点机制未建……故预留为空」）⇒ 即便将来加了 `Id`，也无从关联。
+                //   归属：该列**及其载体**的去留（接上正式载体 / 从 DTO 摘除）属 **2号位 辖区**，已登记在我方
+                //   2026-09-28 回执《APS_V1_批量与正倒排联合裁决…》§四「旧逻辑」表 —— **本号位本次不动**。
+                ExecutionLockId = null,
                 // v1.6 §1：FinalTask 一律原样回传 ContinuationKey；路径身份可解出时才生成执行批键
                 //（与上方「不编造 RouteCode/PathId」同口径 —— 解不出身份就不给批键，不留伪真值）。
                 // P0-02 后键域改为 (需求键, 批序号)：无真实 Path ⇒ 该 Task 不构成「一条完整 Path 的执行批」
@@ -227,14 +426,34 @@ internal class PhaseTwoInitialScheduler
         // 跨物料时序（块3/块4）：记录每个已排需求的最晚完成时间，供父件取子件完成时间作为动态物料下界。
         var demandCompletion = new Dictionary<string, DateTime>();
 
+        // 2026-10-19 四次定位：准备段到此收口（槽 `SchedulePreamble`）。
+        SolverDiagnostics.HotspotEnd(swPreamble, SolverDiagnostics.Hotspot.SchedulePreamble);
+
+        // ── 2026-10-25 运行中进度探针（2号位《单域可复现样本》§7.2）──
+        //   外部线程轮询 `SolverDiagnostics.LiveCounters` 即可读到「Phase2 处理到第几条 / 共几条」。
+        //   ⚠ 不是 `Active`（那是 `AsyncLocal`，跨线程读不到；本类内部用的是它）。
+        //   纯观测，不参与任何业务判定。
+        SolverDiagnostics.SetPhase2DemandTotal(sortedDemands.Count);
+        int phase2Processed = 0;
+
         foreach (var demand in sortedDemands)
         {
+            SolverDiagnostics.SetPhase2DemandProgress(++phase2Processed);
+
+            // 2026-10-26 取消支持（2号位《PV190 第二次现场》§6.3-4）：**粒度＝一条需求**。
+            //   放在这里而不是内层找槽循环：内层是超热路径，进内层检查的代价必须先量；
+            //   而「卡在单条需求内部」这一情形本处确实停不下来 —— 如实写在回执里，不假装已修。
+            cancellationToken.ThrowIfCancellationRequested();
+
             // B-1（0号位 2026-09-29 裁决 §2.3）：StageSeq 全序冲突的物料
             // **不生成可能顺序错误的正式计划** —— 直接置 Unscheduled（Reason 由 Phase5 补 STAGE_SEQUENCE_CONFLICT）。
             // 注意：此处不删 Routing（Routing 本身合法，问题在 StagePath 数据），只拒绝出计划。
             if (constraints.StageSequenceConflictMaterialIds.Contains(demand.MaterialId))
             {
                 result.UnscheduledDemandKeys.Add(demand.LogicalDemandKey);
+                // ⚠ 此处**不登记** `Phase2BlockedDetails`：Phase5 的 `IsStageSequenceConflict`
+                //   查的就是同一个 `constraints.StageSequenceConflictMaterialIds` ⇒ 出口**必然**
+                //   落到具体码 `STAGE_SEQUENCE_CONFLICT`，不走泛化 `else` ⇒ 登记的正文永远读不到（死文本）。
                 continue;
             }
 
@@ -394,7 +613,19 @@ internal class PhaseTwoInitialScheduler
                     RouteCode = demand.RouteCode,
                     PathId = demand.PathId,
                     NoSplitMerge = demand.NoSplitMerge,
-                    PreferredResourceCode = demand.PreferredResourceCode
+                    PreferredResourceCode = demand.PreferredResourceCode,
+                    // ── 2026-10-17（2号位《R2设备子集评分消费与Phase5量化Diff索取》§三 请求补齐）──
+                    //   需求身份四字段 `IsRootDemand` / `BomNo` / `RequestDetailId` / `RepWorksetId`
+                    //   系 2号位 于第十四轮（r13743，J14-01/02/03）新增；其两处切片克隆
+                    //   （`PeggingOrchestrator:3448` / `:3492`）已原样继承。
+                    //   本处（部分锁定剩余需求克隆）**漏拷 = 剩余需求静默丢失需求身份** —— 与上方
+                    //   `RequiredStageCode` 及 5 项路径身份**同款理由**：克隆必须是**忠实克隆**，
+                    //   不得只挑「当前有人读」的字段（漏拷是静默错值，比编译错更难发现）。
+                    //   实测：`LPS.APS.Scheduling/**` 对这四个名字**当前零命中** ⇒ 本改动**行为不变**（零回归）。
+                    IsRootDemand = demand.IsRootDemand,
+                    BomNo = demand.BomNo,
+                    RequestDetailId = demand.RequestDetailId,
+                    RepWorksetId = demand.RepWorksetId
                 };
             }
             // ── P0-05（0号位 2026-10-07 (5).md）：连续份额**输入完整性 Fail Closed** ──
@@ -419,6 +650,10 @@ internal class PhaseTwoInitialScheduler
                     // 与 Phase2 其它 Fail Closed 点同口径（:129/:203/:314/:325/:364…）：**只记 UnscheduledDemandKeys、
                     // 不产 Task、不写 TraceNotes**（TraceNotes 会经 SolveTraceNote 落库给 2号位，不得自造码）。
                     result.UnscheduledDemandKeys.Add(actualDemand.LogicalDemandKey);
+                    RecordPhase2Block(actualDemand.LogicalDemandKey,
+                        $"Phase2 出口=P2_CONTINUATION_INPUT_INCOMPLETE：`IsContinuation=true` 但缺 "
+                        + $"{string.Join("/", missing)}（A/B 连续份额输入完整性 Fail Closed）"
+                        + " ⇒ 不产计划，未进入任何资源/槽位检索。");
                     continue;
                 }
             }
@@ -436,6 +671,9 @@ internal class PhaseTwoInitialScheduler
             {
                 // 无工艺路线 → 无法排程
                 result.UnscheduledDemandKeys.Add(actualDemand.LogicalDemandKey);
+                RecordPhase2Block(actualDemand.LogicalDemandKey,
+                    $"Phase2 出口=P2_NO_ROUTING：物料 {actualDemand.MaterialId} 在本次输入里**一条 Routing 图都没有**"
+                    + "（`ConstraintContext.TryGetRoutingGraphs` 未命中）⇒ 不产计划，未进入任何资源/槽位检索。");
                 continue;
             }
 
@@ -447,6 +685,26 @@ internal class PhaseTwoInitialScheduler
                 {
                     // Fail Closed：需求声明了固定路径但图缺失 ⇒ 不排（不猜、不跨 Path 找替代节点）
                     result.UnscheduledDemandKeys.Add(actualDemand.LogicalDemandKey);
+                    RecordPhase2Block(actualDemand.LogicalDemandKey,
+                        $"Phase2 出口=P2_FIXED_PATH_MISSING：需求声明了固定路径 "
+                        + $"RouteCode='{actualDemand.RouteCode}' PathId={actualDemand.PathId?.ToString() ?? "null"}，"
+                        + $"但物料 {actualDemand.MaterialId} 的图里**没有这条路径**（不猜、不跨 Path 找替代节点）"
+                        + "⇒ 不产计划，未进入任何资源/槽位检索。");
+                    continue;
+                }
+
+                // R2-F ①（0号位 2026-10-14 第七轮 §八.2a）：需求**固定**的那条 Path 本身因模式越域被整条排除
+                //   ⇒ 与「图缺失」**同出口**（未排、不产 Task、不跨 Path 找替代节点）。
+                //   该候选 Path 的输入契约 Issue 已由 Phase1（`ValidateOperationPlanningModes`）逐需求登记
+                //   （Error 级），本处**不**重复留痕、**不**改 Success。
+                if (fixedGraph.IsOperationPlanningModeInvalid)
+                {
+                    result.UnscheduledDemandKeys.Add(actualDemand.LogicalDemandKey);
+                    RecordPhase2Block(actualDemand.LogicalDemandKey,
+                        $"Phase2 出口=P2_FIXED_PATH_MODE_INVALID：需求固定的路径 "
+                        + $"RouteCode='{actualDemand.RouteCode}' PathId={actualDemand.PathId?.ToString() ?? "null"} "
+                        + "因 `OperationPlanningMode` 越域被整条排除（详见 Phase1 的 Error 级输入契约 Issue）"
+                        + "⇒ 不产计划，未进入任何资源/槽位检索。");
                     continue;
                 }
 
@@ -457,7 +715,11 @@ internal class PhaseTwoInitialScheduler
             }
             else
             {
-                candidatePaths = allPaths;
+                // R2-F ①（0号位 2026-10-14 第七轮 §八.2a）：`OperationPlanningMode` 越域的候选 Path
+                //   **整条不成立** ⇒ 从候选中**剔除**（该 Path 不得产出任何 FinalTask），
+                //   其余完整合法 Path 照常参与 C 桶候选择优。剔除后候选为空 ⇒ 下方
+                //   `plannedCandidates.All(...)` 对空集合为 true ⇒ 走既有未排语义（③ 类）。
+                candidatePaths = allPaths.Where(kv => !kv.Value.IsOperationPlanningModeInvalid).ToList();
             }
 
             // 步骤 1：为每条候选求工序列表（纯读，不改任何上下文）。
@@ -486,6 +748,12 @@ internal class PhaseTwoInitialScheduler
             {
                 // S26：全部候选的 StartStage/StartOperation 均非法 ⇒ 业务 Unscheduled（非技术失败，不静默回退）
                 result.UnscheduledDemandKeys.Add(actualDemand.LogicalDemandKey);
+                RecordPhase2Block(actualDemand.LogicalDemandKey,
+                    $"Phase2 出口=P2_NO_OPERATIONS：物料 {actualDemand.MaterialId} 的 "
+                    + $"{plannedCandidates.Count} 条候选路径**全部**裁出空工序列表"
+                    + $"（StartStageCode='{actualDemand.StartStageCode}' "
+                    + $"StartOperationCode='{actualDemand.StartOperationCode}'）"
+                    + "⇒ 工序循环一次都没进，未进入任何资源/槽位检索。");
                 continue;
             }
 
@@ -497,6 +765,9 @@ internal class PhaseTwoInitialScheduler
             if (childUnavailable)
             {
                 result.UnscheduledDemandKeys.Add(demand.LogicalDemandKey);
+                RecordPhase2Block(demand.LogicalDemandKey,
+                    $"Phase2 出口=P2_CHILD_UNAVAILABLE：跨物料子件未排成功 ⇒ 父件拿不到动态物料下界"
+                    + $"（物料 {demand.MaterialId}）⇒ 不产计划，未进入任何资源/槽位检索。");
                 continue;
             }
 
@@ -519,15 +790,126 @@ internal class PhaseTwoInitialScheduler
             //      → 每个 Batch 选择一条完整 Path
             //      → 同 Batch 全部 Operation FinalTask 共享 BatchDraftKey → 不同 Batch 必定不同 Key`
             // P0-01：按 `(MaterialId, StartStageCode→Dept)` **键控**解析本需求的 ⑧块 Batch Policy。
-            var batchPolicy = ResolveExecutionBatchPolicy(actualDemand, request, constraints);
+            // ── B-013 / 06 v1.36 §1（`:17`）/ §281：**显式消费逻辑状态**（旧「无差别返回 null」形态已判违规）──
+            //   · `Valid`   ⇒ 用命中策略（正常路径）；
+            //   · `Missing` ⇒ `Policy = null` ⇒ `DecideExecutionBatchPlan` 判 `BATCH_POLICY_MISSING`
+            //                 ⇒ 经 `FormExecutionBatches` 走 B-010 `Q_C` 经济软 Preferred 兜底（06 §281 允许）。
+            //                 ⚠ **仅当状态「可信」时**（0号位 2026-10-13 §3.3 逐字「MISSING（**可信的**业务键核对结果）」）。
+            //                 ✅ **2026-10-13 起已可达**：2号位 已落载体 `SolverStrategySnapshot.BatchPolicyStates`
+            //                    （《…三态载体最小形态已落码_2号位致1号位_v1.1_20261013》§二），**可信缺配由 2号位
+            //                    逐键核对后下发** ⇒ 本分支由「今日不可达」转为**可达且有据**。**载体为 `null`
+            //                    （旧载荷／测试夹具）时仍不可达** —— 那条路径一切非命中键判 `Unknown`。
+            //   · `Invalid` ⇒ 06 §281 逐字「**不得假装 MISSING 兜底，应暴露 Issue 等待治理**」⇒ 本条需求
+            //                 **Fail Closed**，且**根本不调用** `FormExecutionBatches`（⇒ 不可能误入 B-010 兜底）；
+            //   · `Unknown` ⇒ 0号位 2026-10-13《未命名的Markdown文件4.md》§3.3 逐字：状态不可获得「按现有运行错误/
+            //                 **输入契约缺陷**处理，**不能直接当 MISSING**；**不得静默失去净需求**」⇒ **同款 Fail Closed**
+            //                 （不启 `Q_C`），但**原因类别 = 输入契约缺陷**，与业务治理 Issue 分列。
+            //                 **2026-10-13 起 `Unknown` 的两个来源**：① 载体 `Unavailable`（技术失败，2号位 下发）；
+            //                 ② **载体缺陷**（键未被覆盖／状态值越域／`Valid` 取不到参数行 ⇒ 我方 C-2／C-3 刻意 Fail Closed）。
+            //   ⚠ **2026-10-13 行为变化（0号位 明令「必须纠正过渡期行为」）**：**载体为 `null`** 时一切非命中键
+            //     均判 `Unknown` ⇒ **不取 `Q_C` 兜底**，改为 Fail Closed ＋ 未排净量追溯（「不得**静默**失去净需求」）。
+            //     **载体非 `null`（生产路径）** 时按载体逐键状态判定 —— 真缺配走 `Missing`（**取 `Q_C`**），
+            //     失效/无效走 `Invalid`、技术失败走 `Unknown`（均 Fail Closed）。
+            var policyResolution = ResolveExecutionBatchPolicy(actualDemand, request, constraints);
+            if (policyResolution.State is BatchPolicyMatchState.Invalid or BatchPolicyMatchState.Unknown)
+            {
+                var isInvalid = policyResolution.State == BatchPolicyMatchState.Invalid;
+                if (isInvalid)
+                {
+                    SolverDiagnostics.CountBatchPolicyInvalid();
+                    // 出口码仍取**冻结封闭集**内的 `BATCH_POLICY_CONFLICT`（ReasonCode 值域不新增第 16 码）；
+                    //   「已有配置但无效」的区分信息走**原因文本** —— 与 `:618` 附近
+                    //   `B010_PI_QUANTITY_CONTRACT_PENDING` 同款先例（码不变、文本区分）。
+                    result.BatchPolicyHardFailures[demand.LogicalDemandKey] = "BATCH_POLICY_CONFLICT";
+                    result.BatchPolicyConflicts.Add(
+                        $"[{demand.LogicalDemandKey}] BATCH_POLICY_INVALID：本键存在 Batch Policy 记录但**不满足"
+                        + "发布/有效化资格**（冲突/不合法/失效且未治理隔离）⇒ 按 06 §281 **不得冒充 MISSING 兜底**，"
+                        + $"暴露 Issue 等待治理；匹配来源={policyResolution.MatchSource}");
+                }
+                else
+                {
+                    SolverDiagnostics.CountBatchPolicyUnknown();
+                    // 出口码 = **Solver 原始诊断域**的非标值（0号位 2026-10-13 §六 逐字：Solver 原始
+                    //   `UnscheduledTaskResult.Reason` 与正式 15 码**是异域**；非标值走 `ScheduleReasonCodeDomain`
+                    //   的「非标值单列」通道 ⇒ 正式列写空串 + `EvidenceJson` 留原值，**不新增第 16 码**）。
+                    result.BatchPolicyHardFailures[demand.LogicalDemandKey] = "BATCH_POLICY_STATE_UNAVAILABLE";
+                    result.BatchPolicyUnavailableDemandKeys.Add(
+                        $"[{demand.LogicalDemandKey}] BATCH_POLICY_STATE_UNAVAILABLE：Batch Policy **状态不可获得**"
+                        + "（输入契约缺陷：载荷无状态位，无法区分「确无规则」与「有规则但被上游过滤」）⇒ 依 0号位"
+                        + " 2026-10-13 §3.3 **不得直接当 MISSING**（**不启 `Q_C`**）、**不得静默失去净需求**"
+                        + $"（本条已记未排、净需求保留追溯）；匹配来源={policyResolution.MatchSource}");
+                }
 
-            // AUD-1-006：`piFacts` 传 null —— `PiRemainingFact` 尚未投影进 `DomainSolveRequest`
-            //   （AUD-1-D04，归 2号位 装载）。一旦 2号位 投影，此处换成 `request.PiRemainingFacts` 即可
-            //   激活 B-010 兜底（分支已就位，见 `TryFormConservativePiBatch`），**不需要再改 1号位 结构**。
-            // V1_4 NEW-04：传入**本 Run 唯一**累计账 ⇒ 一旦事实投影，B-009 的 Stage 余额即按 Run 累计消费。
-            //   ⚠ 当前生产入口 `piFacts: null` ⇒ 门禁不可评估 ⇒ 账**恒空**（如实声明，不宣称 B-009 生产态达标）。
+                result.UnscheduledDemandKeys.Add(demand.LogicalDemandKey);
+                // ⚠ 此处**不登记** `Phase2BlockedDetails`：上面 `BatchPolicyHardFailures` 已写
+                //   `BATCH_POLICY_STATE_UNAVAILABLE` ⇒ Phase5 从硬失败表直接取到具体码，不走泛化 `else`
+                //   ⇒ 登记的正文永远读不到（死文本）。
+                continue;
+            }
+            var batchPolicy = policyResolution.Policy;
+
+            // AUD-1-006 / AUD-1-D04：曾因装载未投影而传 `piFacts: null`（**2026-10-12 已通电**，见下方调用点）。
+            //   ⚠ 2026-10-12 状态更新：**载体已到** —— `DomainSolveRequest.PiRemainingFacts`
+            //     （`Core/Dto/DomainSolveRequest.cs:45`）与 `PiStageQuantityBaselines`（`:69`）已由 2号位
+            //     于 **r13633** 投影；`PiStageQuantityBaseline` 与本地 `PiStageQuantityContext` **逐字段 1:1**
+            //     ⇒ 接线本身**不需要再改 1号位 结构**，换参即可激活 B-009/B-010 门禁与 NEW-04 累计账。
+            //   ✅ 2026-10-12 补（**接线就绪**，消除「那天还得改代码」的被动 —— 用户指出）：接线所需的**投影段已先落
+            //     并已单测** —— `BuildPiStageQuantityIndex` / `ResolvePiStageContext`（定义见 `PiStageQuantityContext`
+            //     记录之后；单测 `LPS.APS.Tests/Unit/PiStageQuantityIndexTests.cs`）。
+            //     ⇒ **激活 = 本行加两个实参**（索引在建库外一次性建，勿放进逐需求循环）—— **2026-10-12 已落地**：
+            //         `var piStageIndex = BuildPiStageQuantityIndex(request.PiStageQuantityBaselines, out _);`
+            //         `var formation = FormExecutionBatches(actualDemand, batchPolicy,`
+            //             `piFacts: request.PiRemainingFacts,`
+            //             `piStageContext: ResolvePiStageContext(piStageIndex, actualDemand.ProductionInstructionNo,`
+            //                 `actualDemand.MaterialId, actualDemand.StartStageCode),`
+            //             `piStageLedger: piStageLedger);`
+            //   ⛔ **本处「故意不接线」的原始理由（2026-10-12 上午）**：接线 = **通电**（`ApplyPiLegalQuantityGate`
+            //     在 `piFacts is not null` 时即强制），而 2号位 全量 PV2 实测（2026-10-12 复测值）：
+            //       · `PiRemainingFacts` 缺行 12,649 条（订单行派生、被 B-01 身份闸门挡下，本就不产行）；
+            //       · 候选键收紧后 9,324 条，其中「**该 Stage 位置量 = 0**」9,309 条（**99.8%**）；
+            //       · 来源不唯一 0 条（这半边干净）。
+            //     ⇒ 当时通电 = 该 Domain 的 C 桶需求 **~100% 判 `PI_LEGAL_QTY_CONTRACT_PENDING` ⇒ 不成批 ⇒ 空排程**
+            //       （§3.2 修过的「静默空排程」形态的近亲）。
+            //   ⚠ **根因不在 2号位 装载侧**（2号位 2026-10-12《回复1012落实回复》§4.2/§六 实证）：
+            //     5号位 计算器产 `FIRST_STAGE_PENDING` 的**当时唯一条件**是「存在 MES `StageProgress` 行、且首 Stage
+            //     `GoodCompletedQty ≤ 0`」⇒ **PI 完全无 MES 证据时走不到这条分支**，`EnsureTotalClosure` 把整笔
+            //     剩余归 **`UNLOCATED`**（而不是归入真实首 Stage 待生产位置）；实测 `UNLOCATED = 9,324 片 /
+            //     805,653`、**`FIRST_STAGE_PENDING = 0 片`** ⇒ 真实首 Stage 自由量产不出量 ⇒ 不产 baseline 行。
+            //     **整改方 = 5号位（`LPS.APS.BusinessRules`，非我方辖区）。**
+            //   ✅ **2026-10-12 已整改（r13641，5号位）**：`ProductionInstructionPositionCalculator.cs` 两处改动 ——
+            //     ① 新增「第四步半 可信首Stage待生产位置兜底」：无 Stage/XC/在途/PI库存位置、无 `IN_PROGRESS` 工单、
+            //        `OperationProgress` 全 ≤ 0、`ErpRemainingQty > 0` ⇒ 按 `StagePath` 首 Stage 产
+            //        `FIRST_STAGE_PENDING`（`SourceKey = "FIRST_STAGE_FALLBACK"`、`IsStrongEvidence = false`）；
+            //     ② 合并步骤**透传** `FIRST_STAGE_PENDING`（此前被丢弃 —— 与 ① 独立的第二处缺陷）。
+            //     单测 `U17_NoMesFactsWithStagePath_FirstStagePendingNotUnlocated` 断言「无 MES 事实 ⇒ 首 Stage 兜底、
+            //     非 UNLOCATED」，并断言 `NextOperationContexts` **同步产出**（起点=首 Stage、`SliceQty`=全量）——
+            //     后者是必需的：2号位 `BuildPiStageQuantityBaselines` 取 `stageFree = min(位置量, 起点量)`，**两侧都要有**。
+            //   ⇒ **状态（2026-10-12 收口）：代码侧阻塞已解除 + 实测已到场 ⇒ 本处已通电（见下方调用）。**
+            //     2号位《APS_V1_20261012_门禁通电信号_2号位致1号位_v1.0》§一 / §二之二 全量 PV2 复测 ——
+            //     **实调我方 `BuildPiStageQuantityIndex` / `ResolvePiStageContext` / `EvaluatePiLegalQuantityGate`
+            //     三件套**（经 `InternalsVisibleTo("LPS.APS.Tests")`，非复写一份规则）：候选键 9,324 ⇒
+            //     **放行 9,091（97.5%）** / 拦截 233（缺 Stage 自由量 218 + 超合法量 15）；撞键 0、来源不唯一 0
+            //     ⇒ 1号位 原设的「覆盖率达标」触发条件成立。**故本处接线。**
+            //     通电时点口径见 1号位 致 2号位 答复件
+            //     （`项目文档/1号位的意见/APS_V1_20261012_技术事项汇总回执答复_1号位致2号位_v1.0_20261012.md` §一）。
+            // V1_4 NEW-04：传入**本 Run 唯一**累计账 ⇒ B-009 的 Stage 余额按 Run 累计消费。
+            //   ✅ **2026-10-12 通电**（两个实参已接线）：① `piFacts` 原样透传 `request.PiRemainingFacts`；
+            //     ② `piStageContext` 由上方**建库外一次性**建好的 `piStageIndex` 按需求三元组解析。
+            //   ⚠ **生效面**（2号位 同件 §三 提问、与我方代码判读一致）：这一个开关**同时**激活
+            //     「B-009 门禁」（有策略路径）与「B-010 缺策略保守兜底」（无策略路径）—— 二者共用同一门禁
+            //     `EvaluatePiLegalQuantityGate`（`:3635` 逐字「B-009 与 B-010 共用同一门禁」；行号随编辑漂移，以函数名 `TryFormConservativePiBatch` 上方注释为准），
+            //     是 0号位 判词（AUD-1-006 / V1_3 F-03）的设计口径，**非副作用**。
+            //   ⚠ **回退** = 删掉这两个实参（单点、可逆）。
             var ledgerMark = piStageLedger.Mark();
-            var formation = FormExecutionBatches(actualDemand, batchPolicy, piStageLedger: piStageLedger);
+            var formation = FormExecutionBatches(
+                actualDemand, batchPolicy,
+                piFacts: request.PiRemainingFacts,
+                piStageContext: ResolvePiStageContext(
+                    piStageIndex,
+                    actualDemand.ProductionInstructionNo,
+                    actualDemand.MaterialId,
+                    actualDemand.StartStageCode),
+                piStageLedger: piStageLedger);
 
             // P0-02：**无合法批方案**（Min/Max/AllowSplit 冲突）⇒ 本需求 fail-closed（不排），与既有
             //   Fail Closed 点同口径（`UnscheduledDemandKeys` + 不产 Task）；**绝不产出非法批**。
@@ -595,7 +977,7 @@ internal class PhaseTwoInitialScheduler
                     constraints,
                     request.PlanningStart,
                     dynamicMaterialFloor,
-                    demandGoal: null);
+                    demandGoal: actualDemand.DemandGoal);
                 resolvedDirection = decision.Direction;
 
                 // ── P1-02（复审 §二）：缺口经**既有合法追溯通道**（`SolveTraceNote`）表达 ──
@@ -605,15 +987,17 @@ internal class PhaseTwoInitialScheduler
                 //     与 `:1909` 附近 Setup 的 `ExplanationType` **同一先例**，**不是**冻结字典
                 //     `ScheduleExplanationFact.ReasonCode`（0号位 Q4：决策说明不进 ReasonCode 体系）
                 //     ⇒ **未自造 ReasonCode 枚举**（取值直接复用 Resolver 的既有信号常量）。
-                //   体积：每个 AUTO 需求至多一条；当前 DemandGoal 载体缺失 ⇒ 每需求一条，
-                //     如实记录这一**系统性输入缺口**（真实传播由 2号位 补齐后本信号自然消失）。
+                //   体积：每个 AUTO 需求至多一条。**2026-10-13 就地更正**：取值链**已投产**
+                //     （2号位 `PeggingOrchestrator.FillDemandGoalsAsync`，`:250` 调用；`LogicalProductionDemand.DemandGoal`
+                //     自述「当前恒 null」段已作废）⇒ 本信号**不再是系统性缺口**，只在**该需求血缘无法唯一确定**时出现
+                //     （2号位 判据：跨厂 SH 留空 + 诊断；订单主档缺行等留 null + Warning）⇒ 出现即**个案输入缺口**，须逐案查。
                 if (decision.Has(SchedulingDirectionResolver.SignalDemandGoalAbsent))
                 {
                     constraints.TraceNotes.Add(new SolveTraceNote
                     {
                         Key = actualDemand.LogicalDemandKey,
                         ReasonCode = SchedulingDirectionResolver.SignalDemandGoalAbsent,
-                        Message = "Direction 自决（B-005）缺 DemandGoal 载体（2号位 Pegging 传播未达）：" + decision.Reason,
+                        Message = "Direction 自决（B-005）缺 DemandGoal 取值（该需求血缘未唯一确定／跨厂 SH 未落地）：" + decision.Reason,
                         Level = "Warning"
                     });
                 }
@@ -637,13 +1021,22 @@ internal class PhaseTwoInitialScheduler
             //   四层目标 + 批数 tiebreak；**无改善时基线（nMin）胜出** ⇒ 既有行为不被改写。
             var planCandidates = EnumerateLegalBatchPlanCandidates(
                 actualDemand, batchPolicy, formation, ResolveSolverBatchBudget(request));
+            // 2026-10-20 性能（第二刀）：批方案择优**已经**在克隆缓冲上把胜出方案完整跑过一遍
+            //   ⇒ 把那份试排状态留到落定阶段直接采纳，不再在真实表上重跑（见下方落定段注释）。
+            BatchPlanTrialState? pickedBatchPlan = null;
             if (planCandidates.Count > 1)
             {
-                formation = SelectBestBatchPlan(
+                pickedBatchPlan = SelectBestBatchPlan(
                     planCandidates, actualDemand, plannedCandidates, direction, constraints,
                     resourceOccupancy, result.ScheduledTasks, allocationTaskShare, demandByKey,
-                    request, dynamicMaterialFloor, stageOverlap, mergeAllowed);
+                    request, dynamicMaterialFloor, stageOverlap, mergeAllowed, batchPolicy);
+                formation = pickedBatchPlan.Formation;
             }
+
+            // ── R-1/R-2（2026-10-12，B-011）：**经济软区间偏离**登记（**纯观测**，不参与判定）──
+            //   经济 Min/Max 是**软优化输入**（03 §60 / 07 §4651）⇒ 偏离只登记、**不**判冲突；
+            //   让「经济软参数被如实消费」可观测（10 §19「只有一种合法选择时记录限制来源」）。
+            RecordEconomicBatchDeviation(actualDemand, batchPolicy, formation);
 
             var batches = formation.Batches;
 
@@ -660,11 +1053,82 @@ internal class PhaseTwoInitialScheduler
                 .ToList();
 
             // 多批时**禁止 Merge**（判据在 `RunBatchPlan` 内：`mergeAllowed && !multiBatch`）。
-            var outcome = RunBatchPlan(
-                batches, actualDemand, plannedCandidates, direction, constraints,
-                resourceOccupancy, result.ScheduledTasks, allocationTaskShare, demandByKey,
-                request, dynamicMaterialFloor, stageOverlap, mergeAllowed,
-                constraints.ChosenBatchRoutePaths, constraints.ChosenRoutePaths);
+            // 2026-10-19 四次定位：这是 `RunBatchPlan` 的**第 2 个调用点**（另一个在 `SelectBestBatchPlan` 内、
+            //   已埋为 `BatchPlanTrial`）。16k 档实测 `RunBatchPlan总次数=13,105`、`BatchPlanTrial=9,366`
+            //   ⇒ 本项 ≈ 3,739 次。
+            // 2026-10-20 第二刀：**只有「批方案候选 == 1」时才真正跑**（此时 `SelectBestBatchPlan` 未被调用，
+            //   没有可采纳的试排状态）；候选 > 1 时改为采纳胜者状态，本埋点退化为采纳本身的成本。
+            //   实测落地：16k 档 `LandingRun` 49,953 ms → 1,051 ms。
+            long swLanding = SolverDiagnostics.HotspotStart();
+            BatchPlanRunOutcome outcome;
+            if (pickedBatchPlan is not null)
+            {
+                // ── 2026-10-20 性能（第二刀）：**采纳胜出批方案的试排状态**，取代「在真实表上再跑一遍」 ──
+                //   旧实现：`SelectBestBatchPlan` 已把胜出候选在**克隆缓冲**上完整跑过（`RunBatchPlan`），
+                //     但只返回方案本身、把跑出来的状态丢掉 ⇒ 回到这里在真实表上从头重跑同一个批方案。
+                //     实测 16k 档 `LandingRun` = 49,953 ms / 3,739 次（占 Phase2 的 30.8%），其中属于
+                //     「批方案候选 > 1」的这部分是纯粹的重复劳动。
+                //   等价性：各候选试排**都从同一份真实快照出发**（`scheduledTasks` / `allocationTaskShare` /
+                //     `resourceOccupancy` 在试跑循环内不被改写，逐候选各自克隆）⇒ 胜出候选那次试排
+                //     与「在真实表上跑同一批方案」内容逐字相同，只差对象身份。
+                //   `constraints` 侧只有两个可写字段参与（全文件 grep：`ProductTimeline` / `TraceNotes`），
+                //     两者都在 `SelectBestBatchPlan` 内隔离/回滚，此处按胜者补回。
+                // 2026-10-20 二十八刀：这里才是**真表**的整表替换点（`pickedBatchPlan` 的采纳）。
+                //   批分组索引缓存只跟真表，若不在这一处对齐，真表换完之后缓存与真表永久错位
+                //   ⇒ 之后每一次试排副本的「前缀 + 尾巴」校验全部落空 ⇒ 每次都独立建（实测 17,774 次 × 937 µs）。
+                long swAdoptReconcile = SolverDiagnostics.HotspotStart();
+                var adoptAligned = TryReconcileBatchGroupsBeforeReplace(
+                    result.ScheduledTasks, pickedBatchPlan.Tasks);
+                SolverDiagnostics.HotspotEnd(swAdoptReconcile, SolverDiagnostics.Hotspot.BatchGroupAdoptReconcile);
+
+                result.ScheduledTasks.Clear();
+                result.ScheduledTasks.AddRange(pickedBatchPlan.Tasks);
+
+                // 对齐失败 ⇒ 在**真表已换好之后**重建成「镜像真表」的那份（与改前同价，且把归属绑回真表）。
+                //   重建本身走的是同一套前缀校验：恰好能增量就走增量，不能就整表重建。
+                if (!adoptAligned)
+                {
+                    BuildBatchGroupsIndex(result.ScheduledTasks, useCache: true, rebindOwner: true);
+                }
+                allocationTaskShare.Clear();
+                foreach (var kv in pickedBatchPlan.Shares)
+                {
+                    allocationTaskShare[kv.Key] = kv.Value;
+                }
+
+                resourceOccupancy.Clear();
+                foreach (var kv in pickedBatchPlan.Occupancy)
+                {
+                    resourceOccupancy[kv.Key] = kv.Value;
+                }
+
+                constraints.ProductTimeline = pickedBatchPlan.Timeline;
+                constraints.TraceNotes.AddRange(pickedBatchPlan.Notes);
+
+                // 选路登记：试跑写进的是**一次性副本**（不污染真表）⇒ 胜者那份补回真表。
+                //   副本在候选试跑前是真实表的逐字拷贝、循环内真实表不被改写 ⇒ 整表回填 = 回填增量。
+                foreach (var kv in pickedBatchPlan.ChosenBatchRoutePaths)
+                {
+                    constraints.ChosenBatchRoutePaths[kv.Key] = kv.Value;
+                }
+
+                foreach (var kv in pickedBatchPlan.ChosenRoutePaths)
+                {
+                    constraints.ChosenRoutePaths[kv.Key] = kv.Value;
+                }
+
+                outcome = pickedBatchPlan.Outcome;
+            }
+            else
+            {
+                outcome = RunBatchPlan(
+                    batches, actualDemand, plannedCandidates, direction, constraints,
+                    resourceOccupancy, result.ScheduledTasks, allocationTaskShare, demandByKey,
+                    request, dynamicMaterialFloor, stageOverlap, mergeAllowed,
+                    constraints.ChosenBatchRoutePaths, constraints.ChosenRoutePaths);
+            }
+
+            SolverDiagnostics.HotspotEnd(swLanding, SolverDiagnostics.Hotspot.LandingRun);
 
             // P1-01：登记**实际落定**方向（= 胜出候选自己的方向），供 Phase5 逐需求门控与出口追溯。
             //   覆盖上方 `:542` 的需求级回落值 —— 二者仅在 `AUTO` 且候选 lead 不同时才可能不同，
@@ -693,6 +1157,16 @@ internal class PhaseTwoInitialScheduler
                 //   已落定的前序批**保留**（「能排下的排下」，与「排不下不得静默丢弃」同向），
                 //   需求仍进 `UnscheduledDemandKeys` 以示**未按完整执行批全部满足**。
                 result.UnscheduledDemandKeys.Add(demand.LogicalDemandKey);
+
+                // 2026-10-25 未排原因自报（2号位《单域可复现样本》§7.1）：批没落定时**把批内子出口一并带出**。
+                //   本需求在批试排期间可能已由 ScheduleBackward/ScheduleForward 登记过具体出口
+                //   （物料不足 / 无合格资源 / 无可用时间槽 / 空工序），此处把它接在本条之后；
+                //   没有则说明批在进工序循环之前就被否（路径/批策略层）。
+                _phase2BlockedDetails.TryGetValue(demand.LogicalDemandKey, out var batchInnerBlock);
+                RecordPhase2Block(demand.LogicalDemandKey,
+                    $"Phase2 出口=P2_BATCH_NOT_LANDED：批方案共 {batches.Count} 个，"
+                    + $"第 {(outcome.FailedBatchIndex + 1)} 个执行批未落定（其后各批按 §六 不再尝试）"
+                    + (string.IsNullOrEmpty(batchInnerBlock) ? "；批内工序级出口=未登记（批在进入工序循环之前被否）" : "；批内工序级出口=" + batchInnerBlock));
 
                 // ── P0-03（0号位 2026-10-08《未命名的Markdown文件 (1)(1).md》§六 / §十一-2）──
                 //   登记**未落定执行批身份** = 首个失败批 **及其后所有未试批**
@@ -755,6 +1229,11 @@ internal class PhaseTwoInitialScheduler
 
         // P0-04修复：把 Merge M:N 份额追溯返回给 Phase5，避免合批份额血缘丢失
         result.AllocationTaskShare = allocationTaskShare;
+
+        // 2026-10-25 未排原因自报：把本次 Run 登记的逐需求出口正文交给 Phase5（**只用于 TraceNote 正文**）。
+        //   纯诊断 —— Phase5 用它填 `SolveTraceNote.Message`，不改任何 `Reason`、不改归属。
+        //   取**副本**：字段会被 Phase4 Fallback 重跑复用，交出去的必须是本次 Run 的快照。
+        result.Phase2BlockedDetails = new Dictionary<string, string>(_phase2BlockedDetails, StringComparer.Ordinal);
 
         return result;
     }
@@ -1090,6 +1569,66 @@ internal class PhaseTwoInitialScheduler
         IReadOnlyDictionary<string, string> BatchDirections);   // NEW-P1-01：**批键 → 该批自身落定方向**（逐批独立）
 
     /// <summary>
+    /// 2026-10-20 性能：**单个 Routing 候选试排后的完整隔离状态**。
+    ///
+    /// 【为什么需要】落定（`RunBatchPlan` 步骤 4）原先是「在真实上下文上把胜出候选**重跑一遍**」。
+    ///   但步骤 2 的试排本来就是在**真实上下文的等价快照**上跑的（`ProductTimeline.Clone()` /
+    ///   `CloneOccupancy` / 任务表副本），且 `ScheduleDemandOperations` 是确定性的 —— 代码本身
+    ///   一直依赖这一点（旧注释：「排程确定性 ⇒ 与试排同结果」）。既然如此，重跑一遍纯属白做：
+    ///   实测占 ΣPhase 的 **29.7%**（16k 档 68,481 ms / 3,739 次，仅外层调用点）。
+    ///
+    /// 【本类做什么】把试排那次运行**留在手里的状态**按候选留存，胜者直接采纳：
+    ///   占用表 / 任务表 / 份额表 / 产品时间线 / 新产 Task / 本次 trace 增量。
+    ///
+    /// 【语义为什么不变】
+    ///   · 试排与落定的**唯一**差别原本就只有「对象身份不同、内容相同」（克隆 vs 真表）；
+    ///     采纳 = 把内容完全相同的那份换回真表 ⇒ 后续 Phase 看到的状态逐字一致。
+    ///   · `WroteTaskTables == false`（Merge 结构上不可能）时，试排的 `Tasks`/`Shares`
+    ///     是**真表别名**且全程零写入（`ScheduleDemandOperations` 根本不接收 `scheduledTasks`）
+    ///     ⇒ 采纳时无需、也不得清表重填。
+    ///   · `Produced` 仍是原返回值 ⇒ 调用方 `scheduledTasks.AddRange(batchTasks)` / `newTasks`
+    ///     的口径完全不变（Merge 成功时它是空表，与旧行为一致）。
+    /// </summary>
+    private sealed class RoutingTrialState
+    {
+        /// <summary>本候选是否可排（对应 `trials` 元组的 Feasible）。</summary>
+        public bool Feasible;
+
+        /// <summary>本候选的完成时间（供 <see cref="SelectBestRoutingCandidate"/>）。</summary>
+        public DateTime Completion;
+
+        /// <summary>本候选的 Setup 总量（供 <see cref="SelectBestRoutingCandidate"/>）。</summary>
+        public decimal SetupMinutes;
+
+        /// <summary>本候选**自己**的方向（试排/落定同向，P1-01）。</summary>
+        public string Direction = string.Empty;
+
+        /// <summary>试排后的资源占用表（隔离克隆，已含本次排程的全部写入）。</summary>
+        public Dictionary<int, List<TimeWindow>> Occupancy = null!;
+
+        /// <summary>
+        /// 试排后的任务表。`WroteTaskTables == true` ⇒ **独立副本**（可直接回填真表）；
+        /// `false` ⇒ **真表别名**（试排全程未写，采纳时不得清表）。
+        /// </summary>
+        public List<FinalTaskDraft> Tasks = null!;
+
+        /// <summary>试排后的份额表（同 <see cref="Tasks"/> 的别名/副本口径）。</summary>
+        public Dictionary<string, List<(string DemandKey, decimal ShareQty)>> Shares = null!;
+
+        /// <summary>试排后的产品时间线（隔离克隆）。</summary>
+        public ResourceProductTimeline Timeline = null!;
+
+        /// <summary>本候选的试排是否**可能写**任务表/份额表（= `mergeStructurallyPossible`）。</summary>
+        public bool WroteTaskTables;
+
+        /// <summary>`RunDemandSchedule` 的原始返回值（Merge 成功时为空表，与旧落定同口径）。</summary>
+        public List<FinalTaskDraft> Produced = null!;
+
+        /// <summary>本候选试排产生的 trace 增量（按水位切片；胜者采纳时补回真表）。</summary>
+        public List<SolveTraceNote> Notes = null!;
+    }
+
+    /// <summary>
     /// P1-01：在**给定工作缓冲**上执行一个**批方案**（原 Phase2 批循环主体，逐字抽出）。
     ///
     /// 抽出目的：让「候选批方案试跑」与「最终落定」共用同一段逻辑 —— 试跑传克隆缓冲
@@ -1103,7 +1642,8 @@ internal class PhaseTwoInitialScheduler
     ///   步骤 1 多批时按本批数量克隆需求（单批用原实例，零回归）；
     ///   步骤 2 各候选路径试排（隔离 `ProductTimeline` / occupancy / tasks / shares，回滚 TraceNotes）；
     ///   步骤 3 <see cref="SelectBestRoutingCandidate"/> 本批择优（Q-1 四层目标）；
-    ///   步骤 4 真实上下文重跑落定 + 逐批登记选中路径（RT-002）。
+    ///   步骤 4 **采纳胜出候选的试排状态**落定 + 逐批登记选中路径（RT-002）。
+    ///      （2026-10-20 性能：旧实现是「在真实上下文重跑一遍」，与试排必然等价、纯属白做 ⇒ 已改为直接采纳。）
     /// </summary>
     private BatchPlanRunOutcome RunBatchPlan(
         IReadOnlyList<ExecutionBatchDraft> batches,
@@ -1121,8 +1661,12 @@ internal class PhaseTwoInitialScheduler
         bool mergeAllowed,
         Dictionary<string, RoutePathKey> chosenBatchRoutePaths,
         Dictionary<string, RoutePathKey> chosenRoutePaths,
-        Dictionary<int, List<TimeWindow>>? occupancyPristine = null)   // 2026-10-08 COW：本表为克隆时传入其冻结快照
+        Dictionary<int, List<TimeWindow>>? occupancyPristine = null,   // 2026-10-08 COW：本表为克隆时传入其冻结快照
+        bool isTrial = false)   // 2026-10-20 二十八刀：`scheduledTasks` 是**试排副本**（候选擂台）还是权威真表
     {
+        // 2026-10-19 性能定位：本方法总调用次数（两个调用点：`:846` 多批落定路径 + `:1641` 批方案候选试排）。
+        SolverDiagnostics.CountRunBatchPlanInvocation();
+
         // 多批时 Merge 受**身份保持**判据约束（见循环内 P1-01）。
         var multiBatch = batches.Count > 1;
 
@@ -1172,6 +1716,29 @@ internal class PhaseTwoInitialScheduler
             // P1-01：试排元组带**本候选自己的方向**（`Direction`）—— 候选比较层据此按各自方向裁决，
             //   不再用一个由「任意第一 Path」外推的方向套所有候选。
             var trials = new List<(RoutePathKey Key, bool Feasible, DateTime Completion, decimal SetupMinutes, string Direction)>();
+            // 2026-10-20 性能：候选试排的**完整隔离状态**按序留存（与 `trials` 逐项对齐）——
+            //   胜者直接采纳，免去在真实上下文上重跑一遍（步骤 4 原实现，实测 29.7% ΣPhase）。
+            var trialStates = new List<RoutingTrialState>(plannedCandidates.Count);
+
+            // ── 2026-10-19 性能：批分组索引**本批只建一次** ──
+            //   `FindMergeableStageBatches` 首段的「按 `ExecutionBatchDraftKey` 分组」只依赖 `scheduledTasks`；
+            //   本批候选循环内 `scheduledTasks` **不被改写**（写全落在 `trialTasks`/`trialOccupancy`/`trialShares`），
+            //   且每候选的 `trialTasks` 都是它的逐条拷贝（`:1401`）⇒ 分组结果逐候选**完全一致**。
+            //   原实现每候选重建一次，实测占 ΣPhase 14.6%（resources=16 / FinalTask=11,124）。
+            //   懒建：仅当本批「Merge 结构上可能发生」且候选为**多工序**（分组只在 `operations.Count > 1`
+            //   时被 `FindMergeableStageBatches` 读取）才建 ⇒ 单工序/关 Merge 路径**零额外开销**。
+            Dictionary<string, List<FinalTaskDraft>>? batchGroupsIndex = null;
+            // ── 2026-10-20 十三刀：**撤销** `FinalDraftId → scheduledTasks 下标` 表 ──
+            //   2026-10-19 引入它是为了把摘除段的「全表扫描」降为「O(|锚批|) 直接定位」。当时统计口径
+            //   把**试排**的摘除也算进去了（84,110 次）。2026-10-19 晚些已让试排路径跳过列表摘除
+            //   （`detachTaskList: false`），于是**真正消费**它的只剩落定路径。
+            //   实测（`正式基准_规模扫描_热点定位`，resources=32 / FinalTask=22,296，2026-10-20）：
+            //     · 建表 **17,774** 次（每批一次，22,296 条 `Dictionary<string,int>` 插入 ≈ 1.64 ms/次）
+            //     · 真正消费 **3,080** 次（`ComputeDetachPositions` 调用数）
+            //     ⇒ 建 6 倍于用，且「建表」比「扫一遍表」本身更贵（多一次插入 + 数组分配）。
+            //   ⇒ 一律走 `ComputeDetachPositions` 的**全表扫描回落**（该分支自 2026-10-19 起就在，
+            //     注释明写「`taskIndexById == null` ⇒ 逐字走原路径、零回归」）。
+            //   净效果：PrepIndex 里那一半（≈14.8 s，ΣPhase 的 20.9%）整段消失；回落开销 ≈ 3,080 × 0.45 ms ≈ 1.4 s。
 
             // 试排隔离：`constraints.TraceNotes` 是**共享可变**状态（Setup 追踪三元组在此追加），
             // 试排会把它当真实产出写进去 ⇒ 多候选试排会留下 N 份重复 trace。
@@ -1180,9 +1747,19 @@ internal class PhaseTwoInitialScheduler
 
             foreach (var (pathKey, graph, ops) in plannedCandidates)
             {
+                // 2026-10-20 十次定位：`BatchPlanTrial` 里除 `DemandSchedule` 外还有约 31.5 s 没名字，
+                //   本槽量「试排前准备」（方向解析 + 四份隔离副本）。纯观测。
+                long swPrep = SolverDiagnostics.HotspotStart();
+
+                // 本候选试排前的 trace 水位：试排增量按此切片留存（见 `RoutingTrialState.Notes`）。
+                var notesBefore = constraints.TraceNotes.Count;
+
                 if (ops.Count == 0)
                 {
+                    SolverDiagnostics.HotspotEnd(swPrep, SolverDiagnostics.Hotspot.TrialPrep);
                     trials.Add((pathKey, false, DateTime.MinValue, 0m, direction));
+                    // 占位：保持 `trialStates` 与 `trials` 逐项对齐（该候选不可排，永不会被选为胜者）。
+                    trialStates.Add(new RoutingTrialState());
                     continue;
                 }
 
@@ -1190,8 +1767,10 @@ internal class PhaseTwoInitialScheduler
                 //   非 AUTO ⇒ 原样（零回归）；AUTO ⇒ 本路径的 lead 决定本路径的 Slack 判据。
                 //   同一 `candidateDirection` 同时用于**试排**（本 trial 的完成时间）与**落定**（步骤 4），
                 //   保证「候选比较所用方向」与「真实落定所用方向」**同向**（复审 §五.4）。
+                long swPrepDir = SolverDiagnostics.HotspotStart();
                 var candidateDirection = ResolveDirectionForOps(
                     direction, batchDemand, ops, constraints, request.PlanningStart, dynamicMaterialFloor);
+                SolverDiagnostics.HotspotEnd(swPrepDir, SolverDiagnostics.Hotspot.PrepDirection);
 
                 // 性能计数（§九「Routing 试跑次数」）：每个（执行批 × Routing 候选）⇒ 一次候选试排。
                 SolverDiagnostics.CountRoutingTrial();
@@ -1238,13 +1817,27 @@ internal class PhaseTwoInitialScheduler
                     trialShares = allocationTaskShare;
                 }
 
+                // 2026-10-19 性能：本批首次需要时建一次批分组索引，后续候选复用（原来每候选重建一次）。
+                long swPrepIdx = SolverDiagnostics.HotspotStart();
+                if (mergeStructurallyPossible && ops.Count > 1)
+                {
+                    // 2026-10-20 二十八刀：试排副本**不得**接管共享索引的归属（`rebindOwner:false`）。
+                    //   否则一次候选试排就会把快照绑到一份**随后被丢弃**的副本上，
+                    //   下一份副本（= 真表拷贝，更短）一进来就判「表变短」⇒ 整表重建。
+                    batchGroupsIndex ??= BuildBatchGroupsIndex(scheduledTasks, useCache: true, rebindOwner: !isTrial);
+                    // （原此处还懒建 `FinalDraftId → 下标` 表，2026-10-20 十三刀已撤销，见上方声明处实测数据。）
+                }
+                SolverDiagnostics.HotspotEnd(swPrepIdx, SolverDiagnostics.Hotspot.PrepIndex);
+
+                SolverDiagnostics.HotspotEnd(swPrep, SolverDiagnostics.Hotspot.TrialPrep);
+
                 long swDemand = SolverDiagnostics.HotspotStart();
                 var produced = RunDemandSchedule(
                     batchDemand, ops, graph, candidateDirection, constraints, trialOccupancy,
                     trialTasks, trialShares, demandByKey, request.PlanningStart, request.PlanningEnd,
                     dynamicMaterialFloor, stageOverlap, allowMergeForThisBatch,
                     out var mergedIntoTask, batch.BatchDraftKey,
-                    requireIdentityPreserving, trialOccupancyPristine, request);
+                    requireIdentityPreserving, trialOccupancyPristine, request, batchGroupsIndex);
                 SolverDiagnostics.HotspotEnd(swDemand, SolverDiagnostics.Hotspot.DemandSchedule);
 
                 // ── 2026-10-08 第②刀：合并与否 + 合并后完成时间，均由 Merge 路径**显式上报**
@@ -1279,21 +1872,45 @@ internal class PhaseTwoInitialScheduler
                 var setupMinutes = produced.Sum(t => t.SetupTime);
 
                 trials.Add((pathKey, feasible, completion, setupMinutes, candidateDirection));
+
+                // 2026-10-20 性能：留存本候选**试排后的完整隔离状态**（与 `trials` 逐项对齐）。
+                //   胜者选用后直接采纳这份状态，取代旧实现「在真实上下文上重跑一遍」。
+                trialStates.Add(new RoutingTrialState
+                {
+                    Feasible = feasible,
+                    Completion = completion,
+                    SetupMinutes = setupMinutes,
+                    Direction = candidateDirection,
+                    Occupancy = trialOccupancy,
+                    Tasks = trialTasks,
+                    Shares = trialShares,
+                    Timeline = constraints.ProductTimeline,
+                    WroteTaskTables = mergeStructurallyPossible,
+                    Produced = produced,
+                    Notes = constraints.TraceNotes.Count > notesBefore
+                        ? constraints.TraceNotes.GetRange(notesBefore, constraints.TraceNotes.Count - notesBefore)
+                        : new List<SolveTraceNote>()
+                });
             }
 
-            constraints.ProductTimeline = realTimeline;   // 试排结束，还原真实上下文（试排不污染）
+            constraints.ProductTimeline = realTimeline;   // 试排结束，还原真实上下文（试排不污染；下方采纳胜者时再覆盖为胜者的时间线）
 
-            // 试排产生的 Setup 追踪一并回滚（见上方 watermark）；落定重跑会重新写一份。
+            // 试排产生的 Setup 追踪一并回滚（见上方 watermark）；
+            //   2026-10-20：落定不再重跑，改为**补回胜者那一份**（`winnerState.Notes`，见步骤 4）。
             if (constraints.TraceNotes.Count > traceNotesWatermark)
             {
                 constraints.TraceNotes.RemoveRange(
                     traceNotesWatermark, constraints.TraceNotes.Count - traceNotesWatermark);
             }
 
+            // 2026-10-20 十次定位：步骤 3/4（择优 + 胜者状态整表换回真表）。纯观测。
+            long swAdopt = SolverDiagnostics.HotspotStart();
+
             // 步骤 3：**本批**候选内择优（Q-1 冻结四层目标；P0-03：Routing 择优的业务单位是执行批，不是需求）。
             var winnerIndex = SelectBestRoutingCandidate(trials, batchDemand, constraints);
             if (winnerIndex < 0)
             {
+                SolverDiagnostics.HotspotEnd(swAdopt, SolverDiagnostics.Hotspot.BatchAdopt);
                 // 本批全部候选不可排 ⇒ 该批落不下（需求整体记 Unscheduled，见调用方聚合）。
                 // P0-03：登记**首个未落定批**的下标 —— 调用方据此只对「本批及其后未试批」登记失败身份，
                 //   已落定的前序批**不得**再进入 Phase4 重新展开（否则重复生产）。
@@ -1302,7 +1919,7 @@ internal class PhaseTwoInitialScheduler
                 break;
             }
 
-            // 步骤 4：在**真实上下文**上重跑选中候选落定（排程确定性 ⇒ 与试排同结果）。
+            // 步骤 4：**采纳**选中候选的试排状态作为落定结果（2026-10-20 性能；详见本段末尾注释）。
             var winner = plannedCandidates[winnerIndex];
 
             // RT-002：局部修复不得换路径 —— **逐批**登记本批选中路径（P0-03 升维）。
@@ -1330,11 +1947,64 @@ internal class PhaseTwoInitialScheduler
             //     的 `requireIdentityPreserving` 口径）⇒ 该 Task 在 Phase5 应受**本批**方向约束。
             batchDirections[batch.BatchDraftKey] = winnerDirection;
 
-            var batchTasks = RunDemandSchedule(
-                batchDemand, winner.Ops, winner.Graph, winnerDirection, constraints, resourceOccupancy,
-                scheduledTasks, allocationTaskShare, demandByKey,
-                request.PlanningStart, request.PlanningEnd, dynamicMaterialFloor, stageOverlap,
-                allowMergeForThisBatch, out _, batch.BatchDraftKey, requireIdentityPreserving, occupancyPristine, request);
+            // ── 步骤 4（2026-10-20 性能整改）：**采纳胜出候选的试排状态**，取代「在真实上下文重跑一遍」 ──
+            //   旧实现：`RunDemandSchedule(...)` 在真实 `resourceOccupancy` / `scheduledTasks` /
+            //     `allocationTaskShare` 上把胜者再跑一次，靠「排程确定性 ⇒ 与试排同结果」保证一致
+            //     —— 同一句注释本身就是「这两遍必然等价」的书面证据。
+            //     该重跑实测占 ΣPhase **29.7%**（16k 档 68,481 ms / 3,739 次；仅外层调用点，
+            //     每个「候选批方案试跑」内部还会各自再付一次、未单列）⇒ 结果必然相同，重跑纯属白做。
+            //   新实现：把胜者试排后**留在手里的那份隔离状态**换回真表 —— 内容逐字相同、零重算。
+            //   不变式：
+            //     · `WroteTaskTables == false` ⇒ 试排根本没碰任务/份额表
+            //       （`ScheduleDemandOperations` 压根不接收 `scheduledTasks`）⇒ 只换占用表与时间线；
+            //     · `WroteTaskTables == true`  ⇒ 试排副本已含 Merge 的全部改写 ⇒ 整表换回；
+            //     · 两种情形下 `batchTasks = winnerState.Produced`，与旧落定返回值**同源同义**
+            //       （Merge 成功时为空表 ⇒ 下方 `Count == 0` + `isMerged` 分支照旧）。
+            //   ⚠ `occupancyPristine` 形参自此**不再被读取**：本方法不再向真实占用表增量写入，
+            //     改为整表换回试排副本 ⇒ COW 脱钩诉求消失。形参保留（调用方签名与历史口径不变）。
+            var winnerState = trialStates[winnerIndex];
+
+            if (winnerState.WroteTaskTables)
+            {
+                // 2026-10-20 十一次定位：整表替换（决定「跨 RunBatchPlan 复用索引」是否可行）。纯观测。
+                SolverDiagnostics.CountTaskTableReplaced();
+
+                // ── 2026-10-20 十二次定位结论（量完即撤，逐位比对本身也要多扫一遍全表，不再保留）──
+                //   16k 档实测：整表替换 15,365 次，其中 **15,307 次逐位完全相同**（引用相等 + 同序），
+                //   只有 **58 次**真有差异（且都是大批量差异，最大 17,532 个元素）。
+                //   ⇒ 99.6% 的 `Clear() + AddRange` 是**内容上的空操作**（试排从不改写任务表）。
+                //   ⚠ 但这 15,365 次合计只有 **328 ms**（`BatchAdopt` 热点 = ΣPhase 的 0.5%），
+                //     而「判断是否为空操作」本身要 O(N) 逐位比对 ⇒ 省下的和付出的等量
+                //     ⇒ **不做**「跳过空替换」这一优化。保留此结论，避免后人重复踩。
+                // ── 2026-10-20 二十七刀：采纳前把批分组索引缓存**就地对齐** ──
+                //   胜者那份表 = 旧表「摘掉锚点批 + 追加合批链」⇒ 表变短 ⇒ 增量缓存的前缀比对必然失败、
+                //   回落整表重建（实测 3,602 次 × 574 µs = 2,069 ms，其中「表变短」2,998 次全出自本处）。
+                //   等价性与失败回落见 `TryReconcileBatchGroupsBeforeReplace` 注释。
+                long swReconcile = SolverDiagnostics.HotspotStart();
+                TryReconcileBatchGroupsBeforeReplace(scheduledTasks, winnerState.Tasks);
+                SolverDiagnostics.HotspotEnd(swReconcile, SolverDiagnostics.Hotspot.BatchGroupAdoptReconcile);
+
+                scheduledTasks.Clear();
+                scheduledTasks.AddRange(winnerState.Tasks);
+                allocationTaskShare.Clear();
+                foreach (var kv in winnerState.Shares)
+                {
+                    allocationTaskShare[kv.Key] = kv.Value;
+                }
+            }
+
+            resourceOccupancy.Clear();
+            foreach (var kv in winnerState.Occupancy)
+            {
+                resourceOccupancy[kv.Key] = kv.Value;
+            }
+
+            constraints.ProductTimeline = winnerState.Timeline;
+            constraints.TraceNotes.AddRange(winnerState.Notes);
+
+            SolverDiagnostics.HotspotEnd(swAdopt, SolverDiagnostics.Hotspot.BatchAdopt);
+
+            var batchTasks = winnerState.Produced;
 
             // 第5轮Merge修复：Merge成功时返回空List，但Demand已进入TaskShare，不应标记为Unscheduled
             if (batchTasks.Count == 0)
@@ -1354,6 +2024,7 @@ internal class PhaseTwoInitialScheduler
                 continue;
             }
 
+            SolverDiagnostics.CountTaskTableAppended();
             scheduledTasks.AddRange(batchTasks);
             newTasks.AddRange(batchTasks);
             setupTotal += batchTasks.Sum(t => t.SetupTime);
@@ -1366,6 +2037,42 @@ internal class PhaseTwoInitialScheduler
         }
 
         return new BatchPlanRunOutcome(batchFailed, newTasks, setupTotal, planCompletion, failedBatchIndex, landedDirection, batchDirections);
+    }
+
+    /// <summary>
+    /// 2026-10-20（第二刀）：批方案择优的**胜出者试排状态**（落定阶段直接采纳，取代真实表重跑）。
+    ///
+    /// 每个字段都是「在**克隆缓冲**上完整跑完该批方案后留在手里的那份」——
+    ///   与「在真实表上跑同一批方案」内容逐字相同，只差对象身份（候选试排均从同一份真实快照出发）。
+    /// </summary>
+    private sealed class BatchPlanTrialState
+    {
+        /// <summary>胜出的批方案（供调用方登记批键/批数量）。</summary>
+        public ExecutionBatchFormation Formation = null!;
+
+        /// <summary>`RunBatchPlan` 的原始返回值（新产 Task / 失败批下标 / 逐批方向等）。</summary>
+        public BatchPlanRunOutcome Outcome;
+
+        /// <summary>试跑后的资源占用表（已含本批方案的全部写入）。</summary>
+        public Dictionary<int, List<TimeWindow>> Occupancy = null!;
+
+        /// <summary>试跑后的任务表（始终是独立副本 —— 候选循环外显式 `new List&lt;FinalTaskDraft&gt;(...)`）。</summary>
+        public List<FinalTaskDraft> Tasks = null!;
+
+        /// <summary>试跑后的份额表（同上，独立副本）。</summary>
+        public Dictionary<string, List<(string DemandKey, decimal ShareQty)>> Shares = null!;
+
+        /// <summary>试跑后的产品时间线（末批胜者时间线）。</summary>
+        public ResourceProductTimeline Timeline = null!;
+
+        /// <summary>本次试跑产生的 trace 增量（按水位切片；采纳时补回真表）。</summary>
+        public List<SolveTraceNote> Notes = null!;
+
+        /// <summary>试跑写进的一次性选路副本（采纳时回填真表）。</summary>
+        public Dictionary<string, RoutePathKey> ChosenBatchRoutePaths = null!;
+
+        /// <summary>同上（需求级选路表）。</summary>
+        public Dictionary<string, RoutePathKey> ChosenRoutePaths = null!;
     }
 
     /// <summary>
@@ -1382,8 +2089,11 @@ internal class PhaseTwoInitialScheduler
     ///
     /// 试跑隔离：`constraints.ProductTimeline` 逐候选 clone/restore；`TraceNotes` 按水位回滚；
     ///   `ChosenBatchRoutePaths` / `ChosenRoutePaths` 写进**一次性副本**（不污染真实选路登记表）。
+    ///
+    /// 2026-10-20（第二刀）：返回**胜出候选的完整试排状态**（<see cref="BatchPlanTrialState"/>），
+    ///   调用方据此直接采纳为落定结果，不再在真实表上把同一批方案重跑一遍。
     /// </summary>
-    private ExecutionBatchFormation SelectBestBatchPlan(
+    private BatchPlanTrialState SelectBestBatchPlan(
         List<ExecutionBatchFormation> candidates,
         LogicalProductionDemand actualDemand,
         List<(RoutePathKey Key, RoutingGraph Graph, List<OperationNode> Ops)> plannedCandidates,
@@ -1396,13 +2106,13 @@ internal class PhaseTwoInitialScheduler
         DomainSolveRequest request,
         DateTime dynamicMaterialFloor,
         StageOverlapParams stageOverlap,
-        bool mergeAllowed)
+        bool mergeAllowed,
+        BatchPolicyRuleSnapshot? policy)   // R-2：经济软层需要经济 Min/Max/Preferred
     {
         var realTimeline = constraints.ProductTimeline;
         var traceNotesWatermark = constraints.TraceNotes.Count;
 
-        int bestIndex = 0;
-        BatchPlanRunOutcome bestOutcome = default;
+        BatchPlanTrialState? best = null;
 
         for (int i = 0; i < candidates.Count; i++)
         {
@@ -1426,20 +2136,50 @@ internal class PhaseTwoInitialScheduler
             var trialChosen = new Dictionary<string, RoutePathKey>(
                 constraints.ChosenRoutePaths, StringComparer.Ordinal);
 
+            // 本候选试跑前的 trace 水位：增量按此切片留存（胜出者采纳时补回真表）。
+            var notesBefore = constraints.TraceNotes.Count;
+
             long swBatchTrial = SolverDiagnostics.HotspotStart();
-            var outcome = RunBatchPlan(
-                candidates[i].Batches, actualDemand, plannedCandidates, direction, constraints,
-                trialOccupancy, trialTasks, trialShares, demandByKey, request,
-                dynamicMaterialFloor, stageOverlap, mergeAllowed, trialChosenBatch, trialChosen,
-                trialOccupancyPristine);
+            BatchPlanRunOutcome outcome;
+            // 2026-10-20 二十八刀：**试排覆盖层** —— 副本要看的批分组 = 共享索引（真表那一段）+ 副本尾巴。
+            //   尾巴**临时**并进共享索引，本候选跑完立刻按长度回滚 ⇒ 共享索引恒等于真表、且不重建。
+            BeginBatchGroupsOverlay();
+            try
+            {
+                outcome = RunBatchPlan(
+                    candidates[i].Batches, actualDemand, plannedCandidates, direction, constraints,
+                    trialOccupancy, trialTasks, trialShares, demandByKey, request,
+                    dynamicMaterialFloor, stageOverlap, mergeAllowed, trialChosenBatch, trialChosen,
+                    trialOccupancyPristine, isTrial: true);
+            }
+            finally
+            {
+                RollbackBatchGroupsOverlay();
+            }
+
             SolverDiagnostics.HotspotEnd(swBatchTrial, SolverDiagnostics.Hotspot.BatchPlanTrial);
 
-            if (i == 0
-                || CompareBatchPlans(outcome, candidates[i], bestOutcome, candidates[bestIndex],
-                                     constraints, actualDemand) < 0)
+            if (best is null
+                || CompareBatchPlans(outcome, candidates[i], best.Outcome, best.Formation,
+                                     constraints, actualDemand, policy) < 0)
             {
-                bestIndex = i;
-                bestOutcome = outcome;
+                // 胜出（暂定）⇒ 连同**试跑后的完整隔离状态**一起留存；后续候选若反超则整份替换。
+                best = new BatchPlanTrialState
+                {
+                    Formation = candidates[i],
+                    Outcome = outcome,
+                    Occupancy = trialOccupancy,
+                    Tasks = trialTasks,
+                    Shares = trialShares,
+                    // `RunBatchPlan` 结束时 `constraints.ProductTimeline` 已是本候选末批胜者的时间线
+                    //   （内部逐批 `winnerState.Timeline` 覆盖）⇒ 即「落定后应当持有的那份」。
+                    Timeline = constraints.ProductTimeline,
+                    Notes = constraints.TraceNotes.Count > notesBefore
+                        ? constraints.TraceNotes.GetRange(notesBefore, constraints.TraceNotes.Count - notesBefore)
+                        : new List<SolveTraceNote>(),
+                    ChosenBatchRoutePaths = trialChosenBatch,
+                    ChosenRoutePaths = trialChosen
+                };
             }
         }
 
@@ -1450,7 +2190,8 @@ internal class PhaseTwoInitialScheduler
                 traceNotesWatermark, constraints.TraceNotes.Count - traceNotesWatermark);
         }
 
-        return candidates[bestIndex];
+        // `candidates.Count > 1`（调用方唯一入口）+ 首个候选必被 `best is null` 收下 ⇒ best 非空。
+        return best!;
     }
 
     /// <summary>
@@ -1460,7 +2201,8 @@ internal class PhaseTwoInitialScheduler
     private static int CompareBatchPlans(
         BatchPlanRunOutcome a, ExecutionBatchFormation fa,
         BatchPlanRunOutcome b, ExecutionBatchFormation fb,
-        ConstraintContext constraints, LogicalProductionDemand demand)
+        ConstraintContext constraints, LogicalProductionDemand demand,
+        BatchPolicyRuleSnapshot? policy)
     {
         // ① 硬约束：全部批落定优于有批落不下
         if (a.BatchFailed != b.BatchFailed)
@@ -1498,6 +2240,26 @@ internal class PhaseTwoInitialScheduler
             return a.SetupTotal < b.SetupTotal ? -1 : 1;
         }
 
+        // ── ④.5（R-2，2026-10-12，B-011 / 03 §60 / 01 §单套经济Batch软优化）：**经济软优化**层 ──
+        //   03 逐字：「**不得只在候选生成层消费**」（经济软信号）⇒ 经济 `Min/Max/Preferred` 必须**真实进入
+        //   目标函数**（04 BP-R2a：交期、Setup、资源窗口等**高优先因素相同**时，越接近经济 Min/Max/Preferred
+        //   者应在经济性评分中占优）。
+        //   位置：**在 ④ Setup 之后、批数 tiebreak 之前** ——
+        //     · BP-R2a 逐字把 **Setup 列为高优先因素**（其「相同」才轮到经济性评分）⇒ 经济**不得**先于 Setup；
+        //     · BP-R2b 逐字「不能让经济软参数压过硬约束或高层履约」（= ① 硬约束 / ②③ 交期）⇒ 更不得先于 ①②③；
+        //     · 但必须**先于批数 tiebreak**，否则恒被「批数少者优先」吃掉 = 没进目标函数（正是本轮要修的病）。
+        //   字典序：先**区间偏离**（越出经济 `[Min, Max]` 的总量），再 **Preferred 偏离**。
+        var (rangeA, prefA) = EconomicDeviation(fa, policy);
+        var (rangeB, prefB) = EconomicDeviation(fb, policy);
+        if (rangeA != rangeB)
+        {
+            return rangeA < rangeB ? -1 : 1;
+        }
+        if (prefA != prefB)
+        {
+            return prefA < prefB ? -1 : 1;
+        }
+
         // ④ 次级：批数少者优先（在制/Setup 更少；与 V1 基线 nMin 同向 ⇒ 无改善时保持基线）
         if (fa.Batches.Count != fb.Batches.Count)
         {
@@ -1505,6 +2267,115 @@ internal class PhaseTwoInitialScheduler
         }
 
         return 0;   // 完全等价 ⇒ 调用方保留先出现者（基线在前）
+    }
+
+    /// <summary>
+    /// R-2（2026-10-12，B-011 / 03 §60 / 01 §单套经济Batch软优化）：批方案相对**经济软区间**的偏离度。
+    ///   返回 `(区间偏离总量, Preferred 偏离总量)`，由 <see cref="CompareBatchPlans"/> 按**字典序**消费。
+    ///   逐批口径 = <see cref="EconomicDeviationForQty"/>（**同一助手** ⇒ 拆批/合批两侧口径不可漂移）。
+    ///   ⚠ **纯软**：只用于**合法**方案之间的排序，**不**参与合法性判定，也**不**产生 `BATCH_POLICY_CONFLICT`。
+    /// </summary>
+    private static (decimal Range, decimal Preferred) EconomicDeviation(
+        ExecutionBatchFormation f, BatchPolicyRuleSnapshot? policy)
+    {
+        decimal rangeDev = 0m;
+        decimal prefDev = 0m;
+        foreach (var b in f.Batches)
+        {
+            var (r, p) = EconomicDeviationForQty(b.NetOutputQty, policy);
+            rangeDev += r;
+            prefDev += p;
+        }
+
+        return (rangeDev, prefDev);
+    }
+
+    /// <summary>
+    /// R-2（2026-10-14，0号位《再次整改回执正式审核回复》§二 S1-01 第 4 条）：把**两套候选方案各自
+    /// 「受影响执行批集合」**的逐批偏离相加。供 <see cref="PreferStageMerge"/> 侧构造
+    /// 「独立排程候选 = {锚点批原量, 本需求独立批}」的完整集合偏离。
+    /// ⚠ **纯软**：只用于合法候选间排序。
+    /// </summary>
+    private static (decimal Range, decimal Preferred) AddEconomicDeviation(
+        (decimal Range, decimal Preferred) a, (decimal Range, decimal Preferred) b)
+        => (a.Range + b.Range, a.Preferred + b.Preferred);
+
+    /// <summary>
+    /// R-2（2026-10-14 **二次修正**，0号位《APS V1｜致1号位综合正式审核回复 v1.1》§二.2）：
+    /// 两个经济软偏离之**差**。用于把**多锚点**合批候选统一到**同一基线**后再比较。
+    ///
+    /// 【为什么必须减】旧实现把「合批后批」的**绝对**偏离 `dev(锚量+本批)` 存为擂主分，
+    ///   跨锚点两两比较时**标尺不一致** —— 未参与本次合并的其它合法锚批从未进入同一方案基准
+    ///   ⇒ 多锚择优可能与「完整受影响执行批集合」口径**相反**（0号位 反例：A=10/B=25/C=10/Pref=30）。
+    ///   修法：统一基线 = 「全部既有锚批保持原量 + 本需求独立成批」⇒
+    ///     增量 = `dev(锚量+本批) − dev(锚量) − dev(本批)`，基线自身增量为 `(0,0)`。
+    ///   ⚠ **纯软**：只用于**合法**候选之间的排序，**不**参与合法性判定。
+    /// </summary>
+    private static (decimal Range, decimal Preferred) SubEconomicDeviation(
+        (decimal Range, decimal Preferred) a, (decimal Range, decimal Preferred) b)
+        => (a.Range - b.Range, a.Preferred - b.Preferred);
+
+    /// <summary>
+    /// R-2（2026-10-12，B-011 / 03 §60；**2026-10-14 合批侧补齐**）：**单个执行批数量**相对经济软区间的偏离度。
+    ///   · 区间偏离：`max(0, Min − qty) + max(0, qty − Max)`；
+    ///   · Preferred 偏离：`|qty − Preferred|`（`Preferred` 空 / 非正 ⇒ 0 ⇒ **不比**）。
+    ///   与 <see cref="EconomicDeviation"/>（整条批方案逐批求和）**同一口径**；本助手供**合批侧**
+    ///   （<see cref="PreferStageMerge"/>）比较「独立排程批」与「合批后批」时复用。
+    ///   ⚠ **纯软**：只用于**合法**候选之间的排序，**不**参与合法性判定。
+    /// </summary>
+    private static (decimal Range, decimal Preferred) EconomicDeviationForQty(
+        decimal qty, BatchPolicyRuleSnapshot? policy)
+    {
+        if (policy is null)
+        {
+            return (0m, 0m);
+        }
+
+        decimal min = policy.MinExecutionBatchQty ?? 0m;
+        decimal? max = policy.MaxExecutionBatchQty;
+        decimal? pref = policy.PreferredBatchQty is decimal p && p > 0m ? p : null;
+
+        if (min <= 0m && max is null && pref is null)
+        {
+            return (0m, 0m);
+        }
+
+        decimal rangeDev = 0m;
+        if (qty < min)
+        {
+            rangeDev += min - qty;
+        }
+        if (max is decimal mx && qty > mx)
+        {
+            rangeDev += qty - mx;
+        }
+
+        decimal prefDev = pref is decimal pf ? Math.Abs(qty - pf) : 0m;
+
+        return (rangeDev, prefDev);
+    }
+
+    /// <summary>
+    /// R-1/R-2（2026-10-12，B-011）：把**最终选中**批方案相对经济软区间的偏离登记到诊断计数。
+    /// **纯观测**、不参与任何业务判定；缺策略 / A/B / 无经济区间 ⇒ 不登记。
+    /// </summary>
+    private static void RecordEconomicBatchDeviation(
+        LogicalProductionDemand demand,
+        BatchPolicyRuleSnapshot? policy,
+        ExecutionBatchFormation formation)
+    {
+        if (policy is null || demand.IsContinuation || demand.NoSplitMerge)
+        {
+            return;
+        }
+
+        var (rangeDev, prefDev) = EconomicDeviation(formation, policy);
+        if (rangeDev <= 0m && prefDev <= 0m)
+        {
+            return;
+        }
+
+        SolverDiagnostics.CountEconomicBatchDeviation(formation.Batches.Count);
     }
 
     /// <summary>
@@ -1532,7 +2403,8 @@ internal class PhaseTwoInitialScheduler
         string? batchDraftKey = null,   // P0-01/P0-02：本批归批键（null ⇒ 回落 ExecutionBatchKey(demandKey, 1)）
         bool requireIdentityPreservingMerge = false,   // P1-01：多批需求 ⇒ 只合并到「未归属执行批」的目标 Task
         Dictionary<int, List<TimeWindow>>? occupancyPristine = null,   // 2026-10-08 COW：占用表冻结快照（null ⇒ 自有表）
-        DomainSolveRequest? request = null)   // OWN-P0-02：多 Operation Stage 合批的 Batch Policy Max 判定
+        DomainSolveRequest? request = null,   // OWN-P0-02：多 Operation Stage 合批的 Batch Policy Max 判定
+        Dictionary<string, List<FinalTaskDraft>>? batchGroupsIndex = null)   // 2026-10-19 性能：候选循环外预建的批分组索引（透传）
     {
         // 第4轮Merge修复：检测是否可以合并到已有Task
         if (allowMerge)
@@ -1542,7 +2414,7 @@ internal class PhaseTwoInitialScheduler
                 resourceOccupancy, scheduledTasks, allocationTaskShare, demandByKey,
                 planningStart, planningEnd, dynamicMaterialFloor, stageOverlap,
                 out mergedIntoTask, batchDraftKey,
-                requireIdentityPreservingMerge, occupancyPristine, request);
+                requireIdentityPreservingMerge, occupancyPristine, request, batchGroupsIndex);
         }
 
         mergedIntoTask = null;   // 未走 Merge 路径 ⇒ 构造上不可能合并
@@ -1670,7 +2542,7 @@ internal class PhaseTwoInitialScheduler
         }
 
         return SchedulingDirectionResolver.Resolve(
-            demand, ops, constraints, planningStart, dynamicMaterialFloor, demandGoal: null).Direction;
+            demand, ops, constraints, planningStart, dynamicMaterialFloor, demandGoal: demand.DemandGoal).Direction;
     }
 
     /// <summary>延期分钟数（0 = 按期）。Merge 无新完成时间 / 无交期 ⇒ 视为按期。</summary>
@@ -1695,13 +2567,30 @@ internal class PhaseTwoInitialScheduler
     /// 8,000 目标档下累计 **4,585 ms（ΣPhase 21.8%）**，并贡献约 **11.7 GB / 20.5 GB** 的全部托管分配
     /// ⇒ 直接推高 Gen2 GC（该档实测 **596 次 Gen2**）。这是「速度慢」单项最大的来源。
     ///
-    /// 新实现：**只做两层浅拷**（工作副本 + 冻结快照，均为 O(资源数) 的指针拷贝），
-    /// 占用窗列表本体**暂共享**；谁真被写、谁才在写入前深拷**该**资源那一份（见 <see cref="EnsureOwned"/>）。
+    /// 新实现：**一层浅拷 + 直接引用源表当快照**，占用窗列表本体**暂共享**；
+    /// 谁真被写、谁才在写入前深拷**该**资源那一份（见 <see cref="EnsureOwned"/>）。
     /// 单条需求试排最多命中其工序合格资源（本例 ≤3），资源数 200 ⇒ 单次克隆的列表复制量降到约 1/66。
     ///
-    /// **语义零变化（构造上安全）**：返回的 `pristine` 是**冻结快照**，两侧写入前都比对
-    /// `ReferenceEquals(working[rid], pristine[rid])` —— 相等才拷贝。快照本身永不被改写，
-    /// 故「克隆视图」与「源视图」在任何写入顺序下都不会互相污染
+    /// ── 2026-10-26 第二十七刀：**`pristine` 直接别名 `source`，不再复制第二张表** ──
+    /// 改前是 `new Dictionary&lt;int, List&lt;TimeWindow&gt;&gt;(source)` **两份**，各 O(资源数)
+    /// ⇒ 单次克隆成本 = 2 × 资源数 个条目拷贝，而克隆次数与资源数**无关**
+    /// ⇒ 总成本随资源数线性上涨。实测（Task 数钉死 10,000，只改资源数）：
+    ///   资源 2,000 / 10,000 / 20,000 ⇒ 10.8 s / 23.2 s / 39.8 s，而 `CloneOccupancy` 次数
+    ///   52,322 / 52,855 / 52,855 **基本不动**、内层找槽甚至从 67 万降到 44 万
+    ///   ⇒ 耗时涨幅**全在这一项**。拟合「每多 1,000 资源 +1.66 ms」，2,000 档验证点预测 9.9 s / 实测 10.8 s。
+    /// 本刀去掉两份里的**一份**，该项减半。
+    ///
+    /// **为什么别名是安全的（不是「应该没问题」，是可核的）**：
+    ///   1. `pristine` 全仓**只被读**：仅 `EnsureOwnedCore` 里的 `TryGetValue` + `ReferenceEquals`，
+    ///      没有任何写入 / 遍历 / 存字段（`grep -n "pristine" LPS.APS.Scheduling/Solvers/*.cs` 逐条核过）。
+    ///   2. 快照要保证的是「**克隆那一刻**各资源列表的引用」。而 `source` 在**整个试排循环内不被改写**
+    ///      （`PhaseTwoInitialScheduler.cs:1072` 原注释即此口径；唯一改写点是候选落定后的
+    ///      `resourceOccupancy.Clear()` + 整表换回，见 `:1996`，那时本轮克隆已全部结束、不再读快照）。
+    ///   3. 故「克隆那一刻的 source」与「复制出来的那份内容」**逐键逐引用相同**，比对结果不变
+    ///      ⇒ COW 决策点一个不差，结果逐位相同。
+    ///
+    /// **语义零变化（构造上安全）**：两侧写入前都比对 `ReferenceEquals(working[rid], pristine[rid])`
+    /// —— 相等才拷贝。源表在试排期间不被改写，故「克隆视图」与「源视图」在任何写入顺序下都不会互相污染
     /// （这正是旧实现深拷所保证的不变式，现改为按需支付）。
     /// </summary>
     private static Dictionary<int, List<TimeWindow>> CloneOccupancy(
@@ -1713,7 +2602,8 @@ internal class PhaseTwoInitialScheduler
         long sw = SolverDiagnostics.HotspotStart();
 
         var working = new Dictionary<int, List<TimeWindow>>(source);    // 浅拷：O(资源数)
-        pristine = new Dictionary<int, List<TimeWindow>>(source);       // 冻结快照：O(资源数)，永不被改写
+        // 冻结快照 = 源表本身（不再复制第二份 O(资源数) 的表）。安全性见方法注释第 1~3 条。
+        pristine = source;
 
         SolverDiagnostics.HotspotEnd(sw, SolverDiagnostics.Hotspot.CloneOccupancy);
         return working;
@@ -1728,13 +2618,28 @@ internal class PhaseTwoInitialScheduler
         Dictionary<int, List<TimeWindow>> working,
         Dictionary<int, List<TimeWindow>>? pristine,
         int resourceId)
+        => _ = EnsureOwnedCore(working, pristine, resourceId);
+
+    /// <summary>
+    /// `EnsureOwned` 的本体：返回**本次是否真的做了 COW 深拷**（`true` ⇒ 拷了一份整条资源列表）。
+    /// 2026-10-20 六次定位：只为量「拷贝份数 / 被拷列表长度」，不改变任何判定。
+    /// </summary>
+    private static bool EnsureOwnedCore(
+        Dictionary<int, List<TimeWindow>> working,
+        Dictionary<int, List<TimeWindow>>? pristine,
+        int resourceId)
     {
-        if (pristine is null) return;
-        if (!working.TryGetValue(resourceId, out var list)) return;     // 新键：本就本实例独占
+        if (pristine is null) return false;
+        if (!working.TryGetValue(resourceId, out var list)) return false;     // 新键：本就本实例独占
         if (pristine.TryGetValue(resourceId, out var original) && ReferenceEquals(list, original))
         {
+            long swCopyReal = SolverDiagnostics.HotspotStart();
             working[resourceId] = new List<TimeWindow>(original);
+            SolverDiagnostics.HotspotEnd(swCopyReal, SolverDiagnostics.Hotspot.OccCopyReal);
+            return true;
         }
+
+        return false;
     }
 
     /// <summary>
@@ -1765,8 +2670,17 @@ internal class PhaseTwoInitialScheduler
         TimeWindow window,
         List<(int ResourceId, TimeWindow Window)>? insertLog = null)
     {
-        EnsureOwned(occupancy, pristine, resourceId);
+        // 2026-10-20 七次定位：占用表**写入**总成本（含 `EnsureOwned` 的 COW 深拷 + 二分 + `List.Insert` 搬移）。
+        //   正排天然追加到末尾 ⇒ O(1)；**倒排从头部插入** ⇒ 每次 `Insert` 搬整条列表（16k 档约 541 窗 × 16 B）。
+        //   纯观测，不改变任何判定。
+        long swOccInsert = SolverDiagnostics.HotspotStart();
 
+        // 2026-10-20 十次定位：COW 深拷 与 二分+搬移 分开量。
+        long swOccCopy = SolverDiagnostics.HotspotStart();
+        EnsureOwned(occupancy, pristine, resourceId);
+        SolverDiagnostics.HotspotEnd(swOccCopy, SolverDiagnostics.Hotspot.OccCopy);
+
+        long swOccPos = SolverDiagnostics.HotspotStart();
         var list = occupancy[resourceId];
         int lo = 0, hi = list.Count;
         while (lo < hi)
@@ -1780,25 +2694,187 @@ internal class PhaseTwoInitialScheduler
 
         // F-01：登记插入**身份**（不是位置、不是数量）——回滚只认这一条，绝不截尾。
         insertLog?.Add((resourceId, window));
+        SolverDiagnostics.HotspotEnd(swOccPos, SolverDiagnostics.Hotspot.OccInsertPos);
+        SolverDiagnostics.HotspotEnd(swOccInsert, SolverDiagnostics.Hotspot.OccInsert);
     }
 
-    /// <summary>合批份额深拷贝（候选试排隔离用）。</summary>
+    /// <summary>
+    /// 2026-10-19 性能整改：在**按 `(Start, End)` 升序**的占用窗列表里二分定位 <paramref name="target"/>。
+    ///
+    /// 比较器与 <see cref="AddOccupancyWindow"/> 的插入定位**同源**（`(Start, End)` 字典序），
+    ///   返回**首个**完全相等的位置；不存在 ⇒ `-1`（调用方回落线性 `FindIndex`）。
+    ///
+    /// ⚠ 只认「`windows[lo]` 逐字等于 `target`」这一个证据。不变式（`AddOccupancyWindow` 二分插入 /
+    ///   `:2981` 明文注释：按 `Start` 升序且窗互不重叠）保证同资源内 `(Start, End)` **唯一**
+    ///   ⇒ 命中位置与 `FindIndex` 的首个匹配位置**必然相同**，摘除语义逐字不变。
+    ///   若某处破坏了有序不变式 ⇒ 本方法返回 `-1` ⇒ 调用方**退回原线性路径**，仍然逐字正确。
+    /// </summary>
+    private static int FindOccupancyWindowIndex(List<TimeWindow> windows, TimeWindow target)
+    {
+        int lo = 0, hi = windows.Count;
+        while (lo < hi)
+        {
+            var mid = (lo + hi) / 2;
+            var w = windows[mid];
+            if (w.Start < target.Start || (w.Start == target.Start && w.End < target.End)) lo = mid + 1;
+            else hi = mid;
+        }
+
+        return lo < windows.Count && windows[lo].Start == target.Start && windows[lo].End == target.End
+            ? lo
+            : -1;
+    }
+
+    /// <summary>
+    /// 合批份额**浅拷**（候选试排隔离用）。
+    ///
+    /// ── 2026-10-19 性能整改：由「深拷」改为「浅拷 + 写时换槽」 ──
+    /// 【为什么】旧写法 `source.ToDictionary(kv => kv.Key, kv => new List&lt;&gt;(kv.Value))` 对**每个条目**
+    ///   都 `new List&lt;&gt;` 一次。实测（`正式基准_规模扫描_热点定位`，FinalTask=11,124 / resources=16）：
+    ///   本方法被调用 **115,521** 次、份额表约 **7,400** 条 ⇒ 约 **8.5 亿次 `List` 分配**，
+    ///   累计托管分配 **61,324 MB**（全 Run 分配量的约 83%），`GC 暂停总时长` 实测 **7,408 ms = ΣPhase 的 15.5%**。
+    /// 【为什么浅拷是**等价**的】份额表在隔离副本上的**全部写入都是「换槽位」**，没有一处原地改 list：
+    ///   · `TryMergeDemandIntoStageBatch` 收尾 `allocationTaskShare[fid] = new List&lt;&gt;(shareList)`（逐 Task 换新表）；
+    ///   · `TryMergeDemandIntoTask` 追加份额（**原为 `dict[fid].Add(...)` 原地改**，已同步改为换新表，见该处）；
+    ///   · `RestoreStageBatchSnapshot` 回滚 `allocationTaskShare[fid] = shares`（换回原表）；
+    ///   · 摘除段 `allocationTaskShare.Remove(fid)`（只动字典，不动 list）。
+    ///   ⇒ 未写过的条目与父表**共享同一个 list 对象**，而**没有任何代码会原地改它** ⇒ 读到的内容逐字相同。
+    /// 【收益】单次分配由 O(条目数 × 每表一次 List) 降为 O(条目数 × 一个 Entry) ⇒ 分配量降约 **3 个数量级**。
+    /// </summary>
     private static Dictionary<string, List<(string DemandKey, decimal ShareQty)>> CloneShares(
         Dictionary<string, List<(string DemandKey, decimal ShareQty)>> source)
     {
         // 性能计数（§九「Clone 次数」族）：份额表重建为 O(N) 字典操作，是候选试排隔离的成本之一。
         SolverDiagnostics.CountCloneShares();
         long sw = SolverDiagnostics.HotspotStart();
-        var result = source.ToDictionary(kv => kv.Key, kv => new List<(string, decimal)>(kv.Value));
+        var result = new Dictionary<string, List<(string DemandKey, decimal ShareQty)>>(source);
         SolverDiagnostics.HotspotEnd(sw, SolverDiagnostics.Hotspot.CloneShares);
         return result;
+    }
+
+    // ── 2026-10-20 十六刀：锚点擂台**不再整表克隆份额表**，改「就地写 + 撤销日志」──
+    //   【为什么】`CloneShares` 浅拷后单次成本 = O(份额表条目数)（字典 Entry ≈ 28 B/条）。
+    //     40k 标定点（FinalTask=54,825 / resources=80，份额表 18,468 条）实测：
+    //       `CloneShares` 调用 **1,082,158** 次 × 25.20 µs = **27,272 ms（6.7%）**，
+    //       单次约 **520 KB** 分配 ⇒ 累计 **约 480 GB**，占全 Run 分配量 498,236 MB 的 **96%**；
+    //       由此催出的 `GC暂停总时长` 是 **40,568 ms（ΣPhase 的 10.0%）**。
+    //     而这 108 万次克隆里 **891k 次来自锚点擂台**（`:5339`，每个锚点一份），
+    //     克隆出来的表**在锚点结尾整份丢弃**（`:5509` 还原时间线、胜者事后按 `bestMergeCombinedTasks`
+    //     重跑落定）⇒ 克隆本身就是纯浪费，只要把试排期间写进去的那几条改回来即可。
+    //   【为什么「撤销」是**等价**的】份额表的全部写入都是**键级换槽**（全仓 grep 只有 4 处真写入：
+    //     `:6706` 换新表 / `:6913` 摘除键 / `:7039` 逐 Task 换新表 / `:7069` 回滚换回），
+    //     **没有任何一处原地改 list** ⇒ 记录「该键原来的值（或原本不存在）」就能逐字还原。
+    //     未写到的键自始至终没被碰过，与克隆副本里「共享同一个 list 但没人改」读到的内容逐字相同。
+    //   【开关】只有 `_shareUndoTarget` 指向的那张表（= 擂台拿到的真实表）才记日志；
+    //     真实落定路径（`:3611` 以真实表调用）与其它克隆副本上 `_shareUndoTarget` 不匹配 ⇒ 日志函数退化为直写，行为不变。
+    //   ⚠ 擂台内**不**留任何跨锚点的写入（每个锚点结束即按 mark 回滚到进入前的状态）。
+
+    /// <summary>2026-10-20 十六刀：份额表撤销日志（仅在 <see cref="_shareUndoTarget"/> 被设置时登记）。</summary>
+    private readonly List<(string Key, bool Existed, List<(string DemandKey, decimal ShareQty)>? Previous)>
+        _shareUndo = new();
+
+    /// <summary>2026-10-20 十六刀：当前被日志跟踪的份额表实例（`null` = 不跟踪）。</summary>
+    private Dictionary<string, List<(string DemandKey, decimal ShareQty)>>? _shareUndoTarget;
+
+    /// <summary>2026-10-20 十六刀：开启份额撤销日志，返回当前日志水位（供 <see cref="RollbackShareUndo"/> 用）。</summary>
+    private int BeginShareUndo(Dictionary<string, List<(string DemandKey, decimal ShareQty)>> table)
+    {
+        _shareUndoTarget = table;
+        return _shareUndo.Count;
+    }
+
+    /// <summary>2026-10-20 十六刀：按水位**逆序**撤销本段全部份额写入，把表还原到 <see cref="BeginShareUndo"/> 之前。</summary>
+    private void RollbackShareUndo(
+        Dictionary<string, List<(string DemandKey, decimal ShareQty)>> table,
+        int mark)
+    {
+        for (int i = _shareUndo.Count - 1; i >= mark; i--)
+        {
+            var (key, existed, previous) = _shareUndo[i];
+            if (existed)
+            {
+                table[key] = previous!;
+            }
+            else
+            {
+                table.Remove(key);
+            }
+        }
+
+        _shareUndo.RemoveRange(mark, _shareUndo.Count - mark);
+        if (_shareUndo.Count == 0)
+        {
+            _shareUndoTarget = null;
+        }
+    }
+
+    /// <summary>2026-10-20 十六刀：份额表换槽（等价于 `table[key] = value`，被跟踪时先记旧值）。</summary>
+    private void ShareSet(
+        Dictionary<string, List<(string DemandKey, decimal ShareQty)>> table,
+        string key,
+        List<(string DemandKey, decimal ShareQty)> value)
+    {
+        if (ReferenceEquals(table, _shareUndoTarget))
+        {
+            _shareUndo.Add((key, table.TryGetValue(key, out var previous), previous));
+        }
+
+        table[key] = value;
+    }
+
+    /// <summary>2026-10-20 十六刀：份额表摘键（等价于 `table.Remove(key)`，被跟踪时先记旧值）。</summary>
+    private void ShareRemove(
+        Dictionary<string, List<(string DemandKey, decimal ShareQty)>> table,
+        string key)
+    {
+        if (ReferenceEquals(table, _shareUndoTarget))
+        {
+            _shareUndo.Add((key, table.TryGetValue(key, out var previous), previous));
+        }
+
+        table.Remove(key);
     }
 
     /// <summary>
     /// 排程单个需求的所有工序
     /// 文档：§八 Forward/Backward/Mixed
     /// </summary>
+    /// <remarks>
+    /// 2026-10-19：本方法**只作热点计时包装**，实体在 <see cref="ScheduleDemandOperationsCore"/>。
+    ///   目的 = 量化 `DemandSchedule` 热点里最大的**未埋点**段：实测 2026-10-19 基准
+    ///   （resources=16 / FinalTask=11,124）`DemandSchedule` 36,049 ms 里已埋点子项合计仅 4,839 ms
+    ///   ⇒ **87% 未定位**。包装后可见本方法自身的完整耗时。
+    /// </remarks>
     private List<FinalTaskDraft> ScheduleDemandOperations(
+        LogicalProductionDemand demand,
+        List<OperationNode> operations,
+        RoutingGraph routingGraph,
+        string direction,
+        ConstraintContext constraints,
+        Dictionary<int, List<TimeWindow>> resourceOccupancy,
+        DateTime planningStart,
+        DateTime planningEnd,
+        DateTime dynamicMaterialFloor,
+        StageOverlapParams stageOverlap,
+        string? batchDraftKey = null,
+        Dictionary<int, List<TimeWindow>>? occupancyPristine = null,
+        List<(int ResourceId, TimeWindow Window)>? occupancyInsertLog = null)
+    {
+        long sw = SolverDiagnostics.HotspotStart();
+        try
+        {
+            return ScheduleDemandOperationsCore(
+                demand, operations, routingGraph, direction, constraints, resourceOccupancy,
+                planningStart, planningEnd, dynamicMaterialFloor, stageOverlap,
+                batchDraftKey, occupancyPristine, occupancyInsertLog);
+        }
+        finally
+        {
+            SolverDiagnostics.HotspotEnd(sw, SolverDiagnostics.Hotspot.ScheduleDemandOps);
+        }
+    }
+
+    private List<FinalTaskDraft> ScheduleDemandOperationsCore(
         LogicalProductionDemand demand,
         List<OperationNode> operations,
         RoutingGraph routingGraph,
@@ -1828,11 +2904,17 @@ internal class PhaseTwoInitialScheduler
         //   「`AUTO == MIXED` 不能再作为最终 V1 实现」，此项关闭前 1号位 不能通过 V1 完整性验收。
         //   `AUTO` 现改为**按本需求/本执行批自身上下文正式自决**（见 <see cref="SchedulingDirectionResolver"/>）：
         //     Firm/Frozen/Lock + Execution 连续性 + Material 下界 + RequiredAvailableTime/Slack + Resource
-        //     （+ DemandGoal，载体缺失时登记缺口）⇒ FORWARD / BACKWARD / MIXED 三者之一。
+        //     （+ DemandGoal，**取值**缺失时登记缺口）⇒ FORWARD / BACKWARD / MIXED 三者之一。
         //   调用点位置正确性：P0-01 链规定「每个 Batch 分别进行 Direction + RoutingCandidate + Resource +
         //     Calendar + Setup 联合求解」⇒ 本方法**逐需求逐批**被调用，正是 `ResolveDirection(demand / executionBatch, context)`。
-        //   ⚠ `demandGoal: null`：冻结侧 `DemandGoal`（P-006 两值）**无 C# 载体**（全仓 grep 零命中），
-        //     属 2号位 Pegging 传播缺口（P-008）；此处**不猜、不自造字段**，由 Resolver 记 `DEMAND_GOAL_ABSENT`。
+        //   ✅ `demandGoal: demand.DemandGoal`（R-5 接线，2026-10-13）：冻结侧 `DemandGoal`（P-006 两值）
+        //     载体 `LogicalProductionDemand.DemandGoal` 已于 2026-10-12 落地（**正是 1号位 点名的字段**），
+        //     2号位 已在 Pegging 侧原样传播（`PeggingOrchestrator.cs:2842` / `:2886`）。
+        //     ✅ **2026-10-13 就地更正：取值链已投产**（2号位 `PeggingOrchestrator.FillDemandGoalsAsync`，`:250` 调用）
+        //     ⇒ 本处**不再是空跑**：客户承诺走 `CUSTOMER_COMMITMENT`（反向／交期驱动）、P 行走
+        //     `INVENTORY_REPLENISHMENT`（正向）⇒ **Direction 自决结果自此可能由 FORWARD 变 BACKWARD**。
+        //     仍缺值时由 Resolver 记 `DEMAND_GOAL_ABSENT`（**不猜、不自造字段**）—— 此时为**个案缺口**
+        //     （跨厂 SH 未落地 / 血缘无法唯一确定），非系统性缺口。
         //   `MIXED` 保持字面语义不变（0号位 §三：可作为人工/策略明确模式继续保留）。
         //
         // ── P1-01（0号位 2026-10-09 第三轮复审 §二）：本分支现为**防御性兜底**，生产路径**不再经过** ──
@@ -1845,16 +2927,22 @@ internal class PhaseTwoInitialScheduler
         {
             direction = SchedulingDirectionResolver.Resolve(
                 demand, operations, constraints, planningStart, dynamicMaterialFloor,
-                demandGoal: null).Direction;
+                demandGoal: demand.DemandGoal).Direction;
         }
 
+        // 2026-10-20 七次定位：`ScheduleDemandOperationsCore` 内部 25% 的黑盒，按方向拆两刀。纯观测。
+        long swDir;
         if (direction == "BACKWARD")
         {
+            swDir = SolverDiagnostics.HotspotStart();
             tasks = ScheduleBackward(demand, operations, routingGraph, constraints, resourceOccupancy, planningStart, planningEnd, dynamicMaterialFloor, stageOverlap, batchDraftKey, occupancyPristine, occupancyInsertLog);
+            SolverDiagnostics.HotspotEnd(swDir, SolverDiagnostics.Hotspot.ScheduleBackward);
         }
         else if (direction == "FORWARD")
         {
+            swDir = SolverDiagnostics.HotspotStart();
             tasks = ScheduleForward(demand, operations, routingGraph, constraints, resourceOccupancy, planningStart, planningEnd, dynamicMaterialFloor, stageOverlap, batchDraftKey, occupancyPristine, occupancyInsertLog);
+            SolverDiagnostics.HotspotEnd(swDir, SolverDiagnostics.Hotspot.ScheduleForward);
         }
         else if (direction == "MIXED")
         {
@@ -1912,7 +3000,8 @@ internal class PhaseTwoInitialScheduler
         List<(int ResourceId, TimeWindow Window)>? occupancyInsertLog)
     {
         // 倒排尝试：独立插入日志 —— 失败即整体撤销，**成功才并入**调用方日志（调用方回滚契约不变）。
-        var backwardBaselineResourceIds = CaptureOccupancyResourceIds(resourceOccupancy);
+        // 键集基线取入口拍的那一份（见 `_occupancyBaselineResourceIds`）；未走入口时回落现算。
+        var backwardBaselineResourceIds = _occupancyBaselineResourceIds ?? CaptureOccupancyResourceIds(resourceOccupancy);
         var backwardInsertLog = new List<(int ResourceId, TimeWindow Window)>();
         var timelineBeforeBackward = constraints.ProductTimeline.Clone();
         var traceWatermark = constraints.TraceNotes.Count;
@@ -1980,7 +3069,22 @@ internal class PhaseTwoInitialScheduler
         // P0-05修复：物料总量不足时，标记为业务Unscheduled（不是技术失败）
         if (!isMaterialSufficient)
         {
+            // 2026-10-25 未排原因自报（2号位 §7.1）：与「无合格资源」「无可用时间槽」分开登记 ——
+            //   三者指向完全相反的方向（采购/工艺主数据/产能日历），混成一个泛化出口就无法定位。
+            RecordPhase2Block(demand.LogicalDemandKey,
+                $"P2_NO_MATERIAL(倒排)：需求 {demand.NetOutputQty} × 物料 {demand.MaterialId} "
+                + "总量不足（`GetMaterialEarliestTime` 判 `isMaterialSufficient=false`）"
+                + "⇒ 工序循环一次没进，槽位检索 0 次。");
             return new List<FinalTaskDraft>(); // 物料总量不足
+        }
+
+        // 2026-10-25 未排原因自报：物料够但**工序列表为空** —— 旧实现会静默返回空列表（无一字留痕）。
+        if (operations.Count == 0)
+        {
+            RecordPhase2Block(demand.LogicalDemandKey,
+                "P2_NO_OPERATIONS(倒排)：物料足够，但裁出的工序列表为空 ⇒ 循环一次没进，槽位检索 0 次"
+                + "（Routing 拓扑裁剪结果为空：检查 StartStageCode/StartOperationCode 与 Routing 是否对得上）。");
+            return new List<FinalTaskDraft>();
         }
 
         // 从最后一道工序往前倒推
@@ -2017,8 +3121,20 @@ internal class PhaseTwoInitialScheduler
                 operation.StageCode);   // P1-02：软偏好仅作用于当前承接工序（身份 = StageCode + OperationCode）
             if (eligibleResources.Count == 0)
             {
+                RecordPhase2Block(demand.LogicalDemandKey,
+                    "P2_NO_ELIGIBLE_RESOURCE(倒排)："
+                    + $"Stage='{operation.StageCode}' Op='{operation.OperationCode}' "
+                    + $"Dept={operation.ProductionDepartmentId} Route='{operation.RouteCode}' PathId={operation.PathId} "
+                    + "⇒ `OperationResourceEligibility` 未命中**任何**设备"
+                    + "（合格资源判定键无 StageCode，同码跨 Stage 会互相顶替）"
+                    + "⇒ 资源循环一次没进，槽位检索 0 次。");
                 return new List<FinalTaskDraft>(); // 无合格资源（FINITE_RESOURCE fail-closed）
             }
+
+            // 2026-10-25（2号位《PV195 零任务定位》§4.3）：槽位出口三分成因的读数基线。纯观测。
+            var opAttemptBase = SolverDiagnostics.LiveCounters?.SlotSearchAttempts ?? 0;
+            var opSearchBase = SolverDiagnostics.LiveCounters?.SlotSearches ?? 0;
+            var capacityFactorMissingResources = 0;
 
             // 尝试在合格资源上找时间槽
             FinalTaskDraft? scheduledTask = null;
@@ -2030,7 +3146,18 @@ internal class PhaseTwoInitialScheduler
                 var capacityFactor = GetCapacityFactor(demand.MaterialId, operation, resourceId, constraints);
                 if (capacityFactor == null || capacityFactor <= 0)
                 {
-                    return new List<FinalTaskDraft>(); // CapacityFactor缺失/非法，无法计算Duration
+                    // ── R2-F2（0号位 2026-10-14 第六轮 §四 逐字：「**不得因为一个非法替代资源就把其它合法资源
+                    //    一起封杀**」）── 某资源缺系数 / 系数 ≤ 0 只说明**这一个资源**算不出时长 ⇒ 跳过它、
+                    //    继续试下一个合格资源；**不得**因此放弃整条需求。
+                    //   ⚠ 原实现是 `return new List<FinalTaskDraft>()`：在**资源循环内**直接返回空 ⇒ 一个非法
+                    //     替代资源会把该工序**其余全部合法资源**一起弃掉。Phase4 同判据用的却是 `continue`
+                    //     （`PhaseFourLocalRepair.cs:1154` / `:1670`，行号 2026-10-25 复核）⇒ 该缺陷被「Phase4 局部修复把这笔账补排回来」
+                    //     遮住，**最终结果看起来一致**（「结果一致性」护栏 ≠ 鉴别性反证）。
+                    //   ⚠ 行为边界：若**全部**合格资源都不合法，循环自然走空 ⇒ 下方 `scheduledTask == null`
+                    //     仍返回空列表，与旧行为**完全一致**；仅当存在**合法替代资源**时才改变结果 —— 正是本条要求。
+                    //   回归锁：`OperationPlanningModeContractTests.R2F_09d`（整改前实测红）。
+                    capacityFactorMissingResources++;   // §4.3-1 成因③：本资源缺系数/系数非法（只跳过它，不封杀其余）
+                    continue; // CapacityFactor缺失/非法 ⇒ 跳过该资源（与 Phase4 同语义）
                 }
                 var adjustedDuration = operation.StandardDuration * demand.PlannedProcessQty / capacityFactor.Value;
                 var processDuration = TimeSpan.FromMinutes((double)adjustedDuration);
@@ -2096,7 +3223,7 @@ internal class PhaseTwoInitialScheduler
                     var taskSetupSource = convergedResolution.HasValue
                         ? SetupOptimizer.SetupOutcomeToSource(convergedResolution.Value.Outcome)
                         : null;
-                    scheduledTask = CreateTask(demand, operation, resourceId, taskStart, foundSlot.Value.End, setupMinutes, constraints, taskSetupSource, batchDraftKey);
+                    scheduledTask = CreateTask(demand, operation, resourceId, taskStart, foundSlot.Value.End, adjustedDuration, setupMinutes, constraints, taskSetupSource, batchDraftKey);
 
                     // 更新资源占用：从Setup开始到End结束
                     // 2026-10-08 COW + 有序插入：先脱钩，再按 Start 二分定位插入（维持读端可二分的不变式）
@@ -2122,6 +3249,14 @@ internal class PhaseTwoInitialScheduler
 
             if (scheduledTask == null)
             {
+                RecordPhase2Block(demand.LogicalDemandKey,
+                    "P2_NO_SLOT(倒排)："
+                    + $"Stage='{operation.StageCode}' Op='{operation.OperationCode}' "
+                    + $"合格资源 {eligibleResources.Count} 个**全部**排不进"
+                    + $"；成因={DescribeNoSlotCause(eligibleResources, demand, operation, constraints, capacityFactorMissingResources)}"
+                    + $"；本工序找槽尝试={Math.Max(0, (SolverDiagnostics.LiveCounters?.SlotSearchAttempts ?? 0) - opAttemptBase)} 次"
+                    + $"、槽位检索={Math.Max(0, (SolverDiagnostics.LiveCounters?.SlotSearches ?? 0) - opSearchBase)} 次"
+                    + $"（Run 累计尝试={SolverDiagnostics.LiveCounters?.SlotSearchAttempts ?? 0}）。");
                 return new List<FinalTaskDraft>(); // 排程失败
             }
 
@@ -2155,6 +3290,7 @@ internal class PhaseTwoInitialScheduler
         // 获取物料最早可用时间
         // P0-05修复：传入所需数量，根据累计可用量确定启动时间，并验证总量是否足够
         // 块4（任务喂任务）：合并子件完成时间，父件不能早于子件完成
+        long swFwdPre = SolverDiagnostics.HotspotStart();
         var materialEarliestStart = GetMaterialEarliestTime(
             demand.AllocationSequence,
             demand.NetOutputQty,
@@ -2162,11 +3298,26 @@ internal class PhaseTwoInitialScheduler
             planningStart,
             dynamicMaterialFloor,
             out bool isMaterialSufficient);
+        SolverDiagnostics.HotspotEnd(swFwdPre, SolverDiagnostics.Hotspot.ScheduleFwdPreamble);
 
         // P0-05修复：物料总量不足时，标记为业务Unscheduled（不是技术失败）
         if (!isMaterialSufficient)
         {
+            // 2026-10-25 未排原因自报（2号位 §7.1）：与「无合格资源」「无可用时间槽」分开登记。
+            RecordPhase2Block(demand.LogicalDemandKey,
+                $"P2_NO_MATERIAL(正排)：需求 {demand.NetOutputQty} × 物料 {demand.MaterialId} "
+                + "总量不足（`GetMaterialEarliestTime` 判 `isMaterialSufficient=false`）"
+                + "⇒ 工序循环一次没进，槽位检索 0 次。");
             return new List<FinalTaskDraft>(); // 物料总量不足
+        }
+
+        // 2026-10-25 未排原因自报：物料够但**工序列表为空** —— 旧实现会静默返回空列表（无一字留痕）。
+        if (operations.Count == 0)
+        {
+            RecordPhase2Block(demand.LogicalDemandKey,
+                "P2_NO_OPERATIONS(正排)：物料足够，但裁出的工序列表为空 ⇒ 循环一次没进，槽位检索 0 次"
+                + "（Routing 拓扑裁剪结果为空：检查 StartStageCode/StartOperationCode 与 Routing 是否对得上）。");
+            return new List<FinalTaskDraft>();
         }
 
         // 第4轮C2修复：记录每个Operation的实际完成时间，用于DAG依赖计算。
@@ -2236,8 +3387,20 @@ internal class PhaseTwoInitialScheduler
                 operation.StageCode);   // P1-02：软偏好仅作用于当前承接工序（身份 = StageCode + OperationCode）
             if (eligibleResources.Count == 0)
             {
+                RecordPhase2Block(demand.LogicalDemandKey,
+                    "P2_NO_ELIGIBLE_RESOURCE(正排)："
+                    + $"Stage='{operation.StageCode}' Op='{operation.OperationCode}' "
+                    + $"Dept={operation.ProductionDepartmentId} Route='{operation.RouteCode}' PathId={operation.PathId} "
+                    + "⇒ `OperationResourceEligibility` 未命中**任何**设备"
+                    + "（合格资源判定键无 StageCode，同码跨 Stage 会互相顶替）"
+                    + "⇒ 资源循环一次没进，槽位检索 0 次。");
                 return new List<FinalTaskDraft>(); // 无合格资源（FINITE_RESOURCE fail-closed）
             }
+
+            // 2026-10-25（2号位《PV195 零任务定位》§4.3）：槽位出口三分成因的读数基线。纯观测。
+            var opAttemptBase = SolverDiagnostics.LiveCounters?.SlotSearchAttempts ?? 0;
+            var opSearchBase = SolverDiagnostics.LiveCounters?.SlotSearches ?? 0;
+            var capacityFactorMissingResources = 0;
 
             // 尝试在合格资源上找时间槽
             FinalTaskDraft? scheduledTask = null;
@@ -2249,7 +3412,18 @@ internal class PhaseTwoInitialScheduler
                 var capacityFactor = GetCapacityFactor(demand.MaterialId, operation, resourceId, constraints);
                 if (capacityFactor == null || capacityFactor <= 0)
                 {
-                    return new List<FinalTaskDraft>(); // CapacityFactor缺失/非法，无法计算Duration
+                    // ── R2-F2（0号位 2026-10-14 第六轮 §四 逐字：「**不得因为一个非法替代资源就把其它合法资源
+                    //    一起封杀**」）── 某资源缺系数 / 系数 ≤ 0 只说明**这一个资源**算不出时长 ⇒ 跳过它、
+                    //    继续试下一个合格资源；**不得**因此放弃整条需求。
+                    //   ⚠ 原实现是 `return new List<FinalTaskDraft>()`：在**资源循环内**直接返回空 ⇒ 一个非法
+                    //     替代资源会把该工序**其余全部合法资源**一起弃掉。Phase4 同判据用的却是 `continue`
+                    //     （`PhaseFourLocalRepair.cs:1154` / `:1670`，行号 2026-10-25 复核）⇒ 该缺陷被「Phase4 局部修复把这笔账补排回来」
+                    //     遮住，**最终结果看起来一致**（「结果一致性」护栏 ≠ 鉴别性反证）。
+                    //   ⚠ 行为边界：若**全部**合格资源都不合法，循环自然走空 ⇒ 下方 `scheduledTask == null`
+                    //     仍返回空列表，与旧行为**完全一致**；仅当存在**合法替代资源**时才改变结果 —— 正是本条要求。
+                    //   回归锁：`OperationPlanningModeContractTests.R2F_09d`（整改前实测红）。
+                    capacityFactorMissingResources++;   // §4.3-1 成因③：本资源缺系数/系数非法（只跳过它，不封杀其余）
+                    continue; // CapacityFactor缺失/非法 ⇒ 跳过该资源（与 Phase4 同语义）
                 }
                 var adjustedDuration = operation.StandardDuration * demand.PlannedProcessQty / capacityFactor.Value;
                 var processDuration = TimeSpan.FromMinutes((double)adjustedDuration);
@@ -2257,13 +3431,16 @@ internal class PhaseTwoInitialScheduler
                 // P1-02 item1 接线（阶段二）：Setup = 规则查找「当前工序+当前设备+前产品→当前产品」（v1.2 §2/§5），
                 // RoutingOperation.SetupTime 不再读取（§1.2/§20.3 废止运行真相）；§12：Setup 从候选槽评价阶段参与，
                 // 动态 Setup 与槽位置的相互依赖由 FindSlotWithDynamicSetup 有界迭代解决。
+                long swFwdSetup = SolverDiagnostics.HotspotStart();
                 var found = SetupOptimizer.FindSlotWithDynamicSetup(
                     earliestStart, processDuration, resourceId, operation.OperationCode, demand.MaterialId,
                     constraints.ProductTimeline, constraints.SetupExactRules, constraints.SetupDefaultRules,
                     (f, total) => FindForwardSlot(f, total, resourceId, constraints, resourceOccupancy, planningEnd));
+                SolverDiagnostics.HotspotEnd(swFwdSetup, SolverDiagnostics.Hotspot.ScheduleFwdSetup);
 
                 if (found.HasValue)
                 {
+                    long swFwdBook = SolverDiagnostics.HotspotStart();
                     var (occSlot, setupMinutes, setupResolution) = found.Value;
                     // B.2：Setup 追踪三元组写出（0号位 20260917 回复 §5.1 / §14.3）。
                     // 载体 = 2号位 r13494 落地的 DomainSolveResult.SolveTraceNote；此处只收集，Phase5 统一导出。
@@ -2295,7 +3472,7 @@ internal class PhaseTwoInitialScheduler
                     var taskStart = occSlot.Start + setupDuration;
                     // SetupSource 填充：解析命中类型 → 大写 5 值（5号位 值契约统一 20260921）
                     var taskSetupSource = SetupOptimizer.SetupOutcomeToSource(setupResolution.Outcome);
-                    scheduledTask = CreateTask(demand, operation, resourceId, taskStart, occSlot.End, setupMinutes, constraints, taskSetupSource, batchDraftKey);
+                    scheduledTask = CreateTask(demand, operation, resourceId, taskStart, occSlot.End, adjustedDuration, setupMinutes, constraints, taskSetupSource, batchDraftKey);
 
                     // 资源占用从Setup开始
                     // 2026-10-08 COW + 有序插入（正排写点；天然追加到末尾 ⇒ 退化为 O(1)）
@@ -2315,12 +3492,21 @@ internal class PhaseTwoInitialScheduler
                         operationThresholdTimes[operationKey] = occSlot.Start + thresholdDuration;
                     }
 
+                    SolverDiagnostics.HotspotEnd(swFwdBook, SolverDiagnostics.Hotspot.ScheduleFwdBookkeep);
                     break;
                 }
             }
 
             if (scheduledTask == null)
             {
+                RecordPhase2Block(demand.LogicalDemandKey,
+                    "P2_NO_SLOT(正排)："
+                    + $"Stage='{operation.StageCode}' Op='{operation.OperationCode}' "
+                    + $"合格资源 {eligibleResources.Count} 个**全部**排不进"
+                    + $"；成因={DescribeNoSlotCause(eligibleResources, demand, operation, constraints, capacityFactorMissingResources)}"
+                    + $"；本工序找槽尝试={Math.Max(0, (SolverDiagnostics.LiveCounters?.SlotSearchAttempts ?? 0) - opAttemptBase)} 次"
+                    + $"、槽位检索={Math.Max(0, (SolverDiagnostics.LiveCounters?.SlotSearches ?? 0) - opSearchBase)} 次"
+                    + $"（Run 累计尝试={SolverDiagnostics.LiveCounters?.SlotSearchAttempts ?? 0}）。");
                 return new List<FinalTaskDraft>(); // 排程失败
             }
 
@@ -2494,6 +3680,8 @@ internal class PhaseTwoInitialScheduler
     {
         // 性能计数（§九「SlotSearch 次数」）：倒排找槽。
         SolverDiagnostics.CountSlotSearch();
+        // 2026-10-25（2号位 §4.3-2）：找槽**尝试**计数（本方法入口一次，口径与正排一致）。
+        SolverDiagnostics.CountSlotSearchAttempt(_diag);
         long swSlot = SolverDiagnostics.HotspotStart();
 
         var candidate = new TimeWindow(candidateStart, candidateEnd);
@@ -2517,6 +3705,96 @@ internal class PhaseTwoInitialScheduler
     }
 
     /// <summary>
+    /// 2026-10-25（2号位《PV195 零任务定位》§4.3-1）：把「合格资源全部排不进」拆成**三种成因**的正文。
+    ///   ① **单窗容不下** —— 每个有系数的合格资源，它自己算出的时长都长于它**最长**的日历窗
+    ///      ⇒ 正排在 `windowEnd - windowStart &lt; duration` 处就 `continue` 掉，连一次空闲扫描都发不起来
+    ///      （这正是 PV195：2,898.56 分钟 vs 最长窗 540 分钟）；
+    ///   ② **窗够长但无空档** —— 发起过找槽/扫描，但窗内已被占用；
+    ///   ③ **全部缺 CapacityFactor** —— 所有合格资源都算不出时长。
+    /// 判据全部取自**本次失败路径**的实测读数，不猜；**纯观测**：不改判定、不改返回值、不新增任何码。
+    /// </summary>
+    private string DescribeNoSlotCause(
+        List<int> eligibleResources,
+        LogicalProductionDemand demand,
+        OperationNode operation,
+        ConstraintContext constraints,
+        int capacityFactorMissingResources)
+    {
+        var usable = eligibleResources.Count - capacityFactorMissingResources;
+        if (usable <= 0)
+        {
+            return $"③全部缺 CapacityFactor／系数≤0（{capacityFactorMissingResources}/{eligibleResources.Count} 个合格资源算不出时长）";
+        }
+
+        var tooShort = CountResourcesTooShortForSingleWindow(
+            eligibleResources, demand, operation, constraints,
+            out var longestWindowMinutes, out var maxNeededMinutes);
+
+        if (tooShort >= usable)
+        {
+            // 全部资源「一个窗都没有」时最长窗为 0，别把它写成「最长窗 0 分钟 < 需 xxx」那种误导句。
+            if (longestWindowMinutes <= 0d)
+            {
+                return $"①无可用日历窗（{tooShort} 个有系数的资源一个日历窗都没有，本工序需 {maxNeededMinutes:0.##} 分钟）";
+            }
+
+            return "①单窗容不下（"
+                   + $"{tooShort} 个有系数的资源，其**最长**日历窗 {longestWindowMinutes:0.##} 分钟"
+                   + $" < 本工序最长需 {maxNeededMinutes:0.##} 分钟"
+                   + "；每个窗都装不下一个完整 Task）";
+        }
+
+        return "②日历窗够长但窗内无空档（"
+               + $"{usable} 个有系数的资源中 {usable - tooShort} 个窗长足够，仍排不进）";
+    }
+
+    /// <summary>
+    /// 2026-10-25（2号位《PV195 零任务定位》§4.3-1）：统计「**所有日历窗都短于该资源上本工序时长**」的
+    /// 合格资源数，并给出「最长的日历窗」与「最大的工序需求时长」（分钟）。
+    ///   · 只在**槽位失败出口**调用 ⇒ 不进热路径；
+    ///   · 每个资源的时长按**它自己的** `CapacityFactor` 算；缺系数/系数≤0 的由调用方单独计数，本方法跳过；
+    ///   · 无日历的资源按「一个窗都没有」计入，与「装不下」同档。
+    /// </summary>
+    private int CountResourcesTooShortForSingleWindow(
+        List<int> eligibleResources,
+        LogicalProductionDemand demand,
+        OperationNode operation,
+        ConstraintContext constraints,
+        out double longestWindowMinutes,
+        out double maxNeededMinutes)
+    {
+        longestWindowMinutes = 0d;
+        maxNeededMinutes = 0d;
+        var tooShort = 0;
+
+        foreach (var resourceId in eligibleResources)
+        {
+            var capacityFactor = GetCapacityFactor(demand.MaterialId, operation, resourceId, constraints);
+            if (capacityFactor is null || capacityFactor <= 0) continue;
+
+            var needed = (double)(operation.StandardDuration * demand.PlannedProcessQty / capacityFactor.Value);
+            if (needed > maxNeededMinutes) maxNeededMinutes = needed;
+
+            if (!constraints.ResourceCalendars.TryGetValue(resourceId, out var calendar) || calendar.Count == 0)
+            {
+                tooShort++;
+                continue;
+            }
+
+            var longest = 0d;
+            foreach (var window in calendar)
+            {
+                var length = (window.End - window.Start).TotalMinutes;
+                if (length > longest) longest = length;
+            }
+            if (longest > longestWindowMinutes) longestWindowMinutes = longest;
+            if (longest < needed) tooShort++;
+        }
+
+        return tooShort;
+    }
+
+    /// <summary>
     /// 正排寻找时间槽
     /// </summary>
     private TimeWindow? FindForwardSlot(
@@ -2527,9 +3805,18 @@ internal class PhaseTwoInitialScheduler
         Dictionary<int, List<TimeWindow>> resourceOccupancy,
         DateTime planningEnd)
     {
+        // 2026-10-20 九次定位：本方法全程（日历遍历 + 逐窗 FindFirstAvailableSlot）。纯观测。
+        //   第五刀后「每次调用都 OrderBy 日历」已消除（见 _calendarAscendingCache），本槽不再含排序成本。
+        long swFfs = SolverDiagnostics.HotspotStart();
+        // 2026-10-25（2号位 §4.3-2）：找槽**尝试**计数（正排入口一次）。
+        //   ⚠ 与 `SlotSearches` 不是一回事：后者在本方法里**只在**某个窗够长、真进 `FindFirstAvailableSlot` 时才加 1
+        //   ⇒ 「时长 > 所有窗」时它会一直是 0，看上去像「根本没找」。
+        SolverDiagnostics.CountSlotSearchAttempt(_diag);
+
         // 获取资源日历
         if (!constraints.ResourceCalendars.TryGetValue(resourceId, out var calendar) || calendar.Count == 0)
         {
+            SolverDiagnostics.HotspotEnd(swFfs, SolverDiagnostics.Hotspot.FindForwardSlot);
             return null;
         }
 
@@ -2537,7 +3824,9 @@ internal class PhaseTwoInitialScheduler
         // 0号位裁决（2026-09-12）：无末期限制 —— PlanningEnd 不是硬上界，
         // 正排不再被 planningEnd 截断，只受资源日历窗口（calWindow.End）约束。
         // planningEnd 参数保留仅为签名一致，不再作为末期硬边界。
-        foreach (var calWindow in calendar.OrderBy(w => w.Start))
+        // 2026-10-20 第五刀：改前是 `calendar.OrderBy(w => w.Start)`（每次调用都排一遍 + 分配一次）。
+        //   改后取「已验升序」视图：表本来就有序时直接用原表（逐元素相同），乱序才回落原 OrderBy（结果缓存）。
+        foreach (var calWindow in GetAscendingCalendar(resourceId, calendar))
         {
             if (calWindow.End <= earliestStart) continue;
 
@@ -2550,11 +3839,46 @@ internal class PhaseTwoInitialScheduler
             var slot = FindFirstAvailableSlot(windowStart, duration, resourceId, resourceOccupancy);
             if (slot.HasValue && slot.Value.End <= windowEnd)
             {
+                SolverDiagnostics.HotspotEnd(swFfs, SolverDiagnostics.Hotspot.FindForwardSlot);
                 return slot;
             }
         }
 
+        SolverDiagnostics.HotspotEnd(swFfs, SolverDiagnostics.Hotspot.FindForwardSlot);
         return null;
+    }
+
+    /// <summary>
+    /// 取「按 Start 升序」的日历表（每次调用都等价于原 <c>calendar.OrderBy(w =&gt; w.Start)</c>，但只在必要时真排）。
+    /// </summary>
+    /// <remarks>
+    /// 语义等价性：<c>OrderBy</c> 是**稳定排序** —— 源表若已非递减，排序结果与源表**逐元素相同**（含等值元素的相对次序）
+    /// ⇒ 已有序时直接返回源表与改前行为**完全一致**；只有在自检到逆序时才走原 <c>OrderBy(...).ToList()</c>。
+    /// 自检 O(C)、每张表只做一次（结果按「资源 Id + 源列表引用 + 元素数」缓存），故 700k 次调用的稳态成本是 O(1)。
+    /// 缓存由 <see cref="Schedule"/> 入口清空 ⇒ 不会跨 Run 复用旧日历。
+    /// </remarks>
+    private List<TimeWindow> GetAscendingCalendar(int resourceId, List<TimeWindow> calendar)
+    {
+        if (_calendarAscendingCache.TryGetValue(resourceId, out var cached)
+            && ReferenceEquals(cached.Source, calendar)
+            && cached.Source.Count == calendar.Count)
+        {
+            return cached.Ascending;
+        }
+
+        var ascending = true;
+        for (var i = 1; i < calendar.Count; i++)
+        {
+            if (calendar[i].Start < calendar[i - 1].Start)
+            {
+                ascending = false;
+                break;
+            }
+        }
+
+        var resolved = ascending ? calendar : calendar.OrderBy(w => w.Start).ToList();
+        _calendarAscendingCache[resourceId] = (calendar, resolved);
+        return resolved;
     }
 
     /// <summary>
@@ -2587,8 +3911,10 @@ internal class PhaseTwoInitialScheduler
         //   零分配、零排序。**只有真的乱序时**才回落到原 `OrderBy(...).ToList()`（行为与改前逐字一致）。
         //   本优化**不假设**任何写入方维持有序 —— 每次调用都自检，故对任意输入都保持原语义（零回归）。
         // 性能计数（§九「SlotSearch 次数」）：正排找槽（本方法是 §7.3 点名的重复排序点）。
-        SolverDiagnostics.CountSlotSearch();
-        long swSlot = SolverDiagnostics.HotspotStart();
+        // 2026-10-20 十九刀：本方法 16k 档被调 4,026 万次 ⇒ 三次 `AsyncLocal.Value` 取值本身就要秒级。
+        //   改走缓存重载（`_diag` 在 `Schedule()` 入口取一次），计数口径逐字不变。
+        SolverDiagnostics.CountSlotSearch(_diag);
+        long swSlot = SolverDiagnostics.HotspotStart(_diag);
 
         // ── 2026-10-08 SlotSearch 索引化：**二分跳段**（取代「每次 O(W) 自检有序 + 从头找缝」）──
         //   不变式（见 AddOccupancyWindow）：该列表按 `Start` 升序，且窗互不重叠（⇒ `End` 随 `Start` 非降）。
@@ -2615,14 +3941,14 @@ internal class PhaseTwoInitialScheduler
             if (occ.Start >= cursor + duration)
             {
                 // 找到间隙
-                SolverDiagnostics.HotspotEnd(swSlot, SolverDiagnostics.Hotspot.SlotSearch);
+                SolverDiagnostics.HotspotEnd(_diag, swSlot, SolverDiagnostics.Hotspot.SlotSearch);
                 return new TimeWindow(cursor, cursor + duration);
             }
             cursor = occ.End > cursor ? occ.End : cursor;
         }
 
         // 最后一个占用槽之后的空间
-        SolverDiagnostics.HotspotEnd(swSlot, SolverDiagnostics.Hotspot.SlotSearch);
+        SolverDiagnostics.HotspotEnd(_diag, swSlot, SolverDiagnostics.Hotspot.SlotSearch);
         return new TimeWindow(cursor, cursor + duration);
     }
 
@@ -2650,6 +3976,8 @@ internal class PhaseTwoInitialScheduler
         int resourceId,
         Dictionary<int, List<TimeWindow>> resourceOccupancy)
     {
+        long swHc = SolverDiagnostics.HotspotStart();
+
         // ── 2026-10-08 SlotSearch 索引化：二分定区间 + 区内检查（取代全表 `Any`）──
         //   不变式同上（按 `Start` 升序、互不重叠）。与 `candidate` 重叠的窗必须 `Start < candidate.End`
         //   （否则 `Start >= End_c` ⇒ 不重叠）⇒ 只需检查该前缀；其中 `End <= candidate.Start` 者不重叠，
@@ -2666,8 +3994,14 @@ internal class PhaseTwoInitialScheduler
         while (lower > 0 && occupied[lower - 1].End > candidate.Start) lower--;
         for (int i = lower; i < upper; i++)
         {
-            if (Overlaps(candidate, occupied[i])) return true;
+            if (Overlaps(candidate, occupied[i]))
+            {
+                SolverDiagnostics.HotspotEnd(swHc, SolverDiagnostics.Hotspot.HasConflict);
+                return true;
+            }
         }
+
+        SolverDiagnostics.HotspotEnd(swHc, SolverDiagnostics.Hotspot.HasConflict);
         return false;
     }
 
@@ -2750,6 +4084,8 @@ internal class PhaseTwoInitialScheduler
             UOM = demand.UOM ?? string.Empty,
             PlannedStartTime = start,
             PlannedEndTime = end,
+            // Duration-1：非资源工序与 FINITE 同源但**不除** CapacityFactor（非资源无产能系数，见本方法 XML 摘要口径）
+            EffectiveProcessMinutes = durationMinutes,
             SetupTime = 0m,                // 非资源无换型
             SetupSource = null,            // 非资源无 Setup 来源
             Priority = demand.DemandSequence,
@@ -2852,16 +4188,68 @@ internal class PhaseTwoInitialScheduler
     /// **禁止**回落到「全局默认批量策略」—— 0号位 (7).md §十一 第 3 条明文：1号位不得自行创造全局默认策略。
     /// **禁止**把 `ProductionDepartmentId == null` 的历史记录当 Material 级默认 —— 见 AUD-1-004 整改注释。
     /// </summary>
-    internal static BatchPolicyRuleSnapshot? ResolveExecutionBatchPolicy(
+    /// <summary>
+    /// **B-013 / 06 v1.36 §1（`:17`）/ §272 / §281：Batch Policy 逻辑状态（三态 ＋「状态不可获得」）**
+    /// （1号位 **必须显式消费**）。
+    ///   · <see cref="Valid"/>   —— 精确业务键命中**且**满足发布/有效化资格；
+    ///   · <see cref="Missing"/> —— **经可靠核对证明**「本业务键确实无可用规则」
+    ///     ⇒ 06 §281：「**完全缺配**的合法 C 桶…按本业务键 MISSING 处理」⇒ 走 B-010 `Q_C` 兜底；
+    ///   · <see cref="Invalid"/> —— **有同键但不满足发布/有效化资格**（冲突/不合法/失效且未治理隔离）
+    ///     ⇒ 06 §281 逐字：「**不得假装 MISSING 兜底，应暴露 Issue 等待治理**」；
+    ///   · <see cref="Unknown"/> —— **状态不可获得**（0号位 2026-10-13《未命名的Markdown文件4.md》§3.3 逐字：
+    ///     「`UNKNOWN / NOT_DELIVERED / LOAD_ERROR`……按现有运行错误/输入契约缺陷处理，**不能直接当 MISSING**；
+    ///     **不得静默失去净需求**」）⇒ 与 <see cref="Invalid"/> **同款 Fail Closed**，但**原因类别不同**
+    ///     （**输入契约缺陷**，不是业务治理 Issue）。
+    ///
+    /// ⚠ **0号位 2026-10-13 §3.2 逐字（**推翻我方原「今日行为合规」论证**）**：「你方写道『现行载荷 `INVALID`
+    ///   不可达，因此今日空集合/无命中可以按 `MISSING` 兜底』。**该推论不能接受**。接口把无效规则提前过滤，
+    ///   恰恰说明从空集合**无法区分『真正无规则』和『存在无效规则但未传入』**……它**不授权在信息不完整时把
+    ///   未知状态自动升级为确定的 `MISSING`**。」
+    ///   ⇒ 现行载荷（**无状态位**、投影**只取有效规则**）下，1号位 **对任一非命中键都无法证明「完全缺配」**
+    ///     ⇒ 一律判 <see cref="Unknown"/>，**不得**判 <see cref="Missing"/>。
+    ///   <see cref="Missing"/> 分支**保留**（载体到位后由 2号位 可信状态激活）—— **今日不可达**。
+    ///
+    /// ⚠ 06 §17 逐字：1号位「**不能仅凭旧 `BatchPolicies` 规则行集合为空或查不到行就无差别返回 NULL**」
+    ///   —— 本枚举即为此而设（旧形态 `return null` 已判违规）。
+    /// </summary>
+    internal enum BatchPolicyMatchState
+    {
+        Valid,
+        Missing,
+        Invalid,
+        Unknown
+    }
+
+    /// <summary>三态解析结果：状态 + 命中策略（非 <see cref="BatchPolicyMatchState.Valid"/> 时恒 `null`）+ 可追溯匹配来源。</summary>
+    internal readonly record struct BatchPolicyResolution(
+        BatchPolicyMatchState State,
+        BatchPolicyRuleSnapshot? Policy,
+        string MatchSource);
+
+    /// <summary>
+    /// 解析需求对应的 ⑧块 Batch Policy，并**显式给出逻辑状态**（B-013；旧 `return null` 单值形态已废弃）。
+    ///
+    /// ⚠ **2026-10-13 行为纠正（0号位《未命名的Markdown文件4.md》§3.2／§3.3）——「不可证」不得升级为 `MISSING`**：
+    ///   投影端 `LPS.APS.Core/Dto/FrozenStrategySnapshot.cs:294` 自述本块「仅业务键 + 参数，**不含审计字段**
+    ///   （Id/Created/Updated/**IsActive** —— 投影时**只取有效规则**）」⇒ 无效行**在上游已被滤掉**。
+    ///   0号位 逐字：从空集合**无法区分**「真正无规则」与「存在无效规则但未传入」⇒
+    ///   **「完全缺配 ⇒ MISSING」的前提是「已经可靠证明完全缺配」**，而现行载荷**给不出这个证明**。
+    ///   ⇒ **凡本函数不能证明「确无规则」的情形（⑧块整体为空／本键无命中／业务键不完整）一律判 `Unknown`**，
+    ///     **不判 `Missing`** ⇒ 调用方按**输入契约缺陷 Fail Closed**，**不启 `Q_C`**（`Q_C` 只留给可信 `Missing`）。
+    ///
+    /// ⚠ **`Missing` 与 `Invalid` 当前均不可达（如实登记，非宣称已达标）**：`Invalid` 因投影只取有效规则而
+    ///   结构上到不了 1号位；`Missing` 因**载荷无状态位、无法证明「确无规则」**而不可判。⇒ 已按 06 §17
+    ///   「仅允许经 1/2号位 契约审核确认**最小 DTO 或逻辑状态载体**」提交最小技术合同修正（另件《Batch Policy
+    ///   三态载体最小技术合同修正_1号位致2号位_v1.0_20261013.md》）；**不自行新增字段**（06 §17「此处不预命名新字段」）。
+    ///   两个分支的判据与消费口径**已落码**，待 2号位 可信状态到位即激活。
+    /// </summary>
+    internal static BatchPolicyResolution ResolveExecutionBatchPolicy(
         LogicalProductionDemand demand,
         DomainSolveRequest request,
         ConstraintContext constraints)
     {
-        if (constraints.ExecutionBatchPolicies.Count == 0)
-        {
-            return null;
-        }
-
+        // 部门反查（两条路径共用）：与 2号位 `BuildStates` 推导键集**同源**
+        //   （同查 `MaterialStageDepartmentContexts`）⇒ 按本载体查键**必命中**（贵件 v1.1 §2.4「键集」）。
         int? deptId = null;
         if (!string.IsNullOrEmpty(demand.StartStageCode))
         {
@@ -2876,13 +4264,38 @@ internal class PhaseTwoInitialScheduler
             }
         }
 
+        // ══ 2026-10-13：2号位 已落「三态＋不可用」最小载体 `SolverStrategySnapshot.BatchPolicyStates` ══
+        //   （《APS_V1_20261013_BatchPolicy三态载体最小形态已落码_2号位致1号位_v1.1_20261013》§二）
+        //   非 `null` ⇒ **以载体为唯一判定源**，映射按贵件 §2.5：`Valid→Valid`／`Missing→Missing`／
+        //     `Invalid→Invalid`／**`Unavailable→Unknown`**。
+        //   `null` ⇒ **接口未传递状态**（旧载荷／未适配生产者）⇒ 走下方**现行口径**（贵件 §三「切换时请保留
+        //     `null` 分支」；生产路径 `PeggingOrchestrator` 恒非 null，故该分支只对测试夹具生效）。
+        //   ⚠ **键未命中 ⇒ 载体缺陷 ⇒ Fail Closed（判 `Unknown`），绝不推断 `Missing`** —— 我方 C-2 条件；
+        //     贵件 §2.4 亦逐字「键未被覆盖 ⇒ 按『状态不可获得』处置（**不得推断**）」。
+        if (request.StrategySnapshot?.BatchPolicyStates is { } states)
+        {
+            return ResolveFromCarrier(demand, deptId, states, constraints);
+        }
+
+        if (constraints.ExecutionBatchPolicies.Count == 0)
+        {
+            // ⚠ 2026-10-13 纠正：**不得**再按 06 §281 判 `Missing`（那需要「已可靠证明完全缺配」，本载荷给不出）。
+            //   0号位 逐字：「接口把无效规则提前过滤，恰恰说明从空集合**无法区分**『真正无规则』和『存在无效规则
+            //   但未传入』」⇒ 归 `Unknown`（状态不可获得）⇒ 调用方 Fail Closed，**不启 `Q_C`**。
+            //   本分支**只对 `BatchPolicyStates is null` 的旧载荷／测试夹具生效**。
+            return new BatchPolicyResolution(
+                BatchPolicyMatchState.Unknown, null,
+                "⑧块整体为空 ⇒ 无法区分「确无规则」与「有规则但全被上游过滤」（载荷无状态位）");
+        }
+
         if (deptId is int d)
         {
             foreach (var p in constraints.ExecutionBatchPolicies)
             {
                 if (p.MaterialId == demand.MaterialId && p.ProductionDepartmentId == d)
                 {
-                    return p;
+                    return new BatchPolicyResolution(
+                        BatchPolicyMatchState.Valid, p, $"精确命中 (Material={demand.MaterialId}, Dept={d})");
                 }
             }
         }
@@ -2896,9 +4309,108 @@ internal class PhaseTwoInitialScheduler
         //     那等于 1号位 自造了一条业务上不存在的生效规则（§十一 第 3 条同向：不得自造默认策略）。
         //     投影端（2/3号位）已按 `HasValue` 排除 NULL 部门行；此处再兜底会把它们**复活**。
         //
-        //   ⇒ 未精确命中即 `null`（缺策略）⇒ C 桶走 `BATCH_POLICY_MISSING` Fail Closed
-        //     （见 `DecideExecutionBatchPlan`），**不静默套用历史默认**；历史 NULL 记录仍由 3号位 治理链追溯。
-        return null;
+        //   ⇒ 未精确命中**也不得**判 `Missing`（2026-10-13 纠正，见方法头注释）：「本键无命中」与「本键有规则
+        //     但全被上游过滤」在现行载荷上**不可区分** ⇒ 判 `Unknown`（状态不可获得）⇒ 调用方 Fail Closed，
+        //     **不启 `Q_C`**。**仍不静默套用历史默认**；历史 NULL 记录仍由 3号位 治理链追溯。
+        return new BatchPolicyResolution(
+            BatchPolicyMatchState.Unknown, null,
+            deptId is null
+                ? "业务键不完整（StartStageCode 无法反查 ProductionDepartmentId）⇒ 状态不可获得"
+                : $"精确业务键无命中（Material={demand.MaterialId}, Dept={deptId}；⑧块有行）");
+    }
+
+    /// <summary>
+    /// **载体路径**（2026-10-13）：`SolverStrategySnapshot.BatchPolicyStates` 非 <c>null</c> 时的判定。
+    ///
+    /// 调用前提：<c>states is not null</c>（2号位 已按本 Run 业务键**逐键**给出「状态 ＋ 真实匹配来源」）。
+    /// 语义（2号位 v1.1 件 §2.4／§2.5，**本方法只映射、不重判**）：
+    /// <list type="bullet">
+    ///   <item><c>Valid</c> ⇒ 精确命中且在**本 Run 生效时点**窗口内。**规则参数仍取 <c>BatchPolicies</c>**
+    ///     （载体只给状态、不给参数）⇒ 本方法回查同键行取 <c>Min/Max/Preferred</c>。</item>
+    ///   <item><c>Missing</c> ⇒ 经完整核对**确无**匹配规则 ⇒ 06 <c>:281</c> **允许** B-010 <c>Q_C</c> 软
+    ///     Preferred 兜底（这是本载体的**目的**，不是回归）。</item>
+    ///   <item><c>Invalid</c> ⇒ 本键有规则但不在生效窗口内／未治理隔离 ⇒ 06 <c>:281</c>「不得假装 MISSING
+    ///     兜底，应暴露 Issue 等待治理」⇒ 调用方 Fail Closed。</item>
+    ///   <item><c>Unavailable</c> ⇒ 技术失败（装载失败／未传递状态）⇒ 0号位 文件3 §2「不得直接视为 MISSING」
+    ///     ⇒ 映射为我方 <see cref="BatchPolicyMatchState.Unknown"/>。</item>
+    /// </list>
+    ///
+    /// **三处刻意 Fail Closed（均为「载体缺陷」而非业务状态，不静默降级）**：
+    /// <list type="number">
+    ///   <item><b>键未命中</b>（载体未覆盖本业务键）⇒ 判 <c>Unknown</c>，**绝不推断 <c>Missing</c>**
+    ///     —— 2号位 §2.4 逐字「键未被覆盖 ⇒ 按『状态不可获得』处置（不得推断）」；我方 C-2 条件。</item>
+    ///   <item><b>状态值越域</b>（枚举出现未来新增值）⇒ 判 <c>Unknown</c>，**不按 <c>Valid</c> 放行**（我方 C-3）。</item>
+    ///   <item><b>状态 <c>Valid</c> 但取不到同键参数行</b> ⇒ 载体与载荷不一致 ⇒ 判 <c>Unknown</c>
+    ///     （**不得静默降级为空参数成批**）。</item>
+    /// </list>
+    /// </summary>
+    private static BatchPolicyResolution ResolveFromCarrier(
+        LogicalProductionDemand demand,
+        int? deptId,
+        IReadOnlyList<BatchPolicyStateSnapshot> states,
+        ConstraintContext constraints)
+    {
+        BatchPolicyStateSnapshot? entry = null;
+        foreach (var s in states)
+        {
+            if (s.MaterialId == demand.MaterialId && s.ProductionDepartmentId == deptId)
+            {
+                entry = s;
+                break;
+            }
+        }
+
+        if (entry is null)
+        {
+            // C-2：键未被载体覆盖 ⇒ **载体缺陷** ⇒ Fail Closed，**不得推断 `Missing`**。
+            return new BatchPolicyResolution(
+                BatchPolicyMatchState.Unknown, null,
+                $"载体缺陷：BatchPolicyStates 未覆盖本业务键 (Material={demand.MaterialId}, "
+                + $"Dept={(deptId?.ToString() ?? "null")}) ⇒ 按「状态不可获得」Fail Closed（不推断 Missing）");
+        }
+
+        switch (entry.State)
+        {
+            case BatchPolicyState.Valid:
+                if (deptId is int d)
+                {
+                    foreach (var p in constraints.ExecutionBatchPolicies)
+                    {
+                        if (p.MaterialId == demand.MaterialId && p.ProductionDepartmentId == d)
+                        {
+                            return new BatchPolicyResolution(
+                                BatchPolicyMatchState.Valid, p, entry.MatchSource);
+                        }
+                    }
+                }
+
+                // 状态说 Valid、参数行却取不到 ⇒ 载体与载荷不一致 ⇒ Fail Closed（不静默降级为空参数成批）。
+                return new BatchPolicyResolution(
+                    BatchPolicyMatchState.Unknown, null,
+                    $"载体与载荷不一致：State=Valid 但 BatchPolicies 无同键参数行 (Material={demand.MaterialId}, "
+                    + $"Dept={(deptId?.ToString() ?? "null")}) ⇒ Fail Closed");
+
+            case BatchPolicyState.Missing:
+                // 可信缺配 ⇒ 调用方走 B-010 `Q_C` 软 Preferred 兜底（06 :281）。
+                return new BatchPolicyResolution(
+                    BatchPolicyMatchState.Missing, null, entry.MatchSource);
+
+            case BatchPolicyState.Invalid:
+                // 可信无效 ⇒ 06 :281 不得冒充 MISSING 兜底（调用方 Fail Closed 并暴露 Issue）。
+                return new BatchPolicyResolution(
+                    BatchPolicyMatchState.Invalid, null, entry.MatchSource);
+
+            case BatchPolicyState.Unavailable:
+                // 技术失败 ⇒ 0号位 文件3 §2 不得直接视为 MISSING ⇒ 映射 `Unknown`。
+                return new BatchPolicyResolution(
+                    BatchPolicyMatchState.Unknown, null, entry.MatchSource);
+
+            default:
+                // C-3：枚举越域 ⇒ Fail Closed，**不按 Valid 放行**。
+                return new BatchPolicyResolution(
+                    BatchPolicyMatchState.Unknown, null,
+                    $"载体状态值越域（{entry.State}）⇒ 按 Fail Closed 处置（不按 Valid 放行）");
+        }
     }
 
     /// <summary>
@@ -2912,10 +4424,13 @@ internal class PhaseTwoInitialScheduler
     ///     （v5.1.9 §7.3 `TaskSplitRuleConfig.AllowSplit` 逐字：「0且Qty&gt;Max时返回 `BATCH_POLICY_CONFLICT`」。）
     ///   · `AllowSplit` ⇒ 需 `∃n≥1: n·Min ≤ Qty ≤ n·Max`。
     ///       下界 `n ≥ ceil(Qty/Max)`（Max 给定时）；上界 `n ≤ floor(Qty/Min)`（Min&gt;0 时）。
-    ///       存在解 ⇔ `ceil(Qty/Max) ≤ floor(Qty/Min)`；V1 取**最小合法 n**（批数最少 ⇒ Setup/在制最少，符合四层目标第④层）。
+    ///       基线批数取 `nMin = ceil(Qty/经济Max)`（每批 ≤ 经济 Max；批数最少 ⇒ Setup/在制最少）。
     ///
     /// **明令禁止的旧结论**（0号位 (7).md §五）：不得再写「Max 优先于 Min」或「Min 在 V1 无作用面」。
-    ///   `Qty=10/Min=6/Max=6` ⇒ **无合法切分**（n=1: 10&gt;6；n=2: 12&gt;10）⇒ **冲突**，不得产出 5+5。
+    ///   ⚠ **R-1（2026-10-12）口径已变**：经济 `Min/Max` 是**软优化输入**（03 §60 / 07 §4651），
+    ///   `Qty=10/经济Min=6/经济Max=6` **不再**判 `BATCH_POLICY_CONFLICT`（旧结论作废）⇒ 产出**合法批**
+    ///   （基线 n=2 ⇒ 5+5），**经济偏离由软层登记**（B-011）。**唯一**仍判冲突的是 `AllowSplit=false`
+    ///   时……亦**不再**判冲突（07 §4651 逐字禁止把「Qty 大于经济 Max」当硬冲突）。
     ///
     /// A/B（`IsContinuation` / `NoSplitMerge`）⇒ 恒 1 批（既存执行批，不受普通 C 桶 Batch Decision 约束）。
     /// C 桶**缺有效 Batch Policy ⇒ `BATCH_POLICY_MISSING`**（P0-01，见下）。
@@ -2939,13 +4454,16 @@ internal class PhaseTwoInitialScheduler
         //
         //   正式兜底链（0号位 20260928 四级）：① Material+ProductionDepartment 精确 → ② Material 默认
         //     → ③ **正式发布的 Global Batch Default** → ④ 仍无 ⇒ `BATCH_POLICY_MISSING`。
+        //   ⚠ **第②级「Material 默认」已由 AUD-1-004（2026-10-10）在 Solver 侧删除**（NULL 部门行只作
+        //     历史兼容，不得复活）⇒ 现态实际只剩 ① 与（上游投影后的）③。
         //   第③级由 2/3号位 在上游**投影成 Solver 可消费的有效 Policy** 后交给 1号位（§九：「不要求1号位
         //   自己维护 Global Default」）；**1号位 不得自行展开该级、更不得把末级 `null` 解释成「单批合法」**。
         if (policy is null)
         {
             return ExecutionBatchPlan.Missing(
                 "BATCH_POLICY_MISSING：C 桶需求在 Solver 输入中找不到有效 Batch Policy"
-                + "（(Material + ProductionDepartment) 精确命中 与 Material 级默认 均未命中）");
+                + "（仅 (Material + 明确 ProductionDepartment) 精确命中一条路径；"
+                + "Material 级默认回落已于 AUD-1-004 删除）");
         }
 
         if (demand.NetOutputQty <= 0m)
@@ -2957,13 +4475,22 @@ internal class PhaseTwoInitialScheduler
         decimal min = policy.MinExecutionBatchQty ?? 0m;
         decimal? max = policy.MaxExecutionBatchQty;
 
+        // ── R-1 边界：`经济 Min > 经济 Max` 是**策略自身矛盾**（≠「Qty 越出经济区间」）⇒ **仍判硬冲突** ──
+        //   07 §4651 只禁止把「**Qty 大于经济 Max**」当硬冲突，**不**豁免「策略配置无效」。
+        //   既有单测 ⑤（`Min=6 / Max=2` ⇒ `BATCH_POLICY_CONFLICT`、`IsMissingPolicy=false`）据此**保留**。
+        if (max is decimal mv && mv > 0m && min > mv)
+        {
+            return ExecutionBatchPlan.Conflict(
+                $"BATCH_POLICY_CONFLICT：批量策略配置无效（经济 Min={min} > 经济 Max={mv}）");
+        }
+
+        // ── R-1（2026-10-12，B-011 / 03 §60 / 07 §4651）──
+        //   `AllowSplit=false` 是**独立的拆批业务资格**（03 §62「不因 Min/Max 软化而解除」）⇒ 恒 1 批；
+        //   但 07 §4651 逐字：「**不得再将「Qty 大于经济 Max」本身作为硬冲突条件**」
+        //   ⇒ **不再**因 `qty` 落在经济 `[Min, Max]` 之外判 `BATCH_POLICY_CONFLICT`。
+        //   偏离量交由经济软层（`CompareBatchPlans`，R-2）如实比较，**不作为硬失败**。
         if (!policy.AllowSplit)
         {
-            if (qty < min || (max is decimal mx0 && qty > mx0))
-            {
-                return ExecutionBatchPlan.Conflict(
-                    $"BATCH_POLICY_CONFLICT：不允许拆批（AllowSplit=false）且 Qty={qty} 不在 [Min={min}, Max={(max?.ToString() ?? "∞")}] 内");
-            }
             return ExecutionBatchPlan.Legal(1);
         }
 
@@ -2974,14 +4501,25 @@ internal class PhaseTwoInitialScheduler
             ? ClampToPositiveInt(Math.Floor(qty / min))
             : int.MaxValue;
 
-        if (nMin > nMax)
-        {
-            return ExecutionBatchPlan.Conflict(
-                $"BATCH_POLICY_CONFLICT：不存在合法切分 —— Qty={qty}, Min={min}, Max={(max?.ToString() ?? "∞")}");
-        }
-
-        return ExecutionBatchPlan.Legal(nMin);
+        // ── R-1：经济区间**不整除**（`nMin > nMax`）**不再**判 `BATCH_POLICY_CONFLICT` ──
+        //   03 §60 逐字：「不得把软经济区间用作 **C 桶硬失败**、物理容量或 PI/Stage 数量上限」；
+        //   10 §77 逐字：「经济 Min/Max 偏离**不再触发**批量硬拆或 `BATCH_POLICY_CONFLICT`」。
+        //   代表性回归 = 04 **BP-R1**（`Qty=10 / 经济Min=Max=6`）：旧实现 `nMin=2 > nMax=1`
+        //     ⇒ 整条需求 Unscheduled；现行口径 ⇒ 取基线批数（`nMin`：每批 ≤ 经济 Max）产出
+        //     **合法批**，经济偏离由软层登记（B-011「产生合法批次并记录软偏差」）。
+        //   ⚠ 技术护栏（**非**业务上限、**非**物理单批上限）：防病态策略数据（如 `Max` 极小）令批数
+        //     无界 ⇒ `BuildBatchFormation` 的批列表分配爆炸。正常数据永不触达。
+        return ExecutionBatchPlan.Legal(
+            Math.Min(Math.Max(nMin, 1), MaxTechnicallyFormableBatches));
     }
+
+    /// <summary>
+    /// R-1（2026-10-12）**技术护栏**（**非**业务上限、**非**物理单批上限、**非**冻结默认值）：
+    ///   防**病态** Batch Policy 数据（如 `MaxExecutionBatchQty` 极小 ⇒ `ceil(Qty/Max)` 无界）令基线批数
+    ///   无界 ⇒ `BuildBatchFormation` 的批列表分配爆炸。与 B-007「有界搜索技术预算」同性质：
+    ///   只收不放、**仅对病态输入生效**，正常数据永不触达（⇒ 不改变任何真实业务结果）。
+    /// </summary>
+    private const int MaxTechnicallyFormableBatches = 100000;
 
     /// <summary>把可能溢出/非正的批数折算到 `[1, int.MaxValue]`（防 `decimal→int` 溢出）。</summary>
     private static int ClampToPositiveInt(decimal value)
@@ -3059,6 +4597,94 @@ internal class PhaseTwoInitialScheduler
         string StageCode,
         decimal StageFreeEligibleQty,
         decimal AlreadyCommittedQty = 0m);
+
+    /// <summary>
+    /// V1_3 F-02/F-03 **接线就绪**：把 Core 侧 <see cref="PiStageQuantityBaseline"/> 行集建成
+    /// `(PI 号, 物料ID, StageCode)` → <see cref="PiStageQuantityContext"/> 索引。
+    ///
+    /// 【为什么先落】<see cref="FormExecutionBatches"/> 的 `piStageContext` 形参收的是**单个**上下文，
+    ///   而 baseline 是 (PI × 物料 × Stage) **行集** ⇒ 接线必然需要「按需求三元组取一行」这一步。
+    ///   本方法即那一步（+ <see cref="ResolvePiStageContext"/>），**先落并已单测** —— 消除
+    ///   「等事实覆盖率上来那天才首次写/调这段」的被动（用户 2026-10-12 指出）。
+    ///   ✅ **2026-10-12 已通电**：生产入口 `PhaseTwoInitialScheduler.Schedule` 已传
+    ///     `piFacts: request.PiRemainingFacts` +
+    ///     `piStageContext: ResolvePiStageContext(piStageIndex, demand.ProductionInstructionNo, demand.MaterialId, demand.StartStageCode)`；
+    ///     其中 `piStageIndex` 由 `BuildPiStageQuantityIndex(request.PiStageQuantityBaselines, out _)` **在建库外一次性建**。
+    ///
+    /// 【为什么不用 `ToDictionary`】同一 `(PI, 物料, Stage)` 出现多行时 `ToDictionary` **抛异常**；
+    ///   而「取首条 / 取末条」正是 0号位 裁决 F-02 判死的缺陷（多行匹配时**静默选定一条**）。
+    ///   ⇒ 本实现**不静默取任一**：撞键即把该键**从索引摘除** ⇒ 门禁按「缺 Stage 上下文」显式未满足
+    ///     （Fail Closed），并把撞键经 <paramref name="ambiguousKeys"/> 留痕。
+    ///
+    /// 【不做任何换算】字段逐字搬运（与 <see cref="PiStageQuantityContext"/> 1:1，见 `DomainSolveRequest.cs:200-202`）；
+    ///   空 PI 号 / 空 StageCode 的行**不可键控** ⇒ 跳过（这类行本就不该产出：
+    ///   `DomainSolveRequest.cs:65-67` 明写「缺位置事实或自由量为 0 ⇒ 不产行」）。
+    /// </summary>
+    /// <param name="baselines">Core 侧 `DomainSolveRequest.PiStageQuantityBaselines`；null / 空 ⇒ 空索引。</param>
+    /// <param name="ambiguousKeys">撞键（同三元组 ≥2 行）清单，供诊断留痕；这些键已从索引摘除。</param>
+    internal static Dictionary<(string PiNo, int MaterialId, string StageCode), PiStageQuantityContext>
+        BuildPiStageQuantityIndex(
+            IReadOnlyList<PiStageQuantityBaseline>? baselines,
+            out List<(string PiNo, int MaterialId, string StageCode)> ambiguousKeys)
+    {
+        var index = new Dictionary<(string, int, string), PiStageQuantityContext>();
+        ambiguousKeys = new List<(string, int, string)>();
+
+        if (baselines is null || baselines.Count == 0)
+        {
+            return index;
+        }
+
+        var seen = new HashSet<(string, int, string)>();
+        foreach (var row in baselines)
+        {
+            if (row is null) continue;
+            if (string.IsNullOrWhiteSpace(row.ProductionInstructionNo)) continue;
+            if (string.IsNullOrWhiteSpace(row.StageCode)) continue;
+
+            var key = (row.ProductionInstructionNo, row.MaterialId, row.StageCode);
+
+            if (!seen.Add(key))
+            {
+                // 撞键 ⇒ **摘除**该键（不静默取任一 —— 0号位 裁决 F-02 判词同向）+ 留痕。
+                if (index.Remove(key))
+                {
+                    ambiguousKeys.Add(key);
+                }
+
+                continue;
+            }
+
+            index[key] = new PiStageQuantityContext(
+                row.ProductionInstructionNo,
+                row.MaterialId,
+                row.StageCode,
+                row.StageFreeEligibleQty,
+                row.AlreadyCommittedQty);
+        }
+
+        return index;
+    }
+
+    /// <summary>
+    /// V1_3 F-02/F-03 **接线就绪**：按需求三元组从 <see cref="BuildPiStageQuantityIndex"/> 的索引取**唯一**上下文。
+    /// 无索引 / 未命中 / 三元组任一为空 ⇒ `null` ⇒ 门禁 `stageContext is null` **显式未满足**
+    ///   （Fail Closed；**不得**以 `PiRemainingQty` 冒充 Stage 自由量 —— 裁决 F-02 红线）。
+    /// </summary>
+    internal static PiStageQuantityContext? ResolvePiStageContext(
+        IReadOnlyDictionary<(string PiNo, int MaterialId, string StageCode), PiStageQuantityContext>? index,
+        string? productionInstructionNo,
+        int materialId,
+        string? stageCode)
+    {
+        if (index is null || index.Count == 0) return null;
+        if (string.IsNullOrWhiteSpace(productionInstructionNo)) return null;
+        if (string.IsNullOrWhiteSpace(stageCode)) return null;
+
+        return index.TryGetValue((productionInstructionNo, materialId, stageCode), out var context)
+            ? context
+            : null;
+    }
 
     /// <summary>
     /// V1_4 NEW-04：**本 Run 内「新增 Stage 执行批」的运行累计账**（1号位 侧消费形状，**非 Core 字段、非表**）。
@@ -3152,16 +4778,23 @@ internal class PhaseTwoInitialScheduler
     ///   ② **Stage 位置必须可信** —— 上下文缺失 / PI 或物料不匹配 / `StageCode` 为空 /
     ///      **`StageCode` 不是本需求当前目标 Stage** ⇒ **位置未知 / 错 Stage**，显式未满足
     ///      （裁决 F-02「位置未知须显式未满足」；V1_4 NEW-03「只检查非空」即缺陷）。
-    ///   ③ 合法量 = `min(PI Original, PI Remaining, StageFreeEligibleQty − 已占量)`，
-    ///      **当且仅当 `configuredMax` 有值时**再并入 `配置 Max`；
+    ///   ③ 合法量 = `min(PI Original, PI Remaining, StageFreeEligibleQty − 已占量)`；
     ///      需求量 **严格大于** 合法量 ⇒ 越限（**边界相等合法**，且**绝不静默截断到合法量**）。
     ///
-    /// 【V1_4 NEW-01：`configuredMax` 的**口径**由调用方决定，不得混用】
-    ///   `MaxExecutionBatchQty` 是**单批**上限（B-001/B-009 的「单个新增 Stage 执行批」），
-    ///   **不是**整条需求的「所有批总量」上限。⇒
-    ///     · **单批口径**调用（逐批检查）传 `configuredMax = Policy.MaxExecutionBatchQty`；
-    ///     · **需求累计口径**调用（Σ各批）**必须传 `null`** —— 否则 Q=60 / Max=30 的合法 2×30
-    ///       会被判成 `PI_LEGAL_QTY_OVER_LIMIT`（把合法方案变成 Conflict/0 批）。
+    /// 【`configuredMax` 形参：**生产态无生产者**，**禁止**从 `BatchPolicy` 投影（2026-10-14 S1-01 整改）】
+    ///   本形参是**通用硬上限接缝**，其**唯一合法**用途是承载某条**真实硬**上限。
+    ///   ⚠ `BatchPolicy.MaxExecutionBatchQty` 是**经济**单批偏好（**软目标** —— 2026-10-12 已生效
+    ///     有限产能 v1.9 / 1号位 v1.8），**禁止**把它传进本形参。
+    ///     依据：0号位《APS V1｜1～5号位联合代码审核报告 v1.0》§4 **S1-01（P0 CONFIRMED）** 逐字：
+    ///     「经济Max仍参与PI批量硬数量校验……**在硬PI闸和合批合法性闸排除经济Max**；软Max仅进入有界候选评分。」
+    ///   现行**全部**生产调用点均显式传 `null` —— `ApplyPiLegalQuantityGate` 的单批口径与需求累计口径、
+    ///     `TryFormConservativePiBatch`（B-010 兜底）⇒ 生产态本形参**恒 `null`**，不参与任何判定。
+    ///   【V1_4 NEW-01 历史口径 —— 仅作背景，**勿据此恢复投影**】
+    ///     旧实现按**单批**口径传 `Policy.MaxExecutionBatchQty`（判词称「单批上限」）；但无论单批还是累计口径，
+    ///     **经济 Max 都不得成为硬判据**。✅ **2026-10-14 合批侧已补齐**（0号位《正式回复 v2.0》§二 S1-01 ④）：
+    ///     「软 Max 仅进入有界候选评分」现**两侧均成立** —— 拆批侧 `CompareBatchPlans` → `EconomicDeviation`（R-2）
+    ///     与合批侧 `PreferStageMerge` ④.5（同一助手 `EconomicDeviationForQty`，同层同序）**均已消费**
+    ///     经济 Min/Max/Preferred；**真空档已消除**。**仍不得**据此把本形参恢复投影。
     ///
     /// ⚠ 本方法**不读** `Policy` 的任何其他业务旧列，也不以任何默认值顶替缺失量。
     /// </summary>
@@ -3326,8 +4959,8 @@ internal class PhaseTwoInitialScheduler
 
         // V1_3 F-03：正常 Policy 路径同样过 B-009 统一合法量门禁（不再只给 B-010 兜底装门禁）。
         return ApplyPiLegalQuantityGate(
-            demand, policy, piFacts, piStageContext,
-            BuildBatchFormation(demand, policy, plan.Count, validateDomain: true),
+            demand, piFacts, piStageContext,
+            BuildBatchFormation(demand, policy, plan.Count),
             piStageLedger);
     }
 
@@ -3340,12 +4973,17 @@ internal class PhaseTwoInitialScheduler
     ///   这不是任何冻结文档要求的规则，而是**发明**一条新失败模式（0号位 §8「不要求重新冻结业务」）。
     ///   ⇒ 未投影时**不拦截**，但用 <see cref="SolverDiagnostics"/> 计数器**显式登记缺口**（可观测、不静默）。
     ///   反之，**输入一旦投影，门禁即强制**：唯一性 / Stage 位置 / 合法量任一不满足 ⇒ Fail Closed。
-    ///   ⚠ 本口径已在回执中如实声明：生产态该门禁**当前不可达**（调用点传 `piFacts: null`），
-    ///     缺口归 2号位 装载（AUD-1-D04），1号位 **不宣称** B-009 生产态已达标（不降目标、如实陈述）。
+    ///   ⚠ **生产态可达性（2026-10-12 已变更，以本段为准；上一版此处写「当前不可达」已过期）**：
+    ///     · **接线前**：调用点传 `piFacts: null` ⇒ 生产态本门禁**不可达**、缺口归 2号位 装载（AUD-1-D04），
+    ///       1号位 当时**不宣称** B-009 生产态已达标（不降目标、如实陈述）。
+    ///     · **2026-10-12 已通电**：调用点改传 `request.PiRemainingFacts` + `ResolvePiStageContext(...)`
+    ///       （见 `Schedule` 内 `FormExecutionBatches` 调用）⇒ 生产态**已可达且强制**。
+    ///     · ⚠ 且 `DomainSolveRequest.PiRemainingFacts` 的 Core 默认是**空列表（非 null）**、生产**唯一**构造点
+    ///       `PeggingOrchestrator.cs:358` 恒投影 ⇒ 上面那条 `piFacts is null` 早退在**生产不可达**；
+    ///       「整体未投影」的表现是**全量拦截**，不是 `Unevaluated`（后者恒 0，**非 0 即异常**）。
     /// </summary>
     private static ExecutionBatchFormation ApplyPiLegalQuantityGate(
         LogicalProductionDemand demand,
-        BatchPolicyRuleSnapshot? policy,
         IReadOnlyList<PiRemainingFact>? piFacts,
         PiStageQuantityContext? stageContext,
         ExecutionBatchFormation formation,
@@ -3369,6 +5007,33 @@ internal class PhaseTwoInitialScheduler
             return formation;
         }
 
+        // ── 2026-10-22：**数量权威分级**（2号位 回执 §二 落码 `LogicalProductionDemand.QuantityAuthority`）──
+        //   为什么：客户订单行（B-01 身份闸门 `OrderType='SALES_ORDER'`）也带 `MTS_InstructionNo`，
+        //     但其数量边界取 `[Order].Quantity` —— 按「有 PI 号」一律进门禁会把这批需求误判成 PI 量不足。
+        //   取值语义（逐字大写，见 `QuantityAuthorityValues`）：
+        //     · `MTS_PI`     ⇒ 本门禁全套（**与整改前逐字相同**）
+        //     · `ORDER_ONLY` ⇒ 按 B-010「合法无 PI 规划需求」处理，不进本门禁（PI 号本身仍随下发保留，由 2号位 负责）
+        //     · `NONE`       ⇒ 需求不带 PI 号 ⇒ `EvaluatePiLegalQuantityGate` 首行已返回 null，此处不必另判
+        //     · `null`       ⇒ 我方**尚未填**（过渡期）⇒ **沿用现状**（有 PI 号就走门禁），不因缺值把需求判死
+        //   ⚠ **`ORDER_ONLY` 不得在「本 Run 的 PI 权威事实集整体为空」时生效**：
+        //     事实集为空 / 装载链没跑时，**每一条**带 PI 号的需求都会被分类成 `ORDER_ONLY`；
+        //     照单放行 = 整道硬门禁被静默关掉 = **降低目标**。
+        //     ⇒ 事实集为空 ⇒ 拒绝采信 `ORDER_ONLY`，回落到「有 PI 号就走门禁」（Fail Closed），并单列计数。
+        //     【口径分歧不代裁】「ORDER_ONLY 是否算无 PI」归 0号位（2号位 已提请）；本处只保证**不因此放松**。
+        var authority = demand.QuantityAuthority;
+        if (string.Equals(authority, QuantityAuthorityValues.OrderOnly, StringComparison.Ordinal))
+        {
+            if (piFacts.Count == 0)
+            {
+                SolverDiagnostics.CountPiLegalQuantityGateOrderOnlyRejectedEmptyFacts();
+            }
+            else
+            {
+                SolverDiagnostics.CountPiLegalQuantityGateSkippedOrderOnly();
+                return formation;
+            }
+        }
+
         // V1_4 NEW-03：目标 Stage = 本需求 `StartStageCode`（批形成在 Routing 展开之前 ⇒ 需求级起点即批的 Stage 身份）。
         var piNo = demand.ProductionInstructionNo;
         var targetStage = demand.StartStageCode;
@@ -3376,15 +5041,29 @@ internal class PhaseTwoInitialScheduler
         // V1_4 NEW-04：把**本 Run 已形成批**的累计量并入 Stage 已占量（试排隔离由调用方用克隆账保证）。
         var effectiveStage = MergeLedgerIntoStageContext(stageContext, ledger, piNo, demand.MaterialId, targetStage);
 
-        // ── ① **单批口径**：`配置 Max` 只在此口径参与（B-009「**单个**新增 Stage 执行批上限」）──
+        // ── ① **单批口径**：逐批核对 `min(PI Original, PI Remaining, StageFree − 同PI同Stage已占)` ──
         //   V1_4 NEW-01 判词（本号位核对：**成立**）：旧实现把 `Σ各批 NetOutputQty` 当成 `quantity`
         //   又传入 `policy.MaxExecutionBatchQty` ⇒ 配置 Max（单批上限）被误用成**整条需求的总量上限**
         //   ⇒ Q=60 / AllowSplit / Max=30 的**合法** 2×30 被判 `PI_LEGAL_QTY_OVER_LIMIT`（合法方案 → Conflict/0 批）。
+        //
+        //   ── 2026-10-14 S1-01 整改 ──
+        //   依据：0号位《APS V1｜1～5号位联合代码审核报告 v1.0》§4 **S1-01（P0 CONFIRMED）**，判词逐字：
+        //     「**经济Max仍参与PI批量硬数量校验**……冻结：2026-10-12已生效有限产能v1.9/1号位v1.8，
+        //      **经济Min/Max/Preferred都是软目标**；PI Original、ERP Remaining、Stage净自由、真实资源约束
+        //      另作硬限制……**最小整改**：保留PI Original/Remaining/StageFree硬门禁；在硬PI闸和合批合法性闸
+        //      **排除经济Max**；软Max仅进入有界候选评分。」
+        //   ⇒ 本路径**不再**把 `policy.MaxExecutionBatchQty` 投影进门禁（改传 `configuredMax: null`）：
+        //     · `MaxExecutionBatchQty` 是**经济**单批偏好（软目标，与 `MinExecutionBatchQty` /
+        //       `PreferredBatchQty` 同族），**不是**物理硬上限；
+        //     · 硬上限**只有** PI Original / PI Remaining / Stage 净自由（− 同PI同Stage已占）；
+        //     · 经济 Max 的偏离量仍由**软层**如实比较（`CompareBatchPlans` → `EconomicDeviation`，R-2），
+        //       仅影响**合法方案之间**的排序，**不**在此判 `PI_LEGAL_QTY_OVER_LIMIT`、**不**产生 Conflict。
+        //   ⚠ 不得据「本函数旧注释写着 Max 是硬上限」否定 2026-10-12 已生效冻结（0号位 判词逐字同向）。
         foreach (var b in formation.Batches)
         {
             var reasonBatch = EvaluatePiLegalQuantityGate(
                 b.NetOutputQty, piNo, demand.MaterialId, demand.FactoryId, targetStage,
-                piFacts, effectiveStage, policy?.MaxExecutionBatchQty);
+                piFacts, effectiveStage, configuredMax: null);
 
             if (reasonBatch is not null)
             {
@@ -3418,6 +5097,14 @@ internal class PhaseTwoInitialScheduler
         {
             ledger.Commit(piNo!, demand.MaterialId, targetStage!, total);
         }
+
+        // 2026-10-12（应 2号位《门禁通电接线回执》§三）：**有策略路径的「放行」也必须有计数器**。
+        //   不补则「放行」档**只在缺策略库态**（走 B-010 兜底）读得出来 ⇒ 3号位 修好 ⑧块、C 桶改走本路径的
+        //   那一刻，该验收指标**当场失效**（陷阱式指标）；且「放行 = 评估总数 − 拦截」推不出 ——
+        //   评估总数无计数器（`Unevaluated` 只记 null 早退，不是总数）。
+        //   口径：**本方法完整评估后过闸**才 +1；上面三条早退（`!IsLegal` / A/B 豁免 / `piFacts is null`）
+        //   **不计** —— 它们不是「放行」，是「门禁不适用」。纯观测、不参与任何业务判定。
+        SolverDiagnostics.CountPiLegalQuantityGatePassed();
 
         return formation;
     }
@@ -3495,6 +5182,35 @@ internal class PhaseTwoInitialScheduler
             return null;
         }
 
+        // ── 2026-10-22：`ORDER_ONLY` 在**本条兜底路径**同样不适用 PI 法定量门禁 ──
+        //   为什么必须补：本方法**直接**调 `EvaluatePiLegalQuantityGate`，不经过
+        //   `ApplyPiLegalQuantityGate`。只改那边的话，同一需求会变成
+        //   「有策略 ⇒ 放行、缺策略 ⇒ 被拦」—— 判定随策略库有没有配而变，不可解释（且缺策略那侧是硬失败）。
+        //   ⇒ 与 `ApplyPiLegalQuantityGate` **同一判据、同一空事实集拒绝采信口径**，两处必须同步。
+        //   ⚠ 本分支**不**登记 PI Stage 累计占用：本需求的数量不由该 PI 授权，
+        //     占它的 Stage 自由量就是错记（会把其它真 PI 需求挤掉）。
+        if (string.Equals(demand.QuantityAuthority, QuantityAuthorityValues.OrderOnly, StringComparison.Ordinal))
+        {
+            if (piFacts is null || piFacts.Count == 0)
+            {
+                // 事实集整体为空 ⇒ 不采信（否则整道硬门禁被静默关掉）⇒ 继续走下面的门禁，Fail Closed。
+                SolverDiagnostics.CountPiLegalQuantityGateOrderOnlyRejectedEmptyFacts();
+            }
+            else
+            {
+                SolverDiagnostics.CountPiLegalQuantityGateSkippedOrderOnly();
+                return ExecutionBatchFormation.Legal(new[]
+                {
+                    new ExecutionBatchDraft(
+                        ExecutionBatchKey(demand.LogicalDemandKey, 1),
+                        demand.LogicalDemandKey,
+                        Ordinal: 1,
+                        NetOutputQty: qc,
+                        PlannedProcessQty: demand.PlannedProcessQty)
+                });
+            }
+        }
+
         // V1_4 NEW-04：兜底路径同样消费**本 Run 已形成批**的累计占用。
         var effectiveStage = MergeLedgerIntoStageContext(
             piStageContext, ledger, demand.ProductionInstructionNo, demand.MaterialId, demand.StartStageCode);
@@ -3508,11 +5224,18 @@ internal class PhaseTwoInitialScheduler
 
         if (reason is not null)
         {
+            // 2026-10-12：B-010 路径的拦截**必须单独计数** —— 既有 `PiLegalQuantityGateBlocked`
+            //   只覆盖「有策略路径」（`ApplyPiLegalQuantityGate`），本条路径此前**一次都不计**。
+            //   2号位 验收按计数器读「拦截」档 ⇒ 不补会把 233 条读成 0（见 1号位 致 2号位 答复件 §一）。
+            SolverDiagnostics.CountPiLegalQuantityGateBlockedViaB010Fallback();
             return ExecutionBatchFormation.PiQuantityContractPending(
                 "B010_PI_QUANTITY_CONTRACT_PENDING：C 桶需求在 Solver 输入中找不到有效 Batch Policy（BATCH_POLICY_MISSING），"
                 + "且 B-010 条件化保守兜底所需的前置③「唯一真实 MTS PI 来源 + Stage 合法自由量可靠」未全部成立 —— "
                 + reason);
         }
+
+        // 2026-10-12：B-010 路径**真正成批**（= 放行档）同样单独计数（与上方拦截对称）。
+        SolverDiagnostics.CountPiLegalQuantityGatePassedViaB010Fallback();
 
         // 过闸 ⇒ 登记本 Run 新增 Stage 批的累计占用（与正常路径同口径：一次批形成 = 至多一次登记）。
         if (ledger is not null && !string.IsNullOrWhiteSpace(demand.StartStageCode))
@@ -3545,8 +5268,7 @@ internal class PhaseTwoInitialScheduler
     private static ExecutionBatchFormation BuildBatchFormation(
         LogicalProductionDemand demand,
         BatchPolicyRuleSnapshot? policy,
-        int count,
-        bool validateDomain)
+        int count)
     {
         var batches = new List<ExecutionBatchDraft>(count);
         decimal netAssigned = 0m;
@@ -3574,24 +5296,12 @@ internal class PhaseTwoInitialScheduler
                 batchProc));
         }
 
-        if (validateDomain
-            && policy is not null
-            && !demand.IsContinuation
-            && !demand.NoSplitMerge
-            && (policy.MinExecutionBatchQty is > 0m || policy.MaxExecutionBatchQty is not null))
-        {
-            decimal min = policy.MinExecutionBatchQty ?? 0m;
-            decimal? max = policy.MaxExecutionBatchQty;
-            foreach (var b in batches)
-            {
-                if (b.NetOutputQty < min || (max is decimal mx && b.NetOutputQty > mx))
-                {
-                    return ExecutionBatchFormation.Conflict(
-                        $"BATCH_POLICY_CONFLICT：切分后批数量越界 —— {b.BatchDraftKey} Qty={b.NetOutputQty} 不在 [Min={min}, Max={(max?.ToString() ?? "∞")}] 内");
-                }
-            }
-        }
-
+        // ── R-1（2026-10-12，B-011 / 03 §60 / 07 §4651）：**删除**「切分后批数量越界 ⇒ Conflict」──
+        //   经济 `Min/Max` 是**软优化输入**（03 §60 逐字：「不得把软经济区间用作 **C 桶硬失败**、物理容量或
+        //   PI/Stage 数量上限」；07 §4651 逐字：「**不得再将「Qty 大于经济 Max」本身作为硬冲突条件**」）
+        //   ⇒ 切分结果**不再**因越出经济区间而不合法；偏离量由 `CompareBatchPlans` 的**经济软层**（R-2）比较。
+        //   ⚠ 真正的硬门禁（PI/Stage 合法量）**不在**本方法，而在 `FormExecutionBatches` 的
+        //     `ApplyPiLegalQuantityGate`（B-009）—— 那才是必须 Fail Closed 的硬边界，本处不得重复也不得削弱。
         return ExecutionBatchFormation.Legal(batches);
     }
 
@@ -3694,8 +5404,8 @@ internal class PhaseTwoInitialScheduler
     ///   ⚠ 二者**一律来自入参 `budget`**（`SolverBatchBudget`），**不再从业务 `BatchPolicyRuleSnapshot` 读取**
     ///     —— 后者两列自 v5.1.10 收口① 起恒 null 且**主链不得消费**（B-007）。
     ///
-    /// 每个优化候选都要过 <see cref="BuildBatchFormation"/> 的**合法域复核**；越域者**丢弃该候选**
-    ///   （不得因一个优化候选越界就把整个需求判冲突 —— 基线不受影响）。
+    /// 每个优化候选都产出**合法**批（R-1：经济区间**不再**判不合法 ⇒ 无「越域丢弃」）；
+    ///   ⚠ 候选**不**再按经济 `[Min, Max]` 过滤 —— 03 §60 逐字禁止「**只在候选生成层**消费」经济软信号。
     ///
     /// 不展开的条件（候选恒 = 1，直接返回基线）：
     ///   · A/B（`IsContinuation` / `NoSplitMerge`）/ 非正数量 / `!AllowSplit`
@@ -3720,40 +5430,76 @@ internal class PhaseTwoInitialScheduler
         decimal min = policy.MinExecutionBatchQty ?? 0m;
         decimal? max = policy.MaxExecutionBatchQty;
 
+        // 经济**软最优**锚：`nMin = ceil(Qty/经济Max)`、`nMax = floor(Qty/经济Min)`。
+        //   ⚠ R-1 后二者**只是软参考**（经济区间不再决定合法性）—— 本处仅用于**挑选代表性候选**。
         int nMin = max is decimal mx ? ClampToPositiveInt(Math.Ceiling(qty / mx)) : 1;
         int nMax = min > 0m ? ClampToPositiveInt(Math.Floor(qty / min)) : int.MaxValue;
-        if (nMin >= nMax)
-        {
-            return list;   // 唯一合法批数 ⇒ 无优化空间
-        }
 
         int baselineCount = baseline.Batches.Count;
 
         var counts = new List<int>();
         void TryAdd(int c)
         {
-            if (c < nMin || c > nMax || counts.Contains(c))
+            if (c < 1 || c > MaxTechnicallyFormableBatches || counts.Contains(c))
             {
                 return;
             }
             counts.Add(c);
         }
 
-        TryAdd(1);   // 合法不拆
-        TryAdd(2);   // 合法 2 批
-        TryAdd(3);   // 合法 3 批
+        // ① 经济区间内的**固定代表点**：`{1, 2, 3, nPref} ∩ [nMin, nMax]`（原口径保留）。
+        void TryAddInRange(int c)
+        {
+            if (c >= nMin && c <= nMax)
+            {
+                TryAdd(c);
+            }
+        }
+        TryAddInRange(1);
+        TryAddInRange(2);
+        TryAddInRange(3);
         if (policy.PreferredBatchQty is decimal pref && pref > 0m)
         {
-            TryAdd(ClampToPositiveInt(Math.Round(qty / pref, MidpointRounding.AwayFromZero)));   // Preferred 附近
+            TryAddInRange(ClampToPositiveInt(Math.Round(qty / pref, MidpointRounding.AwayFromZero)));   // Preferred 附近
         }
+
+        // ② **R-3 锚点带**：经济软最优 `nMin` 及其邻近 `nMin + 1`（**不**受经济区间过滤）。
+        //   04 BP-R3 逐字：「技术层**不得因 `{1,2,3,nPref}` 过滤造成零候选**」—— 样本 `Qty100 / 经济Min1 /
+        //     Max30 / Preferred 空` ⇒ `nMin = 4`，固定点 `{1,2,3}` 全被 `[nMin, nMax]` 滤掉 ⇒ 旧实现**零候选**。
+        //   ⇒ 以 `nMin` 为锚补两点，保证**任何** `nMin`（含 ≥4）都有**至少一个**邻近代表候选参与择优。
+        //   ⚠ **不是伪造候选**：两点都是真实合法批方案（R-1 后 `BuildBatchFormation` 恒合法）。
+        //   ⚠ **不是放宽正式规则**：`Preferred` 仍只按正式发布值消费，本处**不**补默认 Preferred（BP-R3 末句）。
+        //   ⚠ **不**无条件加 `1`（整批）：整批候选会把 `AllowMerge` 场景引向「单批合并 ⇒ 批身份被吞」
+        //     （§十二 第 9 行禁止）；`1` 仅在**落在经济区间内**时由 ① 引入。
+        TryAdd(nMin);
+        TryAdd(nMin + 1);
+
+        // 04 BP-R2（`Qty1000 / 经济Min400 / Max600 / Preferred500` ⇒ `nMin == nMax == 2`）逐字要求
+        //   「有界生成**代表性候选**，实际比较交期/Setup/资源效率/软偏离，**非恒整批、非恒500+500**」
+        //   ⇒ **删除**旧 `if (nMin >= nMax) return list;`（「唯一合法批数 ⇒ 无优化空间」）—— 该前提建立在
+        //   「经济区间 = 硬合法域」上，R-1 后不成立。
 
         // ── 技术预算来源（AUD-1-005 整改）：**入参 `budget`**，绝不读业务 `policy` 的两列 ──
         //   `policy.MaxOptimizationSplitCount` / `policy.MaxBatchCandidates` 自 v5.1.10 收口①（2026-10-09 生效）
         //   起投影恒 null 且**主链不得消费**（B-007）；旧写法把它们当运行预算 = 让历史业务列重新变成生效默认。
         var solverBudget = budget ?? SolverBatchBudget.VersionedSafeDefault;
 
-        // 上限①：优化性拆分（批数 > 基线）受预算限制；**基线不受限**（硬 Max 强制拆分不得被技术预算压制）。
-        counts.RemoveAll(c => c > baselineCount && c > solverBudget.MaxOptimizationSplitCount);
+        // 上限①（R-3 更正）：`MaxOptimizationSplitCount` = **优化拆分「种数」**（01 v1.11 §1757 逐字：
+        //   「『优化性拆批最多3种』仅为 LOCAL 工程经验初值，**不是** `MaxOptimizationSplitCount=3` 的字段默认，
+        //     **更非**全部 FULL/LOCAL 的**固定物理批数上限**」）⇒ 只限制**候选个数**，**不**按批数大小过滤。
+        //   **旧写法** `RemoveAll(c => c > baselineCount && c > MaxOptimizationSplitCount)` 把「种数」误读成
+        //   「批数阈值」⇒ `nMin ≥ 4` 时把候选全删光（= 04 BP-R3 的失败形态）。
+        //   排序：离经济软最优 `nMin` **越近**的候选越优先保留（经济软信号真实参与，B-011）。
+        counts.Sort((x, y) =>
+        {
+            int d = Math.Abs(x - nMin).CompareTo(Math.Abs(y - nMin));
+            return d != 0 ? d : x.CompareTo(y);
+        });
+        if (solverBudget.MaxOptimizationSplitCount > 0
+            && counts.Count > solverBudget.MaxOptimizationSplitCount)
+        {
+            counts = counts.Take(solverBudget.MaxOptimizationSplitCount).ToList();
+        }
 
         // 上限②：候选总数受预算限制（基线恒保留 ⇒ 可容纳的优化候选 = cap - 1）。
         if (solverBudget.MaxBatchCandidates > 0)
@@ -3772,7 +5518,7 @@ internal class PhaseTwoInitialScheduler
                 continue;
             }
 
-            var formation = BuildBatchFormation(demand, policy, c, validateDomain: true);
+            var formation = BuildBatchFormation(demand, policy, c);
             if (formation.IsLegal)
             {
                 list.Add(formation);
@@ -3828,6 +5574,7 @@ internal class PhaseTwoInitialScheduler
         int? resourceId,          // 非资源工序（UNCONSTRAINED/WAIT_ONLY）传 null → Task.ResourceId=NULL，不占资源（0号位 2026-09-22 裁决）
         DateTime start,
         DateTime end,
+        decimal effectiveProcessMinutes,  // Duration-1：有效加工分钟（调用方已算好的 adjustedDuration，**本处不重算**）
         decimal setupMinutes,     // item1 接线（阶段二）：规则解析出的换型分钟（调用方经 FindSlotWithDynamicSetup/收敛迭代取得）
         ConstraintContext constraints,
         string? setupSource = null,  // SetupSource 填充（v1.2/5号位 值契约）：SetupOutcome → 大写 5 值
@@ -3861,6 +5608,8 @@ internal class PhaseTwoInitialScheduler
             UOM = demand.UOM ?? string.Empty,
             PlannedStartTime = start,
             PlannedEndTime = end,
+            // Duration-1：有效加工 = 调用方算出的 adjustedDuration；**不在此重算**（本 DTO 无 StandardDuration/CapacityFactor）
+            EffectiveProcessMinutes = effectiveProcessMinutes,
             SetupTime = setupMinutes,   // item1 接线：规则值（原 operation.SetupTime 已废止，v1.2 §1.2）
             SetupSource = setupSource,  // SetupSource 填充：SetupOutcome → 大写 5 值（2号位 原样落库）
             Priority = demand.DemandSequence,
@@ -3932,7 +5681,8 @@ internal class PhaseTwoInitialScheduler
         string? batchDraftKey = null,   // P0-01/P0-02：本批归批键（转交 ScheduleDemandOperations）
         bool requireIdentityPreservingMerge = false,   // P1-01：只合并到「未归属执行批」的目标 Task
         Dictionary<int, List<TimeWindow>>? occupancyPristine = null,   // 2026-10-08 COW：透传
-        DomainSolveRequest? request = null)   // OWN-P0-02：合批数量上界（Batch Policy Max）判定所需
+        DomainSolveRequest? request = null,   // 2026-10-14：合批侧经济软偏离（R-2）解析 Batch Policy 所需
+        Dictionary<string, List<FinalTaskDraft>>? batchGroupsIndex = null)   // 2026-10-19 性能：候选循环外预建的批分组索引（透传）
     {
         // P0-07：连续份额不可被普通 Merge 破坏逐工单身份，直接独立排程，不尝试合并。
         // v1.6 `:26` + 0号位 2026-10-07 裁决 `:246`「`NoSplitMerge` 及固定 Route/Path 应**显式落实**」：
@@ -3962,7 +5712,8 @@ internal class PhaseTwoInitialScheduler
         //     ② **先形成两个候选**：无合批目标 ⇒ 唯一候选 = 独立排程（**一次**运行，与整改前逐字一致）；
         //        有合批目标 ⇒ 「独立排 / 合并排」两候选各在隔离副本上试排；
         //     ③ **联合择优**（复审 §三 第 3 步「再对每个候选联合择优」）：按冻结四层目标
-        //        （可行 → 履约 → 交期(受 Direction 控制) → Setup）比较两候选，胜者在**真实上下文**上重跑落定；
+        //        （可行 → 履约 → 交期(受 Direction 控制) → Setup → **④.5 经济软偏离(R-2，2026-10-14 补齐)**）
+        //        比较两候选，胜者在**真实上下文**上重跑落定；
         //        完全判平取独立排程 ⇒ 合批必须有可度量的改善才被采用（零回归）。见 `PreferStageMerge`。
         //     ④ 合批候选的做法 = **移出**目标批（Task / 资源占用窗 / 份额 / 产品时间线登记），
         //        再以**锚点需求身份 + 两需求数量之和**重跑 `ScheduleDemandOperations`（⇒ 产出该 Path 上**完整
@@ -3978,8 +5729,9 @@ internal class PhaseTwoInitialScheduler
         //       仍**不新建批次平台、不新增 Core 字段**（复用 2026-10-08 已存在的 Core 载体）。
         if (operations.Count > 1)
         {
+            // 2026-10-20 十三刀：下标表已撤销 ⇒ 摘除段一律走 O(n) 全表扫描回落（原 `CountMergeStageNoIndex` 随之作废）。
             var stageBatches = FindMergeableStageBatches(
-                demand, operations, scheduledTasks, constraints, demandByKey, request);
+                demand, operations, scheduledTasks, constraints, demandByKey, batchGroupsIndex);
 
             // ── 无合法合批目标 ⇒ 唯一候选 = 独立排程（**一次**运行；与 OWN-P0-02 之前逐字一致）──
             //   这是常态路径：多工序 C 需求在开 Merge 时不因此多跑一次排程。
@@ -4003,7 +5755,9 @@ internal class PhaseTwoInitialScheduler
             var traceNotesWatermark = constraints.TraceNotes.Count;
 
             // 候选 A：独立排程（与上方回落路径调用**逐字一致**的入参）。
+            long swTimelineSep = SolverDiagnostics.HotspotStart();
             constraints.ProductTimeline = realTimeline.Clone();
+            SolverDiagnostics.HotspotEnd(swTimelineSep, SolverDiagnostics.Hotspot.TimelineClone);
             var sepOccupancy = CloneOccupancy(resourceOccupancy, out var sepOccupancyPristine);
             var sepTasks = new List<FinalTaskDraft>(scheduledTasks);
             var sepShares = CloneShares(allocationTaskShare);
@@ -4016,6 +5770,27 @@ internal class PhaseTwoInitialScheduler
                 : separateProduced.Max(t => t.PlannedEndTime);
             var separateSetup = separateProduced.Sum(t => t.SetupTime);
 
+            // ── R-2（2026-10-14 补齐；0号位《正式回复 v2.0》§二 S1-01 ④）：合批侧**经济软偏离** ──
+            //   与拆批侧 `CompareBatchPlans` ④.5 **同口径**（同一助手 `EconomicDeviationForQty`）。
+            //   数量口径：
+            //     · 独立排程侧 = 本需求本批数量（`demand.NetOutputQty`）；
+            //     · 合批侧     = 锚点批当前累计量 + 本需求本批数量（与 `TryMergeDemandIntoStageBatch` 的
+            //                    `combinedNet` **逐字同源**，见该处注释）。
+            //   ⚠ 只解析、不落定；缺 Valid 经济策略（含默认 Permissive 夹具）⇒ 两侧均 (0,0) ⇒ ④.5 恒平（零回归）。
+            //   ⚠ **2026-10-14 修正（0号位《再次整改回执正式审核回复》§二 S1-01 第 4 条）**：比较口径必须是
+            //     **两套完整合法候选方案的对应执行批集合**。旧实现独立侧只算 `dev(本需求量)`，**遗漏锚批原数量**
+            //     `dev(锚量)` ⇒ 系统性偏向合批。
+            //   ⚠ **2026-10-14 二次修正（0号位《致1号位综合正式审核回复 v1.1》§二.2）**：上一修只保证**单锚**
+            //     完整；多锚时擂主存的是**绝对**偏离 ⇒ 跨锚点**标尺不一致**。现统一为**同一基线的增量**：
+            //       · 基线          = 全部既有锚批保持原量 + 本需求独立成批 ⇒ 增量 `(0,0)`
+            //       · 独立排程候选  = 基线本身                                    ⇒ 增量 `(0,0)`
+            //       · 合批到锚点 i  = 仅锚批 i 改写 ⇒ `dev(锚量_i+本批) − dev(锚量_i) − dev(本批)`
+            //     锚量逐锚点不同 ⇒ 合批增量在循环内按锚点计算（见 `SubEconomicDeviation`）。
+            var economicPolicy = request is null
+                ? null
+                : ResolveExecutionBatchPolicy(demand, request, constraints).Policy;
+            var separateDemandEconDev = EconomicDeviationForQty(demand.NetOutputQty, economicPolicy);
+
             // 候选 B：Stage 合批（在**同一初始上下文**的另一套隔离副本上）。
             // ── AUD-1-R01（0号位 2026-10-10《APS_V1_2_20261010.md》§4，RISK_UNVERIFIED）修复：**逐锚点试排** ──
             //   复审判词（本号位核对：**成立**）：旧实现只试 `stageBatches[0]`（`scheduledTasks` 中出现最早的
@@ -4026,28 +5801,191 @@ internal class PhaseTwoInitialScheduler
             //   每个候选都在**同一初始上下文**上试排：`ProductTimeline` 重新 `Clone()`、`TraceNotes` 回退到水位。
             var bestAnchorIndex = -1;                 // -1 = 独立排程胜出（= 该分支整改前的回落行为）
             FinalTaskDraft? bestMergeRepresentative = null;
+            List<FinalTaskDraft>? bestMergeCombinedTasks = null;   // 2026-10-14（R-2）：擂主的合批后完整 Operation 链
             var bestMergeSetup = 0m;
+            var bestMergeEconDev = (Range: 0m, Preferred: 0m);   // 2026-10-14：擂主的合批侧经济软偏离
+            // 2026-10-14（R-2 / ④.6）：擂主的合批侧**资源效率增量**（除 Setup 外占用的增量，见循环内推导）。
+            //   ⚠ 这是「**含人工槽**」口径的增量；`deviceScope != null` 时**不入比较**（只作对照留痕）。
+            var bestMergeNonSetupIncrement = 0m;
+            // ── R-2 设备口径**进入择优**（0号位 2026-10-16《第十三轮跨号位联合技术契约 v1.2 与 E1/E2/E3
+            //   正式复核意见 v1.0》§5.1 ／处置矩阵 **J13-05**，判定 P1／合同内部冲突）──
+            //   判词逐字：「仅提供一个可空 `DeviceResourceIds` 载体，**不能证明 1号位 评分器在正式 Run 接收
+            //     非 NULL 纯设备集合并排除了人工槽**。……由 1号位 在**评分分支**使用该子集而非全量
+            //     `AffectedResources`；……**不得默认让新正式 Run 一直走含人工路径**。」
+            //   ⇒ ④.6 排序键**三态**：
+            //     · `null`（未投影）⇒ **维持**含人工槽键（兼容边界，与改造前**逐字一致**，零回归）；
+            //     · 非 `null` ⇒ 改取**纯设备键**（`ResourceEfficiencyEvaluator.DeviceScopeNonSetupOccupiedMinutes`）；
+            //     · **空集 ≠ `null`** ⇒ 纯设备键恒 `0` ⇒ ④.6 判平（由 ⑤ Tie-breaker 接管），不回落成未投影。
+            //   ⚠ 只收窄**评分子集**：`Resources` **仍完整保留**设备＋人工两类合法容量；人工槽**继续参与**
+            //     资格与真实 Calendar；候选构造／可行性／履约判定**一律不动**。
+            //   ⚠ 白名单集合**每个 Run 只建一次**（`BuildDeviceScopeSet`）⇒ 热路径**零额外分配**；
+            //     `null` 时**完全不建集合**（连这一步都省掉）。
+            var deviceScope = constraints.DeviceResourceIds is null
+                ? null
+                : ResourceEfficiencyEvaluator.BuildDeviceScopeSet(constraints.DeviceResourceIds);
+            // 擂主的合批侧**纯设备**增量（仅 `deviceScope != null` 时被写入/读取）。
+            var bestMergeNonSetupDeviceIncrement = 0m;
+            // ── R2-C / §八.4（2026-10-15）：**等价合批锚点的稳定 Tie-breaker** ──
+            //   擂主当前所在执行批的**锚批键**（`AnchorBatchKey`：`StageExecutionBatchDraftKey` →
+            //   `ExecutionBatchDraftKey` → `FinalDraftId` 三级退取；前两级由
+            //   `SEB|EB|{logicalDemandKey}|{ordinal:D3}|{stage}` / `EB|{logicalDemandKey}|{ordinal:D3}`
+            //   派生 ⇒ **内容派生、与枚举次序无关**）。
+            //   只用于「⑤ 完全判平时由谁接管擂主」的**稳定取舍**（判据集中在 `PreferChallengerOnTie`），
+            //   **不参与**任何冻结层目标比较（`PreferStageMerge` 的入参逐字未变）。
+            var bestAnchorBatchKey = string.Empty;
+            // ── R2-C（0号位 2026-10-14《致1号位第五轮代码审核正式复核回复 v1.0》§三 R2-C）──
+            //   留痕必须区分三件事：①「该指标存在差异」②「比较器到达 ④.6 层」③「④.6 实际决定采纳方案」。
+            //   只有 ③ 才能用「increment／因效率择优」语义；② 判平才记 `NO_INCREMENT`；真实缺项才记 `DATA_MISSING`。
+            //   ⇒ 逐锚点记录**比较器落点层**：
+            //     · `bestDecidingLayer` = **擂主被采纳**时那次比较的落点层（合批被采纳才有意义）；
+            //     · `lastReachedLayer` / `last*` = **最后一次擂台比较**的落点与**两侧事实**
+            //       （全部锚点均被否决时，最终"独立排程胜出"由**最后一次**比较给出）。
+            var bestDecidingLayer = FrozenLayer.None;
+            var lastReachedLayer = FrozenLayer.None;
+            List<FinalTaskDraft>? lastIncumbentCombinedTasks = null;   // 擂主侧 = 当时的擂主（合批锚）；null = 统一基线/未合批
+            var lastIncumbentNonSetupIncrement = 0m;
+            var lastChallengerAnchorIndex = -1;
+            List<FinalTaskDraft>? lastChallengerCombinedTasks = null;
+            var lastChallengerNonSetupIncrement = 0m;
+
+            // ── **R2-C 多锚整改**（0号位 2026-10-14《致1号位第六轮代码审核正式复核意见 v1.0》§3.2 / §3.3，`RISK_UNVERIFIED`）──
+            //   判词逐字：「追溯使用的 `traceIncrement` 是**合批锚点相对独立基线的增量**，而 `bestDecidingLayer`
+            //     可能记录的是**新合批锚点B与上一位合批擂主A**的比较层。此时『④.6 让 B 胜过 A』和
+            //     『B 相对独立方案节省多少』是**不同命题**」；「保存决定最终采纳的那次比较的**两个真实对手
+            //     （含锚点身份和比较时的资源占用键）**、层身份与胜出方向；若另需展示『相对独立基线节时』，
+            //     可在同一说明中作为**另一指标明确标注**，**不得把相对基线的描述冒充胜负原因**」。
+            //   ⇒ 新增 `decisive*`：**决定最终采纳方案的那一次比较**（= 最后一次 `mergeWins == true`）的
+            //     两侧真实对手（锚点序号 + 完整链 + 该侧的 ④.6 增量）。留痕的**胜负方向由两侧增量的差给出**
+            //     （`decisiveChallengerIncrement − decisiveIncumbentIncrement`），**不再**用挑战者相对独立基线的符号。
+            //   ⇒ 另记 `r2Reached*`：**本轮实际进行过的 ④.6 比较**（与「最终方案主决定层」并列的**第二事实**，
+            //     §3.3 逐字：「最低限度区分『最终被选方案的主决定层』和『本轮实际进行过的④.6比较』两个事实」）。
+            List<FinalTaskDraft>? decisiveIncumbentCombinedTasks = null;
+            var decisiveIncumbentAnchorIndex = -1;
+            var decisiveIncumbentNonSetupIncrement = 0m;
+            var decisiveChallengerAnchorIndex = -1;
+            List<FinalTaskDraft>? decisiveChallengerCombinedTasks = null;
+            var decisiveChallengerNonSetupIncrement = 0m;
+            var r2ReachedCount = 0;
+            var r2LastIncumbentLabel = string.Empty;
+            var r2LastChallengerLabel = string.Empty;
+            // R2-C / §八.4：**决定最终采纳方案的那一次比较**是否由「⑤ 判平 Tie-breaker」接管。
+            //   `true` ⇒ 留痕必须写明 Tie-breaker 且**不得**记「因资源效率择优」（判平 ≠ 效率决定）。
+            var decisiveByTieBreak = false;
+
+            // 2026-10-19 三次定位：登记**本次擂台的锚批数**（`stageBatches.Count`）。
+            //   此前只有「TryMergeStageBatch 次数 / BatchPlanTrial 次数」这个**比值**（5.2 / 12.9 / 30.0），
+            //   既不是真实均值、也没有最大值/分布 ⇒ 本行直接登记本体。纯观测。
+            SolverDiagnostics.CountAnchorLoop(stageBatches.Count);
 
             for (var anchorIndex = 0; anchorIndex < stageBatches.Count; anchorIndex++)
             {
+                long swTimelineAnchor = SolverDiagnostics.HotspotStart();
                 constraints.ProductTimeline = realTimeline.Clone();
+                SolverDiagnostics.HotspotEnd(swTimelineAnchor, SolverDiagnostics.Hotspot.TimelineClone);
                 if (constraints.TraceNotes.Count > traceNotesWatermark)
                 {
                     constraints.TraceNotes.RemoveRange(
                         traceNotesWatermark, constraints.TraceNotes.Count - traceNotesWatermark);
                 }
 
-                var mrgOccupancy = CloneOccupancy(resourceOccupancy, out var mrgOccupancyPristine);
-                var mrgTasks = new List<FinalTaskDraft>(scheduledTasks);
-                var mrgShares = CloneShares(allocationTaskShare);
-                var anchorRepresentative = TryMergeDemandIntoStageBatch(
-                    demand, operations, routingGraph, direction, stageBatches[anchorIndex], constraints,
-                    mrgOccupancy, mrgTasks, mrgShares, demandByKey,
-                    planningStart, planningEnd, dynamicMaterialFloor, stageOverlap, mrgOccupancyPristine,
-                    out var anchorCombinedTasks);
+                // ── 2026-10-20 十七刀：占用表**不克隆**（`occupancyPristine = null` 关掉写时复制）──
+                //   试排直接改**真表**，跑完由 `discardAfterRun` 按身份原样还原（与失败回滚同一套函数）。
+                //   省下的是「为改而拷」：16k 实测 `DetachCopy` 6,362 ms = 12.9%（416,409 份 × 541 窗 ≈ 3.6 GB 分配）。
+                var mrgOccupancy = resourceOccupancy;
+                Dictionary<int, List<TimeWindow>>? mrgOccupancyPristine = null;
+                // 2026-10-20 十七刀(续)：**任务表也不再拷贝** —— 本锚点 `detachTaskList:false`（不 RemoveAt）
+                //   且 `discardAfterRun:true`（不 `AddRange` 落定），回滚的 `Insert` 只对 `index >= 0` 生效、
+                //   而试排路径登记的索引恒为 `-1` ⇒ 传入真表也不会被写。
+                //   省 `CloneTaskList`（16k 实测 44,914 次 × 22,296 引用 ≈ 8 GB 分配）。
+                var mrgTasks = scheduledTasks;
+                // ── 2026-10-20 十六刀：擂台**不再** `CloneShares(allocationTaskShare)` ──
+                //   旧写法每个锚点克隆一份 18,468 条的字典（≈520 KB）× 891k 次 ≈ **480 GB 分配**（40k 实测），
+                //   而这份克隆在锚点结尾**整份丢弃**（`:5509` 还原时间线；胜者事后按 `bestMergeCombinedTasks`
+                //   重跑落定，从不读这份写入）⇒ 克隆纯属浪费。
+                //   改为「就地写 + 撤销日志」：进入前记水位，锚点结束（无论成败）按水位**逆序**还原，
+                //   真实表内容与「用克隆副本」逐字相同（证明见 `_shareUndo` 声明处）。
+                var mrgShares = allocationTaskShare;
+                var shareMark = BeginShareUndo(allocationTaskShare);
+                long swMergeBatch = SolverDiagnostics.HotspotStart();
+                FinalTaskDraft? anchorRepresentative;
+                List<FinalTaskDraft> anchorCombinedTasks;
+                try
+                {
+                    anchorRepresentative = TryMergeDemandIntoStageBatch(
+                        demand, operations, routingGraph, direction, stageBatches[anchorIndex], constraints,
+                        mrgOccupancy, mrgTasks, mrgShares, demandByKey,
+                        planningStart, planningEnd, dynamicMaterialFloor, stageOverlap, mrgOccupancyPristine,
+                        // 2026-10-19 性能：`mrgTasks` 是**丢弃副本**（`:4946` 建、`:4951` 传、此后零读取）⇒ 跳过列表摘除
+                        //   （省 `DetachIndexBuild` 约 7% ΣPhase，业务结果不变，见 `TryMergeDemandIntoStageBatch` 注释）。
+                        out anchorCombinedTasks, detachTaskList: false, discardAfterRun: true);
+                }
+                finally
+                {
+                    // 本锚点的份额写入一律**私有**：结束即还原（真实落定路径不在此天台内，见 `_shareUndo` 声明处）。
+                    RollbackShareUndo(allocationTaskShare, shareMark);
+                }
+
+                SolverDiagnostics.HotspotEnd(swMergeBatch, SolverDiagnostics.Hotspot.TryMergeStageBatch);
                 var anchorSetup = anchorCombinedTasks.Sum(t => t.SetupTime);
 
-                // 当前擂主：首轮 = 独立排程候选；其后 = 已胜出的合批候选（同一冻结四层目标下两两比较）。
+                // 合批侧经济软偏离（2026-10-14 **二次修正**）：数量 = 锚点批累计量 + 本需求本批数量
+                //   （与 `TryMergeDemandIntoStageBatch` 的 `combinedNet` 同源；批内数量一致 ⇒ 取 [0] 即可）。
+                var anchorQty = stageBatches[anchorIndex][0].Quantity;
+                //
+                // ── 0号位 2026-10-14《APS V1｜致1号位综合正式审核回复 v1.1》§二.2 **判词核对：成立** ──
+                //   判词逐字：「`r13685`的锚点循环在逐个比较时，当前擂主`bestMergeEconDev`只保存被合并锚点的
+                //     新批偏离；当新锚点挑战成功时，新挑战者也只保存自身新批偏离，**其余没有合并的原有合法锚批
+                //     没有被放到双方同一完整方案基准内**。因此M_13证明了'单锚完整'，不能证明'多锚全方案完整'。」
+                //   旧实现确为**绝对**偏离 `dev(锚量+本批)`：跨锚点两两比较时**标尺不一致**（各锚点的既有批不同）。
+                //   ⇒ 现统一到**同一基线**：「全部既有锚批保持原量 + 本需求独立成批」。
+                //     · 独立排程候选 = 该基线**本身** ⇒ 增量恒 `(0,0)`（见下方 `incumbentEconDev`）；
+                //     · 合批到第 i 个锚点 = 仅第 i 个锚批被改写 ⇒
+                //       增量 = `dev(锚量_i + 本批) − dev(锚量_i) − dev(本批)`。
+                //   两候选增量**同标尺** ⇒ 与「完整受影响执行批集合」口径等价：基线项
+                //     `Σ_{j≠i} dev(锚量_j) + dev(本批)` 对全部候选相同，可约去。
+                //   ⚠ **单锚时与旧实现逐字等价**（`dev(锚量+本批)` vs `dev(锚量)+dev(本批)`）⇒ 零回归。
+                //   ⚠ 缺 Valid 经济策略 ⇒ 三项皆 `(0,0)` ⇒ 增量 `(0,0)` ⇒ 本层恒平（零回归，同旧注）。
+                var anchorEconDev = SubEconomicDeviation(
+                    EconomicDeviationForQty(anchorQty + demand.NetOutputQty, economicPolicy),
+                    AddEconomicDeviation(
+                        EconomicDeviationForQty(anchorQty, economicPolicy), separateDemandEconDev));
+
+                // ── R-2 ④.6（**2026-10-14 新增**，0号位《APS V1｜致1号位综合正式审核回复 v1.1》§一.3.2）──
+                //   与 ④.5 **同一「统一基线」手法**，避免跨锚点两两比较时标尺不一致：
+                //     · 基线      = 全部既有锚批保持原量 + 本需求独立成批；
+                //     · 独立排程候选 = 基线**本身** ⇒ 增量恒 `0`（见下方 `incumbentNonSetupIncrement`）；
+                //     · 合批到锚点 i = **仅锚批 i 被改写** ⇒
+                //       增量 = `占用(锚批_i + 本批) − 占用(锚批_i) − 占用(本批)`（**已扣 Setup**）。
+                //   ⚠ 只算**除 Setup 外**的占用 ⇒ 与第 ④ 层（Setup 总量）**不重复计分**（§一.2.5）。
+                //   ⚠ **不读日历、O(任务数)** ⇒ 可安全放在逐锚点热路径（可比窗口在落定后另算一次）。
+                //   ⚠ 合批省下的是**真实产能占用**：增量为负 = 该合批释放了可利用产能 ⇒ 越小越优。
+                // 2026-10-20 五次定位：④.6 资源效率评价段（含纯设备口径）耗时；纯观测。
+                long swEffEval = SolverDiagnostics.HotspotStart();
+                var anchorBatchOccupancy = ResourceEfficiencyEvaluator.Evaluate(stageBatches[anchorIndex]);
+                var anchorCombinedOccupancy = ResourceEfficiencyEvaluator.Evaluate(anchorCombinedTasks);
+                var separateDemandOccupancy = ResourceEfficiencyEvaluator.Evaluate(separateProduced);
+                var anchorNonSetupIncrement =
+                    anchorCombinedOccupancy.NonSetupOccupiedMinutes
+                    - anchorBatchOccupancy.NonSetupOccupiedMinutes
+                    - separateDemandOccupancy.NonSetupOccupiedMinutes;
+
+                // R-2 设备口径增量（J13-05）：与上式**同构**（同一「统一基线」手法、同样扣 Setup），
+                //   只是把三个占用换成**纯设备**口径。`deviceScope is null`（未投影）⇒ 恒 `0` ⇒ 下方取
+                //   `anchorNonSetupIncrement`，热路径**零额外开销**（不建集合、不遍历）。
+                var anchorNonSetupDeviceIncrement = deviceScope is null
+                    ? 0m
+                    : ResourceEfficiencyEvaluator.DeviceScopeNonSetupOccupiedMinutes(anchorCombinedTasks, deviceScope)
+                      - ResourceEfficiencyEvaluator.DeviceScopeNonSetupOccupiedMinutes(stageBatches[anchorIndex], deviceScope)
+                      - ResourceEfficiencyEvaluator.DeviceScopeNonSetupOccupiedMinutes(separateProduced, deviceScope);
+                SolverDiagnostics.HotspotEnd(swEffEval, SolverDiagnostics.Hotspot.MergeEffEval);
+
+                // **④.6 实际入比较的排序键**：已投影 ⇒ 纯设备键；未投影 ⇒ 含人工槽键（兼容边界）。
+                var anchorNonSetupKey = deviceScope is null
+                    ? anchorNonSetupIncrement
+                    : anchorNonSetupDeviceIncrement;
+
+                // 当前擂主：首轮 = 独立排程候选（相对统一基线的增量**恒为 (0,0)**，因为基线就是它本身）；
+                //   其后 = 已胜出的合批候选（同一基线下的**增量**，与挑战者同标尺）。
                 var incumbentFeasible = bestAnchorIndex >= 0
                     ? bestMergeRepresentative is not null
                     : separateProduced.Count > 0;
@@ -4055,19 +5993,95 @@ internal class PhaseTwoInitialScheduler
                     ? bestMergeRepresentative?.PlannedEndTime ?? DateTime.MinValue
                     : separateEnd;
                 var incumbentSetup = bestAnchorIndex >= 0 ? bestMergeSetup : separateSetup;
+                var incumbentEconDev = bestAnchorIndex >= 0
+                    ? bestMergeEconDev
+                    : (Range: 0m, Preferred: 0m);
+                // 同一基线 ⇒ 独立排程候选的 ④.6 增量**恒为 0**（它就是基线本身）—— **两个口径都成立**。
+                //   ⚠ 擂主侧与挑战者侧必须**同口径**（否则跨锚点比较标尺不一致）⇒ 与 `anchorNonSetupKey` 同一分支。
+                var incumbentNonSetupIncrement = bestAnchorIndex >= 0
+                    ? (deviceScope is null ? bestMergeNonSetupIncrement : bestMergeNonSetupDeviceIncrement)
+                    : 0m;
 
-                if (PreferStageMerge(
+                // R2-C：**本次比较的擂主侧身份**（合批锚点序号；-1 = 统一基线／未合批）与其完整链。
+                //   擂主 = 当时的 `bestAnchorIndex`（可能是**上一位合批擂主 A**，也可能仍是统一基线）。
+                //   ⇒ 留痕必须记录**这一对**，而不是事后用"挑战者相对独立基线"的符号代替。
+                var incumbentAnchorIndexThisComparison = bestAnchorIndex;
+                var incumbentCombinedTasksThisComparison = bestMergeCombinedTasks;
+
+                var (mergeLayer, mergeWins) = PreferStageMerge(
                         separateFeasible: incumbentFeasible,
                         separateEnd: incumbentEnd,
                         separateSetup: incumbentSetup,
+                        separateEconDev: incumbentEconDev,
                         mergeFeasible: anchorRepresentative is not null,
                         mergeEnd: anchorRepresentative?.PlannedEndTime ?? DateTime.MinValue,
                         mergeSetup: anchorSetup,
-                        demand, constraints, direction))
+                        mergeEconDev: anchorEconDev,
+                        demand, constraints, direction,
+                        separateNonSetupOccupiedMinutes: incumbentNonSetupIncrement,
+                        mergeNonSetupOccupiedMinutes: anchorNonSetupKey);
+
+                // ── R2-C / §八.4（2026-10-15）：**等价合批锚点的稳定 Tie-breaker** ──
+                //   `PreferStageMerge` 判「挑战者未胜」且落点**仍是 ④.6** ⇒ 两侧在 ①～④.5 全平、④.6 也**判平**
+                //   （两侧增量相等）或 ④.6 输入缺项。此时若直接「维持擂主」，则**完全判平**的胜者 =
+                //   **先被枚举**的那个锚点；而枚举次序来自 `FindMergeableStageBatches` 的 `groups.Values`
+                //   （`scheduledTasks` 插入次序 —— Phase4 局部修复会在表尾追加 Task ⇒ 该次序**可漂移**）。
+                //   这是**偶然次序**，不是业务优先级 ⇒ 违反 §八.4「不因普通枚举顺序漂移」。
+                //   ⇒ 完全判平改由**锚批键字典序最小者**胜出（内容派生 ⇒ 次序无关）。判据集中在
+                //     `PreferChallengerOnTie`（**纯函数**，可被单测直接反证）。
+                //   ⚠ 擂主**仍为统一基线**时**不**接管 ⇒ 「合批 vs 独立排程判平取独立排程」这一
+                //     「合批须有可度量改善才被采用」的零回归原则**逐字不变**（该规则本身已次序无关：
+                //     任一锚点判平即不采纳 ⇒ 全部锚点判平 ⇒ 恒取基线，与枚举次序无关）。
+                //   ⚠ 接管**不改变层身份**（仍为 ④.6）⇒ 留痕仍走 (甲)，但结论由两侧增量之差（= 0）
+                //     给出 ⇒ `TraceNoIncrement`（「指标相同／无增量差异」）⇒ **不得**误报「因资源效率择优」。
+                var anchorBatchKey = AnchorBatchKey(stageBatches, anchorIndex);
+                var winsByTieBreak = PreferChallengerOnTie(
+                    mergeWins, mergeLayer, anchorRepresentative is not null,
+                    bestAnchorIndex, anchorBatchKey, bestAnchorBatchKey);
+                if (winsByTieBreak)
+                {
+                    mergeWins = true;
+                }
+
+                // R2-C：登记**本次**比较的落点与**两侧**事实（不论胜负）。
+                lastReachedLayer = mergeLayer;
+                lastIncumbentCombinedTasks = incumbentCombinedTasksThisComparison;
+                lastIncumbentNonSetupIncrement = incumbentNonSetupIncrement;
+                lastChallengerAnchorIndex = anchorIndex;
+                lastChallengerCombinedTasks = anchorCombinedTasks;
+                lastChallengerNonSetupIncrement = anchorNonSetupKey;
+
+                // R2-C **第二事实**（§3.3）：本轮**真正到达 ④.6** 的比较次数 + 最后一次的对手身份。
+                //   「本轮实际进行过的 ④.6 比较」与「最终采纳方案的主决定层」是**两个不同事实**，
+                //   不得用后者的沉默推断前者未生效（§3.3 逐字）。
+                if (mergeLayer == FrozenLayer.ResourceEfficiency)
+                {
+                    r2ReachedCount++;
+                    r2LastIncumbentLabel = AnchorIdentityLabel(stageBatches, incumbentAnchorIndexThisComparison);
+                    r2LastChallengerLabel = AnchorIdentityLabel(stageBatches, anchorIndex);
+                }
+
+                if (mergeWins)
                 {
                     bestAnchorIndex = anchorIndex;
                     bestMergeRepresentative = anchorRepresentative;
+                    bestMergeCombinedTasks = anchorCombinedTasks;
                     bestMergeSetup = anchorSetup;
+                    bestMergeEconDev = anchorEconDev;
+                    bestMergeNonSetupIncrement = anchorNonSetupIncrement;
+                    bestMergeNonSetupDeviceIncrement = anchorNonSetupDeviceIncrement;
+                    bestAnchorBatchKey = anchorBatchKey;
+                    bestDecidingLayer = mergeLayer;
+
+                    // R2-C：**决定最终采纳方案**的那一次比较 —— 保存**两个真实对手**（§3.2 最小整改）。
+                    //   ⚠ 每次 `mergeWins` 覆盖 ⇒ 循环后留下的是**最后一次胜负比较**（采纳方案的最后一次改写）。
+                    decisiveIncumbentAnchorIndex = incumbentAnchorIndexThisComparison;
+                    decisiveIncumbentCombinedTasks = incumbentCombinedTasksThisComparison;
+                    decisiveIncumbentNonSetupIncrement = incumbentNonSetupIncrement;
+                    decisiveChallengerAnchorIndex = anchorIndex;
+                    decisiveChallengerCombinedTasks = anchorCombinedTasks;
+                    decisiveChallengerNonSetupIncrement = anchorNonSetupKey;
+                    decisiveByTieBreak = winsByTieBreak;
                 }
             }
 
@@ -4077,6 +6091,160 @@ internal class PhaseTwoInitialScheduler
             {
                 constraints.TraceNotes.RemoveRange(
                     traceNotesWatermark, constraints.TraceNotes.Count - traceNotesWatermark);
+            }
+
+            // ── R-2 ④.6 留痕（0号位 §一.3.4：指标相同时须显式记录「指标相同／无增量差异」；缺项须记真实缺项、
+            //    **不得编造比率**；R2-C：**不得**由「差额非零」冒充「本层决定了胜负」）──
+            //   【**R2-C 多锚整改**后的留痕结构（第六轮 §3.2/§3.3）】
+            //     (甲) **决定层 = ④.6** ⇒ 写一条「**决定最终采纳方案的那一次比较**」：
+            //          两侧对手 = `decisive*`（擂主侧锚点身份 + 挑战者侧锚点身份 + 各自 ④.6 增量），
+            //          胜负方向由 **两侧增量之差** 给出（`VerdictFromMergeIncrement(差值)`）——
+            //          **不再**用「挑战者相对独立基线的增量」冒充「B 相对 A」的胜负原因（§3.2 判词逐字）；
+            //          相对独立基线的增量在同一说明中**另标签出**（`另计（非本条胜负依据）`）。
+            //     (乙) **决定层 ≠ ④.6 但本轮有比较到达 ④.6** ⇒ 写一条「④.6 被执行但**未**决定采纳方案」
+            //          （与 (甲) 互斥）：避免由「最终记录的是 ③／④.5」反推「④.6 没生效」（§3.3）。
+            //     (丙) **本轮无任何比较到达 ④.6**（被 ①～④.5 短路）⇒ **不写** ④.6 痕（零回归）。
+            //   【两侧完整方案】留痕比较的是**两份完整候选方案**（而非只取受影响锚批）：
+            //     两份都含「其余锚批保持原量」这一**公共部分** ⇒ 其 NonSetup 占用之差**恰等于**两侧 ④.6 增量之差
+            //     的相反数 ⇒ `Describe` 文本里的不等式与胜负方向**必然同向**
+            //     （这是「数字与文案不得互相打脸」的结构性保证）。
+            //   ⚠ 若全部合批候选均被否决，擂主恒为**统一基线**（未被任何合批改写），
+            //     ⇒ 「独立排程胜出」由**最后一次**比较给出，且该条**显式标注其范围**（§3.3 逐字
+            //       「不得用循环最后的锚点充当全局决策依据」「若只留代表性比较，须显式注明其范围」）。
+            //   可比窗口在**此处算一次**（O(资源数×窗口数)），**不进入**上面的逐锚点热路径。
+            var adoptedByMerge = bestAnchorIndex >= 0;
+            var traceLayer = adoptedByMerge ? bestDecidingLayer : lastReachedLayer;
+
+            if (traceLayer == FrozenLayer.ResourceEfficiency)
+            {
+                // 擂主侧 / 挑战者侧：采纳合批 ⇒ 用 **decisive\***（最后一次胜负比较的真实对手）；
+                //   全部被否决 ⇒ 用**最后一次**比较的两侧（此时擂主恒为统一基线）。
+                var incumbentAnchorIndex = adoptedByMerge ? decisiveIncumbentAnchorIndex : -1;
+                var incumbentCombinedTasks = adoptedByMerge ? decisiveIncumbentCombinedTasks : null;
+                var incumbentIncrement = adoptedByMerge
+                    ? decisiveIncumbentNonSetupIncrement
+                    : lastIncumbentNonSetupIncrement;
+                var challengerAnchorIndex = adoptedByMerge ? decisiveChallengerAnchorIndex : lastChallengerAnchorIndex;
+                var challengerCombinedTasks = adoptedByMerge
+                    ? decisiveChallengerCombinedTasks
+                    : lastChallengerCombinedTasks;
+                var challengerIncrement = adoptedByMerge
+                    ? decisiveChallengerNonSetupIncrement
+                    : lastChallengerNonSetupIncrement;
+
+                if (challengerAnchorIndex >= 0 && challengerCombinedTasks is not null)
+                {
+                    var incumbentSideTasks = ComposeCandidatePlan(
+                        stageBatches, incumbentAnchorIndex, incumbentCombinedTasks, separateProduced);
+                    var challengerSideTasks = ComposeCandidatePlan(
+                        stageBatches, challengerAnchorIndex, challengerCombinedTasks, separateProduced);
+
+                    var (windowMinutes, windowAvailable) = ResourceEfficiencyEvaluator.ComputeComparableWindow(
+                        incumbentSideTasks, challengerSideTasks, constraints);
+
+                    // R2-C：胜负方向 = **两侧 ④.6 增量之差**（仍走 R2-B 的**唯一换算口**，不在调用点自行比大小）。
+                    var decisiveIncrementDelta = challengerIncrement - incumbentIncrement;
+                    var r2Verdict = ResourceEfficiencyEvaluator.VerdictFromMergeIncrement(decisiveIncrementDelta);
+
+                    var incumbentLabel = incumbentAnchorIndex < 0
+                        ? "统一基线（未合批）"
+                        : $"擂主锚#{incumbentAnchorIndex}[{AnchorBatchKey(stageBatches, incumbentAnchorIndex)}]";
+                    var challengerLabel =
+                        $"合批到锚#{challengerAnchorIndex}[{AnchorBatchKey(stageBatches, challengerAnchorIndex)}]";
+
+                    var incumbentBreakdown = ResourceEfficiencyEvaluator.BreakdownFor(
+                        incumbentSideTasks, windowMinutes, windowAvailable, constraints);
+                    var challengerBreakdown = ResourceEfficiencyEvaluator.BreakdownFor(
+                        challengerSideTasks, windowMinutes, windowAvailable, constraints);
+
+                    // `ReleasedCapacityMinutes(擂主侧, 挑战者侧) = 擂主侧 − 挑战者侧`：**正值 = 擂主侧少占**。
+                    var released = ResourceEfficiencyEvaluator.ReleasedCapacityMinutes(
+                        incumbentBreakdown, challengerBreakdown);
+
+                    // ⑤ 判平的两种含义：**首次**比较时擂主即统一基线 ⇒ 取独立排程候选；
+                    //   其后判平 ⇒ **维持擂主**（不换擂主 ⇒ 与「合批必须有可度量改善才被采用」一致）。
+                    // R2-C / §八.4：`decisiveByTieBreak` 只在 `adoptedByMerge` 时对应**本次采纳**的那次比较
+                    //   （`decisive*` 与 `bestDecidingLayer` 在同一次 `mergeWins` 中一起被覆盖 ⇒ 两者同源）。
+                    var byTieBreak = adoptedByMerge && decisiveByTieBreak;
+                    var outcome = decisiveIncrementDelta < 0m
+                        ? $"挑战者（{challengerLabel}）胜出 ⇒ **合批释放产能**"
+                        : decisiveIncrementDelta > 0m
+                            ? $"擂主（{incumbentLabel}）胜出 ⇒ 合批多占产能，**维持擂主**"
+                            : incumbentAnchorIndex < 0
+                                ? "两侧判平（第 ⑤ 层）⇒ 取**统一基线／未合批**（首次比较即该基线）；"
+                                  + "**非**因资源效率择优"
+                                : byTieBreak
+                                    ? "两侧判平（第 ⑤ 层）⇒ 按**稳定 Tie-breaker（锚批键字典序最小者胜）**"
+                                      + $"取挑战者（{challengerLabel}）；**非**因资源效率择优"
+                                    : $"两侧判平（第 ⑤ 层）⇒ **维持擂主**（{incumbentLabel}）；"
+                                      + "**非**因资源效率择优";
+
+                    var scope = adoptedByMerge
+                        ? "本条代表**决定最终采纳（合批）方案**的那一次比较"
+                        : $"全部 {stageBatches.Count} 个合批候选均被否决 ⇒ 维持统一基线（未合批）；"
+                          + "本条代表**最后一次**比较（**不代表**本轮全部候选的择优原因）";
+
+                    // J13-05：本条留痕里的「④.6 增量」是**哪个口径**的键 —— 由下方 `R-2 排序键口径=…` 段写明，
+                    //   否则读者会把「含人工槽增量」当成决定依据（只有**未投影**时它才真是决定依据）。
+                    //   ⚠ 口径标记**不插进**「④.6 增量 X 分钟」括号内 —— 既有单测按该子串断言，且值本身未变。
+
+                    var occupancyKeys = incumbentBreakdown.AffectedResources
+                        .Concat(challengerBreakdown.AffectedResources)
+                        .Distinct()
+                        .OrderBy(resourceId => resourceId);
+
+                    constraints.TraceNotes.Add(new SolveTraceNote
+                    {
+                        Key = demand.LogicalDemandKey,
+                        ReasonCode = ResourceEfficiencyEvaluator.VerdictTraceCode(r2Verdict),
+                        Message = ResourceEfficiencyEvaluator.Describe(
+                                r2Verdict, incumbentBreakdown, challengerBreakdown, incumbentLabel, challengerLabel)
+                            + $"｜{scope}"
+                            + $"｜擂主={incumbentLabel}（④.6 增量 {incumbentIncrement} 分钟）"
+                            + $" vs 挑战者={challengerLabel}（④.6 增量 {challengerIncrement} 分钟）"
+                            + $" ⇒ 差值 {decisiveIncrementDelta} 分钟 ⇒ {outcome}"
+                            + $"｜决定层={FrozenLayerName(traceLayer)}"
+                            + $"｜R-2 排序键口径={(deviceScope is null
+                                ? "**含人工槽**（`DeviceResourceIds` 为 `null` ⇒ **未投影** ⇒ 兼容边界）"
+                                : "**纯设备**（`DeviceResourceIds` 已投影 ⇒ 按 0号位 J13-05 用于 ④.6 评分分支）")}"
+                            + $"｜Tie-breaker={(byTieBreak
+                                ? "**已启用**（⑤ 判平 ⇒ 锚批键字典序最小者接管擂主；内容派生、与枚举次序无关）"
+                                : "未启用（本次胜负由冻结层目标给出）")}"
+                            + $"｜占用键（两侧并集）=[{string.Join(", ", occupancyKeys)}]"
+                            // R-2 设备口径留痕（载体 `DomainSolveRequest.DeviceResourceIds`；J13-05 后**已进入择优**）：
+                            //   非 null ⇒ 并列写出「纯设备」与「含人工槽」两个**绝对**排序键作对照
+                            //     （⚠ 决定依据是上面那对**增量**，不是这两个绝对值），并声明**④.6 择优取纯设备键**；
+                            //   复用 `deviceScope`（**同一份集合** ⇒ 留痕所见 = 评分所用，不会两套口径打架）。
+                            //   null（未投影）⇒ 拼空串 ⇒ 本条留痕文本**逐字不变**（零回归）。
+                            + (deviceScope is null
+                                ? string.Empty
+                                : "｜" + ResourceEfficiencyEvaluator.DescribeDeviceScope(
+                                    ResourceEfficiencyEvaluator.EvaluateDeviceScope(incumbentSideTasks, deviceScope),
+                                    incumbentBreakdown.NonSetupOccupiedMinutes, incumbentLabel,
+                                    ResourceEfficiencyEvaluator.EvaluateDeviceScope(challengerSideTasks, deviceScope),
+                                    challengerBreakdown.NonSetupOccupiedMinutes, challengerLabel))
+                            + $"｜本轮共 {r2ReachedCount} 次比较到达 ④.6"
+                            + "｜另计（**非本条胜负依据**）：挑战者相对「全部既有锚批原量 + 本需求独立成批」"
+                            + $"统一基线的 ④.6 增量 = {challengerIncrement} 分钟；"
+                            + $"（擂主侧 − 挑战者侧排序键 = {released} 分钟，>0 表示擂主侧少占）。",
+                        Level = "Info"
+                    });
+                }
+            }
+            else if (r2ReachedCount > 0)
+            {
+                // (乙) ④.6 **被执行过**但**没有**决定最终采纳方案 ⇒ 单列第二事实（§3.3 逐字「最低限度区分
+                //   『最终被选方案的主决定层』和『本轮实际进行过的④.6比较』两个事实」）。
+                constraints.TraceNotes.Add(new SolveTraceNote
+                {
+                    Key = demand.LogicalDemandKey,
+                    ReasonCode = ResourceEfficiencyEvaluator.TraceEvaluatedNotDecisive,
+                    Message = "资源效率（④.6）**被执行但未决定最终采纳方案**：本轮共 "
+                              + $"{r2ReachedCount} 次比较到达 ④.6（最后一次：擂主={r2LastIncumbentLabel}／"
+                              + $"挑战者={r2LastChallengerLabel}）；最终采纳方案由 {FrozenLayerName(traceLayer)} 层决出"
+                              + " ⇒ 本层**未**决定取舍，**不得**记为「因资源效率择优」。",
+                    Level = "Info"
+                });
             }
 
             // 落定：胜者在**真实上下文**上重跑（独立排程与试排同一调用；合批走真实表 + 自身快照）。
@@ -4154,6 +6322,106 @@ internal class PhaseTwoInitialScheduler
     }
 
     /// <summary>
+    /// R2-C 留痕用：**锚点身份**的**短标签**（0号位 第六轮 §3.2 逐字要求「含**锚点身份**」）。
+    ///   `anchorIndex &lt; 0` ⇒ 统一基线（未合批）；否则 `锚#{index}[{批键}]`。
+    ///   批键取该 Stage 执行批首条 Task 的 `StageExecutionBatchDraftKey`（**Stage 内 MES 批身份**，
+    ///   缺失再退 `ExecutionBatchDraftKey`、`FinalDraftId`）。
+    ///   **只**用于说明文本，**不参与**任何判定（判定仍只在 `PreferStageMerge` 的冻结层比较器内）。
+    /// </summary>
+    private static string AnchorIdentityLabel(IReadOnlyList<List<FinalTaskDraft>> stageBatches, int anchorIndex)
+        => anchorIndex < 0 || anchorIndex >= stageBatches.Count
+            ? "统一基线（未合批）"
+            : $"锚#{anchorIndex}[{AnchorBatchKey(stageBatches, anchorIndex)}]";
+
+    /// <summary>R2-C 留痕用：锚点所在 Stage 执行批的**MES 批键**（三级退取，只取第一个非空）。</summary>
+    private static string AnchorBatchKey(IReadOnlyList<List<FinalTaskDraft>> stageBatches, int anchorIndex)
+    {
+        if (anchorIndex < 0 || anchorIndex >= stageBatches.Count)
+        {
+            return "(统一基线)";
+        }
+
+        var batch = stageBatches[anchorIndex];
+        return batch.Count == 0
+            ? "(空批)"
+            : batch[0].StageExecutionBatchDraftKey
+              ?? batch[0].ExecutionBatchDraftKey
+              ?? batch[0].FinalDraftId;
+    }
+
+    /// <summary>
+    /// R2-C 留痕用：冻结**层身份**的人类可读名（只用于说明文本，不参与判定）。
+    /// </summary>
+    private static string FrozenLayerName(FrozenLayer layer) => layer switch
+    {
+        FrozenLayer.Feasibility => "①可行",
+        FrozenLayer.Fulfillment => "②履约(延期分钟)",
+        FrozenLayer.DueDate => "③交期/更早可行完成",
+        FrozenLayer.Setup => "④Setup总量",
+        FrozenLayer.EconomicDeviation => "④.5经济软偏离",
+        FrozenLayer.ResourceEfficiency => "④.6资源效率",
+        _ => "①～④.5均判平且④.6未执行（第⑤层取独立排程）"
+    };
+
+    /// <summary>
+    /// R2-C 留痕用：组装**一份完整候选方案**（0号位 第六轮 §3.2：留痕必须展示**真实对手**，
+    ///   即「该对手胜出时**整个 Domain 会采纳的排程**」，而不是只截取受影响的那个锚批）。
+    ///
+    ///   · `modifiedAnchorIndex &lt; 0` ⇒ 该方案**未被任何合批改写**（统一基线）
+    ///     ⇒ 全部锚批保持原量 ＋ `modifiedPart`（= 本需求独立成批）；
+    ///   · 否则 ⇒ 「其余锚批保持原量」＋ 第 `modifiedAnchorIndex` 个锚批替换为 `modifiedPart`（合批后完整链）。
+    ///
+    ///   ⚠ 两份对照方案因此**共享同一个公共部分**（其余锚批原量）⇒ 其 `NonSetupOccupiedMinutes` 之差
+    ///     **恰等于**两侧 ④.6 增量之差的相反数 ⇒ 说明文本里的不等式与胜负方向**必然同向**。
+    ///   **只**用于留痕计算，**不**回写 `stageBatches` / `scheduledTasks`（纯读）。
+    /// </summary>
+    private static List<FinalTaskDraft> ComposeCandidatePlan(
+        IReadOnlyList<List<FinalTaskDraft>> stageBatches,
+        int modifiedAnchorIndex,
+        List<FinalTaskDraft>? modifiedPart,
+        List<FinalTaskDraft> separateProduced)
+    {
+        var plan = new List<FinalTaskDraft>();
+        for (var i = 0; i < stageBatches.Count; i++)
+        {
+            if (i != modifiedAnchorIndex)
+            {
+                plan.AddRange(stageBatches[i]);
+            }
+        }
+
+        if (modifiedAnchorIndex < 0)
+        {
+            plan.AddRange(modifiedPart ?? separateProduced);
+        }
+        else if (modifiedPart is not null)
+        {
+            plan.AddRange(modifiedPart);
+        }
+
+        return plan;
+    }
+
+    /// <summary>
+    /// 冻结次级目标的**层身份**（R2-C，0号位 2026-10-14《致1号位第五轮代码审核正式复核回复 v1.0》§三 R2-C）：
+    ///   「`RESOURCE_EFFICIENCY_INCREMENT` 不能由『差额非零』推出『本层决定了胜负』」
+    ///   ⇒ 必须能**分辨**「该指标存在差异」/「比较器到达 ④.6 层」/「④.6 实际决定采纳方案」三件事。
+    ///   本枚举即「比较器**落在哪一层**」的载体：**只有** <see cref="ResourceEfficiency"/> 才允许使用
+    ///   「increment／因效率择优」语义留痕。
+    ///   <see cref="None"/> = 未落到任何具体层（①～④.5 全平、④.6 亦未执行 ⇒ ⑤ 判平取独立）。
+    /// </summary>
+    internal enum FrozenLayer
+    {
+        None = 0,
+        Feasibility = 1,
+        Fulfillment = 2,
+        DueDate = 3,
+        Setup = 4,
+        EconomicDeviation = 5,
+        ResourceEfficiency = 6
+    }
+
+    /// <summary>
     /// OWN-P0-02（复审 §三 第 3 步「再对每个候选**联合择优**」）：在「独立排程」与「Stage 合批」两个候选之间裁决。
     ///
     /// 比较顺序与 <see cref="SelectBestRoutingCandidate"/> / <see cref="CompareBatchPlans"/> **逐层同源**
@@ -4163,6 +6431,10 @@ internal class PhaseTwoInitialScheduler
     ///   ③ 交期：两方均按期且完成时间不同 ⇒ 受 **Direction** 控制 ——
     ///        FORWARD / MIXED → 更早可行完成优先；BACKWARD → 更靠近 Due（完成更晚者）优先；
     ///   ④ 次级：Setup 总量小者优先（合批省换型的业务收益在此层体现）；
+    ///   ④.5（**2026-10-14 补齐**，R-2 / 04 BP-R2a-R2b）：**经济软偏离**层 —— 与拆批侧
+    ///        `CompareBatchPlans` 的 ④.5 **同层同序**（④ Setup 之后、⑤ 判平之前），
+    ///        按 `(区间偏离, Preferred 偏离)` **字典序**取更接近经济软 Min/Max/Preferred 者；
+    ///        ⚠ 只在 ①②③④ **全平**时生效 ⇒ **绝不压过**履约/交期/Setup；缺 Valid 经济策略 ⇒ 两侧均 (0,0) ⇒ 本层恒平。
     ///   ⑤ 完全判平 ⇒ 取**独立排程**（= OWN-P0-02 之前的既有行为 ⇒ 零回归；合批必须有可度量的改善才被采用）。
     ///
     /// ⚠ 两个候选同属一条需求、同一 Routing 候选、同一 Direction ⇒ 第 ③ 层不存在「两方方向不同不可比」的情形
@@ -4172,31 +6444,107 @@ internal class PhaseTwoInitialScheduler
     ///   ⇒ 同一套冻结四层目标被直接复用于「**当前擂主 vs 下一个合法锚点候选**」的逐个擂台比较
     ///   （首轮擂主 = 独立排程候选）。判平（⑤）取「不换擂主」= 保守，语义与「判平取独立排程」一致。
     /// </summary>
-    private static bool PreferStageMerge(
+    private static (FrozenLayer Layer, bool MergeWins) PreferStageMerge(
         bool separateFeasible,
         DateTime separateEnd,
         decimal separateSetup,
+        (decimal Range, decimal Preferred) separateEconDev,
         bool mergeFeasible,
         DateTime mergeEnd,
         decimal mergeSetup,
+        (decimal Range, decimal Preferred) mergeEconDev,
         LogicalProductionDemand demand,
         ConstraintContext constraints,
-        string direction)
+        string direction,
+        decimal? separateNonSetupOccupiedMinutes = null,
+        decimal? mergeNonSetupOccupiedMinutes = null)
+    {
+        var due = constraints.EffectiveDue(demand);
+        return ResolveStageMerge(
+            separateFeasible,
+            mergeFeasible,
+            DelayMinutes(separateEnd, due),
+            DelayMinutes(mergeEnd, due),
+            direction,
+            separateEnd,
+            mergeEnd,
+            separateSetup,
+            mergeSetup,
+            separateEconDev,
+            mergeEconDev,
+            separateNonSetupOccupiedMinutes,
+            mergeNonSetupOccupiedMinutes);
+    }
+
+    /// <summary>
+    /// 冻结次级目标的**纯函数比较核**（2026-10-14 从 <see cref="PreferStageMerge"/> 抽出：逐层同序、逐字同判）：
+    ///   ① 可行优于不可行 → ② 履约（延期短者优先）→ ③ 交期（均按期时受 `direction` 控制）
+    ///   → ④ Setup 总量小者优先 → ④.5 经济软偏离（`Range` 先于 `Preferred` 的字典序）
+    ///   → ④.6 资源效率（除 Setup 外占用更少者优先，R-2）→ ⑤ 判平取独立排程。
+    ///
+    /// 【为什么单独抽出】0号位 2026-10-14《APS V1｜致1号位综合正式审核回复 v1.1》§二.3 逐字要求：
+    ///   「先对排序比较函数添加『完工与上层交付相同、真实Setup不同、经济偏离方向相反』的**纯函数级反证**」。
+    ///   抽出后 `LPS.APS.Tests`（经 `InternalsVisibleTo`）可**直接**喂入该四元组，
+    ///   无需构造整个 `ConstraintContext`/合法日历 ⇒ 层序可被**直接**反证。
+    ///
+    /// ⚠ `direction` 取值同 <see cref="SchedulingDirectionResolver"/>（`FORWARD` / `BACKWARD` / `MIXED`）。
+    /// ⚠ 纯函数：无副作用、不读 Context、不查库。
+    /// </summary>
+    internal static bool PreferMergeByFrozenLayers(
+        bool separateFeasible,
+        bool mergeFeasible,
+        long delaySeparate,
+        long delayMerge,
+        string direction,
+        DateTime separateEnd,
+        DateTime mergeEnd,
+        decimal separateSetup,
+        decimal mergeSetup,
+        (decimal Range, decimal Preferred) separateEconDev,
+        (decimal Range, decimal Preferred) mergeEconDev,
+        decimal? separateNonSetupOccupiedMinutes = null,
+        decimal? mergeNonSetupOccupiedMinutes = null)
+        => ResolveStageMerge(
+            separateFeasible, mergeFeasible, delaySeparate, delayMerge, direction,
+            separateEnd, mergeEnd, separateSetup, mergeSetup, separateEconDev, mergeEconDev,
+            separateNonSetupOccupiedMinutes, mergeNonSetupOccupiedMinutes).MergeWins;
+
+    /// <summary>
+    /// 同 <see cref="PreferMergeByFrozenLayers"/> 的**同一比较核**，但**额外返回比较器落在哪一层**
+    ///   （R2-C：把「比较器到达 ④.6 层」这一事实**独立**暴露出来，供留痕区分
+    ///   「该指标存在差异」/「到达 ④.6」/「④.6 决定了胜负」三件事）。
+    ///
+    /// ⚠ 逐层 `return` 的结构与 <see cref="PreferMergeByFrozenLayers"/> **逐字同序**（后者是它的薄封装）
+    ///   ⇒ 层序行为零变化。
+    /// ⚠ `Layer == <see cref="FrozenLayer.ResourceEfficiency"/>` **同时**涵盖「④.6 判出胜负」「④.6 判平」
+    ///   与「④.6 输入缺项」三种情形 —— 判「是否评价过」由 <see cref="ResourceEfficiencyEvaluator.VerdictFromMergeIncrement"/>
+    ///   在调用点给出，本核只负责「**到达了哪一层**」。
+    /// </summary>
+    internal static (FrozenLayer Layer, bool MergeWins) ResolveStageMerge(
+        bool separateFeasible,
+        bool mergeFeasible,
+        long delaySeparate,
+        long delayMerge,
+        string direction,
+        DateTime separateEnd,
+        DateTime mergeEnd,
+        decimal separateSetup,
+        decimal mergeSetup,
+        (decimal Range, decimal Preferred) separateEconDev,
+        (decimal Range, decimal Preferred) mergeEconDev,
+        decimal? separateNonSetupOccupiedMinutes = null,
+        decimal? mergeNonSetupOccupiedMinutes = null)
     {
         // ① 可行优于不可行
         if (separateFeasible != mergeFeasible)
         {
-            return mergeFeasible;
+            return (FrozenLayer.Feasibility, mergeFeasible);
         }
 
-        var due = constraints.EffectiveDue(demand);
-
         // ② 履约：延期短者优先
-        var delaySeparate = DelayMinutes(separateEnd, due);
-        var delayMerge = DelayMinutes(mergeEnd, due);
         if (delaySeparate != delayMerge)
         {
-            return delayMerge < delaySeparate;
+            return (FrozenLayer.Fulfillment, delayMerge < delaySeparate);
         }
 
         // ③ 交期：均按期 ⇒ 受 Direction 控制
@@ -4204,21 +6552,109 @@ internal class PhaseTwoInitialScheduler
         {
             if (string.Equals(direction, SchedulingDirectionResolver.Backward, StringComparison.Ordinal))
             {
-                return mergeEnd > separateEnd;   // 倒排：不延期前提下更靠近 Due
+                return (FrozenLayer.DueDate, mergeEnd > separateEnd);   // 倒排：不延期前提下更靠近 Due
             }
 
-            return mergeEnd < separateEnd;       // FORWARD / MIXED：更早可行完成优先
+            return (FrozenLayer.DueDate, mergeEnd < separateEnd);       // FORWARD / MIXED：更早可行完成优先
         }
 
         // ④ 次级：Setup 总量小者优先
         if (separateSetup != mergeSetup)
         {
-            return mergeSetup < separateSetup;
+            return (FrozenLayer.Setup, mergeSetup < separateSetup);
         }
 
-        // ⑤ 判平 ⇒ 保守取独立排程
-        return false;
+        // ④.5 经济软偏离（2026-10-14 补齐；与 CompareBatchPlans ④.5 同层同序、同字典序口径）：
+        //   只在 ①②③④ 全平时生效 ⇒ 结构性保证**不压过**履约/交期/Setup/可行性。
+        //   区间偏离优先于 Preferred 偏离（与 CompareBatchPlans 逐字同序）。
+        //   ⚠ 缺 Valid 经济策略时两侧均为 (0,0) ⇒ 本层恒平 ⇒ 对既有夹具零回归。
+        //   ⚠ **层序判据（2026-10-14 修订）**：本核被抽出后，层序**已可被纯函数级直接反证** ——
+        //     见 `PhaseTwoLayerOrderTests.PL_01`（完工同、Setup 不同、经济偏离方向相反 ⇒ ④ 必须胜过 ④.5）。
+        //     · 已实测「把本层临时提到 ② 之前」⇒ `M_12` **红**；
+        //     · 早先登记的「④ 与 ④.5 单独相争**不可构造**」**仍然成立**，但**理由更正为结构性**
+        //       （2026-10-14 复核）：本函数**逐层 `return`** ⇒ ④.5 **只在 ④ 判平时才被执行** ⇒
+        //       「④ 有差异且 ④.5 反向」这一形态**在纯函数级也构造不出**，与 Solver 架构无关。
+        //       旧注归因于「③ 已含换型分钟」是 **Solver 级**论证，**不是**真正原因。
+        //       ⚠ `PL_01` 检验的是「两者**同时**有差异时 ④ 在先」= **层序本身**，
+        //         **不等于**「④ 与 ④.5 单独相争」—— 两者不可混称。
+        //     · **不能**据此登记为「业务上不可构造」—— 0号位 §二.3 判词成立：层序已可纯函数级反证。
+        if (separateEconDev.Range != mergeEconDev.Range)
+        {
+            return (FrozenLayer.EconomicDeviation, mergeEconDev.Range < separateEconDev.Range);
+        }
+        if (separateEconDev.Preferred != mergeEconDev.Preferred)
+        {
+            return (FrozenLayer.EconomicDeviation, mergeEconDev.Preferred < separateEconDev.Preferred);
+        }
+
+        // ④.6 资源效率（**2026-10-14 新增**，R-2 / 0号位《APS V1｜致1号位综合正式审核回复 v1.1》§一.3.2）：
+        //   · **业务口径**：资源效率 ＝ **设备有效稼动**；不得靠人为缩小分母 / 扩大生产量抬比率；
+        //     Setup 是真实占用但**不是有效加工**，**不得与有效加工混计**，更**不得与第 ④ 层重复计分**。
+        //   · **排序键** = `除 Setup 外的占用分钟数`（**越小越好**）。⚠ 本层只在 ④（Setup 总量）**判平**时
+        //     才被执行 ⇒ 两侧 Setup **相等** ⇒ `Occupied` 与 `NonSetupOccupied` 在此层**同序**；
+        //     取后者是**显式声明**「不与 ④ 重复计分」（§一.2.5 禁止「同一 Setup 改善重复记两次收益」）。
+        //   · **不读日历** ⇒ 缺日历事实**不会**把本层伪装成「不可评价」：§一.3.2 逐字「即使两方案用
+        //     同一设备，负荷时间、日历空隙、Setup 也可能不同」⇒ 资源集合相同**不构成**不可评价理由。
+        //   · **零回归**：两侧均缺该事实（`null`）⇒ 本层判平 ⇒ 回落 ⑤ 取独立排程（= 既有行为）。
+        //     现行生产调用（`PreferStageMerge`）**已通电**；纯函数级调用可省参。
+        if (separateNonSetupOccupiedMinutes.HasValue && mergeNonSetupOccupiedMinutes.HasValue
+            && separateNonSetupOccupiedMinutes.Value != mergeNonSetupOccupiedMinutes.Value)
+        {
+            return (FrozenLayer.ResourceEfficiency,
+                    mergeNonSetupOccupiedMinutes.Value < separateNonSetupOccupiedMinutes.Value);
+        }
+
+        // ⑤ 判平 ⇒ 保守取独立排程。
+        //   ⚠ **层身份仍是 ④.6**（R2-C）：「比较器到达 ④.6 层」是**独立事实** —— ④.6 **判平**（两侧增量相等）
+        //     与 ④.6 **输入缺项**（任一侧 `null`）都**不得**被当作「没到过本层」，否则留痕会把
+        //     「确实评价且判平」误记成沉默，或把缺项伪装成「本层不可评价」。
+        //     判「评价结论」（INCREMENT / NO_INCREMENT / DATA_MISSING）由调用点用
+        //     `ResourceEfficiencyEvaluator.VerdictFromMergeIncrement(增量)` 给出。
+        return (FrozenLayer.ResourceEfficiency, false);
     }
+
+    /// <summary>
+    /// **R2-C / §八.4（2026-10-15）：等价合批锚点的稳定 Tie-breaker**（**纯函数**，无副作用、不读 Context、
+    ///   不查库 ⇒ 可被 `LPS.APS.Tests` 经 `InternalsVisibleTo` **直接**反证）。
+    ///
+    /// 【触发条件（全部满足才由挑战者接管擂主）】
+    ///   · 冻结层比较**未判挑战者胜**（`mergeWins == false`）；
+    ///   · 比较**落点仍是 ④.6**（`layer == <see cref="FrozenLayer.ResourceEfficiency"/>`）
+    ///     —— 即 ①～④.5 全平且 ④.6 **判平**（两侧增量相等）或 ④.6 **输入缺项**；
+    ///   · 挑战者**确实是合法合批候选**（`challengerFeasible`）；
+    ///   · 擂主**已是某合批锚点**（`incumbentAnchorIndex >= 0`）
+    ///     —— 擂主仍是**统一基线**时**不**接管（判平取独立排程）；
+    ///   · 挑战者锚批键**字典序严格小于**擂主锚批键（`StringComparer.Ordinal`）。
+    ///
+    /// 【为什么必须做】不做时，「完全判平」的胜者 = **先被枚举**的锚点 ⇒ 结果依赖
+    ///   `FindMergeableStageBatches` 的 `groups.Values` 次序（`scheduledTasks` 的**插入次序**；
+    ///   Phase4 局部修复会在表尾追加 Task ⇒ 该次序**可漂移**）⇒ 违反 §八.4
+    ///   「最终合法方案和关键事实应不因**普通枚举顺序**漂移」。
+    ///
+    /// 【为什么用锚批键】`AnchorBatchKey` = `StageExecutionBatchDraftKey` → `ExecutionBatchDraftKey`
+    ///   → `FinalDraftId` 三级退取；前两级 = `SEB|EB|{logicalDemandKey}|{ordinal:D3}|{stage}` /
+    ///   `EB|{logicalDemandKey}|{ordinal:D3}` —— `ordinal` 由**同需求内**份额次序给出，
+    ///   **不**取全局枚举位置 ⇒ 内容派生、次序无关。
+    ///
+    /// 【边界（**不得**越界）】
+    ///   · 本函数**只**改「两个等价合批锚点之间」的取舍；**不**改「合批 vs 独立排程」的判据
+    ///     （擂主为统一基线时判平仍取独立排程 ⇒ 「合批须有可度量改善才被采用」逐字不变）。
+    ///   · 判平**不改变层身份**（仍为 ④.6）⇒ 留痕走 (甲) 分支，但结论由两侧增量之差（= 0）给出
+    ///     ⇒ `TraceNoIncrement`（「指标相同／无增量差异」）⇒ **不得**误报「因资源效率择优」。
+    ///   · 接管后**必然**在真实上下文重跑落定（调用点 `if (mergeWins)` 分支的既有行为）⇒ 不产生半成品状态。
+    /// </summary>
+    internal static bool PreferChallengerOnTie(
+        bool mergeWins,
+        FrozenLayer layer,
+        bool challengerFeasible,
+        int incumbentAnchorIndex,
+        string challengerAnchorKey,
+        string incumbentAnchorKey)
+        => !mergeWins
+           && layer == FrozenLayer.ResourceEfficiency
+           && challengerFeasible
+           && incumbentAnchorIndex >= 0
+           && string.CompareOrdinal(challengerAnchorKey, incumbentAnchorKey) < 0;
 
     /// <summary>
     /// 第4轮Merge修复：查找可合并的已有Task
@@ -4245,6 +6681,8 @@ internal class PhaseTwoInitialScheduler
         var targetOp = operations[0];
 
         // 遍历已排程的Task，找同Material、同Operation的Task
+        // 2026-10-20 五次定位：单工序 Merge 目标查找耗时（逐候选全扫全量任务表；纯观测）。
+        long swFindTasks = SolverDiagnostics.HotspotStart();
         foreach (var task in scheduledTasks)
         {
             // ── P1-01（0号位 2026-10-08 §八）：多批需求下 Merge 必须**保持执行批身份** ──
@@ -4315,9 +6753,550 @@ internal class PhaseTwoInitialScheduler
 
             candidates.Add(task);
         }
+        SolverDiagnostics.HotspotEnd(swFindTasks, SolverDiagnostics.Hotspot.MergeFindTasks);
 
         return candidates;
     }
+
+    /// <summary>
+    /// 2026-10-19 性能整改：把 <paramref name="scheduledTasks"/> 按 <c>ExecutionBatchDraftKey</c> 分组。
+    ///
+    /// 与 <see cref="FindMergeableStageBatches"/> 首段**逐字同源**（同判据、同插入序），抽出来是为了让调用方
+    /// 在**候选循环外只建一次**。原实现每次进 <see cref="FindMergeableStageBatches"/> 都重建一次，而本方法
+    /// 在**每个 Routing 候选试跑**里都会被调用（`RunDemandSchedule` → `TryMergeOrSchedule`）——
+    /// 同一份任务表被整表重建「候选数」遍。
+    ///
+    /// 实测（2026-10-19 基准 `正式基准_规模扫描_热点定位`，resources=16 / FinalTask=11,124）：
+    /// 该段 8,764 ms = ΣPhase 的 **14.6%**，且随规模约 **N^2.5**（1,523 ms@5,634 → 8,764 ms@11,124）。
+    ///
+    /// ⚠ 返回的字典与其中的 `List` 由调用方**只读**共享（`stageBatches` 全程纯读，见 `:5264` 的约定）。
+    ///
+    /// ── 2026-10-20 十四刀：**容器复用**（语义逐字不变，只省分配）──
+    ///   16k 档实测本方法被调用 **17,774** 次、每次 22,296 条 ⇒ 18,894 ms = ΣPhase 的 **30.1%**
+    ///   （撤销 `taskIndexById` 之后，`PrepIndex` 里只剩它一家）。
+    ///   每次调用原本要：新建一个 `Dictionary`（随插入反复扩容重哈希）＋ **约 4,226 个 `List` 对象**
+    ///   （批分组数）。17,774 次累计 ≈ 7,500 万个 `List` 分配，是 GC 暂停 9.9 s（15.8%）的主要来源之一。
+    ///   现在：字典与桶 `List` 各保留一份实例，每次 `Clear()` 后**按原插入次序重新填充**
+    ///   ⇒ `Dictionary` 的枚举序仍等于「首次出现次序」（`Clear()` 会重置空闲链，插入序即枚举序），
+    ///   桶内次序仍等于任务表次序 ⇒ **与每次新建逐字等价**，只是不再反复分配。
+    ///   ⚠ 复用前提：`stageBatches` 只活在一次 `TryMergeOrSchedule` 调用内（全部消费点见 `:5153-5648`，
+    ///     无一处把桶列表存进任何长生命周期结构）⇒ 下一次重建时上一批的引用已全部失效。
+    ///
+    /// ── 2026-10-20 十五刀：**跨批增量维护**（语义逐字等价，见方法体内证明）──
+    ///   14k 刀之后 `PrepIndex` 仍有 **6,172 ms（12.1%）**，全部是「每批把全表 22,296 条重扫一遍」。
+    ///   现在用「逐引用前缀比对 + 只补尾部」替代整表重建：
+    ///     16k 档两次复跑 `PrepIndex` **6,172 → 1,913 / 1,577 ms**；ΣPhase 同机复跑 **51,751 → 47,201 ms**。
+    /// </summary>
+    private Dictionary<string, List<FinalTaskDraft>> BuildBatchGroupsIndex(
+        List<FinalTaskDraft> scheduledTasks,
+        bool useCache = true,
+        bool rebindOwner = true)
+    {
+        // ── 2026-10-20 十五刀：**增量维护**（语义逐字等价，只省重复劳动）──
+        //   16k 档实测：本方法原先每次扫全表 22,296 条、共 35,548 次 ⇒ `PrepIndex` **6,172 ms（12.1%）**。
+        //   而相邻两批之间任务表**绝大多数只是尾部追加**（上一批新排出的 Task 追加到末尾）。
+        //   现在先做一次 O(N) **逐引用前缀比对**：
+        //     · 前缀逐引用相同 ⇒ 只把尾部新增的 Task 补进已有分组（O(新增数)），不重建；
+        //     · 前缀不同（真发生过摘除 / 回退 / 整表换）⇒ 回落到原「清空重建」，与改前**逐字一致**。
+        //   **等价性证明**（字典键序 = 各键在任务表中**首次出现**的次序）：
+        //     ① 前缀逐引用相同 ⇒ 已有键的首次出现位置不变 ⇒ 键序不变；
+        //     ② 尾部新任务若属**已有键** ⇒ 追加进该桶；其首次出现仍在前面 ⇒ 键序不变；
+        //     ③ 尾部新任务若属**新键** ⇒ 插到字典末尾；其首次出现就在尾部，且在它之前的键都已存在
+        //        ⇒ 键序与全量重建逐字相同。
+        //     桶内次序恒为「任务表次序」：增量只往桶尾追加，而尾部任务在任务表里本就更靠后。
+        //   ⚠ `useCache:false` 专供试排路径（`RunDemandSchedule` 的 `prebuiltGroups == null` 分支）：
+        //     那里的任务表是**试排副本**，颜色必须隔离，**绝不能**污染真实表的索引缓存 ——
+        //     故现建一个独立字典、连桶池都不碰（该路径 16k 档实测 0 次，不构成成本）。
+        if (!useCache)
+        {
+            return BuildBatchGroupsFresh(scheduledTasks);
+        }
+
+        long swInc = SolverDiagnostics.HotspotStart();
+        var canAppendTail = _batchGroupsSnapshotValid
+            && _batchGroupsSnapshot.Count <= scheduledTasks.Count
+            && IsPrefixSameReferences(_batchGroupsSnapshot, scheduledTasks);
+
+        // 2026-10-20 二十八刀：**非权威表（试排副本）**走**覆盖层**。
+        //   副本 = 真表拷贝 + 同一 `RunBatchPlan` 内前几批追加的 Task。共享索引镜像的是真表那一段，
+        //   把副本尾巴**临时**并进共享索引即可得到「副本此刻的正确分组」，跑完按桶长度回滚。
+        //   于是：既不用整表重建（实测 8,334 × 913 µs），也不用克隆（实测 8,334 × 583 µs）。
+        //   前缀对不上（副本被摘过 / 中间插过，实测 76 次）⇒ 覆盖层不成立，独立建一份。
+        if (!rebindOwner)
+        {
+            if (!_batchGroupsOverlayActive || !canAppendTail)
+            {
+                SolverDiagnostics.CountBatchGroupReconcileOutcome(
+                    _batchGroupsSnapshotValid && _batchGroupsSnapshot.Count > scheduledTasks.Count ? 7 : 8);
+                SolverDiagnostics.HotspotEnd(swInc, SolverDiagnostics.Hotspot.BatchGroupIncremental);
+                long swTrialFresh = SolverDiagnostics.HotspotStart();
+                var trialGroups = BuildBatchGroupsFresh(scheduledTasks);
+                SolverDiagnostics.HotspotEnd(swTrialFresh, SolverDiagnostics.Hotspot.BatchGroupTrialFresh);
+                return trialGroups;
+            }
+
+            // 同一 `RunBatchPlan` 内**逐批各建一次**分组索引（`batchGroupsIndex` 在批循环内声明）
+            //   ⇒ 本批必须先把上批并进来的尾巴**退掉**再按副本此刻的内容重并，否则尾巴会被叠加两遍。
+            long swOverlay = SolverDiagnostics.HotspotStart();
+            RestoreBatchGroupsOverlay();
+            AppendBatchGroupsOverlayTail(scheduledTasks, _batchGroupsSnapshot.Count);
+            SolverDiagnostics.HotspotEnd(swOverlay, SolverDiagnostics.Hotspot.BatchGroupTrialOverlay);
+            SolverDiagnostics.HotspotEnd(swInc, SolverDiagnostics.Hotspot.BatchGroupIncremental);
+            return _batchGroupsReuse;
+        }
+
+        if (canAppendTail)
+        {
+            for (int i = _batchGroupsSnapshot.Count; i < scheduledTasks.Count; i++)
+            {
+                AddToGroup(_batchGroupsReuse, scheduledTasks[i]);
+                _batchGroupsSnapshot.Add(scheduledTasks[i]);
+            }
+
+            // 2026-10-20 二十八刀：只有**权威真表**才能接管归属（试排副本在上一分支就走了，不到这里）。
+            if (rebindOwner) _batchGroupsSnapshotOwner = scheduledTasks;
+            SolverDiagnostics.HotspotEnd(swInc, SolverDiagnostics.Hotspot.BatchGroupIncremental);
+            return _batchGroupsReuse;
+        }
+
+        SolverDiagnostics.HotspotEnd(swInc, SolverDiagnostics.Hotspot.BatchGroupIncremental);
+
+        // 2026-10-20 二十九次定位：登记重建触发原因（只计次数）。
+        SolverDiagnostics.CountBatchGroupRebuildReason(
+            !_batchGroupsSnapshotValid ? 0
+            : _batchGroupsSnapshot.Count > scheduledTasks.Count ? 1
+            : 2);
+
+        long swFull = SolverDiagnostics.HotspotStart();
+        var groups = _batchGroupsReuse;
+        groups.Clear();
+        _batchGroupsMfIndex.Clear();   // 2026-10-20 十八刀：分组整表重建 ⇒ 分桶同步重建
+        _bucketPoolUsed = 0;
+        // ── 2026-10-20 二十一刀：**连续同批键免哈希**（判定结果逐字不变）──
+        //   20 次定位实测：整表重建 **3,602 次 × 1,072 µs**，单次 = 22,296 次「字符串哈希 + 字典查找 + 桶追加」
+        //   ⇒ 单条约 48 ns，几乎全花在哈希上。
+        //   而 `ExecutionBatchDraftKey` 的**全部赋值点都直接透传同一个局部变量**
+        //   （`PhaseTwoInitialScheduler.cs:3719/5186/6853`、`PhaseFourLocalRepair.cs:1511/1737`、
+        //     `PhaseFiveCompression.cs:852/1433` 均为 `ExecutionBatchDraftKey = <同一个变量>`）
+        //   ⇒ 同一批的 Task **共享同一个 string 实例**。
+        //   等价性：`ReferenceEquals(key, lastKey)` ⇒ 两串是同一对象 ⇒ 必然同值 ⇒ 落入的桶必然是
+        //   `groups[lastKey]`，即上一条任务返回的那个 `lastBucket` ⇒ 直接追加与走字典查找**结果相同**。
+        //   引用不等（不同实例但同值）时一律回落 `AddToGroup` 的按值查找 ⇒ 对任意输入保持原语义。
+        string? lastKey = null;
+        List<FinalTaskDraft>? lastBucket = null;
+        foreach (var task in scheduledTasks)
+        {
+            var key = task.ExecutionBatchDraftKey;
+            if (key is not null && lastBucket is not null && ReferenceEquals(key, lastKey))
+            {
+                lastBucket.Add(task);
+                continue;
+            }
+
+            lastBucket = AddToGroup(groups, task);
+            lastKey = key;
+        }
+
+        _batchGroupsSnapshot.Clear();
+        _batchGroupsSnapshot.AddRange(scheduledTasks);
+        _batchGroupsSnapshotOwner = scheduledTasks;
+        _batchGroupsSnapshotValid = true;
+        SolverDiagnostics.HotspotEnd(swFull, SolverDiagnostics.Hotspot.BatchGroupFullRebuild);
+        return groups;
+    }
+
+    /// <summary>
+    /// 2026-10-20 二十八刀：**独立**建一份批分组索引 —— 不碰 `_batchGroupsReuse` / `_batchGroupsMfIndex` /
+    ///   桶池 / 快照，连 `_batchGroupsMfIndex` 也不建（消费方只在 `ReferenceEquals(groups, _batchGroupsReuse)`
+    ///   时才查 mf 分桶，见 `FindMergeableStageBatches`）。
+    ///   用于「试排副本」：它的颜色必须与真表隔离，既不能读共享索引，也不能把共享索引改脏。
+    /// </summary>
+    private static Dictionary<string, List<FinalTaskDraft>> BuildBatchGroupsFresh(
+        List<FinalTaskDraft> scheduledTasks)
+    {
+        var fresh = new Dictionary<string, List<FinalTaskDraft>>(StringComparer.Ordinal);
+        foreach (var task in scheduledTasks)
+        {
+            if (task.ExecutionBatchDraftKey is not string key) continue;
+            if (!fresh.TryGetValue(key, out var list))
+            {
+                list = new List<FinalTaskDraft>();
+                fresh[key] = list;
+            }
+
+            list.Add(task);
+        }
+
+        return fresh;
+    }
+
+    /// <summary>
+    /// 2026-10-20 十五刀：把一个任务并入批分组（桶 `List` 按序从 `_bucketPool` 复用）。
+    /// 只在 `BuildBatchGroupsIndex` 的两条「用缓存」路径上调用，故可安全共用 `_bucketPoolUsed` 游标。
+    /// </summary>
+    private List<FinalTaskDraft>? AddToGroup(Dictionary<string, List<FinalTaskDraft>> groups, FinalTaskDraft task)
+    {
+        // 2026-10-20 二十一刀：返回值 = 该任务落入的桶（批键为 null 时返回 null）。
+        //   供「连续同批键」快路径复用桶实例，省掉下一次的字符串哈希 + 字典查找。**不改任何既有行为**。
+        if (task.ExecutionBatchDraftKey is not string key) return null;
+        if (!groups.TryGetValue(key, out var list))
+        {
+            // 桶 `List` 复用：按序取用池中实例并 `Clear()`，池不够才新建。
+            if (_bucketPoolUsed < _bucketPool.Count)
+            {
+                list = _bucketPool[_bucketPoolUsed];
+                list.Clear();
+            }
+            else
+            {
+                list = new List<FinalTaskDraft>();
+                _bucketPool.Add(list);
+            }
+
+            _bucketPoolUsed++;
+            groups[key] = list;
+
+            // 2026-10-20 十八刀：(物料, 工厂) 分桶 —— **只在建组那一刻**登记（批内这些字段恒定，
+            //   后续追加不会改变归属）⇒ 桶序恒等于分组创建序 ＝ `groups.Values` 枚举序。
+            var mfKey = (task.MaterialId, task.FactoryId);
+            if (!_batchGroupsMfIndex.TryGetValue(mfKey, out var mfBucket))
+            {
+                mfBucket = new List<List<FinalTaskDraft>>();
+                _batchGroupsMfIndex[mfKey] = mfBucket;
+            }
+
+            mfBucket.Add(list);
+        }
+
+        list.Add(task);
+        return list;
+    }
+
+    /// <summary>
+    /// 2026-10-20 二十八刀：开一个**试排覆盖层** —— 允许试排代码把「副本尾巴」临时并进共享批分组索引，
+    ///   本候选跑完立刻回滚（见 <see cref="RollbackBatchGroupsOverlay"/>）。
+    ///   嵌套/重入：`SelectBestBatchPlan` 每个候选各开一次，开之前必须已回滚干净。
+    /// </summary>
+    private void BeginBatchGroupsOverlay()
+    {
+        _batchGroupsOverlayCounts ??= new Dictionary<string, int>(StringComparer.Ordinal);
+        _batchGroupsOverlayCreated ??= new List<(string Key, (int MaterialId, int FactoryId) MfKey)>();
+        _batchGroupsOverlayCounts.Clear();
+        _batchGroupsOverlayCreated.Clear();
+        _batchGroupsOverlayActive = true;
+    }
+
+    /// <summary>
+    /// 2026-10-20 二十八刀：把 `tasks[from..]` 临时并进共享批分组索引（覆盖层内，不扩快照）。
+    ///   已有键 ⇒ 记**追加前的桶长度**（回滚 = 截回该长度）；新键 ⇒ 记进「覆盖层新建键」表
+    ///   （回滚 = 整键删除，连 `(物料,工厂)` 分桶一起摘）。
+    /// </summary>
+    private void AppendBatchGroupsOverlayTail(List<FinalTaskDraft> tasks, int from)
+    {
+        var counts = _batchGroupsOverlayCounts!;
+        var created = _batchGroupsOverlayCreated!;
+        for (int i = from; i < tasks.Count; i++)
+        {
+            var task = tasks[i];
+            if (task.ExecutionBatchDraftKey is not string key) continue;
+
+            if (!_batchGroupsReuse.TryGetValue(key, out var bucket))
+            {
+                AddToGroup(_batchGroupsReuse, task);
+                created.Add((key, (task.MaterialId, task.FactoryId)));
+                continue;
+            }
+
+            if (!counts.ContainsKey(key)) counts[key] = bucket.Count;
+            bucket.Add(task);
+        }
+    }
+
+    /// <summary>
+    /// 2026-10-20 二十八刀：覆盖层回滚 —— 共享索引恢复到「只镜像真表」。
+    ///   ① 现有桶截回覆盖层开始前的长度（覆盖层只会往**桶尾**追加 ⇒ 截尾即精确还原桶序）；
+    ///   ② 覆盖层新建的键整键删除，并把该桶从 `(物料,工厂)` 分桶里摘掉（摘空就连 mf 键一起删）。
+    ///   任何一步核对不上（桶短了 / 键不见了）⇒ 置 `_batchGroupsSnapshotValid = false`，
+    ///   下一次走整表重建，**只会退回旧行为，不会留下错误分组**。
+    /// </summary>
+    private void RollbackBatchGroupsOverlay()
+    {
+        if (!_batchGroupsOverlayActive) return;
+        _batchGroupsOverlayActive = false;
+        RestoreBatchGroupsOverlay();
+    }
+
+    /// <summary>
+    /// 2026-10-20 二十八刀：把覆盖层**已经并进去的尾巴退掉**（覆盖层保持开启）。
+    ///   同一次 `RunBatchPlan` 里逐批各建一次分组索引 ⇒ 每次重并之前必须先退掉上一批那份。
+    /// </summary>
+    private void RestoreBatchGroupsOverlay()
+    {
+        if (_batchGroupsOverlayCounts is { Count: > 0 } counts)
+        {
+            foreach (var kv in counts)
+            {
+                if (!_batchGroupsReuse.TryGetValue(kv.Key, out var bucket) || bucket.Count < kv.Value)
+                {
+                    _batchGroupsSnapshotValid = false;
+                    continue;
+                }
+
+                if (bucket.Count > kv.Value) bucket.RemoveRange(kv.Value, bucket.Count - kv.Value);
+            }
+
+            counts.Clear();
+        }
+
+        if (_batchGroupsOverlayCreated is { Count: > 0 } created)
+        {
+            foreach (var (key, mfKey) in created)
+            {
+                if (!_batchGroupsReuse.TryGetValue(key, out var bucket))
+                {
+                    _batchGroupsSnapshotValid = false;
+                    continue;
+                }
+
+                _batchGroupsReuse.Remove(key);
+                if (!_batchGroupsMfIndex.TryGetValue(mfKey, out var mfBucket)) continue;
+
+                for (int i = mfBucket.Count - 1; i >= 0; i--)
+                {
+                    if (!ReferenceEquals(mfBucket[i], bucket)) continue;
+                    mfBucket.RemoveAt(i);
+                    break;
+                }
+
+                if (mfBucket.Count == 0) _batchGroupsMfIndex.Remove(mfKey);
+            }
+
+            created.Clear();
+        }
+    }
+
+    /// <summary>
+    /// 2026-10-20 十五刀：逐**引用**比较两张任务表的前 `snapshot.Count` 个元素。
+    /// 调用方已保证 `snapshot.Count &lt;= current.Count`。用 `Span` 顺序读，命中缓存行即为一次 `cmp`。
+    /// </summary>
+    private static bool IsPrefixSameReferences(
+        List<FinalTaskDraft> snapshot,
+        List<FinalTaskDraft> current)
+    {
+        var s = CollectionsMarshal.AsSpan(snapshot);
+        var c = CollectionsMarshal.AsSpan(current);
+        for (int i = 0; i < s.Length; i++)
+        {
+            if (!ReferenceEquals(s[i], c[i])) return false;
+        }
+
+        return true;
+    }
+
+
+    /// <summary>
+    /// 2026-10-20 二十七刀：批分组索引缓存**采纳前对齐**（快照 + 桶 + (物料,工厂) 分桶）。
+    ///
+    /// 【为什么】十五刀的增量缓存要求「任务表只追加」。而合批落定后的**采纳**会整表换掉真表：
+    ///   `scheduledTasks.Clear(); scheduledTasks.AddRange(winnerState.Tasks)`，而胜者那份表已经
+    ///   「摘掉锚点批 + 追加合批链」⇒ 表变短 ⇒ 前缀逐引用比对必然失败 ⇒ 整表重建。
+    ///   实测（16k）重建 3,602 次 × 574 µs = **2,069 ms**，触发原因分类 =
+    ///   **表变短 2,998 / 前缀失配 603 / 缓存失效 1** ⇒ 主犯就是本处采纳。
+    ///   而「新表 = 旧表 − 被摘除 + 尾部追加」这个形状**可以精确搬到桶上**，不必重扫全表。
+    ///
+    /// 【等价性证明】（字典键序 = 各键在任务表中**首次出现**的次序；桶内次序 = 任务表次序）
+    ///   ⓪ 先把「快照落后于旧真表」的尾巴补齐 —— 与 `BuildBatchGroupsIndex` 增量路径逐字相同。
+    ///   ① 双指针求「被摘除集合 R」与「尾部追加段 T」：新表其余元素与快照**逐引用同序**。
+    ///   ② 从桶里按引用摘掉 R：桶内次序不变；桶被摘空 ⇒ 键从字典删除（删除不改变其余键的插入序）。
+    ///   ③ 把 T 逐条 `AddToGroup`：T 的每个元素在新表里都排在任何快照元素之后 ⇒ 追加到桶尾正确；
+    ///      新键在 T 里首次出现 ⇒ 建到字典末尾，与全量重建的键序**逐字相同**。
+    ///   ④ `_batchGroupsMfIndex` 与字典同步删桶；(物料,工厂) 桶被删空时连 mf 键一起删
+    ///      ⇒ 枚举序仍等于分组创建序，`FindMergeableStageBatches` 的扫描次序逐字不变。
+    ///   ⑤ 桶池游标不动：被摘空的桶 `List` 留在池里但不被任何键引用，下次整表重建时按序复用 ⇒ 无泄漏。
+    ///
+    /// 【为什么不会误判】双指针只接受「新表 = 快照 − R + T」：
+    ///   · 中间**插入 / 替换**会让被摘元素出现在尾巴里 ⇒ 末尾那条校验（T ∩ R = ∅）直接否掉；
+    ///   · `|R| > 64` 一律否掉（形状不是「少量摘除」）。
+    ///   任何否掉 / 前提不成立都置 `_batchGroupsSnapshotValid = false` ⇒ 下一次 `BuildBatchGroupsIndex`
+    ///   走整表重建，与改前**逐字一致**（只会退回旧行为，不会产出错误分组）。
+    ///   ⚠ 全部校验（含「R 是否真在桶里」）都在**任何改动之前**做完 ⇒ 失败路径不会留下半改的缓存。
+    /// </summary>
+    /// <param name="current">采纳**前**的真表（桶/快照镜像的那张表）。</param>
+    /// <param name="next">采纳**后**的内容（胜者试排的任务表）。</param>
+    private bool TryReconcileBatchGroupsBeforeReplace(
+        List<FinalTaskDraft> current,
+        List<FinalTaskDraft> next)
+    {
+        // 覆盖层开启期间共享索引里混着「只在试排里存在」的 Task ⇒ 一律不对齐（回滚后自然干净）。
+        if (_batchGroupsOverlayActive
+            || !_batchGroupsSnapshotValid
+            || !ReferenceEquals(_batchGroupsSnapshotOwner, current))
+        {
+            SolverDiagnostics.CountBatchGroupReconcileOutcome(3);
+            return false;
+        }
+
+        // ⓪ 快照落后于旧真表的尾巴先补齐（与增量路径逐字相同）。前缀不成立 ⇒ 交回整表重建。
+        if (_batchGroupsSnapshot.Count > current.Count
+            || !IsPrefixSameReferences(_batchGroupsSnapshot, current))
+        {
+            _batchGroupsSnapshotValid = false;
+            SolverDiagnostics.CountBatchGroupReconcileOutcome(3);
+            return false;
+        }
+
+        for (int i = _batchGroupsSnapshot.Count; i < current.Count; i++)
+        {
+            AddToGroup(_batchGroupsReuse, current[i]);
+            _batchGroupsSnapshot.Add(current[i]);
+        }
+
+        // 快路径：新表只是「快照 + 尾巴」（内容没动 / 只追加）⇒ 补尾部即可。
+        if (_batchGroupsSnapshot.Count <= next.Count
+            && IsPrefixSameReferences(_batchGroupsSnapshot, next))
+        {
+            for (int i = _batchGroupsSnapshot.Count; i < next.Count; i++)
+            {
+                AddToGroup(_batchGroupsReuse, next[i]);
+            }
+
+            ReplaceBatchGroupsSnapshot(next);
+            SolverDiagnostics.CountBatchGroupReconcileOutcome(0);
+            return true;
+        }
+
+        // ① 双指针：新表 = 快照 − R + T。
+        var removed = new List<FinalTaskDraft>(8);
+        int a = 0;
+        int b = 0;
+        while (a < _batchGroupsSnapshot.Count && b < next.Count)
+        {
+            if (ReferenceEquals(_batchGroupsSnapshot[a], next[b]))
+            {
+                a++;
+                b++;
+                continue;
+            }
+
+            removed.Add(_batchGroupsSnapshot[a]);
+            a++;
+            if (removed.Count > 64) break;
+        }
+
+        if (removed.Count <= 64)
+        {
+            while (a < _batchGroupsSnapshot.Count)
+            {
+                removed.Add(_batchGroupsSnapshot[a]);
+                a++;
+                if (removed.Count > 64) break;
+            }
+        }
+
+        if (removed.Count > 64)
+        {
+            _batchGroupsSnapshotValid = false;
+            SolverDiagnostics.CountBatchGroupReconcileOutcome(2);
+            return false;
+        }
+
+        // 校验一：被摘除的元素不得出现在尾巴里（否则是「中间插入 / 替换」而不是「摘除 + 追加」）。
+        for (int t = b; t < next.Count; t++)
+        {
+            for (int r = 0; r < removed.Count; r++)
+            {
+                if (!ReferenceEquals(next[t], removed[r])) continue;
+                _batchGroupsSnapshotValid = false;
+                SolverDiagnostics.CountBatchGroupReconcileOutcome(2);
+                return false;
+            }
+        }
+
+        // 校验二：每个被摘除的元素都必须真在该批键的桶里（写之前验完 ⇒ 失败路径零改动）。
+        foreach (var task in removed)
+        {
+            if (task.ExecutionBatchDraftKey is not string key) continue;
+            if (!_batchGroupsReuse.TryGetValue(key, out var bucket))
+            {
+                _batchGroupsSnapshotValid = false;
+                SolverDiagnostics.CountBatchGroupReconcileOutcome(3);
+                return false;
+            }
+
+            var found = false;
+            foreach (var member in bucket)
+            {
+                if (!ReferenceEquals(member, task)) continue;
+                found = true;
+                break;
+            }
+
+            if (found) continue;
+
+            _batchGroupsSnapshotValid = false;
+            SolverDiagnostics.CountBatchGroupReconcileOutcome(3);
+            return false;
+        }
+
+        // ② 摘除：按引用摘掉；桶被摘空 ⇒ 连同 (物料,工厂) 分桶登记一并删除。
+        foreach (var task in removed)
+        {
+            if (task.ExecutionBatchDraftKey is not string key) continue;
+            var bucket = _batchGroupsReuse[key];
+
+            for (int i = bucket.Count - 1; i >= 0; i--)
+            {
+                if (!ReferenceEquals(bucket[i], task)) continue;
+                bucket.RemoveAt(i);
+                break;
+            }
+
+            if (bucket.Count != 0) continue;
+
+            _batchGroupsReuse.Remove(key);
+
+            var mfKey = (task.MaterialId, task.FactoryId);
+            if (!_batchGroupsMfIndex.TryGetValue(mfKey, out var mfBucket)) continue;
+
+            for (int i = mfBucket.Count - 1; i >= 0; i--)
+            {
+                if (!ReferenceEquals(mfBucket[i], bucket)) continue;
+                mfBucket.RemoveAt(i);
+                break;
+            }
+
+            if (mfBucket.Count == 0) _batchGroupsMfIndex.Remove(mfKey);
+        }
+
+        // ③ 追加尾巴。
+        for (int i = b; i < next.Count; i++)
+        {
+            AddToGroup(_batchGroupsReuse, next[i]);
+        }
+
+        ReplaceBatchGroupsSnapshot(next);
+        SolverDiagnostics.CountBatchGroupReconcileOutcome(1);
+        return true;
+    }
+
+    /// <summary>2026-10-20 二十七刀：把快照改成 `next` 的内容（逐引用），归属表不变。</summary>
+    private void ReplaceBatchGroupsSnapshot(List<FinalTaskDraft> next)
+    {
+        _batchGroupsSnapshot.Clear();
+        _batchGroupsSnapshot.AddRange(next);
+    }
+
+    /// <summary>
+    /// 2026-10-19：`FinalDraftId` → `scheduledTasks` 下标表。
+    ///
+    /// ⚠ **2026-10-20 十三刀已撤销本方法**（整段删除）。撤销依据（`正式基准_规模扫描_热点定位`
+    ///   resources=32 / FinalTask=22,296 / 2026-10-20）：
+    ///     · 建表 **17,774** 次（22,296 条 `Dictionary&lt;string,int&gt;` 插入 ≈ 1.64 ms/次）
+    ///     · 真正消费 **3,080** 次（`ComputeDetachPositions` 调用数）
+    ///   ⇒ 建 6 倍于用，且「建表」比「扫一遍表」本身更贵；摘除段改回全表扫描后
+    ///     `PrepIndex` 里那一半（≈ 14.8 s = ΣPhase 的 20.9%）整段消失，回落开销 ≈ 1.4 s。
+    ///   保留此注释仅为记录口径，**不再有对应代码**。
+    /// </summary>
 
     /// <summary>
     /// OWN-P0-02（0号位 2026-10-10《APS_V1_1_20261010.md》§三）：查找可合并的**完整 Stage 执行批**。
@@ -4335,7 +7314,10 @@ internal class PhaseTwoInitialScheduler
     ///   ④ 批内任一 Task 命中 `LockedTasks` ⇒ 整批排除（既成事实锚点不得被合批改写，M-04）；
     ///   ⑤ 源需求可追溯，且**不是** A/B 连续份额 / `NoSplitMerge`（不拆不合），**且与本需求不是同一条需求**（见上）；
     ///   ⑥ `StartStageCode` / `StartOperationCode` 一致（执行起点兼容）；
-    ///   ⑦ 批内数量一致（构造不变式），且「两需求合批后数量」不突破**锚点需求**的 Batch Policy `Max`（M-01 前提之一）。
+    ///   ⑦ 批内数量一致（构造不变式）。
+    ///      ⚠ **2026-10-14 S1-01 整改**：原 ⑦ 后半句「两需求合批后数量不突破锚点需求的 Batch Policy `Max`」
+    ///        **已删除** —— 经济 Max 是**软目标**，不得作为合批**合法性**判据（0号位《联合代码审核报告 v1.0》
+    ///        §4 S1-01，P0 CONFIRMED）。合批与否改由冻结四层目标联合择优（见 `PreferStageMerge`）。
     /// </summary>
     private List<List<FinalTaskDraft>> FindMergeableStageBatches(
         LogicalProductionDemand demand,
@@ -4343,7 +7325,7 @@ internal class PhaseTwoInitialScheduler
         List<FinalTaskDraft> scheduledTasks,
         ConstraintContext constraints,
         Dictionary<string, LogicalProductionDemand> demandByKey,
-        DomainSolveRequest? request)
+        Dictionary<string, List<FinalTaskDraft>>? prebuiltGroups = null)   // 2026-10-19 性能：候选循环外预建的批分组索引
     {
         var candidates = new List<List<FinalTaskDraft>>();
 
@@ -4355,35 +7337,62 @@ internal class PhaseTwoInitialScheduler
         }
 
         // 按执行批键分区：批键为 null 的 Task 不构成执行批 ⇒ 不能作为 Stage 合批目标。
-        var groups = new Dictionary<string, List<FinalTaskDraft>>(StringComparer.Ordinal);
-        foreach (var task in scheduledTasks)
-        {
-            if (task.ExecutionBatchDraftKey is not string key) continue;
-            if (!groups.TryGetValue(key, out var list))
-            {
-                list = new List<FinalTaskDraft>();
-                groups[key] = list;
-            }
-            list.Add(task);
-        }
+        // ── 2026-10-19 性能整改：索引**提到候选循环外只建一次** ──
+        //   本段把**全量** `scheduledTasks` 重新分组（O(N) 扫描 + 每个批键一个 `List` 分配），而本方法在
+        //   **每个 Routing 候选试跑**里都会被调用一次。每候选传进来的 `scheduledTasks` 都是
+        //   `new List<FinalTaskDraft>(scheduledTasks)`（`:1401`）—— **内容逐条相同**；且真正的
+        //   `scheduledTasks` 在本批候选循环内**不被改写**（所有写都落在 `trialTasks` / `trialOccupancy` /
+        //   `trialShares` 上）⇒ 分组结果逐候选**完全一致**（同键、同插入序；`Dictionary` 无删除 ⇒ 枚举序 = 插入序）。
+        //   ⇒ 由调用方在候选循环外建一次并透传（`prebuiltGroups`）；传 `null` ⇒ 逐字保留旧行为（其他调用点）。
+        //   实测（2026-10-19）：该段 8,764 ms = ΣPhase 的 14.6%（resources=16 / FinalTask=11,124）。
+        long swGroupIndex = SolverDiagnostics.HotspotStart();
+        // 2026-10-20 十五刀：此处 `scheduledTasks` 是**试排副本**，必须与真实表的索引缓存隔离 ⇒ `useCache:false`。
+        var groups = prebuiltGroups ?? BuildBatchGroupsIndex(scheduledTasks, useCache: false);
+        SolverDiagnostics.HotspotEnd(swGroupIndex, SolverDiagnostics.Hotspot.BatchGroupIndex);
 
-        foreach (var group in groups.Values)
+        // ── 2026-10-20 十八刀：主循环只扫 **(物料, 工厂) 同桶**，不再全量扫 ──
+        //   等价性见 `_batchGroupsMfIndex` 声明处：桶序 = 分组创建序 = `groups.Values` 枚举序
+        //   ⇒ 命中子序列与原「全扫后过滤」逐条同序 ⇒ `candidates` 内容与次序逐字相同。
+        //   只有当传入的正是 `_batchGroupsReuse`（增量缓存那份）时才启用；否则回落全量扫描。
+        IEnumerable<List<FinalTaskDraft>> scanSource =
+            ReferenceEquals(groups, _batchGroupsReuse)
+            && _batchGroupsMfIndex.TryGetValue((demand.MaterialId, demand.FactoryId), out var mfBucket)
+                ? mfBucket
+                : groups.Values;
+
+        // 2026-10-19 三次定位：登记**这一遍扫了多少个批分组**（与「几个锚批能活下来」无关）。
+        SolverDiagnostics.CountMergeScan(
+            scanSource is ICollection<List<FinalTaskDraft>> sized ? sized.Count : groups.Count);
+
+        // 2026-10-20 五次定位：主循环耗时（逐候选扫描批分组；纯观测）。
+        long swAnchorScan = SolverDiagnostics.HotspotStart();
+        foreach (var group in scanSource)
         {
             // ① 工序集合完全一致（数量 + 身份）。
             if (group.Count != operations.Count) continue;
+
+            var anchorTask = group[0];
+            var sourceKey = anchorTask.SourceDraftId;
+
+            // ② 同物料 / 同工厂。
+            //
+            // ── 2026-10-20 性能（第五刀）：**判据次序重排，语义逐字不变** ──
+            //   原次序把这两个 `int` 比较排在「构造本组 `HashSet<OperationNodeKey>` + `SetEquals`」**之后**
+            //   ⇒ 每次试排都要为**全部**分组各分配一个 HashSet 并做一遍哈希插入，
+            //   而本段实测 **65,175 ms = ΣPhase 的 48.0%**（16k 档：35,548 次试排 × 平均 4,226 组
+            //   = 1.5 亿次分组迭代，`平均每次扫描批分组=4,226` 而活下来的锚批只有 **4.9** 个）。
+            //   两个 `int` 比较是纯过滤：同物料同工厂的分组极少 ⇒ 提到最前面后，
+            //   `HashSet` 只为「可能命中」的分组构造，过滤结果**逐条相同**（都是 `continue`，彼此无依赖）。
+            //   ⚠ 只是**判定次序**变化，**判据集合、判据内容、命中结果全部不变**（不是放宽/收紧任何条件）。
+            if (anchorTask.MaterialId != demand.MaterialId) continue;
+            if (anchorTask.FactoryId != demand.FactoryId) continue;
+
             var groupOps = new HashSet<OperationNodeKey>();
             foreach (var t in group)
             {
                 groupOps.Add(OperationNodeKey.Of(t.StageCode, t.OperationCode));
             }
             if (!groupOps.SetEquals(opByKey.Keys)) continue;
-
-            var anchorTask = group[0];
-            var sourceKey = anchorTask.SourceDraftId;
-
-            // ② 同物料 / 同工厂。
-            if (anchorTask.MaterialId != demand.MaterialId) continue;
-            if (anchorTask.FactoryId != demand.FactoryId) continue;
 
             var matched = true;
             foreach (var t in group)
@@ -4455,16 +7464,27 @@ internal class PhaseTwoInitialScheduler
             if (!string.Equals(demand.StartStageCode, anchorDemand.StartStageCode, StringComparison.Ordinal)) continue;
             if (!string.Equals(demand.StartOperationCode, anchorDemand.StartOperationCode, StringComparison.Ordinal)) continue;
 
-            // ⑦ 合批后数量不得突破锚点需求 Batch Policy 的 Max（Min 由两需求各自的既有合法性覆盖）。
-            var combinedQty = anchorTask.Quantity + demand.NetOutputQty;
-            if (request is not null)
-            {
-                var anchorPolicy = ResolveExecutionBatchPolicy(anchorDemand, request, constraints);
-                if (anchorPolicy?.MaxExecutionBatchQty is decimal maxQty && combinedQty > maxQty) continue;
-            }
+            // ⑦ ── 2026-10-14 S1-01 整改：**删除「合批后数量不得突破经济 Max」这条硬拒绝** ──
+            //   依据：0号位《APS V1｜1～5号位联合代码审核报告 v1.0》§4 **S1-01（P0 CONFIRMED）** 逐字：
+            //     「……**合批资格亦用经济Max硬拒绝**……**最小整改**：……在硬PI闸和**合批合法性闸排除经济Max**；
+            //      软Max仅进入有界候选评分。反例：PI剩1000、Stage新增合法400、经济Max30/600，
+            //      若允许拆合且资源合法，**不能只因经济Max得出PI超限**。」
+            //   旧实现（已删）：`combinedQty > anchorPolicy.MaxExecutionBatchQty ⇒ continue` ——
+            //     把**经济**（软）单批偏好当成合批的**硬**资格 ⇒ 合法合批被静默排除。
+            //   ⇒ 现行口径：合批**合法性**只由下述硬判据决定（工序集合一致 / 同物料同工厂 / 同一条真实
+            //     Path / 未锁定 / 源需求可追溯且非 A/B 连续份额 / 非同一需求 / 执行起点兼容）；
+            //     合批与否由**冻结四层目标 + 经济软偏离**联合择优（`PreferStageMerge`：可行 → 履约 →
+            //     交期(受 Direction 控制) → Setup → **④.5 经济软偏离(R-2)**；判平取独立排程）。
+            //   ✅ **2026-10-14 残留已闭环**（0号位《正式回复 v2.0》§二 S1-01 ④ 明确「不批准……移出本轮」）：
+            //     合批候选侧的经济软偏离项**已实现** —— 见 `PreferStageMerge` ④.5 与 `EconomicDeviationForQty`；
+            //     数量口径与 `TryMergeDemandIntoStageBatch` 的 `combinedNet` **同源**。
+            //     0号位 判词「软Max仅进入**有界候选评分**」现**两侧均成立**（拆批侧 `CompareBatchPlans` +
+            //     合批侧 `PreferStageMerge` ④.5，同一助手同口径）。⇒ 经济 Max **不再是**「既非硬、亦未入软」的真空档。
+            //     鉴别性证据：`StageBatchMergeTests.M_11_*`（④.5 落点前后结果可分辨）。
 
             candidates.Add(group);
         }
+        SolverDiagnostics.HotspotEnd(swAnchorScan, SolverDiagnostics.Hotspot.MergeAnchorScan);
 
         return candidates;
     }
@@ -4627,6 +7647,9 @@ internal class PhaseTwoInitialScheduler
             UOM = targetTask.UOM,
             PlannedStartTime = targetTask.PlannedStartTime,
             PlannedEndTime = newEndTime, // 新的结束时间
+            // Duration-1（合批）：按**合并后**数量算的 mergedDuration（本方法内 `StandardDuration × mergedQty ÷ CapacityFactor`）；
+            //   与下方 `PlannedProcessQty = mergedQty` 同一乘数，两者必须一起走，否则本字段与新数量脱钩。
+            EffectiveProcessMinutes = mergedDuration,
             SetupTime = targetTask.SetupTime,
             SetupSource = targetTask.SetupSource,   // SetupSource 填充：合并保留 target 来源（2号位 原样落库）
             Priority = targetTask.Priority,
@@ -4651,12 +7674,18 @@ internal class PhaseTwoInitialScheduler
 
         // 第6轮Merge修复：记录AllocationTaskShare时保留原Task的历史Demand
         // 原Task可能已经服务于其他Demand，不能覆盖
-        if (!allocationTaskShare.ContainsKey(mergedTask.FinalDraftId))
-        {
-            allocationTaskShare[mergedTask.FinalDraftId] = new List<(string, decimal)>();
-        }
+        // ── 2026-10-19 写时复制（`CloneShares` 改浅拷后**必须**换新表，不得原地 `Add`）──
+        //   份额表在候选试排隔离副本上与父表**共享未写条目的 list 对象**（见 `CloneShares` 注释）；
+        //   若此处原地 `Add`，会把份额写进父表 ⇒ 隔离失效。改为「复制 + 追加 + 换槽位」，语义逐字等价。
+        var mergedSharePrev = allocationTaskShare.TryGetValue(mergedTask.FinalDraftId, out var mergedShareCur)
+            ? mergedShareCur
+            : null;
+        var mergedShareNext = mergedSharePrev is null
+            ? new List<(string, decimal)>(1)
+            : new List<(string, decimal)>(mergedSharePrev);
         // 追加当前Demand的份额（原Task的份额已在之前记录）
-        allocationTaskShare[mergedTask.FinalDraftId].Add((demand.LogicalDemandKey, demand.NetOutputQty));
+        mergedShareNext.Add((demand.LogicalDemandKey, demand.NetOutputQty));
+        ShareSet(allocationTaskShare, mergedTask.FinalDraftId, mergedShareNext);
 
         // 第6轮Merge修复：更新资源占用，包含Setup时间
         if (resourceOccupancy.ContainsKey(targetResourceId))
@@ -4720,7 +7749,14 @@ internal class PhaseTwoInitialScheduler
         DateTime dynamicMaterialFloor,
         StageOverlapParams stageOverlap,
         Dictionary<int, List<TimeWindow>>? occupancyPristine,
-        out List<FinalTaskDraft> combinedTasks)   // OWN-P0-02：合批产出的**完整 Operation 链**（供候选比较取 Setup 总量）
+        out List<FinalTaskDraft> combinedTasks,   // OWN-P0-02：合批产出的**完整 Operation 链**（供候选比较取 Setup 总量）
+        bool detachTaskList = true,   // 2026-10-19 性能：是否从 `scheduledTasks` **真摘除**（试排路径传 false，见摘除段注释）
+        // ── 2026-10-20 十七刀：**擂台试排不留状态**（只在候选擂台用；真实落定路径传 false）──
+        //   擂台每个锚点都完整跑一遍本方法，但**结果整份丢弃**（`:5509` 后胜者按 `bestMergeCombinedTasks` 重跑）。
+        //   旧写法为此把占用表**逐资源深拷**（16k 实测 `DetachCopy` 6,362 ms = 12.9%，40k 50,650 ms = 12.5%），
+        //   而拷贝只为「改完能丢」。现改为：**直接改真表**，跑完在这里用**现成的身份回滚**原样还原 ——
+        //   与失败路径（`:7052`/`:7077`）走的是**同一套**函数，不是新写的回滚逻辑。
+        bool discardAfterRun = false)
     {
         combinedTasks = new List<FinalTaskDraft>();
 
@@ -4740,20 +7776,75 @@ internal class PhaseTwoInitialScheduler
         var combinedDemand = CloneDemandWithBatchQty(anchorDemand, combinedNet, combinedProc);
 
         // ── 快照（用于失败回滚；试排阶段作用于克隆表，落定阶段作用于真实表，两处语义一致）──
-        var ids = new HashSet<string>(targetBatch.Select(t => t.FinalDraftId), StringComparer.Ordinal);
+        long swDetach = SolverDiagnostics.HotspotStart();
+        long swSeg1 = SolverDiagnostics.HotspotStart();   // 二次定位：摘除段第 1 块
         var removedTasks = new List<(int Index, FinalTaskDraft Task)>();
         var removedWindows = new List<(int ResourceId, TimeWindow Window)>();
         var removedTimeline = new List<(int ResourceId, DateTime End, int MaterialId)>();
         var removedShares = new List<(string FinalDraftId, List<(string DemandKey, decimal ShareQty)> Shares)>();
 
-        // 1) Task（自高位起移除；`removedTasks` 事后按原索引升序回插）
-        for (int i = scheduledTasks.Count - 1; i >= 0; i--)
+        // 1) Task（**单趟压缩**摘除，见 `RemoveTasksAtPositions`；`removedTasks` 按原索引升序登记，供回滚回插）
+        // ── 2026-10-20 十三刀：**撤销**预建下标表，一律全表扫描定位 ──
+        //   2026-10-19 那次整改把本段 15,437 ms 降下来，但分母是「84,110 次调用」——**含 97.3% 的试排**。
+        //   试排路径随后已跳过列表摘除（`detachTaskList == false`，见下条），真正消费索引的只剩落定，
+        //   实测仅 **3,080** 次；而索引每批都要建（**17,774** 次 × 22,296 条插入 ≈ 1.64 ms）。
+        //   ⇒ 建 6 倍于用，且建表比扫描本身更贵 ⇒ 撤掉索引反而更快（回落 ≈ 3,080 × 0.45 ms ≈ 1.4 s）。
+        //   本分支即 2026-10-19 之前的**原始路径**（逐条 `ids.Contains` 全表扫描），语义逐字未变。
+        // ── 2026-10-19 性能：**试排路径跳过列表摘除**（`detachTaskList == false`）──
+        //   试排调用（`TryMergeOrSchedule` 锚点循环内，`:4949`）传入的 `scheduledTasks` 是 `mrgTasks`
+        //   —— 该处 `new List<>(scheduledTasks)` 新建的**丢弃副本**：`grep mrgTasks` 显示它只在建处
+        //   （`:4946`）与传参处（`:4951`）出现，此后**从未被读**。整条试排链
+        //   （`ScheduleDemandOperationsCore` → `ScheduleBackward`/`ScheduleForward` → 全部子方法）
+        //   也**从不读任务列表**（实测本文件 `scheduledTasks` 在 `:1885` 与 `:4724` 之间零命中）。
+        //   实测 63,854 次摘除里 **62,159 次（97.3%）来自试排** ⇒ 定位段（`DetachIndexBuild`
+        //   约 3,3xx ms ≈ ΣPhase 的 7%）是**纯浪费**；去掉它**不改任何业务结果**（列表本来就被丢弃）。
+        //   ⚠ 落定调用（真实 `scheduledTasks`，`:5278`）传默认 `true`，**照摘不误**，并保留原索引供失败回滚回插。
+        //   ⚠ `removedTasks` **两种路径都必须登记全部目标 Task** —— 下方「摘占用窗 / 产品时间线 /
+        //     份额」三段依赖它；试排路径索引填 `-1` 哨兵 ⇒ `RestoreStageBatchSnapshot` 跳过回插。
+        var positions = new List<int>(targetBatch.Count);
+        if (detachTaskList)
         {
-            if (!ids.Contains(scheduledTasks[i].FinalDraftId)) continue;
-            removedTasks.Add((i, scheduledTasks[i]));
-            scheduledTasks.RemoveAt(i);
+            positions = ComputeDetachPositions(targetBatch, scheduledTasks);
+
+            // 先按**原下标升序**登记要摘的 Task（此刻下标仍有效），供回滚按原索引回插。
+            foreach (var p in positions)
+            {
+                removedTasks.Add((p, scheduledTasks[p]));
+            }
+
+            SolverDiagnostics.CountDetachShape(positions.Count, scheduledTasks.Count);
         }
-        removedTasks.Reverse();
+        else
+        {
+            // 试排路径：列表是丢弃副本 ⇒ 不定位、不摘除；只登记 Task 对象供下方三段使用。
+            foreach (var t in targetBatch)
+            {
+                removedTasks.Add((-1, t));
+            }
+        }
+
+        SolverDiagnostics.HotspotEnd(swSeg1, SolverDiagnostics.Hotspot.DetachLocate);
+
+        // 自高位起逐个摘除：每次 `RemoveAt` 只前移「该下标之后的尾巴」，k 个散点总搬移量最小。
+        //   ⚠ **2026-10-19 实测否掉了「单趟压缩」替代方案**（曾改为逐元素前移 + `RemoveRange`）：
+        //     实测形状 = **每次只摘 k=3 个**、列表 n≈8,673（`摘除段形状` 计数器，8k 档 63,854 次调用）。
+        //     k 这么小时单趟压缩要搬 n 个元素、且逐元素写要走 GC 写屏障（约 7 ns/元素），
+        //     而逐个 `RemoveAt` 走 `Array.Copy`（约 1.3 ns/引用）且只搬 k·n/2 ≈ 1.3 万个引用
+        //     ⇒ 压缩版**理论更慢**，A/B 实测差异（−5%）落在机器噪声内、不可复现 ⇒ 撤回。
+        long swSeg1b = SolverDiagnostics.HotspotStart();
+        for (int k = positions.Count - 1; k >= 0; k--)
+        {
+            scheduledTasks.RemoveAt(positions[k]);
+        }
+
+        // 2026-10-20 二十九次定位：摘除落在真表还是试排副本（纯观测）。
+        if (positions.Count > 0)
+        {
+            SolverDiagnostics.CountBatchGroupReconcileOutcome(
+                ReferenceEquals(scheduledTasks, _batchGroupsSnapshotOwner) ? 4 : 5);
+        }
+
+        SolverDiagnostics.HotspotEnd(swSeg1b, SolverDiagnostics.Hotspot.DetachRemoveAt);
 
         // 2) 资源占用窗 / 3) 产品时间线登记 / 4) 份额血缘
         foreach (var (_, t) in removedTasks)
@@ -4763,26 +7854,61 @@ internal class PhaseTwoInitialScheduler
                 var occStart = t.PlannedStartTime - TimeSpan.FromMinutes((double)t.SetupTime);
                 var window = new TimeWindow(occStart, t.PlannedEndTime);
 
-                EnsureOwned(resourceOccupancy, occupancyPristine, rid);
+                // 2026-10-20 六次定位：按 task 计时会污染总量（已知），但这里只切三刀且每刀只包
+                //   一次字典查找/二分，`HotspotEnd` 的开销（约 1.6M 次 × 约 100 ns ≈ 0.16 s）远小于
+                //   待归因的 7.7 s，足够区分量级。纯观测。
+                long swDetOcc = SolverDiagnostics.HotspotStart();
+
+                // ⚠ 2026-10-19：此处**不放**逐 Task 的子埋点 —— 每 Task 一对 `HotspotStart/End`
+                //   在 8k 档是 191,562 对，其自身开销会**污染** `MergeBatchDetach` 的总读数。
+                //   该子段的一次性定位已完成（`DetachEnsureOwned` 1,063 ms / `DetachBookkeeping` 1,512 ms），
+                //   结论：二者合计仅占 ΣPhase 约 2.8%，**不是**摘除段主体 ⇒ 不再保留逐 Task 埋点。
+                // 2026-10-20 十次定位：把「拷」与「搬」分开量（12.49 µs/次 与常识差一个数量级）。
+                long swDetCopy = SolverDiagnostics.HotspotStart();
+                var occupancyCopied = EnsureOwnedCore(resourceOccupancy, occupancyPristine, rid);
+                SolverDiagnostics.HotspotEnd(swDetCopy, SolverDiagnostics.Hotspot.DetachCopy);
+
+                long swDetRem = SolverDiagnostics.HotspotStart();
                 if (resourceOccupancy.TryGetValue(rid, out var windows))
                 {
-                    var idx = windows.FindIndex(w => w.Start == window.Start && w.End == window.End);
+                    // 2026-10-20 六次定位：登记「是否真拷 + 该资源窗列表长度」⇒ 算拷贝份数与平均列表长。
+                    SolverDiagnostics.CountDetachOccupancyShape(windows.Count, occupancyCopied);
+                    // ── 2026-10-19 性能整改：占用窗列表**按 `(Start, End)` 升序**（不变式见
+                    //   `AddOccupancyWindow` 二分插入 / `:2981` 明文注释），故用**同比较器二分**定位，
+                    //   取代 O(每资源窗数) 的 `FindIndex`。
+                    //   实测（2026-10-19 基准，resources=16 / FinalTask=11,124）：摘除段仍余 5,493 ms
+                    //   全部来自这一行 —— 调用 84,110 次 × 约 3 个 Task × 每资源约 700 窗 ≈ **1.76 亿次比较**。
+                    //   ⚠ 二分未命中 ⇒ **回落** `FindIndex`（原路径逐字保留）⇒ 结果不变，只影响快慢。
+                    var idx = FindOccupancyWindowIndex(windows, window);
+                    if (idx < 0)
+                    {
+                        SolverDiagnostics.CountDetachOccupancyBinaryMiss();
+                        idx = windows.FindIndex(w => w.Start == window.Start && w.End == window.End);
+                    }
+
                     if (idx >= 0)
                     {
                         removedWindows.Add((rid, windows[idx]));
                         windows.RemoveAt(idx);
                     }
                 }
+                SolverDiagnostics.HotspotEnd(swDetRem, SolverDiagnostics.Hotspot.DetachRemove);
+                SolverDiagnostics.HotspotEnd(swDetOcc, SolverDiagnostics.Hotspot.DetachOccupancy);
 
+                long swDetTl = SolverDiagnostics.HotspotStart();
                 removedTimeline.Add((rid, t.PlannedEndTime, t.MaterialId));
                 constraints.ProductTimeline.Remove(rid, t.PlannedEndTime, t.MaterialId);
+                SolverDiagnostics.HotspotEnd(swDetTl, SolverDiagnostics.Hotspot.DetachTimeline);
             }
 
+            long swDetSh = SolverDiagnostics.HotspotStart();
             if (allocationTaskShare.TryGetValue(t.FinalDraftId, out var shares))
             {
                 removedShares.Add((t.FinalDraftId, shares));
-                allocationTaskShare.Remove(t.FinalDraftId);
+                // 2026-10-20 十六刀：走日志版本 ⇒ 擂台上就地摘键、锚点结束由 `RollbackShareUndo` 精确还原。
+                ShareRemove(allocationTaskShare, t.FinalDraftId);
             }
+            SolverDiagnostics.HotspotEnd(swDetSh, SolverDiagnostics.Hotspot.DetachShare);
         }
 
         // ── V1_3 F-01（0号位 2026-10-10《APS_V1_3_20261010.md》§3，REWORK/BLOCKED）修复：**按插入身份回滚** ──
@@ -4799,9 +7925,13 @@ internal class PhaseTwoInitialScheduler
         //   ⚠ 不把「COW 通常隔离试排」当作允许真实落定失败时残留状态的理由：真实落定路径
         //     （`TryMergeDemandIntoStageBatch` 由 3611 行以**真实表**调用）非克隆，**必须**按身份回滚；
         //     试排克隆表上回滚是无害的（克隆随即丢弃），保持同一代码路径以便联验。
-        var occupancyBaselineResourceIds = CaptureOccupancyResourceIds(resourceOccupancy);
+        long swSeg4 = SolverDiagnostics.HotspotStart();
+        // 键集基线取入口拍的那一份（见 `_occupancyBaselineResourceIds`）；未走入口时回落现算。
+        var occupancyBaselineResourceIds = _occupancyBaselineResourceIds ?? CaptureOccupancyResourceIds(resourceOccupancy);
         var occupancyInsertLog = new List<(int ResourceId, TimeWindow Window)>();
         var timelineBeforeRerun = constraints.ProductTimeline.Clone();
+        SolverDiagnostics.HotspotEnd(swSeg4, SolverDiagnostics.Hotspot.DetachTail);
+        SolverDiagnostics.HotspotEnd(swDetach, SolverDiagnostics.Hotspot.MergeBatchDetach);
 
         // ── 重跑完整排程：同一 Path、同一批键、完整 Operation 链 ──
         combinedTasks = ScheduleDemandOperations(
@@ -4847,6 +7977,34 @@ internal class PhaseTwoInitialScheduler
                 resourceOccupancy, occupancyPristine, constraints, allocationTaskShare);
             combinedTasks = new List<FinalTaskDraft>();   // 未落定 ⇒ 不得把产出当作合批结果外传
             return null;
+        }
+
+        // ── 2026-10-20 十七刀：擂台试排 ⇒ **跑完即整份还原**，只把产出链外传供候选比较 ──
+        //   本段与失败路径（`:7052`/`:7077`）**调用同一套回滚函数**，顺序也一致
+        //   （先按插入身份撤占用 → 还原时间线 → `RestoreStageBatchSnapshot` 补回被移出的窗/时间线/份额/Task）。
+        //   ⚠ 调用方在 discard 模式下传 `occupancyPristine = null`（关掉写时复制）且 `detachTaskList = false`，
+        //     所以此处「真表」上的改动恰好等于上面登记的那几条：
+        //       · 摘除段登记的 `removedWindows` / `removedTimeline` / `removedShares`；
+        //       · 重跑段经 `AddOccupancyWindow(..., occupancyInsertLog)` 登记的每一个插入窗。
+        //     ⇒ 还原后占用表 / 时间线 / 份额表与进入本方法前**逐条相同**（不是近似、不是截尾）。
+        if (discardAfterRun)
+        {
+            SolverDiagnostics.CountOccupancyRollbackUnmatched(
+                RollbackInsertedOccupancyWindows(
+                    resourceOccupancy, occupancyBaselineResourceIds, occupancyInsertLog));
+            constraints.ProductTimeline = timelineBeforeRerun;
+            RestoreStageBatchSnapshot(
+                scheduledTasks, removedTasks, removedWindows, removedTimeline, removedShares,
+                resourceOccupancy, occupancyPristine, constraints, allocationTaskShare);
+
+            FinalTaskDraft discardedRepresentative = combinedTasks[0];
+            foreach (var t in combinedTasks)
+            {
+                if (t.PlannedEndTime > discardedRepresentative.PlannedEndTime) discardedRepresentative = t;
+            }
+
+            // 不落定：`scheduledTasks.AddRange` 与份额登记都跳过（擂台不采纳任何状态）。
+            return discardedRepresentative;
         }
 
         // ── 落定 ──
@@ -4903,8 +8061,8 @@ internal class PhaseTwoInitialScheduler
 
         foreach (var combinedTask in combinedTasks)
         {
-            allocationTaskShare[combinedTask.FinalDraftId] =
-                new List<(string DemandKey, decimal ShareQty)>(shareList);
+            ShareSet(allocationTaskShare, combinedTask.FinalDraftId,
+                new List<(string DemandKey, decimal ShareQty)>(shareList));
         }
 
         // 候选比较用代表 Task = 完成最晚者（真实完成时间，取代「并入既有 Task 无完成时间」的占位）。
@@ -4948,8 +8106,60 @@ internal class PhaseTwoInitialScheduler
 
         foreach (var (index, task) in removedTasks)
         {
+            // 2026-10-19 性能：`index < 0` = **试排路径的哨兵**（该路径根本没从 `scheduledTasks` 摘除，
+            //   见 `TryMergeDemandIntoStageBatch` 的「试排路径跳过列表摘除」注释）⇒ 无需回插。
+            if (index < 0) continue;
+
             scheduledTasks.Insert(index < scheduledTasks.Count ? index : scheduledTasks.Count, task);
         }
+    }
+
+    /// <summary>
+    /// 摘除段第 1 块 —— **定位** `targetBatch` 各 Task 在 `scheduledTasks` 中的下标（升序）。
+    ///   实现 = **全表扫描**（只读）：自高位起收集后反转成升序；同一 id 出现多次时**全部**收集
+    ///   （与 2026-10-19 之前的原始实现逐字一致）。
+    ///   原为 <see cref="TryMergeDemandIntoStageBatch"/> 内联代码，2026-10-19 **原样抽出（零逻辑改动）**，
+    ///   以便试排路径**整段跳过**（见该处「试排路径跳过列表摘除」注释）。
+    ///   2026-10-20 十三刀：撤销 2026-10-19 的「预建下标表」快路径 —— 实测建表 **17,774** 次
+    ///   而真正消费仅 **3,080** 次（`ComputeDetachPositions` 调用数），且建表比扫描本身更贵
+    ///   ⇒ 快路径整段删除，只留原扫描路径（语义逐字未变）。
+    /// </summary>
+    private static List<int> ComputeDetachPositions(
+        List<FinalTaskDraft> targetBatch,
+        List<FinalTaskDraft> scheduledTasks)
+    {
+        SolverDiagnostics.CountDetachPosCall();   // 2026-10-20 十二次定位：纯观测（本方法调用次数）
+        var positions = new List<int>(targetBatch.Count);
+        if (targetBatch.Count == 0) return positions;
+
+        // ── 2026-10-20 二十刀：**引用身份优先、id 兜底**（判定结果与「按 id 收集」逐字等价）──
+        //   改前：对整个任务表（16k 档 22,296 条）逐条算 `FinalDraftId` 的字符串哈希 + `HashSet<string>` 查找。
+        //   实测（20 次定位，同轮比值口径）：`DetachLocate` 占 ΣPhase **10.8%**，全表扫描 3,080 次
+        //   ⇒ 单次约 0.9~1.8 ms，几乎全花在这 2.2 万次字符串哈希上。
+        //   而命中只有 k≈3 条 ⇒ 先用 `ReferenceEquals` 对 k 个目标做指针比较：
+        //     · 引用相等 ⇒ 必然 id 相等（同一对象）⇒ 直接命中，**不必**再比字符串；
+        //     · 引用不等 ⇒ 回落原 `string.Equals(..., Ordinal)` —— 与 `StringComparer.Ordinal` 的
+        //       `HashSet<string>` 判定**同值**（Ordinal 下「哈希相等 + 内容相等」⇔「内容相等」）⇒ 结果逐条相同。
+        //   `targetDraftIds` 预先取一次，避免内层循环重复读属性。
+        var targetDraftIds = new string[targetBatch.Count];
+        for (int j = 0; j < targetBatch.Count; j++) targetDraftIds[j] = targetBatch[j].FinalDraftId;
+
+        for (int i = scheduledTasks.Count - 1; i >= 0; i--)
+        {
+            var task = scheduledTasks[i];
+            for (int j = 0; j < targetBatch.Count; j++)
+            {
+                if (ReferenceEquals(task, targetBatch[j])
+                    || string.Equals(task.FinalDraftId, targetDraftIds[j], StringComparison.Ordinal))
+                {
+                    positions.Add(i);
+                    break;
+                }
+            }
+        }
+
+        positions.Reverse();
+        return positions;
     }
 
     /// <summary>
@@ -5136,6 +8346,17 @@ internal class InitialScheduleResult
     public List<string> BatchPolicyMissingDemandKeys { get; set; } = new();
 
     /// <summary>
+    /// **2026-10-13 新增**（0号位《未命名的Markdown文件4.md》§3.3）：本 Run 中因 Batch Policy
+    /// **状态不可获得**（`BATCH_POLICY_STATE_UNAVAILABLE` ⇒ 输入契约缺陷）而 fail-closed 的需求。
+    ///
+    /// 与前两列**分列**：本列是**输入契约缺陷**（载荷无状态位 ⇒ 无法证明「确无规则」），
+    /// **不是**业务治理 Issue（`BatchPolicyConflicts`）、**也不是**可信的业务 `MISSING`（`BatchPolicyMissingDemandKeys`）。
+    /// 0号位 逐字：「`UNKNOWN / NOT_DELIVERED / LOAD_ERROR`……按现有运行错误/输入契约缺陷处理，
+    /// **不能直接当 MISSING**；**不得静默失去净需求**」⇒ 本条即「未排 ＋ 净需求保留追溯」的登记点。
+    /// </summary>
+    public List<string> BatchPolicyUnavailableDemandKeys { get; set; } = new();
+
+    /// <summary>
     /// **需求键 → 硬失败原因**（`BATCH_POLICY_MISSING` / `BATCH_POLICY_CONFLICT`）。
     ///
     /// P0-02（0号位 2026-10-08 §五）：Solver 内部必须明确区分「**可修复未排**」与「**硬业务失败**」。
@@ -5159,6 +8380,20 @@ internal class InitialScheduleResult
     /// </summary>
     public bool TechnicalFailure { get; set; } = false;
     public string? TechnicalFailureReason { get; set; }
+
+    /// <summary>
+    /// **2026-10-25 新增**（响应 2号位《单域可复现样本与自查方式》§7.1）：需求键 → Phase2 **自报的出口正文**。
+    ///
+    /// 【它解决什么】Phase2 里能让一条需求「0 Task 且槽位检索 0 次」的出口有十几条，**全都不留字**，
+    ///   出口只能落到 Phase5 的泛化 `Phase 2 初始排程失败，Phase 4 修复未成功` ⇒
+    ///   「0 次」到底是「物料不足」「无合格资源」「没有工序」还是「批未落定」**分不出来**，
+    ///   而这几条指向完全相反的方向（采购 / 工艺主数据 / 产能日历 / 批策略）。
+    ///
+    /// 【使用边界】**只做 `SolveTraceNote.Message` 的人可读正文**。
+    ///   不改 `UnscheduledTaskResult.Reason`、不改任何既有归属、不改 `Success`、不改任务集合。
+    ///   同一需求多次尝试（Routing 候选 / 批方案候选 / 倒排转正排）时只保留**最后一次**。
+    /// </summary>
+    public Dictionary<string, string> Phase2BlockedDetails { get; set; } = new(StringComparer.Ordinal);
 
     /// <summary>某需求是否属**硬业务失败**（Batch Policy 缺失 / 冲突）—— Phase4 据此禁止普通修复。</summary>
     public bool IsBatchPolicyHardFailure(string logicalDemandKey)

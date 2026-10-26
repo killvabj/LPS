@@ -123,7 +123,7 @@ public class ScheduleRunRepository : IScheduleRunRepository
                      [SourceScheduleRunId], [CreatedBy], [CreatedAt])
                 OUTPUT INSERTED.[Id]
                 VALUES (@VersionCode, 'RECOVERY', @DomainKey,
-                        @PlanHorizonStart, @PlanHorizonEnd, 'FULL', 'Created',
+                        @PlanHorizonStart, @PlanHorizonEnd, 'FULL', 'BUILDING',
                         @SourceScheduleRunId, @CreatedBy, @CreatedAt)";
 
             foreach (var shell in shells)
@@ -213,7 +213,7 @@ public class ScheduleRunRepository : IScheduleRunRepository
                      [SourceScheduleRunId], [CreatedBy], [CreatedAt])
                 OUTPUT INSERTED.[Id]
                 VALUES (@VersionCode, 'CANDIDATE', @DomainKey,
-                        @PlanHorizonStart, @PlanHorizonEnd, 'FULL', 'Created',
+                        @PlanHorizonStart, @PlanHorizonEnd, 'FULL', 'BUILDING',
                         @SourceScheduleRunId, @CreatedBy, @StartedAt)";
 
             var shellId = await connection.QueryFirstOrDefaultAsync<int>(insertShellSql,
@@ -241,5 +241,23 @@ public class ScheduleRunRepository : IScheduleRunRepository
                 NewPlanVersionId = shellId,
             };
         }, db: DatabaseId.APS);
+    }
+
+    /// <inheritdoc />
+    public async Task<int> CountReferencingStrategyProfileVersionAsync(IReadOnlyList<long> strategyProfileVersionIds, CancellationToken ct = default)
+    {
+        // 2026-10-26 同 R1 口径：策略包删除 FK 防护（ScheduleRun.StrategyProfileVersionId 反查），不区分状态
+        // （硬删策略包会连带 FK 违约，任何运行引用都阻断）。
+        if (strategyProfileVersionIds == null || strategyProfileVersionIds.Count == 0)
+        {
+            return 0;
+        }
+
+        const string sql = @"
+            SELECT COUNT(1) FROM [dbo].[ScheduleRun]
+            WHERE [StrategyProfileVersionId] IN @Ids";
+
+        return await _connectionManager.QueryFirstOrDefaultAsync<int>(
+            sql, new { Ids = strategyProfileVersionIds.ToArray() }, db: DatabaseId.APS);
     }
 }

@@ -14,6 +14,14 @@ public class RuleSetVersion
     public long RuleSetId { get; set; }
     public string VersionCode { get; set; } = string.Empty;
     public string Status { get; set; } = GovernanceVersionStatus.Draft;
+
+    /// <summary>
+    /// 默认版本标记（D-3 默认版本承载，2026-10-17）：同族（RuleSetId）至多一个 PUBLISHED 且 IsDefault=1
+    /// （过滤唯一索引 UQ_RuleSetVersion_DefaultPublished 保证，模板=SPV UQ_StrategyProfileVersion_DefaultPublished）。
+    /// 属治理元数据，不随 Create/Update 直写（C-7 已强制 Create=false、Update 冻结既有值），只能经显式 SetDefault 置位。
+    /// </summary>
+    public bool IsDefault { get; set; }
+
     public DateTime? EffectiveFrom { get; set; }
     public DateTime? EffectiveTo { get; set; }
     public DateTime? PublishedAt { get; set; }
@@ -25,6 +33,15 @@ public class RuleSetVersion
     public string? Remarks { get; set; }
     /// <summary>需求优先级规则 JSON（发布装配中间态；0号位 方案 A §7.3：退出版本表正式持久化，统一经 ContentSnapshotJson 落库）</summary>
     public string? DemandPriorityJson { get; set; }
+
+    /// <summary>
+    /// 换型规则子块 JSON（详情投影中间态；C-2 整改，2026-10-17）：
+    /// 镜像 <see cref="DemandPriorityJson"/> 投影——读路径经 <c>GovernanceVersionService.ProjectRuleSetContent</c>
+    /// 从 ContentSnapshotJson 的 "SetupTransitionRules" 子块提取到本内存字段，供规则集详情 / published-version 端点
+    /// 回放版本对应的 Setup 主题内容（0号位 复核 7.3「详情接口应能返回 Setup 主题内容」）；发布装配仍走
+    /// <see cref="ContentSnapshotJson"/> 持久化，本字段仅读路径中间态。
+    /// </summary>
+    public string? SetupTransitionRulesJson { get; set; }
 
     /// <summary>
     /// 发布内容快照 JSON（方案 A 落点，契约 §6.10.5；DDL 由 2号位 按变更申请执行）

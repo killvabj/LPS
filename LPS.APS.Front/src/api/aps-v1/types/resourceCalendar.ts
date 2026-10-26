@@ -61,10 +61,9 @@ export interface BulkWindowDraft {
 
 /**
  * 设备日历批量铺窗请求（POST /api/resource-calendar/slots）
- *  - days=1 即"逐条加一天"，覆盖逐条场景
+ *  - **覆盖式**：后端先 DELETE 该区间旧窗、再逐天 INSERT（`ResourceCalendarService.cs` 覆盖式铺窗）
+ *    ⇒ 同一区间重复铺窗幂等、结果无重叠；5号位 2026-10-14 回执与本机代码均已确认
  *  - endTime 须 > startTime（后端 400）
- *  - ⚠️ 后端 BulkCreateAsync 只 INSERT 不删旧窗口（注释与代码不一致，已发函 D2 确认）
- *    → 重复铺窗会累积重叠窗口，前端须提示"追加"而非"覆盖"
  */
 export interface ResourceCalendarBulkRequest {
   resourceId: number
@@ -80,7 +79,34 @@ export interface ResourceCalendarBulkRequest {
   remark?: string
 }
 
-/** 设备日历窗口（GET /api/resource-calendar/{resourceId}） */
+/**
+ * 设备日历**单条窗口追加**请求（POST /api/resource-calendar/slot，2026-10-14 放开"一天多条"方向2）
+ *  - 只插不删；与同日已有窗口**重叠 → 409**；**相切合法**（12:00 收尾接 12:00 起）
+ *  - 不跨天（跨天 400）；startTime/endTime 为**完整时间** `2026-11-02T08:00:00`
+ *  - 后端 DTO：`ResourceCalendarSingleRequest`（lps/.../Dto/ResourceCalendarDtos.cs:106）
+ */
+export interface ResourceCalendarSingleRequest {
+  resourceId: number
+  startTime: string
+  endTime: string
+  availableFlag: boolean
+  remark?: string
+}
+
+/**
+ * 人工槽日历**单条窗口追加**请求（POST /api/manual-capacity/calendar/single）
+ *  - 语义与设备侧完全一致，仅对象键不同
+ *  - 后端 DTO：`ManualSlotCalendarSingleRequest`（lps/.../Dto/ResourceCalendarDtos.cs:126）
+ */
+export interface ManualSlotCalendarSingleRequest {
+  manualSlotId: number
+  startTime: string
+  endTime: string
+  availableFlag: boolean
+  remark?: string
+}
+
+/** 设备日历窗口（GET /api/resource-calendar/{resourceId} 的 PageResult.items 元素） */
 export interface ResourceCalendarEntryDto {
   /** dbo.ResourceCalendarSlot.Id（long） */
   id: number
@@ -92,6 +118,48 @@ export interface ResourceCalendarEntryDto {
   /** true=可用 / false=禁用 */
   availableFlag: boolean
   remark?: string
+}
+
+/** 三级合并解析：这一片合法窗口由哪一级 WORK 决定 */
+export type ResolveWindowSource = 'Factory' | 'Department' | 'Resource'
+
+/** 三级合并后该资源的状态（后端 `ResourceCalendarResolvePreviewDto.Status`）
+ *  - `WORK`    有合法窗口（`windows[].source` 说明是继承上级还是本级）
+ *  - `OFF`     本级明确停机（显式关闭/维修，**不可被上级 WORK 复活**）
+ *  - `MISSING` 本级没登记，且未从上级解析出窗口
+ */
+export type ResolveStatus = 'WORK' | 'OFF' | 'MISSING'
+
+/** 解析后的一片合法窗口（后端 `ResolvedWindowDto`） */
+export interface ResolvedWindowDto {
+  start: string
+  end: string
+  source: ResolveWindowSource
+}
+
+/** 三级合并解析预览（GET /api/resource-calendar/resolve-preview）
+ *  后端 `ResourceCalendarResolvePreviewDto`（lps/.../Dto/ResourceCalendarDtos.cs:143）
+ *  ⚠️ 只收 `resourceIds`（设备）—— **没有人工槽版本**，Tab3 暂无法展示合并状态。 */
+export interface ResourceCalendarResolvePreviewDto {
+  resourceId: number
+  /** 三级合并后最终有没有可排窗口 */
+  hasAnyWindow: boolean
+  status: ResolveStatus
+  windows: ResolvedWindowDto[]
+}
+
+/** 日历窗口列表分页响应（2026-10-17 收：后端已改 PageResult，两端点共用本形状）
+ *  - 设备 `GET /api/resource-calendar/{resourceId}` 与人工槽 `GET /api/manual-capacity/calendar/{manualSlotId}`
+ *  - 字段名 `page`（非 pageIndex），`pageSize` 默认 20、上限 200（越界兜回）
+ *  - 与 `ManualCapacitySlotPageResult<T>` 同为**模块级本地包装**（通用 `PageResult<T>` 已撤，见 types/common.ts:52-57）
+ *  ⚠️ 后端 10-14 已原地改返回类型；不带 pageIndex/pageSize 调用 = 只拿第 1 页（20 条），
+ *     故本类型的两个调用方**必须显式传分页参数**，否则列表会被静默截断成 20 行。
+ */
+export interface CalendarWindowPageResult<T> {
+  items: T[]
+  total: number
+  page: number
+  pageSize: number
 }
 
 /* ==================== 模块 B：人工能力槽 ==================== */
@@ -112,14 +180,30 @@ export interface ManualCapacitySlotDto {
   slotCode: string
   /** 软删标记；false = 已停用（Solver 不再装载） */
   isActive: boolean
+  /** 是否已配日历（后端 ManualCapacitySlotDto.HasCalendar；列表级判定） */
+  hasCalendar?: boolean
 }
 
-/** 人工槽主档查询入参（GET /api/manual-capacity/slots） */
+/** 人工槽主档查询入参（GET /api/manual-capacity/slots，5号位 10-12 加分页） */
 export interface ManualSlotQuery {
   departmentId?: number
   operationName?: string
   /** 默认 false（不含软删） */
   includeInactive?: boolean
+  /** 分页：5号位 10-12 函确认 pageSize 默认 20、上限 200（越界回落 20） */
+  pageIndex?: number
+  pageSize?: number
+}
+
+/** 人工槽主档分页响应（10-12 收：与后端 PageResult<Page> 字段对齐，模块级本地包装）
+ *  - 字段名用 `page`（不是 pageIndex），与 TaskSplitRuleConfig / ManualETA / business-fact-issues 同款
+ *  - 替代此前通用 PageResult<T>（types/common.ts:62-67 已删，@see 4号位-2026-10-12-三函闭环RC22-ME13-E24-给5号位.md）
+ */
+export interface ManualCapacitySlotPageResult<T> {
+  items: T[]
+  total: number
+  page: number
+  pageSize: number
 }
 
 /**
@@ -157,41 +241,57 @@ export interface ManualSlotCalendarBulkRequest {
 /* ==================== 展示用派生类型 ==================== */
 
 /**
- * Calendar 配置状态（v1.3 §九 / 对接函 §三.5：无有效日历 = 不可用）
- *  - CONFIGURED   已配（窗口数 > 0）
- *  - NOT_CONFIGURED 未配（窗口数组为空 = Solver 判不可排）
- *  - UNKNOWN      未查证（列表页尚未逐行查询；G4 待后端补 hasCalendar 后消除该态）
+ * Calendar 配置状态（**本级**窗口有无；不是三级合并后的可排判定）
+ *  - CONFIGURED   已配（本级窗口数 > 0）
+ *  - NOT_CONFIGURED 未配（本级窗口数组为空）
+ *  - UNKNOWN      未查证（本级尚未查询）
+ *
+ * ⚠️ v1.4 §23 + 废止清单 O-024 已废止「本级无窗口 = 不可排」：
+ *    本级 MISSING 允许继承上级已认证窗口，仅三级计算后仍无权威合法窗口才判不可排。
+ *    故 NOT_CONFIGURED 的 description 只陈述本级事实，**不得断言不可用**（10-14 RC25 收）
  */
 export type CalendarConfigStatus = 'CONFIGURED' | 'NOT_CONFIGURED' | 'UNKNOWN'
 
 export const CALENDAR_CONFIG_META: Record<
   CalendarConfigStatus,
-  { label: string; tagType: 'success' | 'danger' | 'info'; description: string }
+  { label: string; tagType: 'success' | 'warning' | 'danger' | 'info'; description: string }
 > = {
   CONFIGURED: {
     label: '已配',
     tagType: 'success',
-    description: '已有有效窗口，可参与排产'
+    description: '本级已单独设过可用时段'
   },
   NOT_CONFIGURED: {
     label: '未配',
-    tagType: 'danger',
-    description: '无有效日历即不可用（不按 7×24 缺省兜底）'
+    tagType: 'warning',
+    description: '本级没单独登记；所属工厂或部门开放了，它照样能排产'
   },
   UNKNOWN: {
     label: '未查证',
     tagType: 'info',
-    description: '尚未查询该对象的窗口；点开后才判定'
+    description: '尚未查询该对象的本级窗口'
   }
 }
 
-/** 资源（设备）候选行 —— 过渡数据源用（正式端点缺失，见发函 G1） */
-export interface ResourceCandidate {
+/**
+ * 资源（设备）主表行（GET /api/resource）—— 10-12 收口：原过渡 `ResourceCandidate` 已撤
+ *  - 真源：`dbo.Resource` 镜像表（@see lps/LPS.APS.Core/Entities/Aps/Resource.cs）
+ *  - 端点：5号位 ResourceController.cs:34，权限码 ResourceCalendarView
+ *  - 字段对齐后端 ResourceListItemDto（@see lps/LPS.APS.Application/Services/Dto/ResourceCalendarDtos.cs:106-118）
+ *  - 含 hasCalendar：v1.3 §九 无有效日历=不可用的"已配/未配"状态在列表阶段即可判定（无须逐行再查）
+ */
+export interface Resource {
   resourceId: number
   resourceCode: string
   resourceName: string
-  productionDepartmentId?: number
+  /** MACHINE / LINE / MANUAL_STATION */
+  resourceType?: string
+  productionDepartmentId: number
   productionDepartmentName?: string
-  /** 过渡数据源标记（true = 来自计划版本甘特资源池，可能遗漏未排资源） */
-  isFallbackSource?: boolean
+  /** 5号位 10-23 R2 随业务范围收窄同批下发：多工厂场景下用于把设备归位 */
+  factoryCode?: string
+  factoryName?: string
+  isActive?: boolean
+  /** 已配日历窗口 = ResourceCalendarSlot 有任一记录；空 = 不可排（v1.3 §九） */
+  hasCalendar?: boolean
 }

@@ -269,7 +269,7 @@ public class Phase5CompactionTests
     //      ⇒ AUTO 自决 FORWARD ⇒ 门控放行 ⇒ 计数器 ≥ 1。
     // ════════════════════════════════════════════════════════════
     [Fact]
-    public async Task AUTO_自决FORWARD_须真正进入Phase5两项优化体()
+    public void AUTO_自决FORWARD_须真正进入Phase5两项优化体()   // 纯同步：内部一律 GetAwaiter().GetResult()
     {
         // 同资源双需求、交期宽松（slack ≫ lead ⇒ DUE_LOOSE ⇒ 逐需求自决 FORWARD）。
         // 无 CandidateContext ⇒ `OptimizeSetupSequences` 不因 §17 提前返回 ⇒ 两项优化均可达。

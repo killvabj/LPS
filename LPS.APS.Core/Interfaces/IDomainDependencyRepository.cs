@@ -20,8 +20,11 @@ public interface IDomainDependencyRepository
     /// upstream   = 该域的上游依赖（DownstreamDomainCode = @domainCode，即本域依赖谁）。
     /// </param>
     /// <param name="ct">取消令牌</param>
+    /// <param name="allowedDomains">授权域集合（数据范围收窄，4号位 2026-10-22 缺口修复）；
+    /// 空集 → fail-closed 返空；null = Global 全放行（不追加过滤）；非空 → 任一端在授权范围即可见该边。</param>
     Task<IReadOnlyList<DomainDependency>> GetByDomainAsync(
         string domainCode,
         string direction,
-        CancellationToken ct = default);
+        CancellationToken ct = default,
+        IReadOnlySet<string>? allowedDomains = null);
 }

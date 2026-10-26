@@ -1,96 +1,68 @@
 /**
  * APS V1 4号位 — 订单 / 需求计划查询 API
  *
- * @owner 5号位（中转 2号位 Order / Supply/Pegging Trace 结果）
- * @see 审核报告 §十六.4↔5 + §十九 + §二十二
+ * @owner 5号位（Pegging / Task 等运行结果的真 Owner 是 2号位，5号位只做查询接入与 DTO 封装）
+ * @see 冻结 `06 v1.38 §7.2`「5号位向4号位提供：订单/需求计划」
  *
- * @see 4号位文档第 5 节（页面 2）
- * 后端未实现，Phase A 阶段前端走 mock。
+ * 端点（`OrderQueryController.cs`）：
+ *  - `GET /api/order-query`                  列表（**服务端分页**，返 `PageResult<OrderListItemDto>`）
+ *  - `GET /api/order-query/summary`          订单状态聚合
+ *  - `GET /api/order-query/{orderId:long}`   详情（order / pegging / tasks）
+ *
+ * 三个端点的 `planVersionId` 全部必填 —— 漏传一律 `code=400 "planVersionId is required"`（实测）。
+ *
+ * 本模块**不再有 mock 分支**：原订单 mock 桩建立在一份自拟 DTO 上（工厂 `F-SUZ-01`、产品族
+ * `INJECTION`、客户 `CUST-001` 全是编的），与 dev 实库零重合；mock 模式下本页直接空态。
  */
 
-import { apsHttp, APS_USE_MOCK } from './http'
-import { mockOrderDetail, mockOrderList, mockOrderSummary } from './__mocks__/fixtures'
+import { apsHttp } from './http'
 import type {
-  OrderBasicInfo,
+  OrderDetailDto,
+  OrderListItemDto,
+  OrderListPageResult,
   OrderQuery,
-  OrderScheduleDetailDto,
-  OrderSummaryStatus,
-  PageResult
+  OrderSummaryDto
 } from './types'
 
 export const orderApi = {
-  /** 订单列表（服务端分页，含可选过滤）
-   *  v1.4 §八：5号位 OrderQueryController
-   *  - GET /api/order-query                  列表（无分页 Query；按 §八 11 维度筛选）
-   *  - GET /api/order-query/{orderId:long}   详情
-   *  旧版 /api/order/list 路径已废
+  /** 订单列表（服务端分页）
+   *
+   * 分页参数用 `pageIndex`(1 起) / `pageSize`；后端 `pageSize>0` 时优先于 `skip/take`。
+   * 2026-10-17 起：`>200` **夹到 200**、`<=0` → 50（原来是越界静默回落 50，5号位 已修）。
+   * 前端仍自夹 ≤200 作双保险，见 store。
    */
-  async list(query: OrderQuery): Promise<PageResult<OrderBasicInfo>> {
-    if (APS_USE_MOCK) {
-      return mockOrderList(query.pageIndex, query.pageSize, {
-        orderNo: query.orderNo,
-        productionInstructionNo: query.productionInstructionNo,
-        materialCode: query.materialCode,
-        customerCode: query.customerCode,
-        productFamilyCode: query.productFamilyCode,
-        factoryCode: query.factoryCode,
-        status: query.delayStatus,
-        planVersionId: query.planVersionId,
-        domainKey: query.domainKey,
-        dueDateFrom: query.dueDateFrom,
-        dueDateTo: query.dueDateTo
-      })
-    }
-    return apsHttp.get<PageResult<OrderBasicInfo>>({
+  async list(query: OrderQuery): Promise<OrderListPageResult<OrderListItemDto>> {
+    return apsHttp.get<OrderListPageResult<OrderListItemDto>>({
       url: '/api/order-query',
       params: { ...query }
     })
   },
 
-  /** 订单详情（§八 4 块：basic / pegging / tasks / reasons） */
-  async getDetail(orderId: number): Promise<OrderScheduleDetailDto> {
-    if (APS_USE_MOCK) return mockOrderDetail(orderId)
-    return apsHttp.get<OrderScheduleDetailDto>({
-      url: `/api/order-query/${orderId}`
+  /** 订单详情（含 Pegging 承接 + 生产任务）
+   *
+   * ⚠️ `planVersionId` 必填 —— 后端 `[FromQuery] int planVersionId` 无默认值，
+   * 漏传得到 400，页面 Drawer 会整块空。
+   */
+  async getDetail(orderId: number, planVersionId: number): Promise<OrderDetailDto> {
+    return apsHttp.get<OrderDetailDto>({
+      url: `/api/order-query/${orderId}`,
+      params: { planVersionId },
+      silent: true
     })
   },
 
-  /** 订单状态聚合（顶部 KPI 用）
-   *  2026-09-17 5号位 回执后落地：
-   *  - 端点 `GET /api/order-query/summary?planVersionId=`（@see OrderQueryController.cs）
-   *  - 响应 DTO（PascalCase）：
-   *      {
-   *        planVersionId: number,
-   *        totalCount: number,
-   *        onTimeCount: number,
-   *        delayedCount: number,
-   *        riskCount: number,
-   *        unscheduledCount: number
-   *      }
-   *  - 前端需将 5 字段映射回 OrderSummaryStatus[]（'ON_TIME' | 'DELAYED' | 'AT_RISK' | 'UNSCHEDULED'）
-   *    'ESTIMATED_ONLY' 由前端按需另行计算（v1.4 §七）
+  /** 订单状态聚合（顶部 KPI）
+   *
+   * ⚠️ `planVersionId` 必填 —— `GetSummaryAsync` 首行即 `throw new ArgumentException("planVersionId is required")`。
+   *
+   * 返回**原始计数**，不做状态名映射：`delayedCount` 是 `FIRST_DELAY + REPEATED_DELAY` 合计，
+   * 不是一个叫「延期」的状态；`riskCount` / `unscheduledCount` 前端不消费（见 `OrderSummaryDto` 注释）。
    */
-  async getSummary(
-    planVersionId?: number
-  ): Promise<{ status: OrderSummaryStatus; count: number }[]> {
-    if (APS_USE_MOCK) return mockOrderSummary()
-    const dto = await apsHttp.get<{
-      planVersionId: number
-      totalCount: number
-      onTimeCount: number
-      delayedCount: number
-      riskCount: number
-      unscheduledCount: number
-    }>({
+  async getSummary(planVersionId: number): Promise<OrderSummaryDto> {
+    return apsHttp.get<OrderSummaryDto>({
       url: '/api/order-query/summary',
-      params: planVersionId !== undefined ? { planVersionId } : undefined
+      params: { planVersionId },
+      silent: true
     })
-    // 映射为现有 OrderSummaryStatus[] 形态
-    return [
-      { status: 'ON_TIME', count: dto.onTimeCount ?? 0 },
-      { status: 'DELAYED', count: dto.delayedCount ?? 0 },
-      { status: 'AT_RISK', count: dto.riskCount ?? 0 },
-      { status: 'UNSCHEDULED', count: dto.unscheduledCount ?? 0 }
-    ]
   }
 }

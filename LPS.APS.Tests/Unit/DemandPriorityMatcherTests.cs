@@ -84,7 +84,7 @@ public class DemandPriorityMatcherTests
                         new SegmentSortField { Field = DemandField.CustomerTier, Direction = SortDirection.Desc },
                         new SegmentSortField { Field = DemandField.RemainingTimeHours, Direction = SortDirection.Asc }
                     },
-                    StableTieBreakFields = new List<string> { "OrderId" }
+                    StableTieBreakFields = new List<TieBreakField> { TieBreakField.DEMANDKEY }
                 }
             }
         };
@@ -197,7 +197,7 @@ public class DemandPriorityMatcherTests
                     {
                         new SegmentSortField { Field = DemandField.RemainingTimeHours, Direction = SortDirection.Asc }
                     },
-                    StableTieBreakFields = new List<string> { "OrderId" }
+                    StableTieBreakFields = new List<TieBreakField> { TieBreakField.DEMANDKEY }
                 },
                 new PrioritySegment
                 {

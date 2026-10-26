@@ -32,7 +32,9 @@ public class BusinessFactIssueService
         CancellationToken ct = default,
         IReadOnlySet<string>? allowedFactories = null)
     {
-        if (take <= 0 || take > 500) take = 100;
+        // 越界夹上限不静默回落（4号位 10-19 R2；同 PI/订单/甘特页口径，全项目已扫净）。
+        if (take <= 0) take = 100;
+        if (take > 500) take = 500;
 
         return await _repository.QueryAllAsync(
             source, materialCode, factoryCode, severity, reviewStatus,

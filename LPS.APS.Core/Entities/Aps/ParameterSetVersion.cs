@@ -14,6 +14,14 @@ public class ParameterSetVersion
     public long ParameterSetId { get; set; }
     public string VersionCode { get; set; } = string.Empty;
     public string Status { get; set; } = GovernanceVersionStatus.Draft;
+
+    /// <summary>
+    /// 默认版本标记（D-3 默认版本承载，2026-10-17）：同族（ParameterSetId）至多一个 PUBLISHED 且 IsDefault=1
+    /// （过滤唯一索引 UQ_ParameterSetVersion_DefaultPublished 保证，模板=SPV UQ_StrategyProfileVersion_DefaultPublished）。
+    /// 属治理元数据，不随 Create/Update 直写（C-7 已强制 Create=false、Update 冻结既有值），只能经显式 SetDefault 置位。
+    /// </summary>
+    public bool IsDefault { get; set; }
+
     public DateTime? EffectiveFrom { get; set; }
     public DateTime? EffectiveTo { get; set; }
     public DateTime? PublishedAt { get; set; }

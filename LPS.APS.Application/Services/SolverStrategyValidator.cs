@@ -24,6 +24,7 @@ public sealed class SolverStrategyValidator
         var warnings = new List<string>();
 
         ValidateMode(block, errors);
+        ValidateBottleneckMode(block, errors);
         ValidateOnTimeTarget(block, errors);
         ValidateSplit(block, errors);
         ValidateStageOverlap(block, errors);
@@ -31,6 +32,15 @@ public sealed class SolverStrategyValidator
         ValidateSetupBudget(block, errors);
 
         return new ValidationResult(errors.Count == 0, errors, warnings);
+    }
+
+    /// <summary>DynamicBottleneckMode 枚举合法性（防御数字越界反序列化，4号位 2026-10-22 G1）</summary>
+    private static void ValidateBottleneckMode(SolverStrategyBlock block, List<string> errors)
+    {
+        if (!Enum.IsDefined(block.BottleneckMode))
+        {
+            errors.Add($"DynamicBottleneckMode 必须为 Auto/PreferAnchor/ForceAnchor/NotAnchor 之一（当前值：{(int)block.BottleneckMode}）");
+        }
     }
 
     /// <summary>SolverStrategyMode 枚举合法性（Auto/Forward/Backward/Mixed；防御数字越界反序列化）</summary>

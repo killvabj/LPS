@@ -609,7 +609,7 @@
         "tags": [
           "DomainStatus"
         ],
-        "summary": "查询排程域状态（G8）",
+        "summary": "查询排程域状态（G8）\r\n            \r\n【异常→HTTP 语义修正 2026-10-16（4号位 R4 联调回执）】\r\n  原实现 catch Exception → ApiResponse.Fail(500)。但 Fail 只改 body.code、HTTP 状态恒 200，\r\n  前端无法区分「查询失败」与「该 Run 无域状态记录」。现与 GovernanceController 同逻辑端点对齐：\r\n    · Run 不存在 / ExpectedDomainKeysJson 缺失或损坏（InvalidOperationException）→ 404\r\n    · 其他异常 → 500\r\n    · 正常空域状态（合法 ExpectedDomainKeys 但计划域当前无记录）→ 200 + []",
         "parameters": [
           {
             "name": "scheduleRunId",
@@ -624,24 +624,7 @@
         ],
         "responses": {
           "200": {
-            "description": "Success",
-            "content": {
-              "text/plain": {
-                "schema": {
-                  "$ref": "#/components/schemas/RunDomainStatusDtoIReadOnlyListApiResponse"
-                }
-              },
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RunDomainStatusDtoIReadOnlyListApiResponse"
-                }
-              },
-              "text/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RunDomainStatusDtoIReadOnlyListApiResponse"
-                }
-              }
-            }
+            "description": "Success"
           }
         }
       }
@@ -781,16 +764,291 @@
         }
       }
     },
-    "/api/Governance/rule-set/{ruleSetId}/versions": {
-      "get": {
+    "/api/Governance/rule-set": {
+      "post": {
         "tags": [
           "Governance"
         ],
-        "summary": "获取规则集的所有版本",
+        "summary": "新建规则集主表（POST /rule-set；2026-10-22 补齐 4号位 缺口/T4）。\r\nQ1：RuleSetCode 用户填、唯一（大小写不敏感）、创建后不可变更；Q2：两步——主表仅建壳，前端随后自动跟建空白 DRAFT 版本；\r\nQ3＝方案 A 跨域通用（无排程域字段）；Q6＝挂 aps.rule.edit（RuleMaintain）。无 DELETE 端点（Q5，一律 IsActive 停用）。",
+        "description": "开发者：3号位",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RuleSet"
+              }
+            },
+            "text/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RuleSet"
+              }
+            },
+            "application/*+json": {
+              "schema": {
+                "$ref": "#/components/schemas/RuleSet"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Success"
+          }
+        }
+      }
+    },
+    "/api/Governance/rule-set/{id}": {
+      "put": {
+        "tags": [
+          "Governance"
+        ],
+        "summary": "编辑规则集主表（PUT /rule-set/{id}）：改 Name/Description/IsActive；RuleSetCode 冻结不可改；不符 → 400。\r\nQ4：IsActive=0 仅关主表、不级联版本（运行时装载判主表归 2号位/1号位 转达项）；Q6＝aps.rule.edit。",
         "description": "开发者：3号位",
         "parameters": [
           {
-            "name": "ruleSetId",
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RuleSet"
+              }
+            },
+            "text/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RuleSet"
+              }
+            },
+            "application/*+json": {
+              "schema": {
+                "$ref": "#/components/schemas/RuleSet"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Success"
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "Governance"
+        ],
+        "summary": "物理删除规则集整族（DELETE /rule-set/{id}，R1 2026-10-25 例外 Q5）：无任何 PUBLISHED 版本才可删（纯新建未发布族）；\r\n有 PUBLISHED 仍只可停用（历史不可变守恒）。被策略包引用则拒绝（FK 防护）。审计前置后整族删（单事务）。",
+        "description": "开发者：3号位",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          }
+        }
+      }
+    },
+    "/api/Governance/parameter-set": {
+      "post": {
+        "tags": [
+          "Governance"
+        ],
+        "summary": "新建参数集主表（POST /parameter-set；2026-10-25 补齐 4号位 缺口，照 rule-set 10-22 范式）。\r\nQ1＝编码用户填、唯一（大小写不敏感）、创建后不可变更；Q2＝两步——主表仅建壳，前端随后自动跟建空白 DRAFT 版本；\r\nQ3＝方案 A 跨域通用（无排程域字段）；Q5＝不给 DELETE；Q6＝挂 aps.parameter.edit（ParameterEdit）。",
+        "description": "开发者：3号位",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ParameterSet"
+              }
+            },
+            "text/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ParameterSet"
+              }
+            },
+            "application/*+json": {
+              "schema": {
+                "$ref": "#/components/schemas/ParameterSet"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Success"
+          }
+        }
+      }
+    },
+    "/api/Governance/parameter-set/{id}": {
+      "put": {
+        "tags": [
+          "Governance"
+        ],
+        "summary": "编辑参数集主表（PUT /parameter-set/{id}）：改 Name/Description/IsActive；ParameterSetCode 冻结不可改；不符 → 400。\r\nQ4：IsActive=0 仅关主表、不级联版本（运行时装载判主表归 2号位/1号位 转达项）；Q6＝aps.parameter.edit。",
+        "description": "开发者：3号位",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ParameterSet"
+              }
+            },
+            "text/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ParameterSet"
+              }
+            },
+            "application/*+json": {
+              "schema": {
+                "$ref": "#/components/schemas/ParameterSet"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Success"
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "Governance"
+        ],
+        "summary": "物理删除参数集整族（DELETE /parameter-set/{id}，2026-10-26 同 R1 规则集删除口径）：无任何 PUBLISHED（已发布）版本才可删\r\n（纯新建未发布族）；含 PUBLISHED（已发布）仍只可停用（历史不可变守恒）。被策略包版本引用则拒绝（FK 反查阻断）。\r\n审计前置（ActionCode=Delete）后整族删（单事务）。权限 Q6＝aps.parameter.edit。",
+        "description": "开发者：3号位",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          }
+        }
+      }
+    },
+    "/api/Governance/strategy-profile": {
+      "post": {
+        "tags": [
+          "Governance"
+        ],
+        "summary": "新建策略包主表（POST /strategy-profile；2026-10-25 补齐 4号位 缺口，照 rule-set 10-22 范式）。\r\nQ1＝编码用户填、唯一、创建后不可变更；Q2＝**只建壳，不能自动跟建版本**（StrategyProfileVersion.RuleSetVersionId/ParameterSetVersionId 均必填 FK，\r\n无「空白首版」合法状态 ⇒ 首版在「新建草稿」里选两个已发布版本）；Q3＝跨域通用；Q5＝不给 DELETE；\r\nQ6＝aps.strategy.edit（StrategyEdit）；Q8＝RunType 仅五值或 NULL（冻结 07 §5.5）。",
+        "description": "开发者：3号位",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/StrategyProfile"
+              }
+            },
+            "text/json": {
+              "schema": {
+                "$ref": "#/components/schemas/StrategyProfile"
+              }
+            },
+            "application/*+json": {
+              "schema": {
+                "$ref": "#/components/schemas/StrategyProfile"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Success"
+          }
+        }
+      }
+    },
+    "/api/Governance/strategy-profile/{id}": {
+      "put": {
+        "tags": [
+          "Governance"
+        ],
+        "summary": "编辑策略包主表（PUT /strategy-profile/{id}）：改 Name/Description/RunType/IsActive；StrategyProfileCode 冻结不可改；不符 → 400。\r\nQ4：IsActive=0 仅关主表、不级联版本（运行时装载判主表归 2号位/1号位 转达项）；Q6＝aps.strategy.edit。",
+        "description": "开发者：3号位",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/StrategyProfile"
+              }
+            },
+            "text/json": {
+              "schema": {
+                "$ref": "#/components/schemas/StrategyProfile"
+              }
+            },
+            "application/*+json": {
+              "schema": {
+                "$ref": "#/components/schemas/StrategyProfile"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Success"
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "Governance"
+        ],
+        "summary": "物理删除策略包整族（DELETE /strategy-profile/{id}，2026-10-26 同 R1 规则集删除口径）：无任何 PUBLISHED（已发布）版本才可删\r\n（纯新建未发布族）；含 PUBLISHED（已发布）仍只可停用（历史不可变守恒）。被 ScheduleRun（运行）引用则拒绝（FK 反查阻断）。\r\n审计前置（ActionCode=Delete）后整族删（单事务）。权限 Q6＝aps.strategy.edit。",
+        "description": "开发者：3号位",
+        "parameters": [
+          {
+            "name": "id",
             "in": "path",
             "required": true,
             "schema": {
@@ -807,6 +1065,29 @@
       }
     },
     "/api/Governance/rule-set/version/{versionId}": {
+      "delete": {
+        "tags": [
+          "Governance"
+        ],
+        "summary": "物理删除单个草稿版本（DELETE /rule-set/version/{id}，R1 2026-10-25）：仅 Status=DRAFT 可删（清空白草稿壳）；\r\n已发布/停用/归档拒绝。被策略包引用则拒绝。审计前置后删单行。",
+        "description": "开发者：3号位",
+        "parameters": [
+          {
+            "name": "versionId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          }
+        }
+      },
       "get": {
         "tags": [
           "Governance"
@@ -873,6 +1154,31 @@
         }
       }
     },
+    "/api/Governance/rule-set/{ruleSetId}/versions": {
+      "get": {
+        "tags": [
+          "Governance"
+        ],
+        "summary": "获取规则集的所有版本（rule-set 同族 2026-10-15：摘要 DTO，镜像参数集 R2——不含 ContentSnapshotJson/DemandPriorityJson 大 JSON 载体；\r\n2026-10-15 4号位 来文 Q2：加补传输层——改调摘要查询，防将来规则集快照变大后版本下拉同方式不可用）",
+        "description": "开发者：3号位",
+        "parameters": [
+          {
+            "name": "ruleSetId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          }
+        }
+      }
+    },
     "/api/Governance/rule-set/version": {
       "post": {
         "tags": [
@@ -911,7 +1217,7 @@
         "tags": [
           "Governance"
         ],
-        "summary": "获取参数集的所有版本",
+        "summary": "获取参数集的所有版本（R2 修复：摘要 DTO，不含 ContentSnapshotJson 大 JSON 载体，防 PSV 1305 序列化 500；\r\n2026-10-15 4号位 来文：加补传输层——改调摘要查询，不再 SELECT * 整列搬 ContentSnapshotJson 大 LOB，PSV 1305 37s → 摘要列 10ms 级）",
         "description": "开发者：3号位",
         "parameters": [
           {
@@ -1080,7 +1386,7 @@
         "tags": [
           "Governance"
         ],
-        "summary": "发布参数集版本（六态状态机 R02 验收）\r\n红线：仅 DRAFT/SUBMITTED/APPROVED 可发布；新 Run 可引用新版本、旧 Run 引用不变；A-6 不变量自动处理。",
+        "summary": "发布参数集版本（六态状态机 R02 验收）\r\n红线：仅 DRAFT/SUBMITTED/APPROVED 可发布；新 Run 可引用新版本、旧 Run 引用不变；A-6 不变量自动处理。\r\n授权：D-1 独立权限 ParameterPublish（0号位 §3.2 参数发布 aps.parameter.publish，不因规则发布自动获得）",
         "description": "开发者：3号位",
         "parameters": [
           {
@@ -1168,7 +1474,7 @@
         "tags": [
           "Governance"
         ],
-        "summary": "停用参数集版本（SUBMITTED/APPROVED/PUBLISHED → DISABLED）\r\n红线：DRAFT 拒绝（草稿直接编辑/删除）；DISABLED/ARCHIVED 幂等保护拒绝。",
+        "summary": "停用参数集版本（SUBMITTED/APPROVED/PUBLISHED → DISABLED）\r\n红线：DRAFT 拒绝（草稿直接编辑/删除）；DISABLED/ARCHIVED 幂等保护拒绝。\r\n授权：C-5/D-1 参数停用改挂 ParameterEdit（0号位 §3.2 参数停用操作授权 aps.parameter.edit）",
         "description": "开发者：3号位",
         "parameters": [
           {
@@ -1244,6 +1550,147 @@
             }
           }
         },
+        "responses": {
+          "200": {
+            "description": "Success"
+          }
+        }
+      }
+    },
+    "/api/Governance/rule-set/version/{versionId}/set-default": {
+      "post": {
+        "tags": [
+          "Governance"
+        ],
+        "summary": "设置规则集版本为同族默认（D-3，2026-10 受控开发，契约 06 §D组 D-1）。\r\n默认标记 IsDefault 属治理元数据，仅 PUBLISHED 版本可置位；切换经仓储 SetDefaultAsync 单事务原子\r\n「清同族其它 + 置目标」，避免 UQ_RuleSetVersion_DefaultPublished 过滤唯一索引冲突；写审计。",
+        "description": "开发者：3号位",
+        "parameters": [
+          {
+            "name": "versionId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          }
+        }
+      }
+    },
+    "/api/Governance/parameter-set/version/{versionId}/set-default": {
+      "post": {
+        "tags": [
+          "Governance"
+        ],
+        "summary": "设置参数集版本为同族默认（D-3，2026-10 受控开发，契约 06 §D组 D-2）。\r\n同规则集语义；切换经 IParameterSetVersionRepository.SetDefaultAsync 单事务原子化（D-3 修正 SPV\r\nClearDefaultFlag + Update 两条独立 SQL 非原子缺陷），避免 UQ_ParameterSetVersion_DefaultPublished 冲突。",
+        "description": "开发者：3号位",
+        "parameters": [
+          {
+            "name": "versionId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          }
+        }
+      }
+    },
+    "/api/Governance/strategy-profile/version/{versionId}/set-default": {
+      "post": {
+        "tags": [
+          "Governance"
+        ],
+        "summary": "设置策略包版本为同族默认（C-7 §9.2 显式治理操作，D-3）。\r\n仅 PUBLISHED 版本可置位；清同 Profile 其它默认再置位，避免 UQ_StrategyProfileVersion_DefaultPublished 冲突；写审计。\r\n服务层内部对已是默认则幂等早退（不重复清默认+置位与审计）。",
+        "description": "开发者：3号位",
+        "parameters": [
+          {
+            "name": "versionId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          }
+        }
+      }
+    },
+    "/api/Governance/rule-set/{ruleSetId}/default": {
+      "get": {
+        "tags": [
+          "Governance"
+        ],
+        "summary": "读侧默认解析：规则集同族当前有效、无歧义的 PUBLISHED 默认版本（D-3，Q-C，契约 06 §D组 D-4）。\r\n无 RunType（RS 族解析）；镜象 SPV 三态判定：候选按生效窗过滤后 0→404、1→返回、>1→400（红线 #4 禁止随机取，不以最新发布代替）。",
+        "description": "开发者：3号位",
+        "parameters": [
+          {
+            "name": "ruleSetId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          },
+          {
+            "name": "asOf",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          }
+        }
+      }
+    },
+    "/api/Governance/parameter-set/{parameterSetId}/default": {
+      "get": {
+        "tags": [
+          "Governance"
+        ],
+        "summary": "读侧默认解析：参数集同族当前有效、无歧义的 PUBLISHED 默认版本（D-3，Q-C，契约 06 §D组 D-5）。\r\n无 RunType（PS 族解析）；三态判定同规则集：0→404、1→返回、>1→400（不随机取、不以最新发布代替）。",
+        "description": "开发者：3号位",
+        "parameters": [
+          {
+            "name": "parameterSetId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          },
+          {
+            "name": "asOf",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "description": "Success"
@@ -1883,7 +2330,7 @@
           "Governance"
         ],
         "summary": "规则集主表列表（G1/A1：4号位规则集列表页；R2 起返回含最新版本摘要的列表 DTO）",
-        "description": "开发者：3号位",
+        "description": "开发者：3号位。activeOnly 三态语义（契约 v1.0 2026-10-10）：true=仅查 IsActive=1；false=仅查 IsActive=0（≠查全部）；缺省=不过滤全量。dev DB 当前无停用数据，传 false 恒返 0（客观状态非 bug）。",
         "parameters": [
           {
             "name": "activeOnly",
@@ -1929,7 +2376,7 @@
           "Governance"
         ],
         "summary": "参数集主表列表（G1/A8：4号位参数集列表页）",
-        "description": "开发者：3号位",
+        "description": "开发者：3号位。activeOnly 三态语义（契约 v1.0 2026-10-10）：true=仅查 IsActive=1；false=仅查 IsActive=0（≠查全部）；缺省=不过滤全量。dev DB 当前无停用数据，传 false 恒返 0（客观状态非 bug）。",
         "parameters": [
           {
             "name": "activeOnly",
@@ -1975,7 +2422,7 @@
           "Governance"
         ],
         "summary": "策略包主表列表（G1/A12：4号位策略包列表页）",
-        "description": "开发者：3号位",
+        "description": "开发者：3号位。activeOnly 三态语义（契约 v1.0 2026-10-10）：true=仅查 IsActive=1；false=仅查 IsActive=0（≠查全部）；缺省=不过滤全量。dev DB 当前无停用数据，传 false 恒返 0（客观状态非 bug）。",
         "parameters": [
           {
             "name": "activeOnly",
@@ -2045,7 +2492,7 @@
         "tags": [
           "Governance"
         ],
-        "summary": "参数集当前生效 PUBLISHED 版本直达（G3/C2）",
+        "summary": "参数集当前生效 PUBLISHED 版本直达（G3/C2；R2 修复：快照载体经投影置空不外泄，五主题子块保留）",
         "description": "开发者：3号位",
         "parameters": [
           {
@@ -2095,7 +2542,7 @@
         "tags": [
           "Governance"
         ],
-        "summary": "域依赖关系查询（G7：4号位失败链 / 域依赖展示；数据源为 2号位 sp_ScanDomainDependency 扫描结果，只读）",
+        "summary": "域依赖关系查询（G7：4号位失败链 / 域依赖展示；数据源为 2号位 sp_ScanDomainDependency 扫描结果，只读）\r\n            2026-10-22 4号位 缺口修复：补数据范围收窄（第二道防线）——ResolveScope → 入参 403 → allowedDomains 下推仓储收窄。",
         "description": "开发者：3号位",
         "parameters": [
           {
@@ -2257,7 +2704,7 @@
           "Governance"
         ],
         "summary": "新建域定义（G-D02：唯一性 / ScopeType / 引用合法性校验 + 审计；新建默认启用）",
-        "description": "开发者：3号位",
+        "description": "开发者：3号位｜2026-10-25 权限修正：RuleMaintain→DomainMaintain（冻结 §4.1 系统管理员维护，勿再误挂规则码）",
         "requestBody": {
           "content": {
             "application/json": {
@@ -2290,7 +2737,7 @@
           "Governance"
         ],
         "summary": "当前有效域集合（G-D09/G-D10：2号位归域执行唯一事实源）",
-        "description": "开发者：3号位",
+        "description": "开发者：3号位｜N-03：信任调用（2号位 归域执行唯一事实源），不做用户 Domain Scope 过滤——与用户态列表/详情严格分离。",
         "responses": {
           "200": {
             "description": "Success"
@@ -2327,7 +2774,7 @@
           "Governance"
         ],
         "summary": "编辑域定义（G-D03~G-D05：DomainKey 不可变更 + 校验）",
-        "description": "开发者：3号位",
+        "description": "开发者：3号位｜2026-10-25 权限修正：RuleMaintain→DomainMaintain（冻结 §4.1 系统管理员维护）",
         "parameters": [
           {
             "name": "id",
@@ -2399,7 +2846,7 @@
           "Governance"
         ],
         "summary": "启用域定义（G-D16 反向）",
-        "description": "开发者：3号位",
+        "description": "开发者：3号位｜2026-10-25 权限修正：RuleMaintain→DomainMaintain（冻结 §4.1 系统管理员维护）",
         "parameters": [
           {
             "name": "id",
@@ -2431,7 +2878,7 @@
           "Governance"
         ],
         "summary": "停用域定义",
-        "description": "开发者：3号位",
+        "description": "开发者：3号位｜2026-10-25 权限修正：RuleMaintain→DomainMaintain（冻结 §4.1 系统管理员维护）",
         "parameters": [
           {
             "name": "id",
@@ -2453,6 +2900,45 @@
         "responses": {
           "200": {
             "description": "Success"
+          }
+        }
+      }
+    },
+    "/api/governance-query/warehouses": {
+      "get": {
+        "tags": [
+          "GovernanceQuery"
+        ],
+        "summary": "治理侧仓库/工序码取值下拉（4号位 10-22 R2 建；10-25 Q1 补列）：\r\n① **按 ProcessCode 归并去重**（`51305101` 视图两行⇒下拉一次；下游 PeggingOrchestrator:5822 亦按 MIN(StageCode) 归并）；\r\n② 补 `erpProperty / warehouseRole / factoryCode` 三列（前端**展示用**，用于用户识别码的性质，**不据此过滤**——\r\n   冻结 07:1286 值域写 M/XC/ZP/BP，但实库另有 KS/BS/AC/ST/NULL 五类且前 6 大收货仓恰为 KS/BS，\r\n   值域漂移待 0号位 裁决，见 5号位 10-25 回执 Q1）；\r\n③ **不按码长过滤**：ERP 6 位码与 MES 8 位码是两源互不相交的合法空间（PeggingOrchestrator:9470-9472）。\r\n权限=类级 aps.plan.view（Q3 本轮维持现状）。",
+        "parameters": [
+          {
+            "name": "search",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "$ref": "#/components/schemas/GovernanceWarehouseItemIReadOnlyListApiResponse"
+                }
+              },
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GovernanceWarehouseItemIReadOnlyListApiResponse"
+                }
+              },
+              "text/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GovernanceWarehouseItemIReadOnlyListApiResponse"
+                }
+              }
+            }
           }
         }
       }
@@ -2503,6 +2989,47 @@
         }
       }
     },
+    "/api/governance-query/run/{scheduleRunId}/scope": {
+      "get": {
+        "tags": [
+          "GovernanceQuery"
+        ],
+        "summary": "单 Run 候选范围明细（G4；候选五字段的明细面板数据源，13 v1.8 §五）。\r\n语义分档（4号位 10-19 §二硬要求）：RunId 不存在 → 404（经全局 Filter 为真 HTTP 404）；\r\nRun 存在但无 ScopeJson（夹具/老 Run）→ **200 + scopeAvailable=false**（\"老数据\"与\"单号打错\"必须可分）。",
+        "parameters": [
+          {
+            "name": "scheduleRunId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int32"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunScopeDtoApiResponse"
+                }
+              },
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunScopeDtoApiResponse"
+                }
+              },
+              "text/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunScopeDtoApiResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/": {
       "get": {
         "tags": [
@@ -2515,12 +3042,67 @@
         }
       }
     },
+    "/api/manual-capacity/resolve-preview": {
+      "get": {
+        "tags": [
+          "ManualCapacity"
+        ],
+        "summary": "人工槽版三级合并解析预览（4号位 10-23 函 R1 选 (a) 新端点；13 v1.8:31 三态+来源+授权+时间片）：\r\nmanualSlotIds 逗号分隔（≤200），返回与设备侧 resolve-preview 同构；只读不写库；越界槽 fail-closed 剔除。",
+        "parameters": [
+          {
+            "name": "manualSlotIds",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "startDate",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            }
+          },
+          {
+            "name": "endDate",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "$ref": "#/components/schemas/ManualCapacityResolvePreviewDtoListApiResponse"
+                }
+              },
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ManualCapacityResolvePreviewDtoListApiResponse"
+                }
+              },
+              "text/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ManualCapacityResolvePreviewDtoListApiResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/manual-capacity/slots": {
       "post": {
         "tags": [
           "ManualCapacity"
         ],
-        "summary": "新增人工槽主档",
+        "summary": "新增人工槽主档（目标部门须在业务范围内）",
         "requestBody": {
           "content": {
             "application/json": {
@@ -2567,7 +3149,7 @@
         "tags": [
           "ManualCapacity"
         ],
-        "summary": "查询人工槽主档（软删不含在默认查询；可按部门/工序过滤）",
+        "summary": "查询人工槽主档（软删不含在默认查询；可按部门/工序过滤；分页 PageResult，4号位 10-12 函；结果按授权部门过滤）",
         "parameters": [
           {
             "name": "departmentId",
@@ -2591,6 +3173,24 @@
               "type": "boolean",
               "default": false
             }
+          },
+          {
+            "name": "pageIndex",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "default": 1
+            }
+          },
+          {
+            "name": "pageSize",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "default": 20
+            }
           }
         ],
         "responses": {
@@ -2599,17 +3199,17 @@
             "content": {
               "text/plain": {
                 "schema": {
-                  "$ref": "#/components/schemas/ManualCapacitySlotDtoListApiResponse"
+                  "$ref": "#/components/schemas/ManualCapacitySlotDtoPageResultApiResponse"
                 }
               },
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ManualCapacitySlotDtoListApiResponse"
+                  "$ref": "#/components/schemas/ManualCapacitySlotDtoPageResultApiResponse"
                 }
               },
               "text/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ManualCapacitySlotDtoListApiResponse"
+                  "$ref": "#/components/schemas/ManualCapacitySlotDtoPageResultApiResponse"
                 }
               }
             }
@@ -2622,7 +3222,7 @@
         "tags": [
           "ManualCapacity"
         ],
-        "summary": "软删人工槽主档（IsActive=0）",
+        "summary": "软删人工槽主档（IsActive=0；目标槽所属部门须在业务范围内）",
         "parameters": [
           {
             "name": "manualSlotId",
@@ -2663,7 +3263,7 @@
         "tags": [
           "ManualCapacity"
         ],
-        "summary": "批量铺人工槽窗口",
+        "summary": "批量铺人工槽窗口（覆盖式；目标槽所属部门须在业务范围内）",
         "requestBody": {
           "content": {
             "application/json": {
@@ -2707,12 +3307,61 @@
         }
       }
     },
+    "/api/manual-capacity/calendar/single": {
+      "post": {
+        "tags": [
+          "ManualCapacity"
+        ],
+        "summary": "单条窗口追加（2026-10-14 放开\"一天多条\"方向2，与设备日历同口径）：\r\n只插不删；同日重叠 409；相切合法；不跨天。批量端点覆盖语义不变。",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ManualSlotCalendarSingleRequest"
+              }
+            },
+            "text/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ManualSlotCalendarSingleRequest"
+              }
+            },
+            "application/*+json": {
+              "schema": {
+                "$ref": "#/components/schemas/ManualSlotCalendarSingleRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "$ref": "#/components/schemas/Int64ApiResponse"
+                }
+              },
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Int64ApiResponse"
+                }
+              },
+              "text/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Int64ApiResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/manual-capacity/calendar/{manualSlotId}": {
       "get": {
         "tags": [
           "ManualCapacity"
         ],
-        "summary": "查询某人工槽所有窗口",
+        "summary": "查询某人工槽窗口（分页 PageResult；可按时间范围过滤；目标槽所属部门须在业务范围内）",
         "parameters": [
           {
             "name": "manualSlotId",
@@ -2722,6 +3371,40 @@
               "type": "integer",
               "format": "int32"
             }
+          },
+          {
+            "name": "from",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            }
+          },
+          {
+            "name": "to",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            }
+          },
+          {
+            "name": "pageIndex",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "default": 1
+            }
+          },
+          {
+            "name": "pageSize",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "default": 20
+            }
           }
         ],
         "responses": {
@@ -2730,17 +3413,17 @@
             "content": {
               "text/plain": {
                 "schema": {
-                  "$ref": "#/components/schemas/ManualSlotCalendarDtoListApiResponse"
+                  "$ref": "#/components/schemas/ManualSlotCalendarDtoPageResultApiResponse"
                 }
               },
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ManualSlotCalendarDtoListApiResponse"
+                  "$ref": "#/components/schemas/ManualSlotCalendarDtoPageResultApiResponse"
                 }
               },
               "text/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ManualSlotCalendarDtoListApiResponse"
+                  "$ref": "#/components/schemas/ManualSlotCalendarDtoPageResultApiResponse"
                 }
               }
             }
@@ -2753,7 +3436,7 @@
         "tags": [
           "ManualCapacity"
         ],
-        "summary": "物理删除某人工槽窗口",
+        "summary": "物理删除某人工槽窗口（窗口所属槽的部门须在业务范围内）",
         "parameters": [
           {
             "name": "id",
@@ -2794,8 +3477,8 @@
         "tags": [
           "MesDispatch"
         ],
-        "summary": "发起 MES 受控操作下发——骨架：仅 scope 二次校验，核心下发待 2号位 接入",
-        "description": "开发者：3号位（编排骨架）；核心下发能力归 2号位",
+        "summary": "发起 MES 受控操作下发——中转：权限/Scope 校验 + 透传 2号位 判定，接入前返回 501（预期）",
+        "description": "中转承载：5号位；判定/下发能力：2号位（接入前 501，前端不接线）",
         "requestBody": {
           "content": {
             "application/json": {
@@ -2887,6 +3570,36 @@
             }
           },
           {
+            "name": "productionInstructionNo",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "productFamilyCode",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "dueDateFrom",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            }
+          },
+          {
+            "name": "dueDateTo",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            }
+          },
+          {
             "name": "skip",
             "in": "query",
             "schema": {
@@ -2929,17 +3642,17 @@
             "content": {
               "text/plain": {
                 "schema": {
-                  "$ref": "#/components/schemas/OrderListItemDtoListApiResponse"
+                  "$ref": "#/components/schemas/OrderListItemDtoPageResultApiResponse"
                 }
               },
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/OrderListItemDtoListApiResponse"
+                  "$ref": "#/components/schemas/OrderListItemDtoPageResultApiResponse"
                 }
               },
               "text/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/OrderListItemDtoListApiResponse"
+                  "$ref": "#/components/schemas/OrderListItemDtoPageResultApiResponse"
                 }
               }
             }
@@ -3041,7 +3754,7 @@
         "tags": [
           "Overview"
         ],
-        "summary": "查询当前ACTIVE计划版本信息",
+        "summary": "查询当前ACTIVE计划版本信息（R1-a：按 Domain 列表，每 Domain 至多一条）\r\n不传 domainKey → 返回授权范围内全部生效 Domain；传 domainKey → 该 Domain 的单元素列表（越界 403）",
         "parameters": [
           {
             "name": "domainKey",
@@ -3057,57 +3770,17 @@
             "content": {
               "text/plain": {
                 "schema": {
-                  "$ref": "#/components/schemas/OverviewActivePlanDtoApiResponse"
+                  "$ref": "#/components/schemas/OverviewActivePlanDtoListApiResponse"
                 }
               },
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/OverviewActivePlanDtoApiResponse"
+                  "$ref": "#/components/schemas/OverviewActivePlanDtoListApiResponse"
                 }
               },
               "text/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/OverviewActivePlanDtoApiResponse"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/overview/task-summary": {
-      "get": {
-        "tags": [
-          "Overview"
-        ],
-        "summary": "查询任务状态摘要",
-        "parameters": [
-          {
-            "name": "planVersionId",
-            "in": "query",
-            "schema": {
-              "type": "integer",
-              "format": "int32"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Success",
-            "content": {
-              "text/plain": {
-                "schema": {
-                  "$ref": "#/components/schemas/OverviewTaskSummaryDtoApiResponse"
-                }
-              },
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/OverviewTaskSummaryDtoApiResponse"
-                }
-              },
-              "text/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/OverviewTaskSummaryDtoApiResponse"
+                  "$ref": "#/components/schemas/OverviewActivePlanDtoListApiResponse"
                 }
               }
             }
@@ -3199,7 +3872,7 @@
         "tags": [
           "PeggingTrace"
         ],
-        "summary": "查询Pegging分配列表",
+        "summary": "查询Pegging分配列表。\r\ncommitmentStatus 支持 'UNKNOWN'（=未标注，匹配 NULL，与汇总同口径）；\r\n⚠️ orderNo 依赖 RootOrderNo/CurrentOrderNo——dev 现全 NULL（写入侧归 2号位），实际筛选用 `rootOrderId`（100% 非空）。",
         "parameters": [
           {
             "name": "planVersionId",
@@ -3242,6 +3915,14 @@
             "in": "query",
             "schema": {
               "type": "string"
+            }
+          },
+          {
+            "name": "rootOrderId",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "format": "int64"
             }
           },
           {
@@ -3916,6 +4597,346 @@
               "text/json": {
                 "schema": {
                   "$ref": "#/components/schemas/ProductionDepartmentDtoListApiResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/production-work-calendar": {
+      "get": {
+        "tags": [
+          "ProductionWorkCalendar"
+        ],
+        "summary": "分页查询上级工作日历（MISSING=无行，不造虚拟行；结果按授权 Factory/Department 过滤）",
+        "parameters": [
+          {
+            "name": "scopeType",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "factoryId",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "format": "int32"
+            }
+          },
+          {
+            "name": "departmentId",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "format": "int32"
+            }
+          },
+          {
+            "name": "includeInactive",
+            "in": "query",
+            "schema": {
+              "type": "boolean",
+              "default": false
+            }
+          },
+          {
+            "name": "pageIndex",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "default": 1
+            }
+          },
+          {
+            "name": "pageSize",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "default": 20
+            }
+          },
+          {
+            "name": "sortBy",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "sortDir",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "onlyEffective",
+            "in": "query",
+            "schema": {
+              "type": "boolean",
+              "default": false
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProductionWorkCalendarDtoPageResultApiResponse"
+                }
+              },
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProductionWorkCalendarDtoPageResultApiResponse"
+                }
+              },
+              "text/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProductionWorkCalendarDtoPageResultApiResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/production-work-calendar/weekly": {
+      "post": {
+        "tags": [
+          "ProductionWorkCalendar"
+        ],
+        "summary": "周基准铺设（1..7 星期几一批；同星期可多窗口并存=白班/小夜/大夜多班制，窗口重叠拒绝；\r\n            同范围同星期整组替换：未生效旧行覆盖、已生效闭区间换版）",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WeeklyCalendarUpsertRequest"
+              }
+            },
+            "text/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WeeklyCalendarUpsertRequest"
+              }
+            },
+            "application/*+json": {
+              "schema": {
+                "$ref": "#/components/schemas/WeeklyCalendarUpsertRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "$ref": "#/components/schemas/Int32ApiResponse"
+                }
+              },
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Int32ApiResponse"
+                }
+              },
+              "text/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Int32ApiResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/production-work-calendar/exception": {
+      "post": {
+        "tags": [
+          "ProductionWorkCalendar"
+        ],
+        "summary": "日期例外铺设（节假日 OFF / 补班 WORK / 授权加班；同级同日重叠拒绝）",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WorkCalendarExceptionRequest"
+              }
+            },
+            "text/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WorkCalendarExceptionRequest"
+              }
+            },
+            "application/*+json": {
+              "schema": {
+                "$ref": "#/components/schemas/WorkCalendarExceptionRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "$ref": "#/components/schemas/Int64ApiResponse"
+                }
+              },
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Int64ApiResponse"
+                }
+              },
+              "text/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Int64ApiResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/production-work-calendar/close": {
+      "post": {
+        "tags": [
+          "ProductionWorkCalendar"
+        ],
+        "summary": "闭区间换版（把该范围全部未闭行闭到 NewEffectiveFrom-1，供新版班制接力）",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CalendarCloseOpenRequest"
+              }
+            },
+            "text/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CalendarCloseOpenRequest"
+              }
+            },
+            "application/*+json": {
+              "schema": {
+                "$ref": "#/components/schemas/CalendarCloseOpenRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "$ref": "#/components/schemas/Int32ApiResponse"
+                }
+              },
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Int32ApiResponse"
+                }
+              },
+              "text/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Int32ApiResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/production-work-calendar/rows/{id}/close": {
+      "post": {
+        "tags": [
+          "ProductionWorkCalendar"
+        ],
+        "summary": "单行闭区间（撤销已生效例外行：历史保留、审计完整；不可重复闭）",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          },
+          {
+            "name": "effectiveTo",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "$ref": "#/components/schemas/BooleanApiResponse"
+                }
+              },
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BooleanApiResponse"
+                }
+              },
+              "text/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BooleanApiResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/production-work-calendar/rows/{id}": {
+      "delete": {
+        "tags": [
+          "ProductionWorkCalendar"
+        ],
+        "summary": "物理删除——仅限未生效行（EffectiveFrom>今天，纯纠错）；已生效行 409 提示走 close",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "$ref": "#/components/schemas/BooleanApiResponse"
+                }
+              },
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BooleanApiResponse"
+                }
+              },
+              "text/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BooleanApiResponse"
                 }
               }
             }
@@ -5315,7 +6336,7 @@
         "tags": [
           "Resource"
         ],
-        "summary": "资源主表列表（支持按部门/类型过滤；含 hasCalendar）",
+        "summary": "资源主表列表（支持按部门/类型过滤；含 hasCalendar）。\r\n10-23 R1 起按登录者业务范围收窄（与资源日历读路径 EnsureTargetScopeAsync 同源同判定：\r\nGlobal 放行；非 Global 须 Factory 命中 ∧（资源无部门归属 或 Department 命中））；身份解析失败=0 → 空列表（fail-closed）。",
         "parameters": [
           {
             "name": "departmentId",
@@ -5370,7 +6391,7 @@
         "tags": [
           "ResourceCalendar"
         ],
-        "summary": "批量铺窗（一次生成连续多天窗口）",
+        "summary": "批量铺窗（覆盖式：一次生成连续多天窗口）",
         "requestBody": {
           "content": {
             "application/json": {
@@ -5414,12 +6435,116 @@
         }
       }
     },
+    "/api/resource-calendar/slot": {
+      "post": {
+        "tags": [
+          "ResourceCalendar"
+        ],
+        "summary": "单条窗口追加（2026-10-14 放开\"一天多条\"方向2）：只插不删；同日重叠 409；相切合法；不跨天。\r\n与批量端点分工：批量=整段重铺（覆盖式），本端点=按条增补。",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ResourceCalendarSingleRequest"
+              }
+            },
+            "text/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ResourceCalendarSingleRequest"
+              }
+            },
+            "application/*+json": {
+              "schema": {
+                "$ref": "#/components/schemas/ResourceCalendarSingleRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "$ref": "#/components/schemas/Int64ApiResponse"
+                }
+              },
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Int64ApiResponse"
+                }
+              },
+              "text/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Int64ApiResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/resource-calendar/resolve-preview": {
+      "get": {
+        "tags": [
+          "ResourceCalendar"
+        ],
+        "summary": "三级合并解析预览（4号位 10-14 函 R1）：某批设备在指定区间内三级继承后的最终可排窗口与来源层级。\r\n只读、不写库；业务范围 fail-closed（越界设备剔除）。",
+        "parameters": [
+          {
+            "name": "resourceIds",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "startDate",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            }
+          },
+          {
+            "name": "endDate",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResourceCalendarResolvePreviewDtoListApiResponse"
+                }
+              },
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResourceCalendarResolvePreviewDtoListApiResponse"
+                }
+              },
+              "text/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResourceCalendarResolvePreviewDtoListApiResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/resource-calendar/{resourceId}": {
       "get": {
         "tags": [
           "ResourceCalendar"
         ],
-        "summary": "查询某设备所有窗口（可按时间范围过滤）",
+        "summary": "查询某设备窗口（分页 PageResult；可按时间范围过滤；目标设备须在业务范围内）",
         "parameters": [
           {
             "name": "resourceId",
@@ -5445,6 +6570,24 @@
               "type": "string",
               "format": "date-time"
             }
+          },
+          {
+            "name": "pageIndex",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "default": 1
+            }
+          },
+          {
+            "name": "pageSize",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "default": 20
+            }
           }
         ],
         "responses": {
@@ -5453,17 +6596,17 @@
             "content": {
               "text/plain": {
                 "schema": {
-                  "$ref": "#/components/schemas/ResourceCalendarEntryDtoListApiResponse"
+                  "$ref": "#/components/schemas/ResourceCalendarEntryDtoPageResultApiResponse"
                 }
               },
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ResourceCalendarEntryDtoListApiResponse"
+                  "$ref": "#/components/schemas/ResourceCalendarEntryDtoPageResultApiResponse"
                 }
               },
               "text/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ResourceCalendarEntryDtoListApiResponse"
+                  "$ref": "#/components/schemas/ResourceCalendarEntryDtoPageResultApiResponse"
                 }
               }
             }
@@ -5476,7 +6619,7 @@
         "tags": [
           "ResourceCalendar"
         ],
-        "summary": "物理删除某窗口",
+        "summary": "物理删除某窗口（窗口所属设备须在业务范围内）",
         "parameters": [
           {
             "name": "id",
@@ -5624,7 +6767,7 @@
         "tags": [
           "Schedule"
         ],
-        "summary": "获取指定计划版本的甘特图数据（资源行 + 任务条；越权返回空）",
+        "summary": "获取指定计划版本的甘特图数据（资源行 + 任务条；越权返回空且 ScopeDenied=true）。\r\n冻结 05:1013「Gantt按时间窗/资源加载」：支持可选 from / to / resourceIds，不传则全量（向后兼容）。\r\n<br>⚠️ `resourceIds` 只认<b>重复键</b>写法：`?resourceIds=1&resourceIds=2`。\r\n逗号形式（`1,2`）会被模型绑定拒绝（422）；`resourceIds[]=1` 形式会被静默忽略而返回全量，\r\n故下方显式拦截，避免调用方误以为过滤生效（4号位 10-17 §3.2）。",
         "parameters": [
           {
             "name": "planVersionId",
@@ -5633,6 +6776,33 @@
             "schema": {
               "type": "integer",
               "format": "int32"
+            }
+          },
+          {
+            "name": "from",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            }
+          },
+          {
+            "name": "to",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            }
+          },
+          {
+            "name": "resourceIds",
+            "in": "query",
+            "schema": {
+              "type": "array",
+              "items": {
+                "type": "integer",
+                "format": "int32"
+              }
             }
           }
         ],
@@ -6083,13 +7253,22 @@
         "tags": [
           "SetupRule"
         ],
-        "summary": "部门下拉（masterId=Id，code=DeptCode；search 模糊 DeptCode）",
+        "summary": "部门下拉（masterId=Id，code=DeptCode；search 模糊 DeptCode；limit 默认 200，缺省行为不变）",
         "parameters": [
           {
             "name": "search",
             "in": "query",
             "schema": {
               "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "default": 200
             }
           }
         ],
@@ -6105,13 +7284,22 @@
         "tags": [
           "SetupRule"
         ],
-        "summary": "设备下拉（masterId=Id，code=ResourceCode；search 模糊 ResourceCode/ResourceName）",
+        "summary": "设备下拉（masterId=Id，code=ResourceCode；search 模糊 ResourceCode/ResourceName；limit 默认 200，缺省行为不变）",
         "parameters": [
           {
             "name": "search",
             "in": "query",
             "schema": {
               "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "default": 200
             }
           }
         ],
@@ -6127,7 +7315,7 @@
         "tags": [
           "SetupRule"
         ],
-        "summary": "物料下拉（masterId=Material.Id，code=MaterialCode；search 模糊 MaterialCode/MaterialName/Spec；activeOnly=true 仅活动）",
+        "summary": "物料下拉（masterId=Material.Id，code=MaterialCode；search 模糊 MaterialCode/MaterialName/Spec；activeOnly=true 仅活动；limit 默认 200，缺省行为不变）",
         "parameters": [
           {
             "name": "search",
@@ -6142,6 +7330,15 @@
             "schema": {
               "type": "boolean",
               "default": false
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "default": 200
             }
           }
         ],
@@ -7028,6 +8225,29 @@
         ],
         "type": "string"
       },
+      "CalendarCloseOpenRequest": {
+        "type": "object",
+        "properties": {
+          "scopeType": {
+            "type": "string",
+            "nullable": true
+          },
+          "factoryId": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "productionDepartmentId": {
+            "type": "integer",
+            "format": "int32",
+            "nullable": true
+          },
+          "newEffectiveFrom": {
+            "type": "string",
+            "format": "date-time"
+          }
+        },
+        "additionalProperties": false
+      },
       "CancelManualEtaRequest": {
         "type": "object",
         "properties": {
@@ -7147,8 +8367,35 @@
             "format": "int32",
             "nullable": true
           },
+          "baseVersionCode": {
+            "type": "string",
+            "nullable": true
+          },
           "canActivate": {
             "type": "boolean"
+          },
+          "businessTriggerType": {
+            "type": "string",
+            "nullable": true
+          },
+          "priorityMode": {
+            "type": "string",
+            "nullable": true
+          },
+          "orderTargetCount": {
+            "type": "integer",
+            "format": "int32",
+            "nullable": true
+          },
+          "taskTargetCount": {
+            "type": "integer",
+            "format": "int32",
+            "nullable": true
+          },
+          "changedResourceCount": {
+            "type": "integer",
+            "format": "int32",
+            "nullable": true
           }
         },
         "additionalProperties": false
@@ -8041,6 +9288,15 @@
               "$ref": "#/components/schemas/GanttTaskDto"
             },
             "nullable": true
+          },
+          "scopeDenied": {
+            "type": "boolean"
+          },
+          "isEmpty": {
+            "type": "boolean"
+          },
+          "versionExists": {
+            "type": "boolean"
           }
         },
         "additionalProperties": false
@@ -8221,6 +9477,24 @@
           "isDelayed": {
             "type": "boolean"
           },
+          "customerDueDate": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          },
+          "delayHours": {
+            "type": "number",
+            "format": "double",
+            "nullable": true
+          },
+          "isCriticalPath": {
+            "type": "boolean"
+          },
+          "duration": {
+            "type": "number",
+            "format": "double",
+            "nullable": true
+          },
           "domainKey": {
             "type": "string",
             "nullable": true
@@ -8236,7 +9510,8 @@
             "nullable": true
           },
           "mesEligible": {
-            "type": "boolean"
+            "type": "boolean",
+            "nullable": true
           },
           "mesIneligibleReasons": {
             "type": "array",
@@ -8246,7 +9521,8 @@
             "nullable": true
           },
           "crossDomainBlocked": {
-            "type": "boolean"
+            "type": "boolean",
+            "nullable": true
           },
           "crossDomainBlockReason": {
             "type": "string",
@@ -8374,6 +9650,61 @@
         },
         "additionalProperties": false
       },
+      "GovernanceWarehouseItem": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string",
+            "nullable": true
+          },
+          "name": {
+            "type": "string",
+            "nullable": true
+          },
+          "erpProperty": {
+            "type": "string",
+            "nullable": true
+          },
+          "warehouseRole": {
+            "type": "string",
+            "nullable": true
+          },
+          "factoryCode": {
+            "type": "string",
+            "nullable": true
+          }
+        },
+        "additionalProperties": false
+      },
+      "GovernanceWarehouseItemIReadOnlyListApiResponse": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "message": {
+            "type": "string",
+            "nullable": true
+          },
+          "data": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/GovernanceWarehouseItem"
+            },
+            "nullable": true
+          },
+          "traceId": {
+            "type": "string",
+            "nullable": true
+          },
+          "timestamp": {
+            "type": "string",
+            "format": "date-time"
+          }
+        },
+        "additionalProperties": false
+      },
       "Int32ApiResponse": {
         "type": "object",
         "properties": {
@@ -8388,6 +9719,32 @@
           "data": {
             "type": "integer",
             "format": "int32"
+          },
+          "traceId": {
+            "type": "string",
+            "nullable": true
+          },
+          "timestamp": {
+            "type": "string",
+            "format": "date-time"
+          }
+        },
+        "additionalProperties": false
+      },
+      "Int64ApiResponse": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "message": {
+            "type": "string",
+            "nullable": true
+          },
+          "data": {
+            "type": "integer",
+            "format": "int64"
           },
           "traceId": {
             "type": "string",
@@ -8487,6 +9844,59 @@
         },
         "additionalProperties": false
       },
+      "ManualCapacityResolvePreviewDto": {
+        "type": "object",
+        "properties": {
+          "manualSlotId": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "hasAnyWindow": {
+            "type": "boolean"
+          },
+          "status": {
+            "type": "string",
+            "nullable": true
+          },
+          "windows": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ResolvedWindowDto"
+            },
+            "nullable": true
+          }
+        },
+        "additionalProperties": false
+      },
+      "ManualCapacityResolvePreviewDtoListApiResponse": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "message": {
+            "type": "string",
+            "nullable": true
+          },
+          "data": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ManualCapacityResolvePreviewDto"
+            },
+            "nullable": true
+          },
+          "traceId": {
+            "type": "string",
+            "nullable": true
+          },
+          "timestamp": {
+            "type": "string",
+            "format": "date-time"
+          }
+        },
+        "additionalProperties": false
+      },
       "ManualCapacitySlotDto": {
         "type": "object",
         "properties": {
@@ -8544,7 +9954,32 @@
         },
         "additionalProperties": false
       },
-      "ManualCapacitySlotDtoListApiResponse": {
+      "ManualCapacitySlotDtoPageResult": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ManualCapacitySlotDto"
+            },
+            "nullable": true
+          },
+          "total": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "page": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "pageSize": {
+            "type": "integer",
+            "format": "int32"
+          }
+        },
+        "additionalProperties": false
+      },
+      "ManualCapacitySlotDtoPageResultApiResponse": {
         "type": "object",
         "properties": {
           "code": {
@@ -8556,11 +9991,7 @@
             "nullable": true
           },
           "data": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/ManualCapacitySlotDto"
-            },
-            "nullable": true
+            "$ref": "#/components/schemas/ManualCapacitySlotDtoPageResult"
           },
           "traceId": {
             "type": "string",
@@ -8633,7 +10064,32 @@
         },
         "additionalProperties": false
       },
-      "ManualSlotCalendarDtoListApiResponse": {
+      "ManualSlotCalendarDtoPageResult": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ManualSlotCalendarDto"
+            },
+            "nullable": true
+          },
+          "total": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "page": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "pageSize": {
+            "type": "integer",
+            "format": "int32"
+          }
+        },
+        "additionalProperties": false
+      },
+      "ManualSlotCalendarDtoPageResultApiResponse": {
         "type": "object",
         "properties": {
           "code": {
@@ -8645,11 +10101,7 @@
             "nullable": true
           },
           "data": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/ManualSlotCalendarDto"
-            },
-            "nullable": true
+            "$ref": "#/components/schemas/ManualSlotCalendarDtoPageResult"
           },
           "traceId": {
             "type": "string",
@@ -8658,6 +10110,31 @@
           "timestamp": {
             "type": "string",
             "format": "date-time"
+          }
+        },
+        "additionalProperties": false
+      },
+      "ManualSlotCalendarSingleRequest": {
+        "type": "object",
+        "properties": {
+          "manualSlotId": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "startTime": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "endTime": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "availableFlag": {
+            "type": "boolean"
+          },
+          "remark": {
+            "type": "string",
+            "nullable": true
           }
         },
         "additionalProperties": false
@@ -8821,11 +10298,50 @@
           "bomno": {
             "type": "string",
             "nullable": true
+          },
+          "plannedCompletionTime": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          },
+          "delayHours": {
+            "type": "number",
+            "format": "double",
+            "nullable": true
+          },
+          "primaryReasonCode": {
+            "type": "string",
+            "nullable": true
           }
         },
         "additionalProperties": false
       },
-      "OrderListItemDtoListApiResponse": {
+      "OrderListItemDtoPageResult": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/OrderListItemDto"
+            },
+            "nullable": true
+          },
+          "total": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "page": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "pageSize": {
+            "type": "integer",
+            "format": "int32"
+          }
+        },
+        "additionalProperties": false
+      },
+      "OrderListItemDtoPageResultApiResponse": {
         "type": "object",
         "properties": {
           "code": {
@@ -8837,11 +10353,7 @@
             "nullable": true
           },
           "data": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/OrderListItemDto"
-            },
-            "nullable": true
+            "$ref": "#/components/schemas/OrderListItemDtoPageResult"
           },
           "traceId": {
             "type": "string",
@@ -9067,6 +10579,10 @@
             "type": "string",
             "nullable": true
           },
+          "status": {
+            "type": "string",
+            "nullable": true
+          },
           "planHorizonStart": {
             "type": "string",
             "format": "date-time"
@@ -9100,7 +10616,7 @@
         },
         "additionalProperties": false
       },
-      "OverviewActivePlanDtoApiResponse": {
+      "OverviewActivePlanDtoListApiResponse": {
         "type": "object",
         "properties": {
           "code": {
@@ -9112,7 +10628,11 @@
             "nullable": true
           },
           "data": {
-            "$ref": "#/components/schemas/OverviewActivePlanDto"
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/OverviewActivePlanDto"
+            },
+            "nullable": true
           },
           "traceId": {
             "type": "string",
@@ -9200,7 +10720,15 @@
             "nullable": true
           },
           "isBottleneck": {
-            "type": "boolean"
+            "type": "boolean",
+            "nullable": true
+          },
+          "unavailableWindows": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/OverviewUnavailableWindowDto"
+            },
+            "nullable": true
           }
         },
         "additionalProperties": false
@@ -9234,65 +10762,62 @@
         },
         "additionalProperties": false
       },
-      "OverviewTaskSummaryDto": {
+      "OverviewUnavailableWindowDto": {
         "type": "object",
         "properties": {
-          "planVersionId": {
-            "type": "integer",
-            "format": "int32"
+          "from": {
+            "type": "string",
+            "format": "date-time"
           },
-          "totalTasks": {
-            "type": "integer",
-            "format": "int32"
+          "to": {
+            "type": "string",
+            "format": "date-time"
           },
-          "onTimeCount": {
-            "type": "integer",
-            "format": "int32"
-          },
-          "delayedCount": {
-            "type": "integer",
-            "format": "int32"
-          },
-          "riskCount": {
-            "type": "integer",
-            "format": "int32"
-          },
-          "unscheduledCount": {
-            "type": "integer",
-            "format": "int32"
-          },
-          "estimatedOnlyCount": {
-            "type": "integer",
-            "format": "int32"
-          },
-          "otherCount": {
-            "type": "integer",
-            "format": "int32"
+          "reason": {
+            "type": "string",
+            "nullable": true
           }
         },
         "additionalProperties": false
       },
-      "OverviewTaskSummaryDtoApiResponse": {
+      "ParameterSet": {
         "type": "object",
         "properties": {
-          "code": {
+          "id": {
             "type": "integer",
-            "format": "int32"
+            "format": "int64"
           },
-          "message": {
+          "parameterSetCode": {
             "type": "string",
             "nullable": true
           },
-          "data": {
-            "$ref": "#/components/schemas/OverviewTaskSummaryDto"
-          },
-          "traceId": {
+          "parameterSetName": {
             "type": "string",
             "nullable": true
           },
-          "timestamp": {
+          "description": {
+            "type": "string",
+            "nullable": true
+          },
+          "isActive": {
+            "type": "boolean"
+          },
+          "createdAt": {
             "type": "string",
             "format": "date-time"
+          },
+          "createdBy": {
+            "type": "string",
+            "nullable": true
+          },
+          "updatedAt": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          },
+          "updatedBy": {
+            "type": "string",
+            "nullable": true
           }
         },
         "additionalProperties": false
@@ -9315,6 +10840,9 @@
           "status": {
             "type": "string",
             "nullable": true
+          },
+          "isDefault": {
+            "type": "boolean"
           },
           "effectiveFrom": {
             "type": "string",
@@ -10206,6 +11734,145 @@
         },
         "additionalProperties": false
       },
+      "ProductionWorkCalendarDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "scopeType": {
+            "type": "string",
+            "nullable": true
+          },
+          "factoryId": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "factoryCode": {
+            "type": "string",
+            "nullable": true
+          },
+          "productionDepartmentId": {
+            "type": "integer",
+            "format": "int32",
+            "nullable": true
+          },
+          "departmentName": {
+            "type": "string",
+            "nullable": true
+          },
+          "workDate": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          },
+          "weekdayIso": {
+            "type": "integer",
+            "format": "int32",
+            "nullable": true
+          },
+          "startAt": {
+            "$ref": "#/components/schemas/TimeSpan"
+          },
+          "endAt": {
+            "$ref": "#/components/schemas/TimeSpan"
+          },
+          "workState": {
+            "type": "string",
+            "nullable": true
+          },
+          "allowLowerOverride": {
+            "type": "boolean"
+          },
+          "isAuthorizedOverride": {
+            "type": "boolean"
+          },
+          "sourceSystem": {
+            "type": "string",
+            "nullable": true
+          },
+          "sourceReference": {
+            "type": "string",
+            "nullable": true
+          },
+          "effectiveFrom": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "effectiveTo": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          },
+          "isActive": {
+            "type": "boolean"
+          },
+          "createdBy": {
+            "type": "string",
+            "nullable": true
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "updatedAt": {
+            "type": "string",
+            "format": "date-time"
+          }
+        },
+        "additionalProperties": false
+      },
+      "ProductionWorkCalendarDtoPageResult": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ProductionWorkCalendarDto"
+            },
+            "nullable": true
+          },
+          "total": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "page": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "pageSize": {
+            "type": "integer",
+            "format": "int32"
+          }
+        },
+        "additionalProperties": false
+      },
+      "ProductionWorkCalendarDtoPageResultApiResponse": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "message": {
+            "type": "string",
+            "nullable": true
+          },
+          "data": {
+            "$ref": "#/components/schemas/ProductionWorkCalendarDtoPageResult"
+          },
+          "traceId": {
+            "type": "string",
+            "nullable": true
+          },
+          "timestamp": {
+            "type": "string",
+            "format": "date-time"
+          }
+        },
+        "additionalProperties": false
+      },
       "PublishRequest": {
         "type": "object",
         "properties": {
@@ -10253,6 +11920,27 @@
         },
         "additionalProperties": false,
         "description": "刷新Token请求"
+      },
+      "ResolvedWindowDto": {
+        "type": "object",
+        "properties": {
+          "start": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "end": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "source": {
+            "type": "string",
+            "nullable": true
+          },
+          "isAuthorized": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false
       },
       "ResourceCalendarBulkRequest": {
         "type": "object",
@@ -10322,7 +12010,81 @@
         },
         "additionalProperties": false
       },
-      "ResourceCalendarEntryDtoListApiResponse": {
+      "ResourceCalendarEntryDtoPageResult": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ResourceCalendarEntryDto"
+            },
+            "nullable": true
+          },
+          "total": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "page": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "pageSize": {
+            "type": "integer",
+            "format": "int32"
+          }
+        },
+        "additionalProperties": false
+      },
+      "ResourceCalendarEntryDtoPageResultApiResponse": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "message": {
+            "type": "string",
+            "nullable": true
+          },
+          "data": {
+            "$ref": "#/components/schemas/ResourceCalendarEntryDtoPageResult"
+          },
+          "traceId": {
+            "type": "string",
+            "nullable": true
+          },
+          "timestamp": {
+            "type": "string",
+            "format": "date-time"
+          }
+        },
+        "additionalProperties": false
+      },
+      "ResourceCalendarResolvePreviewDto": {
+        "type": "object",
+        "properties": {
+          "resourceId": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "hasAnyWindow": {
+            "type": "boolean"
+          },
+          "status": {
+            "type": "string",
+            "nullable": true
+          },
+          "windows": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ResolvedWindowDto"
+            },
+            "nullable": true
+          }
+        },
+        "additionalProperties": false
+      },
+      "ResourceCalendarResolvePreviewDtoListApiResponse": {
         "type": "object",
         "properties": {
           "code": {
@@ -10336,7 +12098,7 @@
           "data": {
             "type": "array",
             "items": {
-              "$ref": "#/components/schemas/ResourceCalendarEntryDto"
+              "$ref": "#/components/schemas/ResourceCalendarResolvePreviewDto"
             },
             "nullable": true
           },
@@ -10347,6 +12109,31 @@
           "timestamp": {
             "type": "string",
             "format": "date-time"
+          }
+        },
+        "additionalProperties": false
+      },
+      "ResourceCalendarSingleRequest": {
+        "type": "object",
+        "properties": {
+          "resourceId": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "startTime": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "endTime": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "availableFlag": {
+            "type": "boolean"
+          },
+          "remark": {
+            "type": "string",
+            "nullable": true
           }
         },
         "additionalProperties": false
@@ -10375,6 +12162,14 @@
             "format": "int32"
           },
           "productionDepartmentName": {
+            "type": "string",
+            "nullable": true
+          },
+          "factoryCode": {
+            "type": "string",
+            "nullable": true
+          },
+          "factoryName": {
             "type": "string",
             "nullable": true
           },
@@ -10552,6 +12347,48 @@
         },
         "additionalProperties": false
       },
+      "RuleSet": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "ruleSetCode": {
+            "type": "string",
+            "nullable": true
+          },
+          "ruleSetName": {
+            "type": "string",
+            "nullable": true
+          },
+          "description": {
+            "type": "string",
+            "nullable": true
+          },
+          "isActive": {
+            "type": "boolean"
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "createdBy": {
+            "type": "string",
+            "nullable": true
+          },
+          "updatedAt": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          },
+          "updatedBy": {
+            "type": "string",
+            "nullable": true
+          }
+        },
+        "additionalProperties": false
+      },
       "RuleSetVersion": {
         "type": "object",
         "properties": {
@@ -10570,6 +12407,9 @@
           "status": {
             "type": "string",
             "nullable": true
+          },
+          "isDefault": {
+            "type": "boolean"
           },
           "effectiveFrom": {
             "type": "string",
@@ -10615,6 +12455,10 @@
             "type": "string",
             "nullable": true
           },
+          "setupTransitionRulesJson": {
+            "type": "string",
+            "nullable": true
+          },
           "contentSnapshotJson": {
             "type": "string",
             "nullable": true
@@ -10622,48 +12466,88 @@
         },
         "additionalProperties": false
       },
-      "RunDomainStatusDto": {
+      "RunScopeCountsDto": {
         "type": "object",
         "properties": {
-          "domainKey": {
-            "type": "string",
-            "nullable": true
-          },
-          "status": {
-            "type": "string",
-            "nullable": true
-          },
-          "reason": {
-            "type": "string",
-            "nullable": true
-          },
-          "planVersionId": {
+          "orderTargets": {
             "type": "integer",
-            "format": "int64",
-            "nullable": true
+            "format": "int32"
           },
-          "planVersionCode": {
-            "type": "string",
-            "nullable": true
+          "taskTargets": {
+            "type": "integer",
+            "format": "int32"
           },
-          "startedAt": {
-            "type": "string",
-            "format": "date-time"
-          },
-          "computedAt": {
-            "type": "string",
-            "format": "date-time",
-            "nullable": true
-          },
-          "activatedAt": {
-            "type": "string",
-            "format": "date-time",
-            "nullable": true
+          "changedResources": {
+            "type": "integer",
+            "format": "int32"
           }
         },
         "additionalProperties": false
       },
-      "RunDomainStatusDtoIReadOnlyListApiResponse": {
+      "RunScopeDto": {
+        "type": "object",
+        "properties": {
+          "scheduleRunId": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "runType": {
+            "type": "string",
+            "nullable": true
+          },
+          "scopeAvailable": {
+            "type": "boolean"
+          },
+          "schemaVersion": {
+            "type": "integer",
+            "format": "int32",
+            "nullable": true
+          },
+          "businessTriggerType": {
+            "type": "string",
+            "nullable": true
+          },
+          "priorityMode": {
+            "type": "string",
+            "nullable": true
+          },
+          "basePlanVersionId": {
+            "type": "integer",
+            "format": "int32",
+            "nullable": true
+          },
+          "baseVersionCode": {
+            "type": "string",
+            "nullable": true
+          },
+          "orderTargets": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RunScopeOrderTargetDto"
+            },
+            "nullable": true
+          },
+          "taskTargets": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RunScopeTaskTargetDto"
+            },
+            "nullable": true
+          },
+          "changedResources": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RunScopeResourceDto"
+            },
+            "nullable": true
+          },
+          "counts": {
+            "$ref": "#/components/schemas/RunScopeCountsDto"
+          }
+        },
+        "additionalProperties": false
+      },
+      "RunScopeDtoApiResponse": {
         "type": "object",
         "properties": {
           "code": {
@@ -10675,11 +12559,7 @@
             "nullable": true
           },
           "data": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/RunDomainStatusDto"
-            },
-            "nullable": true
+            "$ref": "#/components/schemas/RunScopeDto"
           },
           "traceId": {
             "type": "string",
@@ -10688,6 +12568,70 @@
           "timestamp": {
             "type": "string",
             "format": "date-time"
+          }
+        },
+        "additionalProperties": false
+      },
+      "RunScopeOrderTargetDto": {
+        "type": "object",
+        "properties": {
+          "orderCanonicalId": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "orderNo": {
+            "type": "string",
+            "nullable": true
+          },
+          "mtS_InstructionNo": {
+            "type": "string",
+            "nullable": true
+          },
+          "manualTargetDueDate": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          }
+        },
+        "additionalProperties": false
+      },
+      "RunScopeResourceDto": {
+        "type": "object",
+        "properties": {
+          "resourceId": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "resourceCode": {
+            "type": "string",
+            "nullable": true
+          },
+          "resourceName": {
+            "type": "string",
+            "nullable": true
+          }
+        },
+        "additionalProperties": false
+      },
+      "RunScopeTaskTargetDto": {
+        "type": "object",
+        "properties": {
+          "taskId": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "taskNo": {
+            "type": "string",
+            "nullable": true
+          },
+          "operationCode": {
+            "type": "string",
+            "nullable": true
+          },
+          "targetTime": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
           }
         },
         "additionalProperties": false
@@ -10843,6 +12787,12 @@
             "type": "integer",
             "format": "int32",
             "nullable": true
+          },
+          "versionExists": {
+            "type": "boolean"
+          },
+          "scopeDenied": {
+            "type": "boolean"
           }
         },
         "additionalProperties": false
@@ -10987,6 +12937,52 @@
           "setupMinutes": {
             "type": "number",
             "format": "double"
+          }
+        },
+        "additionalProperties": false
+      },
+      "StrategyProfile": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "strategyProfileCode": {
+            "type": "string",
+            "nullable": true
+          },
+          "strategyProfileName": {
+            "type": "string",
+            "nullable": true
+          },
+          "description": {
+            "type": "string",
+            "nullable": true
+          },
+          "runType": {
+            "type": "string",
+            "nullable": true
+          },
+          "isActive": {
+            "type": "boolean"
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "createdBy": {
+            "type": "string",
+            "nullable": true
+          },
+          "updatedAt": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          },
+          "updatedBy": {
+            "type": "string",
+            "nullable": true
           }
         },
         "additionalProperties": false
@@ -11680,6 +13676,123 @@
           "timestamp": {
             "type": "string",
             "format": "date-time"
+          }
+        },
+        "additionalProperties": false
+      },
+      "WeeklyCalendarEntry": {
+        "type": "object",
+        "properties": {
+          "weekdayIso": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "workState": {
+            "type": "string",
+            "nullable": true
+          },
+          "startAt": {
+            "$ref": "#/components/schemas/TimeSpan"
+          },
+          "endAt": {
+            "$ref": "#/components/schemas/TimeSpan"
+          },
+          "allowLowerOverride": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false
+      },
+      "WeeklyCalendarUpsertRequest": {
+        "type": "object",
+        "properties": {
+          "scopeType": {
+            "type": "string",
+            "nullable": true
+          },
+          "factoryId": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "productionDepartmentId": {
+            "type": "integer",
+            "format": "int32",
+            "nullable": true
+          },
+          "effectiveFrom": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "entries": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/WeeklyCalendarEntry"
+            },
+            "nullable": true
+          },
+          "sourceSystem": {
+            "type": "string",
+            "nullable": true
+          },
+          "sourceReference": {
+            "type": "string",
+            "nullable": true
+          }
+        },
+        "additionalProperties": false
+      },
+      "WorkCalendarExceptionRequest": {
+        "type": "object",
+        "properties": {
+          "scopeType": {
+            "type": "string",
+            "nullable": true
+          },
+          "factoryId": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "productionDepartmentId": {
+            "type": "integer",
+            "format": "int32",
+            "nullable": true
+          },
+          "workDate": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "workState": {
+            "type": "string",
+            "nullable": true
+          },
+          "startAt": {
+            "$ref": "#/components/schemas/TimeSpan"
+          },
+          "endAt": {
+            "$ref": "#/components/schemas/TimeSpan"
+          },
+          "allowLowerOverride": {
+            "type": "boolean"
+          },
+          "isAuthorizedOverride": {
+            "type": "boolean"
+          },
+          "sourceSystem": {
+            "type": "string",
+            "nullable": true
+          },
+          "sourceReference": {
+            "type": "string",
+            "nullable": true
+          },
+          "effectiveFrom": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "effectiveTo": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
           }
         },
         "additionalProperties": false

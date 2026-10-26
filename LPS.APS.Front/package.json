@@ -9,7 +9,7 @@
     "i": "pnpm install",
     "dev": "pnpm vite --mode base",
     "ts:check": "pnpm vue-tsc --noEmit --skipLibCheck",
-    "test:unit": "esno --test tests/unit/draftBuffer.spec.ts",
+    "test:unit": "esno --test tests/unit/draftBuffer.spec.ts tests/unit/validationMessages.spec.ts tests/unit/warehouseRefs.spec.ts tests/unit/anchorResource.spec.ts",
     "verify:rbac": "node scripts/verify-rbac.mjs",
     "seed:dev": "node scripts/seed-dev.mjs",
     "build:pro": "pnpm vite build --mode pro",

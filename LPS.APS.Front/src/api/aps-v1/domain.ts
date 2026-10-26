@@ -19,6 +19,8 @@
 import { apsHttp, ApiError, APS_USE_MOCK } from './http'
 import type {
   DomainDefinitionDto,
+  DomainDependencyDto,
+  DomainDependencyQuery,
   DomainListQuery,
   FactorySummaryDto,
   ProductFamilySummaryDto
@@ -292,6 +294,32 @@ export const domainApi = {
     }
     return apsHttp.get<FactorySummaryDto[]>({
       url: '/api/governance/factories'
+    })
+  },
+
+  /**
+   * 排程域依赖（G7：GET /api/governance-query/domain-dependencies）
+   *
+   * 选这个端点而不是 3号位 的 GET /api/Governance/domain-dependencies 的原因：
+   *  - 本端点按调用人数据范围收窄结果集（空范围 fail-closed，越权 domainCode → 403），且已联调；
+   *  - 3号位 端点原先无范围收窄（2026-10-22 我方出函）；3号位 2026-10-25 回执称已补 scope，
+   *    但本仓 lps/ 尚未同步、无从核实，且该端点从未联调 ⇒ 前端不接，避免两套同名端点并存。
+   *
+   * 语义：domainCode 省略 = 全部；direction=upstream 查本域依赖谁，downstream 查谁依赖本域。
+   * silent：失败在「域依赖关系」区块内展示，不弹全局 toast（不影响页面其余部分）。
+   */
+  async getDependencies(query: DomainDependencyQuery = {}): Promise<DomainDependencyDto[]> {
+    if (APS_USE_MOCK) {
+      // mock 模式无依赖夹具：不编造依赖边（页面按「扫描结果为空」如实展示）
+      return []
+    }
+    return apsHttp.get<DomainDependencyDto[]>({
+      url: '/api/governance-query/domain-dependencies',
+      params: {
+        domainCode: query.domainCode,
+        direction: query.direction
+      },
+      silent: true
     })
   }
 }

@@ -51,7 +51,7 @@ SELECT
     ReviewedBy,
     ReviewedAt,
     CreatedAt
-FROM MES_APS_BOM_Workset_Issues
+FROM ext_MES_APS_BOM_Workset_Issues
 WHERE 1=1
     AND (@BatchNo IS NULL OR BatchNo = @BatchNo)
     AND (@MaterialCode IS NULL OR ParentMaterialCode = @MaterialCode OR ChildMaterialCode = @MaterialCode)
@@ -66,7 +66,8 @@ ORDER BY
         WHEN 'INFO' THEN 2
         ELSE 3
     END,
-    CreatedAt DESC
+    CreatedAt DESC,
+    BOMNO, IssueType, ChildMaterialCode   -- tiebreaker：视图无 Id，用内容键三元组定序（全链清扫）
 OFFSET @Skip ROWS FETCH NEXT @Take ROWS ONLY";
 
         var parameters = new
@@ -81,10 +82,11 @@ OFFSET @Skip ROWS FETCH NEXT @Take ROWS ONLY";
             Take = take
         };
 
-        // MES_APS_BOM_Workset_Issues 属 ODS 集成层（MES_Integration，随 MES_APS_BOM_Workset 同库），非 APS_Production。
-        // 此前误用 DatabaseId.APS → 查错库 → "对象名无效" 500（4号位 2026-10-10 报）。
+        // 2026-10-12：经 APS 库同义词 ext_MES_APS_BOM_Workset_Issues（linked server [mes] → MES_Integration.dbo.MES_APS_BOM_Workset_Issues）
+        // 访问 ODS 数据，统一 DatabaseId.APS；防腐层 ext_* 惯例，仓库不再直连 ODS。
+        // （10-10 教训备忘：该表物理在 ODS——当初误在 APS 找裸表名致 500；同义词方案落地后可单连接引用。）
         var results = await _connectionManager.QueryAsync<BusinessFactIssueDto>(
-            sql, parameters, CommandType.Text, DatabaseId.ODS, commandTimeout: 30);
+            sql, parameters, CommandType.Text, DatabaseId.APS, commandTimeout: 30);
 
         return results.ToList();
     }
@@ -174,12 +176,18 @@ OFFSET @Skip ROWS FETCH NEXT @Take ROWS ONLY";
     {
         var allIssues = new List<BusinessFactIssueDto>();
 
+        // 分页 skip 透传修复（4号位 10-10 回检）：内层原先只取 take 条，外层 .Skip(skip) 在
+        // skip > take 时必空。两表分属不同服务器（BOM Issues=ODS，MSC=APS_Production），
+        // 无法单 SQL UNION ALL，故各源取自己的 top (skip+take)：任一源的全局 top (skip+take)
+        // 行必含自身 top (skip+take)，合并后再全局排序取窗口，语义正确。
+        var innerTake = skip + take;
+
         // BOM Workset Issues
         if (string.IsNullOrEmpty(source) || source == "BOM_WORKSET")
         {
             var bomIssues = await QueryBomWorksetIssuesAsync(
                 materialCode: materialCode, severity: severity,
-                reviewStatus: reviewStatus, take: take, ct: ct,
+                reviewStatus: reviewStatus, take: innerTake, ct: ct,
                 allowedFactories: allowedFactories);
             allIssues.AddRange(bomIssues);
         }
@@ -189,7 +197,7 @@ OFFSET @Skip ROWS FETCH NEXT @Take ROWS ONLY";
         {
             var mscIssues = await QueryMaterialStageContextIssuesAsync(
                 materialCode: materialCode, severity: severity,
-                reviewStatus: reviewStatus, take: take, ct: ct,
+                reviewStatus: reviewStatus, take: innerTake, ct: ct,
                 allowedFactories: allowedFactories);
             allIssues.AddRange(mscIssues);
         }
@@ -220,7 +228,7 @@ OFFSET @Skip ROWS FETCH NEXT @Take ROWS ONLY";
 
         var sql = @"
 SELECT COUNT(*)
-FROM MES_APS_BOM_Workset_Issues
+FROM ext_MES_APS_BOM_Workset_Issues
 WHERE 1=1
     AND (@MaterialCode IS NULL OR ParentMaterialCode = @MaterialCode OR ChildMaterialCode = @MaterialCode)
     AND (@Severity IS NULL OR Severity = @Severity)
@@ -237,7 +245,7 @@ WHERE 1=1
         };
 
         return await _connectionManager.QueryFirstOrDefaultAsync<int>(
-            sql, parameters, CommandType.Text, DatabaseId.ODS, commandTimeout: 30);
+            sql, parameters, CommandType.Text, DatabaseId.APS, commandTimeout: 30);
     }
 
     /// <summary>MaterialStageDeptContext Issues 命中总数（同查询2 WHERE，不含分页）</summary>

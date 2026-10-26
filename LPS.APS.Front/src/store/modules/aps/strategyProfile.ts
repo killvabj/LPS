@@ -11,13 +11,13 @@
  *  - runTrace：Run 引用追溯
  *  - loading 系列：UI 态
  *
- * 权限（前端按钮显隐，对齐后端 PermissionCodes.cs 三码）：
+ * 权限（前后端一致，DDL 真值见 lps/LPS.APS.Core/Authorization/PermissionCodes.cs:54-58）：
  *  - aps.strategy.view     → 查看（列表 / 详情 / Diff / Trace / Default / Published）
  *  - aps.strategy.edit     → 编辑（创建 DRAFT / 更新 DRAFT / Disable）
  *  - aps.strategy.publish  → 发布（POST /publish）
- *  - 注：后端类级用 [Authorize(StrategyView/RuleMaintain/RulePublish)] 三码对应
- *    （RuleMaintain = edit 权限码，RulePublish = publish 权限码；命名上后端用 Rule.* 复用，
- *     前端通过策略包专属的 aps.strategy.* 三码 OR 组合表达，与路由 meta 保持一致）
+ *  - 注：后端 .NET 常量名是 StrategyView / StrategyEdit / StrategyPublish（PascalCase），
+ *    但 DDL PermissionCode 字符串值与前端 aps.strategy.* 三码完全一致（10-10 审查
+ *    确认非错位；store 历史注释的「RuleMaintain/RulePublish」实为常量名误读）
  *
  * 红线：
  *  - 已发布/退役/归档版本不可编辑（前端按钮 disabled + 后端 400 双保险）
@@ -155,6 +155,68 @@ export const useStrategyProfileStore = defineStore('aps.strategyProfile', () => 
       handleError(err)
     } finally {
       listLoading.value = false
+    }
+  }
+
+  /**
+   * 新建策略包主表（POST /strategy-profile）。
+   *
+   * 与参数集不同：策略包首版**必须绑定规则集版本 + 参数集版本**，没有「空白草稿」可自动跟建
+   * ⇒ 这里只建壳并选中，首版由用户点「新建草稿」时选择两个版本。
+   *
+   * ⚠️ 后端 `POST /strategy-profile` 尚未提供（见 strategyProfileApi.createProfile 注释）：
+   * 调用会 404；回列表核对同编码，防「其实已建成、只是响应报错」把用户卡死。
+   */
+  async function createProfile(input: {
+    strategyProfileCode: string
+    strategyProfileName: string
+    description?: string
+    runType?: string | null
+  }): Promise<number | null> {
+    if (!canWrite.value) {
+      error.value = '当前操作者无写权限（需权限码 aps.strategy.edit）'
+      return null
+    }
+    const code = input.strategyProfileCode.trim()
+    const name = input.strategyProfileName.trim()
+    if (!code || !name) {
+      error.value = '策略包编码和名称都必须填写'
+      return null
+    }
+    if (
+      profiles.value.some((p) => p.strategyProfileCode?.trim().toLowerCase() === code.toLowerCase())
+    ) {
+      error.value = `策略包编码已存在：${code}`
+      return null
+    }
+    actionRunning.value = true
+    error.value = null
+    try {
+      const created = await strategyProfileApi.createProfile({
+        strategyProfileCode: code,
+        strategyProfileName: name,
+        description: input.description?.trim() || undefined,
+        runType: input.runType || null
+      })
+      await loadProfiles()
+      return created.id
+    } catch (err) {
+      await loadProfiles()
+      const hit = profiles.value.find(
+        (p) => p.strategyProfileCode?.trim().toLowerCase() === code.toLowerCase()
+      )
+      if (hit) {
+        console.warn('[策略包] 新建接口报错，但回列表发现同编码策略包已存在，按已建成继续', err)
+        return hit.id
+      }
+      handleError(err)
+      const httpStatus = err instanceof ApiError ? err.code : undefined
+      error.value =
+        `新建没成功${httpStatus ? `（服务器返回 ${httpStatus}）` : ''}。` +
+        '也可能是「其实已经建好了，只是返回时出错」——请刷新一下列表，看这个编码在不在。'
+      return null
+    } finally {
+      actionRunning.value = false
     }
   }
 
@@ -361,6 +423,7 @@ export const useStrategyProfileStore = defineStore('aps.strategyProfile', () => 
     selectProfile,
     selectVersion,
     loadProfiles,
+    createProfile,
     loadVersions,
     loadDiff,
     validateDraft,

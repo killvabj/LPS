@@ -1,140 +1,214 @@
 /**
- * APS V1 4号位 — 运行/版本/MES Pinia store（页面 9）
+ * APS V1 4号位 — 运行治理 Pinia store（页面 9：运行与下发）
  *
- * 状态：
- *  - data：RunStatusDto
- *  - loading / error：UI 态
- *
- * 注意：4号位文档第 2.1 节：阶段 A 阶段不直接触发任何写操作
- *       recoverFailedRun 由 PMC 在阶段 B 手工触发，4号位页面只读展示
+ * 2026-10-16 重整（依据《4号位致3号位/5号位·运行页联调缺口回执》）：
+ *  - 删掉自拟聚合体 `RunStatusDto`：后端 `GET /api/governance/runs` 只返 `ScheduleRunGov[]` 裸数组，
+ *    端点说明已写明「只查 ScheduleRun 表、不做跨域综合统计」⇒ 页面按聚合体取值时
+ *    `recentRuns` 恒 undefined，整页 KPI 恒 0（dev 实有 44 次排产）
+ *  - 改为三个真实数据面各自独立调、各自降级：
+ *      ① Run 列表   `GET /api/governance/runs`       （3号位）
+ *      ② 生效版本   `GET /api/overview/active-plan`   （5号位）
+ *      ③ 域状态拆解 `GET /api/domain-status/{runId}`  （5号位，取最近一次 Run）
+ *  - 状态词表改为冻结 07 §4.5 权威四值 `RUNNING / COMPLETED / PARTIAL_SUCCESS / FAILED`
+ *    （此前自拟的 `PENDING` / `SUCCESS` 冻结里不存在，且漏了 `COMPLETED`
+ *      ⇒ 「成功」卡恒 0、后端真跑出 COMPLETED 时不计入任何卡片）
+ *  - 删除 MES 全部状态（资格样本 / 下发 / 回执）：后端无资格查询端点，
+ *    `POST /api/mes/dispatch` 只认 `factoryCode` 且是登记 stub，冻结 §十 要求的
+ *    4号位 → 5号位 → 2号位 链路前端也接不上
  */
 
 import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
 import {
   runApi,
+  overviewApi,
   ApiError,
-  type RunStatusDto,
-  type ScheduleRunDto,
+  type ActiveVersionPanel,
   type RecoverFailedRunResult,
-  type DomainKey,
-  type MesDispatchInput,
-  type MesDispatchResult
+  type RunDomainStatusItem,
+  type RunStatus,
+  type RunType,
+  type ScheduleRunGovDto,
+  type DomainKey
 } from '@/api/aps-v1'
 import { useApsAuthStore } from './auth'
 import { assertScope, ScopeViolationError } from './scope'
 
-export const RUN_STATUS_LABEL: Record<ScheduleRunDto['status'], string> = {
-  PENDING: '排队',
+/** 冻结 07 §4.5 ScheduleRun.Status 权威四值 */
+export const RUN_STATUS_LABEL: Record<RunStatus, string> = {
   RUNNING: '运行中',
+  COMPLETED: '已完成',
   PARTIAL_SUCCESS: '部分成功',
-  SUCCESS: '成功',
   FAILED: '失败'
 }
 
-export const RUN_STATUS_TAG: Record<
-  ScheduleRunDto['status'],
-  'success' | 'warning' | 'danger' | 'primary' | 'info'
-> = {
-  PENDING: 'info',
+export const RUN_STATUS_TAG: Record<RunStatus, 'success' | 'warning' | 'danger' | 'primary'> = {
   RUNNING: 'primary',
+  COMPLETED: 'success',
   PARTIAL_SUCCESS: 'warning',
-  SUCCESS: 'success',
   FAILED: 'danger'
 }
 
-export const RUN_TYPE_LABEL: Record<ScheduleRunDto['runType'], string> = {
+/** 冻结 07 §4.5 运行类型五值（含 SIMULATION，后端 DTO 注释列明但此前前端缺） */
+export const RUN_TYPE_LABEL: Record<RunType, string> = {
   FULL_SCHEDULE: '全量排产',
-  LOCAL_RESCHEDULE: '局部重排',
   MANUAL_RESCHEDULE: '手工重排',
+  LOCAL_RESCHEDULE: '局部重排',
+  SIMULATION: '仿真运行',
   INSERT_ORDER_WHATIF: '插单 WhatIf'
+}
+
+/** 单个数据面的失败信息（页面按块提示，而不是整页报错） */
+export interface RunSectionError {
+  section: string
+  message: string
+}
+
+/** 列表卡片用（已归一，模板不必处理后端省略掉的 null 字段） */
+export interface RunListItem extends ScheduleRunGovDto {
+  /** 后端给的是 JSON 字符串（如 `["FAMILY_INJECTION"]`）；无值或解析失败为 null */
+  expectedDomainKeys: DomainKey[] | null
+}
+
+/** 后端给的是 JSON 数组字符串；解析失败不抛，按 null 走「无域限定」放行 */
+function parseDomainKeysJson(raw?: string | null): DomainKey[] | null {
+  if (!raw) return null
+  try {
+    const parsed: unknown = JSON.parse(raw)
+    return Array.isArray(parsed) ? (parsed as DomainKey[]) : null
+  } catch {
+    return null
+  }
 }
 
 export const useRunStore = defineStore('aps.run', () => {
   // ===== state =====
-  const data = ref<RunStatusDto | null>(null)
+  const runs = ref<RunListItem[]>([])
+  const activeVersions = ref<ActiveVersionPanel[]>([])
+  const domainStatuses = ref<RunDomainStatusItem[]>([])
+  /** 域状态对应的 Run（取最近一次）；null = 尚无可取数的 Run */
+  const domainStatusRunId = ref<number | null>(null)
+  /**
+   * 取数的这次 Run 是否**登记过**预期域（分母）。
+   *
+   * ⚠️ 5号位 2026-10-19 R3 收口裁定：夹具 Run（TEST_*）的 `ExpectedDomainKeysJson`
+   * **不回填**，`/api/domain-status/{runId}` 对其 404 是**正确终态**、不是故障；
+   * 但「有真分母的 Run 出现 404」是**新缺陷**。两者在 HTTP 层同为 404，
+   * 只有本标志分得开 —— 否则页面会把一次真故障写成「没登记要跑哪些排程域」。
+   */
+  const domainStatusHasDenominator = ref(false)
+
   const loading = ref(false)
   const error = ref<string | null>(null)
+  const errors = ref<RunSectionError[]>([])
   /** 最近一次 FAILED 恢复结果（U19 验收：原 Run 仍 FAILED + 新 Run 产生） */
   const lastRecover = ref<RecoverFailedRunResult | null>(null)
   const recovering = ref(false)
-  /** 最近一次 MES 下发结果（§十九.MES展示/操作） */
-  const lastDispatch = ref<MesDispatchResult | null>(null)
-  const dispatching = ref(false)
 
   // ===== getters =====
-  /** P1-15：业务范围联动（前端防御；3号位后端会二次校验） */
+  /** P1-15：业务范围（前端防御；后端亦有二次校验） */
   const apsAuth = useApsAuthStore()
-  const allowedDomainKeys = computed<DomainKey[] | null>(() => {
-    const keys = apsAuth.dataScope.domainKeys
-    return keys.length > 0 ? keys : null
-  })
 
   /**
-   * ScheduleRun 是否在当前用户业务范围内
-   *  - 判定标准：expectedDomainKeys 与用户 domainKeys 至少有一个交集
-   *  - 空 scope → 全部放行
+   * Run 是否落在当前用户业务范围内。
+   *
+   * ⚠️ 2026-10-16：后端 `ScheduleRunGov` 只给 `ExpectedDomainKeysJson` **JSON 字符串**，
+   *    且 dev 实测 44 条里只有 7 条有值（其余被 WhenWritingNull 省略）。
+   *    缺该字段时**按放行处理**（无域限定 = 全员可见），不猜、不拿别的字段顶替 ——
+   *    否则 37 条会被静默隐藏、页面又变成「空」。已随函请后端确认该字段是否应补齐。
    */
-  function runInScope(run: ScheduleRunDto): boolean {
-    const allow = allowedDomainKeys.value
-    if (!allow) return true
-    return run.expectedDomainKeys.some((k) => allow.includes(k))
+  function runInScope(run: RunListItem): boolean {
+    const keys = apsAuth.dataScope.domainKeys
+    if (keys.length === 0) return true
+    if (!run.expectedDomainKeys || run.expectedDomainKeys.length === 0) return true
+    return run.expectedDomainKeys.some((k) => keys.includes(k))
   }
 
-  /** recentRuns 受业务范围过滤（前端预过滤，不替换 data.value） */
-  const runs = computed(() => (data.value?.recentRuns ?? []).filter(runInScope))
-  /** activeVersions 受业务范围过滤 */
-  const activeVersions = computed(() =>
-    (data.value?.activeVersions ?? []).filter((v) => {
-      const allow = allowedDomainKeys.value
-      if (!allow) return true
-      return allow.includes(v.domainKey)
-    })
-  )
-  const mesSamples = computed(() => data.value?.mesEligibilitySamples ?? [])
-  const partialBreakdown = computed(() => data.value?.currentPartialBreakdown ?? null)
+  const visibleRuns = computed(() => runs.value.filter(runInScope))
+  const latestRun = computed<RunListItem | null>(() => visibleRuns.value[0] ?? null)
 
+  /** 各状态计数（四值齐全，未出现的状态为 0，不开新键） */
   const runStatusCounts = computed(() => {
-    const counts: Record<ScheduleRunDto['status'], number> = {
-      PENDING: 0,
+    const counts: Record<RunStatus, number> = {
       RUNNING: 0,
+      COMPLETED: 0,
       PARTIAL_SUCCESS: 0,
-      SUCCESS: 0,
       FAILED: 0
     }
-    runs.value.forEach((r) => {
+    visibleRuns.value.forEach((r) => {
       counts[r.status] = (counts[r.status] ?? 0) + 1
     })
     return counts
   })
 
-  const mesStats = computed(() => {
-    const stats = { ELIGIBLE: 0, INELIGIBLE: 0, UNKNOWN: 0 }
-    mesSamples.value.forEach((s) => {
-      stats[s.eligibility] = (stats[s.eligibility] ?? 0) + 1
-    })
-    return stats
-  })
+  /** 有失败 / 部分成功需要用户关注的 Run */
+  const attentionRuns = computed(() =>
+    visibleRuns.value.filter((r) => r.status === 'FAILED' || r.status === 'PARTIAL_SUCCESS')
+  )
 
   // ===== actions =====
   async function load(): Promise<void> {
     loading.value = true
     error.value = null
+    errors.value = []
+    const failed = (section: string, err: unknown, fallback: string) =>
+      errors.value.push({
+        section,
+        message:
+          err instanceof ApiError
+            ? `[${err.code}] ${err.message}`
+            : ((err as Error)?.message ?? fallback)
+      })
+
+    // ---- ① Run 列表（页面主体）----
     try {
-      data.value = await runApi.getStatus()
+      const rows = await runApi.listRuns(50)
+      runs.value = rows.map((r) => ({
+        ...r,
+        expectedDomainKeys: parseDomainKeysJson(r.expectedDomainKeysJson)
+      }))
     } catch (err) {
-      handleError(err)
-    } finally {
-      loading.value = false
+      runs.value = []
+      failed('排产记录', err, '加载排产记录失败')
     }
+
+    // ---- ② 生效版本（5号位）----
+    try {
+      activeVersions.value = await overviewApi.getActivePlans()
+    } catch (err) {
+      activeVersions.value = []
+      failed('生效版本', err, '加载生效版本失败')
+    }
+
+    // ---- ③ 域状态拆解（5号位，入参取最近一次 Run）----
+    //  没有 runId 就不发请求（路由是 {scheduleRunId:int}）。
+    //  后端对「该 Run 没登记 ExpectedDomainKeysJson」的 run 返 404（实测 run 160 如此，
+    //  45 条里 37 条属此类）⇒ 走卡片里的空态，不进 errors[]、不弹全局 toast。
+    const latest = visibleRuns.value[0]
+    if (!latest) {
+      domainStatuses.value = []
+      domainStatusRunId.value = null
+      domainStatusHasDenominator.value = false
+    } else {
+      domainStatusRunId.value = latest.id
+      domainStatusHasDenominator.value = Boolean(latest.expectedDomainKeys?.length)
+      try {
+        domainStatuses.value = await overviewApi.getRunDomainStatus(latest.id)
+      } catch (err) {
+        domainStatuses.value = []
+        // 只豁免「本来就没分母」的 404（5号位 R3 裁定：夹具 Run 不回填，404 即终态）。
+        // 有分母还 404 = 新缺陷，必须进 errors[]，不能被空态文案盖成正常。
+        const terminalNoDenominator =
+          err instanceof ApiError && err.code === 404 && !domainStatusHasDenominator.value
+        if (!terminalNoDenominator) {
+          failed('排程域状态', err, '加载排程域状态失败')
+        }
+      }
+    }
+
+    loading.value = false
   }
 
-  /**
-   * FAILED Run 人工恢复（U19：新建 Run，原始 Run 仍 FAILED）
-   *  - 4 号位文档第 15 节：FAILED 人工恢复按钮必须调用"新建 ScheduleRun"，不能把 FAILED 直接改回 RUNNING
-   *  - 恢复完成后 refresh，新 Run 应出现在 runs 列表顶部，原 Run 仍为 FAILED
-   *  - P1-15：payload.domainKeys 中每个 Domain 都必须在当前用户业务范围内
-   */
   /**
    * 校验 ScheduleRun.ExpectedDomainKeysJson 冻结规则（v1.4 §十九.2）
    *  - 在 recoverFailedRun 之前调用，避免"空恢复"撞 400
@@ -147,7 +221,7 @@ export const useRunStore = defineStore('aps.run', () => {
     try {
       const res = await runApi.validateDomainKeys(scheduleRunId)
       if (!res.valid) {
-        error.value = res.message
+        errors.value = [{ section: 'DomainKey 校验', message: res.message }]
       }
       return res
     } catch (err) {
@@ -156,6 +230,12 @@ export const useRunStore = defineStore('aps.run', () => {
     }
   }
 
+  /**
+   * FAILED Run 人工恢复（U19：新建 Run，原始 Run 仍 FAILED）
+   *  - 4 号位文档第 15 节：FAILED 人工恢复按钮必须调用"新建 ScheduleRun"，不能把 FAILED 直接改回 RUNNING
+   *  - 恢复完成后 refresh，新 Run 应出现在 runs 列表顶部，原 Run 仍为 FAILED
+   *  - P1-15：payload.domainKeys 中每个 Domain 都必须在当前用户业务范围内
+   */
   async function recoverFailedRun(payload: {
     originalRunId: number
     domainKeys: DomainKey[]
@@ -168,7 +248,7 @@ export const useRunStore = defineStore('aps.run', () => {
         assertScope(apsAuth.dataScope, { domainKey: dk })
       } catch (err) {
         if (err instanceof ScopeViolationError) {
-          error.value = err.message
+          handleError(err)
           throw err
         }
         throw err
@@ -177,8 +257,9 @@ export const useRunStore = defineStore('aps.run', () => {
     // v1.4 §十九.2：预校验（避免空恢复直接 400）
     const check = await runApi.validateDomainKeys(payload.originalRunId)
     if (!check.valid) {
-      error.value = `DomainKey 冻结规则校验失败：${check.message}（请先修正再恢复）`
-      throw new Error(error.value)
+      const msg = `DomainKey 冻结规则校验失败：${check.message}（请先修正再恢复）`
+      handleError(new Error(msg))
+      throw new Error(msg)
     }
     recovering.value = true
     error.value = null
@@ -195,39 +276,6 @@ export const useRunStore = defineStore('aps.run', () => {
     }
   }
 
-  /**
-   * MES 下发（§十九.MES展示/操作）
-   *  - 仅 ELIGIBLE Task 可下发；前端按钮 :disabled 强制
-   *  - P1-15：dataScope.domainKeys 断言（前端防御；3号位后端会二次校验）
-   *  - 成功后将 MES 工单号回写到 lastDispatch；样本状态刷新为 DISPATCHED（mock 端不真改 status）
-   */
-  async function dispatchMes(input: MesDispatchInput): Promise<MesDispatchResult> {
-    // P1-15：业务范围断言（task 的 domainKey 命中 scope；缺失则跳过，由 3号位兜底）
-    const sample = data.value?.mesEligibilitySamples.find((s) => s.taskId === input.taskId)
-    if (sample?.domainKey) {
-      try {
-        assertScope(apsAuth.dataScope, { domainKey: sample.domainKey })
-      } catch (err) {
-        if (err instanceof ScopeViolationError) {
-          error.value = err.message
-          throw err
-        }
-        throw err
-      }
-    }
-    dispatching.value = true
-    error.value = null
-    try {
-      lastDispatch.value = await runApi.dispatch(input)
-      return lastDispatch.value
-    } catch (err) {
-      handleError(err)
-      throw err
-    } finally {
-      dispatching.value = false
-    }
-  }
-
   function handleError(err: unknown): void {
     if (err instanceof ApiError) {
       error.value =
@@ -238,30 +286,35 @@ export const useRunStore = defineStore('aps.run', () => {
   }
 
   function reset(): void {
-    data.value = null
+    runs.value = []
+    activeVersions.value = []
+    domainStatuses.value = []
+    domainStatusRunId.value = null
+    domainStatusHasDenominator.value = false
     error.value = null
+    errors.value = []
     lastRecover.value = null
-    lastDispatch.value = null
   }
 
   return {
-    data,
+    runs,
+    visibleRuns,
+    latestRun,
+    activeVersions,
+    domainStatuses,
+    domainStatusRunId,
+    domainStatusHasDenominator,
     loading,
     error,
+    errors,
     lastRecover,
     recovering,
-    lastDispatch,
-    dispatching,
-    runs,
-    activeVersions,
-    mesSamples,
-    partialBreakdown,
     runStatusCounts,
-    mesStats,
+    attentionRuns,
+    runInScope,
     load,
     recoverFailedRun,
     validateDomainKeys,
-    dispatchMes,
     reset,
     RUN_STATUS_LABEL,
     RUN_STATUS_TAG,

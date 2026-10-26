@@ -32,12 +32,20 @@ const mockLoginResponse = (req: LoginRequest): LoginResponse => ({
 })
 
 export const apsAuthApi = {
-  /** APS 登录 */
+  /**
+   * APS 登录
+   *
+   * `silent: true` —— 登录失败由登录页自己提示，避免两条链路各弹一次：
+   *  - 旧形态 `200 + 信封 401` 走 `unwrap` 抛错，**根本不会弹 toast**（登录失败曾经一声不吭）；
+   *  - 5号位 2026-10-19 全局收口后 `401 + 信封 401` 会走拦截器错误分支，那里会弹 toast。
+   * ⇒ 标 silent 后两种形态都只在登录页提示一次，行为与部署无关。
+   */
   async login(req: LoginRequest): Promise<LoginResponse> {
     if (APS_USE_MOCK) return mockLoginResponse(req)
     return apsHttp.post<LoginResponse>({
       url: '/api/auth/login',
-      data: req
+      data: req,
+      silent: true
     })
   },
 

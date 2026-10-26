@@ -19,6 +19,7 @@ import { storeToRefs } from 'pinia'
 import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import dayjs from 'dayjs'
+import { formatUtcDate, formatUtcDateTimeSec } from '@/utils/datetime'
 import { DhxGantt } from '@/components/DhxGantt'
 import type {
   DhxGanttTask,
@@ -48,19 +49,23 @@ import {
   type TaskLockMarker,
   type TaskStatus
 } from '@/api/aps-v1/types'
-import { SETUP_SOURCE_META } from '@/api/aps-v1/types/setup'
+import { SETUP_SOURCE_META, type SetupSource } from '@/api/aps-v1/types/setup'
+import { REASON_CODE_LABELS, type ReasonCode } from '@/api/aps-v1/types/explanation'
 
 import {
   ElAlert,
   ElButton,
+  ElCard,
   ElDescriptions,
   ElDescriptionsItem,
   ElDivider,
   ElDropdown,
   ElDropdownMenu,
   ElDropdownItem,
+  ElEmpty,
   ElIcon,
   ElOption,
+  ElPagination,
   ElRadioButton,
   ElRadioGroup,
   ElSelect,
@@ -120,6 +125,57 @@ const dateRange = computed<{
     default:
       return { from: start.toISOString(), to: start.add(7, 'day').toISOString(), scaleUnit: 'day' }
   }
+})
+
+/* ===== 任务清单（冻结 09 §六 / 01:1914「今日/未来任务清单」）=====
+ *  - 数据源 = 甘特体 `ganttData.tasks`（同一个已部署端点，不另造查询）
+ *  - 时间窗与甘特时间轴同源（dateRange：今日 / 7 / 30 / 90 天）
+ *  - 只做**列表形态**补齐；MES 下发/工单/执行状态后端尚未接入，不在此伪造 */
+const TASK_LIST_PAGE_SIZE = 50
+const taskListPage = ref(1)
+
+const TIME_RANGE_LABEL: Record<TimeRangeKey, string> = {
+  D1: '今日',
+  D7: '未来 7 天',
+  D30: '未来 30 天',
+  D90: '未来 90 天'
+}
+
+const ganttResourceMap = computed(() => {
+  const map = new Map<number, GanttResourceDto>()
+  for (const r of ganttData.value?.resources ?? []) map.set(r.resourceId, r)
+  return map
+})
+
+/** 与甘特时间轴同窗筛选：任务区间与 [from, to) 有交集即入选；无计划时间的任务不入清单 */
+const taskListRows = computed(() => {
+  const from = dayjs(dateRange.value.from).valueOf()
+  const to = dayjs(dateRange.value.to).valueOf()
+  return (ganttData.value?.tasks ?? [])
+    .filter((t: GanttTaskDto) => {
+      const s = t.plannedStartTime ? dayjs(t.plannedStartTime).valueOf() : null
+      const e = t.plannedEndTime ? dayjs(t.plannedEndTime).valueOf() : null
+      if (s == null && e == null) return false
+      const start = s ?? e!
+      const end = e ?? s!
+      return start < to && end >= from
+    })
+    .sort(
+      (a: GanttTaskDto, b: GanttTaskDto) =>
+        (a.plannedStartTime ?? '').localeCompare(b.plannedStartTime ?? '') ||
+        a.taskNo.localeCompare(b.taskNo)
+    )
+})
+
+const taskListTotal = computed(() => taskListRows.value.length)
+const taskListPaged = computed(() => {
+  const start = (taskListPage.value - 1) * TASK_LIST_PAGE_SIZE
+  return taskListRows.value.slice(start, start + TASK_LIST_PAGE_SIZE)
+})
+
+// 切时间窗 / 切版本 → 回第一页（避免停在越界页）
+watch([timeRange, () => ganttData.value?.planVersionId], () => {
+  taskListPage.value = 1
 })
 
 /* ===== 多维度切换（U01：Domain / 资源 / Stage / 工厂 / 部门） ===== */
@@ -213,7 +269,7 @@ const lanes = computed<Lane[]>(() => {
   if (groupBy.value === 'resource') {
     return data.resources.map((r) => ({
       id: `lane-${r.resourceId}`,
-      label: `${r.resourceCode} | ${r.resourceName}`,
+      label: `${r.resourceCode} | ${r.resourceName} | ${r.factoryName} / ${r.productionDepartmentName}`,
       color: '#e2e8f0',
       textColor: '#1e293b'
     }))
@@ -340,11 +396,23 @@ function versionOptionLabel(v: PlanVersionSummaryDto): string {
   return `${v.versionCode}（${label}）`
 }
 
-/* ===== 文档第 16 节：MES 下发资格展示 ===== */
+/* ===== 文档第 16 节：MES 下发资格展示 =====
+ * 后端 `GanttTaskDto.MesEligible` **不是任何表的列**（全库无此列，`Task` 表 30 列里也没有），
+ * 是「接口先占位、真值未落盘」的产物 —— 5号位 2026-10-17 回执 §三 已查库确认。
+ * 该函已把它从 **`bool` + `CAST(0 AS BIT)` 恒 false 改为 `bool?` + `CAST(NULL AS BIT)`**
+ * （`GanttDataDto.cs:163`；同型的 `CrossDomainBlocked` 一并改）：不改则「判定为否」与「未判定」不可区分。
+ *
+ * ⇒ 契约下 `null`（未接入期）经 `WhenWritingNull` **整个键不出现**，实测 v2 203/203 无该键。
+ *   无论 `false` 还是缺键，本页一律呈现「未接入」：不宣称可/不可下发，只说明判定能力尚未接入。
+ *   后端给出真值（true/false 或三态字符串）后，这里按新契约自动放开，无需改判定逻辑。 */
+function mesEligibilityOf(task: GanttTaskDto | null): 'ELIGIBLE' | 'INELIGIBLE' | 'UNKNOWN' {
+  const raw = task?.mesEligible
+  return raw === 'ELIGIBLE' || raw === 'INELIGIBLE' || raw === 'UNKNOWN' ? raw : 'UNKNOWN'
+}
 const MES_ELIGIBLE_LABEL = {
   ELIGIBLE: '可下发',
   INELIGIBLE: '不可下发',
-  UNKNOWN: '未判定'
+  UNKNOWN: '未接入'
 } as const
 const MES_ELIGIBLE_TYPE = {
   ELIGIBLE: 'success',
@@ -352,38 +420,49 @@ const MES_ELIGIBLE_TYPE = {
   UNKNOWN: 'info'
 } as const
 
-/* ===== 文档第 11 节：异常与原因解释 — 根因展示标签 ===== */
-const DELAY_REASON_LABEL: Record<GanttTaskDelayReason['reasonCode'], string> = {
-  MATERIAL_AVAILABILITY: '物料未到货',
-  CAPACITY_SHORTAGE: '设备产能不足',
-  UPSTREAM_DELAY: '上游阶段延迟',
-  LOCK_BLOCKING: 'Firm/FROZEN 锁占关键窗口',
-  CROSS_DOMAIN_BLOCK: '外排程域共享设备阻挡',
-  EQUIPMENT_FAILURE: '设备故障',
-  DUE_DATE_RISK: '到期风险（兜底）',
-  OTHER: '其它'
+/* ===== 换型时间来源（4 态，`SetupOptimizer.cs:60-72`）=====
+ * 后端落库值仅 EXACT / DEFAULT / SETUP_RULE_MISSING_ZERO_FALLBACK / INITIAL_SETUP_STATE。
+ * 未知值原样展示，绝不 `SETUP_SOURCE_META[x].tag` 直取 —— 取到 undefined 会抛 TypeError，
+ * 整个详情 Drawer 会白屏。 */
+function setupSourceMetaOf(
+  raw: string | null | undefined
+): { label: string; tag: 'info' | 'success' | 'warning' | 'danger' } | null {
+  if (!raw) return null
+  return SETUP_SOURCE_META[raw as SetupSource] ?? { label: raw, tag: 'info' }
 }
-const DELAY_REASON_ICON: Record<GanttTaskDelayReason['reasonCode'], string> = {
-  MATERIAL_AVAILABILITY: 'vi-mdi:package-variant',
-  CAPACITY_SHORTAGE: 'vi-mdi:gauge-low',
-  UPSTREAM_DELAY: 'vi-mdi:arrow-up-bold-circle-outline',
-  LOCK_BLOCKING: 'vi-mdi:lock-alert',
-  CROSS_DOMAIN_BLOCK: 'vi-mdi:alert-octagon',
-  EQUIPMENT_FAILURE: 'vi-mdi:tools',
-  DUE_DATE_RISK: 'vi-mdi:clock-alert',
-  OTHER: 'vi-mdi:help-circle'
+
+/* ===== 文档第 11 节：异常与原因解释 — 根因展示标签 =====
+ * 2026-10-17：标签改为复用冻结 `07 v5.1.13 §八.1` 15 码字典（`REASON_CODE_LABELS`），
+ * 不再在甘特页自拟一套平行码表（原 8 码与冻结只有 DUE_DATE_RISK 一处重合，违反 U-004）。
+ * 未入字典的码中性展示「待核对·<码值>」，不臆造中文名 —— 与 Explanation 页同一口径。 */
+function reasonLabel(code: string): string {
+  return REASON_CODE_LABELS[code as ReasonCode] ?? `待核对·${code}`
 }
+/** 图标为纯前端装饰，冻结未约束；只对能一眼归类的码给专属图标，其余走中性问号。 */
+const DELAY_REASON_ICON: Record<string, string> = {
+  MATERIAL_SHORTAGE: 'vi-mdi:package-variant',
+  RESOURCE_CAPACITY_WAIT: 'vi-mdi:gauge-low',
+  PRECEDENCE_WAIT: 'vi-mdi:arrow-up-bold-circle-outline',
+  FROZEN_ZONE_LOCK: 'vi-mdi:lock-alert',
+  CROSS_DOMAIN_VERSION_MISMATCH_RISK: 'vi-mdi:alert-octagon',
+  CROSS_ORG_HANDOFF: 'vi-mdi:swap-horizontal',
+  LOGISTICS_DELAY: 'vi-mdi:truck-alert',
+  EQUIPMENT_BREAKDOWN_RISK: 'vi-mdi:tools',
+  DUE_DATE_RISK: 'vi-mdi:clock-alert'
+}
+function reasonIcon(code: string): string {
+  return DELAY_REASON_ICON[code] ?? 'vi-mdi:help-circle'
+}
+/** 冻结 `07 v5.1.13 :4938`：INFO / WARN / ERROR 三值，不含 CRITICAL */
 const SEVERITY_TAG_TYPE: Record<GanttTaskDelayReason['severity'], 'info' | 'warning' | 'danger'> = {
   INFO: 'info',
-  WARNING: 'warning',
-  ERROR: 'danger',
-  CRITICAL: 'danger'
+  WARN: 'warning',
+  ERROR: 'danger'
 }
 const SEVERITY_LABEL: Record<GanttTaskDelayReason['severity'], string> = {
   INFO: '提示',
-  WARNING: '告警',
-  ERROR: '错误',
-  CRITICAL: '严重'
+  WARN: '告警',
+  ERROR: '错误'
 }
 const ISSUE_CATEGORY_DESC: Record<GanttTaskDelayReason['issueCategory'], string> = {
   DATA_ISSUE: '上游主数据 / 业务事实层面问题（PO ETA / PI Position / 库存等）',
@@ -484,7 +563,9 @@ const dhxTasks = computed<DhxGanttTask[]>(() => {
     const resource = resourceMap.get(t.resourceId ?? -1)
     const baseRow: DhxGanttTask & Record<string, unknown> = {
       id: t.taskId,
-      text: `${t.taskNo}${t.orderNo ? ' | ' + t.orderNo : ''}`,
+      text: t.materialName
+        ? `${t.taskNo}${t.orderNo ? ' | ' + t.orderNo : ''} | ${t.materialName}`
+        : `${t.taskNo}${t.orderNo ? ' | ' + t.orderNo : ''}`,
       start_date: formatDate(t.plannedStartTime),
       duration: hoursBetween(t.plannedStartTime!, t.plannedEndTime!),
       parent: getTaskGroupKey(t, resourceMap),
@@ -511,9 +592,12 @@ const dhxTasks = computed<DhxGanttTask[]>(() => {
       quantity: t.quantity,
       uom: t.uom,
       isDelayed: t.isDelayed,
+      // 冻结 07:3683 / 08:4249；dev 当前全 0（2号位 未标记），有值时自动触发 dhx-task-critical 样式
+      isCritical: !!t.isCriticalPath,
       laneName: resource?.resourceName,
       domainKey: t.domainKey,
       shareCount: t.taskShare?.length ?? 1,
+      // null（未判定，判定未接入）折叠为 false：只用于「要不要弹阻挡横幅」，误报代价远大于漏报
       crossDomainBlocked: !!t.crossDomainBlocked,
       hasSegments: !!t.taskSegments?.length,
       segmentCount: t.taskSegments?.length ?? 0
@@ -562,6 +646,9 @@ const selectedTask = computed<GanttTaskDto | null>(() => {
   return ganttData.value?.tasks.find((t) => t.taskId === selectedTaskId.value) ?? null
 })
 
+/** 换型时间来源标签（未知值降级原样显示，不查表硬取） */
+const selectedSetupSourceMeta = computed(() => setupSourceMetaOf(selectedTask.value?.setupSource))
+
 /** 当前 Task 关联的资源（用于展示 Resource Down / 不可用窗口） */
 const selectedResource = computed(() => {
   const t = selectedTask.value
@@ -595,8 +682,8 @@ const explanationReasonsByCategory = computed<{
   const reasons: GanttTaskDelayReason[] = selectedTask.value?.delayReasons ?? []
   const dataIssue = reasons.filter((r) => r.issueCategory === 'DATA_ISSUE')
   const schedulingIssue = reasons.filter((r) => r.issueCategory === 'SCHEDULING_ISSUE')
-  // SCHEDULING_ISSUE 内部按 severity 倒序：CRITICAL > ERROR > WARNING > INFO
-  const sevOrder = { CRITICAL: 4, ERROR: 3, WARNING: 2, INFO: 1 } as const
+  // SCHEDULING_ISSUE 内部按 severity 倒序：ERROR > WARN > INFO（冻结 :4938 三值）
+  const sevOrder = { ERROR: 3, WARN: 2, INFO: 1 } as const
   const sortBySeverity = (a: GanttTaskDelayReason, b: GanttTaskDelayReason) =>
     sevOrder[b.severity] - sevOrder[a.severity]
   dataIssue.sort(sortBySeverity)
@@ -744,6 +831,39 @@ const stats = computed(() => {
     inProgress: tasks.filter((t) => sanitizeStatus(t.status) === 'IN_PROGRESS').length
   }
 })
+
+/* ===== 空态分类（5号位 2026-10-17 R8 新增 `scopeDenied` / `isEmpty`，回执 §六补 `versionExists`）=====
+ * 三个信号现已能分清三种空态：
+ *   版本不存在   → `versionExists=false`
+ *   越权         → `scopeDenied=true`
+ *   存在但无任务 → 两者皆真/皆假 + `isEmpty=true`（计数是真实 0）
+ * ⚠️ 早期版本这里用 `versionCode === ''` 当第三信号（隐式契约），已换为后端显式位 `versionExists`
+ *   （`GanttDataDto.cs:56`，DTO 注释点名「替代 versionCode === '' 隐式契约」）。
+ *   兜底仍保留 `!d.versionCode`：老版本后端未部署该字段时行为不变（不退回「无任务」误判）。 */
+type EmptyKind = 'scope-denied' | 'version-missing' | 'no-tasks' | null
+const emptyKind = computed<EmptyKind>(() => {
+  if (loading.value || error.value) return null
+  const d = ganttData.value
+  if (!d) return null
+  if (!d.isEmpty && d.tasks.length > 0) return null
+  if (d.scopeDenied) return 'scope-denied'
+  if (d.versionExists === false || !d.versionCode) return 'version-missing'
+  return 'no-tasks'
+})
+const EMPTY_TEXT: Record<Exclude<EmptyKind, null>, { title: string; hint: string }> = {
+  'scope-denied': {
+    title: '当前账号无权查看该版本',
+    hint: '该版本不在你的排程域授权范围内。如需查看，请联系管理员开通对应排程域。'
+  },
+  'version-missing': {
+    title: '该计划版本不存在',
+    hint: '可能已被清理。请在左上角重新选择一个计划版本。'
+  },
+  'no-tasks': {
+    title: '当前版本没有排程结果',
+    hint: '该版本可能尚未算完，或算完后没有产出任务。'
+  }
+}
 
 /* ===== 加载 ===== */
 async function refresh() {
@@ -1358,12 +1478,14 @@ function triggerRescheduleForResource(): void {
     <!-- ===== 错误 / 空状态 ===== -->
     <ElAlert v-if="error" type="error" :closable="false" show-icon :title="`加载失败：${error}`" />
     <ElAlert
-      v-else-if="!loading && stats.total === 0"
-      type="info"
+      v-else-if="emptyKind"
+      :type="emptyKind === 'scope-denied' ? 'warning' : 'info'"
       :closable="false"
       show-icon
-      title="当前版本暂无任务数据"
-    />
+      :title="EMPTY_TEXT[emptyKind].title"
+    >
+      {{ EMPTY_TEXT[emptyKind].hint }}
+    </ElAlert>
 
     <!-- ===== 甘特图 =====
          软拖动（4号位文档第 6 节最后一句 + 第 24 节）：
@@ -1390,6 +1512,68 @@ function triggerRescheduleForResource(): void {
         @task-drag-rejected="handleTaskDragRejected"
       />
     </div>
+
+    <!-- ===== 任务清单（今日 / 未来）：冻结 09 §六 / 01:1914 =====
+         与甘特时间轴同窗；列表只展示后端已给字段，MES 下发/执行状态未接入不伪造 -->
+    <ElCard class="task-list-card">
+      <template #header>
+        <div class="task-list-head">
+          <span>任务清单（{{ TIME_RANGE_LABEL[timeRange] }}）</span>
+          <span class="task-list-hint">
+            共 {{ taskListTotal }} 条 · 按计划开始时间排序 · 仅含该时间窗内有计划时间的任务
+          </span>
+        </div>
+      </template>
+      <ElEmpty v-if="!taskListTotal" description="该时间范围内没有任务" :image-size="60" />
+      <template v-else>
+        <ElTable :data="taskListPaged" size="small" border max-height="420" style="width: 100%">
+          <ElTableColumn prop="taskNo" label="任务号" min-width="150" show-overflow-tooltip />
+          <ElTableColumn label="订单号" min-width="140" show-overflow-tooltip>
+            <template #default="{ row }">{{ row.orderNo ?? '—' }}</template>
+          </ElTableColumn>
+          <ElTableColumn label="物料" min-width="160" show-overflow-tooltip>
+            <template #default="{ row }">{{ row.materialCode ?? '—' }}</template>
+          </ElTableColumn>
+          <ElTableColumn prop="operationCode" label="工序" width="100" />
+          <ElTableColumn label="资源" min-width="140" show-overflow-tooltip>
+            <template #default="{ row }">
+              {{ ganttResourceMap.get(row.resourceId ?? -1)?.resourceCode ?? '—' }}
+            </template>
+          </ElTableColumn>
+          <ElTableColumn label="计划开始" width="160">
+            <template #default="{ row }">{{
+              row.plannedStartTime ? formatUtcDateTimeSec(row.plannedStartTime) : '—'
+            }}</template>
+          </ElTableColumn>
+          <ElTableColumn label="计划结束" width="160">
+            <template #default="{ row }">{{
+              row.plannedEndTime ? formatUtcDateTimeSec(row.plannedEndTime) : '—'
+            }}</template>
+          </ElTableColumn>
+          <ElTableColumn label="状态" width="100">
+            <template #default="{ row }">{{
+              TASK_STATUS_LABELS[row.status] ?? row.status
+            }}</template>
+          </ElTableColumn>
+          <ElTableColumn label="延期" width="80" align="center">
+            <template #default="{ row }">
+              <ElTag v-if="row.isDelayed" type="danger" size="small">延期</ElTag>
+              <span v-else class="task-list-muted">-</span>
+            </template>
+          </ElTableColumn>
+        </ElTable>
+        <div class="task-list-pager">
+          <ElPagination
+            v-model:current-page="taskListPage"
+            :page-size="TASK_LIST_PAGE_SIZE"
+            :total="taskListTotal"
+            layout="total, prev, pager, next, jumper"
+            small
+            background
+          />
+        </div>
+      </template>
+    </ElCard>
 
     <!-- ===== P3：双击任务条 → 轻量浮窗（Task 摘要 + 复制 TaskNo） ===== -->
     <div
@@ -1482,15 +1666,6 @@ function triggerRescheduleForResource(): void {
       </ul>
     </div>
 
-    <!-- ===== 页面只读提示 ===== -->
-    <div class="hint-bar">
-      <ElIcon class="hint-icon"><Icon icon="vi-mdi:information-outline" /></ElIcon>
-      <span>
-        本页只读：只展示排产结果，不直接修改计划。拖动任务条后位置会自动弹回原位，并转为「甘特图调整」表单，
-        经确认后才可能生效。
-      </span>
-    </div>
-
     <!-- ===== 任务详情 Drawer（自实现 v-if + Transition + Teleport，避开 Element Plus append-to-body + slot 的 click 不触发 bug） =====
          设计要点：
          1. 不依赖 ElDrawer：自渲染 panel，自己捕获 click，绝对不会被全局 Header 用户头像遮挡
@@ -1557,12 +1732,17 @@ function triggerRescheduleForResource(): void {
                         <span class="qty-net">
                           净需求 <strong>{{ selectedTask.netQty }}</strong> {{ selectedTask.uom }}
                         </span>
-                        <span class="qty-arrow">→</span>
-                        <span class="qty-plan">
-                          计划加工 <strong>{{ selectedTask.plannedProcessQty }}</strong>
-                          {{ selectedTask.uom }}
-                        </span>
+                        <!-- 2026-10-17：后端恒返 null（ScheduleQueryService.cs:158 CAST(NULL AS ...)），
+                             拿不到就不展示这半段，避免出现「计划加工」后面空着、或被误读成"没有良率补偿" -->
+                        <template v-if="selectedTask.plannedProcessQty != null">
+                          <span class="qty-arrow">→</span>
+                          <span class="qty-plan">
+                            计划加工 <strong>{{ selectedTask.plannedProcessQty }}</strong>
+                            {{ selectedTask.uom }}
+                          </span>
+                        </template>
                         <ElTooltip
+                          v-if="selectedTask.plannedProcessQty != null"
                           :content="`计划加工 = 净需求 ÷ 良率（默认 95%）；两者不可混用`"
                           placement="top"
                         >
@@ -1587,10 +1767,29 @@ function triggerRescheduleForResource(): void {
                         {{ TASK_STATUS_LABELS[sanitizeStatus(selectedTask.status)] }}
                       </ElTag>
                     </ElDescriptionsItem>
+                    <ElDescriptionsItem label="客户交期">
+                      {{ formatUtcDate(selectedTask.customerDueDate) }}
+                    </ElDescriptionsItem>
                     <ElDescriptionsItem label="是否延期">
                       <ElTag :type="selectedTask.isDelayed ? 'danger' : 'success'" size="small">
                         {{ selectedTask.isDelayed ? '是' : '否' }}
                       </ElTag>
+                      <!-- 延期时长取后端 `delayHours`（自然小时：交日零点 → 计划完工），
+                           不在前端用交期与完工时间相减重算 -->
+                      <span v-if="selectedTask.delayHours != null" class="delay-hours">
+                        延 {{ selectedTask.delayHours.toFixed(1) }} 小时
+                      </span>
+                    </ElDescriptionsItem>
+                    <ElDescriptionsItem label="关键路径">
+                      <ElTag
+                        v-if="selectedTask.isCriticalPath"
+                        type="danger"
+                        size="small"
+                        effect="dark"
+                      >
+                        关键路径
+                      </ElTag>
+                      <span v-else class="muted-text">-</span>
                     </ElDescriptionsItem>
                     <ElDescriptionsItem label="锁定标识">
                       <ElTag
@@ -1623,16 +1822,16 @@ function triggerRescheduleForResource(): void {
                     </ElDescriptionsItem>
                     <ElDescriptionsItem label="换型时间来源">
                       <ElTag
-                        v-if="selectedTask.setupSource"
-                        :type="SETUP_SOURCE_META[selectedTask.setupSource].tag"
+                        v-if="selectedSetupSourceMeta"
+                        :type="selectedSetupSourceMeta.tag"
                         size="small"
                         effect="dark"
                       >
-                        {{ SETUP_SOURCE_META[selectedTask.setupSource].label }}
+                        {{ selectedSetupSourceMeta.label }}
                       </ElTag>
                       <ElTooltip
-                        v-if="selectedTask.setupSource === 'NONE'"
-                        content="无换型规则兜底 → 按 0 分钟计算"
+                        v-if="selectedTask.setupSource === 'SETUP_RULE_MISSING_ZERO_FALLBACK'"
+                        content="有前后产品但没有换型规则 → 按 0 分钟兜底，属数据质量问题，已进入「缺失规则查询」"
                         placement="top"
                       >
                         <ElTag size="small" type="info" effect="plain" style="margin-left: 6px">
@@ -1641,8 +1840,8 @@ function triggerRescheduleForResource(): void {
                       </ElTooltip>
                       <span v-else-if="!selectedTask.setupSource">-</span>
                       <ElTooltip
-                        v-if="selectedTask.setupSource === 'INITIAL'"
-                        content="班头首单 / 冷启动按 0 分钟计，属正常表现，不是数据质量问题"
+                        v-if="selectedTask.setupSource === 'INITIAL_SETUP_STATE'"
+                        content="没有上一产品（班头首单 / 冷启动）按 0 分钟计，属正常生产事实，不是数据质量问题"
                         placement="top"
                       >
                         <ElTag size="small" type="info" effect="plain" style="margin-left: 6px">
@@ -1705,12 +1904,9 @@ function triggerRescheduleForResource(): void {
                             :key="`data-${idx}`"
                             class="explanation-reason-item"
                           >
-                            <Icon
-                              :icon="DELAY_REASON_ICON[r.reasonCode]"
-                              class="reason-type-icon"
-                            />
+                            <Icon :icon="reasonIcon(r.reasonCode)" class="reason-type-icon" />
                             <span class="reason-type-label">
-                              {{ DELAY_REASON_LABEL[r.reasonCode] }}
+                              {{ reasonLabel(r.reasonCode) }}
                             </span>
                             <ElTag
                               size="small"
@@ -1753,12 +1949,9 @@ function triggerRescheduleForResource(): void {
                             :key="`sched-${idx}`"
                             class="explanation-reason-item"
                           >
-                            <Icon
-                              :icon="DELAY_REASON_ICON[r.reasonCode]"
-                              class="reason-type-icon"
-                            />
+                            <Icon :icon="reasonIcon(r.reasonCode)" class="reason-type-icon" />
                             <span class="reason-type-label">
-                              {{ DELAY_REASON_LABEL[r.reasonCode] }}
+                              {{ reasonLabel(r.reasonCode) }}
                             </span>
                             <ElTag
                               size="small"
@@ -1778,7 +1971,9 @@ function triggerRescheduleForResource(): void {
                         </ul>
                       </div>
 
-                      <!-- 仅有 isDelayed 但没具体根因：兜底（提醒不是只有 DUE_DATE_RISK） -->
+                      <!-- 仅有 isDelayed 但没具体根因：如实说明「后端没有任务级原因」，
+                           不谎称走了 DUE_DATE_RISK 兜底（5号位 2026-10-17 R5：解释事实目前落在订单级，
+                           任务级仅 63 行，查询层起填解决不了） -->
                       <div
                         v-if="
                           selectedTask.delayReasons?.length === 0 &&
@@ -1788,8 +1983,8 @@ function triggerRescheduleForResource(): void {
                         class="explanation-no-detail"
                       >
                         <Icon icon="vi-mdi:clock-alert-outline" />
-                        当前任务标记为延期，但暂无具体根因（仅 DUE_DATE_RISK 兜底）。
-                        可联系系统管理员核查原因数据。
+                        当前任务已延期，但系统尚未提供任务级延期原因。
+                        可到「排程解释」页按订单查看订单级原因。
                       </div>
                     </template>
 
@@ -1801,9 +1996,9 @@ function triggerRescheduleForResource(): void {
                     </div>
                   </div>
 
-                  <!-- Section 十六：MES 下发资格 -->
+                  <!-- Section 十六：MES 下发资格（取 mesEligibilityOf，bool 契约已归一为「未判定」） -->
                   <ElAlert
-                    :type="MES_ELIGIBLE_TYPE[selectedTask.mesEligible ?? 'UNKNOWN']"
+                    :type="MES_ELIGIBLE_TYPE[mesEligibilityOf(selectedTask)]"
                     :closable="false"
                     show-icon
                     class="mes-eligible-alert"
@@ -1811,12 +2006,10 @@ function triggerRescheduleForResource(): void {
                     <template #title>
                       <span class="mes-eligible-title">
                         MES 下发资格：
-                        <strong>{{
-                          MES_ELIGIBLE_LABEL[selectedTask.mesEligible ?? 'UNKNOWN']
-                        }}</strong>
+                        <strong>{{ MES_ELIGIBLE_LABEL[mesEligibilityOf(selectedTask)] }}</strong>
                       </span>
                     </template>
-                    <template v-if="selectedTask.mesEligible === 'INELIGIBLE'">
+                    <template v-if="mesEligibilityOf(selectedTask) === 'INELIGIBLE'">
                       <ul class="mes-reason-list">
                         <li v-for="r in selectedTask.mesIneligibleReasons ?? []" :key="r">
                           {{ r }}
@@ -1824,11 +2017,12 @@ function triggerRescheduleForResource(): void {
                       </ul>
                       <div class="mes-note">页面仅展示与调用下发服务，不直接写 MES 接口表。</div>
                     </template>
-                    <template v-else-if="selectedTask.mesEligible === 'ELIGIBLE'">
+                    <template v-else-if="mesEligibilityOf(selectedTask) === 'ELIGIBLE'">
                       已满足下发条件，可通过 MES Dispatch 服务下发。
                     </template>
                     <template v-else>
-                      后端未判定（一般为等待释放窗口），将在释放瞬间更新。
+                      后端尚未接入 MES 资格判定，页面不显示「可下发 / 不可下发」。
+                      待资格判定落地后，这里会按真实结果展示。
                     </template>
                   </ElAlert>
 
@@ -2285,22 +2479,6 @@ function triggerRescheduleForResource(): void {
   }
 }
 
-/* 提示条 */
-.hint-bar {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  padding: 6px 12px;
-  font-size: 12px;
-  color: #64748b;
-  background: #fff;
-  border-radius: 6px;
-
-  .hint-icon {
-    color: #94a3b8;
-  }
-}
-
 /* 详情 */
 .detail-section {
   display: flex;
@@ -2706,6 +2884,12 @@ function triggerRescheduleForResource(): void {
   gap: 4px;
 }
 
+.delay-hours {
+  margin-left: 8px;
+  font-size: 12px;
+  color: #ef4444;
+}
+
 .share-bar-wrap {
   position: relative;
   display: flex;
@@ -3045,6 +3229,37 @@ function triggerRescheduleForResource(): void {
 .ctx-menu-arrow {
   margin-left: auto;
   color: #94a3b8;
+}
+
+/* ===== 任务清单（今日 / 未来） ===== */
+.task-list-card {
+  margin-top: 12px;
+  border-radius: 8px;
+
+  .task-list-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    font-size: 14px;
+    font-weight: 600;
+    color: #1e293b;
+  }
+
+  .task-list-hint {
+    font-size: 12px;
+    font-weight: 400;
+    color: #94a3b8;
+  }
+
+  .task-list-pager {
+    display: flex;
+    justify-content: flex-end;
+    margin-top: 10px;
+  }
+
+  .task-list-muted {
+    color: #cbd5e1;
+  }
 }
 
 /* ===== §10A 入口 Dialog 已抽为独立组件（GanttAdjustDialog / ResourceRescheduleDialog /

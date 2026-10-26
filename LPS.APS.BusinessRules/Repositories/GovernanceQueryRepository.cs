@@ -132,4 +132,55 @@ ORDER BY UpstreamDomainCode, DownstreamDomainCode";
 
         return results.ToList();
     }
+
+    // ───── run/{id}/scope 支撑读取（4号位 10-19《候选scope明细端点改归你侧》§二/§三；归属变更承接）─────
+
+    public async Task<RunScopeRawRow?> GetRunScopeRawAsync(int scheduleRunId, CancellationToken ct = default)
+        => await _connectionManager.QueryFirstOrDefaultAsync<RunScopeRawRow>(@"
+SELECT TOP 1
+    sr.Id,
+    sr.RunType,
+    sr.ScopeJson,
+    sr.BasePlanVersionId,
+    bpv.VersionCode AS BaseVersionCode
+FROM ScheduleRun sr
+LEFT JOIN PlanVersion bpv ON bpv.Id = sr.BasePlanVersionId
+WHERE sr.Id = @Id",
+            new { Id = scheduleRunId }, CommandType.Text, DatabaseId.APS, commandTimeout: 10);
+
+    public async Task<Dictionary<long, (string? OrderNo, string? MTS_InstructionNo)>> GetOrderCanonicalMapAsync(
+        IReadOnlyList<long> orderCanonicalIds, CancellationToken ct = default)
+    {
+        if (orderCanonicalIds.Count == 0) return new();
+        var rows = await _connectionManager.QueryAsync<OrderCanonicalMapRow>(
+            "SELECT Id, OrderNo, MTS_InstructionNo FROM Order_Canonical WHERE Id IN @Ids",
+            new { Ids = orderCanonicalIds }, CommandType.Text, DatabaseId.APS, commandTimeout: 10);
+        return rows.ToDictionary(r => r.Id, r => (r.OrderNo, r.MTS_InstructionNo));
+    }
+
+    public async Task<Dictionary<long, (string? TaskNo, string? OperationCode)>> GetTaskMapAsync(
+        IReadOnlyList<long> taskIds, CancellationToken ct = default)
+    {
+        if (taskIds.Count == 0) return new();
+        // Task.Id BIGINT IDENTITY 全局唯一 + PK(Id,PlanVersionId) 前导列 → 按 Id 直查 seek（4号位 §3.2）；
+        // 无结果版本的 Run 也能带出 taskNo；行不存在 → 上层置 null 保留行，不 500。
+        var rows = await _connectionManager.QueryAsync<TaskMapRow>(
+            "SELECT Id, TaskNo, OperationCode FROM Task WHERE Id IN @Ids",
+            new { Ids = taskIds }, CommandType.Text, DatabaseId.APS, commandTimeout: 10);
+        return rows.ToDictionary(r => r.Id, r => ((string?)r.TaskNo, (string?)r.OperationCode));
+    }
+
+    public async Task<Dictionary<int, (string? ResourceCode, string? ResourceName)>> GetResourceMapAsync(
+        IReadOnlyList<int> resourceIds, CancellationToken ct = default)
+    {
+        if (resourceIds.Count == 0) return new();
+        var rows = await _connectionManager.QueryAsync<ResourceMapRow>(
+            "SELECT Id, ResourceCode, ResourceName FROM Resource WHERE Id IN @Ids",
+            new { Ids = resourceIds }, CommandType.Text, DatabaseId.APS, commandTimeout: 10);
+        return rows.ToDictionary(r => r.Id, r => ((string?)r.ResourceCode, (string?)r.ResourceName));
+    }
+
+    private sealed class OrderCanonicalMapRow { public long Id { get; set; } public string? OrderNo { get; set; } public string? MTS_InstructionNo { get; set; } }
+    private sealed class TaskMapRow { public long Id { get; set; } public string? TaskNo { get; set; } public string? OperationCode { get; set; } }
+    private sealed class ResourceMapRow { public int Id { get; set; } public string? ResourceCode { get; set; } public string? ResourceName { get; set; } }
 }

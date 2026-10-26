@@ -72,7 +72,10 @@ const ROUTES = [
  *        aps.viewer.management  → 11 个 *.view（v1.5 加 aps.setup.view）
  *        aps.planner            → 19 个（plan/ctp/candidate/manual_eta/demand_protection.view + aps.setup.view + aps.audit.view）
  *        aps.admin.aps          → 13 个（rule/parameter/strategy/setup edit + publish + aps.audit.view；含 strategy.publish 与 auth.ts 既有漂移）
- *        aps.admin.system       → 37 个全部 */
+ *        aps.admin.system       → 37 个全部
+ *      10-19 D-1 追加：两个 admin 角色各加 1 个 `aps.parameter.publish`（参数集发布独立码），
+ *      与 auth.ts mock preset 对齐；⚠️ dev 真实库**无任何角色持该码**（码在目录、角色未授权），
+ *      已出函请 3号位 落授权 ⇒ 此处仅是 mock/校验侧口径，不代表真实库已授。 */
 const ROLE_PRESETS = {
   'aps.viewer.management': [
     'aps.plan.view',
@@ -116,6 +119,8 @@ const ROLE_PRESETS = {
     'aps.rule.publish',
     'aps.parameter.view',
     'aps.parameter.edit',
+    // D-1：参数集发布独立权限码（与 auth.ts mock preset 保持一致）
+    'aps.parameter.publish',
     'aps.strategy.view',
     'aps.strategy.edit',
     'aps.strategy.publish',
@@ -143,6 +148,8 @@ const ROLE_PRESETS = {
     'aps.rule.publish',
     'aps.parameter.view',
     'aps.parameter.edit',
+    // D-1：参数集发布独立权限码（与 auth.ts mock preset 保持一致）
+    'aps.parameter.publish',
     'aps.strategy.view',
     'aps.strategy.edit',
     'aps.strategy.publish',

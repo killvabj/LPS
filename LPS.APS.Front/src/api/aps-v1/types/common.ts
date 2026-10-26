@@ -48,23 +48,13 @@ export const APS_ERROR_CODE = {
   INTERNAL: 500
 } as const
 
-/** 分页请求 */
-export interface PageQuery {
-  pageIndex: number
-  pageSize: number
-  /** 模糊匹配关键字 */
-  keyword?: string
-  /** 排序字段（如 "createdAt desc"） */
-  sort?: string
-}
-
-/** 分页响应 */
-export interface PageResult<T> {
-  items: T[]
-  total: number
-  pageIndex: number
-  pageSize: number
-}
+/** 分页请求
+ *  - 10-12 收：PageQuery / PageResult 通用类型已撤
+ *  - 各模块改用本地包装：ManualEtaPageResult / PagedTaskSplitRuleConfig / BusinessFactIssueResponsePage / 新增 ManualCapacitySlotPageResult
+ *  - 字段名统一为 `page`（后端 LPS.APS.Core.Dto.PageResult<T>.Page 真值）
+ *  - 此前 PageResult<T> 字段名 pageIndex 与后端 page 不一致，9 文件本地包装已隔离；删通用类型避免误用
+ */
+// （PageQuery / PageResult 已删，@see frontNew/docs/4号位-2026-10-12-三函闭环RC22-ME13-E24-给5号位.md）
 
 /**
  * 4号位文档第 6 节：Task 正式状态仅 5 种
@@ -96,14 +86,18 @@ export const TASK_STATUS_LABELS: Record<TaskStatus, string> = {
 }
 
 /**
- * 4号位文档第 15 节：PlanVersion 状态机
+ * PlanVersion 生命周期状态（冻结文档 07 §4.2:3552 值域 + 2号位 2026-10-15 词表统一）
  *
- *  - BUILDING    排程构建中
- *  - ACTIVE      当前生效版本（PMC 只读这个）
- *  - CANDIDATE   候选版本（PMC 可对比 + 最小人工确认）
- *  - FAILED      构建失败
- *  - ARCHIVED    已归档
+ *  - BUILDING    待发令（排程启动建记录时的初始态）
+ *  - CANDIDATE   算完待确认
+ *  - ACTIVE      已生效 —— **「正式采用」直接看 Status = 'ACTIVE'**（07 §4.2:3573）
+ *  - FAILED      失败
+ *  - ARCHIVED    已被同域新版顶替
+ *  - Computing   计算中（实现子状态：发令枪防重复领取，非冻结 DDL 值）
  *
+ * 历史：2026-10-15 前代码曾偏离为 Created/Computed/ComputeFailed，
+ *       2号位 已统一回冻结词表（Created→BUILDING、Computed→CANDIDATE、ComputeFailed→FAILED）
+ *       ⇒ 后端**永不**返 Computed/ComputeFailed，这两个 key 是死分支，已删（5号位 10-15 §九）。
  * 注：CTP / INSERT_IMPACT_ANALYSIS 永远不能成为 PlanVersion（验收 U11/U12），
  *     因此枚举里也不包含这两种业务用途。
  */
@@ -112,40 +106,126 @@ export const PLAN_VERSION_STATUSES = [
   'ACTIVE',
   'CANDIDATE',
   'FAILED',
-  'ARCHIVED'
+  'ARCHIVED',
+  'Computing'
 ] as const
 
 export type PlanVersionStatus = (typeof PLAN_VERSION_STATUSES)[number]
 
-/** UI 层用：PlanVersion 状态中文标签（4号位文档第 15 节状态机） */
+/** UI 层用：PlanVersion 状态中文标签（5号位 2026-10-15 §一 指定渲染口径） */
 export const PLAN_VERSION_STATUS_LABELS: Record<PlanVersionStatus, string> = {
-  BUILDING: '构建中',
-  ACTIVE: '生效中',
-  CANDIDATE: '候选',
-  FAILED: '构建失败',
-  ARCHIVED: '已归档'
+  BUILDING: '待发令',
+  ACTIVE: '已生效',
+  CANDIDATE: '算完待确认',
+  FAILED: '失败',
+  ARCHIVED: '已被新版本顶替',
+  Computing: '计算中'
 }
+
+/** UI 层用：PlanVersion 状态 → ElTag type（4号位 全前端 owner：版本切换条 / Overview 状态徽章共用） */
+export const PLAN_VERSION_STATUS_TAG: Record<
+  PlanVersionStatus,
+  'success' | 'primary' | 'warning' | 'info' | 'danger'
+> = {
+  BUILDING: 'primary',
+  ACTIVE: 'success',
+  CANDIDATE: 'warning',
+  FAILED: 'danger',
+  ARCHIVED: 'info',
+  Computing: 'primary'
+}
+
+/** 后端返未知状态（新词表 / 老 dev 库）时的兜底，禁止页面因未知值崩 */
+export const planVersionStatusLabel = (raw: string | null | undefined): string =>
+  raw ? (PLAN_VERSION_STATUS_LABELS[raw as PlanVersionStatus] ?? raw) : '-'
+
+export const planVersionStatusTag = (
+  raw: string | null | undefined
+): 'success' | 'primary' | 'warning' | 'info' | 'danger' =>
+  raw ? (PLAN_VERSION_STATUS_TAG[raw as PlanVersionStatus] ?? 'info') : 'info'
 
 /** 4号位文档第 6 节：Task 不可移动标识（UI 显示，不允许拖动改库） */
 export type TaskLockMarker = 'EXECUTION' | 'FIRM' | 'FROZEN'
 
-/** 4号位文档第 4 节：订单摘要状态（排产总览用） */
-export const ORDER_SUMMARY_STATUSES = [
-  'ON_TIME',
-  'DELAYED',
-  'AT_RISK',
-  'UNSCHEDULED',
-  'ESTIMATED_ONLY'
+/**
+ * 订单状态（`[Order].Status`）—— 冻结 `07:3611`（`[Order]` 表 `Status` 行）权威**六值**
+ *
+ * ⚠️ 2026-10-19 方向已反转，勿再改回三值：
+ *   本文件此前取「数据流向」一侧的 `07:3474` 三值（`Order_Canonical.Status` =
+ *   `OPEN/CLOSED/CANCELLED`），理由是 `sp_SyncOrdersToPartitionTable` 原样复制 `oc.Status`。
+ *   **该推理已被 0号位 第二十~二十三轮（10-17）裁定否掉**：两表是**不同语义层、本就不冲突**，
+ *   且存储过程早已整改 —— SP `modify_date = 10-17 16:49` **显式写 `N'PLANNED'`**，不再复制
+ *   Canonical 值（5号位 10-19 勘误段原文）。
+ *   实库实测（dev 2026-10-19）：v190 = **22,017 行全部 PLANNED**、v195 = 1 行 PLANNED。
+ *   ⇒ 现行写入值就是六值里的 `PLANNED`；继续按三值渲染会把 2 万余行渲染成「未知值原样英文」。
+ *
+ * ⇒ DTO 一律用开放 `string`；命中本词表按中文标签渲染，仍未认识的**原样显示**（不崩、不空标签）。
+ */
+export const ORDER_STATUSES = [
+  'NEW',
+  'PLANNED',
+  'CONFIRMED',
+  'IN_PROGRESS',
+  'COMPLETED',
+  'CANCELLED'
 ] as const
+export type OrderStatus = (typeof ORDER_STATUSES)[number]
 
-export type OrderSummaryStatus = (typeof ORDER_SUMMARY_STATUSES)[number]
+/**
+ * 历史遗留值 `Open` —— **不在冻结六值域内**，故单列、不并进 `OrderStatus`。
+ *
+ * 它是 0号位 裁定前的老 SP 把 Canonical 值原样复制进 `[Order].Status` 的产物，裁定后不再新产生；
+ * 但老计划版本仍是它（dev v2/v5 实测 22,163 行 `Open`）⇒ 仍需中文标签、仍需能筛。
+ */
+export type OrderStatusDisplay = OrderStatus | 'OPEN'
 
-export const ORDER_SUMMARY_STATUS_LABELS: Record<OrderSummaryStatus, string> = {
-  ON_TIME: '按期',
-  DELAYED: '延期',
-  AT_RISK: '风险',
-  UNSCHEDULED: '未排',
-  ESTIMATED_ONLY: '仅估算'
+/** UI 层用：订单状态中文标签（未知值由调用方 `?? raw` 降级原样显示） */
+export const ORDER_STATUS_LABELS: Record<OrderStatusDisplay, string> = {
+  NEW: '新建',
+  PLANNED: '计划中',
+  CONFIRMED: '已确认',
+  IN_PROGRESS: '执行中',
+  COMPLETED: '已完成',
+  CANCELLED: '已取消',
+  // 历史遗留 OPEN：老 SP 从 Order_Canonical 复制而来，非冻结 07:3611 六值
+  OPEN: '进行中'
+}
+
+/**
+ * 筛选下拉可用项 —— **只放实测真查得到的值**，否则就是「选了必空」的假筛选。
+ *
+ * dev 2026-10-19 逐值实测（`GET /api/order-query`）：
+ *  - `PLANNED`：v190 total=22,017、v195 total=1 ⇒ 现行写入值
+ *  - `OPEN`：v2/v5 total=22,163 ⇒ 历史遗留值（CI 等价，老 SP 产物）
+ *  - 六值里其余五值 `NEW / CONFIRMED / IN_PROGRESS / COMPLETED / CANCELLED` 在域无产出
+ *    （实测 total=0）⇒ **入词表、不入下拉**：字段真出现时能渲染，但不让用户去选一个空结果
+ *    （⚠️ 5号位 10-19 勘误段此处写的是「其余四值」，按六值减一只有五个，此处按实测的五值列全）
+ */
+export const ORDER_STATUS_FILTER_OPTIONS = ['PLANNED', 'OPEN'] as const
+
+/** 后端实返 `Open`（大写不敏感归一回 `OPEN`）；未进本表的原样交给调用方降级 */
+export const normalizeOrderStatus = (raw: string | null | undefined): OrderStatusDisplay | null => {
+  if (!raw) return null
+  const upper = String(raw).toUpperCase()
+  return upper in ORDER_STATUS_LABELS ? (upper as OrderStatusDisplay) : null
+}
+
+/**
+ * 订单延迟状态（`Order.DelayStatus`）—— 冻结 `07:2666` / `07:277` / `07:3494` / `07:3625`
+ *
+ * 值域三种：`ON_TIME`（未延迟）/ `FIRST_DELAY`（首次延迟）/ `REPEATED_DELAY`（二次及以上延迟）。
+ * 冻结 `07:277` 另注明 **V1 简化：FIRST_DELAY / REPEATED_DELAY 暂不区分，超期均记为 FIRST_DELAY**。
+ *
+ * 与 `Order.Status`（`OPEN/CLOSED/CANCELLED`）是**两个独立维度**，冻结明文禁止与 DemandMaturityStatus 混用。
+ */
+export const ORDER_DELAY_STATUSES = ['ON_TIME', 'FIRST_DELAY', 'REPEATED_DELAY'] as const
+export type OrderDelayStatus = (typeof ORDER_DELAY_STATUSES)[number]
+
+/** UI 层用：延迟状态中文标签（未知值原样降级显示） */
+export const ORDER_DELAY_STATUS_LABELS: Record<OrderDelayStatus, string> = {
+  ON_TIME: '未延迟',
+  FIRST_DELAY: '首次延迟',
+  REPEATED_DELAY: '重复延迟'
 }
 
 /** 4号位文档第 13 节：Supply 来源类型 */
@@ -174,14 +254,26 @@ export const FACT_TYPE_LABELS: Record<FactType, string> = {
   RECOMMENDATION: '建议'
 }
 
-/** 4号位文档第 13 节：PI PositionType */
+/**
+ * PI 位置类型（PositionType）
+ *
+ * 值域未收敛，已上报 0号位 裁决（5号位 2026-10-17 回执 §1.2），过渡期 6 值全预留：
+ *  - 冻结 `07 v5.1.13:4055`：`STAGE_WIP / XC / INTERPLANT_TRANSIT / WAITING_INBOUND / UNLOCATED`
+ *  - 后端实际落库：`STAGE_WAITING / XC / INTERPLANT_TRANSIT / FIRST_STAGE_PENDING / UNLOCATED`
+ *
+ * 其中只有 `STAGE_WIP ↔ STAGE_WAITING` 是同概念改名；
+ * `WAITING_INBOUND`（冻结有、后端未实现）与 `FIRST_STAGE_PENDING`（后端有、冻结无）**不可互映射**。
+ *
+ * 原先这里是自拟的 `ERP_REMAINING / PRODUCTION / TRANSIT / WAITING / UNLOCATED / CROSS_STAGE`，
+ * 与冻结和后端**零重合**，按该值域筛选取不到任何行 —— 2026-10-17 整组替换。
+ */
 export const PI_POSITION_TYPES = [
-  'ERP_REMAINING',
-  'PRODUCTION',
-  'TRANSIT',
-  'WAITING',
+  'STAGE_WAITING',
+  'FIRST_STAGE_PENDING',
+  'XC',
+  'INTERPLANT_TRANSIT',
   'UNLOCATED',
-  'CROSS_STAGE'
+  'WAITING_INBOUND'
 ] as const
 export type PiPositionType = (typeof PI_POSITION_TYPES)[number]
 
@@ -207,6 +299,27 @@ export const RULE_STATUSES = [
   'ARCHIVED'
 ] as const
 export type RuleStatus = (typeof RULE_STATUSES)[number]
+
+/**
+ * UI 流程实际触发的 3 态子集（v1.4 §二十 6 态冻结；前端无 submit / approve / archive 按钮）
+ * 用途：Rules.vue KPI 横条 + 状态过滤 Tab 的 v-for（避免永远 0 的 SUBMITTED/APPROVED/ARCHIVED 噪声）
+ * 不替代 RULE_STATUSES：类型、normalize、Record 键空间仍按 6 态对齐
+ */
+export const RULE_STATUSES_UI = ['DRAFT', 'PUBLISHED', 'DISABLED'] as const
+export type RuleStatusUI = (typeof RULE_STATUSES_UI)[number]
+
+/**
+ * 「未配版本」—— **不属于 6 态的 UI 过滤/展示标记**（10-14 增）
+ *
+ * 为什么需要：后端 `RuleSetListItemDto` 的 status 来自 RuleSetVersion 的 OUTER APPLY，
+ * 且 `Program.cs:94` 设了 `WhenWritingNull` —— RuleSet **一条版本都没有**时 status key 整个消失。
+ * 这类规则集点开必然 404，但它在 6 态里找不到正确的落点（标 PUBLISHED 是撒谎，标 DRAFT 暗示有草稿可编辑）。
+ *
+ * 故单独用这个字符串做 UI 标签 + 过滤值，**不**扩充 RULE_STATUSES —— v1.4 §二十 的 6 态是
+ * DDL 冻结契约，不因前端展示需要而扩张（@see RuleSetSummaryDto.hasVersion）。
+ */
+export const NO_VERSION = 'NO_VERSION' as const
+export const NO_VERSION_LABEL = '未配版本'
 
 /** UI 层用：RuleSet / ParameterSet 状态中文标签（6 态） */
 export const RULE_STATUS_LABELS: Record<RuleStatus, string> = {
@@ -249,6 +362,27 @@ export const normalizeRuleStatus = (raw: string | null | undefined): RuleStatus 
 
   console.warn(`[RuleStatus] Unknown status from backend: ${raw}, falling back to DISABLED`)
   return 'DISABLED'
+}
+
+/**
+ * 从版本列表里挑出「当前生效的已发布版本」
+ *
+ * ⚠️ 后端允许**多条 PUBLISHED 并存**（旧版本不会自动降级），所以不能
+ *   `find(status === 'PUBLISHED')` —— 那会命中**最旧**的一版。dev 实测：
+ *   RS_DEMO 的 RS-DEMO-V1（2026-07-04 生效 ~ 08-03 到期）与 RS-DEMO-V2
+ *   （08-03 生效 ~ 一直）**都是** PUBLISHED，`find` 拿到 V1，
+ *   页面就把已到期的旧版标成「当前生效」，而列表摘要明明写着 V2。
+ *
+ * 选取口径 = **Id 最大**，与后端列表 `OUTER APPLY (... ORDER BY [Id] DESC)`
+ * （`RuleSetRepository.cs:95-102` / `ParameterSetRepository.cs:93-100`）完全一致
+ * ⇒ 列表里的「当前版本」和详情页标「当前生效」的那一条不会打架。
+ */
+export function pickCurrentPublished<T extends { id: number; status?: string | null }>(
+  versions: readonly T[]
+): T | undefined {
+  const published = versions.filter((v) => normalizeRuleStatus(v.status) === 'PUBLISHED')
+  if (published.length === 0) return undefined
+  return published.reduce((best, cur) => (cur.id > best.id ? cur : best))
 }
 
 /**

@@ -34,7 +34,10 @@ public class SupplyFactTraceService
         CancellationToken ct = default,
         IReadOnlySet<string>? allowedFactories = null)
     {
-        if (take <= 0 || take > 500) take = 100;
+        // 越界夹上限不静默回落（4号位 10-19 R2：我 §六 说"第三处已修"，实际修的是 PeggingTraceService，
+        // 本处属同型未扫到副本——教训第三次应用，已按建议 grep `take <= 0 || take >` 全库一次收净）。
+        if (take <= 0) take = 100;
+        if (take > 500) take = 500;
 
         return await _repository.QueryAllAsync(
             sourceType, materialCode, materialId, factoryCode,

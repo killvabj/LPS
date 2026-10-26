@@ -93,8 +93,13 @@ public sealed class ExistingExecutionContextDto
     /// <summary>
     /// 路径序号（与 RouteCode 成对；PathId 为 APS 内部概念，MES 侧无此维度）
     ///
-    /// 说明：MES 的 RouteCode 是工序名串，表达不了 PathId；当同一 RouteCode 文本挂多个 PathId 时（C桶假歧义），
-    ///      5号位 缺 Path 上下文，本字段可能为空或取默认值，由 2号位 结合 Routing 展开时消解。
+    /// 解析（2026-10-22 起，5号位 按工单交付）：以本工单 RouteCode 文本在**本 PI 的 RoutingOperations 子集**
+    /// （2号位 已按 物料+部门 过滤）内等值匹配 → 命中 PathId **唯一才填**；0/多条 ⇒ 留 null 并登记
+    /// AB_PATH_ID_NOT_RESOLVED / AB_PATH_ID_AMBIGUOUS Issue，由 1号位 维持 Fail Closed，绝不择一（Q-3）。
+    /// 背景：09-30「PathId 可省」的定调失效于 1号位 A/B 硬闸（缺 PathId 即不产 Task），
+    ///      2号位 2026-10-08/10-22 两次请求按 slice 交付真值；2号位 装载层只做诊断
+    ///      （DiagnoseContinuationRouteIdentities，2026-10-22 拆桥后不再回填 `DEFAULT/1`），
+    ///      缺真值的片保持 null 交 1号位 硬闸 Fail Closed。
     /// </summary>
     public int? PathId { get; init; }
 

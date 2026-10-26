@@ -282,4 +282,91 @@ public class ParameterSetVersionPublishTests
             .WithMessage("*发布前校验失败*");
         _repo.Verify(r => r.UpdateAsync(It.IsAny<ParameterSetVersion>(), It.IsAny<CancellationToken>()), Times.Never);
     }
+
+    [Fact]
+    public async Task Publish_InvalidSupplyPiSort_RejectedByValidator()
+    {
+        // Arrange（4号位 2026-10-22 G2：Business 越界 PiSort.SortBy → 发布前校验拒绝；越界值运行期会被 PeggingOrchestrator 静默按 IssueDateAsc 兜底）
+        var (lockJson, _, procurementJson, solverStrategyJson, candidateGuardrailJson) = CreateValidJson();
+        var invalidSupplyJson = System.Text.Json.JsonSerializer.Serialize(new LPS.APS.Core.Dto.SupplyBlock
+        {
+            Inventory = new LPS.APS.Core.Dto.InventoryAvailabilityRule
+            {
+                IsEnabled = true,
+                WarehousePriority = new List<string> { "WH01", "WH02" }
+            },
+            PiSort = new LPS.APS.Core.Dto.PiSortParams
+            {
+                SortBy = (LPS.APS.Core.Dto.PiSortBy)99 // 数字越界（System.Text.Json 数字枚举反序列化不抛异常）
+            }
+        });
+
+        var version = new ParameterSetVersion
+        {
+            Id = 5,
+            ParameterSetId = 20,
+            VersionCode = "V5",
+            Status = GovernanceVersionStatus.Draft,
+            LockJson = lockJson,
+            SupplyJson = invalidSupplyJson,
+            ProcurementJson = procurementJson,
+            SolverStrategyJson = solverStrategyJson,
+            CandidateGuardrailJson = candidateGuardrailJson,
+        };
+        _repo.Setup(r => r.GetByIdAsync(5, It.IsAny<CancellationToken>())).ReturnsAsync(version);
+
+        // Act
+        var act = () => _service.PublishParameterSetVersionAsync(5, "tester", 1001);
+
+        // Assert（G2：Supply PiSort.SortBy 越界 → 发布前校验拒绝，不得落库）
+        await act.Should().ThrowAsync<InvalidOperationException>()
+            .WithMessage("*发布前校验失败*");
+        _repo.Verify(r => r.UpdateAsync(It.IsAny<ParameterSetVersion>(), It.IsAny<CancellationToken>()), Times.Never);
+    }
+
+    [Fact]
+    public async Task Publish_DuplicatePlanningYieldKey_RejectedByValidator()
+    {
+        // Arrange（R04 会签第 4 项：重复 (MaterialId, StageCode) → 发布侧去重归 3号位，发布前校验拒绝）
+        var (lockJson, supplyJson, _, solverStrategyJson, candidateGuardrailJson) = CreateValidJson();
+        var duplicateProcurementJson = System.Text.Json.JsonSerializer.Serialize(new LPS.APS.Core.Dto.ProcurementBlock
+        {
+            PlanningYields =
+            [
+                new LPS.APS.Core.Dto.PlanningYieldRule { MaterialId = "MAT001", StageCode = "ST-1", YieldPercent = 95 },
+                new LPS.APS.Core.Dto.PlanningYieldRule { MaterialId = "MAT001", StageCode = "ST-1", YieldPercent = 95 }   // 同键重复
+            ],
+            DefaultPurchaseLt =
+            [
+                new LPS.APS.Core.Dto.PurchaseLtRule { WarehouseCode = "WH01", DefaultLtDays = 3 }
+            ],
+            ArrivalToUsableOffsets =
+            [
+                new LPS.APS.Core.Dto.WarehouseOffsetRule { WarehouseCode = "WH01", OffsetHours = 2 }
+            ],
+            OverdueMargin = new LPS.APS.Core.Dto.OverdueMarginParams { MarginPercent = 10, MinimumExtraDays = 1 }
+        });
+
+        var version = new ParameterSetVersion
+        {
+            Id = 6,
+            ParameterSetId = 20,
+            VersionCode = "V6",
+            Status = GovernanceVersionStatus.Draft,
+            LockJson = lockJson,
+            SupplyJson = supplyJson,
+            ProcurementJson = duplicateProcurementJson,
+            SolverStrategyJson = solverStrategyJson,
+            CandidateGuardrailJson = candidateGuardrailJson,
+        };
+        _repo.Setup(r => r.GetByIdAsync(6, It.IsAny<CancellationToken>())).ReturnsAsync(version);
+
+        // Act
+        var act = () => _service.PublishParameterSetVersionAsync(6, "tester", 1001);
+
+        // Assert（重复键 → 发布前校验拒绝，不得落库）
+        await act.Should().ThrowAsync<InvalidOperationException>()
+            .WithMessage("*发布前校验失败*");
+        _repo.Verify(r => r.UpdateAsync(It.IsAny<ParameterSetVersion>(), It.IsAny<CancellationToken>()), Times.Never);
+    }
 }

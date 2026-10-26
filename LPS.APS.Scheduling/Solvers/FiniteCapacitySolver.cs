@@ -57,6 +57,12 @@ public class FiniteCapacitySolver : IFiniteCapacityScheduler
     {
         var startTime = DateTime.UtcNow;
 
+        // 2026-10-26 取证（2号位 §6.3-5「最小复现切片」/ 1号位 回执 §十一）：**入参原样交宿主一次**。
+        //   宿主设了 `SolverDiagnostics.OnSolveRequest` 才生效，默认 null ⇒ 零开销、零行为变化。
+        //   放在第一行、Phase1 之前 ⇒ 抓到的是**未被求解器改动过**的原始入参。
+        //   ⚠ 本程序集零 I/O 红线不变：这里只回调，不序列化、不落盘。
+        SolverDiagnostics.CaptureSolveRequest(request);
+
         // ── Phase 边界计时（0号位 2026-10-08《未命名的Markdown文件 (2)(1).md》§九 / §十四 第三优先级）──
         //   V1_4 NEW-06 起：`SolveAsync` 入口已保证作用域存在（自动或调用方显式）⇒ `StartPhase()` 恒非 null；
         //   直调本方法（仅测试/内部）时仍按旧口径「无作用域 ⇒ 零开销、零行为影响」。
@@ -65,6 +71,12 @@ public class FiniteCapacitySolver : IFiniteCapacityScheduler
         // ═══════════════════════════════════════════════
         // Phase 1: 硬约束构建
         // ═══════════════════════════════════════════════
+        // 2026-10-25 运行中进度探针（2号位 §7.2）：写入当前阶段名，供 `SolverDiagnostics.LiveCounters` 运行中轮询
+        //   （⚠ 不是 `Active` —— 那个是 `AsyncLocal`，外部线程读不到）。
+        SolverDiagnostics.SetPhase("Phase1");
+        // 2026-10-26 取消支持：本方法一直**收着** `cancellationToken` 却从未检查 ⇒ 外层只能杀进程。
+        //   这里只在「阶段边界」与「需求/修复单元之间」检查（见 Phase2/Phase4），不进超热内层。
+        cancellationToken.ThrowIfCancellationRequested();
         var phase1 = new PhaseOneConstraintBuilder();
         var p1 = SolverDiagnostics.StartPhase();
         ConstraintContext constraints;
@@ -92,12 +104,14 @@ public class FiniteCapacitySolver : IFiniteCapacityScheduler
         // ═══════════════════════════════════════════════
         // Phase 2: 初始有限产能排程
         // ═══════════════════════════════════════════════
+        SolverDiagnostics.SetPhase("Phase2");
+        cancellationToken.ThrowIfCancellationRequested();
         var phase2 = new PhaseTwoInitialScheduler();
         var p2 = SolverDiagnostics.StartPhase();
         InitialScheduleResult scheduleResult;
         try
         {
-            scheduleResult = phase2.Schedule(request, constraints);
+            scheduleResult = phase2.Schedule(request, constraints, cancellationToken);
         }
         catch (SolverInputContractException ex)
         {
@@ -119,6 +133,8 @@ public class FiniteCapacitySolver : IFiniteCapacityScheduler
         // ═══════════════════════════════════════════════
         // Phase 3: 可行性与延期诊断
         // ═══════════════════════════════════════════════
+        SolverDiagnostics.SetPhase("Phase3");
+        cancellationToken.ThrowIfCancellationRequested();
         var phase3 = new PhaseThreeDiagnostics();
         var p3 = SolverDiagnostics.StartPhase();
         var diagnostics = phase3.Diagnose(request, scheduleResult, constraints);
@@ -127,14 +143,18 @@ public class FiniteCapacitySolver : IFiniteCapacityScheduler
         // ═══════════════════════════════════════════════
         // Phase 4: 有界局部修复
         // ═══════════════════════════════════════════════
+        SolverDiagnostics.SetPhase("Phase4");
+        cancellationToken.ThrowIfCancellationRequested();
         var phase4 = new PhaseFourLocalRepair();
         var p4 = SolverDiagnostics.StartPhase();
-        var repairResult = phase4.Repair(request, scheduleResult, diagnostics, constraints);
+        var repairResult = phase4.Repair(request, scheduleResult, diagnostics, constraints, cancellationToken);
         SolverDiagnostics.EndPhase(p4, 4);
 
         // ═══════════════════════════════════════════════
         // Phase 5: 压缩空隙与最终评价
         // ═══════════════════════════════════════════════
+        SolverDiagnostics.SetPhase("Phase5");
+        cancellationToken.ThrowIfCancellationRequested();
         var phase5 = new PhaseFiveCompression();
         var p5 = SolverDiagnostics.StartPhase();
         var finalResult = phase5.Compress(request, scheduleResult, repairResult, diagnostics, constraints);
@@ -154,6 +174,14 @@ public class FiniteCapacitySolver : IFiniteCapacityScheduler
             ExplanationFacts = finalResult.ExplanationFacts,
             // B.2：透传 Phase5 导出的求解过程追溯 —— 此前重组装漏拷，会静默丢弃 2号位 r13494 落地的 SolveTraceNotes 载体
             SolveTraceNotes = finalResult.SolveTraceNotes,
+            // §④⑤⑨：透传 Phase5 构建的 Demand 级时间事实 —— **同一类漏拷缺陷的第二次实例**（与上一行
+            //   SolveTraceNotes 同因）：`PhaseFiveCompression.cs:210` 已由 `StageTimingNodeBuilder.Build`
+            //   构建 `DemandCompletions`，但本重组装未拷贝 ⇒ `SolveAsync`（唯一端到端入口）返回的
+            //   `DemandCompletions` **恒为空**，`DEMAND_COMPLETION_TIME_UNAVAILABLE` /
+            //   `STAGE_TIMING_PATH_UNDETERMINED` 留痕所指的**时间事实载体被静默丢弃**。
+            //   实测证据：`OperationPlanningModeContractTests.R2F_10` / `R2F_11` 整改前红（集合为空）。
+            //   ⚠ 只补透传，不改任何取值语义；载体在 Core（2号位 落），值由 1号位 填。
+            DemandCompletions = finalResult.DemandCompletions,
             Summary = new SolveSummary
             {
                 TotalDrafts = finalResult.Summary.TotalDrafts,

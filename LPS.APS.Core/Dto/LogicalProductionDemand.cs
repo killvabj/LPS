@@ -38,6 +38,30 @@ public sealed class LogicalProductionDemand
     public long? OrderId { get; init; }
 
     /// <summary>
+    /// 本需求是否为**该订单的顶层根需求**（BOM 展开的第 0 层）。
+    ///
+    /// 【为什么必须显式携带（0号位 2026-10-17 第十四轮 J14-03/J14-04）】
+    ///   Stage 链角色此前由「该物料在本运行是否有 BOM 供给阈值」反推 ⇒ 子件阈值为 NULL 时被错判成 ROOT。
+    ///   角色是**需求的结构属性**（本需求是不是本订单的根），阈值只决定 EDGE 链的**截断点**（<see cref="RequiredStageCode"/>）。
+    /// </summary>
+    public bool IsRootDemand { get; set; }
+
+    /// <summary>
+    /// 本需求所属 BOM 请求的 `ResolvedBOMNO`（来自 `OrderBomRequestLink`，按 `OrderId + PlanVersionId` 解析）。
+    /// null = 无锚点（旧链路/未建链接）⇒ Stage 链装载不做请求收窄并须留痕。
+    /// </summary>
+    public string? BomNo { get; set; }
+
+    /// <summary>本需求所属 BOM 请求的 `RequestDetailId`（`OrderBomRequestLink.RequestDetailId`，追溯用）。</summary>
+    public long? RequestDetailId { get; set; }
+
+    /// <summary>
+    /// 本需求所属 BOM 请求的 ROOT 代表锚点（`OrderBomRequestLink.RepWorksetId` = 该 RequestDetail 下 Level=1 的 `MIN(Workset.Id)`）。
+    /// ROOT 侧 Stage 链按它做第二层收窄（`WorksetId` 已回灌时生效）。
+    /// </summary>
+    public long? RepWorksetId { get; set; }
+
+    /// <summary>
     /// 物料ID
     /// </summary>
     public int MaterialId { get; init; }
@@ -168,17 +192,15 @@ public sealed class LogicalProductionDemand
     /// 与 <see cref="PathId"/> 成对使用；**A/B 缺值应 Fail Closed，不得回退猜唯一 Path**（0号位 2026-10-07 裁决 §三）。
     ///
     /// ⚠ 2026-10-09：由 <c>init</c> 放开为 <c>set</c> —— 分桶（<c>ApplyContinuityBucketing</c>）发生在
-    ///   <c>LoadRoutingContextAsync</c> **之前**，切片构造时无法拿到路由上下文，只能在路由装载后由
-    ///   <c>FillContinuationRouteIdentities</c> 统一回填（与 <see cref="StartStageCode"/> 同款理由）。
+    ///   <c>LoadRoutingContextAsync</c> **之前**，切片构造时拿不到路由上下文。
     ///
-    /// 🔴 **桥接期取值 ≠ 业务真值**：该回填的取值源是上游刚被 <c>NormalizeToSingleRoute</c> 就地改写的路由载荷
-    ///   ⇒ 当前实际回填的是 **`DEFAULT / 1`**（1号位 技术适配值）。冻结 <c>11_2号位v2.1</c> 执行红线 <b>Q1</b>
-    ///   明令「`DEFAULT / 1` **不得**作为归一化后的业务真值」「A/B 向 1号位 发送固定**真实** Route/Path，
-    ///   **禁止预先压成 DEFAULT/1**」⇒ 本字段在桥接期**仅供 1号位 查图，不得当作持久化/FinalTask/Task/MES
-    ///   执行身份的真实路径来源**。终态 = ① 1号位 去 <c>StageTimingNodeBuilder.GetRoutelessStages</c> 的
-    ///   <c>RouteCode != "DEFAULT"</c> 判断（我方归一化删除补丁已备好、压住不发）+ ② 5号位 按 slice 交付
-    ///   真实 <c>RouteCode / PathId</c>（Q-1008-1）。两者齐备后 <c>FillContinuationRouteIdentities</c> 因
-    ///   「已带真值即跳过」自动失效，本字段即为真值。桥接期每次 Run 都有 WARNING 留痕，不静默。
+    /// 🔴 **本字段只填真实值，不填默认值**：唯一取值源是 5号位 按**工单**交付的
+    ///   <c>ExistingExecutionContextDto.RouteCode / .PathId</c>（`PathId` 唯一命中才交付，歧义或无匹配留 null，
+    ///   见该 DTO 的解析口径）。分桶逐工单切（§8），故工单级真值即片级真值 —— 装载层
+    ///   <c>BucketContinuityShares</c> 逐工单取用；**不得用 `DEFAULT / 1` 填假身份、不得把缺真路径的 A/B
+    ///   当普通 C 桶重新选路**（0号位 2026-10-22 §五(一)，冻结 <c>11_2号位v2.1</c> 红线 Q1 同向）。
+    ///   工单级真值本身缺（5号位 侧 `AB_PATH_ID_*`）时保持 null，由 1号位 硬闸 Fail Closed 记
+    ///   Unscheduled 且不产 Task。
     /// </summary>
     public string? RouteCode { get; set; }
 
@@ -210,4 +232,121 @@ public sealed class LogicalProductionDemand
     ///   本字段为空时回落旧字段（行为不变）。
     /// </summary>
     public string? PreferredResourceCode { get; init; }
+
+    /// <summary>
+    /// 需求的业务目标（DemandGoal）—— 冻结规则清单 v1.5 <c>P-006</c> 两个取值：
+    /// <c>CUSTOMER_COMMITMENT</c>（客户承诺）／<c>INVENTORY_REPLENISHMENT</c>（库存补充）。
+    /// <c>P-008</c> 要求 Pegging 侧**传播**该目标（不传播 Direction）。
+    ///
+    /// 【粒度（0号位 2026-10-12 裁决《DemandGoal与SH整单及关联问题正式裁决回执 v1.0》）】
+    ///   Goal 是**需求（Demand）级**的业务目标，不是 Supply／Task／MES工单 的固有属性（DG-01）。
+    ///   ⇒ 载体＝本类（需求级），**不是** <c>PeggingSupplyAllocation</c>（份额级）；
+    ///   同一 MTS PI 在 Supply 层承接不同需求，**不**因「600 已承接客户／剩 400」就把该 PI 自身
+    ///   拆成两种 Goal（DG-03.4）——是否存在多目标只看**真实 Demand 关系**。
+    ///
+    /// 【字段形状（1号位 2026-10-12《技术事项汇总回执答复 v1.0》§四「需求级」分支点名）】
+    ///   `public string? DemandGoal { get; set; }` —— 可空；取值**逐字大写、不归一**；
+    ///   1号位 消费：缺值 ⇒ 登记 <c>DEMAND_GOAL_ABSENT</c> 进 SolveTraceNotes（既有行为不变）。
+    ///   契约约定：1↔2 契约字段只按 1号位 点名字段扩 —— 本字段即按其点名落地。
+    ///
+    /// 【取值规则（0号位 裁决 §一 DG-05 ／ §2.1–§2.4）】
+    ///   按**实际 Pegging 供需承接及需求份额血缘**确定，**不得**按 <c>OrderType</c>／单据类型硬映射
+    ///   （DG-02/DG-04、§一.1）；正式交给 Solver 且血缘可唯一判定的需求**不应**长期为空；
+    ///   仅「事实确实不足、血缘无法唯一判定」的异常输入才允许留空，且必须显式 Issue／诊断，
+    ///   **不猜值、不一律当补库**（§2.4）。
+    ///
+    /// ✅ **2026-10-13 状态：取值链已投产**（原 2026-10-12「恒 null」段作废）。
+    ///   取值点 = `PeggingOrchestrator.FillDemandGoalsAsync`，在 `BuildSolveRequestAsync` 内、
+    ///   **跨版本连续性分桶之前**调用（切片 <c>CloneDemandSlice</c>／<c>CloneDemandRescaled</c>
+    ///   均原样继承本字段，故先填即两片自动带值）。
+    ///
+    ///   【判据 —— 按**需求血缘根**一刀切，粒度=需求级（0号位 §3.3 答复）】
+    ///   <list type="bullet">
+    ///     <item><b>O 行</b>（客户订单行，<c>OrderNo</c> 非 'P' 开头）且 <c>CustomerSegment ≠ '跨厂'</c>
+    ///       ⇒ <c>CUSTOMER_COMMITMENT</c>（客户履约需求）。</item>
+    ///     <item><b>P 行</b>（PI 自身指令行，<c>OrderNo</c> 以 'P' 开头）⇒ <c>INVENTORY_REPLENISHMENT</c>。
+    ///       依 DG-03 §一.1：顶层/中间层 MTS 自成独立补库需求，**被上层客户需求消费并不改写其自身需求身份**。</item>
+    ///     <item><b>跨厂 SH</b>（<c>CustomerSegment = '跨厂'</c>）⇒ **当前留空 + 诊断**（⚠ 未落地项）。
+    ///       SH-02 要求整单判「被真实上层需求承接 ⇒ 客户承诺 / 孤儿 ⇒ 补库」，但唯一可得信号
+    ///       （<c>SupplyAllocations</c> 里 <c>ShippingInstructionNo = SH号</c> 的分配行）**区分不出**
+    ///       「SH 供给在目标厂自扣自己那张订单」与「被上层承接」——实测 PV2 四个 SH 订单
+    ///       <c>Allocation=4</c> 而需求=0（即自扣）。用它会恒判客户承诺（含真孤儿），违反 SH-02；
+    ///       故按 DG-05 §2.4「不猜、不一律当补库」留空，待 2→1 联调定载体。**当前 PV2 SH 产出 0 条需求**，
+    ///       本分支无实例，不得记作「已验证」。</item>
+    ///     <item><b>BOM 子件需求</b>⇒ 自动随根（子需求 <c>OrderId</c> 即**根订单** Id，BOM 传播无需另判）。</item>
+    ///     <item><b>血缘无法唯一确定</b>（判例 8：订单主档缺行等）⇒ **留 null + Warning 诊断**，
+    ///       不猜、不自动归补库；1号位 侧按既有 <c>DEMAND_GOAL_ABSENT</c> 登记缺口（行为不变）。</item>
+    ///   </list>
+    ///
+    ///   【为什么不用 <c>OrderType</c>】PV2 实测 **533 行** <c>OrderType='PRODUCTION_INSTRUCTION'</c>
+    ///   却是 O 行（客户订单引用了 PI）⇒ 按 <c>OrderType</c> 硬映射会把它们误判（DG-02 明令禁止）。
+    ///   干净判据 = <c>OrderNo</c> 前缀 ＋ <c>CustomerSegment</c>。
+    /// </summary>
+    public string? DemandGoal { get; set; }
+
+    /// <summary>
+    /// 数量权威（QuantityAuthority）—— 本需求的**数量**由谁授权：PI 还是订单。
+    ///
+    /// 【为什么需要（1号位 2026-10-22 回执 §4.3）】「有 PI 号」≠「PI 是数量权威」。
+    ///   客户订单行（B-01 身份闸门：<c>OrderType='SALES_ORDER'</c>）同样携带 <c>MTS_InstructionNo</c>
+    ///   （ODS 视图 <c>v_APS_SalesOrder</c> 分支2 的刻意设计，非数据缺口），但其数量边界取
+    ///   <c>[Order].Quantity</c>、不取 PI 合法量 ⇒ 按「有 PI 号」一律进 PI 门禁会把这类需求误判。
+    ///   本字段只回答这一项区分；**不得**当作「有没有 PI」的同义词。
+    ///
+    /// 【取值（逐字大写、不归一，常量见 <see cref="QuantityAuthorityValues"/>）】
+    ///   <list type="bullet">
+    ///     <item><c>MTS_PI</c> ⇒ PI 是数量权威（1号位 保留全部门禁：净需求／PI 原始量／ERP 权威剩余／
+    ///       PI Position 当前 Stage 自由份额／已认证其他硬资格）。</item>
+    ///     <item><c>ORDER_ONLY</c> ⇒ 不进 PI 法定量门禁，按 B-010「合法无 PI 规划需求」处理，
+    ///       <c>NetOutputQty</c> 作软 Preferred；**仍保留 PI 号本身**（追溯 + <c>MTS_InstructionNo</c> 下发）。</item>
+    ///     <item><c>NONE</c> ⇒ 需求不带 PI 号（1号位 现行已直接放行，取值仅作留痕）。</item>
+    ///   </list>
+    ///
+    /// 【可空语义（1号位 §4.2 第 1 条）】<c>null</c> = 我方**尚未填**（过渡期）⇒ 1号位 沿用现状
+    ///   （有 PI 号就走门禁）并登记**一条汇总**留痕 <c>QUANTITY_AUTHORITY_ABSENT</c>，不逐需求登记、
+    ///   不因缺值把需求判死。⇒ 本字段必须在装载链跑满后逐条有值。
+    ///
+    /// 【约定】1↔2 契约字段只按 1号位 点名扩 —— 本字段即按其 2026-10-22 回执 §四 点名落地；
+    ///   取值点 = <c>PeggingOrchestrator.FillQuantityAuthority</c>，在 <c>BuildSolveRequestAsync</c> 内、
+    ///   <c>ApplyContinuityBucketing</c> **之前**（切片克隆逐项继承，先填则两片自动带值）。
+    /// </summary>
+    public string? QuantityAuthority { get; set; }
+}
+
+/// <summary>
+/// <see cref="LogicalProductionDemand.DemandGoal"/> 的取值常量（冻结规则清单 <c>P-006</c>）。
+///
+/// **为什么用常量而非 enum**（我方 2026-10-12 致 1号位 建议、对方采纳）：
+///   跨号位契约取值走 <c>string</c> 更耐演进——新增取值时无需两边同步改枚举并重编译；
+///   且 1号位 侧 `SchedulingDirectionResolver` 的比对是 <c>StringComparison.Ordinal</c>，
+///   ⇒ **逐字大写、大小写敏感**，本类取值必须与之逐字一致（不得归一化、不得小写）。
+/// </summary>
+public static class DemandGoalValues
+{
+    /// <summary>客户承诺（P-006 取值一）。1号位 消费为**反向**信号。</summary>
+    public const string CustomerCommitment = "CUSTOMER_COMMITMENT";
+
+    /// <summary>库存补充（P-006 取值二）。1号位 消费为**正向**信号。</summary>
+    public const string InventoryReplenishment = "INVENTORY_REPLENISHMENT";
+}
+
+/// <summary>
+/// <see cref="LogicalProductionDemand.QuantityAuthority"/> 的取值常量（1号位 2026-10-22 回执 §4.1 点名）。
+///
+/// 写法照 <see cref="DemandGoalValues"/>：可空 <c>string</c> + 逐字大写常量类（**大小写敏感**，
+/// 1号位 侧按 <c>StringComparison.Ordinal</c> 比对 ⇒ 不得归一化、不得小写）。
+/// </summary>
+public static class QuantityAuthorityValues
+{
+    /// <summary>PI 是数量权威（MTS 生产指示）：1号位 保留既有 PI 法定量门禁全套。</summary>
+    public const string MtsPi = "MTS_PI";
+
+    /// <summary>
+    /// 仅订单量权威（需求带 PI 号但本 Run 无该 PI 的权威事实行，典型＝客户订单行 B-01 闸门内）。
+    /// 1号位 跳过 PI 法定量门禁，按 B-010 合法无 PI 规划需求处理；PI 号本身**保留**。
+    /// </summary>
+    public const string OrderOnly = "ORDER_ONLY";
+
+    /// <summary>需求不带 PI 号。</summary>
+    public const string None = "NONE";
 }

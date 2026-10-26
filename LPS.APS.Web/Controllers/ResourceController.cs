@@ -30,7 +30,11 @@ public class ResourceController : ControllerBase
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
     }
 
-    /// <summary>资源主表列表（支持按部门/类型过滤；含 hasCalendar）</summary>
+    /// <summary>
+    /// 资源主表列表（支持按部门/类型过滤；含 hasCalendar）。
+    /// 10-23 R1 起按登录者业务范围收窄（与资源日历读路径 EnsureTargetScopeAsync 同源同判定：
+    /// Global 放行；非 Global 须 Factory 命中 ∧（资源无部门归属 或 Department 命中））；身份解析失败=0 → 空列表（fail-closed）。
+    /// </summary>
     [HttpGet]
     public async Task<ApiResponse<List<ResourceListItemDto>>> GetList(
         [FromQuery] int? departmentId = null,
@@ -40,7 +44,8 @@ public class ResourceController : ControllerBase
     {
         try
         {
-            var rows = await _service.GetListAsync(departmentId, resourceType, includeInactive, ct);
+            var userId = int.TryParse(User.FindFirst(System.Security.Claims.ClaimTypes.NameIdentifier)?.Value, out var uid) ? uid : 0;
+            var rows = await _service.GetListAsync(userId, departmentId, resourceType, includeInactive, ct);
             return ApiResponse<List<ResourceListItemDto>>.Success(rows);
         }
         catch (Exception ex)

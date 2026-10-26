@@ -27,6 +27,8 @@ import { useApsAuthStore } from '@/store/modules/aps/auth'
 import {
   DOMAIN_SCOPE_TYPE_LABELS,
   type DomainDefinitionDto,
+  type DomainDependencyDto,
+  type DomainDependencyDirection,
   type DomainScopeType,
   type FactorySummaryDto,
   type ProductFamilySummaryDto
@@ -48,7 +50,11 @@ import {
   ElInputNumber,
   ElMessage,
   ElOption,
+  ElRadioButton,
+  ElRadioGroup,
   ElSelect,
+  ElTable,
+  ElTableColumn,
   ElTag,
   ElTooltip
 } from 'element-plus'
@@ -394,6 +400,71 @@ async function onCreate(): Promise<void> {
   }
 }
 
+/* ===== 域依赖关系（G7：GET /api/governance-query/domain-dependencies，只读）=====
+ * 数据源：Domain_Dependency（跨产品族血缘扫描产物）
+ * 口径依据：冻结《07 数据库字段说明文档》§B.1
+ *  - 上下游节点是真实 DomainKey（不是 ProductFamily）
+ *  - DefaultLeadTimeDays 是兼容缓存字段；0 = 尚未按真实工厂/Stage 转运 LT 派生
+ *    ⇒ 不得把固定 2 天当权威，也不得把 0 说成「0 天提前期」
+ *
+ * ⚠️ 空态口径：扫描结果为空 ≠ 依赖关系不存在。
+ *    表为空只说明「系统尚未扫描到跨产品族依赖边」，不得据此断言依赖关系已确认不存在。
+ */
+const dependencyDomainKey = ref<DomainDefinitionDto['domainKey'] | undefined>(undefined)
+const dependencyDirection = ref<DomainDependencyDirection>('downstream')
+const dependencyRows = ref<DomainDependencyDto[]>([])
+const dependencyLoading = ref(false)
+const dependencyError = ref<string | null>(null)
+
+async function loadDependencies(): Promise<void> {
+  if (!dependencyDomainKey.value) {
+    dependencyRows.value = []
+    return
+  }
+  dependencyLoading.value = true
+  dependencyError.value = null
+  try {
+    dependencyRows.value = await domainApi.getDependencies({
+      domainCode: dependencyDomainKey.value,
+      direction: dependencyDirection.value
+    })
+  } catch (err) {
+    console.warn('[APS 排程域页] 加载域依赖关系失败', err)
+    dependencyRows.value = []
+    // 403 = 越权（后端回「Domain 范围越界」）→ 说「无权」，不说「稍后重试」
+    const apiErr = err as { code?: number }
+    dependencyError.value =
+      apiErr?.code === 403 ? '无权查看该排程域的依赖关系' : '域依赖关系暂不可用，请稍后重试'
+  } finally {
+    dependencyLoading.value = false
+  }
+}
+
+/** 选中域 / 方向变化 → 重新取数 */
+watch([dependencyDomainKey, dependencyDirection], () => {
+  void loadDependencies()
+})
+
+/** 左侧列表选中行 → 同步依赖区块的域（点谁看谁） */
+watch(
+  selectedKey,
+  (k) => {
+    if (k) dependencyDomainKey.value = k
+  },
+  { immediate: true }
+)
+
+/** 提前期展示：0/空 = 未派生（兼容缓存字段，不是「0 天」）；>0 = 缓存值（明标非权威） */
+function dependencyLeadTimeText(days: number | undefined | null): string {
+  if (days == null || days <= 0) return '未派生（以真实工厂/Stage 转运事实为准）'
+  return `${days} 天（兼容缓存值，非权威）`
+}
+
+/** 依赖另一侧排程域的展示名（字典里查不到就原样显示 key，不臆造名称） */
+function dependencyDomainName(code: string): string {
+  return domainStore.label(code) || code
+}
+
 /* ===== 字典（下拉数据源）=====
  * 加载时机：组件挂载时与 domainStore.refresh() 并行
  * lookup 用法：getProductFamilyName(id) / getFactoryName(id)
@@ -429,6 +500,10 @@ function getFactoryName(id: number): string {
 
 onMounted(async () => {
   await Promise.all([domainStore.refresh(), loadDictionaries()])
+  // 依赖区块默认落到第一个启用域（左侧未选中时也能直接看）
+  if (!dependencyDomainKey.value && allActive.value.length > 0) {
+    dependencyDomainKey.value = allActive.value[0].domainKey
+  }
 })
 </script>
 
@@ -438,9 +513,6 @@ onMounted(async () => {
     <div class="page-header">
       <div>
         <h2 class="page-title">排程域定义维护</h2>
-        <p class="page-sub">
-          按产品族 / 工厂+产品族维护排程域；排程域标识由系统生成、不可改；停用后下拉不可选
-        </p>
       </div>
       <div class="header-actions">
         <ElButton :loading="loading" @click="refreshList">
@@ -744,6 +816,12 @@ onMounted(async () => {
               </ElTag>
               <span class="meta-hint"> · 启停用请用右上方按钮（专用端点） </span>
             </ElDescriptionsItem>
+            <ElDescriptionsItem label="创建人">{{
+              currentDetail.createdBy ?? '—'
+            }}</ElDescriptionsItem>
+            <ElDescriptionsItem label="创建时间">{{
+              formatUtcDateTime(currentDetail.createdAt)
+            }}</ElDescriptionsItem>
             <ElDescriptionsItem label="更新人">{{
               currentDetail.updatedBy ?? '—'
             }}</ElDescriptionsItem>
@@ -772,6 +850,71 @@ onMounted(async () => {
         </div>
       </ElCard>
     </div>
+
+    <!-- ===== 域依赖关系（只读；G7 域依赖查询）===== -->
+    <ElCard class="panel dependency-panel">
+      <template #header>
+        <div class="panel-header">
+          <span>域依赖关系</span>
+          <ElTag size="small" effect="plain">{{ dependencyRows.length }}</ElTag>
+        </div>
+      </template>
+
+      <div class="dependency-toolbar">
+        <span class="filter-label">排程域：</span>
+        <ElSelect
+          v-model="dependencyDomainKey"
+          size="small"
+          style="width: 240px"
+          placeholder="选择排程域"
+        >
+          <ElOption
+            v-for="d in allActive"
+            :key="d.domainKey"
+            :label="`${d.domainName}（${d.domainKey}）`"
+            :value="d.domainKey"
+          />
+        </ElSelect>
+        <ElRadioGroup v-model="dependencyDirection" size="small">
+          <ElRadioButton value="downstream">下游（谁依赖它）</ElRadioButton>
+          <ElRadioButton value="upstream">上游（它依赖谁）</ElRadioButton>
+        </ElRadioGroup>
+        <span v-if="dependencyLoading" class="muted small">加载中…</span>
+      </div>
+
+      <div v-if="dependencyError" class="panel-empty">
+        <ElEmpty :description="dependencyError" />
+      </div>
+      <div v-else-if="!dependencyRows.length" class="panel-empty">
+        <ElEmpty description="依赖扫描结果为空：系统尚未扫描到跨产品族依赖边" />
+        <p class="dependency-hint">
+          扫描结果为空只表示当前没有可展示的跨产品族依赖边，不代表依赖关系已确认不存在。
+        </p>
+      </div>
+      <ElTable v-else :data="dependencyRows" size="small" border>
+        <ElTableColumn label="上游排程域" min-width="160">
+          <template #default="{ row }">
+            {{ dependencyDomainName(row.upstreamDomainCode) }}
+          </template>
+        </ElTableColumn>
+        <ElTableColumn label="下游排程域" min-width="160">
+          <template #default="{ row }">
+            {{ dependencyDomainName(row.downstreamDomainCode) }}
+          </template>
+        </ElTableColumn>
+        <ElTableColumn label="关联半成品物料" min-width="140">
+          <template #default="{ row }">{{ row.childMaterialCode || '—' }}</template>
+        </ElTableColumn>
+        <ElTableColumn label="转运提前期" min-width="220">
+          <template #default="{ row }">
+            {{ dependencyLeadTimeText(row.defaultLeadTimeDays) }}
+          </template>
+        </ElTableColumn>
+        <ElTableColumn label="扫描时间" min-width="160">
+          <template #default="{ row }">{{ formatUtcDateTime(row.scannedAt) }}</template>
+        </ElTableColumn>
+      </ElTable>
+    </ElCard>
 
     <!-- ===== 新建排程域 Dialog ===== -->
     <ElDialog
@@ -851,10 +994,6 @@ onMounted(async () => {
         <ElFormItem label="排序权重" prop="sortOrder">
           <ElInputNumber v-model="createForm.sortOrder" :min="0" :max="9999" />
         </ElFormItem>
-        <ElAlert type="warning" :closable="false" show-icon>
-          <template #title>排程域标识不可改</template>
-          创建后此字段不可修改；如需修改请删除重建。
-        </ElAlert>
       </ElForm>
       <template #footer>
         <ElButton :disabled="createSubmitting" @click="createDialog = false">取消</ElButton>
@@ -894,12 +1033,6 @@ onMounted(async () => {
     font-size: 20px;
     font-weight: 600;
     color: #1e293b;
-  }
-
-  .page-sub {
-    margin: 4px 0 0;
-    font-size: 12px;
-    color: #94a3b8;
   }
 
   .header-actions {
@@ -1020,6 +1153,24 @@ onMounted(async () => {
 
 .panel-empty {
   padding: 20px 0;
+}
+
+.dependency-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-bottom: 12px;
+
+  .filter-label {
+    font-size: 12px;
+    color: #64748b;
+  }
+
+  .muted {
+    font-size: 12px;
+    color: #94a3b8;
+  }
 }
 
 .content-row {

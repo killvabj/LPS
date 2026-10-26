@@ -60,7 +60,7 @@ public class RuleSetVersionPublishTests
                         [
                             new LPS.APS.Core.Dto.SegmentSortField
                             {
-                                Field = LPS.APS.Core.Dto.DemandField.RemainingTimeHours,
+                                Field = LPS.APS.Core.Dto.DemandField.DueDate,
                                 Direction = LPS.APS.Core.Dto.SortDirection.Asc
                             }
                         ]
@@ -113,7 +113,7 @@ public class RuleSetVersionPublishTests
                         [
                             new LPS.APS.Core.Dto.SegmentSortField
                             {
-                                Field = LPS.APS.Core.Dto.DemandField.RemainingTimeHours,
+                                Field = LPS.APS.Core.Dto.DemandField.DueDate,
                                 Direction = LPS.APS.Core.Dto.SortDirection.Asc
                             }
                         ]

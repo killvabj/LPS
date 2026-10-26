@@ -56,7 +56,8 @@ public class PhaseTwoRoutingCandidateTests
         bool isContinuation = false,
         string? continuationKey = null,
         DateTime? due = null,
-        string? preferredResourceCode = null)
+        string? preferredResourceCode = null,
+        string? demandGoal = null)
     {
         var ops = new List<RoutingOperation>();
         var deps = new List<RoutingDependency>();
@@ -148,6 +149,9 @@ public class PhaseTwoRoutingCandidateTests
                     RouteCode = demandRouteCode, PathId = demandPathId,
                     // B-005「Resource」上下文载体（P1-11 软偏好；仅进次级，不 Hard Lock）。
                     PreferredResourceCode = preferredResourceCode,
+                    // R-5（0号位 2026-10-13 回复第 5 条）：**非空 DemandGoal 的端到端实际行为**须实测。
+                    //   P-006 两值：CUSTOMER_COMMITMENT（反向/交期驱动） / INVENTORY_REPLENISHMENT（正向）。
+                    DemandGoal = demandGoal,
                     // 0号位 2026-10-07 (5).md P0-05：连续份额输入完整性 Fail Closed 的反证锁用。
                     IsContinuation = isContinuation,
                     ContinuationKey = continuationKey,
@@ -465,7 +469,7 @@ public class PhaseTwoRoutingCandidateTests
     // 整改要点：**撤销**「`AUTO` 与 `MIXED` 行为等价」（0号位 2026-10-07 Q-1 的旧口径已被明判
     //   「不能再作为最终 V1 实现」）。`AUTO` 现由 `SchedulingDirectionResolver` 按 Demand / Execution Batch
     //   **自身上下文**（RequiredAvailableTime/Slack、Material、Resource、Execution、Firm-Frozen-Lock；
-    //   DemandGoal 载体缺失则登记缺口）正式裁决为 FORWARD / BACKWARD / MIXED 之一。
+    //   DemandGoal 取值缺失则登记缺口）正式裁决为 FORWARD / BACKWARD / MIXED 之一。
     //
     // 断言方式（行为层；**对 Phase5 压缩免疫**）：`AUTO` 的结果必须**逐字段等于**
     //   「把自决方向显式传入」的结果；且同一夹具**只改一处上下文**时结果必须随之变化
@@ -525,6 +529,45 @@ public class PhaseTwoRoutingCandidateTests
 
         Assert.True(auto.Success, auto.ErrorMessage);
         AssertSameSchedule(forward, auto);
+    }
+
+    /// <summary>
+    /// ⑧-DG **R-5 非空 `DemandGoal` 的端到端实际行为**（0号位 2026-10-13《冻结候选包覆盖核查与残留缺口
+    ///   ——0号位回复》**第 5 条**：「应提供完整 Commit 文件清单、测试记录，并**验证 DemandGoal 非空情况下的
+    ///   实际行为**；**单测通过不等于端到端验收通过**」）。
+    ///
+    /// 夹具 = ⑧-① 的**无上下文**场景（`due = +3h`、lead = 120min ⇒ Slack 落在工艺周期内 ⇒
+    ///   `NO_CONTEXT_SIGNAL` ⇒ 默认 BACKWARD）。只改 `DemandGoal` 一个上下文：
+    ///     · `null`                    ⇒ 无信号 ⇒ **BACKWARD**（既有默认）
+    ///     · `INVENTORY_REPLENISHMENT`（P-006 **正向**信号）⇒ 唯一信号 ⇒ **FORWARD**
+    ///     · `CUSTOMER_COMMITMENT`（P-006 **反向**信号）⇒ 唯一信号 ⇒ **BACKWARD**
+    ///
+    /// 断言：① AUTO + 库存补充 == 显式 FORWARD；② AUTO + 客户承诺 == 显式 BACKWARD；
+    ///       ③ 且 `none ≠ inventory`（**非空 DemandGoal 确实改变了排程几何** —— 排除「接了线但没喂进判据」）；
+    ///       ④ 且 `forward ≠ backward`（夹具本身**能**区分两方向 ⇒ ①② 非恒真）。
+    /// </summary>
+    [Fact]
+    public async Task AUTO_DemandGoal非空_端到端确实改变方向()
+    {
+        var paths = new[] { new PathSpec("RTA", 1, 1, PlanningStart, PlanningEnd) };
+        var due = PlanningStart.AddHours(3);   // Slack 落在工艺周期内 ⇒ 无交期信号
+
+        var none = await _solver.SolveAsync(Build(paths, direction: "AUTO", due: due));
+        var inventory = await _solver.SolveAsync(Build(paths, direction: "AUTO", due: due,
+            demandGoal: "INVENTORY_REPLENISHMENT"));
+        var commitment = await _solver.SolveAsync(Build(paths, direction: "AUTO", due: due,
+            demandGoal: "CUSTOMER_COMMITMENT"));
+        var forward = await _solver.SolveAsync(Build(paths, direction: "FORWARD", due: due));
+        var backward = await _solver.SolveAsync(Build(paths, direction: "BACKWARD", due: due));
+
+        Assert.True(none.Success, none.ErrorMessage);
+        Assert.True(inventory.Success, inventory.ErrorMessage);
+        Assert.True(commitment.Success, commitment.ErrorMessage);
+
+        AssertSameSchedule(forward, inventory);     // ① 库存补充 ⇒ 正排
+        AssertSameSchedule(backward, commitment);   // ② 客户承诺 ⇒ 倒排
+        Assert.NotEqual(Signature(none), Signature(inventory));      // ③ 非空值确实改变结果
+        Assert.NotEqual(Signature(forward), Signature(backward));    // ④ 夹具能区分 ⇒ ①② 非恒真
     }
 
     /// <summary>
@@ -772,7 +815,7 @@ public class PhaseTwoRoutingCandidateTests
     /// ⑩ P1-02 反证（复审 §二）：**DemandGoal 缺失的缺口必须真正进入生产诊断出口**。
     ///   复审判词：「`DEMAND_GOAL_ABSENT` 只加到 `Decision.Signals`，未写入 `SolveTraceNotes`」
     ///   ⇒ 开发报告「生产路径恒记缺口」的说法只对内部对象成立，**不等于**用户/日志可见证据。
-    ///   整改：AUTO 自决时若缺 DemandGoal 载体 ⇒ 经**既有合法追溯通道** `DomainSolveResult.SolveTraceNotes`
+    ///   整改：AUTO 自决时若缺 DemandGoal **取值** ⇒ 经**既有合法追溯通道** `DomainSolveResult.SolveTraceNotes`
     ///   写出一条 `ReasonCode = DEMAND_GOAL_ABSENT` 的记录（**未自造** ReasonCode 枚举）。
     ///
     /// 反向对照：**显式**方向（BACKWARD）不经过 B-005 自决 ⇒ **不得**产出该 trace

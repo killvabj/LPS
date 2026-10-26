@@ -126,7 +126,7 @@ public class PeggingSupplyAllocationRepository : IPeggingSupplyAllocationReposit
         CancellationToken cancellationToken = default)
     {
         // v5.1.2: IsConsumed字段已移除，此方法暂时保留但不执行
-        return 0;
+        return await Task.FromResult(0);
     }
 
     public async Task<int> DeleteByPlanVersionIdAsync(

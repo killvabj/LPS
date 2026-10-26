@@ -1,6 +1,7 @@
 using System.Data;
 using Dapper;
 using ParameterSetVersion = LPS.APS.Core.Entities.APS.ParameterSetVersion;
+using LPS.APS.Core.DTOs.Governance;
 using LPS.APS.Core.Interfaces;
 using LPS.APS.Engine.Data;
 using Microsoft.Extensions.Logging;
@@ -47,16 +48,89 @@ public class ParameterSetVersionRepository : IParameterSetVersionRepository
         return results.ToList();
     }
 
+    /// <inheritdoc />
+    public async Task<IReadOnlyList<ParameterSetVersionSummaryDto>> GetSummariesByParameterSetIdAsync(long parameterSetId, CancellationToken ct = default)
+    {
+        // 2026-10-15 4号位 来文：列表端点原 SELECT * 整列搬 ContentSnapshotJson 大 LOB（PSV 1305 稳定 37s）。
+        // 显式列仅取摘要字段（冻结 DDL v5.1.8.3 已确认列；ContentSnapshotJson/五主题 JSON/Remarks 为方案 A 实表新增列
+        // 或代码实体独有，列表不消费故不取——避免大 LOB 搬运与列存在性耦合）。
+        const string sql = @"
+            SELECT [Id], [ParameterSetId], [VersionCode], [Status], [IsDefault],
+                   [EffectiveFrom], [EffectiveTo], [PublishedAt], [PublishedBy],
+                   [ApprovedAt], [ApprovedBy], [CreatedAt], [CreatedBy]
+            FROM [dbo].[ParameterSetVersion]
+            WHERE [ParameterSetId] = @ParameterSetId
+            ORDER BY [VersionCode]";
+
+        var results = await _connectionManager.QueryAsync<ParameterSetVersionSummaryDto>(
+            sql, new { ParameterSetId = parameterSetId }, db: DatabaseId.APS);
+
+        return results.ToList();
+    }
+
+    /// <inheritdoc />
+    public async Task<ParameterSetVersion?> GetDetailByIdAsync(long id, CancellationToken ct = default)
+    {
+        // 方案 A 落点（2026-10-16）：详情端点原 SELECT * 整列搬 ContentSnapshotJson 大 LOB（PSV 1305 ≈ 2.15 亿字符 → 39s）。
+        // 治理显式列同摘要方法（冻结 DDL v5.1.8.3 已确认列）；五主题经 OPENJSON 单次解析顶级键按块提取原始 JSON 文本，
+        // ContentSnapshotJson 不读回应用层；损坏/空快照（ISJSON=0 或 NULL）按块返回 null（与 ExtractBlockJson 容错等价）。
+        const string sql = @"
+            SELECT ps.[Id], ps.[ParameterSetId], ps.[VersionCode], ps.[Status], ps.[IsDefault],
+                   ps.[EffectiveFrom], ps.[EffectiveTo], ps.[PublishedAt], ps.[PublishedBy],
+                   ps.[ApprovedAt], ps.[ApprovedBy], ps.[CreatedAt], ps.[CreatedBy],
+                   MAX(CASE WHEN j.[key] = N'Lock' THEN j.[value] END) AS [LockJson],
+                   MAX(CASE WHEN j.[key] = N'Supply' THEN j.[value] END) AS [SupplyJson],
+                   MAX(CASE WHEN j.[key] = N'Procurement' THEN j.[value] END) AS [ProcurementJson],
+                   MAX(CASE WHEN j.[key] = N'SolverStrategy' THEN j.[value] END) AS [SolverStrategyJson],
+                   MAX(CASE WHEN j.[key] = N'CandidateGuardrail' THEN j.[value] END) AS [CandidateGuardrailJson]
+            FROM [dbo].[ParameterSetVersion] ps
+            OUTER APPLY OPENJSON(CASE WHEN ISJSON(ps.[ContentSnapshotJson]) = 1 THEN ps.[ContentSnapshotJson] END) AS j
+            WHERE ps.[Id] = @Id
+            GROUP BY ps.[Id], ps.[ParameterSetId], ps.[VersionCode], ps.[Status], ps.[IsDefault],
+                     ps.[EffectiveFrom], ps.[EffectiveTo], ps.[PublishedAt], ps.[PublishedBy],
+                     ps.[ApprovedAt], ps.[ApprovedBy], ps.[CreatedAt], ps.[CreatedBy]";
+
+        return await _connectionManager.QueryFirstOrDefaultAsync<ParameterSetVersion>(
+            sql, new { Id = id }, db: DatabaseId.APS);
+    }
+
+    /// <inheritdoc />
+    public async Task<IReadOnlyList<ParameterSetVersion>> GetDetailByParameterSetIdAsync(long parameterSetId, CancellationToken ct = default)
+    {
+        // published-version 读路径（方案 A 落点）：语义同 GetDetailByIdAsync，返回列表供 SelectCurrentPublished 0/1/多三态判定。
+        const string sql = @"
+            SELECT ps.[Id], ps.[ParameterSetId], ps.[VersionCode], ps.[Status], ps.[IsDefault],
+                   ps.[EffectiveFrom], ps.[EffectiveTo], ps.[PublishedAt], ps.[PublishedBy],
+                   ps.[ApprovedAt], ps.[ApprovedBy], ps.[CreatedAt], ps.[CreatedBy],
+                   MAX(CASE WHEN j.[key] = N'Lock' THEN j.[value] END) AS [LockJson],
+                   MAX(CASE WHEN j.[key] = N'Supply' THEN j.[value] END) AS [SupplyJson],
+                   MAX(CASE WHEN j.[key] = N'Procurement' THEN j.[value] END) AS [ProcurementJson],
+                   MAX(CASE WHEN j.[key] = N'SolverStrategy' THEN j.[value] END) AS [SolverStrategyJson],
+                   MAX(CASE WHEN j.[key] = N'CandidateGuardrail' THEN j.[value] END) AS [CandidateGuardrailJson]
+            FROM [dbo].[ParameterSetVersion] ps
+            OUTER APPLY OPENJSON(CASE WHEN ISJSON(ps.[ContentSnapshotJson]) = 1 THEN ps.[ContentSnapshotJson] END) AS j
+            WHERE ps.[ParameterSetId] = @ParameterSetId
+            GROUP BY ps.[Id], ps.[ParameterSetId], ps.[VersionCode], ps.[Status], ps.[IsDefault],
+                     ps.[EffectiveFrom], ps.[EffectiveTo], ps.[PublishedAt], ps.[PublishedBy],
+                     ps.[ApprovedAt], ps.[ApprovedBy], ps.[CreatedAt], ps.[CreatedBy]
+            ORDER BY ps.[VersionCode]";
+
+        var results = await _connectionManager.QueryAsync<ParameterSetVersion>(
+            sql, new { ParameterSetId = parameterSetId }, db: DatabaseId.APS);
+
+        return results.ToList();
+    }
+
     public async Task<ParameterSetVersion> AddAsync(ParameterSetVersion version, CancellationToken ct = default)
     {
         const string sql = @"
             INSERT INTO [dbo].[ParameterSetVersion]
-                ([ParameterSetId], [VersionCode], [Status], [ContentSnapshotJson],
+                ([ParameterSetId], [VersionCode], [Status], [IsDefault], [ContentSnapshotJson],
                  [EffectiveFrom], [EffectiveTo],
                  [PublishedAt], [PublishedBy], [ApprovedAt], [ApprovedBy],
                  [CreatedAt], [CreatedBy])
             VALUES
-                (@ParameterSetId, @VersionCode, @Status, @ContentSnapshotJson,
+                (@ParameterSetId, @VersionCode, @Status, @IsDefault, @ContentSnapshotJson,
                  @EffectiveFrom, @EffectiveTo,
                  @PublishedAt, @PublishedBy, @ApprovedAt, @ApprovedBy,
                  @CreatedAt, @CreatedBy);
@@ -75,6 +149,7 @@ public class ParameterSetVersionRepository : IParameterSetVersionRepository
             UPDATE [dbo].[ParameterSetVersion]
             SET [VersionCode] = @VersionCode,
                 [Status] = @Status,
+                [IsDefault] = @IsDefault,
                 [ContentSnapshotJson] = @ContentSnapshotJson,
                 [EffectiveFrom] = @EffectiveFrom,
                 [EffectiveTo] = @EffectiveTo,
@@ -85,5 +160,52 @@ public class ParameterSetVersionRepository : IParameterSetVersionRepository
             WHERE [Id] = @Id";
 
         await _connectionManager.ExecuteAsync(sql, version, db: DatabaseId.APS);
+    }
+
+    /// <inheritdoc />
+    public async Task SetDefaultAsync(long parameterSetId, long versionId, CancellationToken ct = default)
+    {
+        // D-3 原子默认切换（2026-10-17）：单事务内「清同族其它 IsDefault=1」+「置目标 IsDefault=1」，
+        // 修正 SPV 现 ClearDefaultFlagAsync + UpdateAsync 两条独立 SQL 的非原子缺陷（崩溃/并发下可能同族双默认）。
+        // 事务内直接用传入连接与事务执行，不在事务中再经 GetConnectionAsync 取连接（DatabaseConnectionManager 死锁警告）。
+        await _connectionManager.ExecuteInTransactionAsync(
+            async (connection, transaction) =>
+            {
+                const string clearSql = @"
+                    UPDATE [dbo].[ParameterSetVersion]
+                    SET [IsDefault] = 0
+                    WHERE [ParameterSetId] = @ParameterSetId
+                      AND [Id] <> @VersionId
+                      AND [IsDefault] = 1";
+                const string setSql = @"
+                    UPDATE [dbo].[ParameterSetVersion]
+                    SET [IsDefault] = 1
+                    WHERE [Id] = @VersionId";
+
+                await connection.ExecuteAsync(clearSql, new { ParameterSetId = parameterSetId, VersionId = versionId }, transaction);
+                await connection.ExecuteAsync(setSql, new { VersionId = versionId }, transaction);
+                return 0;
+            },
+            DatabaseId.APS);
+    }
+
+    /// <inheritdoc />
+    public async Task<IReadOnlyList<ParameterSetVersion>> GetDefaultCandidatesAsync(long parameterSetId, CancellationToken ct = default)
+    {
+        // D-3 读侧默认解析（2026-10-17）：同族 ParameterSetId=1 且 PUBLISHED 候选全集（不 TOP 1），
+        // Application 层结合生效窗过滤后判定 0/1/多（多→歧义）。显式列排除大 LOB 避免搬运。
+        const string sql = @"
+            SELECT [Id], [ParameterSetId], [VersionCode], [Status], [IsDefault],
+                   [EffectiveFrom], [EffectiveTo], [PublishedAt], [PublishedBy],
+                   [ApprovedAt], [ApprovedBy], [CreatedAt], [CreatedBy]
+            FROM [dbo].[ParameterSetVersion]
+            WHERE [ParameterSetId] = @ParameterSetId
+              AND [IsDefault] = 1
+              AND [Status] = 'PUBLISHED'";
+
+        var results = await _connectionManager.QueryAsync<ParameterSetVersion>(
+            sql, new { ParameterSetId = parameterSetId }, db: DatabaseId.APS);
+
+        return results.ToList();
     }
 }

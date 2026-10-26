@@ -67,6 +67,32 @@ public class PeggingExecutionRequest
     public IReadOnlyList<ResourceBlock>? UpstreamResourceBlocks { get; set; }
 
     /// <summary>
+    /// Run 级跨 Domain 物理供给消耗账本（R03-02 跨域守恒）。
+    /// Key = <c>SupplyLedgerEntry.PhysicalSourceKey</c>；Value = 已被**前序成功 Domain** 合法消耗的累计量。
+    /// 编排层逐 Domain 串行时持有、透传；本 Domain 入池时按此账本扣减可用量（不重复计入同一批物理供给）。
+    /// 语义约束：FULL 模式下前序 Domain 的占用不得被后域释放；本账本只在内存中存在，**不落库**、
+    /// 不写 <c>InventoryBalance.AllocatedQty</c>（R03-02 明文禁止运行期永久回写）。
+    /// Candidate 模式为 null（Candidate 的外部占用走 <see cref="ExternalDomainResourceBlocks"/>，不在此扣减）。
+    /// </summary>
+    public IDictionary<string, decimal>? UpstreamPhysicalConsumption { get; set; }
+
+    /// <summary>
+    /// Candidate 专用：**其它 Domain 当前 ACTIVE 计划版本已在库存上占用的总量**（R03-02 跨域守恒的跨 Run 侧）。
+    /// Key = <c>(物料, 供给工厂, 供给类型)</c> 聚合键（见 <c>PeggingOrchestrator.BuildAggregateConsumptionKey</c>）；
+    /// Value = 已被其它 ACTIVE 域累计占用的量。本 Domain 入池时在同键各批之间**顺着扣、扣完为止**。
+    ///
+    /// 为什么是聚合键、不是 <see cref="UpstreamPhysicalConsumption"/> 那种物理键：
+    ///   物理键（来源系统 + ERP/MES 主档号 + 仓码 + 厂）**只存在于内存**，`PeggingSupplyAllocation`
+    ///   没有该列、库存行的 `SupplyWarehouseCode`/`SupplyDocumentNo` 实测全为空、`SupplySourceId`
+    ///   跨批会变 ⇒ 跨 Run 无法把「别的域吃了哪一批」回连出来。
+    ///   取舍：**总量守恒成立**（候选不会看见已被别的域吃掉的量），批次归属不精确。
+    ///
+    /// 只装 <c>INVENTORY</c>：库存各批可用时间同为「立即可用」，聚合扣减不改可行性；
+    /// 采购/在途供给的可用时间逐批不同，按聚合键扣会把 A 批的占用挪到 B 批的时点上，故不纳入。
+    /// </summary>
+    public IDictionary<string, decimal>? UpstreamAggregateConsumption { get; set; }
+
+    /// <summary>
     /// 是否强制重新 Pegging（忽略冻结区）
     /// </summary>
     public bool ForceRePegging { get; set; }

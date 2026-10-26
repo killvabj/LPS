@@ -52,7 +52,8 @@ WHERE PlanVersionId = @PlanVersionId
     AND (@Severity IS NULL OR Severity = @Severity)
 ORDER BY
     CASE Severity WHEN 'ERROR' THEN 1 WHEN 'WARN' THEN 2 ELSE 3 END,
-    ImpactHours DESC
+    ImpactHours DESC,
+    Id   -- tiebreaker：分页确定性（全链清扫）
 OFFSET @Skip ROWS FETCH NEXT @Take ROWS ONLY";
 
         var parameters = new

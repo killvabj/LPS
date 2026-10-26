@@ -1,5 +1,6 @@
 using System.Data;
 using Dapper;
+using LPS.APS.Core.DTOs.Governance;
 using LPS.APS.Core.Entities.APS;
 using LPS.APS.Core.Interfaces;
 using LPS.APS.Engine.Data;
@@ -43,6 +44,29 @@ public class StrategyProfileVersionRepository : IStrategyProfileVersionRepositor
             ORDER BY [VersionCode]";
 
         var results = await _connectionManager.QueryAsync<StrategyProfileVersion>(
+            sql, new { StrategyProfileId = strategyProfileId }, db: DatabaseId.APS);
+
+        return results.ToList();
+    }
+
+    public async Task<IReadOnlyList<StrategyProfileVersionListItem>> GetByStrategyProfileIdWithCodesAsync(long strategyProfileId, CancellationToken ct = default)
+    {
+        // 4号位 2026-10-14 审计 R2/R3：LEFT JOIN RuleSetVersion/ParameterSetVersion 带出版本编码与父级主表 Id。
+        // LEFT JOIN 而非 INNER：版本可能引用已停用/被删的版本行（悬空引用不致命时列表仍应可见）。
+        const string sql = @"
+            SELECT v.[Id], v.[StrategyProfileId], v.[VersionCode], v.[RuleSetVersionId], v.[ParameterSetVersionId],
+                   rsv.[VersionCode] AS [RuleSetVersionCode], rsv.[RuleSetId] AS [RuleSetId],
+                   psv.[VersionCode] AS [ParameterSetVersionCode], psv.[ParameterSetId] AS [ParameterSetId],
+                   v.[Status], v.[EffectiveFrom], v.[EffectiveTo], v.[IsDefault],
+                   v.[PublishedAt], v.[PublishedBy], v.[ApprovedAt], v.[ApprovedBy],
+                   v.[CreatedAt], v.[CreatedBy]
+            FROM [dbo].[StrategyProfileVersion] v
+            LEFT JOIN [dbo].[RuleSetVersion] rsv ON rsv.[Id] = v.[RuleSetVersionId]
+            LEFT JOIN [dbo].[ParameterSetVersion] psv ON psv.[Id] = v.[ParameterSetVersionId]
+            WHERE v.[StrategyProfileId] = @StrategyProfileId
+            ORDER BY v.[VersionCode]";
+
+        var results = await _connectionManager.QueryAsync<StrategyProfileVersionListItem>(
             sql, new { StrategyProfileId = strategyProfileId }, db: DatabaseId.APS);
 
         return results.ToList();
@@ -120,6 +144,35 @@ public class StrategyProfileVersionRepository : IStrategyProfileVersionRepositor
         return results.ToList();
     }
 
+    /// <inheritdoc />
+    public async Task<IReadOnlyList<StrategyProfileVersion>> GetReferencingPublishedVersionsAsync(
+        long? referencedRuleSetVersionId,
+        long? referencedParameterSetVersionId,
+        CancellationToken ct = default)
+    {
+        // C-5/D-2：反查引用被停用版本、且仍具合法可新Run资格的已发布策略包版本（父 Profile IsActive=1）。
+        // 生效窗口过滤由 Application 层完成；本条仅过滤 PUBLISHED + 父 IsActive（镜像 GetDefaultByRunTypeAsync 判定）。
+        const string sql = @"
+            SELECT v.*
+            FROM [dbo].[StrategyProfileVersion] v
+            JOIN [dbo].[StrategyProfile] p ON p.Id = v.StrategyProfileId
+            WHERE v.[Status] = 'PUBLISHED'
+              AND p.[IsActive] = 1
+              AND (   (@ReferencedRuleSetVersionId IS NOT NULL AND v.[RuleSetVersionId] = @ReferencedRuleSetVersionId)
+                   OR (@ReferencedParameterSetVersionId IS NOT NULL AND v.[ParameterSetVersionId] = @ReferencedParameterSetVersionId))";
+
+        var results = await _connectionManager.QueryAsync<StrategyProfileVersion>(
+            sql,
+            new
+            {
+                ReferencedRuleSetVersionId = referencedRuleSetVersionId,
+                ReferencedParameterSetVersionId = referencedParameterSetVersionId
+            },
+            db: DatabaseId.APS);
+
+        return results.ToList();
+    }
+
     public async Task ClearDefaultFlagAsync(long strategyProfileId, long exceptVersionId, CancellationToken ct = default)
     {
         const string sql = @"
@@ -133,5 +186,39 @@ public class StrategyProfileVersionRepository : IStrategyProfileVersionRepositor
             sql,
             new { StrategyProfileId = strategyProfileId, ExceptVersionId = exceptVersionId },
             db: DatabaseId.APS);
+    }
+
+    /// <inheritdoc />
+    public async Task<int> CountReferencingRuleSetVersionAsync(IReadOnlyList<long> ruleSetVersionIds, CancellationToken ct = default)
+    {
+        // R1 2026-10-25：删除 FK 防护，不区分状态（硬删会连带 FK 违约，任何引用都阻断）。
+        if (ruleSetVersionIds == null || ruleSetVersionIds.Count == 0)
+        {
+            return 0;
+        }
+
+        const string sql = @"
+            SELECT COUNT(1) FROM [dbo].[StrategyProfileVersion]
+            WHERE [RuleSetVersionId] IN @Ids";
+
+        return await _connectionManager.QueryFirstOrDefaultAsync<int>(
+            sql, new { Ids = ruleSetVersionIds.ToArray() }, db: DatabaseId.APS);
+    }
+
+    /// <inheritdoc />
+    public async Task<int> CountReferencingParameterSetVersionAsync(IReadOnlyList<long> parameterSetVersionIds, CancellationToken ct = default)
+    {
+        // 2026-10-26 同 R1 口径：参数集删除 FK 防护，不区分状态（硬删会连带 FK 违约，任何引用都阻断）。
+        if (parameterSetVersionIds == null || parameterSetVersionIds.Count == 0)
+        {
+            return 0;
+        }
+
+        const string sql = @"
+            SELECT COUNT(1) FROM [dbo].[StrategyProfileVersion]
+            WHERE [ParameterSetVersionId] IN @Ids";
+
+        return await _connectionManager.QueryFirstOrDefaultAsync<int>(
+            sql, new { Ids = parameterSetVersionIds.ToArray() }, db: DatabaseId.APS);
     }
 }

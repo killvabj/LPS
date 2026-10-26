@@ -58,4 +58,13 @@ public interface IScheduleRunRepository
         long strategyProfileVersionId,
         string triggeredBy,
         CancellationToken ct = default);
+
+    /// <summary>
+    /// 策略包删除 FK 防护（2026-10-26 同 R1 口径）：统计引用任一给定 StrategyProfileVersionId 的 ScheduleRun（运行）行数
+    /// （ScheduleRun.StrategyProfileVersionId FK；**不区分状态**——物理删除该策略包版本会连带 FK 违约，
+    /// 故任何运行引用都应阻断删除）。返回 0=可安全删，&gt;0=被引用须拒绝。传入空列表返回 0。Dapper `IN @Ids` 多值。
+    /// </summary>
+    Task<int> CountReferencingStrategyProfileVersionAsync(
+        IReadOnlyList<long> strategyProfileVersionIds,
+        CancellationToken ct = default);
 }

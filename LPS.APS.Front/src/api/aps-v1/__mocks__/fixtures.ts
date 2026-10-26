@@ -12,14 +12,11 @@ import type {
   GanttDataDto,
   GanttResourceDto,
   GanttTaskDto,
-  OrderBasicInfo,
-  OrderScheduleDetailDto,
-  PlanOverviewDto,
   PlanVersionSummaryDto,
   ScheduleSummaryDto
 } from '../types'
-import type { DomainKey, OrderSummaryStatus, TaskStatus } from '../types'
-import { ORDER_SUMMARY_STATUSES, TASK_STATUSES } from '../types'
+import type { TaskStatus } from '../types'
+import { TASK_STATUSES } from '../types'
 
 /* ========== 时间工具 ========== */
 const now = new Date()
@@ -144,19 +141,43 @@ const pickStatus = (seed: number): TaskStatus => TASK_STATUSES[seed % TASK_STATU
 const TASKS: GanttTaskDto[] = (() => {
   const list: GanttTaskDto[] = []
   const orders = [
-    { orderNo: 'ORD-2026-0001', material: '电机壳体-A', orderId: 101 },
-    { orderNo: 'ORD-2026-0002', material: '机柜上盖-B', orderId: 102 },
-    { orderNo: 'ORD-2026-0003', material: '控制箱-C', orderId: 103 },
-    { orderNo: 'ORD-2026-0004', material: '标准泵-D', orderId: 104 },
-    { orderNo: 'ORD-2026-0005', material: '包装套件-E', orderId: 105 },
-    { orderNo: 'ORD-2026-0006', material: '机架焊接件-F', orderId: 106 }
+    {
+      orderNo: 'ORD-2026-0001',
+      material: '电机壳体-A / 铝合金ADC12 / 6.5kg / 静电喷涂黑',
+      orderId: 101
+    },
+    {
+      orderNo: 'ORD-2026-0002',
+      material: '机柜上盖-B / 镀锌钢板1.2mm / 600×400mm / 折弯成型',
+      orderId: 102
+    },
+    {
+      orderNo: 'ORD-2026-0003',
+      material: '控制箱-C / 钢结构壳体 / 0.8mm冷板 / 喷塑RAL7035',
+      orderId: 103
+    },
+    {
+      orderNo: 'ORD-2026-0004',
+      material: '标准泵-D / 铸铁HT200 / DN80 / 法兰连接',
+      orderId: 104
+    },
+    {
+      orderNo: 'ORD-2026-0005',
+      material: '包装套件-E / 蜂窝纸板+PE膜 / 850×600×400 / VCI防锈',
+      orderId: 105
+    },
+    {
+      orderNo: 'ORD-2026-0006',
+      material: '机架焊接件-F / Q235B型材 / 1200×800×1800 / 二保焊',
+      orderId: 106
+    }
   ]
   const operations = [
-    { code: 'OP10', seq: 10, name: '切割' },
-    { code: 'OP20', seq: 20, name: '焊接' },
-    { code: 'OP30', seq: 30, name: '喷涂' },
-    { code: 'OP40', seq: 40, name: '装配' },
-    { code: 'OP50', seq: 50, name: '测试' }
+    { code: 'OP10', seq: 10, name: '切割下料' },
+    { code: 'OP20', seq: 20, name: '焊接成型' },
+    { code: 'OP30', seq: 30, name: '表面处理' },
+    { code: 'OP40', seq: 40, name: '总装调试' },
+    { code: 'OP50', seq: 50, name: '出厂测试' }
   ]
   let taskId = 1000
   for (let i = 0; i < 60; i++) {
@@ -166,7 +187,21 @@ const TASKS: GanttTaskDto[] = (() => {
     const startDays = (i % 14) - 3 // -3 ~ 10
     const status = pickStatus(i)
     const plannedStart = dayOffset(startDays, 8 + (i % 8))
-    const plannedEnd = dayOffset(startDays, 8 + (i % 8) + 4)
+    // 时长多样化：4h ~ 32h，按 i 分段（OP10 切割 4-8h / OP20 焊接 8-16h / OP30 喷涂 6-12h
+    //   / OP40 总装 10-20h / OP50 测试 4-8h；少量跨日 24-32h）
+    const opDurations: Record<string, number[]> = {
+      OP10: [4, 6, 8, 4, 6],
+      OP20: [10, 12, 14, 16, 8],
+      OP30: [6, 8, 10, 12, 6],
+      OP40: [12, 16, 20, 14, 10],
+      OP50: [4, 6, 8, 6, 4]
+    }
+    const opDur = opDurations[op.code] ?? [4, 6, 8]
+    let durationH = opDur[i % opDur.length]
+    // 偶发跨日长 Task（i%11===2 → 24-32h，跨 2-3 天；让甘特条更长更好看）
+    if (i % 11 === 2) durationH = 24 + (i % 3) * 4 // 24/28/32
+    const plannedEndHours = 8 + (i % 8) + durationH
+    const plannedEnd = dayOffset(startDays + Math.floor(plannedEndHours / 24), plannedEndHours % 24)
     const isDelayed = i % 7 === 0 // 与下方根因类型选择器 i % 5 解耦，确保 5 类根因都能展开
 
     // U05：净需求 + 计划加工（含良率补偿）
@@ -207,8 +242,13 @@ const TASKS: GanttTaskDto[] = (() => {
       const seg1Qty = Math.ceil(plannedProcessQty * 0.6)
       const seg2Qty = plannedProcessQty - seg1Qty
       const seg1Start = plannedStart
-      const seg1End = dayOffset(startDays, 8 + (i % 8) + 2)
-      const seg2Start = dayOffset(startDays + 2, 10)
+      // 段 1 占用 60% 时长（向上取整），段 2 补剩余 40%
+      const seg1Hours = Math.ceil(durationH * 0.6)
+      const seg1End = dayOffset(
+        startDays + Math.floor((8 + (i % 8) + seg1Hours) / 24),
+        (8 + (i % 8) + seg1Hours) % 24
+      )
+      const seg2Start = seg1End
       const seg2End = plannedEnd
       taskSegments = [
         {
@@ -249,7 +289,7 @@ const TASKS: GanttTaskDto[] = (() => {
     let upstreamStageCode: string | undefined
     if (crossDomainBlocked) {
       delayReasons.push({
-        reasonCode: 'CROSS_DOMAIN_BLOCK',
+        reasonCode: 'CROSS_DOMAIN_VERSION_MISMATCH_RISK',
         issueCategory: 'SCHEDULING_ISSUE',
         severity: 'ERROR',
         description: '外 Domain 共享设备占用，本 Domain 任务无法按时开工',
@@ -260,18 +300,18 @@ const TASKS: GanttTaskDto[] = (() => {
     if (isDelayed) {
       if (i % 5 === 0) {
         delayReasons.push({
-          reasonCode: 'CAPACITY_SHORTAGE',
+          reasonCode: 'RESOURCE_CAPACITY_WAIT',
           issueCategory: 'SCHEDULING_ISSUE',
-          severity: 'WARNING',
+          severity: 'WARN',
           description: `设备 ${resource.resourceCode} 产能不足，无法在本时段内完工`,
           relatedObjectRef: resource.resourceCode,
           impactHours: 4
         })
       } else if (i % 5 === 1) {
         delayReasons.push({
-          reasonCode: 'MATERIAL_AVAILABILITY',
+          reasonCode: 'MATERIAL_SHORTAGE',
           issueCategory: 'DATA_ISSUE',
-          severity: 'WARNING',
+          severity: 'WARN',
           description: `PO-${String(1000 + i).padStart(4, '0')} 物料预计 ${dayOffset(
             startDays + 3,
             14
@@ -285,16 +325,16 @@ const TASKS: GanttTaskDto[] = (() => {
         upstreamStageBlocked = true
         upstreamStageCode = 'STG-AS'
         delayReasons.push({
-          reasonCode: 'UPSTREAM_DELAY',
+          reasonCode: 'PRECEDENCE_WAIT',
           issueCategory: 'SCHEDULING_ISSUE',
-          severity: 'WARNING',
+          severity: 'WARN',
           description: `上游 ${upstreamStageCode} 完成晚，预计延误 6h 后才能开始本工序`,
           relatedObjectRef: upstreamStageCode,
           impactHours: 6
         })
       } else if (i % 5 === 3) {
         delayReasons.push({
-          reasonCode: 'LOCK_BLOCKING',
+          reasonCode: 'FROZEN_ZONE_LOCK',
           issueCategory: 'SCHEDULING_ISSUE',
           severity: 'INFO',
           description: '关键窗口已被 Firm/FROZEN 任务占用，本任务只能后置',
@@ -303,7 +343,7 @@ const TASKS: GanttTaskDto[] = (() => {
         })
       } else {
         delayReasons.push({
-          reasonCode: 'EQUIPMENT_FAILURE',
+          reasonCode: 'EQUIPMENT_BREAKDOWN_RISK',
           issueCategory: 'DATA_ISSUE',
           severity: 'ERROR',
           description: `${resource.resourceCode} 在本时段发生设备故障，预计 ${dayOffset(
@@ -432,7 +472,9 @@ export const mockSummary = (planVersionId: number): ScheduleSummaryDto => {
     delayedOrders: Math.round(delayed / 5),
     firstTaskStart: TASKS[0]?.plannedStartTime,
     lastTaskEnd: TASKS[TASKS.length - 1]?.plannedEndTime,
-    computeDurationSeconds: 18
+    computeDurationSeconds: 18,
+    versionExists: true,
+    scopeDenied: false
   }
 }
 
@@ -445,269 +487,11 @@ export const mockGantt = (planVersionId: number): GanttDataDto => ({
   tasks: TASKS
 })
 
-/* ========== Overview（占位） ========== */
-
-const DOMAIN_KEYS: DomainKey[] = ['FAMILY_INJECTION', 'FAMILY_ASSEMBLY', 'FAMILY_TEST']
-
-export const mockOverview: PlanOverviewDto = {
-  activeVersions: DOMAIN_KEYS.map((dk, i) => ({
-    domainKey: dk,
-    planVersionId: 1001 + i,
-    versionCode: `V-2026-001-${dk}`,
-    status: 'ACTIVE',
-    activatedAt: hourOffset(-2),
-    sourceScheduleRunId: 5001 + i,
-    planHorizonStart: dayOffset(-7),
-    planHorizonEnd: dayOffset(83)
-  })),
-  orderSummary: [
-    { status: 'ON_TIME', count: 42 },
-    { status: 'AT_RISK', count: 8 },
-    { status: 'DELAYED', count: 6 },
-    { status: 'ESTIMATED_ONLY', count: 3 },
-    { status: 'UNSCHEDULED', count: 1 }
-  ],
-  resourceSummary: RESOURCES.map((r, i) => ({
-    resourceId: r.resourceId,
-    resourceCode: r.resourceCode,
-    resourceName: r.resourceName,
-    utilization: Math.round((60 + i * 4) * 100) / 100,
-    isBottleneck: i % 3 === 0,
-    unavailableWindows: [{ from: dayOffset(3, 8), to: dayOffset(3, 12) }]
-  })),
-  domainIssues: [
-    {
-      domainKey: 'FAMILY_TEST',
-      issueType: 'PI_POSITION_ISSUE',
-      message: 'PI-2026-3320 缺 XC 数量，Stage-3 不可定位',
-      occurredAt: hourOffset(-4)
-    }
-  ],
-  estimatedOnlyOrderCount: 3,
-  pendingCandidateCount: 1
-}
-
 /* ========== Orders（页面 2 订单/需求计划） ========== */
 
 /** 订单静态维度表（mock 用，10 个物料 × 5 个客户 × 2 个工厂） */
-const ORDER_MATERIALS = [
-  { materialId: 200, code: 'M-001', name: '电机壳体-A' },
-  { materialId: 201, code: 'M-002', name: '机柜上盖-B' },
-  { materialId: 202, code: 'M-003', name: '控制箱-C' },
-  { materialId: 203, code: 'M-004', name: '标准泵-D' },
-  { materialId: 204, code: 'M-005', name: '包装套件-E' },
-  { materialId: 205, code: 'M-006', name: '机架焊接件-F' },
-  { materialId: 206, code: 'M-007', name: '电路板组件-G' },
-  { materialId: 207, code: 'M-008', name: '散热模组-H' },
-  { materialId: 208, code: 'M-009', name: '金属面板-I' },
-  { materialId: 209, code: 'M-010', name: '精密轴承-J' }
-]
-
-const ORDER_CUSTOMERS = [
-  { code: 'CUST-001', name: '示例客户-华东' },
-  { code: 'CUST-002', name: '示例客户-华南' },
-  { code: 'CUST-003', name: '示例客户-华北' },
-  { code: 'CUST-004', name: '示例客户-海外' },
-  { code: 'CUST-005', name: '示例客户-西南' }
-]
-
-const ORDER_FACTORIES = [
-  { id: 1, code: 'F-SUZ-01' },
-  { id: 2, code: 'F-CDG-02' }
-]
-
-const ORDER_FAMILIES = ['INJECTION', 'ASSEMBLY', 'TEST']
-const ORDER_PRIORITIES = ['P1', 'P2', 'P3']
-const ORDER_STATUS_DISTRIBUTION: OrderSummaryStatus[] = [
-  ...new Array(38).fill('ON_TIME'),
-  ...new Array(10).fill('AT_RISK'),
-  ...new Array(6).fill('DELAYED'),
-  ...new Array(4).fill('ESTIMATED_ONLY'),
-  ...new Array(2).fill('UNSCHEDULED')
-]
-
-/** 单个订单的详情生成器（页面 2 的 OrderScheduleDetailDto） */
-export const mockOrderDetail = (orderId: number): OrderScheduleDetailDto => {
-  const mat = ORDER_MATERIALS[orderId % ORDER_MATERIALS.length]
-  const cust = ORDER_CUSTOMERS[orderId % ORDER_CUSTOMERS.length]
-  const factory = ORDER_FACTORIES[orderId % ORDER_FACTORIES.length]
-  const family = ORDER_FAMILIES[orderId % ORDER_FAMILIES.length]
-  const priority = ORDER_PRIORITIES[orderId % ORDER_PRIORITIES.length]
-  const status = ORDER_STATUS_DISTRIBUTION[orderId % ORDER_STATUS_DISTRIBUTION.length]
-  const dueOffset = (orderId % 30) - 5 // -5 ~ 24 天
-  const orderQty = 80 + ((orderId * 17) % 320)
-  const basic: OrderBasicInfo = {
-    orderId,
-    orderNo: `ORD-2026-${String(orderId).padStart(4, '0')}`,
-    orderCanonicalId: orderId + 100000, // mock：B4 落地映射（orderId 1 → canonicalId 100001，ID 空间独立）
-    productionInstructionNo: `PI-${String(orderId).padStart(5, '0')}`,
-    mtS_InstructionNo: `MTS-${String(orderId).padStart(5, '0')}`, // mock：与 dev 实跑字段命名对齐
-    materialId: mat.materialId,
-    materialCode: mat.code,
-    materialName: mat.name,
-    customerCode: cust.code,
-    customerName: cust.name,
-    factoryId: factory.id,
-    factoryCode: factory.code,
-    productFamilyCode: family,
-    orderQty,
-    uom: 'PCS',
-    customerDueDate: dayOffset(dueOffset, 17),
-    prioritySegmentCode: priority,
-    status,
-    planVersionId: 1001,
-    planVersionStatus: 'ACTIVE',
-    domainKey: family
-  }
-  const pegging: OrderScheduleDetailDto['pegging'] = [
-    {
-      supplyType: 'INVENTORY',
-      supplyKey: `INV-${String(orderId).padStart(4, '0')}`,
-      allocatedQty: Math.round(orderQty * 0.4),
-      availableTime: dayOffset(-1, 9),
-      commitment: 'COMMITMENT',
-      confidence: 'HIGH',
-      isHardLocked: true,
-      factType: 'FACT'
-    },
-    {
-      supplyType: 'PLANNED_PRODUCTION',
-      supplyKey: `T${1000 + (orderId % 50)}`,
-      allocatedQty: Math.round(orderQty * 0.4),
-      availableTime: dayOffset(Math.max(2, dueOffset - 2), 8),
-      commitment: 'COMMITMENT',
-      confidence: 'MEDIUM',
-      isHardLocked: false,
-      factType: 'RESULT'
-    },
-    {
-      supplyType: 'PLANNING_PURCHASE_PLACEHOLDER',
-      supplyKey: `PO-${String(orderId).padStart(4, '0')}`,
-      allocatedQty: orderQty - Math.round(orderQty * 0.4) - Math.round(orderQty * 0.4),
-      availableTime: dayOffset(dueOffset + 3, 12),
-      commitment: 'NONE',
-      confidence: 'LOW',
-      isHardLocked: false,
-      factType: 'ESTIMATED'
-    }
-  ]
-  const tasks: OrderScheduleDetailDto['tasks'] = [
-    {
-      taskId: 9000 + orderId,
-      taskNo: `T${9000 + orderId}`,
-      operationCode: 'OP10',
-      operationSeq: 10,
-      stageCode: 'STG-INJ',
-      resourceId: (orderId % 7) + 1,
-      resourceCode: `MC0${(orderId % 3) + 1}`,
-      startTime: dayOffset(0, 8),
-      endTime: dayOffset(0, 17),
-      netQty: orderQty,
-      plannedProcessQty: Math.round(orderQty * 1.05),
-      uom: 'PCS',
-      status: status === 'DELAYED' ? 'IN_PROGRESS' : 'PLANNED',
-      lockMarker: orderId % 7 === 0 ? 'EXECUTION' : undefined,
-      taskShares: [{ orderId, orderNo: basic.orderNo, shareQty: orderQty }]
-    }
-  ]
-  const reasons: OrderScheduleDetailDto['reasons'] = []
-  if (status === 'DELAYED') {
-    reasons.push({
-      reasonCode: 'CAPACITY_INSUFFICIENT',
-      description: '注塑机产能不足',
-      rootCause: '下游 AS 占用了部分时段',
-      relatedObjectRef: 'MC01'
-    })
-  } else if (status === 'AT_RISK') {
-    reasons.push({
-      reasonCode: 'PURCHASE_ESTIMATED_RISK',
-      description: '部分物料依赖采购估算',
-      rootCause: '采购尚未正式承诺',
-      relatedObjectRef: `PO-${String(orderId).padStart(4, '0')}`
-    })
-  } else if (status === 'ESTIMATED_ONLY') {
-    reasons.push({
-      reasonCode: 'PURCHASE_ESTIMATED_RISK',
-      description: '仅依赖 PLANNING_PURCHASE_PLACEHOLDER',
-      rootCause: '本地无库存且未排产',
-      relatedObjectRef: `PO-${String(orderId).padStart(4, '0')}`
-    })
-  }
-  return { basic, pegging, tasks, reasons }
-}
-
-/** 订单分页 mock（按 status 过滤、按 orderNo 模糊匹配、按 PageQuery 切页） */
-export const mockOrderList = (
-  pageIndex: number,
-  pageSize: number,
-  filter?: {
-    orderNo?: string
-    productionInstructionNo?: string
-    materialCode?: string
-    customerCode?: string
-    factoryCode?: string
-    productFamilyCode?: string
-    dueDateFrom?: string
-    dueDateTo?: string
-    status?: OrderSummaryStatus
-    planVersionId?: number
-    domainKey?: string
-  }
-): { items: OrderBasicInfo[]; total: number; pageIndex: number; pageSize: number } => {
-  const all = Array.from({ length: 60 }, (_, i) => mockOrderDetail(i + 1).basic)
-  let filtered = all
-  if (filter?.orderNo) {
-    const q = filter.orderNo.toLowerCase()
-    filtered = filtered.filter((o) => o.orderNo.toLowerCase().includes(q))
-  }
-  if (filter?.productionInstructionNo) {
-    const q = filter.productionInstructionNo.toLowerCase()
-    filtered = filtered.filter((o) => o.productionInstructionNo?.toLowerCase().includes(q) ?? false)
-  }
-  if (filter?.materialCode) {
-    const q = filter.materialCode.toLowerCase()
-    filtered = filtered.filter((o) => o.materialCode.toLowerCase().includes(q))
-  }
-  if (filter?.customerCode) {
-    filtered = filtered.filter((o) => o.customerCode === filter.customerCode)
-  }
-  if (filter?.productFamilyCode) {
-    filtered = filtered.filter((o) => o.productFamilyCode === filter.productFamilyCode)
-  }
-  if (filter?.factoryCode) {
-    filtered = filtered.filter((o) => o.factoryCode === filter.factoryCode)
-  }
-  if (filter?.status) {
-    filtered = filtered.filter((o) => o.status === filter.status)
-  }
-  if (filter?.planVersionId !== undefined) {
-    filtered = filtered.filter((o) => o.planVersionId === filter.planVersionId)
-  }
-  if (filter?.domainKey) {
-    filtered = filtered.filter((o) => o.domainKey === filter.domainKey)
-  }
-  if (filter?.dueDateFrom) {
-    const fromMs = new Date(filter.dueDateFrom).getTime()
-    filtered = filtered.filter((o) => new Date(o.customerDueDate).getTime() >= fromMs)
-  }
-  if (filter?.dueDateTo) {
-    const toMs = new Date(filter.dueDateTo).getTime() + 86400000
-    filtered = filtered.filter((o) => new Date(o.customerDueDate).getTime() < toMs)
-  }
-  const start = (pageIndex - 1) * pageSize
-  return {
-    items: filtered.slice(start, start + pageSize),
-    total: filtered.length,
-    pageIndex,
-    pageSize
-  }
-}
-
-/** 订单聚合统计（顶部 KPI 用） */
-export const mockOrderSummary = (): { status: OrderSummaryStatus; count: number }[] => {
-  const all = Array.from({ length: 60 }, (_, i) => mockOrderDetail(i + 1).basic)
-  const counts = new Map<OrderSummaryStatus, number>()
-  ORDER_SUMMARY_STATUSES.forEach((s) => counts.set(s, 0))
-  all.forEach((o) => counts.set(o.status, (counts.get(o.status) ?? 0) + 1))
-  return ORDER_SUMMARY_STATUSES.map((s) => ({ status: s, count: counts.get(s) ?? 0 }))
-}
+/* 订单 mock 桩已删（2026-10-17）
+ * 原因：整块建立在一份自拟 DTO（OrderBasicInfo / OrderScheduleDetailDto / OrderSummaryStatus）上，
+ * 那三个类型与后端真实契约零重合；且工厂 `F-SUZ-01`、产品族 `INJECTION`、客户 `CUST-001` 全是编的，
+ * 与 dev 实库（`CN` / `CYL` / 中文客户名）无一命中 —— mock 分支会把假数据端上页面。
+ * 前端 mock 模式下订单页直接空态，与 candidate 页 10-16 的同类处置一致。 */

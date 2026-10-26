@@ -279,6 +279,10 @@ public class SetupWiringTests
             AllocationSequence = alloc, DemandKey = key, MaterialId = materialId, FactoryId = 1,
             StartStageCode = "STAGE1",
             NetOutputQty = 1m, PlannedProcessQty = 1m,
-            RequiredAvailableTime = Day.AddDays(20), DemandSequence = seq
+            RequiredAvailableTime = Day.AddDays(20), DemandSequence = seq,
+            // 2026-10-22：本组用例只验 Setup 追溯，**不**验数量权威分级。
+            //   显式填 NONE ⇒ `Phase5Compression` 不产 `QUANTITY_AUTHORITY_ABSENT` 汇总条
+            //   （留 null 会让 TraceNotes 多一条，把本组「恰好 N 条」的断言打偏）。
+            QuantityAuthority = QuantityAuthorityValues.None
         };
 }

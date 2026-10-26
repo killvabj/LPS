@@ -13,6 +13,7 @@
  */
 
 import type { DomainKey, IsoDate, IsoDateTime } from './common'
+import type { ReasonCode } from './explanation'
 
 /** CTP 输入（插单评估请求） */
 export interface CtpInput {
@@ -26,6 +27,12 @@ export interface CtpInput {
   customerCode?: string
   /** 业务用途标签（CTP / INSERT_IMPACT_ANALYSIS — 后端不允许激活） */
   purpose: 'CTP' | 'INSERT_IMPACT_ANALYSIS'
+  /**
+   * 事业部 / 业务域键（前端不再传，2026-09-30 撤下拉后由后端按 materialCode+factoryCode 自动 resolve）
+   *  - 后端 CtpEvaluateRequest.DomainKey 改 optional（契约登记 v1.0 §3.2）
+   *  - F-G4 业务范围校验不撤：resolve 后的 domainKey 仍走 _dataScopeService.EnsureInScopeAsync
+   *  - 多域歧义 / 无匹配 → 后端 400「无法自动确定 DomainKey」（红线 #4）
+   */
 }
 
 /** CTP 受影响订单 */
@@ -55,14 +62,20 @@ export interface CtpDomainResult {
   failureReason?: string
 }
 
-/** CTP 主要原因（根因优先，不只显示 DUE_DATE_RISK） */
+/**
+ * CTP 主要原因（根因优先，不只显示 DUE_DATE_RISK）
+ *
+ * 2026-10-19 更正：`reasonCode` 此前自拟了 **5 码**
+ * （`MATERIAL_AVAILABLE / CAPACITY_LIMIT / CROSS_DOMAIN_HANDOFF / DEMAND_PROTECTION_CONFLICT / DUE_DATE_RISK`），
+ * 与冻结 `07 v5.1.13 §八.1` 权威 15 码**只有 `DUE_DATE_RISK` 一处重合**，违反
+ * 「ReasonCode 不得同义重复创建多个原因码」。改为复用 `types/explanation.ts` 的 `ReasonCode`，
+ * 与甘特 / Explanation 页共用**唯一**一份码表。
+ *
+ * ⚠️ 未知码仍要能显示：后端若返回 15 码之外的受控扩展值，UI 一律原样展示码值
+ * （`待核对·<码>`），不得渲染成空白标签（见 `Ctp.vue` 的 `reasonLabelOf`）。
+ */
 export interface CtpReason {
-  reasonCode:
-    | 'MATERIAL_AVAILABLE'
-    | 'CAPACITY_LIMIT'
-    | 'CROSS_DOMAIN_HANDOFF'
-    | 'DEMAND_PROTECTION_CONFLICT'
-    | 'DUE_DATE_RISK'
+  reasonCode: ReasonCode
   description: string
   /** 是否 Estimated（4号位文档第 7 节：必须显示徽章） */
   isEstimated: boolean

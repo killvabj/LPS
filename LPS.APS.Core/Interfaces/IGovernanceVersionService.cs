@@ -66,6 +66,39 @@ public interface IGovernanceVersionService
     Task DisableStrategyProfileVersionAsync(long strategyProfileVersionId, string? operatedBy, int actorUserId, string? reason = null, CancellationToken ct = default);
 
     /// <summary>
+    /// 设置策略包版本为同族默认（C-7 §9.2 显式治理操作，2026-10-17）：默认标记 IsDefault 属治理元数据，
+    /// 不随 Create/Update 直写（C-7 已强制 Create IsDefault=false、Update 冻结既有值），只能经本显式操作置位。
+    /// 语义：目标版本须为 PUBLISHED（D-3「默认版本=已发布版本」定义），置位前先 ClearDefaultFlagAsync 清同 Profile
+    /// 其它默认（避免 UQ_StrategyProfileVersion_DefaultPublished 冲突，镜像 Publish/Disable 既有关联操作）；
+    /// 审计默认设置操作。
+    /// </summary>
+    Task SetDefaultStrategyProfileVersionAsync(long strategyProfileVersionId, string? operatedBy, int actorUserId, CancellationToken ct = default);
+
+    /// <summary>
+    /// 设置规则集版本为同族（RuleSetId）默认（D-3 默认版本承载，2026-10-17，镜像 SPV）：
+    /// 目标须已 PUBLISHED；原子切换（仓储事务「清同族其它 + 置目标」），审计 ActionCode=SetDefault/EntityType=RuleSetVersion。
+    /// </summary>
+    Task SetDefaultRuleSetVersionAsync(long ruleSetVersionId, string? operatedBy, int actorUserId, CancellationToken ct = default);
+
+    /// <summary>
+    /// 设置参数集版本为同族（ParameterSetId）默认（D-3 默认版本承载，2026-10-17，镜像 SPV）：
+    /// 目标须已 PUBLISHED；原子切换（仓储事务「清同族其它 + 置目标」），审计 ActionCode=SetDefault/EntityType=ParameterSetVersion。
+    /// </summary>
+    Task SetDefaultParameterSetVersionAsync(long parameterSetVersionId, string? operatedBy, int actorUserId, CancellationToken ct = default);
+
+    /// <summary>
+    /// 读侧默认解析：规则集同族当前有效、无歧义的 PUBLISHED 默认版本（D-3，2026-10-17）；
+    /// 按生效窗过滤；0→null、1→返回、&gt;1→抛歧义（不发随机取，红线 #4）。
+    /// </summary>
+    Task<RuleSetVersion?> ResolveDefaultRuleSetVersionAsync(long ruleSetId, DateTime? asOf = null, CancellationToken ct = default);
+
+    /// <summary>
+    /// 读侧默认解析：参数集同族当前有效、无歧义的 PUBLISHED 默认版本（D-3，2026-10-17）；
+    /// 按生效窗过滤；0→null、1→返回、&gt;1→抛歧义（不发随机取，红线 #4）。
+    /// </summary>
+    Task<ParameterSetVersion?> ResolveDefaultParameterSetVersionAsync(long parameterSetId, DateTime? asOf = null, CancellationToken ct = default);
+
+    /// <summary>
     /// 解析当前有效默认 PUBLISHED 策略包版本（P0-06：跨号位冻结语义，C2-3）
     /// 语义：按 RunType 匹配 IsActive=1 StrategyProfile（RunType 在父表）的 IsDefault=1+PUBLISHED 版本，
     ///       再过滤 EffectiveFrom/EffectiveTo 生效窗口（asOf 为空取当前时刻）。

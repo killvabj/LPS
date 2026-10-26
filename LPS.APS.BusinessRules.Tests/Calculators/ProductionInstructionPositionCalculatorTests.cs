@@ -208,6 +208,54 @@ public class ProductionInstructionPositionCalculatorTests
     }
 
     [Test]
+    public async Task F04b_XcSameStageMultipleSlices_DeductsOnceAcrossGroup()
+    {
+        // 回归 R03-A②：同一 Stage 有两个 STAGE_WAITING 切片（MES 进度派生 S10 + PiInventories 派生 S10），
+        // XC 只应把该 Stage 总量扣一次（池化），不得对每个切片各扣同一份 XC 总量（否则过度扣减→Stage 被吞进 UNLOCATED）。
+        var input = new ProductionInstructionPositionInput
+        {
+            ProductionInstructionNo = "PI-F04B-001",
+            MaterialId = 1004,
+            FactoryId = 1,
+            ErpRemainingQty = 100m,
+            StagePath = new[]
+            {
+                new StagePathFact { StageCode = "S10", StageSequence = 1, IsStartStage = true }
+            },
+            // MES 进度：S10 已完成 40，差分得 STAGE_WAITING 40（ErpRemaining=100 → 末Stage qty=40）
+            StageProgress = new[]
+            {
+                new StageProgressFact { StageCode = "S10", StageSequence = 1, GoodCompletedQty = 40m, SnapshotId = 1 }
+            },
+            // PiInventories：同 S10 再切一片 30 → 同 Stage 两切片(40+30=70)
+            PiInventories = new[]
+            {
+                new PiInventoryFact { WarehouseCode = "WH-A", RelatedStageCode = "S10", Quantity = 30m, LocationCategory = "STAGE_INVENTORY" }
+            },
+            // 同 Stage 只有 20 的 XC
+            XcFacts = new[]
+            {
+                new XcFact { XcWarehouseCode = "XC-01", RelatedStageCode = "S10", Quantity = 20m, SourceDocument = "D" }
+            }
+        };
+
+        var results = await _calculator.CalculateProductionInstructionPositionsAsync(new[] { input }, new FrozenFactParameters(), CancellationToken.None);
+        var result = results.First();
+
+        Assert.That(result.IsSuccess, Is.True);
+
+        // S10 全部 STAGE_WAITING 切片合计应 = (40+30) - 20 = 50，即 XC 只从该 Stage 总量扣一次。
+        // 旧实现会对每个切片各扣 20 → 40-20=20、30-20=10 合计 30（过度扣减 20）。
+        var s10Total = result.Positions
+            .Where(p => p.PositionType == PositionType.STAGE_WAITING && p.StageCode == "S10")
+            .Sum(p => p.Quantity);
+        Assert.That(s10Total, Is.EqualTo(50m), "同 Stage 多切片时 XC 应池化只扣一次");
+
+        // 不得误触发 XC_EXCEEDS_STAGE（单切片 30 或 40 都 > 0，总量 70 远大于 XC 20）
+        Assert.That(result.Issues.Any(i => i.IssueType == "XC_EXCEEDS_STAGE"), Is.False);
+    }
+
+    [Test]
     public async Task F05_TransitIndependent_ShouldNotOverlapStage()
     {
         var input = new ProductionInstructionPositionInput
@@ -879,12 +927,162 @@ public class ProductionInstructionPositionCalculatorTests
         Assert.That(result.NextOperationContexts.Sum(c => c.SliceQty), Is.EqualTo(500m));
     }
 
+    // ── A/B 路径身份 PathId（2026-10-22，2号位《上级日历真实事实与A-B片路径身份》§二）──────
+
+    private static ProductionInstructionPositionInput BuildPathIdInput(
+        string woRouteCode, RoutingOperationFact[] routing) => new()
+    {
+        ProductionInstructionNo = "PI-PATHID-001",
+        MaterialId = 1090,
+        MaterialCode = "MAT-PATHID",
+        FactoryId = 1,
+        FactoryCode = "CN",
+        ErpRemainingQty = 500m,
+        StageProgress = new[]
+        {
+            new StageProgressFact { StageCode = "CN_ASSY", StageSequence = 1, GoodCompletedQty = 500m, SnapshotId = 1 }
+        },
+        OperationProgress = new[]
+        {
+            new OperationProgressFact
+            {
+                OperationCode = "OP-A", OperationName = "挤丝", StageCode = "CN_ASSY",
+                MESWorkOrderNo = "WO-001", PlannedQty = 500m, GoodQty = 200m, RemainingQty = 300m,
+                RouteCode = woRouteCode
+            }
+        },
+        WorkOrders = new[]
+        {
+            new WorkOrderSnapshotFact
+            {
+                ProductionInstructionNo = "PI-PATHID-001", MESWorkOrderNo = "WO-001",
+                MaterialCode = "MAT-PATHID", PlannedQty = 500m,
+                WorkOrderStatus = "IN_PROGRESS", DataCutoffTime = DateTime.UtcNow
+            }
+        },
+        StagePath = new[]
+        {
+            new StagePathFact { StageCode = "CN_ASSY", StageSequence = 1, IsStartStage = true }
+        },
+        RoutingOperations = routing
+    };
+
+    [Test]
+    public async Task AbPathId_UniqueRouteTextMatch_ShouldDeliverRealPathId()
+    {
+        var input = BuildPathIdInput("挤丝,磨削,组装", new[]
+        {
+            new RoutingOperationFact { OperationCode = "J1", OperationName = "挤丝", StageCode = "CN_ASSY", RouteCode = "挤丝,磨削,组装", PathId = 7 },
+            new RoutingOperationFact { OperationCode = "J2", OperationName = "磨削", StageCode = "CN_ASSY", RouteCode = "挤丝,磨削,组装", PathId = 7 }
+        });
+
+        var result = (await _calculator.CalculateProductionInstructionPositionsAsync(
+            new[] { input }, new FrozenFactParameters(), CancellationToken.None)).First();
+
+        var ctx = result.ExistingExecutionContexts.Single();
+        Assert.That(ctx.RouteCode, Is.EqualTo("挤丝,磨削,组装"));
+        Assert.That(ctx.PathId, Is.EqualTo(7), "文本唯一命中（多工序同行号）⇒ 交付真实 PathId");
+        Assert.That(result.Issues.Any(i => i.IssueType.StartsWith("AB_PATH_ID")), Is.False);
+    }
+
+    [Test]
+    public async Task AbPathId_AmbiguousRouteText_ShouldStayNullWithErrorAndNotPickOne()
+    {
+        var input = BuildPathIdInput("挤丝,磨削,组装", new[]
+        {
+            new RoutingOperationFact { OperationCode = "J1", OperationName = "挤丝", StageCode = "CN_ASSY", RouteCode = "挤丝,磨削,组装", PathId = 7 },
+            new RoutingOperationFact { OperationCode = "J1b", OperationName = "挤丝", StageCode = "CN_ASSY", RouteCode = "挤丝,磨削,组装", PathId = 9 }
+        });
+
+        var result = (await _calculator.CalculateProductionInstructionPositionsAsync(
+            new[] { input }, new FrozenFactParameters(), CancellationToken.None)).First();
+
+        var ctx = result.ExistingExecutionContexts.Single();
+        Assert.That(ctx.RouteCode, Is.EqualTo("挤丝,磨削,组装"), "RouteCode 真值照常交付");
+        Assert.That(ctx.PathId, Is.Null, "同文本多 PathId（C桶假歧义）⇒ 留 null，绝不择一（Q-3）");
+        Assert.That(result.Issues.Any(i => i.IssueType == "AB_PATH_ID_AMBIGUOUS"), Is.True);
+    }
+
+    [Test]
+    public async Task AbPathId_NoRouteTextMatch_ShouldStayNullWithWarn()
+    {
+        var input = BuildPathIdInput("挤丝,未知工序X", new[]
+        {
+            new RoutingOperationFact { OperationCode = "J1", OperationName = "挤丝", StageCode = "CN_ASSY", RouteCode = "挤丝,磨削,组装", PathId = 7 }
+        });
+
+        var result = (await _calculator.CalculateProductionInstructionPositionsAsync(
+            new[] { input }, new FrozenFactParameters(), CancellationToken.None)).First();
+
+        var ctx = result.ExistingExecutionContexts.Single();
+        Assert.That(ctx.PathId, Is.Null, "无匹配路径 ⇒ 留 null，1号位 Fail Closed 为预期");
+        Assert.That(result.Issues.Any(i => i.IssueType == "AB_PATH_ID_NOT_RESOLVED"), Is.True);
+    }
+
+    // ── PI 级 XC 源不可用（2026-10-25，2号位《PI级XC缺源时Position侧表达位询问》）──────
+
+    private static ProductionInstructionPositionInput BuildPiXcUnavailableInput(bool unavailable) => new()
+    {
+        ProductionInstructionNo = "PI-XCUNAVAIL-001",
+        MaterialId = 1091,
+        MaterialCode = "MAT-XCU",
+        FactoryId = 1,
+        FactoryCode = "CN",
+        ErpRemainingQty = 500m,
+        StageProgress = Array.Empty<StageProgressFact>(),
+        OperationProgress = Array.Empty<OperationProgressFact>(),
+        WorkOrders = new[]
+        {
+            new WorkOrderSnapshotFact
+            {
+                ProductionInstructionNo = "PI-XCUNAVAIL-001", MESWorkOrderNo = "WO-X1",
+                MaterialCode = "MAT-XCU", PlannedQty = 500m,
+                WorkOrderStatus = "IN_PROGRESS", DataCutoffTime = DateTime.UtcNow
+            }
+        },
+        StagePath = new[] { new StagePathFact { StageCode = "CN_ASSY", StageSequence = 1, IsStartStage = true } },
+        PiXcSourceUnavailable = unavailable
+    };
+
     /// <summary>
-    /// U17（TECH-03 §八）：PI 总量可信但**无任何有效位置事实**（无 Stage/XC/Transit/库存）⇒
-    /// 按既有 UNLOCATED 降级：单个 UNLOCATED 承载全量、总量仍闭合、UNLOCATED 保守返回最早 Stage。
+    /// 缺源时：①闭合不破（份额落 UNLOCATED）；②产 PI_XC_SOURCE_UNAVAILABLE Issue；
+    /// ③**抑制 ERP 兜底**（DerivedRemainingQty 0 vs 关闭时 500），防止未知 XC 份额流入 A/B 片造成过排；
+    /// ④ UNLOCATED 不再产 NextOperationContext。关闭标记时行为与既有完全一致。
     /// </summary>
     [Test]
-    public async Task U17_NoValidPositionButTrustedTotal_UnlocatedFallback()
+    public async Task PiXcSourceUnavailable_ShouldIssueAndSuppressFallback_KeepClosure()
+    {
+        var on = (await _calculator.CalculateProductionInstructionPositionsAsync(
+            new[] { BuildPiXcUnavailableInput(true) }, new FrozenFactParameters(), CancellationToken.None)).First();
+        var off = (await _calculator.CalculateProductionInstructionPositionsAsync(
+            new[] { BuildPiXcUnavailableInput(false) }, new FrozenFactParameters(), CancellationToken.None)).First();
+
+        // ① 闭合不破：两态 ΣPosition 都等于 ERP Remaining
+        Assert.That(on.Positions.Sum(p => p.Quantity), Is.EqualTo(500m));
+        Assert.That(off.Positions.Sum(p => p.Quantity), Is.EqualTo(500m));
+        Assert.That(on.Positions.Any(p => p.PositionType == PositionType.UNLOCATED), Is.True);
+
+        // ② Issue 留痕（仅开启时）
+        Assert.That(on.Issues.Any(i => i.IssueType == "PI_XC_SOURCE_UNAVAILABLE"), Is.True);
+        Assert.That(off.Issues.Any(i => i.IssueType == "PI_XC_SOURCE_UNAVAILABLE"), Is.False);
+
+        // ③ 兜底抑制：开启=0（不过排）；关闭=500（既有行为）
+        Assert.That(on.ExistingExecutionContexts.Single().DerivedRemainingQty, Is.EqualTo(0m));
+        Assert.That(off.ExistingExecutionContexts.Single().DerivedRemainingQty, Is.EqualTo(500m));
+
+        // ④ UNLOCATED 不产起点：开启时无 IsUnlocated 上下文；关闭时有一个
+        Assert.That(on.NextOperationContexts.Any(c => c.IsUnlocated), Is.False);
+        Assert.That(off.NextOperationContexts.Any(c => c.IsUnlocated), Is.True);
+    }
+
+    /// <summary>
+    /// U17（TECH-03 §八，按 0号位 2026-10-12《业务口径两问统一回复》§4.1 更新期望）：
+    /// PI 总量可信、无任何 MES 位置事实、**无活跃工单**、但有 StagePath ⇒
+    /// **不得视为 Stage 剩余为零/全量 UNLOCATED**，未生产剩余归入真实首Stage待生产位置（FIRST_STAGE_PENDING）。
+    /// 真正无法定位（连 StagePath 都没有）才进 UNLOCATED/Issue。
+    /// </summary>
+    [Test]
+    public async Task U17_NoMesFactsWithStagePath_FirstStagePendingNotUnlocated()
     {
         var input = new ProductionInstructionPositionInput
         {
@@ -906,18 +1104,97 @@ public class ProductionInstructionPositionCalculatorTests
         var results = await _calculator.CalculateProductionInstructionPositionsAsync(new[] { input }, new FrozenFactParameters(), CancellationToken.None);
         var result = results.First();
 
-        // 无任何位置事实 → 单个 UNLOCATED 承载全量，总量仍闭合到可信入参
+        // 0号位 §4.1：可信首Stage待生产位置，不再是全量 UNLOCATED
         Assert.That(result.Positions.Count, Is.EqualTo(1));
+        var firstStage = result.Positions.Single();
+        Assert.That(firstStage.PositionType, Is.EqualTo(PositionType.FIRST_STAGE_PENDING));
+        Assert.That(firstStage.StageCode, Is.EqualTo("CN_ASSY"));
+        Assert.That(firstStage.Quantity, Is.EqualTo(600m));
+        Assert.That(result.IsSuccess, Is.True);
+        Assert.That(result.Positions.Any(p => p.PositionType == PositionType.UNLOCATED), Is.False);
+
+        // NextOperation：起点=首Stage、非 UNLOCATED（1号位 可正常消费排程）
+        var nextOp = result.NextOperationContexts.Single();
+        Assert.That(nextOp.IsUnlocated, Is.False);
+        Assert.That(nextOp.StartStageCode, Is.EqualTo("CN_ASSY"));
+        Assert.That(nextOp.SliceQty, Is.EqualTo(600m));
+    }
+
+    /// <summary>
+    /// U17 变体：真正无法定位（无事实 **且** 无 StagePath）⇒ 才走 UNLOCATED 降级 + NO_STAGE_PATH Issue，
+    /// 总量仍闭合、批次不阻断（§9.7）。
+    /// </summary>
+    [Test]
+    public async Task U17b_NoFactsNoStagePath_UnlocatedFallbackWithIssue()
+    {
+        var input = new ProductionInstructionPositionInput
+        {
+            ProductionInstructionNo = "PI-U17B-001",
+            MaterialId = 1017,
+            MaterialCode = "MAT-U17B",
+            FactoryId = 1,
+            FactoryCode = "CN",
+            ErpRemainingQty = 600m,
+            StageProgress = Array.Empty<StageProgressFact>(),
+            OperationProgress = Array.Empty<OperationProgressFact>(),
+            WorkOrders = Array.Empty<WorkOrderSnapshotFact>(),
+            StagePath = Array.Empty<StagePathFact>()
+        };
+
+        var results = await _calculator.CalculateProductionInstructionPositionsAsync(new[] { input }, new FrozenFactParameters(), CancellationToken.None);
+        var result = results.First();
+
         var unlocated = result.Positions.Single();
         Assert.That(unlocated.PositionType, Is.EqualTo(PositionType.UNLOCATED));
-        Assert.That(unlocated.IsUnlocated, Is.True);
         Assert.That(unlocated.Quantity, Is.EqualTo(600m));
         Assert.That(result.IsSuccess, Is.True);
+        Assert.That(result.Issues.Any(i => i.IssueType == "NO_STAGE_PATH"), Is.True);
+    }
 
-        // NextOperation：UNLOCATED 保守返回最早 Stage（IsStartStage）
-        var nextOp = result.NextOperationContexts.Single();
-        Assert.That(nextOp.IsUnlocated, Is.True);
-        Assert.That(nextOp.StartStageCode, Is.EqualTo("CN_ASSY"));
+    /// <summary>
+    /// 首Stage兜底的门禁：**存在 IN_PROGRESS 工单时不触发**（该场景走 E 侧诉求2 ERP 兜底链，
+    /// Position 侧维持 UNLOCATED，A/B 连续性归属由 2号位 消费 E 处理）。
+    /// </summary>
+    [Test]
+    public async Task FirstStageFallback_NotTriggered_WhenInProgressWorkOrderExists()
+    {
+        var input = new ProductionInstructionPositionInput
+        {
+            ProductionInstructionNo = "PI-GUARD-001",
+            MaterialId = 1032,
+            MaterialCode = "MAT-GUARD",
+            FactoryId = 1,
+            FactoryCode = "CN",
+            ErpRemainingQty = 600m,
+            StageProgress = Array.Empty<StageProgressFact>(),
+            OperationProgress = Array.Empty<OperationProgressFact>(),
+            WorkOrders = new[]
+            {
+                new WorkOrderSnapshotFact
+                {
+                    ProductionInstructionNo = "PI-GUARD-001", MESWorkOrderNo = "WO-G1",
+                    MaterialCode = "MAT-GUARD", PlannedQty = 600m,
+                    WorkOrderStatus = "IN_PROGRESS", DataCutoffTime = DateTime.UtcNow
+                }
+            },
+            StagePath = new[]
+            {
+                new StagePathFact { StageCode = "CN_ASSY", StageSequence = 1, IsStartStage = true }
+            }
+        };
+
+        var results = await _calculator.CalculateProductionInstructionPositionsAsync(new[] { input }, new FrozenFactParameters(), CancellationToken.None);
+        var result = results.First();
+
+        // Position 侧：仍是 UNLOCATED（兜底未触发）
+        var unlocated = result.Positions.Single();
+        Assert.That(unlocated.PositionType, Is.EqualTo(PositionType.UNLOCATED));
+        Assert.That(unlocated.Quantity, Is.EqualTo(600m));
+
+        // E 侧：诉求2 兜底仍给量（erpFallbackTotal=600−0=600），并带 UNLOCATED_STAGE 标记
+        var ctx = result.ExistingExecutionContexts.Single();
+        Assert.That(ctx.DerivedRemainingQty, Is.EqualTo(600m));
+        Assert.That(ctx.Slices.Single().IssueCode, Is.EqualTo("UNLOCATED_STAGE"));
     }
 
     /// <summary>
@@ -1055,6 +1332,181 @@ public class ProductionInstructionPositionCalculatorTests
         var slice = ctx.Slices.Single();
         Assert.That(slice.StartOperationCode, Is.Null);
         Assert.That(slice.StartOperationName, Is.Null);
+    }
+
+    /// <summary>
+    /// 形态②（2026-10-10 用户定：由 5号位 从 Routing DAG 推）：后道工序在 MES 快照**无行**时，
+    /// 从 Routing DAG 推「前驱全部完工的未完工工序」⇒ 唯一后继直接填码 + 名。
+    /// 形态：活塞挤压(M103) 已完工、组装(M102) **无行**；M103→M102。
+    /// </summary>
+    [Test]
+    public async Task Form2_NoBackOpRow_ResolvesFromRoutingDag()
+    {
+        var input = new ProductionInstructionPositionInput
+        {
+            ProductionInstructionNo = "14946237",
+            MaterialId = 163118,
+            MaterialCode = "FINAL_FG-CDM3B20-50",
+            FactoryId = 1,
+            FactoryCode = "CN",
+            ErpRemainingQty = 27m,
+            StageProgress = new[]
+            {
+                new StageProgressFact { StageCode = "CN_ASSY", StageSequence = 1, GoodCompletedQty = 27m, RemainingQty = 27m, SnapshotId = 1 }
+            },
+            OperationProgress = new[]
+            {
+                // 只有前道有行（已完工）；组装 **无行**
+                new OperationProgressFact
+                {
+                    OperationCode = "M103", OperationName = "活塞挤压", StageCode = "CN_ASSY",
+                    MESWorkOrderNo = "014946237092989", PlannedQty = 27m, GoodQty = 27m, RemainingQty = 0m
+                }
+            },
+            RoutingOperations = new[]
+            {
+                new RoutingOperationFact { OperationCode = "M103", OperationName = "活塞挤压", StageCode = "CN_ASSY", RouteCode = "配品,活塞挤压,组装" },
+                new RoutingOperationFact { OperationCode = "M102", OperationName = "组装", StageCode = "CN_ASSY", RouteCode = "配品,活塞挤压,组装" }
+            },
+            RoutingDependencies = new[]
+            {
+                new RoutingDependencyFact { FromOperationCode = "M103", ToOperationCode = "M102", RouteCode = "配品,活塞挤压,组装" }
+            },
+            WorkOrders = new[]
+            {
+                new WorkOrderSnapshotFact
+                {
+                    ProductionInstructionNo = "14946237", MESWorkOrderNo = "014946237092989",
+                    MaterialCode = "FINAL_FG-CDM3B20-50", PlannedQty = 27m,
+                    WorkOrderStatus = "IN_PROGRESS", DataCutoffTime = DateTime.UtcNow
+                }
+            },
+            StagePath = new[]
+            {
+                new StagePathFact { StageCode = "CN_ASSY", StageSequence = 1, IsStartStage = true }
+            }
+        };
+
+        var results = await _calculator.CalculateProductionInstructionPositionsAsync(new[] { input }, new FrozenFactParameters(), CancellationToken.None);
+        var result = results.First();
+
+        var ctx = result.ExistingExecutionContexts.Single();
+        Assert.That(ctx.StartOperationCode, Is.EqualTo("M102")); // 从 Routing DAG 推出的码
+        Assert.That(ctx.StartOperationName, Is.EqualTo("组装"));
+        var slice = ctx.Slices.Single();
+        Assert.That(slice.StartOperationCode, Is.EqualTo("M102"));
+        Assert.That(slice.StartOperationName, Is.EqualTo("组装"));
+    }
+
+    /// <summary>
+    /// 形态② + 路由后继**多个并行分支** ⇒ AMBIGUOUS，不得静默取首条。
+    /// </summary>
+    [Test]
+    public async Task Form2_MultipleRoutingSuccessors_Ambiguous()
+    {
+        var input = new ProductionInstructionPositionInput
+        {
+            ProductionInstructionNo = "PI-AMB-001",
+            MaterialId = 1030,
+            MaterialCode = "MAT-AMB",
+            FactoryId = 1,
+            FactoryCode = "CN",
+            ErpRemainingQty = 10m,
+            StageProgress = new[]
+            {
+                new StageProgressFact { StageCode = "CN_ASSY", StageSequence = 1, GoodCompletedQty = 10m, RemainingQty = 10m, SnapshotId = 1 }
+            },
+            OperationProgress = new[]
+            {
+                new OperationProgressFact
+                {
+                    OperationCode = "M101", OperationName = "配品", StageCode = "CN_ASSY",
+                    MESWorkOrderNo = "WO-AMB", PlannedQty = 10m, GoodQty = 10m, RemainingQty = 0m
+                }
+            },
+            RoutingOperations = new[]
+            {
+                new RoutingOperationFact { OperationCode = "M101", OperationName = "配品", StageCode = "CN_ASSY", RouteCode = "配品,并行A,并行B" },
+                new RoutingOperationFact { OperationCode = "M102A", OperationName = "并行A", StageCode = "CN_ASSY", RouteCode = "配品,并行A,并行B" },
+                new RoutingOperationFact { OperationCode = "M102B", OperationName = "并行B", StageCode = "CN_ASSY", RouteCode = "配品,并行A,并行B" }
+            },
+            RoutingDependencies = new[]
+            {
+                new RoutingDependencyFact { FromOperationCode = "M101", ToOperationCode = "M102A" },
+                new RoutingDependencyFact { FromOperationCode = "M101", ToOperationCode = "M102B" }
+            },
+            WorkOrders = new[]
+            {
+                new WorkOrderSnapshotFact
+                {
+                    ProductionInstructionNo = "PI-AMB-001", MESWorkOrderNo = "WO-AMB",
+                    MaterialCode = "MAT-AMB", PlannedQty = 10m,
+                    WorkOrderStatus = "IN_PROGRESS", DataCutoffTime = DateTime.UtcNow
+                }
+            },
+            StagePath = new[]
+            {
+                new StagePathFact { StageCode = "CN_ASSY", StageSequence = 1, IsStartStage = true }
+            }
+        };
+
+        var results = await _calculator.CalculateProductionInstructionPositionsAsync(new[] { input }, new FrozenFactParameters(), CancellationToken.None);
+        var result = results.First();
+
+        var ctx = result.ExistingExecutionContexts.Single();
+        Assert.That(ctx.StartOperationCode, Is.Null);
+        Assert.That(ctx.StartOperationName, Is.Null);
+        Assert.That(ctx.Slices.Single().IssueCode, Is.EqualTo("NEXT_OPERATION_AMBIGUOUS"));
+    }
+
+    /// <summary>
+    /// 形态② 但**无 Routing** ⇒ 不推（保持原样），码/名均 null。
+    /// </summary>
+    [Test]
+    public async Task Form2_NoRouting_StaysNull()
+    {
+        var input = new ProductionInstructionPositionInput
+        {
+            ProductionInstructionNo = "PI-F2NR-001",
+            MaterialId = 1031,
+            MaterialCode = "MAT-F2NR",
+            FactoryId = 1,
+            FactoryCode = "CN",
+            ErpRemainingQty = 27m,
+            StageProgress = new[]
+            {
+                new StageProgressFact { StageCode = "CN_ASSY", StageSequence = 1, GoodCompletedQty = 27m, RemainingQty = 27m, SnapshotId = 1 }
+            },
+            OperationProgress = new[]
+            {
+                // 前道完工、后道无行；且**无 Routing**
+                new OperationProgressFact
+                {
+                    OperationCode = "OP-A", OperationName = "活塞挤压", StageCode = "CN_ASSY",
+                    MESWorkOrderNo = "WO-F2NR", PlannedQty = 27m, GoodQty = 27m, RemainingQty = 0m
+                }
+            },
+            WorkOrders = new[]
+            {
+                new WorkOrderSnapshotFact
+                {
+                    ProductionInstructionNo = "PI-F2NR-001", MESWorkOrderNo = "WO-F2NR",
+                    MaterialCode = "MAT-F2NR", PlannedQty = 27m,
+                    WorkOrderStatus = "IN_PROGRESS", DataCutoffTime = DateTime.UtcNow
+                }
+            },
+            StagePath = new[]
+            {
+                new StagePathFact { StageCode = "CN_ASSY", StageSequence = 1, IsStartStage = true }
+            }
+        };
+
+        var results = await _calculator.CalculateProductionInstructionPositionsAsync(new[] { input }, new FrozenFactParameters(), CancellationToken.None);
+        var result = results.First();
+
+        var ctx = result.ExistingExecutionContexts.Single();
+        Assert.That(ctx.StartOperationCode, Is.Null);
+        Assert.That(ctx.StartOperationName, Is.Null);
     }
 }
 

@@ -35,6 +35,10 @@ public class GovernanceController : ControllerBase
     private readonly IScheduleRunRepository _scheduleRunRepo;
     private readonly IScheduleQueryService _queryService;
     private readonly IDomainDefinitionGovernanceService _domainDefinitionService;
+    private readonly IRuleSetGovernanceService _ruleSetGovernanceService;
+    private readonly IParameterSetGovernanceService _parameterSetGovernanceService;
+    private readonly IStrategyProfileGovernanceService _strategyProfileGovernanceService;
+    private readonly IDataScopeService _dataScopeService;
     private readonly ILogger<GovernanceController> _logger;
 
     public GovernanceController(
@@ -51,6 +55,10 @@ public class GovernanceController : ControllerBase
         IScheduleRunRepository scheduleRunRepo,
         IScheduleQueryService queryService,
         IDomainDefinitionGovernanceService domainDefinitionService,
+        IRuleSetGovernanceService ruleSetGovernanceService,
+        IParameterSetGovernanceService parameterSetGovernanceService,
+        IStrategyProfileGovernanceService strategyProfileGovernanceService,
+        IDataScopeService dataScopeService,
         ILogger<GovernanceController> logger)
     {
         _governanceService = governanceService;
@@ -66,6 +74,10 @@ public class GovernanceController : ControllerBase
         _scheduleRunRepo = scheduleRunRepo;
         _queryService = queryService;
         _domainDefinitionService = domainDefinitionService;
+        _ruleSetGovernanceService = ruleSetGovernanceService;
+        _parameterSetGovernanceService = parameterSetGovernanceService;
+        _strategyProfileGovernanceService = strategyProfileGovernanceService;
+        _dataScopeService = dataScopeService;
         _logger = logger;
     }
 
@@ -79,14 +91,237 @@ public class GovernanceController : ControllerBase
 
     #region RuleSetVersion CRUD
 
-    /// <summary>获取规则集的所有版本</summary>
+    /// <summary>
+    /// 新建规则集主表（POST /rule-set；2026-10-22 补齐 4号位 缺口/T4）。
+    /// Q1：RuleSetCode 用户填、唯一（大小写不敏感）、创建后不可变更；Q2：两步——主表仅建壳，前端随后自动跟建空白 DRAFT 版本；
+    /// Q3＝方案 A 跨域通用（无排程域字段）；Q6＝挂 aps.rule.edit（RuleMaintain）。无 DELETE 端点（Q5，一律 IsActive 停用）。
+    /// </summary>
+    /// <remarks>开发者：3号位</remarks>
+    [Authorize(Policy = PermissionCodes.RuleMaintain)]
+    [HttpPost("rule-set")]
+    public async Task<IActionResult> CreateRuleSet([FromBody] RuleSet entity, CancellationToken ct)
+    {
+        try
+        {
+            var created = await _ruleSetGovernanceService.CreateRuleSetAsync(entity, GetCurrentUserCode(), GetCurrentUserId(), ct);
+            // 主表此时尚无任何版本，CreatedAtAction 无合法 Location（GetRuleSetVersion 需 versionId）；
+            // 曾传 null → INSERT 后 MVC 生成 Location 失败抛 500（4号位 2026-10-25 F1）。改回 200 + body。
+            return Ok(ApiResponse<RuleSet>.Success(created));
+        }
+        catch (InvalidOperationException ex)
+        {
+            _logger.LogWarning(ex, "规则集新建失败：{RuleSetCode}", entity.RuleSetCode);
+            return BadRequest(ApiResponse.Fail(400, ex.Message));
+        }
+    }
+
+    /// <summary>
+    /// 编辑规则集主表（PUT /rule-set/{id}）：改 Name/Description/IsActive；RuleSetCode 冻结不可改；不符 → 400。
+    /// Q4：IsActive=0 仅关主表、不级联版本（运行时装载判主表归 2号位/1号位 转达项）；Q6＝aps.rule.edit。
+    /// </summary>
+    /// <remarks>开发者：3号位</remarks>
+    [Authorize(Policy = PermissionCodes.RuleMaintain)]
+    [HttpPut("rule-set/{id}")]
+    public async Task<IActionResult> UpdateRuleSet(long id, [FromBody] RuleSet entity, CancellationToken ct)
+    {
+        try
+        {
+            var updated = await _ruleSetGovernanceService.UpdateRuleSetAsync(id, entity, GetCurrentUserCode(), GetCurrentUserId(), ct);
+            return Ok(ApiResponse<RuleSet>.Success(updated));
+        }
+        catch (InvalidOperationException ex)
+        {
+            _logger.LogWarning(ex, "规则集更新失败：{Id}", id);
+            return BadRequest(ApiResponse.Fail(400, ex.Message));
+        }
+    }
+
+    /// <summary>
+    /// 新建参数集主表（POST /parameter-set；2026-10-25 补齐 4号位 缺口，照 rule-set 10-22 范式）。
+    /// Q1＝编码用户填、唯一（大小写不敏感）、创建后不可变更；Q2＝两步——主表仅建壳，前端随后自动跟建空白 DRAFT 版本；
+    /// Q3＝方案 A 跨域通用（无排程域字段）；Q5＝不给 DELETE；Q6＝挂 aps.parameter.edit（ParameterEdit）。
+    /// </summary>
+    /// <remarks>开发者：3号位</remarks>
+    [Authorize(Policy = PermissionCodes.ParameterEdit)]
+    [HttpPost("parameter-set")]
+    public async Task<IActionResult> CreateParameterSet([FromBody] ParameterSet entity, CancellationToken ct)
+    {
+        try
+        {
+            var created = await _parameterSetGovernanceService.CreateParameterSetAsync(entity, GetCurrentUserCode(), GetCurrentUserId(), ct);
+            // 主表此时尚无任何版本，CreatedAtAction 无合法 Location（GetParameterSetVersion 需 versionId）；改回 200 + body（同 rule-set）。
+            return Ok(ApiResponse<ParameterSet>.Success(created));
+        }
+        catch (InvalidOperationException ex)
+        {
+            _logger.LogWarning(ex, "参数集新建失败：{ParameterSetCode}", entity.ParameterSetCode);
+            return BadRequest(ApiResponse.Fail(400, ex.Message));
+        }
+    }
+
+    /// <summary>
+    /// 编辑参数集主表（PUT /parameter-set/{id}）：改 Name/Description/IsActive；ParameterSetCode 冻结不可改；不符 → 400。
+    /// Q4：IsActive=0 仅关主表、不级联版本（运行时装载判主表归 2号位/1号位 转达项）；Q6＝aps.parameter.edit。
+    /// </summary>
+    /// <remarks>开发者：3号位</remarks>
+    [Authorize(Policy = PermissionCodes.ParameterEdit)]
+    [HttpPut("parameter-set/{id}")]
+    public async Task<IActionResult> UpdateParameterSet(long id, [FromBody] ParameterSet entity, CancellationToken ct)
+    {
+        try
+        {
+            var updated = await _parameterSetGovernanceService.UpdateParameterSetAsync(id, entity, GetCurrentUserCode(), GetCurrentUserId(), ct);
+            return Ok(ApiResponse<ParameterSet>.Success(updated));
+        }
+        catch (InvalidOperationException ex)
+        {
+            _logger.LogWarning(ex, "参数集更新失败：{Id}", id);
+            return BadRequest(ApiResponse.Fail(400, ex.Message));
+        }
+    }
+
+    /// <summary>
+    /// 新建策略包主表（POST /strategy-profile；2026-10-25 补齐 4号位 缺口，照 rule-set 10-22 范式）。
+    /// Q1＝编码用户填、唯一、创建后不可变更；Q2＝**只建壳，不能自动跟建版本**（StrategyProfileVersion.RuleSetVersionId/ParameterSetVersionId 均必填 FK，
+    /// 无「空白首版」合法状态 ⇒ 首版在「新建草稿」里选两个已发布版本）；Q3＝跨域通用；Q5＝不给 DELETE；
+    /// Q6＝aps.strategy.edit（StrategyEdit）；Q8＝RunType 仅五值或 NULL（冻结 07 §5.5）。
+    /// </summary>
+    /// <remarks>开发者：3号位</remarks>
+    [Authorize(Policy = PermissionCodes.StrategyEdit)]
+    [HttpPost("strategy-profile")]
+    public async Task<IActionResult> CreateStrategyProfile([FromBody] StrategyProfile entity, CancellationToken ct)
+    {
+        try
+        {
+            var created = await _strategyProfileGovernanceService.CreateStrategyProfileAsync(entity, GetCurrentUserCode(), GetCurrentUserId(), ct);
+            // 主表此时尚无任何版本，CreatedAtAction 无合法 Location；改回 200 + body（同 rule-set）。
+            return Ok(ApiResponse<StrategyProfile>.Success(created));
+        }
+        catch (InvalidOperationException ex)
+        {
+            _logger.LogWarning(ex, "策略包新建失败：{StrategyProfileCode}", entity.StrategyProfileCode);
+            return BadRequest(ApiResponse.Fail(400, ex.Message));
+        }
+    }
+
+    /// <summary>
+    /// 编辑策略包主表（PUT /strategy-profile/{id}）：改 Name/Description/RunType/IsActive；StrategyProfileCode 冻结不可改；不符 → 400。
+    /// Q4：IsActive=0 仅关主表、不级联版本（运行时装载判主表归 2号位/1号位 转达项）；Q6＝aps.strategy.edit。
+    /// </summary>
+    /// <remarks>开发者：3号位</remarks>
+    [Authorize(Policy = PermissionCodes.StrategyEdit)]
+    [HttpPut("strategy-profile/{id}")]
+    public async Task<IActionResult> UpdateStrategyProfile(long id, [FromBody] StrategyProfile entity, CancellationToken ct)
+    {
+        try
+        {
+            var updated = await _strategyProfileGovernanceService.UpdateStrategyProfileAsync(id, entity, GetCurrentUserCode(), GetCurrentUserId(), ct);
+            return Ok(ApiResponse<StrategyProfile>.Success(updated));
+        }
+        catch (InvalidOperationException ex)
+        {
+            _logger.LogWarning(ex, "策略包更新失败：{Id}", id);
+            return BadRequest(ApiResponse.Fail(400, ex.Message));
+        }
+    }
+
+    /// <summary>
+    /// 物理删除参数集整族（DELETE /parameter-set/{id}，2026-10-26 同 R1 规则集删除口径）：无任何 PUBLISHED（已发布）版本才可删
+    /// （纯新建未发布族）；含 PUBLISHED（已发布）仍只可停用（历史不可变守恒）。被策略包版本引用则拒绝（FK 反查阻断）。
+    /// 审计前置（ActionCode=Delete）后整族删（单事务）。权限 Q6＝aps.parameter.edit。
+    /// </summary>
+    /// <remarks>开发者：3号位</remarks>
+    [Authorize(Policy = PermissionCodes.ParameterEdit)]
+    [HttpDelete("parameter-set/{id}")]
+    public async Task<IActionResult> DeleteParameterSet(long id, CancellationToken ct)
+    {
+        try
+        {
+            await _parameterSetGovernanceService.DeleteParameterSetAsync(id, GetCurrentUserCode(), GetCurrentUserId(), ct);
+            return Ok(ApiResponse<bool>.Success(true));
+        }
+        catch (InvalidOperationException ex)
+        {
+            _logger.LogWarning(ex, "参数集删除失败：{Id}", id);
+            return BadRequest(ApiResponse.Fail(400, ex.Message));
+        }
+    }
+
+    /// <summary>
+    /// 物理删除策略包整族（DELETE /strategy-profile/{id}，2026-10-26 同 R1 规则集删除口径）：无任何 PUBLISHED（已发布）版本才可删
+    /// （纯新建未发布族）；含 PUBLISHED（已发布）仍只可停用（历史不可变守恒）。被 ScheduleRun（运行）引用则拒绝（FK 反查阻断）。
+    /// 审计前置（ActionCode=Delete）后整族删（单事务）。权限 Q6＝aps.strategy.edit。
+    /// </summary>
+    /// <remarks>开发者：3号位</remarks>
+    [Authorize(Policy = PermissionCodes.StrategyEdit)]
+    [HttpDelete("strategy-profile/{id}")]
+    public async Task<IActionResult> DeleteStrategyProfile(long id, CancellationToken ct)
+    {
+        try
+        {
+            await _strategyProfileGovernanceService.DeleteStrategyProfileAsync(id, GetCurrentUserCode(), GetCurrentUserId(), ct);
+            return Ok(ApiResponse<bool>.Success(true));
+        }
+        catch (InvalidOperationException ex)
+        {
+            _logger.LogWarning(ex, "策略包删除失败：{Id}", id);
+            return BadRequest(ApiResponse.Fail(400, ex.Message));
+        }
+    }
+
+    /// <summary>
+    /// 物理删除规则集整族（DELETE /rule-set/{id}，R1 2026-10-25 例外 Q5）：无任何 PUBLISHED 版本才可删（纯新建未发布族）；
+    /// 有 PUBLISHED 仍只可停用（历史不可变守恒）。被策略包引用则拒绝（FK 防护）。审计前置后整族删（单事务）。
+    /// </summary>
+    /// <remarks>开发者：3号位</remarks>
+    [Authorize(Policy = PermissionCodes.RuleMaintain)]
+    [HttpDelete("rule-set/{id}")]
+    public async Task<IActionResult> DeleteRuleSet(long id, CancellationToken ct)
+    {
+        try
+        {
+            await _ruleSetGovernanceService.DeleteRuleSetAsync(id, GetCurrentUserCode(), GetCurrentUserId(), ct);
+            return Ok(ApiResponse<bool>.Success(true));
+        }
+        catch (InvalidOperationException ex)
+        {
+            _logger.LogWarning(ex, "规则集删除失败：{Id}", id);
+            return BadRequest(ApiResponse.Fail(400, ex.Message));
+        }
+    }
+
+    /// <summary>
+    /// 物理删除单个草稿版本（DELETE /rule-set/version/{id}，R1 2026-10-25）：仅 Status=DRAFT 可删（清空白草稿壳）；
+    /// 已发布/停用/归档拒绝。被策略包引用则拒绝。审计前置后删单行。
+    /// </summary>
+    /// <remarks>开发者：3号位</remarks>
+    [Authorize(Policy = PermissionCodes.RuleMaintain)]
+    [HttpDelete("rule-set/version/{versionId}")]
+    public async Task<IActionResult> DeleteRuleSetVersion(long versionId, CancellationToken ct)
+    {
+        try
+        {
+            await _ruleSetGovernanceService.DeleteRuleSetVersionAsync(versionId, GetCurrentUserCode(), GetCurrentUserId(), ct);
+            return Ok(ApiResponse<bool>.Success(true));
+        }
+        catch (InvalidOperationException ex)
+        {
+            _logger.LogWarning(ex, "规则集版本删除失败：{VersionId}", versionId);
+            return BadRequest(ApiResponse.Fail(400, ex.Message));
+        }
+    }
+
+    /// <summary>
+    /// 获取规则集的所有版本（rule-set 同族 2026-10-15：摘要 DTO，镜像参数集 R2——不含 ContentSnapshotJson/DemandPriorityJson 大 JSON 载体；
+    /// 2026-10-15 4号位 来文 Q2：加补传输层——改调摘要查询，防将来规则集快照变大后版本下拉同方式不可用）
+    /// </summary>
     /// <remarks>开发者：3号位</remarks>
     [Authorize(Policy = PermissionCodes.RuleView)]
     [HttpGet("rule-set/{ruleSetId}/versions")]
     public async Task<IActionResult> GetRuleSetVersions(long ruleSetId, CancellationToken ct)
     {
-        var versions = await _ruleSetVersionRepo.GetByRuleSetIdAsync(ruleSetId, ct);
-        return Ok(ApiResponse<IReadOnlyList<RuleSetVersion>>.Success(versions));
+        var summaries = await _ruleSetVersionRepo.GetSummariesByRuleSetIdAsync(ruleSetId, ct);
+        return Ok(ApiResponse<IReadOnlyList<RuleSetVersionSummaryDto>>.Success(summaries));
     }
 
     /// <summary>获取规则集版本详情（P0-01：ContentSnapshotJson 投影回 DemandPriorityJson，前端 API 兼容）</summary>
@@ -135,14 +370,17 @@ public class GovernanceController : ControllerBase
 
     #region ParameterSetVersion CRUD
 
-    /// <summary>获取参数集的所有版本</summary>
+    /// <summary>
+    /// 获取参数集的所有版本（R2 修复：摘要 DTO，不含 ContentSnapshotJson 大 JSON 载体，防 PSV 1305 序列化 500；
+    /// 2026-10-15 4号位 来文：加补传输层——改调摘要查询，不再 SELECT * 整列搬 ContentSnapshotJson 大 LOB，PSV 1305 37s → 摘要列 10ms 级）
+    /// </summary>
     /// <remarks>开发者：3号位</remarks>
     [Authorize(Policy = PermissionCodes.ParameterView)]
     [HttpGet("parameter-set/{parameterSetId}/versions")]
     public async Task<IActionResult> GetParameterSetVersions(long parameterSetId, CancellationToken ct)
     {
-        var versions = await _parameterSetVersionRepo.GetByParameterSetIdAsync(parameterSetId, ct);
-        return Ok(ApiResponse<IReadOnlyList<ParameterSetVersion>>.Success(versions));
+        var summaries = await _parameterSetVersionRepo.GetSummariesByParameterSetIdAsync(parameterSetId, ct);
+        return Ok(ApiResponse<IReadOnlyList<ParameterSetVersionSummaryDto>>.Success(summaries));
     }
 
     /// <summary>获取参数集版本详情（P0-01：ContentSnapshotJson 五子块投影回五主题 JSON，前端 API 兼容）</summary>
@@ -216,9 +454,10 @@ public class GovernanceController : ControllerBase
     /// <summary>
     /// 发布参数集版本（六态状态机 R02 验收）
     /// 红线：仅 DRAFT/SUBMITTED/APPROVED 可发布；新 Run 可引用新版本、旧 Run 引用不变；A-6 不变量自动处理。
+    /// 授权：D-1 独立权限 ParameterPublish（0号位 §3.2 参数发布 aps.parameter.publish，不因规则发布自动获得）
     /// </summary>
     /// <remarks>开发者：3号位</remarks>
-    [Authorize(Policy = PermissionCodes.RulePublish)]
+    [Authorize(Policy = PermissionCodes.ParameterPublish)]
     [HttpPost("parameter-set/version/{versionId}/publish")]
     public async Task<IActionResult> PublishParameterSetVersion(long versionId, [FromBody] PublishRequest request, CancellationToken ct)
     {
@@ -264,9 +503,10 @@ public class GovernanceController : ControllerBase
     /// <summary>
     /// 停用参数集版本（SUBMITTED/APPROVED/PUBLISHED → DISABLED）
     /// 红线：DRAFT 拒绝（草稿直接编辑/删除）；DISABLED/ARCHIVED 幂等保护拒绝。
+    /// 授权：C-5/D-1 参数停用改挂 ParameterEdit（0号位 §3.2 参数停用操作授权 aps.parameter.edit）
     /// </summary>
     /// <remarks>开发者：3号位</remarks>
-    [Authorize(Policy = PermissionCodes.RuleMaintain)]
+    [Authorize(Policy = PermissionCodes.ParameterEdit)]
     [HttpPost("parameter-set/version/{versionId}/disable")]
     public async Task<IActionResult> DisableParameterSetVersion(long versionId, [FromBody] DisableRequest request, CancellationToken ct)
     {
@@ -289,7 +529,7 @@ public class GovernanceController : ControllerBase
     /// IsDefault=1 停用时自动清默认标志（避免 DISABLED 默认残留于 ResolveDefault 范围）。
     /// </summary>
     /// <remarks>开发者：3号位</remarks>
-    [Authorize(Policy = PermissionCodes.RuleMaintain)]
+    [Authorize(Policy = PermissionCodes.StrategyEdit)]
     [HttpPost("strategy-profile/version/{versionId}/disable")]
     public async Task<IActionResult> DisableStrategyProfileVersion(long versionId, [FromBody] DisableRequest request, CancellationToken ct)
     {
@@ -302,6 +542,127 @@ public class GovernanceController : ControllerBase
         catch (InvalidOperationException ex)
         {
             _logger.LogWarning(ex, "策略包版本停用失败：{VersionId}", versionId);
+            return BadRequest(ApiResponse.Fail(400, ex.Message));
+        }
+    }
+
+    #endregion
+
+    #region 默认版本设置与解析（D-3，Q-C：同族原子切换 + 读侧歧义不随机取）
+
+    /// <summary>
+    /// 设置规则集版本为同族默认（D-3，2026-10 受控开发，契约 06 §D组 D-1）。
+    /// 默认标记 IsDefault 属治理元数据，仅 PUBLISHED 版本可置位；切换经仓储 SetDefaultAsync 单事务原子
+    /// 「清同族其它 + 置目标」，避免 UQ_RuleSetVersion_DefaultPublished 过滤唯一索引冲突；写审计。
+    /// </summary>
+    /// <remarks>开发者：3号位</remarks>
+    [Authorize(Policy = PermissionCodes.RuleMaintain)]
+    [HttpPost("rule-set/version/{versionId}/set-default")]
+    public async Task<IActionResult> SetDefaultRuleSetVersion(long versionId, CancellationToken ct)
+    {
+        try
+        {
+            await _governanceService.SetDefaultRuleSetVersionAsync(versionId, GetCurrentUserCode(), GetCurrentUserId(), ct);
+            _logger.LogInformation("规则集版本设为默认：{VersionId}，操作人：{OperatedBy}", versionId, GetCurrentUserCode());
+            return Ok(ApiResponse.Ok($"规则集版本 {versionId} 已设为默认"));
+        }
+        catch (InvalidOperationException ex)
+        {
+            _logger.LogWarning(ex, "规则集版本设为默认失败：{VersionId}", versionId);
+            return BadRequest(ApiResponse.Fail(400, ex.Message));
+        }
+    }
+
+    /// <summary>
+    /// 设置参数集版本为同族默认（D-3，2026-10 受控开发，契约 06 §D组 D-2）。
+    /// 同规则集语义；切换经 IParameterSetVersionRepository.SetDefaultAsync 单事务原子化（D-3 修正 SPV
+    /// ClearDefaultFlag + Update 两条独立 SQL 非原子缺陷），避免 UQ_ParameterSetVersion_DefaultPublished 冲突。
+    /// </summary>
+    /// <remarks>开发者：3号位</remarks>
+    [Authorize(Policy = PermissionCodes.ParameterEdit)]
+    [HttpPost("parameter-set/version/{versionId}/set-default")]
+    public async Task<IActionResult> SetDefaultParameterSetVersion(long versionId, CancellationToken ct)
+    {
+        try
+        {
+            await _governanceService.SetDefaultParameterSetVersionAsync(versionId, GetCurrentUserCode(), GetCurrentUserId(), ct);
+            _logger.LogInformation("参数集版本设为默认：{VersionId}，操作人：{OperatedBy}", versionId, GetCurrentUserCode());
+            return Ok(ApiResponse.Ok($"参数集版本 {versionId} 已设为默认"));
+        }
+        catch (InvalidOperationException ex)
+        {
+            _logger.LogWarning(ex, "参数集版本设为默认失败：{VersionId}", versionId);
+            return BadRequest(ApiResponse.Fail(400, ex.Message));
+        }
+    }
+
+    /// <summary>
+    /// 设置策略包版本为同族默认（C-7 §9.2 显式治理操作，D-3）。
+    /// 仅 PUBLISHED 版本可置位；清同 Profile 其它默认再置位，避免 UQ_StrategyProfileVersion_DefaultPublished 冲突；写审计。
+    /// 服务层内部对已是默认则幂等早退（不重复清默认+置位与审计）。
+    /// </summary>
+    /// <remarks>开发者：3号位</remarks>
+    [Authorize(Policy = PermissionCodes.StrategyEdit)]
+    [HttpPost("strategy-profile/version/{versionId}/set-default")]
+    public async Task<IActionResult> SetDefaultStrategyProfileVersion(long versionId, CancellationToken ct)
+    {
+        try
+        {
+            await _governanceService.SetDefaultStrategyProfileVersionAsync(versionId, GetCurrentUserCode(), GetCurrentUserId(), ct);
+            _logger.LogInformation("策略包版本设为默认：{VersionId}，操作人：{OperatedBy}", versionId, GetCurrentUserCode());
+            return Ok(ApiResponse.Ok($"策略包版本 {versionId} 已设为默认"));
+        }
+        catch (InvalidOperationException ex)
+        {
+            _logger.LogWarning(ex, "策略包版本设为默认失败：{VersionId}", versionId);
+            return BadRequest(ApiResponse.Fail(400, ex.Message));
+        }
+    }
+
+    /// <summary>
+    /// 读侧默认解析：规则集同族当前有效、无歧义的 PUBLISHED 默认版本（D-3，Q-C，契约 06 §D组 D-4）。
+    /// 无 RunType（RS 族解析）；镜象 SPV 三态判定：候选按生效窗过滤后 0→404、1→返回、&gt;1→400（红线 #4 禁止随机取，不以最新发布代替）。
+    /// </summary>
+    /// <remarks>开发者：3号位</remarks>
+    [Authorize(Policy = PermissionCodes.RuleView)]
+    [HttpGet("rule-set/{ruleSetId}/default")]
+    public async Task<IActionResult> ResolveDefaultRuleSet([FromRoute] long ruleSetId, [FromQuery] DateTime? asOf, CancellationToken ct)
+    {
+        try
+        {
+            var version = await _governanceService.ResolveDefaultRuleSetVersionAsync(ruleSetId, asOf, ct);
+            if (version == null)
+            {
+                return NotFound(ApiResponse.Fail(404, $"RuleSetId={ruleSetId} 无当前有效默认 PUBLISHED 规则集版本"));
+            }
+            return Ok(ApiResponse<RuleSetVersion>.Success(version));
+        }
+        catch (InvalidOperationException ex)
+        {
+            return BadRequest(ApiResponse.Fail(400, ex.Message));
+        }
+    }
+
+    /// <summary>
+    /// 读侧默认解析：参数集同族当前有效、无歧义的 PUBLISHED 默认版本（D-3，Q-C，契约 06 §D组 D-5）。
+    /// 无 RunType（PS 族解析）；三态判定同规则集：0→404、1→返回、&gt;1→400（不随机取、不以最新发布代替）。
+    /// </summary>
+    /// <remarks>开发者：3号位</remarks>
+    [Authorize(Policy = PermissionCodes.ParameterView)]
+    [HttpGet("parameter-set/{parameterSetId}/default")]
+    public async Task<IActionResult> ResolveDefaultParameterSet([FromRoute] long parameterSetId, [FromQuery] DateTime? asOf, CancellationToken ct)
+    {
+        try
+        {
+            var version = await _governanceService.ResolveDefaultParameterSetVersionAsync(parameterSetId, asOf, ct);
+            if (version == null)
+            {
+                return NotFound(ApiResponse.Fail(404, $"ParameterSetId={parameterSetId} 无当前有效默认 PUBLISHED 参数集版本"));
+            }
+            return Ok(ApiResponse<ParameterSetVersion>.Success(version));
+        }
+        catch (InvalidOperationException ex)
+        {
             return BadRequest(ApiResponse.Fail(400, ex.Message));
         }
     }
@@ -398,8 +759,9 @@ public class GovernanceController : ControllerBase
     [HttpGet("strategy-profile/{strategyProfileId}/versions")]
     public async Task<IActionResult> GetStrategyProfileVersions(long strategyProfileId, CancellationToken ct)
     {
-        var versions = await _strategyProfileVersionRepo.GetByStrategyProfileIdAsync(strategyProfileId, ct);
-        return Ok(ApiResponse<IReadOnlyList<StrategyProfileVersion>>.Success(versions));
+        // 4号位 2026-10-14 审计 R2/R3：列表投影带版本编码与父级主表 Id（前端直显编码 + 编辑定位父级，消除 N+1）
+        var versions = await _strategyProfileVersionRepo.GetByStrategyProfileIdWithCodesAsync(strategyProfileId, ct);
+        return Ok(ApiResponse<IReadOnlyList<StrategyProfileVersionListItem>>.Success(versions));
     }
 
     /// <summary>获取策略包版本详情</summary>
@@ -418,7 +780,7 @@ public class GovernanceController : ControllerBase
 
     /// <summary>创建策略包版本（P0-02：Service 强制初始状态 DRAFT——入参 Status 一律被忽略覆盖）</summary>
     /// <remarks>开发者：3号位</remarks>
-    [Authorize(Policy = PermissionCodes.RuleMaintain)]
+    [Authorize(Policy = PermissionCodes.StrategyEdit)]
     [HttpPost("strategy-profile/version")]
     public async Task<IActionResult> CreateStrategyProfileVersion([FromBody] StrategyProfileVersion version, CancellationToken ct)
     {
@@ -428,7 +790,7 @@ public class GovernanceController : ControllerBase
 
     /// <summary>更新策略包版本（P0-02：状态机约束——已发布/失效/归档拒绝原地修改；Status/治理字段/引用字段冻结，禁止越权改状态）</summary>
     /// <remarks>开发者：3号位</remarks>
-    [Authorize(Policy = PermissionCodes.RuleMaintain)]
+    [Authorize(Policy = PermissionCodes.StrategyEdit)]
     [HttpPut("strategy-profile/version/{versionId}")]
     public async Task<IActionResult> UpdateStrategyProfileVersion(long versionId, [FromBody] StrategyProfileVersion version, CancellationToken ct)
     {
@@ -446,7 +808,7 @@ public class GovernanceController : ControllerBase
 
     /// <summary>发布策略包版本（P0-06：DRAFT/SUBMITTED/APPROVED → PUBLISHED；发布前强制校验）</summary>
     /// <remarks>开发者：3号位</remarks>
-    [Authorize(Policy = PermissionCodes.RulePublish)]
+    [Authorize(Policy = PermissionCodes.StrategyPublish)]
     [HttpPost("strategy-profile/version/{versionId}/publish")]
     public async Task<IActionResult> PublishStrategyProfileVersion(long versionId, [FromBody] PublishRequest request, CancellationToken ct)
     {
@@ -670,7 +1032,7 @@ public class GovernanceController : ControllerBase
     #region 主表列表与运行支撑（G1/G7：3-4联调）
 
     /// <summary>规则集主表列表（G1/A1：4号位规则集列表页；R2 起返回含最新版本摘要的列表 DTO）</summary>
-    /// <remarks>开发者：3号位</remarks>
+    /// <remarks>开发者：3号位。activeOnly 三态语义（契约 v1.0 2026-10-10）：true=仅查 IsActive=1；false=仅查 IsActive=0（≠查全部）；缺省=不过滤全量。dev DB 当前无停用数据，传 false 恒返 0（客观状态非 bug）。</remarks>
     [Authorize(Policy = PermissionCodes.RuleView)]
     [HttpGet("rule-sets")]
     public async Task<IActionResult> GetRuleSets(
@@ -686,7 +1048,7 @@ public class GovernanceController : ControllerBase
     }
 
     /// <summary>参数集主表列表（G1/A8：4号位参数集列表页）</summary>
-    /// <remarks>开发者：3号位</remarks>
+    /// <remarks>开发者：3号位。activeOnly 三态语义（契约 v1.0 2026-10-10）：true=仅查 IsActive=1；false=仅查 IsActive=0（≠查全部）；缺省=不过滤全量。dev DB 当前无停用数据，传 false 恒返 0（客观状态非 bug）。</remarks>
     [Authorize(Policy = PermissionCodes.ParameterView)]
     [HttpGet("parameter-sets")]
     public async Task<IActionResult> GetParameterSets(
@@ -697,12 +1059,12 @@ public class GovernanceController : ControllerBase
         CancellationToken ct = default)
     {
         var (skip, take) = ResolvePaging(page, pageSize);
-        var result = await _parameterSetRepo.GetListAsync(activeOnly, keyword, skip, take, ct);
-        return Ok(ApiResponse<IReadOnlyList<ParameterSet>>.Success(result));
+        var result = await _parameterSetRepo.GetListWithVersionAsync(activeOnly, keyword, skip, take, ct);
+        return Ok(ApiResponse<IReadOnlyList<ParameterSetListItemDto>>.Success(result));
     }
 
     /// <summary>策略包主表列表（G1/A12：4号位策略包列表页）</summary>
-    /// <remarks>开发者：3号位</remarks>
+    /// <remarks>开发者：3号位。activeOnly 三态语义（契约 v1.0 2026-10-10）：true=仅查 IsActive=1；false=仅查 IsActive=0（≠查全部）；缺省=不过滤全量。dev DB 当前无停用数据，传 false 恒返 0（客观状态非 bug）。</remarks>
     [Authorize(Policy = PermissionCodes.StrategyView)]
     [HttpGet("strategy-profiles")]
     public async Task<IActionResult> GetStrategyProfiles(
@@ -738,7 +1100,7 @@ public class GovernanceController : ControllerBase
         }
     }
 
-    /// <summary>参数集当前生效 PUBLISHED 版本直达（G3/C2）</summary>
+    /// <summary>参数集当前生效 PUBLISHED 版本直达（G3/C2；R2 修复：快照载体经投影置空不外泄，五主题子块保留）</summary>
     /// <remarks>开发者：3号位</remarks>
     [Authorize(Policy = PermissionCodes.ParameterView)]
     [HttpGet("parameter-set/{parameterSetId}/published-version")]
@@ -780,7 +1142,8 @@ public class GovernanceController : ControllerBase
         }
     }
 
-    /// <summary>域依赖关系查询（G7：4号位失败链 / 域依赖展示；数据源为 2号位 sp_ScanDomainDependency 扫描结果，只读）</summary>
+    /// <summary>域依赖关系查询（G7：4号位失败链 / 域依赖展示；数据源为 2号位 sp_ScanDomainDependency 扫描结果，只读）
+    /// 2026-10-22 4号位 缺口修复：补数据范围收窄（第二道防线）——ResolveScope → 入参 403 → allowedDomains 下推仓储收窄。</summary>
     /// <remarks>开发者：3号位</remarks>
     [Authorize(Policy = PermissionCodes.PlanView)]
     [HttpGet("domain-dependencies")]
@@ -794,7 +1157,17 @@ public class GovernanceController : ControllerBase
             return BadRequest(ApiResponse.Fail(400, "domainCode 必填"));
         }
 
-        var result = await _domainDependencyRepo.GetByDomainAsync(domainCode.Trim(), direction, ct);
+        var scope = await _dataScopeService.ResolveScopeAsync(GetCurrentUserId(), ct);
+
+        // 入参必须落在授权范围（Global 全放行，无范围全拒绝）；越界 → 403（对照 A，RBAC 之外第二道防线）
+        var trimmedDomainCode = domainCode.Trim();
+        if (!scope.Allows(DataScopeTypes.Domain, trimmedDomainCode))
+        {
+            return StatusCode(403, ApiResponse.Fail(403, "Domain 范围越界"));
+        }
+
+        var allowedDomains = scope.GetValues(DataScopeTypes.Domain);
+        var result = await _domainDependencyRepo.GetByDomainAsync(trimmedDomainCode, direction, ct, allowedDomains);
         return Ok(ApiResponse<IReadOnlyList<DomainDependency>>.Success(result));
     }
 
@@ -869,12 +1242,13 @@ public class GovernanceController : ControllerBase
     [HttpGet("domain-definition")]
     public async Task<IActionResult> GetDomainDefinitions(CancellationToken ct)
     {
-        var result = await _domainDefinitionService.GetAllAsync(ct);
+        // N-03（0号位 复审 v1.1）：用户态列表读——按操作人 Domain Scope 过滤（Global 全量 / 非 Global 仅授权域 / 无授权空列表）。
+        var result = await _domainDefinitionService.GetAllAsync(GetCurrentUserId(), ct);
         return Ok(ApiResponse<IReadOnlyList<DomainDefinition>>.Success(result));
     }
 
     /// <summary>当前有效域集合（G-D09/G-D10：2号位归域执行唯一事实源）</summary>
-    /// <remarks>开发者：3号位</remarks>
+    /// <remarks>开发者：3号位｜N-03：信任调用（2号位 归域执行唯一事实源），不做用户 Domain Scope 过滤——与用户态列表/详情严格分离。</remarks>
     [Authorize(Policy = PermissionCodes.PlanView)]
     [HttpGet("domain-definition/active")]
     public async Task<IActionResult> GetActiveDomainDefinitions(CancellationToken ct)
@@ -889,12 +1263,21 @@ public class GovernanceController : ControllerBase
     [HttpGet("domain-definition/{id}")]
     public async Task<IActionResult> GetDomainDefinition(int id, CancellationToken ct)
     {
-        var entity = await _domainDefinitionService.GetByIdAsync(id, ct);
-        if (entity == null)
+        try
         {
-            return NotFound(ApiResponse.Fail(404, $"域定义不存在：{id}"));
+            // N-03（0号位 复审 v1.1）：用户态详情读——非 Global 用户目标域不在授权范围 → 403（防通过 Id 窥探他域定义）。
+            var entity = await _domainDefinitionService.GetByIdAsync(id, GetCurrentUserId(), ct);
+            if (entity == null)
+            {
+                return NotFound(ApiResponse.Fail(404, $"域定义不存在：{id}"));
+            }
+            return Ok(ApiResponse<DomainDefinition>.Success(entity));
         }
-        return Ok(ApiResponse<DomainDefinition>.Success(entity));
+        catch (ScopeViolationException ex)
+        {
+            _logger.LogWarning(ex, "域定义详情业务范围越权：{Id}", id);
+            return StatusCode(403, ApiResponse.Fail(403, ex.Message));
+        }
     }
 
     /// <summary>产品族下拉列表（Domain 维护页数据源；方案 A：前端 productFamilyId 数字选择器）</summary>
@@ -918,8 +1301,8 @@ public class GovernanceController : ControllerBase
     }
 
     /// <summary>新建域定义（G-D02：唯一性 / ScopeType / 引用合法性校验 + 审计；新建默认启用）</summary>
-    /// <remarks>开发者：3号位</remarks>
-    [Authorize(Policy = PermissionCodes.RuleMaintain)]
+    /// <remarks>开发者：3号位｜2026-10-25 权限修正：RuleMaintain→DomainMaintain（冻结 §4.1 系统管理员维护，勿再误挂规则码）</remarks>
+    [Authorize(Policy = PermissionCodes.DomainMaintain)]
     [HttpPost("domain-definition")]
     public async Task<IActionResult> CreateDomainDefinition([FromBody] DomainDefinition entity, CancellationToken ct)
     {
@@ -927,6 +1310,11 @@ public class GovernanceController : ControllerBase
         {
             var created = await _domainDefinitionService.CreateAsync(entity, GetCurrentUserId(), GetCurrentUserCode(), ct);
             return CreatedAtAction(nameof(GetDomainDefinition), new { id = created.Id }, ApiResponse<DomainDefinition>.Success(created));
+        }
+        catch (ScopeViolationException ex)
+        {
+            _logger.LogWarning(ex, "域定义业务范围越权：{DomainKey}", entity.DomainKey);
+            return StatusCode(403, ApiResponse.Fail(403, ex.Message));
         }
         catch (InvalidOperationException ex)
         {
@@ -936,8 +1324,8 @@ public class GovernanceController : ControllerBase
     }
 
     /// <summary>编辑域定义（G-D03~G-D05：DomainKey 不可变更 + 校验）</summary>
-    /// <remarks>开发者：3号位</remarks>
-    [Authorize(Policy = PermissionCodes.RuleMaintain)]
+    /// <remarks>开发者：3号位｜2026-10-25 权限修正：RuleMaintain→DomainMaintain（冻结 §4.1 系统管理员维护）</remarks>
+    [Authorize(Policy = PermissionCodes.DomainMaintain)]
     [HttpPut("domain-definition/{id}")]
     public async Task<IActionResult> UpdateDomainDefinition(int id, [FromBody] DomainDefinition entity, CancellationToken ct)
     {
@@ -945,6 +1333,11 @@ public class GovernanceController : ControllerBase
         {
             var updated = await _domainDefinitionService.UpdateAsync(id, entity, GetCurrentUserId(), GetCurrentUserCode(), ct);
             return Ok(ApiResponse<DomainDefinition>.Success(updated));
+        }
+        catch (ScopeViolationException ex)
+        {
+            _logger.LogWarning(ex, "域定义业务范围越权：{Id}", id);
+            return StatusCode(403, ApiResponse.Fail(403, ex.Message));
         }
         catch (InvalidOperationException ex)
         {
@@ -954,8 +1347,8 @@ public class GovernanceController : ControllerBase
     }
 
     /// <summary>启用域定义（G-D16 反向）</summary>
-    /// <remarks>开发者：3号位</remarks>
-    [Authorize(Policy = PermissionCodes.RuleMaintain)]
+    /// <remarks>开发者：3号位｜2026-10-25 权限修正：RuleMaintain→DomainMaintain（冻结 §4.1 系统管理员维护）</remarks>
+    [Authorize(Policy = PermissionCodes.DomainMaintain)]
     [HttpPost("domain-definition/{id}/enable")]
     public async Task<IActionResult> EnableDomainDefinition(int id, [FromQuery] string? operatedBy, CancellationToken ct)
     {
@@ -963,6 +1356,11 @@ public class GovernanceController : ControllerBase
         {
             var updated = await _domainDefinitionService.SetActiveAsync(id, true, GetCurrentUserId(), GetCurrentUserCode(), ct);
             return Ok(ApiResponse<DomainDefinition>.Success(updated));
+        }
+        catch (ScopeViolationException ex)
+        {
+            _logger.LogWarning(ex, "域定义业务范围越权：{Id}", id);
+            return StatusCode(403, ApiResponse.Fail(403, ex.Message));
         }
         catch (InvalidOperationException ex)
         {
@@ -972,8 +1370,8 @@ public class GovernanceController : ControllerBase
     }
 
     /// <summary>停用域定义</summary>
-    /// <remarks>开发者：3号位</remarks>
-    [Authorize(Policy = PermissionCodes.RuleMaintain)]
+    /// <remarks>开发者：3号位｜2026-10-25 权限修正：RuleMaintain→DomainMaintain（冻结 §4.1 系统管理员维护）</remarks>
+    [Authorize(Policy = PermissionCodes.DomainMaintain)]
     [HttpPost("domain-definition/{id}/disable")]
     public async Task<IActionResult> DisableDomainDefinition(int id, [FromQuery] string? operatedBy, CancellationToken ct)
     {
@@ -981,6 +1379,11 @@ public class GovernanceController : ControllerBase
         {
             var updated = await _domainDefinitionService.SetActiveAsync(id, false, GetCurrentUserId(), GetCurrentUserCode(), ct);
             return Ok(ApiResponse<DomainDefinition>.Success(updated));
+        }
+        catch (ScopeViolationException ex)
+        {
+            _logger.LogWarning(ex, "域定义业务范围越权：{Id}", id);
+            return StatusCode(403, ApiResponse.Fail(403, ex.Message));
         }
         catch (InvalidOperationException ex)
         {

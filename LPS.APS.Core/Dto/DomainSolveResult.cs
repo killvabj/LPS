@@ -94,6 +94,46 @@ public sealed class FinalTaskDraft
     public decimal SetupTime { get; init; }
 
     /// <summary>
+    /// 有效加工分钟（1号位 2026-10-26 回执 §一 点名新增的 1→2 出口字段）。
+    ///
+    /// 【口径】＝标准工时 × 该 draft 的 <see cref="PlannedProcessQty"/> ÷ 产能系数（CapacityFactor）。
+    ///   **不含** Setup（单列在 <see cref="SetupTime"/>）、**不含**跨日历中断（中断由评估层按日历算，不落库）。
+    ///   是**不变量**：压实、重排、Setup 重解析都不改它。
+    ///
+    ///   ⚠ 乘数取**该 draft 自己的 <see cref="PlannedProcessQty"/>**（计划加工数量，含计划良率放大）；
+    ///   不得套需求级的 `demand.PlannedProcessQty` —— 拆批／合批时 1号位 已把拆后值／合并值
+    ///   **写进该 draft 的 `PlannedProcessQty`**（拆批 `PhaseFourLocalRepair.cs:1786`、
+    ///   合批 `PhaseTwoInitialScheduler.cs:7606`），故消费侧**不需特判**。
+    ///   <see cref="Quantity"/> 是净合格产出（`NetOutputQty`，**不含**良率放大），不可当乘数 —— 拿它算会短一截。
+    ///   现役加工时长的五个计算点一律乘 `PlannedProcessQty`（1号位 2026-10-26 回执 §五 逐处列出）。
+    ///   **本字段由 1号位 填值，我方只按值使用、不自行推算。**
+    ///
+    /// 【用途】我方回写 <c>Task.Duration</c> 时的有效加工分量：装「工时」时
+    ///   <c>Duration = EffectiveProcessMinutes + SetupTime</c>；若 0号位 裁装「有效加工」则两者同值。
+    ///
+    /// null ＝ 1号位 未给值。消费侧回落 <c>PlannedEndTime − PlannedStartTime</c> 并**计数**：
+    ///   单窗下该值与有效加工碰巧相等，**跨窗 Task 落到回落分支值会偏大** ⇒ 必须被缺值计数抓出，不得静默通过。
+    /// </summary>
+    public decimal? EffectiveProcessMinutes { get; init; }
+
+    /// <summary>
+    /// 工时出口字段（落库 <c>Task.Duration</c>，即冻结 DDL v5.1.8.9 <c>:4323</c> 的既有列、<c>:4337</c> 已 INCLUDE 进查询索引）。
+    ///
+    /// 【语义】以 1号位 2026-10-26 回执 §一 为准：装<b>工时 ＝ Setup ＋ 加工</b>，不含跨窗中断；
+    ///   依据冻结 <c>07 :33</c>「Setup 占设备但不属于有效加工，计划负荷不能代替有效加工评分」。
+    ///   **有效加工另由 <see cref="EffectiveProcessMinutes"/> 承载，两者不是一个数（差一个 Setup），不可互相顶替。**
+    ///   若 0号位 裁定装「有效加工」，则以 <see cref="EffectiveProcessMinutes"/> 同值写入。
+    ///
+    /// 【单位】现行库值口径＝**分钟**；冻结《字段说明》v5.1.15 <c>:3696</c> 标「小时」，
+    ///   单位订正已出提案、待 0号位 裁，我方不直改冻结件。
+    ///
+    /// 【现状】本属性在生产代码中**无赋值点、无消费点**（2026-10-26 核实）。
+    ///   历史 <c>Task.Duration</c> 一直由我方以墙钟跨度 <c>PlannedEndTime − PlannedStartTime</c> 回写；
+    ///   按新语义该算式需连同 <see cref="SetupTime"/> 一并调整（落地顺序见 1号位 2026-10-26 回执 §九）。
+    /// </summary>
+    public decimal? Duration { get; init; }
+
+    /// <summary>
     /// 换型来源（唯一落库值 = 4 态：INITIAL_SETUP_STATE / EXACT / DEFAULT / SETUP_RULE_MISSING_ZERO_FALLBACK，
     /// 0号位 2026-09-22 裁决替换旧 5 值 EXACT/DEFAULT/SAME_PRODUCT/NONE/INITIAL）。
     /// SetupTime=0 三语义与 SetupTime&gt;0 二语义无法由数值区分，必须显式来源字段，禁止查询层反推。
@@ -172,8 +212,25 @@ public sealed class AllocationTaskShare
 
 public sealed class UnscheduledTaskResult
 {
+    /// <summary>
+    /// 需求键。**值域是 `LogicalDemandKey`，不是 `FinalDraftId`** ——
+    /// 由 Solver 在 `PhaseFiveCompression.ReportUnscheduled` 处原样回传，
+    /// 消费侧必须按需求键域 join（`PeggingOrchestrator` 据此反查 `NetOutputQty`）。
+    /// </summary>
     public string DraftId { get; init; } = string.Empty;
+
+    /// <summary>未排原因码。</summary>
     public string Reason { get; init; } = string.Empty;
+
+    /// <summary>
+    /// 该需求的未排量 U（＝ `NetOutputQty` − 已落定份额之和，≥ 0）。
+    ///
+    /// 【为什么在 Solver 出口给数量】部分落定时「已排量可交、未排量只有键没有量」，
+    /// 下游只能按「完全未排」去猜，与「未排 200 可追溯」的基线要求不符。
+    /// 与 `PeggingOrchestrator` 侧同名同义，供 Allocation 级三量对账 `Σ ShareQty + Σ U = Σ Q`。
+    /// 未填写时按 0 处理（未排量不进份额、不造伪 Task）。
+    /// </summary>
+    public decimal UnscheduledQty { get; init; }
 }
 
 /// <summary>
@@ -244,6 +301,27 @@ public sealed class DemandCompletionFact
 
     /// <summary>供给可用时间。V1 与 <see cref="CompletionTime"/> 同值（已对齐）。</summary>
     public DateTime AvailableTime { get; init; }
+
+    /// <summary>
+    /// **完成时间是否可信**（G-3，1号位 2026-10-25 核证回执 §五 点名；Core 契约）。
+    ///
+    /// 三态：
+    ///   · `null` = 未标注 ⇒ **按现状**（向后兼容，旧载荷/未适配生产者一律落此支）；
+    ///   · `true`  = 时间由真实事实推出，可作承诺与供给可用时间；
+    ///   · `false` = **时间不可信**（缺 LT / 缺合法 WORK 窗口）⇒ 消费侧**不得**把它当承诺、
+    ///     不得作为供给可用时间、**不得**据它推下游 `AvailableTime`。
+    ///
+    /// 【为什么加标注位而不把 `CompletionTime` 改可空】改可空会让所有消费方静默拿到
+    ///   `default(DateTime)`（0001-01-01），比现状更糟；`SolveTraceNote` 是自由文本诊断通道，
+    ///   不能替代结构化契约（1号位 同件 §五 G-3 理由，我方同意）。
+    ///
+    /// 【2号位 读侧义务】`false` 的完成时间进入「时间不可信」计数（证据 JSON / 未排口径），
+    ///   不进入任何承诺或供给可用时间。
+    ///
+    /// 【交付状态 2026-10-25】契约骨架已落；**生产侧尚未置值**（恒 `null` ⇒ 零回归）。
+    ///   置值随「缺 LT / 缺 WORK 两类判据」在 1号位 消费侧扩判据后同步落码。
+    /// </summary>
+    public bool? CompletionTimeCertain { get; init; }
 
     /// <summary>
     /// 做到 `RequiredStageCode` 为止的完成时间（0号位 §10.3「Demand / RequiredStage」两个口径都给，已对齐）。

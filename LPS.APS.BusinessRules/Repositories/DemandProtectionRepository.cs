@@ -51,7 +51,8 @@ WHERE 1=1
     AND (@Status IS NULL OR Status = @Status)
 ORDER BY
     CASE Status WHEN 'ACTIVE' THEN 1 WHEN 'RELEASED' THEN 2 ELSE 3 END,
-    CreatedAt DESC
+    CreatedAt DESC,
+    Id   -- tiebreaker：分页确定性（全链清扫）
 OFFSET @Skip ROWS FETCH NEXT @Take ROWS ONLY";
 
         var parameters = new

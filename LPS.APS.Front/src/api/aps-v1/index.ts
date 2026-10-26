@@ -19,7 +19,29 @@ export { ctpApi } from './ctp'
 export { candidateApi } from './candidate'
 export { explanationApi } from './explanation'
 export { piApi } from './pi'
-export { ruleApi, mockActor } from './rule'
+export { peggingTraceApi } from './peggingTrace'
+export { ruleApi, mockActor, buildForkContentSnapshot } from './rule'
+export type { BackendRuleSetVersion } from './rule'
+export { parameterSetApi } from './parameterSet'
+export type {
+  BackendParameterSetVersion,
+  BackendParameterSet,
+  CreateParameterSetInput
+} from './parameterSet'
+export {
+  DEMAND_FIELDS,
+  CONDITION_OPERATORS,
+  SORT_DIRECTIONS,
+  COMPETITION_ROUNDS,
+  demandFieldLabel,
+  conditionOperatorLabel,
+  sortDirectionLabel,
+  competitionRoundLabel,
+  conditionValueText,
+  conditionText,
+  sortFieldText,
+  parsePrioritySegments
+} from './prioritySegment'
 export {
   flattenBlocks,
   applyEdit,
@@ -43,6 +65,30 @@ export type {
   BlockBindings,
   ParameterSetBindingsConfig
 } from './parameterSetBindings'
+export { warehouseDictionaryApi } from './warehouseDictionary'
+export type { WarehouseDictItem } from './warehouseDictionary'
+export {
+  SUPPLY_WAREHOUSE_PRIORITY_PATH,
+  PROCUREMENT_WAREHOUSE_PRIORITY_PATH,
+  DEFAULT_PURCHASE_LT_PATH,
+  ARRIVAL_TO_USABLE_OFFSETS_PATH,
+  isWarehouseRefRow,
+  readStringArray,
+  writeStringArray,
+  readObjectArray,
+  writeObjectArray,
+  collectWarehouseRefs,
+  unknownWarehouseCodes,
+  unknownWarehouseCodesOf
+} from './warehouseRefs'
+export type { PurchaseLtItem, ArrivalOffsetItem, WarehouseRefGroups } from './warehouseRefs'
+export {
+  ANCHOR_RESOURCE_CODE_KEY,
+  isAnchorResourceCodeRow,
+  readAnchorResourceCode,
+  writeAnchorResourceCode,
+  ensureAnchorResourceCodeKey
+} from './anchorResource'
 export { runApi } from './run'
 export {
   BUSINESS_ENTRIES,
@@ -67,5 +113,12 @@ export { strategyProfileApi } from './strategyProfile'
 export { setupApi } from './setup'
 export { auditApi } from './audit'
 export { opmApi, MOCK_OPM_MATERIAL_ID } from './opm'
+export { materialLookupApi } from './materialLookup'
+export { departmentLookupApi } from './departmentLookup'
+export type { DepartmentLookupItem } from './departmentLookup'
+export { resourceLookupApi } from './resourceLookup'
+export type { ResourceLookupItem } from './resourceLookup'
 export { resourceCalendarApi } from './resourceCalendar'
-export type { ResourceCandidateResult, DepartmentCandidate } from './resourceCalendar'
+export type { DepartmentCandidate } from './resourceCalendar'
+export { taskSplitRuleConfigApi } from './taskSplitRuleConfig'
+export { productionWorkCalendarApi } from './productionWorkCalendar'

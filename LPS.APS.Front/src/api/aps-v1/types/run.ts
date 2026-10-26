@@ -1,124 +1,71 @@
 /**
- * 运行 / 版本 / MES 下发状态 DTO（占位）
+ * 运行 / 候选触发 DTO —— 对齐后端**已部署**契约（2026-10-16）
  *
- * @see 4号位文档第 15-16 节（页面 9：运行/版本/MES 下发状态）
- * 后端未实现，等 3 号位落地后对齐。
+ * 2026-10-16 代码级审计修正（`/aps/run` 页面恒空）：
+ *  此处的 `RunStatusDto` 聚合体是 4号位 早前自拟的，后端**从未实现**。
+ *  `GET /api/governance/runs` 的端点说明已写明「**只查 ScheduleRun 表、不做跨域综合统计**」，
+ *  实际返回的是 `ScheduleRunGov[]` 裸数组；页面按聚合体取值 ⇒ `recentRuns` 恒 undefined ⇒
+ *  整页 KPI 恒 0。现按三个真实数据面重排：
+ *   - Run 列表   ← `GET /api/governance/runs`            （3号位，裸数组）
+ *   - 生效版本   ← `GET /api/overview/active-plan`       （5号位，`ActiveVersionPanel[]`）
+ *   - 域状态拆解 ← `GET /api/domain-status/{runId}`      （5号位，`RunDomainStatusItem[]`）
  *
- * 验收场景参考：
- *  - U01（ACTIVE 多 Domain 各 Domain 版本正确展示）
- *  - U02（PARTIAL_SUCCESS：成功/失败/被上游失败阻断的 Domain 区分）
- *  - U19（FAILED Run 恢复：新 Run 产生，旧 Run 仍 FAILED）
- *  - U16-U18（MES 下发资格判定）
+ * 已删（后端无源，见《4号位致3号位/5号位·运行页联调缺口回执》）：
+ *  - `RunStatusDto` 聚合体 · `MesEligibilityDto` · `MesDispatchInput` · `MesDispatchResult`
+ *  - `PartialSuccessBreakdown` / `DomainRunResult`（改用 5号位 `/api/domain-status/{runId}`）
+ *  - `PlanVersionDto`（改用 5号位 `ActiveVersionPanel`）
  */
 
-import type {
-  DomainKey,
-  IsoDateTime,
-  MesEligibility,
-  PlanVersionStatus,
-  TaskStatus
-} from './common'
+import type { DomainKey, IsoDateTime, TaskStatus } from './common'
 
-/** ScheduleRun 详情 */
-export interface ScheduleRunDto {
-  runId: number
-  runType: 'FULL_SCHEDULE' | 'LOCAL_RESCHEDULE' | 'MANUAL_RESCHEDULE' | 'INSERT_ORDER_WHATIF'
-  status: 'PENDING' | 'RUNNING' | 'PARTIAL_SUCCESS' | 'SUCCESS' | 'FAILED'
+/**
+ * ScheduleRun 状态权威值域 —— 冻结 07 §4.5：`RUNNING / COMPLETED / PARTIAL_SUCCESS / FAILED`，默认 COMPLETED。
+ * @see 冻结文档/07_APS_数据库字段说明文档 §4.5 ScheduleRun 表 Status 行
+ *
+ * ⚠️ 历史踩坑：前端曾自拟 `PENDING` / `SUCCESS`，冻结值域里**都不存在**，而真正的 `COMPLETED` 反而漏了
+ *    ⇒ 「成功」卡恒 0、后端真跑出 COMPLETED 时不计入任何卡片。
+ */
+export const RUN_STATUSES = ['RUNNING', 'COMPLETED', 'PARTIAL_SUCCESS', 'FAILED'] as const
+export type RunStatus = (typeof RUN_STATUSES)[number]
+
+/** ScheduleRun 运行类型（冻结 07 §4.5：FULL_SCHEDULE / MANUAL_RESCHEDULE / LOCAL_RESCHEDULE / SIMULATION / INSERT_ORDER_WHATIF） */
+export const RUN_TYPES = [
+  'FULL_SCHEDULE',
+  'MANUAL_RESCHEDULE',
+  'LOCAL_RESCHEDULE',
+  'SIMULATION',
+  'INSERT_ORDER_WHATIF'
+] as const
+export type RunType = (typeof RUN_TYPES)[number]
+
+/**
+ * ScheduleRun 行 —— 对齐后端 `ScheduleRunGov`（`GET /api/governance/runs` 的数组元素）。
+ * @see lps/LPS.APS.Core/DTOs/Governance/ScheduleRunGov.cs
+ *
+ * ⚠️ 后端 `WhenWritingNull` 会把 null 字段**整个从 JSON 里省掉**，故除 id/runType/status/
+ *    dataCutoffTime/startedAt 外全部按可选处理，模板不得假设它们一定在。
+ */
+export interface ScheduleRunGovDto {
+  id: number
+  runType: RunType
+  status: RunStatus
+  /** 触发来源：'Hangfire' / UserId / 'API' / 'Agent' */
+  triggeredBy?: string | null
+  /** 本次运行统一数据切片边界 */
   dataCutoffTime: IsoDateTime
-  strategyProfileVersion?: string
-  /** 期望 Domain 列表 */
-  expectedDomainKeys: DomainKey[]
+  /** 绑定的策略包版本 Id（可为 null = 无绑定） */
+  strategyProfileVersionId?: number | null
+  /** 白天 Candidate 所基于的当前 ACTIVE 计划版本 */
+  basePlanVersionId?: number | null
+  /** 运行启动时冻结的预期 Domain 集合（JSON 数组字符串；后端不给解析后的数组） */
+  expectedDomainKeysJson?: string | null
+  /** 局部重排范围 JSON（v5.1.4 起不再承载 ExpectedDomainKeys，仅保留只读） */
+  scopeJson?: string | null
   startedAt: IsoDateTime
-  completedAt?: IsoDateTime
-  errorMessage?: string
-}
-
-/** Domain 执行结果（在 ScheduleRun 内） */
-export interface DomainRunResult {
-  domainKey: DomainKey
-  status: 'SUCCESS' | 'FAILED' | 'BLOCKED_BY_UPSTREAM'
-  errorMessage?: string
-  /** 该 Domain 产出的 PlanVersionId（成功时） */
-  planVersionId?: number
-  /** 阻断来源 Domain Key（BLOCKED_BY_UPSTREAM 时） */
-  blockedByDomainKey?: DomainKey
-}
-
-/** PlanVersion 详情 */
-export interface PlanVersionDto {
-  domainKey: DomainKey
-  planVersionId: number
-  versionCode: string
-  status: PlanVersionStatus
-  basePlanVersionId?: number
-  activatedAt?: IsoDateTime
-  errorMessage?: string
-  /** 当前排产范围 */
-  planHorizonStart: IsoDateTime
-  planHorizonEnd: IsoDateTime
-}
-
-/** PARTIAL_SUCCESS 拆解（U02） */
-export interface PartialSuccessBreakdown {
-  scheduleRunId: number
-  successDomains: DomainRunResult[]
-  failedDomains: DomainRunResult[]
-  blockedDomains: DomainRunResult[]
-}
-
-/** MES 下发资格（4号位文档第 16 节） */
-export interface MesEligibilityDto {
-  taskId: number
-  taskNo: string
-  eligibility: MesEligibility
-  /** 不可下发时的原因列表 */
-  reasons?: Array<
-    | 'CANDIDATE'
-    | 'UNLOCATED'
-    | 'NO_PI'
-    | 'PLANNING_PLACEHOLDER_DEPENDENCY'
-    | 'OUT_OF_DISPATCH_WINDOW'
-    | 'CANCELLED'
-  >
-  /** 下发窗口（合法下发开始/结束时间） */
-  dispatchWindow?: { from: IsoDateTime; to: IsoDateTime }
-  /**
-   * 任务所属 Domain（P1-15 业务范围断言用；缺失 = 跳过前端断言，由 3号位后端兜底）
-   * @see 审核报告 §十七.17.2 + §二十五.7
-   */
-  domainKey?: DomainKey
-}
-
-/** MES 下发输入（5号位中转 → MES） */
-export interface MesDispatchInput {
-  taskId: number
-  /** 当前操作人（Section 17 审计要求；mock 由 JWT 注入） */
-  actor: string
-  /** 可选备注 */
-  remark?: string
-}
-
-/** MES 下发结果 */
-export interface MesDispatchResult {
-  taskId: number
-  taskNo: string
-  /** MES 返回的工单号（5号位 → MES → 返回） */
-  mesDispatchId: string
-  /** 下发时间 */
-  dispatchedAt: IsoDateTime
-  status: 'DISPATCHED'
-  /** 当前操作人（回显） */
-  actor: string
-}
-
-/** RunStatusDto — 运行/版本/MES 状态（页面 9） */
-export interface RunStatusDto {
-  recentRuns: ScheduleRunDto[]
-  activeVersions: PlanVersionDto[]
-  /** 当前 PARTIAL_SUCCESS 拆解（如有） */
-  currentPartialBreakdown?: PartialSuccessBreakdown
-  /** MES 下发资格检查的样本 Task */
-  mesEligibilitySamples: MesEligibilityDto[]
+  /** 终态完成时间（COMPLETED / PARTIAL_SUCCESS / FAILED 均写入；RUNNING 时为 null ⇒ 键缺失） */
+  completedAt?: IsoDateTime | null
+  /** 失败错误信息（仅 FAILED） */
+  errorMessage?: string | null
 }
 
 /** FAILED 恢复输入（U19：新建 Run，不直接改 FAILED → RUNNING） */
@@ -135,7 +82,7 @@ export interface RecoverFailedRunResult {
   originalRunId: number
   /** 原始 Run 状态保持 FAILED（4号位文档第 15 节） */
   originalRunStatus: 'FAILED'
-  newRunStatus: ScheduleRunDto['status']
+  newRunStatus: RunStatus
   startedAt: IsoDateTime
 }
 

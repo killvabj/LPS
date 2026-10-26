@@ -1,3 +1,5 @@
+using System.Text.Json.Serialization;
+
 namespace LPS.APS.Core.Dto;
 
 /// <summary>
@@ -35,18 +37,53 @@ public sealed class DemandPriorityBlock
     public List<PrioritySegment> Segments { get; set; } = [];
 }
 
+/// <summary>
+/// 段内**拒绝未知成员**（.NET 8 <c>JsonUnmappedMemberHandling.Disallow</c>）。
+///
+/// 要防的具体形态：轮次键名写错。`JsonSerializerOptions` 默认**忽略**未知成员，
+/// 若快照写 <c>"Round": 1</c> 而我们读 <c>CompetitionRound</c>，
+/// 该段会被当成「未声明轮次」⇒ 整块回落第 1 轮，**无异常、无告警**，只有排序结果不对。
+/// 设为拒收后，同一情形变成装载期报错并点名 <c>Round</c>。
+///
+/// 影响面已核：现行三个已发布快照（<c>RuleSetVersion</c> 477 / 478 / 1240）的段内键
+/// 只有 <c>SegmentOrder / SegmentName / IsEnabled / MatchConditions / SortFields / StableTieBreakFields</c>
+/// 六个，与本类一一对应，不会误伤存量数据。
+/// </summary>
+[JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
 public sealed class PrioritySegment
 {
     public int SegmentOrder { get; set; }                 // 排序序号（升序）
     public string SegmentName { get; set; } = "";         // 可解释名
     public bool IsEnabled { get; set; }
 
+    /// <summary>
+    /// 竞争轮次（可选；B1／B3 v1.2 §1.1，2026-10-20）。**可空是契约的一部分**，不是缺省填充：
+    /// <c>null</c> 表示该段**没有声明轮次**，投影层据此执行 fail-closed——
+    /// 整块都未声明 ⇒ 全部按第 1 轮（今日行为不变）；部分声明部分未声明 ⇒ 显式抛错。
+    /// 若改成非空并给默认 <see cref="Dto.CompetitionRound.Round1"/>，就再也分不出
+    /// 「声明了第 1 轮」与「漏写」，静默并轮的口子会重开。
+    ///
+    /// 轮次≠BOM 计算层级（0号位 Q1）。值域＝<see cref="Dto.CompetitionRound"/>（3号位 B3 v1.2 定盘）。
+    /// </summary>
+    public CompetitionRound? CompetitionRound { get; set; }
+
     /// <summary>命中条件（AND 列表；全部满足才命中本 Segment）——强类型表达，不建 DSL（清单 17 红线）</summary>
     public List<SegmentMatchCondition> MatchConditions { get; set; } = [];
     /// <summary>命中后本 Segment 内部排序字段（有序，依次生效）</summary>
     public List<SegmentSortField> SortFields { get; set; } = [];
-    /// <summary>稳定 Tie-break 字段（并列时最终稳定顺序，避免随机）</summary>
-    public List<string> StableTieBreakFields { get; set; } = [];
+
+    /// <summary>
+    /// 稳定 Tie-break 字段（并列时最终稳定顺序，避免随机）。
+    ///
+    /// **强类型**（B3 v1.2 §3：枚举成员名直接取执行器白名单词），编译器即可挡住名字漂移；
+    /// 旧快照写的 <c>"OrderId"</c> / <c>"DemandKey"</c> 由
+    /// <see cref="TieBreakFieldJsonConverter"/> 归一化到 <see cref="TieBreakField.DEMANDKEY"/>，
+    /// 新快照一律写 <c>"DEMANDKEY"</c>。
+    /// </summary>
+    // 转换器挂在枚举类型本体上（见 TieBreakField 声明），不能挂在这个 List 属性上：
+    // JsonConverterAttribute 的转换器必须与**属性的声明类型**同型，挂在 List<TieBreakField>
+    // 上会被 System.Text.Json 直接判为不兼容并抛 InvalidOperationException（整个快照都反序列化不了）。
+    public List<TieBreakField> StableTieBreakFields { get; set; } = [];
 }
 
 public sealed class SegmentMatchCondition
@@ -82,6 +119,40 @@ public enum DemandField
 
 public enum ConditionOperator { Equals, NotEquals, LessThan, LessOrEqual, GreaterThan, GreaterOrEqual, In }
 public enum SortDirection { Asc, Desc }
+
+/// <summary>
+/// 竞争轮次（B3 v1.2 §1.1，3号位 治理侧强类型三分组）。
+///
+/// **与 BOM 计算层级无关**（0号位 Q1 明令）：轮次只表达「谁先参与竞争」，
+/// 不等于 `01 §22` 的 BOM 层深。
+/// 数值即轮序，运行侧按数值升序逐轮调用同一个排序器。
+/// </summary>
+public enum CompetitionRound
+{
+    /// <summary>顶层独立需求：顶层客户订单 ＋ 成品层顶层 MTS。</summary>
+    Round1 = 1,
+    /// <summary>SH 源厂履约（仅 `SourceFactoryId &lt;&gt; FactoryId`）。</summary>
+    Round2 = 2,
+    /// <summary>孤儿与下阶：孤儿 SH ＋ 孤儿 MTS ＋ BOM 下阶子件（随根需求继承）。</summary>
+    Round3 = 3,
+}
+
+/// <summary>
+/// 稳定 Tie-break 字段（B3 v1.2 §3，2026-10-20）。
+/// **枚举成员名＝执行器白名单词**，因此投影层不再需要任何别名换算。
+///
+/// 转换器（<see cref="TieBreakFieldJsonConverter"/>）必须挂在**枚举本体**上：元素级转换器在
+/// <c>List&lt;TieBreakField&gt;</c> 里才会被逐个应用；挂到 List 属性上会被判为类型不兼容。
+///
+/// ⚠ 新增成员必须先由 2号位 在 <c>DemandPriorityExecutor.KnownFields</c> 落地对应比较分支，
+/// 否则发布期放行、运行期抛错。
+/// </summary>
+[JsonConverter(typeof(TieBreakFieldJsonConverter))]
+public enum TieBreakField
+{
+    /// <summary>需求键（＝订单身份）。执行器词表 `DEMANDKEY`。</summary>
+    DEMANDKEY,
+}
 
 /// <summary>
 /// ② LockBlock（Demand Protection / 锁定）（清单 18~19 / 冻结 4.2-Supply/Lock）
@@ -163,7 +234,7 @@ public sealed class ProcurementBlock
 public sealed class PurchaseLtRule
 {
     public string WarehouseCode { get; set; } = "";
-    public string? MaterialId { get; set; }               // 空 = Warehouse 级默认
+    public string? MaterialId { get; set; }               // Material 主表「数值主键 Id」（区别于 PlanningYieldRule.MaterialId=物料编码）；空 = Warehouse 级默认
     public double DefaultLtDays { get; set; }
 }
 
@@ -181,7 +252,7 @@ public sealed class WarehouseOffsetRule
 
 public sealed class PlanningYieldRule
 {
-    public string MaterialId { get; set; } = "";
+    public string MaterialId { get; set; } = "";          // = 物料编码 MaterialCode（R04 良率 3↔2 已签：以 MaterialCode 为准，2号位 会签见 20261023 五项会签）；需求侧已用 Material 表 Id↔MaterialCode 映射把数值 Id 转成编码后再与快照内本字段比对，故快照存编码、直接等值比对，无两套身份
     public string? StageCode { get; set; }                // 空 = Material 级默认
     public decimal YieldPercent { get; set; }             // 0 < YieldPercent <= 100
 }
@@ -204,7 +275,8 @@ public sealed class SolverStrategyBlock
     // P1-02 补充（2026-09-14，2号位 出字段 / 3号位 冻结参数值 / 1号位 换读）：
     // BottleneckMode 只定「选哪个锚点」，不覆盖「利用率超多少判瓶颈」的百分比阈值——这是两个可调旋钮。
     // 0.85 判瓶颈资源（1号位 PhaseThreeDiagnostics.cs:92，填 BottleneckResourceIds，影响展示）；
-    // 0.90 判延期根因 RESOURCE_CAPACITY_SHORTAGE（PhaseThreeDiagnostics.cs:170，影响产能短缺责任归属）。
+    // 0.90 判延期根因 RESOURCE_CAPACITY_WAIT（PhaseThreeDiagnostics.cs:183，影响产能短缺责任归属）。
+    //    2026-10-12（1号位 §2.1 附带）：旧名 RESOURCE_CAPACITY_SHORTAGE 已退役、不在 15 码内，此处仅为注释引用，随之改名。
     // 拆两个独立阈值（目标不同、可单独调）。归 3号位 冻结。
     public decimal BottleneckUtilizationThreshold { get; set; } = 0.85m;           // 利用率 > 此值 → 判瓶颈资源
     public decimal CapacityShortageUtilizationThreshold { get; set; } = 0.90m;     // 利用率 > 此值 → 判延期根因产能短缺
@@ -285,7 +357,10 @@ public sealed class SetupTransitionRuleSnapshot
 /// ⑧ 批量策略（Batch Policy）规则快照——本 Run 冻结内容（0号位 2026-10-07 裁决：本轮落码）。
 /// 粒度：Material + ProductionDepartment（MaterialId NOT NULL；ProductionDepartmentId 正式业务键须明确，NULL 仅历史兼容，
 /// v5.1.10 收口④：NULL 部门历史记录不默认为所有部门生效，投影端已按 HasValue 排除）。
-/// 来源：TaskSplitRuleConfig 物理表 active + 生效区间内规则，由 FrozenStrategySnapshotProvider 装配时投影。
+/// 来源：**本 Run 冻结策略包的 ⑧ 块**（`ParameterSetVersion.ContentSnapshotJson.BatchPolicy`），
+/// 由 FrozenStrategySnapshotProvider.DeserializeBatchPolicy 反序列化（投影端 TaskSplitRuleConfigProjector.ProjectFromSnapshot）。
+/// ⚠ 该子块是**「发布」时点**从 TaskSplitRuleConfig 物理表 active 规则**抄录的快照**，发布后**不再随物理表变化**
+/// （刷新唯一路径 = 重新发布参数集版本）；装载层**不回读**物理表。
 /// 缺策略（某 Material+Dept 无命中规则）由消费侧 fail-closed（BATCH_POLICY_MISSING），本块不承载信号位。
 /// 仅业务键 + 参数，不含审计字段（Id/Created/Updated/IsActive——投影时只取有效规则）。
 /// v5.1.10 收口①②（2026-10-09 生效）：MaxOptimizationSplitCount / MaxBatchCandidates / BottleneckSplitStrategy / NonBottleneckStrategy
@@ -297,6 +372,20 @@ public sealed class BatchPolicyRuleSnapshot
     public int MaterialId { get; set; }                         // 物料（正式业务键）
     public int? ProductionDepartmentId { get; set; }            // 生产部门（正式命中须明确；可空仅历史兼容，不默认为所有部门生效）
 
+    /// <summary>
+    /// 生效窗口起点（半开区间 <c>[EffectiveFrom, EffectiveTo)</c>；null = 无下界）。
+    /// **2026-10-13 新增**：由 <c>TaskSplitRuleConfig</c> 表直读装载（发布侧⑧投影已退休）填充，
+    /// 装载期按**本 Run 生效时点**重判 —— 「发布时有效、Run 时已失效」的行因此可被显式判成
+    /// <see cref="BatchPolicyState.Invalid"/>，而不再被原样下发为有效。
+    /// 依据：冻结 06 集成接口 **v1.36 <c>:17</c>**（＝v1.37 <c>:25</c> 同一段；业务键含**生效时点**）
+    /// ＋ 规则清单 **v1.7 <c>B-013</c>**（1号位 2026-10-14《BatchPolicy三态载体…回执》§五 逐字核对）。
+    /// 旧快照（如 PSV 807）无此字段 ⇒ 反序列化为 null ⇒ 无界，**向后兼容、零行为变化**。
+    /// </summary>
+    public DateTime? EffectiveFrom { get; set; }
+
+    /// <summary>生效窗口终点（半开区间；null = 无上界）。与 <see cref="EffectiveFrom"/> 同批新增、同口径。</summary>
+    public DateTime? EffectiveTo { get; set; }
+
     public decimal? MinExecutionBatchQty { get; set; }          // 硬最小批量
     public decimal? MaxExecutionBatchQty { get; set; }          // 硬最大批量（NULL=无硬上限）
     public decimal? PreferredBatchQty { get; set; }             // 软偏好切点（业务生效必填且 >0、处于硬 Min/Max 内，由治理发布校验）
@@ -306,4 +395,110 @@ public sealed class BatchPolicyRuleSnapshot
     public int? MaxBatchCandidates { get; set; }                // v5.1.10 收口①：恒 null 不投（1号位 Solver 技术预算）；仅类型兼容
     public string? BottleneckSplitStrategy { get; set; }        // v5.1.10 收口②：恒 null 不投（历史兼容列，V1 不得消费拆/合批倾向）；仅类型兼容
     public string? NonBottleneckStrategy { get; set; }          // v5.1.10 收口②：恒 null 不投（历史兼容列，V1 不得消费拆/合批倾向）；仅类型兼容
+}
+
+/// <summary>
+/// ⑧块 Batch Policy **三态＋不可用**（2→1 最小技术合同，2026-10-13）。
+///
+/// 依据（逐字）：06 集成接口 **v1.36 <c>:17</c>**（G2-T01 补正）——2号位须按
+/// <c>MaterialId + ProductionDepartmentId + 运行版本/Scope/生效时点</c> 的业务键**准确区分并传递**
+/// <c>VALID/MISSING/INVALID</c> 三态；「现有2→1合同确实不能无歧义表达三态时，仅允许经1/2号位契约审核确认
+/// **最小DTO或逻辑状态载体**，**不得增加Batch表**或**把所有物料规则发送Solver**；此处不预命名新字段。」
+/// ＋ 规则清单 **v1.7 <c>B-013</c>**（「不创第二Batch数据库真相」）
+/// ＋ 0号位 2026-10-13《未命名的Markdown文件3》<c>§2</c>（**新增第 4 类「不可用（技术失败）」**：
+/// 「接口未传递状态、规则数据装载失败或 DTO 无法表达三态，**不得直接视为 MISSING**」）。
+///
+/// 本载体**不新增数据库表、不新增第二份规则真相、不把全部物料规则发给 Solver** —— 只随本 Run 载荷
+/// 逐业务键附一条 <c>(状态, 真实匹配来源)</c>；规则参数本身仍走既有的
+/// <c>SolverStrategySnapshot.BatchPolicies</c>（仅承载 VALID 行）。
+/// </summary>
+public enum BatchPolicyState
+{
+    /// <summary>精确业务键命中，且记录**满足发布/有效化资格**且在**本 Run 生效时点**的生效窗口内。</summary>
+    Valid = 0,
+
+    /// <summary>经完整核对后本业务键**确无匹配规则**（含「⑧块整体为空（完全缺配）」与「本部门无命中而别的部门有记录」）
+    /// ⇒ 06 §「明确MTS PI来源时的运行时数量硬上限与缺配兜底」允许 1号位 走 B-010 取 <c>Q_C</c> 作本 Run 软 Preferred 兜底。</summary>
+    Missing = 1,
+
+    /// <summary>**本键有规则但不合法/冲突/失效且未治理隔离**（含「发布时有效、本 Run 生效时点已失效」）
+    /// ⇒ 06 同节逐字「**存在INVALID匹配时，不得假装MISSING兜底，应暴露Issue等待治理**」⇒ 1号位 Fail Closed，**不启 Q_C**。</summary>
+    Invalid = 2,
+
+    /// <summary>**不可用（技术失败）**：接口未传递状态／规则数据装载失败／DTO 无法表达三态
+    /// ⇒ 0号位 文件3 <c>§2</c>「**不得直接视为 MISSING**」⇒ 1号位 Fail Closed，**不启 Q_C**。
+    /// 过渡形态：载体整体缺席（<c>SolverStrategySnapshot.BatchPolicyStates is null</c>）亦按本类处置。</summary>
+    Unavailable = 3
+}
+
+/// <summary>
+/// <see cref="BatchPolicyStateSnapshot.MatchSource"/> 的**封闭取值域**（9 值，1号位 2026-10-14 定稿；
+/// 见《APS_V1_20261014_BatchPolicy三态载体_六条答复的回执与两处非对称处置_1号位致2号位_v1.0_20261014.md》§三）。
+///
+/// **为什么要有常量而不是自由文本**：<c>MatchSource</c> 是 B-013 逐字要求的「**真实匹配来源**」，
+/// 它要被消费侧当作**可判定的域值**使用（1号位 的 C-3 将按本值域做 Fail Closed 校验），自由文本使该判定不可能。
+///
+/// **强制落点（1号位 §一.1 定稿，2号位 已确认）**：值域校验**只作用于 <see cref="BatchPolicyState.Valid"/> 的条目**
+/// —— 另三态的出口由 <see cref="BatchPolicyState"/> 决定，<c>MatchSource</c> 只进诊断文本
+/// ⇒ 对它们强制值域无安全收益，且有把「技术失败」按「业务无效」处置的误伤风险（0号位 文件3 §2 所禁）。
+///
+/// **取值规则（2号位 产出侧）**：除 <see cref="LoadError"/> 外**一律是裸常量** —— 各态所需的附加信息
+/// （物料/部门/是否跨部门）本就在条目的业务键字段里，重复塞进 <c>MatchSource</c> 只会破坏值域封闭。
+/// <see cref="LoadError"/> 是**唯一例外**：装载失败的具体原因**只有调用方知道、且从条目上不可复原**
+/// ⇒ 以 <c>"LOAD_ERROR: &lt;原因&gt;"</c> 形式带出（值域以**前导常量**锚定，原因不丢失）。
+/// </summary>
+public static class BatchPolicyMatchSource
+{
+    /// <summary><c>Valid</c> 的**唯一合法值**：精确业务键命中且在生效窗口内。</summary>
+    public const string SnapshotHit = "SNAPSHOT_HIT";
+
+    /// <summary><c>Missing</c>：⑧块整体为空（完全缺配）／精确业务键无命中（⑧块有行但本键无行）。</summary>
+    public const string NoRuleForMaterial = "NO_RULE_FOR_MATERIAL";
+
+    /// <summary><c>Missing</c>：本部门无命中而**别的部门**存在记录（06 v1.36 <c>:17</c> 逐字归 MISSING）。</summary>
+    public const string OtherDeptOnly = "OTHER_DEPT_ONLY";
+
+    /// <summary><c>Missing</c>／<c>Invalid</c>：命中一条已停用（<c>IsActive = false</c>）的行。
+    /// （发布侧⑧投影已退休；装载由 2号位 按 <c>TaskSplitRuleConfig</c> 表直读，是否过滤 Inactive 按其装载口径。）</summary>
+    public const string Inactive = "INACTIVE";
+
+    /// <summary><c>Missing</c>：业务键不完整（本 Run 未解析到该物料的 <c>ProductionDepartmentId</c>）⇒ 无命中。</summary>
+    public const string NoDept = "NO_DEPT";
+
+    /// <summary><c>Invalid</c>：本键有规则但本 Run 生效时点不在 <c>[EffectiveFrom, EffectiveTo)</c> 内
+    /// —— **本链 <c>Invalid</c> 唯一可达成因**（发布时有效、Run 时已失效、未治理隔离）。</summary>
+    public const string OutOfWindow = "OUT_OF_WINDOW";
+
+    /// <summary><c>Invalid</c>：**预留** —— <c>PreferredBatchQty</c> 缺失／≤ 0。
+    /// 当前链路上不可达（发布闸 <c>IsSnapshotEligible</c> 已阻断；装载期走「一致性护栏 ⇒ Unavailable」而非本值）。</summary>
+    public const string PreferredNull = "PREFERRED_NULL";
+
+    /// <summary><c>Invalid</c>：**预留** —— 同键生效窗口重叠。<c>FindOverlappingWindowIds</c> 已在发布闸阻断。</summary>
+    public const string WindowConflict = "WINDOW_CONFLICT";
+
+    /// <summary><c>Unavailable</c>：装载失败／技术失败。**唯一带明细的取值** —— 形如
+    /// <c>"LOAD_ERROR: &lt;原因&gt;"</c>；前导常量恒为本值。</summary>
+    public const string LoadError = "LOAD_ERROR";
+}
+
+/// <summary>
+/// 三态载体的**逐业务键**条目（2→1 最小技术合同，2026-10-13）。**不含规则参数** —— 参数仍由
+/// <c>BatchPolicies</c> 承载，本条目只回答「这个键是什么状态、凭什么判的」。
+/// </summary>
+public sealed class BatchPolicyStateSnapshot
+{
+    /// <summary>业务键①：物料。</summary>
+    public int MaterialId { get; set; }
+
+    /// <summary>业务键②：生产部门。**null = 本 Run 未能确定该物料的生产部门**（业务键不完整）
+    /// —— 显式给出而非省略，使消费侧不必把「键缺失」误读成「未传递状态」。</summary>
+    public int? ProductionDepartmentId { get; set; }
+
+    /// <summary>状态。</summary>
+    public BatchPolicyState State { get; set; }
+
+    /// <summary>**真实匹配来源**（B-013 逐字要求「状态、**真实匹配来源**与 <c>Q_C</c>」）—— 供 1号位 追溯本状态据以判定的来源事实。
+    /// 取值域见 <see cref="BatchPolicyMatchSource"/>（9 值封闭；<see cref="BatchPolicyMatchSource.LoadError"/> 允许
+    /// <c>"LOAD_ERROR: &lt;原因&gt;"</c> 形式带明细）。</summary>
+    public string MatchSource { get; set; } = "";
 }

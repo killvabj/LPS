@@ -7,6 +7,7 @@ using LPS.APS.Core.Interfaces;
 using LPS.APS.Core.Dto;
 using LPS.APS.Core.DTOs.Governance;
 using LPS.APS.Engine.Data;
+using Microsoft.Extensions.Logging;
 
 namespace LPS.APS.Application.Services;
 
@@ -30,8 +31,15 @@ public class GovernanceVersionService : IGovernanceVersionService
     private readonly IAuditLogRepository _auditLogRepository;
     /// <summary>权威仓库事实源只读访问（0号位 裁决5：INVALID_WAREHOUSE_REF 校验；可空——未接入事实源时跳过校验，见清单三 2号位/5号位 确认项）</summary>
     private readonly DatabaseConnectionManager? _connectionManager;
-    /// <summary>执行批拆分规则治理服务（可空——未接入时发布跳过 BatchPolicy 注入；0号位 2026-10-07 裁决本轮落码）</summary>
-    private readonly ITaskSplitRuleConfigGovernanceService? _taskSplitRuleConfigGovernanceService;
+
+    /// <summary>
+    /// 发布期观测日志（**可空** —— 沿用本类既有 <c>_connectionManager</c> 的「可选可空」风格，
+    /// 从而**不破坏** 6 处既有 <c>new GovernanceVersionService(...)</c> 调用点）。
+    ///
+    /// 2026-10-14 新增：本类此前**完全没有 logger** ⇒ 发布若因体积 OOM/超时挂掉，连一行日志都不留。
+    /// （旧⑧块 BatchPolicy 注入曾把全表 837,957 行≈601 MB 整块写入快照，2026-10-15 终裁退出后不再有此量级。）
+    /// </summary>
+    private readonly ILogger<GovernanceVersionService>? _logger;
     /// <summary>Demand Priority 业务校验器（无状态纯校验，P0-05 强制接入发布前校验）</summary>
     private readonly DemandPriorityValidator _demandPriorityValidator = new();
 
@@ -48,7 +56,7 @@ public class GovernanceVersionService : IGovernanceVersionService
         IStrategyProfileVersionRepository strategyProfileVersionRepository,
         IAuditLogRepository auditLogRepository,
         DatabaseConnectionManager? connectionManager = null,
-        ITaskSplitRuleConfigGovernanceService? taskSplitRuleConfigGovernanceService = null)
+        ILogger<GovernanceVersionService>? logger = null)
     {
         _ruleSetVersionRepository = ruleSetVersionRepository;
         _parameterSetVersionRepository = parameterSetVersionRepository;
@@ -56,7 +64,7 @@ public class GovernanceVersionService : IGovernanceVersionService
         _strategyProfileVersionRepository = strategyProfileVersionRepository;
         _auditLogRepository = auditLogRepository;
         _connectionManager = connectionManager;
-        _taskSplitRuleConfigGovernanceService = taskSplitRuleConfigGovernanceService;
+        _logger = logger;
     }
 
     /// <summary>合法发布前驱状态（其余状态发布一律拒绝）</summary>
@@ -80,6 +88,9 @@ public class GovernanceVersionService : IGovernanceVersionService
 
         // P0-02b：发布时聚合 DemandPriority 子块 → ContentSnapshotJson（契约 §6.10.5，Run 装载重放载体）
         version.ContentSnapshotJson = BuildRuleSetContentSnapshot(version);
+
+        // 发布期键名漂移告警（只记日志，不阻断）——⑦块 SetupTransitionRules 的键名未冻结，拼错即静默当未配置。
+        WarnIfUnknownSnapshotBlocks(version.ContentSnapshotJson, "规则集", ruleSetVersionId);
 
         version.Status = GovernanceVersionStatus.Published;
         version.PublishedAt = DateTime.Now;
@@ -125,8 +136,21 @@ public class GovernanceVersionService : IGovernanceVersionService
         // P0-02b：发布时聚合五子块（Lock/Supply/Procurement/SolverStrategy/CandidateGuardrail）→ ContentSnapshotJson（契约 §6.10.5）
         version.ContentSnapshotJson = BuildParameterSetContentSnapshot(version);
 
-        // P0-09（0号位 2026-10-07 裁决本轮落码）：发布时聚合第⑧块 BatchPolicy 子块（读 active 规则 → Project → 注入 ContentSnapshotJson.BatchPolicy）
-        version.ContentSnapshotJson = await InjectBatchPolicyAsync(version.ContentSnapshotJson, ct);
+        // 发布期体积可见（2026-10-14 新增）：聚合后如实记下 `ContentSnapshotJson` 的真实字符数。
+        // 此前本类无任何日志 ⇒ 发布因体积 OOM/超时挂掉时无迹可查。**仅记录，不阻断**（见 B-006：
+        // 「发布数据质量校验不等于 Solver 对生产批量经济区间偏离的硬拒排」）。
+        // 注：旧⑧块 BatchPolicy 注入（0号位 2026-10-07 裁决落码）已按 0号位 2026-10-15 终裁退出——
+        // 停止发布时 JSON 全量注入归 3号位，与 2号位 按表查询读取切换**同批受控上线**（2/3号位 共同会签，不可单侧先投产）。
+        if (_logger is not null)
+        {
+            var snapshotChars = version.ContentSnapshotJson?.Length ?? 0;
+            _logger.LogInformation(
+                "参数集版本发布快照体积：ParameterSetVersionId={VersionId}，ContentSnapshotJson={Chars} 字符（≈{Mb:F1} MB，UTF-16 单列）",
+                parameterSetVersionId, snapshotChars, snapshotChars * 2.0 / 1048576.0);
+        }
+
+        // 发布期键名漂移告警（只记日志，不阻断）——⑧块键名未冻结，拼错即静默当未配置。
+        WarnIfUnknownSnapshotBlocks(version.ContentSnapshotJson, "参数集", parameterSetVersionId);
 
         version.Status = GovernanceVersionStatus.Published;
         version.PublishedAt = DateTime.Now;
@@ -172,6 +196,44 @@ public class GovernanceVersionService : IGovernanceVersionService
     }
 
     /// <summary>
+    /// 发布期**键名漂移**可见性告警（2026-10-14 新增）。
+    ///
+    /// **背景**：8 个子块里，①–⑥ 走 <c>FrozenStrategySnapshotProvider</c> 的强类型反序列化，
+    /// 键名/结构不符会**抛异常**（fail-fast）；而 ⑦块（<c>SetupTransitionRules</c>）与 ⑧块（<c>BatchPolicy</c>）
+    /// 的投影器是**单点 <c>TryGetProperty</c></c> —— 键名拼错 ⇒ **静默返回空列表**，
+    /// 与「合法未配置」**在运行时不可区分**。**8 块键名一个都没有冻结**（见台账 §T-1014h）。
+    ///
+    /// **本方法只做一件事**：把「快照顶层出现了不在已知 8 键白名单里的键」记一条 <c>LogWarning</c>。
+    /// **不阻断发布、不剔行、不改快照内容、不抛异常** —— 合 0号位 2026-10-12 §三.2 红线
+    /// （不得在装载/发布层替对方补值或跳过异常）与 B-006（发布数据质量校验 ≠ 硬拒排）。
+    ///
+    /// **现状噪音为零**：2026-10-14 已对全库实测，RSV 4 份 ＋ PSV 4 份快照的顶层键**恰好**是白名单那 8 个，
+    /// **零未知键**。故本告警只在**将来**有人写错键名时才会响。
+    /// </summary>
+    /// <param name="contentSnapshotJson">待检查的快照 JSON（可为 null/空 ⇒ 直接返回，不告警）</param>
+    /// <param name="versionKind">版本种类（"规则集"/"参数集"），仅用于日志可读性</param>
+    /// <param name="versionId">版本 Id，仅用于日志可读性</param>
+    private void WarnIfUnknownSnapshotBlocks(string? contentSnapshotJson, string versionKind, long versionId)
+    {
+        if (_logger is null)
+        {
+            return;
+        }
+
+        var unknownKeys = TaskSplitRuleConfigProjector.FindUnknownSnapshotBlockNames(contentSnapshotJson);
+        if (unknownKeys.Count == 0)
+        {
+            return;
+        }
+
+        _logger.LogWarning(
+            "快照顶层出现未知子块键：{VersionKind}版本 {VersionId}，未知键=[{UnknownKeys}]。" +
+            "已知 8 块为 DemandPriority/Lock/Supply/Procurement/SolverStrategy/CandidateGuardrail/SetupTransitionRules/BatchPolicy。" +
+            "⚠ 若这是 ⑦/⑧ 块被写错键名，装载侧投影器会**静默当未配置**（不报错）——请核对键名逐字。本告警不阻断发布。",
+            versionKind, versionId, string.Join(", ", unknownKeys));
+    }
+
+    /// <summary>
     /// 校验状态是否可停用（G2：Retired↔DISABLED 语义映射 §8.4）：
     /// SUBMITTED/APPROVED/PUBLISHED → DISABLED 合法（下线，新 Run 不再引用）；
     /// DRAFT 拒绝（草稿不产生引用，请直接编辑或删除）；
@@ -195,12 +257,59 @@ public class GovernanceVersionService : IGovernanceVersionService
         };
     }
 
+    /// <summary>
+    /// C-5/D-2 引用保护（0号位 §4.2 方案a，2026-10-17）：停用前置预检——
+    /// 被停用版本若仍被「合法可供新Run使用的已发布策略包版本」引用，阻断停用并返回明确引用冲突错误。
+    /// 判定：引用方 Status='PUBLISHED' + 父 StrategyProfile IsActive=1（仓储过滤）+ 生效窗 EffectiveFrom≤now≤EffectiveTo（本层过滤，镜像 <see cref="SelectCurrentPublished"/>）。
+    /// 由于实围墙停用经 D-2 建议方案a（尚未单独终裁），若 0号位 终裁为 b 本阻断改为仅告警，不预写失效引用静默建 Run 的豁免。
+    /// </summary>
+    private async Task EnsureNoLegitimateNewRunReferenceAsync(
+        long? referencedRuleSetVersionId,
+        long? referencedParameterSetVersionId,
+        string displayName,
+        CancellationToken ct)
+    {
+        var referencing = await _strategyProfileVersionRepository.GetReferencingPublishedVersionsAsync(
+            referencedRuleSetVersionId, referencedParameterSetVersionId, ct);
+
+        // D-2 检查范围校正（0号位 2026-10-17 统一审核 §5.2）：阻断范围须覆盖「未来有效期内仍可能合法用于新 Run」
+        // 的已发布策略包版本——即使其 EffectiveFrom 尚未来临（如策略包今天发布、明天正式生效），今天停用其绑定的
+        // 规则/参数版本，明天该策略包仍会失去合法排程资格。故仅以「未来仍生效」（EffectiveTo 未过或未限失效）为
+        // 阻断判据，不再要求 EffectiveFrom ≤ now。EffectiveTo 已过去的失效引用则放行。
+        var now = DateTime.Now;
+        var inWindow = referencing
+            .Where(v => !v.EffectiveTo.HasValue || v.EffectiveTo.Value >= now)
+            .Select(v => v.Id)
+            .ToList();
+
+        if (inWindow.Count == 0)
+            return;
+
+        throw new InvalidOperationException(
+            $"{displayName} 仍被 {inWindow.Count} 个当前或未来有效期内可新Run策略包版本引用（策略包版本Id: {string.Join(", ", inWindow)}），" +
+            $"禁止直接停用（D-2 引用保护，须先经合法策略包切换消除引用再停用）");
+    }
+
     public async Task DisableRuleSetVersionAsync(long ruleSetVersionId, string? operatedBy, int actorUserId, string? reason = null, CancellationToken ct = default)
     {
         var version = await _ruleSetVersionRepository.GetByIdAsync(ruleSetVersionId, ct)
             ?? throw new InvalidOperationException($"规则集版本不存在：{ruleSetVersionId}");
 
         EnsureDisableable(version.Status, ruleSetVersionId);
+
+        // C-5/D-2 引用保护（0号位 §4.2 方案a）：与参数停用对称——被停用版本若仍被合法可新Run策略包引用，阻断停用。
+        await EnsureNoLegitimateNewRunReferenceAsync(
+            referencedRuleSetVersionId: ruleSetVersionId,
+            referencedParameterSetVersionId: null,
+            displayName: "规则集版本",
+            ct);
+
+        // D-3 停用联动（2026-10-17，镜像 SPV Disable 清默认）：IsDefault=1 版本停用须先解除同族默认，
+        // 避免 DISABLED 版本残留于 ResolveDefault 查询范围（只清其它默认，保目标 IsDefault 随 UpdateAsync 冻结为 DISABLED 后自然失效）。
+        if (version.IsDefault)
+        {
+            await _ruleSetVersionRepository.SetDefaultAsync(version.RuleSetId, ruleSetVersionId, ct);
+        }
 
         var beforeStatus = version.Status;
         version.Status = GovernanceVersionStatus.Disabled;
@@ -232,6 +341,19 @@ public class GovernanceVersionService : IGovernanceVersionService
             ?? throw new InvalidOperationException($"参数集版本不存在：{parameterSetVersionId}");
 
         EnsureDisableable(version.Status, parameterSetVersionId);
+
+        // C-5/D-2 引用保护（0号位 §4.2 方案a）：被停用版本若仍被合法可新Run的已发布策略包引用，阻断停用。
+        await EnsureNoLegitimateNewRunReferenceAsync(
+            referencedRuleSetVersionId: null,
+            referencedParameterSetVersionId: parameterSetVersionId,
+            displayName: "参数集版本",
+            ct);
+
+        // D-3 停用联动（2026-10-17，镜像 SPV Disable 清默认）：IsDefault=1 版本停用须先解除同族默认（停用即不再作为默认解析候选）。
+        if (version.IsDefault)
+        {
+            await _parameterSetVersionRepository.SetDefaultAsync(version.ParameterSetId, parameterSetVersionId, ct);
+        }
 
         var beforeStatus = version.Status;
         version.Status = GovernanceVersionStatus.Disabled;
@@ -292,6 +414,201 @@ public class GovernanceVersionService : IGovernanceVersionService
             OccurredAt = DateTime.Now,
             Remark = reason
         }, ct);
+    }
+
+    /// <summary>
+    /// 设置策略包版本为同族默认（C-7 §9.2 显式治理操作，2026-10-17）。
+    /// 默认标记 IsDefault 属治理元数据，不随 Create/Update 直写（C-7 已强制 Create IsDefault=false、
+    /// Update 冻结既有值），只能经本显式操作置位。目标版本须为 PUBLISHED（D-3「默认版本=已发布版本」定义）；
+    /// 置位前先清同 Profile 其它默认避免 UQ_StrategyProfileVersion_DefaultPublished 冲突（镜像 Disable 既有关联操作）。
+    /// </summary>
+    public async Task SetDefaultStrategyProfileVersionAsync(long strategyProfileVersionId, string? operatedBy, int actorUserId, CancellationToken ct = default)
+    {
+        var version = await _strategyProfileVersionRepository.GetByIdAsync(strategyProfileVersionId, ct)
+            ?? throw new InvalidOperationException($"策略包版本不存在：{strategyProfileVersionId}");
+
+        // D-3 语义：默认版本须为已发布版本（DRAFT/SUBMITTED/APPROVED 尚未生效，DISABLED/ARCHIVED 已失效，均不可设为同族解析默认）
+        if (version.Status != GovernanceVersionStatus.Published)
+        {
+            throw new InvalidOperationException($"仅 PUBLISHED 版本可设为默认（当前状态：{version.Status}），版本 Id：{strategyProfileVersionId}");
+        }
+
+        // 已是默认则幂等早退（避免无谓清默认+置位与审计）
+        if (version.IsDefault)
+        {
+            return;
+        }
+
+        // Q8-2 跨 Profile 收敛（2026-10-25，2号位 §二.2 运行侧口径）：禁止「重叠生效窗内，同一 RunType 下
+        // 另一策略包已存在 PUBLISHED 默认」——否则运行侧 GetDefaultByRunTypeAsync 返回多个候选判歧义（fail-closed）。
+        // 不做简单唯一索引（窗口不相交是合法形态）；窗口两端闭区间，端点相接同一点视为同时命中，须拒绝。
+        var conflict = await FindCrossProfileOverlappingDefaultAsync(
+            version.StrategyProfileId, version.EffectiveFrom, version.EffectiveTo, ct);
+        if (conflict != null)
+        {
+            throw new InvalidOperationException(
+                $"设置默认失败：RunType 下另一策略包 {conflict.StrategyProfileId} 的 PUBLISHED 默认版本 " +
+                $"{conflict.Id}（{conflict.VersionCode}）生效窗与目标重叠，运行侧将判歧义（DEFAULT_CONFLICT）；须错开生效窗或先停用再置位");
+        }
+
+        // P1-03：审计前置预检（跨库无 2PC）——审计库不可写则整操作失败、业务零变更。
+        await _auditLogRepository.EnsureWritableAsync(ct);
+
+        // 清同 Profile 其它默认，再置位；避免 UQ_StrategyProfileVersion_DefaultPublished 冲突
+        await _strategyProfileVersionRepository.ClearDefaultFlagAsync(version.StrategyProfileId, strategyProfileVersionId, ct);
+        version.IsDefault = true;
+        await _strategyProfileVersionRepository.UpdateAsync(version, ct);
+
+        // P1-04 审计日志：记录默认设置操作
+        await _auditLogRepository.AddAsync(new Core.Entities.Auth.AuditLog
+        {
+            ActionCode = "SetDefault",
+            EntityType = "StrategyProfileVersion",
+            EntityId = strategyProfileVersionId.ToString(),
+            VersionCode = version.VersionCode,
+            OldValue = "false",
+            NewValue = "true",
+            UserId = actorUserId,
+            UserCode = operatedBy,
+            OccurredAt = DateTime.Now,
+            Remark = "策略包版本设为默认"
+        }, ct);
+    }
+
+    /// <summary>
+    /// 设置规则集版本为同族默认（D-3 默认版本承载，2026-10-17，镜像 SPV SetDefaultStrategyProfileVersionAsync）。
+    /// 默认标记 IsDefault 属治理元数据，不随 Create/Update 直写（C-7 已强制 Create=false、Update 冻结既有值），只能经本显式操作置位。
+    /// 目标版本须为 PUBLISHED（D-3「默认版本=已发布版本」定义）；切换采用仓储 <see cref="IRuleSetVersionRepository.SetDefaultAsync"/>
+    /// 单事务「清同族其它 + 置目标」（修正 SPV 现 ClearDefaultFlag + Update 两条独立 SQL 非原子的缺陷）。
+    /// </summary>
+    public async Task SetDefaultRuleSetVersionAsync(long ruleSetVersionId, string? operatedBy, int actorUserId, CancellationToken ct = default)
+    {
+        var version = await _ruleSetVersionRepository.GetByIdAsync(ruleSetVersionId, ct)
+            ?? throw new InvalidOperationException($"规则集版本不存在：{ruleSetVersionId}");
+
+        // D-3 语义：默认版本须为已发布版本（DRAFT/SUBMITTED/APPROVED 尚未生效，DISABLED/ARCHIVED 已失效，均不可设为同族解析默认）
+        if (version.Status != GovernanceVersionStatus.Published)
+        {
+            throw new InvalidOperationException($"仅 PUBLISHED 版本可设为默认（当前状态：{version.Status}），版本 Id：{ruleSetVersionId}");
+        }
+
+        // 已是默认则幂等早退（避免无谓清默认+置位与审计）
+        if (version.IsDefault)
+        {
+            return;
+        }
+
+        // P1-03：审计前置预检（跨库无 2PC）——审计库不可写则整操作失败、业务零变更。
+        await _auditLogRepository.EnsureWritableAsync(ct);
+
+        // D-3 原子切换：单事务内清同族其它默认并置目标为默认（避免 UQ_RuleSetVersion_DefaultPublished 过滤唯一索引冲突）
+        await _ruleSetVersionRepository.SetDefaultAsync(version.RuleSetId, ruleSetVersionId, ct);
+
+        // P1-04 审计日志：记录默认设置操作
+        await _auditLogRepository.AddAsync(new Core.Entities.Auth.AuditLog
+        {
+            ActionCode = "SetDefault",
+            EntityType = "RuleSetVersion",
+            EntityId = ruleSetVersionId.ToString(),
+            VersionCode = version.VersionCode,
+            OldValue = "false",
+            NewValue = "true",
+            UserId = actorUserId,
+            UserCode = operatedBy,
+            OccurredAt = DateTime.Now,
+            Remark = "规则集版本设为默认"
+        }, ct);
+    }
+
+    /// <summary>
+    /// 设置参数集版本为同族默认（D-3 默认版本承载，2026-10-17，镜像 SPV SetDefaultStrategyProfileVersionAsync）。
+    /// 同 <see cref="SetDefaultRuleSetVersionAsync"/> 语义；切换采用仓储 <see cref="IParameterSetVersionRepository.SetDefaultAsync"/> 单事务原子化。
+    /// </summary>
+    public async Task SetDefaultParameterSetVersionAsync(long parameterSetVersionId, string? operatedBy, int actorUserId, CancellationToken ct = default)
+    {
+        var version = await _parameterSetVersionRepository.GetByIdAsync(parameterSetVersionId, ct)
+            ?? throw new InvalidOperationException($"参数集版本不存在：{parameterSetVersionId}");
+
+        // D-3 语义：默认版本须为已发布版本
+        if (version.Status != GovernanceVersionStatus.Published)
+        {
+            throw new InvalidOperationException($"仅 PUBLISHED 版本可设为默认（当前状态：{version.Status}），版本 Id：{parameterSetVersionId}");
+        }
+
+        // 已是默认则幂等早退
+        if (version.IsDefault)
+        {
+            return;
+        }
+
+        // P1-03：审计前置预检（跨库无 2PC）——审计库不可写则整操作失败、业务零变更。
+        await _auditLogRepository.EnsureWritableAsync(ct);
+
+        // D-3 原子切换：单事务内清同族其它默认并置目标为默认（避免 UQ_ParameterSetVersion_DefaultPublished 过滤唯一索引冲突）
+        await _parameterSetVersionRepository.SetDefaultAsync(version.ParameterSetId, parameterSetVersionId, ct);
+
+        // P1-04 审计日志：记录默认设置操作
+        await _auditLogRepository.AddAsync(new Core.Entities.Auth.AuditLog
+        {
+            ActionCode = "SetDefault",
+            EntityType = "ParameterSetVersion",
+            EntityId = parameterSetVersionId.ToString(),
+            VersionCode = version.VersionCode,
+            OldValue = "false",
+            NewValue = "true",
+            UserId = actorUserId,
+            UserCode = operatedBy,
+            OccurredAt = DateTime.Now,
+            Remark = "参数集版本设为默认"
+        }, ct);
+    }
+
+    /// <summary>
+    /// 读侧默认解析：规则集同族当前有效、无歧义的 PUBLISHED 默认版本（D-3，2026-10-17）。
+    /// 镜像 SPV <see cref="ResolveDefaultStrategyProfileVersionAsync"/> 三态判定：候选集按生效窗过滤后 0→null、1→返回、
+    /// &gt;1→抛歧义（红线 #4 禁止随机取）。RS 无 RunType，按 RuleSetId 族解析（《(6)》§四「不原样复制 SPV 按 RunType 解析」）。
+    /// </summary>
+    public async Task<RuleSetVersion?> ResolveDefaultRuleSetVersionAsync(long ruleSetId, DateTime? asOf = null, CancellationToken ct = default)
+    {
+        var candidates = await _ruleSetVersionRepository.GetDefaultCandidatesAsync(ruleSetId, ct);
+        var effective = asOf ?? DateTime.Now;
+
+        var inWindow = candidates
+            .Where(v => (!v.EffectiveFrom.HasValue || v.EffectiveFrom.Value <= effective)
+                     && (!v.EffectiveTo.HasValue || v.EffectiveTo.Value >= effective))
+            .ToList();
+
+        return inWindow.Count switch
+        {
+            0 => null,
+            1 => inWindow[0],
+            _ => throw new InvalidOperationException(
+                $"RuleSetId={ruleSetId} 的默认 PUBLISHED 规则集版本存在歧义：{inWindow.Count} 个候选（Id: {string.Join(", ", inWindow.Select(v => v.Id))}），须收敛为 1 个再执行"),
+        };
+    }
+
+    /// <summary>
+    /// 读侧默认解析：参数集同族当前有效、无歧义的 PUBLISHED 默认版本（D-3，2026-10-17）。
+    /// 镜像 SPV <see cref="ResolveDefaultStrategyProfileVersionAsync"/> 三态判定（过滤生效窗；0→null、1→返回、&gt;1→抛歧义）。
+    /// PS 无 RunType，按 ParameterSetId 族解析（《(6)》§四「不原样复制 SPV 按 RunType 解析」）。
+    /// </summary>
+    public async Task<ParameterSetVersion?> ResolveDefaultParameterSetVersionAsync(long parameterSetId, DateTime? asOf = null, CancellationToken ct = default)
+    {
+        var candidates = await _parameterSetVersionRepository.GetDefaultCandidatesAsync(parameterSetId, ct);
+        var effective = asOf ?? DateTime.Now;
+
+        var inWindow = candidates
+            .Where(v => (!v.EffectiveFrom.HasValue || v.EffectiveFrom.Value <= effective)
+                     && (!v.EffectiveTo.HasValue || v.EffectiveTo.Value >= effective))
+            .ToList();
+
+        return inWindow.Count switch
+        {
+            0 => null,
+            1 => inWindow[0],
+            _ => throw new InvalidOperationException(
+                $"ParameterSetId={parameterSetId} 的默认 PUBLISHED 参数集版本存在歧义：{inWindow.Count} 个候选（Id: {string.Join(", ", inWindow.Select(v => v.Id))}），须收敛为 1 个再执行"),
+        };
     }
 
     /// <summary>开发者：3号位</summary>
@@ -482,6 +799,22 @@ public class GovernanceVersionService : IGovernanceVersionService
                 Message = "版本编码不能为空",
                 FieldName = "VersionCode"
             });
+        }
+        else
+        {
+            // 校验版本编码同规则集内唯一（4号位 2026-10-14 审计 R：同 RuleSet 下 VersionCode 重复即治理脏数据，
+            // publish 前置 fail-closed 拦截；新增校验不改接口签名）
+            var siblings = await _ruleSetVersionRepository.GetByRuleSetIdAsync(version.RuleSetId, ct) ?? [];
+            var normalizedCode = version.VersionCode.Trim();
+            if (siblings.Any(s => s.Id != version.Id && string.Equals(s.VersionCode?.Trim(), normalizedCode, StringComparison.OrdinalIgnoreCase)))
+            {
+                result.Errors.Add(new ValidationError
+                {
+                    Code = "DUPLICATE_VERSION_CODE",
+                    Message = $"同一规则集内版本编码已存在：{normalizedCode}",
+                    FieldName = "VersionCode"
+                });
+            }
         }
 
         // 校验生效时间范围
@@ -680,8 +1013,10 @@ public class GovernanceVersionService : IGovernanceVersionService
             return;
         }
 
-        // 1. 采集配置中引用的仓库编码（去重，忽略空串）
-        var referenced = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        // 1. 采集配置中引用的仓库编码（按落点分 Supply / Procurement 去重、忽略空串；
+        //    分开采集以便校验错误按 Supply / Procurement 落点报正确的 FieldName）
+        var supplyReferenced = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var procurementReferenced = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         try
         {
             var supplyJson = ExtractBlockJson(contentSnapshotJson, "Supply");
@@ -695,19 +1030,19 @@ public class GovernanceVersionService : IGovernanceVersionService
 
             if (supply?.Inventory?.WarehousePriority is { } supplyWh)
             {
-                foreach (var code in supplyWh) { if (!string.IsNullOrWhiteSpace(code)) referenced.Add(code); }
+                foreach (var code in supplyWh) { if (!string.IsNullOrWhiteSpace(code)) supplyReferenced.Add(code); }
             }
             if (procurement?.WarehousePriority is { } procWh)
             {
-                foreach (var code in procWh) { if (!string.IsNullOrWhiteSpace(code)) referenced.Add(code); }
+                foreach (var code in procWh) { if (!string.IsNullOrWhiteSpace(code)) procurementReferenced.Add(code); }
             }
             if (procurement?.DefaultPurchaseLt is { } lt)
             {
-                foreach (var rule in lt) { if (!string.IsNullOrWhiteSpace(rule.WarehouseCode)) referenced.Add(rule.WarehouseCode); }
+                foreach (var rule in lt) { if (!string.IsNullOrWhiteSpace(rule.WarehouseCode)) procurementReferenced.Add(rule.WarehouseCode); }
             }
             if (procurement?.ArrivalToUsableOffsets is { } offsets)
             {
-                foreach (var rule in offsets) { if (!string.IsNullOrWhiteSpace(rule.WarehouseCode)) referenced.Add(rule.WarehouseCode); }
+                foreach (var rule in offsets) { if (!string.IsNullOrWhiteSpace(rule.WarehouseCode)) procurementReferenced.Add(rule.WarehouseCode); }
             }
         }
         catch (System.Text.Json.JsonException)
@@ -716,7 +1051,7 @@ public class GovernanceVersionService : IGovernanceVersionService
             return;
         }
 
-        if (referenced.Count == 0)
+        if (supplyReferenced.Count == 0 && procurementReferenced.Count == 0)
         {
             return;
         }
@@ -734,14 +1069,34 @@ public class GovernanceVersionService : IGovernanceVersionService
             return;
         }
 
-        // 3. 引用不存在 → INVALID_WAREHOUSE_REF
-        foreach (var code in referenced.Where(c => !existingSet.Contains(c)).OrderBy(c => c, StringComparer.Ordinal))
+        // 3. 引用不存在 → INVALID_WAREHOUSE_REF（Supply / Procurement 落点分开报错）
+        AddWarehouseReferenceErrors(supplyReferenced, existingSet, "Supply/Warehouse", result);
+        AddWarehouseReferenceErrors(procurementReferenced, existingSet, "Procurement/Warehouse", result);
+    }
+
+    /// <summary>
+    /// 为给定仓库编码集合中**不在权威字典**的引用逐一追加 INVALID_WAREHOUSE_REF 错误。
+    /// fieldName 由调用方指定（Supply / Procurement 落点分开报，便于前端定位）。
+    /// </summary>
+    /// <param name="referencedCodes">配置中引用到的仓库编码集合（已去重）。</param>
+    /// <param name="existingSet">权威仓库字典存活编码，不存在则报错。</param>
+    /// <param name="fieldName">错误归属落点（Supply/Warehouse 或 Procurement/Warehouse）。</param>
+    /// <param name="result">发布校验结果容器。</param>
+    private static void AddWarehouseReferenceErrors(
+        IEnumerable<string> referencedCodes,
+        HashSet<string> existingSet,
+        string fieldName,
+        PublishValidationResult result)
+    {
+        foreach (var code in referencedCodes
+                     .Where(c => !existingSet.Contains(c))
+                     .OrderBy(c => c, StringComparer.Ordinal))
         {
             result.Errors.Add(new ValidationError
             {
                 Code = "INVALID_WAREHOUSE_REF",
                 Message = $"参数配置引用了不存在的仓库编码：{code}（权威仓库事实源：ext_MES_ProcessCode_View 仓库字典）",
-                FieldName = "Procurement/Warehouse"
+                FieldName = fieldName
             });
         }
     }
@@ -899,6 +1254,18 @@ public class GovernanceVersionService : IGovernanceVersionService
                     FieldName = "SupplyJson"
                 });
             }
+
+            // PiSort.SortBy 枚举合法性（防御数字越界反序列化，4号位 2026-10-22 G2）；
+            // 越界值运行期会被 PeggingOrchestrator 的 _ => 兜底静默按 IssueDateAsc，发布期即应拦截。
+            if (!Enum.IsDefined(block.PiSort.SortBy))
+            {
+                result.Errors.Add(new ValidationError
+                {
+                    Code = "INVALID_SUPPLY_PI_SORT",
+                    Message = $"Supply.PiSort.SortBy 必须为 IssueDateAsc/CreatedAtAsc/StablePiNoAsc 之一（当前值：{(int)block.PiSort.SortBy}）",
+                    FieldName = "SupplyJson"
+                });
+            }
         }
         catch (System.Text.Json.JsonException ex)
         {
@@ -937,6 +1304,24 @@ public class GovernanceVersionService : IGovernanceVersionService
                     {
                         Code = "INVALID_YIELD",
                         Message = $"PlanningYield 越界（0 < YieldPercent <= 100）：物料 {rule.MaterialId} = {rule.YieldPercent}",
+                        FieldName = "ProcurementJson"
+                    });
+                }
+            }
+
+            // 重复 (MaterialId, StageCode) 判定与拒绝（R04 会签第 4 项：发布侧去重归 3号位）
+            // MaterialId 语义 = MaterialCode（按 OrdinalIgnoreCase 比对）；StageCode 空/空白 = Material 级默认；
+            // 复合键含分隔符，OrdinalIgnoreCase 使整体大小写不敏感，且 null 与 "" 归一为同一键（物料级默认）。
+            var yieldKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var rule in block.PlanningYields)
+            {
+                var key = $"{rule.MaterialId}|{rule.StageCode}";
+                if (!yieldKeys.Add(key))
+                {
+                    result.Errors.Add(new ValidationError
+                    {
+                        Code = "DUPLICATE_PLANNING_YIELD",
+                        Message = $"PlanningYield 重复键 (MaterialId, StageCode)：物料 {rule.MaterialId} Stage（{rule.StageCode ?? "物料级"}）",
                         FieldName = "ProcurementJson"
                     });
                 }
@@ -1021,22 +1406,6 @@ public class GovernanceVersionService : IGovernanceVersionService
         EnsureParameterSetNormalized(version);
         return version.ContentSnapshotJson
             ?? throw new InvalidOperationException($"参数集版本 {version.Id} 无内容快照，无法聚合发布");
-    }
-
-    /// <summary>
-    /// 发布时注入第⑧块 BatchPolicy 子块（0号位 2026-10-07 裁决本轮落码）。
-    /// 读 TaskSplitRuleConfig active + 生效区间内规则 → 投影 BatchPolicyRuleSnapshot → 原子写入 ContentSnapshotJson.BatchPolicy。
-    /// 未接入规则治理服务（单测/未接线场景）→ 保持原快照不变（发布侧 fail-open；缺策略 fail-closed 属 1号位 消费侧）。
-    /// </summary>
-    private async Task<string> InjectBatchPolicyAsync(string contentSnapshotJson, CancellationToken ct)
-    {
-        if (_taskSplitRuleConfigGovernanceService is null)
-        {
-            return contentSnapshotJson;
-        }
-
-        var rules = await _taskSplitRuleConfigGovernanceService.GetActiveRulesForSnapshotAsync(ct);
-        return TaskSplitRuleConfigProjector.SetRules(contentSnapshotJson, rules);
     }
 
     // ==================== P0-01：内容持久化链辅助（ContentSnapshotJson 唯一真相，方案 A2） ====================
@@ -1139,20 +1508,22 @@ public class GovernanceVersionService : IGovernanceVersionService
         }
     }
 
-    /// <summary>投影：ContentSnapshotJson 的 DemandPriority 子块 → 主题 JSON 内存字段（GET 详情前端兼容）</summary>
+    /// <summary>
+    /// 投影：ContentSnapshotJson 的 DemandPriority + SetupTransitionRules 子块 → 主题 JSON 内存字段（GET 详情前端兼容）。
+    /// C-2 整改（2026-10-17）：补 SetupTransitionRules 投影，镜像 DemandPriority——镜像参数集五主题投影方式，
+    /// 规则集详情/published-version 端点回放版本对应 Setup 主题内容（0号位 复核 7.3）。SetupTransitionRules 块名
+    /// 常量取自 <see cref="SetupTransitionRuleProjector.SetupTransitionRulesBlockName"/>（避免字面量漂移）。
+    /// </summary>
     private static void ProjectRuleSetContent(RuleSetVersion version)
     {
         version.DemandPriorityJson = ExtractBlockJson(version.ContentSnapshotJson, "DemandPriority");
-    }
-
-    /// <summary>投影：ContentSnapshotJson 五子块 → 五主题 JSON 内存字段（GET 详情前端兼容）</summary>
-    private static void ProjectParameterSetContent(ParameterSetVersion version)
-    {
-        version.LockJson = ExtractBlockJson(version.ContentSnapshotJson, "Lock");
-        version.SupplyJson = ExtractBlockJson(version.ContentSnapshotJson, "Supply");
-        version.ProcurementJson = ExtractBlockJson(version.ContentSnapshotJson, "Procurement");
-        version.SolverStrategyJson = ExtractBlockJson(version.ContentSnapshotJson, "SolverStrategy");
-        version.CandidateGuardrailJson = ExtractBlockJson(version.ContentSnapshotJson, "CandidateGuardrail");
+        version.SetupTransitionRulesJson = ExtractBlockJson(
+            version.ContentSnapshotJson, SetupTransitionRuleProjector.SetupTransitionRulesBlockName);
+        // rule-set 同族（2026-10-15）：快照载体为内部可重放 JSON，投影已回填主题子块后置空，
+        // 镜像参数集 ProjectParameterSetContent（R2 修复）——前端经详情/published-version 端点读主题子块，不消费载体列；
+        // 本方法仅读路径调用（详情 GetRuleSetVersionAsync / published-version GetPublishedRuleSetVersionAsync），
+        // 不影响发布装配（Write 走 ContentSnapshotJson 持久化）。
+        version.ContentSnapshotJson = null;
     }
 
     /// <summary>P0-02：状态机约束——已发布不可原地修改；失效/归档不可改；仅 DRAFT/SUBMITTED/APPROVED 可编辑。</summary>
@@ -1248,10 +1619,65 @@ public class GovernanceVersionService : IGovernanceVersionService
                     FieldName = "IsDefault"
                 });
             }
+
+            // Q8-2 跨 Profile 收敛（2号位 §二.2）：发布 IsDefault=1 时，禁止重叠窗内同 RunType 另一策略包已有 PUBLISHED 默认。
+            var crossConflict = await FindCrossProfileOverlappingDefaultAsync(
+                version.StrategyProfileId, version.EffectiveFrom, version.EffectiveTo, ct);
+            if (crossConflict != null)
+            {
+                result.Errors.Add(new ValidationError
+                {
+                    Code = "DEFAULT_CONFLICT",
+                    Message = $"RunType 下另一策略包 {crossConflict.StrategyProfileId} 已存在 PUBLISHED 默认版本 {crossConflict.Id}（{crossConflict.VersionCode}）且生效窗与目标重叠，运行侧将判歧义（DEFAULT_CONFLICT）",
+                    FieldName = "IsDefault"
+                });
+            }
         }
 
         result.IsValid = result.Errors.Count == 0;
         return result;
+    }
+
+    /// <summary>
+    /// Q8-2 跨 Profile 收敛校验（2026-10-25，2号位 §二.2 运行侧口径落地）：判定目标策略包生效窗内，
+    /// 同 RunType 下是否已存在另一策略包的 PUBLISHED 默认版本（跨 Profile）。
+    /// 不做简单唯一索引——窗口不相交是合法形态；窗口两端闭区间，端点相接同一点视为同时命中（判定重叠 → 拒绝）。
+    /// 返回相冲突的默认版本；无冲突（或目标无 RunType）返回 null。Q3：仅本策略包内默认由 UQ_DefaultPublished/ClearDefaultFlag 收敛，不在此判定。
+    /// </summary>
+    private async Task<StrategyProfileVersion?> FindCrossProfileOverlappingDefaultAsync(
+        long strategyProfileId, DateTime? effectiveFrom, DateTime? effectiveTo, CancellationToken ct)
+    {
+        // 目标策略包的 RunType（父表）
+        var profile = await _strategyProfileRepository.GetByIdAsync(strategyProfileId, ct);
+        if (profile == null || string.IsNullOrWhiteSpace(profile.RunType))
+        {
+            return null; // 无 RunType（NULL）不进候选（Q8-3 按甲），不参与收敛
+        }
+
+        // 同 RunType 全部 PUBLISHED 默认候选（含本策略包自身）
+        var candidates = await _strategyProfileVersionRepository.GetDefaultByRunTypeAsync(profile.RunType, ct);
+        foreach (var cand in candidates)
+        {
+            // 排除本策略包自身（同 Profile 由 UQ_DefaultPublished / ClearDefaultFlag 收敛）、排除非发布状态
+            if (cand.StrategyProfileId == strategyProfileId || cand.Status != GovernanceVersionStatus.Published)
+            {
+                continue;
+            }
+
+            // 两端闭区间重叠判定：仅当一目标准确早于另一目标窗口时才不相交；有值才比较，null= 无界。
+            // 端点相接同一点 → 不相交判定不成立 → 视为重叠（同时命中，运行侧判歧义，拒绝）。
+            var targetBeforeCandidate =
+                effectiveTo != null && cand.EffectiveFrom != null && effectiveTo.Value < cand.EffectiveFrom.Value;
+            var candidateBeforeTarget =
+                cand.EffectiveTo != null && effectiveFrom != null && cand.EffectiveTo.Value < effectiveFrom.Value;
+
+            if (!targetBeforeCandidate && !candidateBeforeTarget)
+            {
+                return cand;
+            }
+        }
+
+        return null;
     }
 
     /// <summary>引用版本合法性：存在且 PUBLISHED（P0-06；泛型兼容 RuleSet/ParameterSet 不同实体类型，statusGetter 提取状态）</summary>
@@ -1379,22 +1805,17 @@ public class GovernanceVersionService : IGovernanceVersionService
 
     /// <summary>
     /// 参数集当前生效 PUBLISHED 版本直达（G3/C2；五主题 JSON 投影，与 A10 详情一致；多候选报错收敛）
+    /// 方案 A（2026-10-16）：五主题由仓储 DB 侧 OPENJSON 按块提取，ContentSnapshotJson 不读回应用层——消除 39s 根因。
     /// </summary>
     /// <remarks>开发者：3号位</remarks>
     public async Task<ParameterSetVersion?> GetPublishedParameterSetVersionAsync(long parameterSetId, CancellationToken ct = default)
     {
-        var versions = await _parameterSetVersionRepository.GetByParameterSetIdAsync(parameterSetId, ct);
-        var published = SelectCurrentPublished(
+        var versions = await _parameterSetVersionRepository.GetDetailByParameterSetIdAsync(parameterSetId, ct);
+        return SelectCurrentPublished(
             versions,
             v => v.Status, v => v.Id,
             v => v.EffectiveFrom, v => v.EffectiveTo,
             $"参数集 {parameterSetId}");
-
-        if (published != null)
-        {
-            ProjectParameterSetContent(published);
-        }
-        return published;
     }
 
     /// <summary>
@@ -1470,6 +1891,8 @@ public class GovernanceVersionService : IGovernanceVersionService
             IsDefault = version.IsDefault,
             PublishedAt = version.PublishedAt,
             PublishedBy = version.PublishedBy,
+            // 4号位 2026-10-14 R4 止血：V1 不真查 ScheduleRun 维，恒返空数组（前端防崩；真追溯归 Q1 待 0号位 裁决）
+            ReferencingRuns = Array.Empty<RunReferenceItem>(),
         };
     }
 
@@ -1537,6 +1960,10 @@ public class GovernanceVersionService : IGovernanceVersionService
         version.PublishedBy = existing.PublishedBy;
         version.ApprovedAt = existing.ApprovedAt;
         version.ApprovedBy = existing.ApprovedBy;
+        // Q2（4号位 2026-10-15）：快照载体为内部可重放 JSON，generic Update 永不合法写它（内容经主题 JSON
+        // 归一化或 SetupRuleService 独立写路径）。回填 existing 防止读改写回传 null 时 EnsureXxxNormalized
+        // 重建快照丢弃独立子块（SetupTransitionRules 仅存于该列）；置于归一化之前使子块保留提取读到既有快照。
+        version.ContentSnapshotJson = existing.ContentSnapshotJson;
 
         EnsureRuleSetNormalized(version);
 
@@ -1627,6 +2054,9 @@ public class GovernanceVersionService : IGovernanceVersionService
         version.PublishedBy = existing.PublishedBy;
         version.ApprovedAt = existing.ApprovedAt;
         version.ApprovedBy = existing.ApprovedBy;
+        // Q2（4号位 2026-10-15）：回填 existing，防止读改写回传 null 时 EnsureXxxNormalized 重建快照丢弃
+        // BatchPolicy 子块（仅存于该列；参数集读路径 R2 已置空，此隐患当前即存在）。
+        version.ContentSnapshotJson = existing.ContentSnapshotJson;
 
         EnsureParameterSetNormalized(version);
 
@@ -1653,15 +2083,13 @@ public class GovernanceVersionService : IGovernanceVersionService
         }, ct);
     }
 
-    /// <summary>获取参数集版本详情（P0-01：ContentSnapshotJson 五子块 → 五主题 JSON 投影，前端 API 兼容）</summary>
+    /// <summary>
+    /// 获取参数集版本详情（P0-01：五主题 JSON 投影，前端 API 兼容；方案 A 落点 2026-10-16：
+    /// 改调仓储 DB 侧按块提取——五主题 JSON + 治理字段，ContentSnapshotJson 不读回，消除 SELECT * 大 LOB 搬运）
+    /// </summary>
     public async Task<ParameterSetVersion?> GetParameterSetVersionAsync(long parameterSetVersionId, CancellationToken ct = default)
     {
-        var version = await _parameterSetVersionRepository.GetByIdAsync(parameterSetVersionId, ct);
-        if (version != null)
-        {
-            ProjectParameterSetContent(version);
-        }
-        return version;
+        return await _parameterSetVersionRepository.GetDetailByIdAsync(parameterSetVersionId, ct);
     }
 
     /// <summary>创建策略包版本（P0-02：强制 DRAFT；治理字段置空；P1-04：Create 审计+预检）</summary>
@@ -1674,6 +2102,9 @@ public class GovernanceVersionService : IGovernanceVersionService
         version.PublishedBy = null;
         version.ApprovedAt = null;
         version.ApprovedBy = null;
+        // C-7 越权防护（0号位 §9.2：默认标记「不应由当前用户直接控制」）：新建一律强制非默认，
+        // 用户在创建请求中即使传 isDefault=true 也不得写入；默认标记只能经 SetDefault 显式治理操作置位。
+        version.IsDefault = false;
 
         // P1-04：审计前置预检（跨库无 2PC）——审计库不可写则整操作失败、业务零变更。
         await _auditLogRepository.EnsureWritableAsync(ct);

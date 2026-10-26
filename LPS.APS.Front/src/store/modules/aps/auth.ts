@@ -162,6 +162,10 @@ const MOCK_ROLE_PRESETS: Record<
       'aps.rule.publish',
       'aps.parameter.view',
       'aps.parameter.edit',
+      // D-1：参数集发布是独立权限码（后端 GovernanceController 挂 PermissionCodes.ParameterPublish），
+      // 不因持 aps.rule.publish 自动获得。**0号位 10-19 裁定：唯一持有者为 aps.admin.aps**。
+      // mock preset 缺此码会让「双轨发布」在 mock 下假过（前端闸放行、真实后端 403）。
+      'aps.parameter.publish',
       'aps.strategy.view',
       'aps.strategy.edit',
       'aps.setup.view',
@@ -199,6 +203,8 @@ const MOCK_ROLE_PRESETS: Record<
       'aps.rule.publish',
       'aps.parameter.view',
       'aps.parameter.edit',
+      // D-1：参数集发布独立码按 0号位 10-19 裁定收敛为**仅 aps.admin.aps** 持有，
+      // admin.system 刻意不持（系统管理员不兼参数发布，避免两个发布管理员角色并存）。
       'aps.strategy.view',
       'aps.strategy.edit',
       'aps.setup.view',

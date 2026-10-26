@@ -56,7 +56,8 @@ public class StageLeadTimeParamGovernanceServiceTests
         decimal leadTimeHours = 0,
         int priority = 0,
         DateTime? effectiveFrom = null,
-        DateTime? effectiveTo = null)
+        DateTime? effectiveTo = null,
+        bool isDefault = false)
         => new()
         {
             FactoryCode = factoryCode,
@@ -66,6 +67,7 @@ public class StageLeadTimeParamGovernanceServiceTests
             Priority = priority,
             EffectiveFrom = effectiveFrom ?? new DateTime(2026, 1, 1),
             EffectiveTo = effectiveTo,
+            IsDefault = isDefault,
         };
 
     // ---------- 构造守卫 ----------
@@ -290,5 +292,107 @@ public class StageLeadTimeParamGovernanceServiceTests
         Func<Task> act = () => svc.DeactivateAsync(0, 1, "u", CancellationToken.None);
 
         await act.Should().ThrowAsync<ArgumentException>().WithParameterName("id");
+    }
+
+    // ---------- R09-V-A（3-P5）IsDefault 全局唯一 / 生效窗冲突校验 ----------
+    // 语义：IsDefault=1 为跨工厂全局兜底（GLOBAL_STAGE_DEFAULT），生效窗闭区间重叠即冲突。
+    // 纯谓词锁定语义（DefaultWindowsOverlap 抽出为可测纯函数）；DB 装载路径经 mock 覆盖红线触发。
+
+    [Fact]
+    public void DefaultWindowsOverlap_窗口重叠_返回true()
+    {
+        // 目标 [1/1,1/31] 与候选 [1/15,1/20] 内含 → 冲突
+        StageLeadTimeParamGovernanceService.DefaultWindowsOverlap(
+            new DateTime(2026, 1, 1), new DateTime(2026, 1, 31),
+            new DateTime(2026, 1, 15), new DateTime(2026, 1, 20))
+            .Should().BeTrue();
+    }
+
+    [Fact]
+    public void DefaultWindowsOverlap_窗口相离_返回false()
+    {
+        // 目标 [1/1,1/10] 与候选 [1/11,1/20] 严格相离 → 合法
+        StageLeadTimeParamGovernanceService.DefaultWindowsOverlap(
+            new DateTime(2026, 1, 1), new DateTime(2026, 1, 10),
+            new DateTime(2026, 1, 11), new DateTime(2026, 1, 20))
+            .Should().BeFalse();
+    }
+
+    [Fact]
+    public void DefaultWindowsOverlap_端点相接_返回true()
+    {
+        // 目标 [1/1,1/10] 与候选 [1/10,1/20] 端点相接同一点 → 闭区间视为重叠（与 Q8-2 口径一致）
+        StageLeadTimeParamGovernanceService.DefaultWindowsOverlap(
+            new DateTime(2026, 1, 1), new DateTime(2026, 1, 10),
+            new DateTime(2026, 1, 10), new DateTime(2026, 1, 20))
+            .Should().BeTrue();
+    }
+
+    [Fact]
+    public void DefaultWindowsOverlap_无界目标窗_返回true()
+    {
+        // 目标 [1/1,∞) 覆盖后任意 → 冲突
+        StageLeadTimeParamGovernanceService.DefaultWindowsOverlap(
+            new DateTime(2026, 1, 1), null,
+            new DateTime(2027, 6, 1), new DateTime(2027, 6, 30))
+            .Should().BeTrue();
+    }
+
+    [Fact]
+    public void DefaultWindowsOverlap_无界候选窗_返回true()
+    {
+        // 候选 [1/5,∞) 内含目标 [1/1,1/10] → 冲突
+        StageLeadTimeParamGovernanceService.DefaultWindowsOverlap(
+            new DateTime(2026, 1, 1), new DateTime(2026, 1, 10),
+            new DateTime(2026, 1, 5), null)
+            .Should().BeTrue();
+    }
+
+    [Fact]
+    public async Task CreateAsync_IsDefault存在重叠全局默认_抛红线异常()
+    {
+        // R09-V-A：Create IsDefault=true 时须查 active 的 IsDefault=1 候选，存在生效窗重叠 → 拒绝
+        var conn = CreateConnectionMock();
+        conn.Setup(c => c.QueryFirstOrDefaultAsync<int>(
+                It.IsAny<string>(), It.IsAny<object?>(), It.IsAny<CommandType>(), It.IsAny<DatabaseId>(), It.IsAny<int?>()))
+            .ReturnsAsync(0); // EnsureNotDuplicate 不命中
+        conn.Setup(c => c.QueryAsync<StageLeadTimeParamDto>(
+                It.IsAny<string>(), It.IsAny<object?>(), It.IsAny<CommandType>(), It.IsAny<DatabaseId>(), It.IsAny<int?>()))
+            .ReturnsAsync(new List<StageLeadTimeParamDto>
+            {
+                new() { Id = 9, EffectiveFrom = new DateTime(2026, 2, 1), EffectiveTo = new DateTime(2026, 5, 1), IsDefault = true, IsActive = true },
+            });
+        var svc = CreateService(conn);
+
+        Func<Task> act = () => svc.CreateAsync(
+            Request(effectiveFrom: new DateTime(2026, 3, 1), effectiveTo: new DateTime(2026, 6, 1), isDefault: true),
+            1, "u", CancellationToken.None);
+
+        await act.Should().ThrowAsync<SetupRuleDataRedLineException>();
+    }
+
+    [Fact]
+    public async Task CreateAsync_IsDefault无重叠全局默认_不触红线()
+    {
+        // R09-V-A：候选生效窗相离 → 合法放行（红线不触发，落 INSERT 回带 Id）
+        var conn = CreateConnectionMock();
+        conn.SetupSequence(c => c.QueryFirstOrDefaultAsync<int>(
+                It.IsAny<string>(), It.IsAny<object?>(), It.IsAny<CommandType>(), It.IsAny<DatabaseId>(), It.IsAny<int?>()))
+            .ReturnsAsync(0)   // 第 1 跳 EnsureNotDuplicate → 不重复
+            .ReturnsAsync(9);  // 第 2 跳 INSERT → 回带 Id
+        conn.Setup(c => c.QueryAsync<StageLeadTimeParamDto>(
+                It.IsAny<string>(), It.IsAny<object?>(), It.IsAny<CommandType>(), It.IsAny<DatabaseId>(), It.IsAny<int?>()))
+            .ReturnsAsync(new List<StageLeadTimeParamDto>
+            {
+                new() { Id = 9, EffectiveFrom = new DateTime(2026, 9, 1), EffectiveTo = new DateTime(2026, 12, 1), IsDefault = true, IsActive = true },
+            });
+        var svc = CreateService(conn);
+
+        var created = await svc.CreateAsync(
+            Request(effectiveFrom: new DateTime(2026, 3, 1), effectiveTo: new DateTime(2026, 6, 1), isDefault: true),
+            1, "u", CancellationToken.None);
+
+        created.Id.Should().Be(9); // INSERT 第 2 跳回带 Id
+        created.IsDefault.Should().BeTrue();
     }
 }

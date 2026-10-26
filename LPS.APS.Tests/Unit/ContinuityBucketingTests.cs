@@ -41,7 +41,8 @@ public class ContinuityBucketingTests
         };
 
     private static ExistingExecutionContextDto Ctx(
-        string pi, string wo, decimal remaining, string startStage = "MACH", string? startOp = null)
+        string pi, string wo, decimal remaining, string startStage = "MACH", string? startOp = null,
+        string? startOpName = null, string? routeCode = null, int? pathId = null)
         => new()
         {
             ProductionInstructionNo = pi,
@@ -49,6 +50,9 @@ public class ContinuityBucketingTests
             WorkOrderStatus         = "IN_PROGRESS",
             StartStageCode          = startStage,
             StartOperationCode      = startOp,
+            StartOperationName      = startOpName,
+            RouteCode               = routeCode ?? string.Empty,
+            PathId                  = pathId,
             DerivedRemainingQty     = remaining,
             DataCutoffTime          = DateTime.Now
         };
@@ -94,6 +98,35 @@ public class ContinuityBucketingTests
         var free = result.Single(d => !d.IsContinuation);
         free.NetOutputQty.Should().Be(70m);                             // Free = Q − E，非 Q 被扣小后的 40
         free.LogicalDemandKey.Should().Be("328_1/FREE");
+    }
+
+    [Fact]
+    public void 中间态只有工序名时_名进入片起点_交下游反查换真码()
+    {
+        // 5号位 取 A（2026-10-10）：DAG 前沿为空（前道完工、后道未开工，占 82%）时只吐
+        // `StartOperationName`、`StartOperationCode` 为 null。本处必须把**名**带进片起点，
+        // 否则下游「名→码 反查」循环（`ApplyContinuityBucketing`）拿不到输入 ⇒ 232 片恒缺码、
+        // 1号位 硬 Fail Closed 不产 Task。
+        // 注意断言的是**中间态**：此处装的仍是名，换码/留 null 由下游 resolver 负责（载荷里绝不出现名）。
+        var demands = new List<LogicalProductionDemand> { Demand("328_31", 31, "PI-C31", 100m) };
+        var ctxs = Map(Ctx("PI-C31", "WO301", 27m, "CN_ASSY", startOp: null, startOpName: "组装"));
+
+        var result = Bucket(demands, ctxs);
+
+        var continuation = result.Single(d => d.IsContinuation);
+        continuation.StartOperationCode.Should().Be("组装");   // 名，非码；下游 resolver 换取 M000
+        continuation.NetOutputQty.Should().Be(27m);
+    }
+
+    [Fact]
+    public void 有真码时_真码优先_不被名覆盖()
+    {
+        var demands = new List<LogicalProductionDemand> { Demand("328_32", 32, "PI-C32", 100m) };
+        var ctxs = Map(Ctx("PI-C32", "WO302", 27m, "CN_ASSY", startOp: "M103", startOpName: "活塞挤压"));
+
+        var result = Bucket(demands, ctxs);
+
+        result.Single(d => d.IsContinuation).StartOperationCode.Should().Be("M103");
     }
 
     [Fact]
@@ -363,5 +396,65 @@ public class ContinuityBucketingTests
 
         result.Single(d => d.LogicalDemandKey == "328_61/FREE").NetOutputQty.Should().Be(470m);
         over.Should().NotContain(o => o.Kind == "PI_FREE_OVER_COMMIT");
+    }
+
+    // ── A/B 路径身份（2026-10-26）：身份来自该片所属 MES 工单的 5号位 上下文真值 ──
+
+    [Fact]
+    public void 连续片带入本工单上下文的真RouteCode与PathId()
+    {
+        // 1号位 PhaseTwoInitialScheduler 对 IsContinuation 需求硬 Fail Closed：
+        // ContinuationKey / RouteCode / PathId / StartOperationCode / NoSplitMerge 缺任一 ⇒ 不产 Task。
+        // 分桶逐工单切，故工单级真值即片级真值，必须带进片。
+        var demands = new List<LogicalProductionDemand> { Demand("328_71", 71, "PI-C71", 100m) };
+        var ctxs = Map(Ctx("PI-C71", "WO071", 30m, routeCode: "配品,C1,C2", pathId: 3));
+
+        var cont = Bucket(demands, ctxs).Single(d => d.IsContinuation);
+
+        cont.RouteCode.Should().Be("配品,C1,C2");
+        cont.PathId.Should().Be(3);
+    }
+
+    [Fact]
+    public void 多工单各带自己的路径身份_不互相串用()
+    {
+        var demands = new List<LogicalProductionDemand> { Demand("328_72", 72, "PI-C72", 100m) };
+        var ctxs = Map(
+            Ctx("PI-C72", "WO-A", 30m, routeCode: "R-A", pathId: 1),
+            Ctx("PI-C72", "WO-B", 20m, routeCode: "R-B", pathId: 2));
+
+        var conts = Bucket(demands, ctxs).Where(d => d.IsContinuation).ToList();
+
+        conts.Should().HaveCount(2);
+        conts.Single(d => d.LogicalDemandKey.EndsWith("/WO:WO-A")).RouteCode.Should().Be("R-A");
+        conts.Single(d => d.LogicalDemandKey.EndsWith("/WO:WO-A")).PathId.Should().Be(1);
+        conts.Single(d => d.LogicalDemandKey.EndsWith("/WO:WO-B")).RouteCode.Should().Be("R-B");
+        conts.Single(d => d.LogicalDemandKey.EndsWith("/WO:WO-B")).PathId.Should().Be(2);
+    }
+
+    [Fact]
+    public void 上下文未交付路径身份时片保持null_不猜唯一Path不填默认值()
+    {
+        // 5号位 侧 PathId 未唯一命中 ⇒ 其 DTO 留 null 并登记 AB_PATH_ID_*；我方原样留空，
+        // 不按「物料唯一 Path」补、不写 DEFAULT/1（0号位 2026-10-07 §三 / 2026-10-22 §五(一)）。
+        var demands = new List<LogicalProductionDemand> { Demand("328_73", 73, "PI-C73", 100m) };
+        var ctxs = Map(Ctx("PI-C73", "WO073", 30m));
+
+        var cont = Bucket(demands, ctxs).Single(d => d.IsContinuation);
+
+        cont.RouteCode.Should().BeNull();
+        cont.PathId.Should().BeNull();
+    }
+
+    [Fact]
+    public void 自由片不继承工单路径身份_由1号位在候选内选路()
+    {
+        var demands = new List<LogicalProductionDemand> { Demand("328_74", 74, "PI-C74", 100m) };
+        var ctxs = Map(Ctx("PI-C74", "WO074", 30m, routeCode: "R-X", pathId: 9));
+
+        var free = Bucket(demands, ctxs).Single(d => !d.IsContinuation);
+
+        free.RouteCode.Should().BeNull();
+        free.PathId.Should().BeNull();
     }
 }
