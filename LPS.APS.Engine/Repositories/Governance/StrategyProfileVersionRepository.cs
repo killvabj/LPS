@@ -144,6 +144,50 @@ public class StrategyProfileVersionRepository : IStrategyProfileVersionRepositor
         return results.ToList();
     }
 
+    /// <summary>
+    /// 按 RunType 解析默认候选，**含 NULL 通用兜底**（AE-007 / Q8，2026-10-29）。
+    /// 语义：**精确 RunType 优先；仅当该时点「精确 RunType」下无任何生效默认时，才回退到 `RunType IS NULL`
+    /// 的「适用所有」默认；两层不混合**。生效窗口（EffectiveFrom/EffectiveTo，有值才校验）与
+    /// IsDefault/PUBLISHED/父 IsActive 在 SQL 内一次判定，避免「精确层存在但已过期」错误地挡住 NULL 兜底。
+    /// 同层多默认由调用方判歧义（多 → HTTP 409，不得随机取第一个）。
+    /// 既有 <see cref="GetDefaultByRunTypeAsync"/> 保持精确匹配语义不动（写侧收敛等仍用它）。
+    /// </summary>
+    public async Task<IReadOnlyList<StrategyProfileVersion>> GetDefaultByRunTypeOrFallbackAsync(
+        string runType, DateTime asOf, CancellationToken ct = default)
+    {
+        const string sql = @"
+            SELECT v.*
+            FROM [dbo].[StrategyProfileVersion] v
+            JOIN [dbo].[StrategyProfile] p ON p.Id = v.StrategyProfileId
+            WHERE v.[IsDefault] = 1
+              AND v.[Status] = 'PUBLISHED'
+              AND p.[IsActive] = 1
+              AND (v.[EffectiveFrom] IS NULL OR v.[EffectiveFrom] <= @AsOf)
+              AND (v.[EffectiveTo]   IS NULL OR v.[EffectiveTo]   >= @AsOf)
+              AND (
+                    p.[RunType] = @RunType
+                 OR (
+                      p.[RunType] IS NULL
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM [dbo].[StrategyProfileVersion] v2
+                          JOIN [dbo].[StrategyProfile] p2 ON p2.Id = v2.StrategyProfileId
+                          WHERE v2.[IsDefault] = 1
+                            AND v2.[Status] = 'PUBLISHED'
+                            AND p2.[IsActive] = 1
+                            AND p2.[RunType] = @RunType
+                            AND (v2.[EffectiveFrom] IS NULL OR v2.[EffectiveFrom] <= @AsOf)
+                            AND (v2.[EffectiveTo]   IS NULL OR v2.[EffectiveTo]   >= @AsOf)
+                      )
+                    )
+                  )";
+
+        var results = await _connectionManager.QueryAsync<StrategyProfileVersion>(
+            sql, new { RunType = runType, AsOf = asOf }, db: DatabaseId.APS);
+
+        return results.ToList();
+    }
+
     /// <inheritdoc />
     public async Task<IReadOnlyList<StrategyProfileVersion>> GetReferencingPublishedVersionsAsync(
         long? referencedRuleSetVersionId,
@@ -186,6 +230,36 @@ public class StrategyProfileVersionRepository : IStrategyProfileVersionRepositor
             sql,
             new { StrategyProfileId = strategyProfileId, ExceptVersionId = exceptVersionId },
             db: DatabaseId.APS);
+    }
+
+    /// <inheritdoc />
+    public async Task SetDefaultAsync(long strategyProfileId, long versionId, CancellationToken ct = default)
+    {
+        // R12-O02 / S-04 单事务原子默认切换（2026-11-03）：镜像 RuleSetVersionRepository.SetDefaultAsync / ParameterSetVersionRepository.SetDefaultAsync
+        // 一致语义——同一事务内「清同 Profile 其它 IsDefault=1」+「置目标 IsDefault=1」，
+        // 修正此前 ClearDefaultFlagAsync + UpdateAsync 两条独立 SQL 的非原子缺陷（崩溃/并发下可能同族双默认），
+        // 并规避 UQ_StrategyProfileVersion_DefaultPublished 过滤唯一索引冲突。
+        await _connectionManager.ExecuteInTransactionAsync(
+            async (connection, transaction) =>
+            {
+                const string clearSql = @"
+                    UPDATE [dbo].[StrategyProfileVersion]
+                    SET [IsDefault] = 0
+                    WHERE [StrategyProfileId] = @StrategyProfileId
+                      AND [Id] <> @VersionId
+                      AND [IsDefault] = 1";
+                const string setSql = @"
+                    UPDATE [dbo].[StrategyProfileVersion]
+                    SET [IsDefault] = 1
+                    WHERE [Id] = @VersionId";
+
+                await connection.ExecuteAsync(
+                    clearSql, new { StrategyProfileId = strategyProfileId, VersionId = versionId }, transaction);
+                await connection.ExecuteAsync(
+                    setSql, new { VersionId = versionId }, transaction);
+                return 0;
+            },
+            DatabaseId.APS);
     }
 
     /// <inheritdoc />

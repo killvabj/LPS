@@ -137,6 +137,13 @@ public class ProductionInstructionPositionCalculator : IProductionInstructionPos
         // 第五步：Position互斥消重
         var deduplicatedPositions = DeduplicatePositions(positions, issues);
 
+        // 第五步半：首Stage残差项——"Stage 已投产未完工 / 尚未投入"的存量必须成位置
+        // （冻结《Pegging供需承接与分层计算业务说明》§9.2「MACH未完成100」：
+        //   Stage 未完工量本身就是一个位置；0号位 2026-10-12 §4.1 同源原则——不得把真实存量当零。
+        //   第一步的相邻差分只覆盖"完成上道、未完成本道"区间，首Stage 缺"投入量 − 累计完工"这一项。）
+        // 2号位 2026-10-31《Stage 部分完工态落 UNLOCATED》：Stage Good=0 但工步已完工 ⇒ 该量本日归 UNLOCATED。
+        ApplyFirstStageResidual(input, deduplicatedPositions, issues);
+
         // 第六步：计算UNLOCATED并总量闭合
         var finalPositions = EnsureTotalClosure(
             input.ErpRemainingQty,
@@ -284,6 +291,85 @@ public class ProductionInstructionPositionCalculator : IProductionInstructionPos
     }
 
     /// <summary>
+    /// 首Stage残差项：max(PlannedQty − GoodCompletedQty, 0)（StageProgressFact 的派生 RemainingQty 口径），
+    /// 以闭合缺口封顶（不得与 XC/在途/库存重复、不得超 ErpRemainingQty）。
+    ///
+    /// 该量是"未完成"量而非"已完成"量，因此不参与 DeduplicatePositions 的 XC/在途扣减
+    ///（扣减只作用于已完成区间），故在消重之后、闭合之前落位。
+    ///
+    /// 类型：该Stage无任何完工证据 ⇒ FIRST_STAGE_PENDING（待生产）；
+    ///       已有工步完工（已开工未完工）⇒ STAGE_WAITING。区分口径与第四步半兜底门禁同源
+    ///      （0号位 2026-10-12 §4.1：有任何工序动过就不算"首Stage待生产"）。
+    /// </summary>
+    private void ApplyFirstStageResidual(
+        ProductionInstructionPositionInput input,
+        List<PositionSlice> positions,
+        List<PositionIssue> issues)
+    {
+        if (input.StageProgress == null || input.StageProgress.Count == 0)
+            return;
+
+        // 首Stage取数与 GetEarliestStage / 第四步半兜底同口径：IsStartStage 优先，其次最小 StageSequence
+        var startStageCode = input.StagePath?
+            .Where(sp => sp.IsStartStage)
+            .OrderBy(sp => sp.StageSequence)
+            .Select(sp => sp.StageCode)
+            .FirstOrDefault();
+
+        var firstStage = (startStageCode != null
+                ? input.StageProgress.FirstOrDefault(s => s.StageCode == startStageCode)
+                : null)
+            ?? input.StageProgress.OrderBy(s => s.StageSequence).First();
+
+        // Stage 事实缺 PlannedQty（旧数据/未映射）⇒ 残差不可算，维持既有兜底路径
+        if (firstStage.PlannedQty <= 0m)
+            return;
+
+        var factResidual = Math.Max(firstStage.PlannedQty - firstStage.GoodCompletedQty, 0m);
+        if (factResidual <= 0.0001m)
+            return;
+
+        var gap = Math.Max(input.ErpRemainingQty - positions.Sum(p => p.Quantity), 0m);
+        var residual = Math.Min(factResidual, gap);
+
+        if (residual > 0.0001m)
+        {
+            var movedInFirstStage = input.OperationProgress != null
+                && input.OperationProgress.Any(op =>
+                    op.StageCode == firstStage.StageCode && op.GoodQty > 0);
+            var hasCompleted = firstStage.GoodCompletedQty > 0.0001m;
+
+            positions.Add(new PositionSlice
+            {
+                PositionType = (hasCompleted || movedInFirstStage)
+                    ? PositionType.STAGE_WAITING
+                    : PositionType.FIRST_STAGE_PENDING,
+                StageCode = firstStage.StageCode,
+                Quantity = residual,
+                IsStrongEvidence = false,
+                SourceKey = "FIRST_STAGE_RESIDUAL",
+                IsUnlocated = false
+            });
+        }
+
+        // 封顶告警只在"部分量被缺口吸收"时出：Stage 计划量 > PI 剩余量 = 源侧不一致，
+        // 不得放大位置总量。gap=0（其它位置已占满剩余）属正常覆盖，不告警。
+        if (gap > 0.0001m && factResidual - residual > 0.0001m)
+        {
+            issues.Add(new PositionIssue
+            {
+                IssueType = "FIRST_STAGE_RESIDUAL_CAPPED",
+                Level = PositionIssueLevel.WARN,
+                Description = $"首Stage残差按闭合缺口封顶：Stage事实剩余{factResidual}，可用缺口{gap}，按{residual}记位置" +
+                              "（Stage计划量高于PI剩余量=源数据不一致，不得放大位置总量）",
+                ProductionInstructionNo = input.ProductionInstructionNo,
+                StageCode = firstStage.StageCode,
+                AffectedQuantity = factResidual - residual
+            });
+        }
+    }
+
+    /// <summary>
     /// 计算XC位置
     /// </summary>
     private List<PositionSlice> CalculateXcPositions(
@@ -299,18 +385,66 @@ public class ProductionInstructionPositionCalculator : IProductionInstructionPos
 
         foreach (var xc in input.XcFacts)
         {
-            if (xc.Quantity > 0.0001m)
+            if (xc.Quantity <= 0.0001m)
             {
-                xcPositions.Add(new PositionSlice
+                continue;
+            }
+
+            // [2026-10-28 0号位《R03-27-04 新DTO最小联测》件2] 同 PI 源物料与 PI 物料不符：
+            // r13926 起 2号位不再预拒、事实照达（XcFact.MaterialCode=源行物料原样）⇒ 取舍归 Position。
+            // 保守处置=**不得计为有效 XC 位置**：该行不成位，份额经 EnsureTotalClosure 落 UNLOCATED
+            // （复用既有闭合，Σ=ERP Remaining 不破），并出一条 XC_MATERIAL_MISMATCH（WARN）保留
+            // 可追溯原因（既有 Issue 均不携带"哪个仓/源物料 vs PI物料/量"，属最小自举新增码）。
+            // 判据两侧任一为空 ⇒ 不明不判（订阅方旧构造/非PI级行行为与 r13923 一致）。
+            if (!string.IsNullOrWhiteSpace(xc.MaterialCode)
+                && !string.IsNullOrWhiteSpace(input.MaterialCode)
+                && !string.Equals(xc.MaterialCode, input.MaterialCode, StringComparison.Ordinal))
+            {
+                issues.Add(new PositionIssue
                 {
-                    PositionType = PositionType.XC,
-                    LocationKey = xc.XcWarehouseCode,
-                    StageCode = xc.RelatedStageCode,
-                    Quantity = xc.Quantity,
-                    AvailableTime = xc.AvailableTime,
-                    IsStrongEvidence = true,  // XC是强事实
-                    SourceKey = xc.SourceDocument,
-                    IsUnlocated = false
+                    IssueType = "XC_MATERIAL_MISMATCH",
+                    Level = PositionIssueLevel.WARN,
+                    Description = $"XC 行 PI 号合法但源物料与 PI 物料不符（不计有效XC，份额经闭合落 UNLOCATED）: " +
+                                  $"PI={input.ProductionInstructionNo}, 仓={xc.XcWarehouseCode}, " +
+                                  $"源物料={xc.MaterialCode}, PI物料={input.MaterialCode}, 数量={xc.Quantity}",
+                    ProductionInstructionNo = input.ProductionInstructionNo,
+                    AffectedQuantity = xc.Quantity
+                });
+                continue;
+            }
+
+            xcPositions.Add(new PositionSlice
+            {
+                PositionType = PositionType.XC,
+                LocationKey = xc.XcWarehouseCode,
+                StageCode = xc.RelatedStageCode,
+                Quantity = xc.Quantity,
+                AvailableTime = xc.AvailableTime,
+                IsStrongEvidence = true,  // XC是强事实
+                SourceKey = xc.SourceDocument,
+                IsUnlocated = false
+            });
+
+            // [2026-10-27 0号位《R03-27-04》] 跨厂 XC：位置照记（物理事实不剔除、不降级），
+            // 但登记 XC_CROSS_FACTORY（WARN）留痕——位置成立 ≠ 该厂可开工（XC 本就不进
+            // NextOperationContext，见 CalculateNextOperationContexts 的 XC 跳过分支）。
+            // 判据=库存实际厂(XcFact.FactoryCode) ≠ PI 所属厂(input.FactoryCode)；
+            // 任一侧为空 ⇒ 厂不明，不参与任何判定（XcFact.FactoryCode 注释语义）。
+            // 数量口径不变：ΣPosition 仍闭合到 ERP Remaining，跨厂输入不新增任何供给。
+            if (!string.IsNullOrWhiteSpace(xc.FactoryCode)
+                && !string.IsNullOrWhiteSpace(input.FactoryCode)
+                && !string.Equals(xc.FactoryCode, input.FactoryCode, StringComparison.Ordinal)
+                && !string.IsNullOrWhiteSpace(xc.ProductionInstructionNo))
+            {
+                issues.Add(new PositionIssue
+                {
+                    IssueType = "XC_CROSS_FACTORY",
+                    Level = PositionIssueLevel.WARN,
+                    Description = $"XC 库存实际所在厂与 PI 所属厂不同（跨厂持有，位置照记）: " +
+                                  $"PI={input.ProductionInstructionNo}, 仓={xc.XcWarehouseCode}, " +
+                                  $"PI厂={input.FactoryCode}, 库存厂={xc.FactoryCode}, 数量={xc.Quantity}",
+                    ProductionInstructionNo = input.ProductionInstructionNo,
+                    AffectedQuantity = xc.Quantity
                 });
             }
         }
@@ -882,17 +1016,33 @@ public class ProductionInstructionPositionCalculator : IProductionInstructionPos
         }
         else
         {
-            // 超量：严重问题
+            // 超量：强事实互相冲突（冻结 Pegging v1.6 §9.7「V1不猜哪条源事实错」／§18.1「单PI事实冲突=可降级」／
+            // §24 典型案例五）：不把较大的位置计算结果写成新 PI 总量、也不静默改小，
+            // 而是将该 PI 剩余整体降级为 UNLOCATED 并登记 Issue；Domain 继续
+            //（本 PI 仍以 erpRemainingQty 作为 Supply 承接；UNLOCATED 不在位置毛量白名单 ⇒ 不产执行批，
+            //   1号位按最早可信 Stage 保守占产能，保守 Task 不得下发 MES——§24）。
+            // 2号位 2026-10-31《首Stage残差复验》§六：残余超量 89% 为 XC 报毛量，属本 §9.7 形态。
             issues.Add(new PositionIssue
             {
                 IssueType = "QUANTITY_OVERFLOW",
                 Level = PositionIssueLevel.ERROR,
-                Description = $"Position总量({totalQty})超过ERP RemainingQty({erpRemainingQty})，超出{-gap}",
+                Description = $"Position总量({totalQty})超过ERP RemainingQty({erpRemainingQty})，超出{-gap}；" +
+                              "按冻结 §9.7 不猜哪条源事实错，本 PI 剩余整体降级为 UNLOCATED（本 Issue 即登记）",
                 ProductionInstructionNo = piNo,
                 AffectedQuantity = -gap
             });
 
-            return positions;
+            return new List<PositionSlice>
+            {
+                new PositionSlice
+                {
+                    PositionType = PositionType.UNLOCATED,
+                    Quantity = erpRemainingQty,
+                    IsStrongEvidence = false,
+                    IsUnlocated = true,
+                    SourceKey = "OVERFLOW_DOWNGRADE"
+                }
+            };
         }
     }
 

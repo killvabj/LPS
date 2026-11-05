@@ -60,7 +60,9 @@ public static class DatabaseServiceExtensions
                 .AddClasses(classes => classes
                     .InNamespaces(
                         "LPS.APS.Engine.Services.Sync",
-                        "LPS.APS.Engine.Services.Auth")
+                        "LPS.APS.Engine.Services.Auth",
+                        // 保留期清理（D1~D4）：IRetentionMaintenanceService → RetentionMaintenanceService
+                        "LPS.APS.Engine.Services.Maintenance")
                     .Where(t => ServiceScanFilters.IsServiceCandidate(t)))
                 .AsImplementedInterfaces()
                 .WithScopedLifetime()

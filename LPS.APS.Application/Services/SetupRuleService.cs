@@ -379,19 +379,37 @@ public sealed class SetupRuleService : ISetupRuleService
             filtered = filtered.Where(v => string.Equals(v.Status, normalized, StringComparison.OrdinalIgnoreCase));
         }
 
-        return filtered
+        // P2（2026-10-28）：批查 RuleSet 主表回带 RuleSetCode/RuleSetName（按过滤后版本去重主键，一次 IN 批查，无 N+1）。
+        // 依据 aps.planner 仅持 aps.setup.view 不持 aps.rule.view，前端需在本端点（挂 aps.setup.view）直接分辨所属规则集。
+        var versionList = filtered.ToList();
+        if (versionList.Count == 0)
+        {
+            return new List<SetupRuleSetVersionDto>();
+        }
+
+        var ruleSetIds = versionList.Select(v => v.RuleSetId).Distinct().ToList();
+        var ruleSets = await _masterDataLookup.GetRuleSetsAsync(ruleSetIds, ct);
+        var ruleSetById = ruleSets.ToDictionary(r => r.Id);
+
+        return versionList
             .OrderBy(v => v.VersionCode)
-            .Select(v => new SetupRuleSetVersionDto
+            .Select(v =>
             {
-                Id = v.Id,
-                RuleSetId = v.RuleSetId,
-                VersionCode = v.VersionCode,
-                Status = v.Status,
-                EffectiveFrom = v.EffectiveFrom,
-                EffectiveTo = v.EffectiveTo,
-                PublishedAt = v.PublishedAt,
-                PublishedBy = v.PublishedBy,
-                CreatedAt = v.CreatedAt,
+                ruleSetById.TryGetValue(v.RuleSetId, out var rs);
+                return new SetupRuleSetVersionDto
+                {
+                    Id = v.Id,
+                    RuleSetId = v.RuleSetId,
+                    RuleSetCode = rs?.RuleSetCode ?? string.Empty,
+                    RuleSetName = rs?.RuleSetName,
+                    VersionCode = v.VersionCode,
+                    Status = v.Status,
+                    EffectiveFrom = v.EffectiveFrom,
+                    EffectiveTo = v.EffectiveTo,
+                    PublishedAt = v.PublishedAt,
+                    PublishedBy = v.PublishedBy,
+                    CreatedAt = v.CreatedAt,
+                };
             })
             .ToList();
     }
@@ -486,14 +504,9 @@ public sealed class SetupRuleService : ISetupRuleService
         // 404 前置：版本不存在直接拒（发布语义上属资源缺失）
         var version = await GetVersionOrThrowAsync(versionId, ct);
 
-        // 发布前 Setup 冲突全量预校验（§8.3；补齐旧发布路径 GovernanceController rule-set/version/{versionId}/publish 不校验 Setup 冲突的旁路缺口）
-        var rules = SetupTransitionRuleProjector.ExtractRules(version.ContentSnapshotJson);
-        var activeRules = rules.Where(r => r.IsActive).ToList();
-        var result = _conflictValidator.Validate(activeRules);
-        if (!result.IsValid)
-        {
-            throw new SetupRuleDataRedLineException($"发布前 Setup 换型规则冲突校验未通过：{result.GetErrorMessage()}");
-        }
+        // P0-B（2026-10-27 核证收口）：Setup 同键冲突校验已收拢进 GovernanceVersionService.ValidateRuleSetVersionForPublishAsync
+        // （统一发布与 Setup 发布共用同一份，消除校验倒挂）。本路径由 PublishRuleSetVersionAsync 触发同一校验，不再各自持有防双跑。
+        // 写作路径增量校验（EnsureNoConflict, §10）仍在此类：每次 Create/Update 候选并入后校验，与发布前全量校验互补。
 
         await _governanceVersionService.PublishRuleSetVersionAsync(versionId, actorUserCode, actorUserId, ct, changeReason);
     }
@@ -514,6 +527,16 @@ public sealed class SetupRuleService : ISetupRuleService
     public Task<IReadOnlyList<SetupUncoveredStatDto>> GetUncoveredStatsAsync(
         int? runId, int? departmentId, string? operationCode, int? resourceId, int? materialId, CancellationToken ct = default)
         => _setupUncoveredStatRepository.GetUncoveredAsync(runId, departmentId, operationCode, resourceId, materialId, ct);
+
+    /// <summary>分页版服务端分页：pageSize 截断到 1..200（默认 20）、pageIndex &lt;1 归 1，规范化后透传仓储。</summary>
+    public Task<SetupUncoveredStatsPage> GetUncoveredStatsPageAsync(
+        int? runId, int? departmentId, string? operationCode, int? resourceId, int? materialId,
+        int pageIndex = 1, int pageSize = 20, CancellationToken ct = default)
+    {
+        var pi = pageIndex < 1 ? 1 : pageIndex;
+        var ps = pageSize < 1 ? 1 : (pageSize > 200 ? 200 : pageSize);
+        return _setupUncoveredStatRepository.GetUncoveredPageAsync(runId, departmentId, operationCode, resourceId, materialId, pi, ps, ct);
+    }
 
     /// <summary>目标规则须与端点类型一致且不可变更所属版本（否则 422）</summary>
     private static void EnsureSameTypeAndVersion(SetupTransitionRule existing, string expectedType, long inputRuleSetVersionId)
@@ -563,10 +586,10 @@ public sealed class SetupRuleService : ISetupRuleService
             throw new SetupRuleDataRedLineException("明确换型规则（EXACT）必须携带前产品与后产品（fromMaterialId/toMaterialId）。");
         }
 
-        if (input.FromMaterialId == input.ToMaterialId)
-        {
-            throw new SetupRuleDataRedLineException("明确换型规则（EXACT）前产品与后产品不能相同（fromMaterialId == toMaterialId）。");
-        }
+        // 0号位 2026-10-28 更正（R08 显式 A→A 必须按冻结整改）：放开合法显式**同材 EXACT**（fromMaterialId == toMaterialId）。
+        // 业务基线 v1.14 §57 允许显式同材换型规则，且其值优先于默认同材 0（DEFAULT 兜底）；同材规则仍按 EXACT 七元组唯一键判重、
+        // 仍受方向性/DEFAULT/Scope/重复/数值红线校验。方向性=同材时 From/To 相同不构成反向（语义上等价自环自命中）。
+        // 备注：方向性校验见 <see cref="SetupTransitionRuleConflictValidator"/>（仍只判 EXACT×EXACT 同键重复与反向交叉，不受本放开影响）。
 
         ValidateCommon(input.ProductionDepartmentId, input.StageCode, input.OperationCode, input.ResourceId, input.SetupMinutes);
     }
@@ -783,16 +806,9 @@ public sealed class SetupRuleService : ISetupRuleService
             ? $"换型规则 工序[{rule.OperationCode}] 设备[{rule.ResourceId}] {rule.FromMaterialId}→{rule.ToMaterialId}"
             : $"换型规则 工序[{rule.OperationCode}] 设备[{rule.ResourceId}] 默认";
 
-    /// <summary>Setup 换型规则唯一键（EXACT 七元组 / DEFAULT 五元组；前缀区分类型，杜绝跨类误并）</summary>
+    /// <summary>Setup 换型规则唯一键（EXACT 七元组 / DEFAULT 五元组）。单源在投影器，此处委托防双实现漂移（Q2 口径）。</summary>
     private static string BuildKey(SetupTransitionRule rule)
-    {
-        if (rule.RuleType == SetupTransitionRuleType.Exact)
-        {
-            return $"E|{rule.ProductionDepartmentId}|{rule.StageCode}|{rule.OperationCode}|{rule.ResourceId}|{rule.FromMaterialId}|{rule.ToMaterialId}";
-        }
-
-        return $"D|{rule.ProductionDepartmentId}|{rule.StageCode}|{rule.OperationCode}|{rule.ResourceId}";
-    }
+        => SetupTransitionRuleProjector.BuildBusinessKey(rule);
 
     /// <summary>规则 → 变更行（added/removed 维度；Code 回带，不含 id/before/after——契约仅 modified 行携带）</summary>
     private static async Task<SetupRuleChangeDto> BuildChangeAsync(SetupTransitionRule rule, MasterDataCodeCache codes)

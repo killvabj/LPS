@@ -649,6 +649,39 @@ VALUES (@MaterialId, NULL, 10, 100, 50, 1, 1, 1, NULL, NULL, GETDATE(), GETDATE(
         count.Should().Be(1);
     }
 
+    [Fact]
+    public async Task ActivateAsync_停用后恢复启用_IsActive复位且审计Activate()
+    {
+        var materialId = await PickFreeMaterialIdAsync();
+        if (_testMaterialId <= 0) _testMaterialId = materialId; // 复用既有清理按 MaterialId 删除自建数据
+
+        var deptId = await PickAnyDepartmentIdAsync();
+        var created = await _service.CreateAsync(new SaveTaskSplitRuleConfigRequest
+        {
+            MaterialId = materialId,
+            ProductionDepartmentId = deptId,
+            PreferredBatchQty = 30m,
+            AllowSplit = true,
+            AllowMerge = true,
+        }, actorUserId: 1, actorUserCode: "test", CancellationToken.None);
+
+        var deactivated = await _service.DeactivateAsync(created.Id, actorUserId: 1, actorUserCode: "test", CancellationToken.None);
+        deactivated.IsActive.Should().BeFalse();
+        _auditLogs.Should().Contain(x => x.ActionCode == "Deactivate");
+
+        // 恢复启用：IsActive 复位 true，且追加 Activate 审计
+        var reactivated = await _service.ActivateAsync(created.Id, actorUserId: 1, actorUserCode: "test", CancellationToken.None);
+
+        reactivated.IsActive.Should().BeTrue();
+        reactivated.Id.Should().Be(created.Id);
+        _auditLogs.Should().Contain(x => x.ActionCode == "Activate");
+
+        // 幂等：再次激活原样返回（GetById 命中，不追加第二条 Activate 审计）
+        var idempotent = await _service.ActivateAsync(created.Id, actorUserId: 1, actorUserCode: "test", CancellationToken.None);
+        idempotent.IsActive.Should().BeTrue();
+        _auditLogs.Count(x => x.ActionCode == "Activate").Should().Be(1);
+    }
+
     public void Dispose()
     {
         // 清理本测试自建数据（仅按测试期选定的 MaterialId，绝不误删 4号位 curl / 真实数据）

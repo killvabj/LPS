@@ -25,6 +25,21 @@ namespace LPS.APS.Tests.Unit;
 /// </summary>
 public class AllocationShareInvariantTests
 {
+    /// <summary>
+    /// 部门范围守卫**放行桩**：本类只测产出份额的纯内存不变式，不触范围判定。
+    /// 用真 mock（而非 `Mock.Of`）给出 `Task.CompletedTask` —— `Mock.Of` 未 setup 的 `Task` 方法返回 null，
+    /// 一旦编排路径真的调到就会 `await null` 抛 NRE，掩盖真实意图。
+    /// </summary>
+    private static IDepartmentScopeGuard DepartmentScopeGuardPassThrough()
+    {
+        var guard = new Mock<IDepartmentScopeGuard>();
+        guard.Setup(g => g.EnsureAsync(
+                It.IsAny<long?>(), It.IsAny<string>(),
+                It.IsAny<IReadOnlyCollection<int>>(), It.IsAny<CancellationToken>()))
+            .Returns(Task.CompletedTask);
+        return guard.Object;
+    }
+
     private static PeggingOrchestrator BuildOrchestrator()
     {
         var options = Options.Create(new DatabaseOptions
@@ -45,7 +60,8 @@ public class AllocationShareInvariantTests
             Mock.Of<ITimedSupplyFactLoader>(),
             Mock.Of<IProcurementManualEtaRepository>(),
             Mock.Of<IProductionInstructionPositionCalculator>(),
-            Mock.Of<IProductionInstructionPositionSnapshotRepository>());
+            Mock.Of<IProductionInstructionPositionSnapshotRepository>(),
+            DepartmentScopeGuardPassThrough());
     }
 
     private static PeggingResultVoucher Voucher(params LogicalProductionDemand[] demands)

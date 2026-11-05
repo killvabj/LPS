@@ -30,4 +30,11 @@ public class MaterialMapping
     public bool IsCurrent { get; set; } = true;
     public DateTime CreatedAt { get; set; }
     public DateTime UpdatedAt { get; set; }
+
+    /// <summary>
+    /// 源侧「物料—仓库关系」当前启用状态（N10，2026-10-28；来源同 MaterialSupplyContext.SourceIsActive）。
+    /// 1=当前有效，0=已停用，NULL=尚未回填。
+    /// 只做源侧事实留痕，不改变 SCD2 版本切分逻辑（版本仍按 SourceID / 业务属性变化开闭）。
+    /// </summary>
+    public bool? SourceIsActive { get; set; }
 }

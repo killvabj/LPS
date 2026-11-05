@@ -60,9 +60,9 @@ const spec = computed(() => TRIGGER_RUN_MATRIX[props.trigger])
 /** 事实前提提示（两码差异仅在此） */
 const FACT_HINT: Record<'EQUIPMENT_FAILURE' | 'RESOURCE_CALENDAR_CHANGE', string> = {
   EQUIPMENT_FAILURE:
-    '设备故障后重排：仅选择**已发生故障 / 已确认不可用**的资源。系统不得假设设备故障——未落库的故障事实请先在设备侧登记，再从此入口发起建议重排。',
+    '设备故障后重排：仅选择已发生故障 / 已确认不可用的资源。系统不得假设设备故障——未落库的故障事实请先在设备侧登记，再从此入口发起建议重排。',
   RESOURCE_CALENDAR_CHANGE:
-    '资源日历调整后重排：仅可选**已正式修改 Calendar**（维护窗口 / 停机日历）的资源。前端 V1 不提供 Calendar 维护功能，日历变更由外部系统落库后在此引用。'
+    '资源日历调整后重排：仅可选已正式修改 Calendar（维护窗口 / 停机日历）的资源。前端 V1 不提供 Calendar 维护功能，日历变更由外部系统落库后在此引用。'
 }
 
 const domainKey = ref<DomainKey | undefined>(undefined)

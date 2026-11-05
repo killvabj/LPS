@@ -130,18 +130,35 @@ export type ResolveWindowSource = 'Factory' | 'Department' | 'Resource'
  */
 export type ResolveStatus = 'WORK' | 'OFF' | 'MISSING'
 
-/** 解析后的一片合法窗口（后端 `ResolvedWindowDto`） */
+/** 解析后的一片合法窗口（后端 `ResolvedWindowDto`）
+ *  - `isAuthorized` = 本片是否来自**授权加班例外**（来源层存在 WorkDate 例外行、
+ *    IsAuthorizedOverride=1 且 WORK 且与本片刻交叠）；本级片恒 false。
+ *    后端在预览侧 ApplyAuthorization 推导（不动 2号位 Resolver）⇒ 设备/人工槽两个端点同名字段。 */
 export interface ResolvedWindowDto {
   start: string
   end: string
   source: ResolveWindowSource
+  /** 授权加班例外片 = true；后端未返回时按 false 处理 */
+  isAuthorized?: boolean
 }
 
 /** 三级合并解析预览（GET /api/resource-calendar/resolve-preview）
- *  后端 `ResourceCalendarResolvePreviewDto`（lps/.../Dto/ResourceCalendarDtos.cs:143）
- *  ⚠️ 只收 `resourceIds`（设备）—— **没有人工槽版本**，Tab3 暂无法展示合并状态。 */
+ *  后端 `ResourceCalendarResolvePreviewDto`（lps/.../Dto/ResourceCalendarDtos.cs:143） */
 export interface ResourceCalendarResolvePreviewDto {
   resourceId: number
+  /** 三级合并后最终有没有可排窗口 */
+  hasAnyWindow: boolean
+  status: ResolveStatus
+  windows: ResolvedWindowDto[]
+}
+
+/** 人工槽版三级合并解析预览（GET /api/manual-capacity/resolve-preview）
+ *  后端 `ManualCapacityResolvePreviewDto`（lps/.../Dto/ResourceCalendarDtos.cs:179）
+ *  - 与设备侧同构；键 = ManualSlotId（与 Solver 合成资源键 10亿+id 互不混用）
+ *  - 归属链 槽 → 部门 → 工厂 上溯（人工槽无直接工厂列）
+ *  - 越界槽 fail-closed 剔除（不泄露存在性） */
+export interface ManualCapacityResolvePreviewDto {
+  manualSlotId: number
   /** 三级合并后最终有没有可排窗口 */
   hasAnyWindow: boolean
   status: ResolveStatus

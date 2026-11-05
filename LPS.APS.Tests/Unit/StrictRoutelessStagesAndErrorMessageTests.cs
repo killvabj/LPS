@@ -33,6 +33,33 @@ public class StrictRoutelessStagesAndErrorMessageTests
     private static DomainSolveRequest RequestWith(params RoutingOperation[] ops)
         => new() { RoutingOperations = ops };
 
+    // ── R09-①（2026-10-29 落码）夹具补齐：无 Routing Stage 现在按 `(FactoryId, DepartmentId)` 的
+    //   合法 WORK 窗口逐片推进，不再按墙钟 `AddHours`。本族期望值仍写成 `Start.AddHours(n)`
+    //   ⇒ 给一条**连续 24×7 窗口**，「有效生产小时累计」与「墙钟小时」逐位相同，断言不用改。
+    //   ⚠ 夹具口径，不是生产回落：生产里无窗口 ⇒ 不推进 + `CompletionTimeCertain=false`。
+    private const int FixtureDepartmentId = 9001;
+
+    private static IReadOnlyList<MaterialStageDepartmentContextDto> FixtureDeptContexts => new[]
+    {
+        new MaterialStageDepartmentContextDto
+        {
+            MaterialId = MaterialId, StageCode = "S2", ProductionDepartmentId = FixtureDepartmentId
+        },
+        new MaterialStageDepartmentContextDto
+        {
+            MaterialId = MaterialId, StageCode = "S3", ProductionDepartmentId = FixtureDepartmentId
+        },
+    };
+
+    private static IReadOnlyList<DepartmentWorkWindow> FixtureWorkWindows => new[]
+    {
+        new DepartmentWorkWindow
+        {
+            FactoryId = 0, DepartmentId = FixtureDepartmentId,
+            Start = Start, End = Start.AddYears(100)
+        },
+    };
+
     private static RoutingOperation Op(string routeCode, int pathId, string stageCode, int materialId = MaterialId)
         => new()
         {
@@ -200,6 +227,8 @@ public class StrictRoutelessStagesAndErrorMessageTests
                 Op("R1", 1, "S1"),
                 Op("R1", 1, "S2"),
             },
+            MaterialStageDepartmentContexts = FixtureDeptContexts,
+            DepartmentWorkWindows = FixtureWorkWindows,
         };
 
         var stages = Effective("S1", "S2", "S3");
@@ -270,6 +299,8 @@ public class StrictRoutelessStagesAndErrorMessageTests
                 },
             },
             RoutingOperations = ops,
+            MaterialStageDepartmentContexts = FixtureDeptContexts,
+            DepartmentWorkWindows = FixtureWorkWindows,
         };
 
     /// <summary>末端真实 Task 落在 `S1`，`End = Start + 8h`，并带上**实际选中路径**（可为 null = 未选定）。</summary>

@@ -13,7 +13,7 @@ namespace LPS.APS.Web.Controllers;
 /// <summary>
 /// Setup 换型规则维护 API（4号位 Setup 契约 §11.1，#1-13 端点）。
 /// 路径前缀 /api/governance（与 <see cref="GovernanceController"/> 共享前缀，字面路由段不冲突）。
-/// 权限：查看 aps.setup.view；维护 aps.setup.edit；发布 aps.setup.publish。
+/// 权限：查看 aps.setup.view；维护 aps.setup.edit；**整版发布挂 aps.rule.publish（P0-A 2026-10-27 核证收口，不得仅持 aps.setup.publish 越权发布①＋⑦）**。
 /// 错误映射：422 数据红线 / 404 不存在 / 400 状态红线与参数 / 403 权限不足（[Authorize]）。
 /// </summary>
 [ApiController]
@@ -278,8 +278,14 @@ public class SetupRuleController : ControllerBase
         }
     }
 
-    /// <summary>#13 发布规则集版本（发布前 Setup 冲突全量预校验；权限 aps.setup.publish）</summary>
-    [Authorize(Policy = PermissionCodes.SetupPublish)]
+    /// <summary>
+    /// #13 发布规则集版本（发布前 Setup 冲突全量预校验）。
+    /// 权限 aps.rule.publish（P0-A 2026-10-27 核证收口）：本端点发布的是含需求优先级①的整版规则集，
+    /// 由仅持 aps.setup.publish 越权改为规则集发布权，语义与整版发布对齐（不得仅凭 setup.publish 发布①＋⑦）。
+    /// 端到端 403 负例（仅持 aps.setup.publish、无 aps.rule.publish 主体 → 403 且版本仍 DRAFT）归 WebApplicationFactory
+    /// 集成基建（2号位 运行域），见《…_统一发布门禁_端到端403负例协助请求_3号位致2号位_v1.0》。
+    /// </summary>
+    [Authorize(Policy = PermissionCodes.RulePublish)]
     [HttpPost("rule-set-versions/{id:long}/publish")]
     public async Task<IActionResult> Publish(long id, [FromBody] SetupPublishRequest? request, CancellationToken ct)
     {
@@ -364,10 +370,21 @@ public class SetupRuleController : ControllerBase
         [FromQuery] string? operationCode,
         [FromQuery] int? resourceId,
         [FromQuery] int? materialId,
+        [FromQuery] int? pageIndex,
+        [FromQuery] int? pageSize,
         CancellationToken ct)
     {
         try
         {
+            // 方案 A（2026-10-28 裁定，4号位 契约提请）：传了分页参数 → 服务端分页（PageResult 同形 + KPI summary）；
+            // 未传 → 保持既有全量数组（CSV 全量导出 / SET-UNCL01 判据不变）。两形态由前端 api 层按是否传参分派。
+            if (pageIndex.HasValue || pageSize.HasValue)
+            {
+                var page = await _setupRuleService.GetUncoveredStatsPageAsync(
+                    runId, departmentId, operationCode, resourceId, materialId, pageIndex ?? 1, pageSize ?? 20, ct);
+                return Ok(ApiResponse<SetupUncoveredStatsPage>.Success(page));
+            }
+
             var data = await _setupRuleService.GetUncoveredStatsAsync(runId, departmentId, operationCode, resourceId, materialId, ct);
             return Ok(ApiResponse<IReadOnlyList<SetupUncoveredStatDto>>.Success(data));
         }

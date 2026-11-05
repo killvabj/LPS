@@ -187,25 +187,64 @@ public class NightlyBatchOrchestrator : INightlyBatchOrchestrator
         var versionCode = $"NIGHTLY_{now:yyyyMMdd}_{domainKey}";
 
         var sql = @"
-            -- 同日重跑幂等清理：本 VersionCode 含日期（NIGHTLY_{yyyyMMdd}_{DomainKey}），
-            -- 所以这条只命中「同一天重跑」留下的旧壳 —— 目的是给下面 INSERT 让路（UQ_PlanVersion_VersionCode 唯一约束）。
-            -- ⚠️ 跨天的历史版本**不在这里归档**：由新版本算完自动采用时的 ReplaceActiveAsync 归档旧 ACTIVE，
-            --    否则会在「新版本还没算完」的窗口里把该域唯一的正式版本提前归档掉。
-            -- 状态值一律用冻结词表（ARCHIVED），不写 'Archived' 这种大小写变体。
-            UPDATE PlanVersion
-            SET Status = 'ARCHIVED', ArchivedAt = GETDATE()
-            WHERE VersionCode = @VersionCode AND Status <> 'ARCHIVED';
+            -- ============================================================
+            -- 2026-11-05 修复：同日重跑必撞键
+            --   原实现：「先把同 VersionCode 的旧壳 UPDATE 成 ARCHIVED，再 INSERT」，
+            --     并注释「目的是给 INSERT 让路（UQ_PlanVersion_VersionCode 唯一约束）」。
+            --   **该假设不成立**：`UQ_PlanVersion_VersionCode` 是**无过滤**唯一索引（实测
+            --     `has_filter=0`、`filter_definition=NULL`），**不看 Status** ⇒ 归档行照样占着码
+            --     ⇒ 同一天第二次跑 INSERT 必报 Msg 2627。
+            --   （另一条 `UQ_PlanVersion_OneActivePerDomain` 才是过滤索引 `WHERE Status='ACTIVE'`。）
+            --   实测：2026-11-05 08:51 重跑夜间批，第 1 个域就撞 2627，整批中断。
+            --
+            --   现改为「**有则 UPDATE 复用同一行，无则 INSERT**」：
+            --     · 天然幂等，Id 稳定（下游 [Order] / OrderLoadRejection 等按 PlanVersionId 挂着，不用重建）；
+            --     · 同日的旧壳本来就没算完（BUILDING/ARCHIVED 且 Task=0），复用不丢任何有效结果。
+            --   ⚠️ 跨天的历史版本**仍不在这里动**：由新版本算完自动采用时的 ReplaceActiveAsync 归档旧 ACTIVE。
+            -- ============================================================
+            DECLARE @Id INT = (SELECT Id FROM PlanVersion WHERE VersionCode = @VersionCode);
 
-            INSERT INTO PlanVersion (
-                VersionCode, VersionCategory, PlanHorizonStart, PlanHorizonEnd,
-                ComputeMode, Status, BatchNo, SourceScheduleRunId, DomainKey, CreatedBy, CreatedAt
-            )
-            VALUES (
-                @VersionCode, 'DAILY_BASELINE', @PlanHorizonStart, @PlanHorizonEnd,
-                'FULL', 'BUILDING', @BatchNo, @SourceScheduleRunId, @DomainKey, 'SYSTEM', GETDATE()
-            );
+            IF @Id IS NOT NULL
+            BEGIN
+                UPDATE PlanVersion
+                SET VersionCategory        = 'DAILY_BASELINE',
+                    PlanHorizonStart       = @PlanHorizonStart,
+                    PlanHorizonEnd         = @PlanHorizonEnd,
+                    ComputeMode            = 'FULL',
+                    Status                 = 'BUILDING',
+                    BatchNo                = @BatchNo,
+                    SourceScheduleRunId    = @SourceScheduleRunId,
+                    DomainKey              = @DomainKey,
+                    CreatedBy              = 'SYSTEM',
+                    CreatedAt              = GETDATE(),
+                    ComputedAt             = NULL,
+                    ArchivedAt             = NULL,
+                    ActivatedAt            = NULL,
+                    ActivatedBy            = NULL,
+                    TotalOrders            = NULL,
+                    TotalTasks             = NULL,
+                    SnapshotFilePath       = NULL,
+                    SnapshotFileSize       = NULL,
+                    SnapshotCompressedSize = NULL,
+                    SnapshotFileHash       = NULL,
+                    SnapshotCreatedAt      = NULL
+                WHERE Id = @Id;
 
-            SELECT CAST(SCOPE_IDENTITY() AS INT);";
+                SELECT @Id;
+            END
+            ELSE
+            BEGIN
+                INSERT INTO PlanVersion (
+                    VersionCode, VersionCategory, PlanHorizonStart, PlanHorizonEnd,
+                    ComputeMode, Status, BatchNo, SourceScheduleRunId, DomainKey, CreatedBy, CreatedAt
+                )
+                VALUES (
+                    @VersionCode, 'DAILY_BASELINE', @PlanHorizonStart, @PlanHorizonEnd,
+                    'FULL', 'BUILDING', @BatchNo, @SourceScheduleRunId, @DomainKey, 'SYSTEM', GETDATE()
+                );
+
+                SELECT CAST(SCOPE_IDENTITY() AS INT);
+            END";
 
         var parameters = new DynamicParameters();
         parameters.Add("@VersionCode", versionCode);

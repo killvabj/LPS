@@ -69,7 +69,11 @@ import {
   type SetupRuleExactInput
 } from '@/api/aps-v1'
 import { useSetupExactStore } from '@/store/modules/aps/setupExact'
-import { useSetupMasterData, type SetupLookupOption } from '../composables/useSetupMasterData'
+import {
+  filterLookupOptions,
+  useSetupMasterData,
+  type SetupLookupOption
+} from '../composables/useSetupMasterData'
 
 defineOptions({ name: 'SetupExactDialog' })
 
@@ -151,6 +155,11 @@ const deviceRules = computed(() =>
 // ===== 远程搜索（后端三个 lookup 均 TOP 200 写死，见 useSetupMasterData 头注释） =====
 const searching = reactive({ department: false, material: false, resource: false })
 
+/** 每个下拉各自的输入关键词 —— EP 在 remote 模式下不做本地过滤，靠它收窄展示项 */
+const departmentQuery = ref('')
+const fromMaterialQuery = ref('')
+const toMaterialQuery = ref('')
+
 /** 300ms 防抖：连续打字只发最后一次 */
 function debounce<A extends unknown[]>(fn: (...args: A) => void) {
   let timer: ReturnType<typeof setTimeout> | undefined
@@ -160,7 +169,7 @@ function debounce<A extends unknown[]>(fn: (...args: A) => void) {
   }
 }
 
-const onSearchDepartment = debounce((kw: string) => {
+const searchDepartment = debounce((kw: string) => {
   if (!kw.trim()) {
     searching.department = false
     return
@@ -168,7 +177,7 @@ const onSearchDepartment = debounce((kw: string) => {
   searching.department = true
   void masterData.searchDepartments(kw).finally(() => (searching.department = false))
 })
-const onSearchMaterial = debounce((kw: string) => {
+const searchMaterial = debounce((kw: string) => {
   if (!kw.trim()) {
     searching.material = false
     return
@@ -177,9 +186,30 @@ const onSearchMaterial = debounce((kw: string) => {
   void masterData.searchMaterials(kw).finally(() => (searching.material = false))
 })
 
+/** 关键词立即落到展示项（收窄），后端补拉只负责追加 TOP 200 之外的项 */
+function onSearchDepartment(kw: string): void {
+  departmentQuery.value = kw
+  searchDepartment(kw)
+}
+function onSearchFromMaterial(kw: string): void {
+  fromMaterialQuery.value = kw
+  searchMaterial(kw)
+}
+function onSearchToMaterial(kw: string): void {
+  toMaterialQuery.value = kw
+  searchMaterial(kw)
+}
+
 // ===== 下拉源（后端主数据 lookup；Id-口径 v1.1 选项带 id 供写输入提交） =====
-const departmentOptions = masterData.departments
-const materialOptions = masterData.materials
+const departmentOptions = computed(() =>
+  filterLookupOptions(masterData.departments.value, departmentQuery.value)
+)
+const fromMaterialOptions = computed(() =>
+  filterLookupOptions(masterData.materials.value, fromMaterialQuery.value)
+)
+const toMaterialOptions = computed(() =>
+  filterLookupOptions(masterData.materials.value, toMaterialQuery.value)
+)
 
 /** 大工艺按所选部门收窄（部门选项自带 stageCode）；未选部门时给全部 */
 const stageOptions = computed(() => {
@@ -393,6 +423,9 @@ watch(
     if (!visible) return
     eligibilityError.value = null
     eligibilityResources.value = null
+    departmentQuery.value = ''
+    fromMaterialQuery.value = ''
+    toMaterialQuery.value = ''
     if (props.mode === 'edit' && props.rule) {
       form.ruleSetVersionId = props.rule.ruleSetVersionId
       form.departmentCode = props.rule.departmentCode ?? ''
@@ -601,13 +634,13 @@ const dialogTitle = computed(() =>
           placeholder="输入编码搜索前产品"
           filterable
           remote
-          :remote-method="onSearchMaterial"
+          :remote-method="onSearchFromMaterial"
           :loading="searching.material || masterData.loading.value"
           style="width: 100%"
           @change="onFromMaterialChange"
         >
           <ElOption
-            v-for="opt in materialOptions"
+            v-for="opt in fromMaterialOptions"
             :key="opt.value"
             :label="opt.label"
             :value="opt.value"
@@ -620,12 +653,12 @@ const dialogTitle = computed(() =>
           placeholder="输入编码搜索后产品"
           filterable
           remote
-          :remote-method="onSearchMaterial"
+          :remote-method="onSearchToMaterial"
           :loading="searching.material || masterData.loading.value"
           style="width: 100%"
         >
           <ElOption
-            v-for="opt in materialOptions"
+            v-for="opt in toMaterialOptions"
             :key="opt.value"
             :label="opt.label"
             :value="opt.value"

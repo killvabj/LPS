@@ -21,7 +21,8 @@
  *
  * 红线：
  *  - 已发布/退役/归档版本不可编辑（前端按钮 disabled + 后端 400 双保险）
- *  - IsDefault 仅 DRAFT 可改（与 UQ_StrategyProfileVersion_DefaultPublished 联动）
+ *  - IsDefault 不在创建/更新入参内（C-7：Create 强制 false、Update 冻结），
+ *    只能对 PUBLISHED 版本走 set-default 显式置位；发布≠默认
  *  - 发布前必须先看 diff（UI 流程：选 DRAFT → 看 diff(base, draft) → validate → publish）
  */
 
@@ -39,6 +40,7 @@ import {
   type StrategyVersionDiffDto,
   type StrategyRunTraceDto,
   type StrategyVersionStatus,
+  STRATEGY_STATUS_META,
   STRATEGY_EDITABLE_STATUSES,
   STRATEGY_PUBLISHABLE_STATUSES,
   STRATEGY_DISABLEABLE_STATUSES
@@ -164,8 +166,7 @@ export const useStrategyProfileStore = defineStore('aps.strategyProfile', () => 
    * 与参数集不同：策略包首版**必须绑定规则集版本 + 参数集版本**，没有「空白草稿」可自动跟建
    * ⇒ 这里只建壳并选中，首版由用户点「新建草稿」时选择两个版本。
    *
-   * ⚠️ 后端 `POST /strategy-profile` 尚未提供（见 strategyProfileApi.createProfile 注释）：
-   * 调用会 404；回列表核对同编码，防「其实已建成、只是响应报错」把用户卡死。
+   * 写接口报错不等于没写成：失败时回列表核对同编码，防「其实已建成、只是响应报错」把用户卡死。
    */
   async function createProfile(input: {
     strategyProfileCode: string
@@ -215,6 +216,114 @@ export const useStrategyProfileStore = defineStore('aps.strategyProfile', () => 
         `新建没成功${httpStatus ? `（服务器返回 ${httpStatus}）` : ''}。` +
         '也可能是「其实已经建好了，只是返回时出错」——请刷新一下列表，看这个编码在不在。'
       return null
+    } finally {
+      actionRunning.value = false
+    }
+  }
+
+  /**
+   * 更新策略包主表（PUT /strategy-profile/{id}）：名称 / 描述 / RunType / 启停。
+   *
+   * 编码原样回传（后端拒绝变更）；停用只关主表，不级联版本状态（存在版本时页面禁止新建草稿）。
+   * 写接口报错不等于没写成：失败时回列表核对真值，已是新值就按成功继续。
+   */
+  async function updateProfile(input: {
+    id: number
+    strategyProfileCode: string
+    strategyProfileName: string
+    description?: string | null
+    runType?: string | null
+    isActive: boolean
+  }): Promise<boolean> {
+    if (!canWrite.value) {
+      error.value = '当前操作者无写权限（需权限码 aps.strategy.edit）'
+      return false
+    }
+    const name = input.strategyProfileName.trim()
+    if (!name) {
+      error.value = '策略包名称必须填写'
+      return false
+    }
+    actionRunning.value = true
+    error.value = null
+    try {
+      await strategyProfileApi.updateProfile({
+        id: input.id,
+        strategyProfileCode: input.strategyProfileCode,
+        strategyProfileName: name,
+        description: input.description?.trim() || null,
+        runType: input.runType || null,
+        isActive: input.isActive
+      })
+      await loadProfiles()
+      return true
+    } catch (err) {
+      await loadProfiles()
+      const row = profiles.value.find((p) => p.id === input.id)
+      const saved =
+        row != null &&
+        row.strategyProfileName === name &&
+        row.isActive === input.isActive &&
+        (row.runType ?? null) === (input.runType || null)
+      if (saved) {
+        console.warn('[策略包] 保存接口报错，但回列表核对已是新值，按已保存继续', err)
+        return true
+      }
+      handleError(err)
+      const httpStatus = err instanceof ApiError ? err.code : undefined
+      error.value =
+        `保存没成功${httpStatus ? `（服务器返回 ${httpStatus}）` : ''}。` +
+        '请刷新列表核对名称/运行类型/启用状态是否已生效。'
+      return false
+    } finally {
+      actionRunning.value = false
+    }
+  }
+
+  /**
+   * 删除策略包主表（DELETE /strategy-profile/{id}，3号位 2026-10-26 同 R1 口径）
+   *
+   *  - 权限码沿用主表写端点码 `aps.strategy.edit`（3号位：不新增权限码）
+   *  - 前端先拦「已发布过不可删」：后端必拒，前端先拦是为了让用户看到原因而不是撞 400
+   *  - 后端还有一条前端拿不到的前置条件（版本被 ScheduleRun 引用 ⇒ 400），
+   *    页面不预判，失败时如实回显后端原文
+   *  - 写接口报错≠没写成 ⇒ 失败后回列表核对：行已不在 ⇒ 按已删除继续
+   */
+  async function removeStrategyProfile(profileId: number): Promise<boolean> {
+    if (!canWrite.value) {
+      error.value = '当前操作者无删除权限（需权限码 aps.strategy.edit）'
+      return false
+    }
+    const row = profiles.value.find((p) => p.id === profileId)
+    if (!row) {
+      error.value = '策略包未选中'
+      return false
+    }
+    // versions 只装当前选中策略包的版本 ⇒ 带上 profileId 判定，避免删 A 时用上 B 的状态
+    const hasPublished = versions.value.some(
+      (v) => v.strategyProfileId === profileId && v.status === 'PUBLISHED'
+    )
+    if (hasPublished) {
+      error.value = '该策略包已发布过，不能删除（请先停用版本）'
+      return false
+    }
+    actionRunning.value = true
+    error.value = null
+    try {
+      await strategyProfileApi.deleteStrategyProfile(profileId)
+      selectProfile(null)
+      await loadProfiles()
+      return true
+    } catch (err) {
+      await loadProfiles()
+      const stillThere = profiles.value.some((p) => p.id === profileId)
+      if (!stillThere) {
+        console.warn('[策略包] 删除接口报错，但回列表发现该策略包已不存在，按已删除继续', err)
+        selectProfile(null)
+        return true
+      }
+      handleError(err)
+      return false
     } finally {
       actionRunning.value = false
     }
@@ -362,6 +471,51 @@ export const useStrategyProfileStore = defineStore('aps.strategyProfile', () => 
     }
   }
 
+  /**
+   * 设为默认（需 edit 权限；仅 PUBLISHED 可置位，D-3）
+   *
+   * - 后端只允许经该显式操作置位：Create 强制 IsDefault=false、Update 冻结既有值
+   * - 同策略包旧默认由后端清；跨策略包生效窗重叠会被后端拒（DEFAULT_CONFLICT），前端不预判
+   * - 写接口报错≠没写成 ⇒ 失败后重载版本，目标已是默认即按成功继续
+   */
+  async function setDefault(versionId: number): Promise<boolean> {
+    if (!canWrite.value) {
+      error.value = '当前操作者无设为默认权限（需权限码 aps.strategy.edit）'
+      return false
+    }
+    const target = versions.value.find((v) => v.id === versionId)
+    if (!target) {
+      error.value = '策略包版本未找到，请刷新列表'
+      return false
+    }
+    if (target.status !== 'PUBLISHED') {
+      error.value = `仅已发布版本可设为默认（当前状态：${STRATEGY_STATUS_META[target.status].label}）`
+      return false
+    }
+    actionRunning.value = true
+    error.value = null
+    try {
+      await strategyProfileApi.setDefaultVersion(versionId)
+      if (selectedProfileId.value !== null) {
+        await loadVersions(selectedProfileId.value)
+      }
+      return true
+    } catch (err) {
+      if (selectedProfileId.value !== null) {
+        await loadVersions(selectedProfileId.value)
+      }
+      const after = versions.value.find((v) => v.id === versionId)
+      if (after?.isDefault) {
+        console.warn('[策略包] 设为默认接口报错，但回列表核对已是默认，按成功继续', err)
+        return true
+      }
+      handleError(err)
+      return false
+    } finally {
+      actionRunning.value = false
+    }
+  }
+
   /** Run 引用追溯 */
   async function loadTrace(versionId: number): Promise<void> {
     error.value = null
@@ -424,6 +578,8 @@ export const useStrategyProfileStore = defineStore('aps.strategyProfile', () => 
     selectVersion,
     loadProfiles,
     createProfile,
+    updateProfile,
+    removeStrategyProfile,
     loadVersions,
     loadDiff,
     validateDraft,
@@ -431,6 +587,7 @@ export const useStrategyProfileStore = defineStore('aps.strategyProfile', () => 
     updateDraft,
     publish,
     disable,
+    setDefault,
     loadTrace,
     reset,
     handleError

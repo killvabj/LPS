@@ -25,6 +25,48 @@ public sealed class FrozenStrategySnapshot
     public CandidateGuardrailBlock CandidateGuardrail { get; set; } = new(); // ⑥ Candidate 技术 Guardrail
     public List<SetupTransitionRuleSnapshot> SetupTransitionRules { get; set; } = []; // ⑦ 产品转换换型规则本 Run 冻结内容（v1.2 §九/§十；0号位 裁决项2）
     public List<BatchPolicyRuleSnapshot> BatchPolicy { get; set; } = []; // ⑧ 批量策略（Batch Policy）本 Run 冻结内容（0号位 2026-10-07 裁决：本轮落码；Material+ProductionDepartment 粒度）
+
+    /// <summary>
+    /// Stage 固定交接（StageHandoffWaitRules）独立顶层子块（合同 v1.1 §四）。
+    ///
+    /// **唯一物理路径 = 顶层**：<c>$.StageHandoffWaitRules</c>（与 <c>$.Procurement</c>、<c>$.Lock</c>、<c>$.SolverStrategy</c>
+    /// 顶层并列），**非** <c>$.SolverStrategy.StageHandoffWaitRules</c>（v1.0 稿误置于 SolverStrategy 内、v1.1 按 0号位 既定顶层路径更正）。
+    /// 根 DTO 顶层加本属性（合同 v1.1 §四/§九契约1 H-2：DTO 差异最小三处之一），键缺省→空 List。
+    /// 1/2 号位 只读 <c>$.StageHandoffWaitRules</c> 单一位置，杜绝双路径来源分裂。
+    /// 触发根因：整体批完成后/下游开工前算一次等待（R05-V-03），不建物流 Task、不乘数量、不借 <c>StageLeadTimeParam</c> 单 Stage 提前期。
+    /// </summary>
+    public List<StageHandoffWaitRule> StageHandoffWaitRules { get; set; } = [];
+}
+
+/// <summary>
+/// Stage 固定交接等待规则（合同 v1.1 §五）。字段=业务键 + 等待基准，不含审计字段（Id/Created/Updated——治理由参数版本承载）。
+/// 校验下限为**纯 JSON 六项**：必填 / 同厂格式（字符串结构非存在性）/ From≠To / 重复键三键（Factory,From,To）/
+/// 分钟≥0（整数）/ 枚举（WORK|ELAPSED）。存在性/日期/日历资格交装载/消费上下文判定（V-1/V-2 已按 v1.1 关闭）。
+/// ⚠ 反向（Reverse）不拒绝、仅禁误命中：A→B 与 B→A 为两条独立可配置规则，方向匹配必须精确（合同 v1.1 §二 修订1）。
+/// </summary>
+public sealed class StageHandoffWaitRule
+{
+    /// <summary>厂代码（必填；同厂格式校验下限；存在性交装载/消费上下文）</summary>
+    public string FactoryCode { get; set; } = "";
+    /// <summary>前置 Stage 编码（必填；≠ ToStageCode；厂内编码字符串结构，非存在性）</summary>
+    public string FromStageCode { get; set; } = "";
+    /// <summary>后置 Stage 编码（必填；≠ FromStageCode；厂内编码字符串结构，非存在性）</summary>
+    public string ToStageCode { get; set; } = "";
+    /// <summary>等待分钟（必填；≥0 整数）。显式 0 = EXPLICIT_ZERO（确实零交接等待），与未定义/MISSING 区分见 §七。</summary>
+    public int WaitMinutes { get; set; }
+    /// <summary>等待基准：WORK（按工作日历折算）/ ELAPSED（自然时间）。枚举值（必填）；WORK 日历资格归 Run 消费侧诊断。</summary>
+    public StageHandoffTimeBasis TimeBasis { get; set; }
+    /// <summary>是否有效（可空缺省 false）；仅 IsActive=true 参与重复键判定与消费匹配。</summary>
+    public bool? IsActive { get; set; }
+}
+
+/// <summary>Stage 固定交接等待基准（合同 v1.1 §五）。</summary>
+public enum StageHandoffTimeBasis
+{
+    /// <summary>按工作日历（WORK）折算等待分钟；日历资格由 Run 消费侧诊断（WORK_NO_CALENDAR 独立诊断类），校验器纯内容不注入 DB。</summary>
+    WORK = 0,
+    /// <summary>按自然时间（ELAPSED）等待分钟。</summary>
+    ELAPSED = 1,
 }
 
 /// <summary>
@@ -425,7 +467,8 @@ public enum BatchPolicyState
     /// ⇒ 06 同节逐字「**存在INVALID匹配时，不得假装MISSING兜底，应暴露Issue等待治理**」⇒ 1号位 Fail Closed，**不启 Q_C**。</summary>
     Invalid = 2,
 
-    /// <summary>**不可用（技术失败）**：接口未传递状态／规则数据装载失败／DTO 无法表达三态
+    /// <summary>**不可用（技术失败／状态不可获得）**：接口未传递状态／规则数据装载失败／DTO 无法表达三态／
+    /// **业务键不完整（部门未解析且本物料在域内有规则行，2026-10-29 增）**
     /// ⇒ 0号位 文件3 <c>§2</c>「**不得直接视为 MISSING**」⇒ 1号位 Fail Closed，**不启 Q_C**。
     /// 过渡形态：载体整体缺席（<c>SolverStrategySnapshot.BatchPolicyStates is null</c>）亦按本类处置。</summary>
     Unavailable = 3
@@ -462,7 +505,10 @@ public static class BatchPolicyMatchSource
     /// （发布侧⑧投影已退休；装载由 2号位 按 <c>TaskSplitRuleConfig</c> 表直读，是否过滤 Inactive 按其装载口径。）</summary>
     public const string Inactive = "INACTIVE";
 
-    /// <summary><c>Missing</c>：业务键不完整（本 Run 未解析到该物料的 <c>ProductionDepartmentId</c>）⇒ 无命中。</summary>
+    /// <summary><c>Unavailable</c>：**业务键不完整** —— 本 Run 未解析到该物料的 <c>ProductionDepartmentId</c>
+    /// ⇒ 无法判定本键命中与否，属「状态不可获得」⇒ 消费侧映射 <c>Unknown</c>、**不取 `Q_C`**。
+    /// （0号位 2026-10-28 R07/R08 更正回复 §1：严禁把 `(物料, NULL)` 键补成可按 `Q_C` 排的 MISSING。
+    /// 唯一例外仍走 <see cref="NoRuleForMaterial"/>：本物料在域内**一条规则行都没有**时，「确无规则」与部门无关、可证。）</summary>
     public const string NoDept = "NO_DEPT";
 
     /// <summary><c>Invalid</c>：本键有规则但本 Run 生效时点不在 <c>[EffectiveFrom, EffectiveTo)</c> 内

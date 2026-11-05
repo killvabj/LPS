@@ -222,30 +222,77 @@ export interface SetupRuleDefaultInput {
 
 /* ==================== 0 分钟兜底统计 ==================== */
 
-/** 0 分钟兜底统计查询参数 */
+/**
+ * 0 分钟兜底统计查询参数
+ *
+ * 后端形参（SetupRuleController.cs:366-372，10-27 复核）：
+ *   runId / departmentId / operationCode / resourceId / materialId
+ *
+ * ⚠️ 后端**只认 Id 与工序码**：
+ *   - 此前前端发 departmentCode / stageCode / resourceCode 三个参数，后端绑不上 ⇒ 一律 null
+ *     ⇒ 部门/大工艺/设备三个筛选当时完全静默失效（10-27 dev 实测：发 Code 返回全量 38 行，
+ *        发 Id 返回 0 行）。
+ *   - 大工艺（stageCode）后端**没有**对应筛参，它只是输出行上的展示维度，不是下钻级。
+ *     后端的四级下钻是 部门 → 工序 → 设备 → 产品。
+ */
 export interface SetupUncoveredQuery {
   /** 选定的 Run（必填） */
   runId: number
-  /** 按部门筛选（可选） */
-  departmentCode?: string
-  /** 按大工艺筛选（可选） */
-  stageCode?: string
-  /** 按设备筛选（可选） */
-  resourceCode?: string
+  /** 按部门筛选（可选）—— 传部门主键 Id，不是编码 */
+  departmentId?: number
+  /** 按工序筛选（可选）—— 工序码（Code），后端无工序 lookup，只能手工输入 */
+  operationCode?: string
+  /** 按设备筛选（可选）—— 传设备主键 Id，不是编码 */
+  resourceId?: number
+  /** 按产品筛选（可选）—— 传物料主键 Id（= Material.Id） */
+  materialId?: number
 }
 
-/** 0 分钟兜底统计输出行 */
+/**
+ * 0 分钟兜底统计输出行
+ *
+ * 对齐后端 `SetupUncoveredStatDto`（SetupUncoveredStatDtos.cs，10-28 P1 落码后 13 字段）。
+ * dev 实测（2026-10-28 15:xx，runId=1，38 行）：
+ *   {scheduleRunId, ruleSetVersionId, departmentId, departmentCode, stageCode,
+ *    operationCode, resourceId, resourceCode, materialId, materialCode,
+ *    hitCount, count, sampleTaskId}
+ *
+ * 前产品 / 后产品 / 最近出现后端**没有**（[Task] 表只有 SetupSource + MaterialId，
+ * 无 FromMaterial）⇒ 前端不得再渲染这三列，也不得用它们做出口预填。
+ */
 export interface SetupUncoveredStatDto {
+  /** 排程 Run Id（后端经 PlanVersion.SourceScheduleRunId 回带） */
+  scheduleRunId?: number | null
+  /**
+   * 本次统计归属的规则集版本 Id（3号位 2026-10-28 补）
+   *
+   * 反查链 ScheduleRun.StrategyProfileVersionId → StrategyProfileVersion.RuleSetVersionId；
+   * LEFT JOIN ⇒ Run 未绑策略包 / 关联链断时为 null（不误归属）。
+   * 展示用 `#11 rule-set-versions` 映射成「规则集编码 / 版本号」，不直接显示内部 Id。
+   */
+  ruleSetVersionId?: number | null
+  /** 生产部门主键 */
+  departmentId: number
+  /** 生产部门编码 */
   departmentCode: string
-  stageCode: string
+  /** 大工艺阶段码（可空：Task.StageCode 未透传的行） */
+  stageCode?: string | null
+  /** 工序编码 */
   operationCode: string
+  /** 资源主键 */
+  resourceId: number
+  /** 设备编码 */
   resourceCode: string
-  fromMaterialCode: string
-  toMaterialCode: string
-  /** 该转换对出现次数 */
+  /** 物料主键 */
+  materialId: number
+  /** 物料编码 */
+  materialCode: string
+  /** 命中频次（后端 HitCount） */
+  hitCount: number
+  /** 命中频次兼容别名（后端 Count{get=>HitCount}，与 hitCount 同值） */
   count: number
-  /** 最近一次出现时间 */
-  lastOccurrence?: IsoDateTime
+  /** 首条命中 Task Id */
+  sampleTaskId?: number | null
 }
 
 /* ==================== 共同合法设备推荐 ==================== */
@@ -344,6 +391,15 @@ export interface SetupDiffDto {
 export interface SetupRuleSetVersionDto {
   id: number
   ruleSetId: number
+  /**
+   * 所属规则集编码（3号位 2026-10-28 P2 落码：后端 #11 直接回带，必返）
+   *
+   * 旧实现靠 `GET /rule-sets`（aps.rule.view）在页面侧映射 ⇒ aps.planner 无该权限必 403，
+   * PMC 下拉只剩版本号；改为直接用本字段。旧后端缺该键时为 undefined ⇒ 显示退化为版本号。
+   */
+  ruleSetCode?: string
+  /** 所属规则集名称（P2 同批回带；主表缺行时为空） */
+  ruleSetName?: string | null
   versionCode: string
   /** 版本治理六态原文（09-20 lps 核实；仅 DRAFT 可编辑 Setup 规则，） */
   status: SetupVersionStatus
@@ -371,22 +427,17 @@ export interface SetupDialogPrefill {
   toMaterialCode?: string
 }
 
-/* ==================== 发布请求体（契约 #13） ==================== */
-
-/** POST /rule-set-versions/{id}/publish 请求体（复用 v1.4 范式） */
-export interface PublishSetupRuleSetVersionRequest {
-  changeReason: string
-}
-
 /* ==================== 权限码（Setup 专项指导 v1.2 §19.1） ==================== */
 
 /**
  * Setup 模块权限码（与后端 PermissionCodes.cs 对齐）
  *
- * 路由 meta 用 OR 语义：apsRequiredPermissions: ['aps.setup.view', 'aps.setup.edit', 'aps.setup.publish']
+ * 路由 meta 用 OR 语义：apsRequiredPermissions: ['aps.setup.view', 'aps.setup.edit']
  *  - VIEWER（持 view）可读
- *  - APS_ADMIN（持全部）可写
- *  - RULE_PUBLISHER（持 publish）可发
+ *  - APS_ADMIN（持 view+edit）可写
+ *
+ * ⚠️ `aps.setup.publish` 是**死码**（3号位 2026-10-28 裁定：全仓无任何端点消费，
+ *   整版发布已改由 `aps.rule.publish` 保护）⇒ 保留码定义/种子不动，但**前端不再用它做门控**。
  */
 export const SETUP_PERMISSIONS = {
   VIEW: 'aps.setup.view',

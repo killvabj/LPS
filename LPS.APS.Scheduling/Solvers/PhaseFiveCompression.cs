@@ -29,12 +29,28 @@ internal class PhaseFiveCompression
         InitialScheduleResult scheduleResult,
         RepairResult repairResult,
         DiagnosticsResult diagnostics,
-        ConstraintContext constraints)
+        ConstraintContext constraints,
+        CancellationToken cancellationToken = default)
     {
         // 合并所有已排程任务
         var allScheduledTasks = new List<FinalTaskDraft>();
         allScheduledTasks.AddRange(scheduleResult.ScheduledTasks);
         allScheduledTasks.AddRange(repairResult.RepairedTasks);
+
+        // ── 2026-10-28：Phase5 入口快照（**仅当宿主显式设 `APS_PHASE5_SNAPSHOT_DIR` 时执行**）──
+        //   目的（用户 2026-10-28 要求）：一轮全量跑 71 分钟，其中 Phase1+Phase2+Phase4 约 43 分钟只是
+        //   **产生 Phase5 的输入**。把这两份入参落盘后，Phase5 的 bug 可以**离线重放**——
+        //   不连库、不重跑 Phase2，还能按需求切片（几秒一轮）。
+        //   零 I/O 红线不变：环境变量未设 ⇒ `SnapshotPhase5Inputs` 第一行即返回，程序集行为逐字不变。
+        SnapshotPhase5Inputs(allScheduledTasks, request, constraints);
+
+        // ── R11-2（0号位 2026-10-28《R11_致1号位核查通知_新交付》§R11-2「可停止搜索」）──
+        //   整改前：`PhaseFiveCompression.cs` 内 `CancellationToken` **0 命中** ⇒ Phase2/4 能被人工掐断，
+        //   Phase5 一旦进入就**不可停**（PV190 实测 Phase5 单段跑 12 分钟仍不可中断）。
+        //   整改：Run 的 token 从 `FiniteCapacitySolver.SolveAsync` 透传进来，在各主要阶段边界与
+        //   **两个最贵的内层循环**（`CompactGaps` 主循环、`OptimizeSetupSequences` 资源×窗口循环）
+        //   各设检查点。未取消时逐字不改任何取值语义。
+        cancellationToken.ThrowIfCancellationRequested();
 
         // P1-05：Gap Compaction（§六 Phase 5 最小次级优化，Level 3——不破坏 Level 0 硬约束/Level 1 履约/Level 2 交期）。
         // 保序前向压实：把 Task 拉进更早的日历可用空档（减少不必要等待/减少 WIP/提升利用率）；
@@ -44,14 +60,14 @@ internal class PhaseFiveCompression
         // BACKWARD/MIXED 倒排 JIT 锚点即「避免过早生产」语义本身，V1 不做前向拉早。
         // 必须在 Shares/Dependency/硬校验/诊断之前执行，让下游看到压实后的最终时间。
         long swP5Compact = SolverDiagnostics.HotspotStart();
-        CompactGaps(allScheduledTasks, request, constraints);
+        CompactGaps(allScheduledTasks, request, constraints, cancellationToken);
         SolverDiagnostics.HotspotEnd(swP5Compact, SolverDiagnostics.Hotspot.Phase5CompactGaps);
 
         // P1-02 item1（夜间 FULL，v1.2 §14-§16）：单 Resource × 生产日窗口 × 固定锚点间可移动段的
         // 有界序列优化——Level 0-2 不恶化前提下减少段内 Setup 总时间（Level 3）。
         // 门控：仅 FULL Run（§17：白天 Candidate 局部优先，不做全天重排）且 FORWARD（与压实同口径）。
         long swP5Setup = SolverDiagnostics.HotspotStart();
-        OptimizeSetupSequences(allScheduledTasks, request, constraints);
+        OptimizeSetupSequences(allScheduledTasks, request, constraints, cancellationToken);
         SolverDiagnostics.HotspotEnd(swP5Setup, SolverDiagnostics.Hotspot.Phase5SetupSeq);
 
         // ── N8-02（2026-10-17，1号位）：末端 Task × Demand 产出构成 —— 必须在**份额生成之前**算 ──
@@ -227,6 +243,23 @@ internal class PhaseFiveCompression
         foreach (var t in allScheduledTasks) scheduledSourceDraftIds.Add(t.SourceDraftId);
 
         long swP5UnschedP2 = SolverDiagnostics.HotspotStart();
+
+        // ── 2026-10-28：未排程归因里的两处「字典当列表扫」──
+        //   原实现每判一条未排程需求，都要对 `request.RoutingOperations`（PV190 实测 87,093 行）做一次全表 `Where`，
+        //   再对 `constraints.OperationResourceEligibility` 做一次全表 `Where`
+        //   ⇒ 成本 = 未排程需求数 × 87,093，以及 未排程需求数 × 每需求工序数 × 资格键数。
+        //   `dotnet-stack` 实测（run36，Phase5 跑到 300 秒时连采 6 次）：6/6 停在 `IsCalendarCoverageInsufficient`，
+        //   其中 5/6 是 `WhereEnumerableIterator` 在扫 `OperationResourceEligibility`。
+        //   修法：路由工序按 (MaterialId, RoutePathKey) 一次分桶（桶内再按原谓词过滤）；
+        //   资格字典**本来就以 `EligibilityLookupKey` 为键** ⇒ 原来那五个字段的 `Where` 就是一次命中，见下。
+        //   ⚠ `RoutePathKey.Of` 把 null `RouteCode` 归一化为 `string.Empty`，与 P1 建路由图的
+        //     `PhaseOneConstraintBuilder.cs:586` / `:874` 同一个归一化口径（原谓词 `string.Equals` 遇 null 恒 false，
+        //     而 `chosenPath.RouteCode` 由 `RoutePathKey.Of` 构造、永不为 null ⇒ 只有「双方都是 null」这一种情形有差，
+        //     此时新实现与 P1 的图口径一致，视为对齐而非回归）。
+        var routingOpsByMaterialRoutePath = request.RoutingOperations
+            .GroupBy(op => (MaterialId: op.MaterialId, Path: RoutePathKey.Of(op.RouteCode, op.PathId)))
+            .ToDictionary(g => g.Key, g => g.ToList());
+
         // Phase 2 未排程的需求
         foreach (var demandKey in scheduleResult.UnscheduledDemandKeys)
         {
@@ -250,13 +283,19 @@ internal class PhaseFiveCompression
                 // 2026-10-22（2号位 回执 §四）：判定同时算出**逐资源**诊断正文（首个 ResourceId + 计数 +
                 //   缺行/窗长两档拆分），只在「日历」真是选中根因时随 TraceNote 导出；不抢其它根因。
                 var calendarCoverageInsufficient = IsCalendarCoverageInsufficient(
-                    demandKey, demandByLogicalKey, request, constraints, out var calendarDetail);
+                    demandKey, demandByLogicalKey, request, constraints,
+                    routingOpsByMaterialRoutePath, out var calendarDetail);
 
                 string reason;
                 string? reasonDetail = null;
                 if (missingDept)
                 {
                     reason = "MISSING_PRODUCTION_DEPARTMENT_CONTEXT";
+                    // 2026-11-03：此前本分支**不产明细** ⇒ 2,143 行全是「无明细」，数据方只有 DraftId。
+                    //   现在补上「物料 + 缺哪个 Stage + 该物料现有部门」，可直接定位要补哪一行。
+                    //   纯文案，不改 Reason、不改判定。
+                    reasonDetail = BuildMissingDepartmentDetail(
+                        demandKey, demandByLogicalKey, request, constraints);
                 }
                 else if (stageSeqConflict)
                 {
@@ -418,6 +457,22 @@ internal class PhaseFiveCompression
             new InitialScheduleResult { ScheduledTasks = allScheduledTasks },
             constraints);
 
+        // ── 2026-11-02｜**确定性指纹**（纯观测）：同一输入多轮跑出不同 `FinalTask` 条数 ─────────
+        //   实测：同一份 PV 999329 输入、同一份代码连跑三轮，`FinalTask = 1,084,606 / 1,084,326 /
+        //   1,085,066`，而未排侧（条数、量）逐位相同 ⇒ 差异在「排上的 Task 条数」，不满足「结果逐位相同」。
+        //   只靠总数看不出是**哪条需求**变了，故此处按需求聚合出条数，算两个指纹：
+        //     · `Count`      —— 条数之和（与 `FinalTask` 同值，便于对表）；
+        //     · `XorDigest`  —— 逐需求 `hash(需求键, 条数, 计划量)` 的**异或**（与顺序无关，
+        //                       两轮不同 ⇒ 必有不同的需求；两轮相同 ⇒ 至少这一层没变）。
+        //   落成一条 `SolveTraceNote`（既有对外载体，Level=Info），**不新增 Core 字段、不改任何判定**。
+        //   ⚠ **默认关闭**（开门：`APS_DETERMINISM_DIGEST=1`）。理由：`TraceNotes` 是**对外载体**
+        //     （2号位 原样落 `APS_ETL_Log`），本条是内部排查口径，不该混进正常交付的追溯里；
+        //     且既有单测会**按条数**断言 `TraceNotes`，默认注入会直接把它们打红（实测 2 条红）。
+        if (Environment.GetEnvironmentVariable("APS_DETERMINISM_DIGEST") == "1")
+        {
+            var determinismNote = BuildDeterminismDigestNote(allScheduledTasks);
+            if (determinismNote is not null) constraints.TraceNotes.Add(determinismNote);
+        }
         return new DomainSolveResult
         {
             Success = !technicalFailure,
@@ -459,6 +514,45 @@ internal class PhaseFiveCompression
     ///     <see cref="InitialScheduleResult.BatchPolicyMissingDemandKeys"/> /
     ///     <see cref="InitialScheduleResult.BatchPolicyUnavailableDemandKeys"/>（元素前缀 = `[{LogicalDemandKey}] `）。
     /// </summary>
+    /// <summary>
+    /// 2026-11-02｜**确定性指纹**（纯观测，不参与任何判定）。
+    ///
+    /// 起因：同一输入、同一代码连跑三轮，`FinalTask` 得到 1,084,606 / 1,084,326 / 1,085,066，
+    ///   而未排侧（条数、量）逐位相同 ⇒ 差异在「排上的 Task 条数」。只读总数看不出是哪条需求变了。
+    ///
+    /// 指纹设计（**与枚举顺序无关**，否则指纹自己就不确定）：
+    ///   · `条数` = 全部 `${FinalDraftId}` 条数，与 `FinalTask` 同值，可直接对表；
+    ///   · `Xor` = 逐条 (`FinalDraftId`, 需求量, 计划量) 三者字符串哈希的**异或** —— 异或可交换，
+    ///     故与任务表顺序无关；两轮 `Xor` 不同 ⇒ 必有任务差异，相同 ⇒ 至少这一层没有差异。
+    /// 用 <see cref="StringComparer.Ordinal"/> 的确定性哈希（`string.GetHashCode` 每进程随机，
+    ///   **不能用**，否则跨进程必然对不上，会把确定性问题误报成「有差异」）。
+    /// </summary>
+    private static SolveTraceNote? BuildDeterminismDigestNote(IReadOnlyList<FinalTaskDraft> tasks)
+    {
+        if (tasks is null) return null;
+
+        ulong xor = 0UL;
+        foreach (var t in tasks)
+        {
+            ulong h = 1469598103934665603UL;   // FNV-1a 64 偏移基
+            foreach (var ch in t.FinalDraftId ?? string.Empty) { h ^= ch; h *= 1099511628211UL; }
+            h ^= (ulong)t.Quantity.GetHashCode();
+            h *= 1099511628211UL;
+            h ^= (ulong)t.PlannedProcessQty.GetHashCode();
+            h *= 1099511628211UL;
+            xor ^= h;
+        }
+
+        return new SolveTraceNote
+        {
+            Key = "(determinism)",
+            ReasonCode = "SCHEDULE_DIGEST",
+            Level = "Info",
+            Message = $"确定性指纹：FinalTask={tasks.Count}，Xor=0x{xor:X16}"
+                      + "（纯观测；两轮此值不同即说明排上的 Task 本身发生了变化）"
+        };
+    }
+
     internal static string? ComposeErrorMessage(
         string? phase5Segment,
         string? technicalSegment,
@@ -589,6 +683,51 @@ internal class PhaseFiveCompression
     /// 部门锁定在 Phase 1 完成，缺失 Context 的 Material 记入 constraints.MissingDepartmentContextMaterialIds；
     /// 此处按 LogicalDemandKey → MaterialId 反查，给 Unscheduled 结果补正确的 Reason。
     /// </summary>
+    /// <summary>
+    /// 2026-11-03｜`MISSING_PRODUCTION_DEPARTMENT_CONTEXT` 的**人可读明细**（纯文案，不改判定）。
+    ///
+    /// 起因：该出口此前只给泛化 Reason、不给明细 ⇒ 未排逐条 CSV 里 2,143 行全是「无明细」，
+    ///   数据方拿到只有 `DraftId`，无法定位「要补 `MaterialStageDeptContext` 的哪一行」。
+    ///
+    /// 输出三件（全部取自本次求解的内存事实，不查库）：
+    ///   ① 物料号；② 本次求解范围内**缺部门上下文的 Stage 列表**；③ 该物料在本次输入里**现有的部门行**。
+    /// 若 ③ 为空 ⇒ 该物料一条部门行都没有，只能整条补；若 ③ 有值但不含 ① 的 Stage ⇒ 只补缺的那个 Stage。
+    /// </summary>
+    internal static string BuildMissingDepartmentDetail(
+        string demandKey,
+        Dictionary<string, LogicalProductionDemand> demandByLogicalKey,
+        DomainSolveRequest request,
+        ConstraintContext constraints)
+    {
+        var demand = FindDemandByLogicalKey(request, demandByLogicalKey, demandKey);
+        if (demand is null)
+        {
+            return "缺生产部门上下文（未能在请求中回查到该需求的物料信息）。";
+        }
+
+        var materialId = demand.MaterialId;
+
+        var missStages = constraints.MissingDepartmentContextStages.TryGetValue(materialId, out var stages)
+                         && stages.Count > 0
+            ? string.Join("/", stages)
+            : "(未登记到具体 Stage)";
+
+        var existingDepts = (request.MaterialStageDepartmentContexts ?? Array.Empty<MaterialStageDepartmentContextDto>())
+            .Where(c => c.MaterialId == materialId)
+            .Select(c => c.ProductionDepartmentId)
+            .Distinct()
+            .OrderBy(d => d)
+            .ToList();
+
+        var deptsDesc = existingDepts.Count == 0
+            ? "该物料在本次输入里**一条部门上下文行都没有** ⇒ 需整条补 `MaterialStageDeptContext`"
+            : $"该物料现有部门行 = {string.Join("/", existingDepts)}（但不含上述 Stage）";
+
+        return $"缺生产部门上下文：物料 {materialId}，需求起点 Stage='{demand.StartStageCode}'；"
+               + $"本次求解范围内**缺部门上下文的 Stage = {missStages}**；{deptsDesc}。"
+               + "⇒ 需求不进 Phase2 排程，按业务未排计入 U。";
+    }
+
     private bool IsMissingDepartmentContext(
         string demandKey,
         Dictionary<string, LogicalProductionDemand> demandByLogicalKey,
@@ -652,6 +791,7 @@ internal class PhaseFiveCompression
         Dictionary<string, LogicalProductionDemand> demandByLogicalKey,
         DomainSolveRequest request,
         ConstraintContext constraints,
+        Dictionary<(int MaterialId, RoutePathKey Path), List<LPS.APS.Core.Entities.APS.RoutingOperation>> routingOpsByMaterialRoutePath,
         out string? detail)
     {
         // 2026-10-22（2号位 回执 §四）：本判定**同时**产出人可读诊断正文，
@@ -677,16 +817,33 @@ internal class PhaseFiveCompression
         // 该物料的**逐工序**时长（含 Setup，与 Phase2 占资源窗口径一致），**限定选中 Path**。
         // 时长源仍取 RoutingOperation（OperationNode 已按 item1 删除静态 SetupTime 字段）。
         long swCalScan = SolverDiagnostics.HotspotStart();
-        var operations = request.RoutingOperations
-            .Where(op => op.MaterialId == demand.MaterialId
-                         && string.Equals(op.RouteCode, chosenPath.RouteCode, StringComparison.Ordinal)
-                         && op.PathId == chosenPath.PathId)
+        // 2026-10-28：桶由调用方一次建好（键 = `(MaterialId, RouteCode, PathId)`），桶内再按原谓词过滤。
+        //   三元组与原谓词一一对应：`op.MaterialId == demand.MaterialId`、`op.RouteCode` 序数相等、`op.PathId` 相等
+        //   ⇒ 「全表扫 + 三谓词」与「按三元组直取桶 + 零谓词」选出的是同一批行，逐元素等价。
+        //   桶里没有行 ⇒ 原实现筛完也是空 `operations` ⇒ 同样 `return false`。
+        if (!routingOpsByMaterialRoutePath.TryGetValue(
+                (demand.MaterialId, chosenPath), out var candidateOps))
+        {
+            SolverDiagnostics.HotspotEnd(swCalScan, SolverDiagnostics.Hotspot.Phase5CalendarScan);
+            return false;   // 该物料/路径下无任何工序行 ⇒ 无有限资源工序 ⇒ 根因不是日历
+        }
+
+        var operations = candidateOps
             .Where(op => string.Equals(op.OperationPlanningMode, "FINITE_RESOURCE", StringComparison.Ordinal))
             .GroupBy(op => (op.ProductionDepartmentId, op.OperationCode))
             .Select(g => (
                 DepartmentId: g.Key.ProductionDepartmentId,
                 OperationCode: g.Key.OperationCode,
-                DurationMinutes: g.Max(op => (double)(op.StandardDuration + op.SetupTime))))
+                // ── 2026-10-28｜R04-S-G-Units 的**绕过入口**处（0号位 要求自查「有没有绕过装配点的原始字段调用」）──
+                //   这里的 `op` 是**原始** `RoutingOperation`（不是装配后的 `OperationNode`）⇒ `StandardDuration`
+                //   仍是源事实**秒**，必须在本处自己 ÷60。原来不除 ⇒ 拿「秒」去比「分钟」的日历窗长
+                //   （下一段 `windows.Any(w => (w.End - w.Start).TotalMinutes >= op.DurationMinutes)`）
+                //   恒判装不下 ⇒ CALENDAR_COVERAGE_INSUFFICIENT **误报**。这是全仓唯一一处绕过装配点的读取：
+                //   其余 8 处（Phase2 `:3792/:4058/:4405/:4699/:8493`、Phase4 `:1187/:1725`、
+                //   `SchedulingDirectionResolver:252`）读的都是 `OperationNode.StandardDuration`，已由装配点统一转换。
+                //   ⚠ `op.SetupTime` **不除**：冻结 DDL v5.1.2 定「换型时间，单位：分钟」。
+                //     （顺带修掉原式「秒 + 分钟」的单位混加。）
+                DurationMinutes: g.Max(op => (double)(op.StandardDuration / 60m + op.SetupTime))))
             .ToList();
         SolverDiagnostics.HotspotEnd(swCalScan, SolverDiagnostics.Hotspot.Phase5CalendarScan);
         if (operations.Count == 0)
@@ -699,15 +856,21 @@ internal class PhaseFiveCompression
         {
             // 该工序有资格的全部资源（按 MaterialId + 部门 + RouteCode + PathId + 工序码归集，
             // 与 EligibilityLookupKey 口径一致 —— P1-04 Path 隔离：不得跨 Path 混用资格）
-            var eligibleResourceIds = constraints.OperationResourceEligibility
-                .Where(kv => kv.Key.MaterialId == demand.MaterialId
-                             && kv.Key.ProductionDepartmentId == op.DepartmentId
-                             && string.Equals(kv.Key.RouteCode, chosenPath.RouteCode, StringComparison.Ordinal)
-                             && kv.Key.PathId == chosenPath.PathId
-                             && kv.Key.OperationCode == op.OperationCode)
-                .SelectMany(kv => kv.Value)
-                .Distinct()
-                .ToList();
+            // 2026-10-28：原实现把资格字典**当列表扫**（成本 = 未排程需求数 × 工序数 × 资格键数）。
+            //   这张字典的键就是 `EligibilityLookupKey(MaterialId, ProductionDepartmentId, RouteCode, PathId, OperationCode)`，
+            //   与上面五个谓词**一一对应**。判等口径也相同：`EligibilityLookupKey` 是 `readonly record struct`，
+            //   生成的 `Equals` 对 string 成员走 `EqualityComparer<string>.Default`（= 序数比较），
+            //   而原谓词显式写的就是 `StringComparison.Ordinal`
+            //   ⇒ 「扫一遍取相等项」与「按同一个键直取」选出的条目完全相同，逐元素等价。
+            var eligibleResourceIds = new List<int>();
+            if (constraints.OperationResourceEligibility.TryGetValue(
+                    new EligibilityLookupKey(
+                        demand.MaterialId, op.DepartmentId, chosenPath.RouteCode, chosenPath.PathId, op.OperationCode),
+                    out var eligibleForOp))
+            {
+                // `Distinct` 保留：字典值是该键聚合出的 ResourceId 列表，组内仍可能重复。
+                eligibleResourceIds = eligibleForOp.Distinct().ToList();
+            }
             if (eligibleResourceIds.Count == 0)
             {
                 return false;   // 无资格资源 ⇒ 根因是工艺/资格，不是日历（保守：不抢归属）
@@ -747,12 +910,21 @@ internal class PhaseFiveCompression
             if (!anyWindowFits)
             {
                 // 该工序在**所有**资格资源的真实日历中均装不下 ⇒ 日历覆盖不足（按 §11.2 判）
+                // ── 2026-11-03 措辞订正（2号位 《未排12509片成因回执》§3.2 指出）──
+                //   原文案写「日历行 0 条」，会被读成「**库里**没有日历数据」——**不准确**。
+                //   本判据读的是 `constraints.ResourceCalendars`，即**本次载荷内解析后**的可用窗，不是库表。
+                //   （装载：`SchedulingOrchestrator.cs:1689` 全表无 WHERE 读 `ResourceCalendarSlot`
+                //     → 三级继承解析 → `PeggingOrchestrator.cs:811 BuildResourceCalendarSlots`。）
+                //   ⇒ 改说「载荷内可用窗」，并明写「成因可能是原始缺行、也可能是设备状态不可用」，
+                //     不替装载侧猜是哪一种 —— 载荷 `ResourceDefinition` 无状态字段，1号位 看不到 MC/DC。
                 detail = $"工序 {op.OperationCode}（生产部门 {op.DepartmentId}）时长 {op.DurationMinutes:0.##} 分钟："
                        + $"选中路径 RouteCode={chosenPath.RouteCode} / PathId={chosenPath.PathId}；"
                        + $"有资格资源 {eligibleResourceIds.Count} 个（首个 ResourceId={firstResourceId}），"
-                       + $"其中【无日历行】{noCalendarRows} 个、【有日历行但无任何窗装得下】{hasRowsNoFit} 个；"
-                       + $"首个 ResourceId={firstResourceId} 的日历行 {firstResourceRowCount} 条，最长窗 {firstResourceLongestWindow:0.##} 分钟。"
-                       + "⇒ 本判据只分两档：该资源没有日历行 / 它有日历行但所有窗都短于工艺时长。"
+                       + $"其中【本次载荷内无可用窗】{noCalendarRows} 个、【有窗但无一装得下】{hasRowsNoFit} 个；"
+                       + $"首个 ResourceId={firstResourceId} 的可用窗 {firstResourceRowCount} 个，最长窗 {firstResourceLongestWindow:0.##} 分钟。"
+                       + "⇒ 本判据只分两档：该资源在**本次载荷内**没有可用窗 / 有窗但所有窗都短于工艺时长。"
+                       + "⚠「载荷内无窗」的成因可能是原始日历缺行，也可能是设备状态不可用（载荷 `ResourceDefinition` 不带状态，"
+                       + "本处**不区分成因**，只报载荷事实）。"
                        + "（日期段与工厂部门关联**不在**本判据内 —— 日历装载不做日期裁剪，资格侧已按部门归集。）";
                 return true;
             }
@@ -822,10 +994,233 @@ internal class PhaseFiveCompression
     /// Setup 减少：保序压实不改变资源上的产品先后关系（FromMaterial 链不变），Setup 不恶化；
     /// 真正的 Setup 序列优化属 item1 夜间 FULL 有界搜索（待 2号位 规则通道接线）。
     /// </summary>
-    private static void CompactGaps(
+    /// <summary>
+    /// **Phase5 入口快照**（调试专用，`APS_PHASE5_SNAPSHOT_DIR` 未设 ⇒ 零开销直接返回）。
+    ///
+    /// 用户 2026-10-28 要求：「跑过的数据没必要从头再来，保留一下之前进 Phase5 的数据直接测就行」。
+    /// 全量一轮 71 分钟，其中 Phase1+Phase2+Phase4 约 43 分钟只是在**生产 Phase5 的入参**；
+    /// 落盘后 Phase5 可离线重放（不连库、不重跑 Phase2，且可按需求切片到秒级）。
+    ///
+    /// 落两份：
+    ///   · `request.json` —— Phase1 原始入参，重放侧据此用 `PhaseOneConstraintBuilder` 重建 `ConstraintContext`
+    ///     （Phase1 实测 3.6 秒，不必序列化 30 多个内部类型的上下文）。
+    ///   · `tasks.json` —— Phase4 结束后的**全部**已排 Task ＝ `CompactGaps` 的真实入参。
+    ///
+    /// ⚠ 「Scheduling 纯内存零 I/O」这条**只在本环境变量显式设置时失效**；默认路径一字不写盘。
+    /// ⚠ 必须**流式**写盘：PV190 量级下 `JsonSerializer.Serialize(object)` 会先拼成数百 MB 的 string（LOH）。
+    /// </summary>
+    private static void SnapshotPhase5Inputs(
         List<FinalTaskDraft> tasks,
         DomainSolveRequest request,
         ConstraintContext constraints)
+    {
+        var dir = Environment.GetEnvironmentVariable("APS_PHASE5_SNAPSHOT_DIR");
+        if (string.IsNullOrWhiteSpace(dir))
+        {
+            return;
+        }
+
+        System.IO.Directory.CreateDirectory(dir);
+
+        var options = new System.Text.Json.JsonSerializerOptions
+        {
+            WriteIndented = false,
+            NumberHandling = System.Text.Json.Serialization.JsonNumberHandling.AllowNamedFloatingPointLiterals
+        };
+
+        using (var fs = new System.IO.FileStream(
+                   System.IO.Path.Combine(dir, "request.json"),
+                   System.IO.FileMode.Create, System.IO.FileAccess.Write,
+                   System.IO.FileShare.Read, bufferSize: 1 << 20))
+        {
+            System.Text.Json.JsonSerializer.Serialize(fs, request, options);
+        }
+
+        using (var fs = new System.IO.FileStream(
+                   System.IO.Path.Combine(dir, "tasks.json"),
+                   System.IO.FileMode.Create, System.IO.FileAccess.Write,
+                   System.IO.FileShare.Read, bufferSize: 1 << 20))
+        {
+            System.Text.Json.JsonSerializer.Serialize(fs, tasks, options);
+        }
+
+        // ── `context.json`：**Phase2/Phase4 运行期登记**的那几张表 ──
+        //   `request` 重建不出它们（`PhaseOneConstraintBuilder` 只在 Phase1 跑，这六张表是后写的），
+        //   而 Phase5 的门控（`IsForwardDemand`/`IsForwardTask`）、取图链（`TryGetGraphForBatch`
+        //   → `TryGetBatchRoutingGraph`/`TryGetDemandRoutingGraph`）都读它们。
+        //   漏了 ⇒ 重放口径与生产不一致，结论不可信（2026-10-28 首轮重放已踩：越序边两侧源需求不同，
+        //   但无法判断是生产真实存在还是重放自造）。
+        var contextSnapshot = new Phase5ContextSnapshot();
+        foreach (var kv in constraints.ResolvedDirections)
+            contextSnapshot.ResolvedDirections[kv.Key] = kv.Value;
+        foreach (var kv in constraints.ResolvedBatchDirections)
+            contextSnapshot.ResolvedBatchDirections[kv.Key] = kv.Value;
+        foreach (var kv in constraints.ChosenRoutePaths)
+            contextSnapshot.ChosenRoutePaths[kv.Key] = kv.Value.ToString();
+        foreach (var kv in constraints.ChosenBatchRoutePaths)
+            contextSnapshot.ChosenBatchRoutePaths[kv.Key] = kv.Value.ToString();
+        foreach (var kv in constraints.ExecutionBatchDraftKeys)
+            contextSnapshot.ExecutionBatchDraftKeys[kv.Key] = new List<string>(kv.Value);
+        foreach (var kv in constraints.ExecutionBatchPlans)
+        {
+            var entries = new List<Phase5BatchPlanEntry>(kv.Value.Count);
+            foreach (var entry in kv.Value)
+            {
+                entries.Add(new Phase5BatchPlanEntry
+                {
+                    BatchKey = entry.BatchKey,
+                    NetOutputQty = entry.NetOutputQty,
+                    PlannedProcessQty = entry.PlannedProcessQty
+                });
+            }
+
+            contextSnapshot.ExecutionBatchPlans[kv.Key] = entries;
+        }
+
+        using (var fs = new System.IO.FileStream(
+                   System.IO.Path.Combine(dir, "context.json"),
+                   System.IO.FileMode.Create, System.IO.FileAccess.Write,
+                   System.IO.FileShare.Read, bufferSize: 1 << 20))
+        {
+            System.Text.Json.JsonSerializer.Serialize(fs, contextSnapshot, options);
+        }
+
+        // 「只要快照、不跑完 Phase5」：设 `APS_PHASE5_SNAPSHOT_ONLY=1` ⇒ 文件已落盘后主动结束本轮，
+        //   省掉 Phase5 那 21 分钟。⚠ 本轮的失败/异常码是**调试开关造成的**，不是真实排程结论。
+        if (Environment.GetEnvironmentVariable("APS_PHASE5_SNAPSHOT_ONLY") == "1")
+        {
+            throw new InvalidOperationException(
+                "APS_PHASE5_SNAPSHOT_ONLY=1：Phase5 入参已落盘，本轮按调试开关提前结束（非真实排程失败）。");
+        }
+    }
+
+    /// <summary>
+    /// `context.json` 的载体：**Phase2/Phase4 运行期登记**、`request` 重建不出来的六张表。
+    /// 全部摊平成字符串键/值，避免 `RoutePathKey` 这类结构体字典键导致 JSON 无法往返。
+    /// </summary>
+    internal sealed class Phase5ContextSnapshot
+    {
+        /// <summary>需求键 → 该需求自决方向（`FORWARD`/`BACKWARD`/`MIXED`）。</summary>
+        public Dictionary<string, string> ResolvedDirections { get; set; } = new(StringComparer.Ordinal);
+
+        /// <summary>执行批键 → 该批自决方向。</summary>
+        public Dictionary<string, string> ResolvedBatchDirections { get; set; } = new(StringComparer.Ordinal);
+
+        /// <summary>需求键 → `"RouteCode::PathId"`。</summary>
+        public Dictionary<string, string> ChosenRoutePaths { get; set; } = new(StringComparer.Ordinal);
+
+        /// <summary>执行批键 → `"RouteCode::PathId"`。</summary>
+        public Dictionary<string, string> ChosenBatchRoutePaths { get; set; } = new(StringComparer.Ordinal);
+
+        /// <summary>需求键 → 该需求下的执行批键清单。</summary>
+        public Dictionary<string, List<string>> ExecutionBatchDraftKeys { get; set; } = new(StringComparer.Ordinal);
+
+        /// <summary>需求键 → 该需求下各执行批的计划量。</summary>
+        public Dictionary<string, List<Phase5BatchPlanEntry>> ExecutionBatchPlans { get; set; } = new(StringComparer.Ordinal);
+    }
+
+    /// <summary>`context.json` 里的单个执行批计划项（对应 `ExecutionBatchPlanEntry`，字段一一对应）。</summary>
+    internal sealed class Phase5BatchPlanEntry
+    {
+        public string BatchKey { get; set; } = string.Empty;
+        public decimal NetOutputQty { get; set; }
+        public decimal PlannedProcessQty { get; set; }
+    }
+
+    /// <summary>
+    /// 测试钩子：把 `context.json` 的六张表写回刚重建出来的 <see cref="ConstraintContext"/>。
+    /// **只写这六张表**，其余（Routing/日历/物料/跨物料…）本就是 Phase1 产物，重建即真值。
+    /// </summary>
+    internal static void ApplyContextSnapshotForTest(
+        ConstraintContext constraints,
+        Phase5ContextSnapshot snapshot)
+    {
+        foreach (var kv in snapshot.ResolvedDirections)
+            constraints.ResolvedDirections[kv.Key] = kv.Value;
+        foreach (var kv in snapshot.ResolvedBatchDirections)
+            constraints.ResolvedBatchDirections[kv.Key] = kv.Value;
+
+        foreach (var kv in snapshot.ChosenRoutePaths)
+        {
+            if (TryParseRoutePath(kv.Value, out var key))
+                constraints.ChosenRoutePaths[kv.Key] = key;
+        }
+
+        foreach (var kv in snapshot.ChosenBatchRoutePaths)
+        {
+            if (TryParseRoutePath(kv.Value, out var key))
+                constraints.ChosenBatchRoutePaths[kv.Key] = key;
+        }
+
+        foreach (var kv in snapshot.ExecutionBatchDraftKeys)
+            constraints.ExecutionBatchDraftKeys[kv.Key] = new List<string>(kv.Value);
+
+        foreach (var kv in snapshot.ExecutionBatchPlans)
+        {
+            var entries = new List<ExecutionBatchPlanEntry>(kv.Value.Count);
+            foreach (var entry in kv.Value)
+            {
+                entries.Add(new ExecutionBatchPlanEntry(
+                    entry.BatchKey, entry.NetOutputQty, entry.PlannedProcessQty));
+            }
+
+            constraints.ExecutionBatchPlans[kv.Key] = entries;
+        }
+    }
+
+    /// <summary>解析 `"RouteCode::PathId"`（口径同 `RoutePathKey.ToString()`）。</summary>
+    private static bool TryParseRoutePath(string? text, out RoutePathKey key)
+    {
+        key = default;
+        if (string.IsNullOrEmpty(text))
+        {
+            return false;
+        }
+
+        var sep = text.LastIndexOf("::", StringComparison.Ordinal);
+        if (sep < 0)
+        {
+            return false;
+        }
+
+        if (!int.TryParse(text.Substring(sep + 2), out var pathId))
+        {
+            return false;
+        }
+
+        key = RoutePathKey.Of(text.Substring(0, sep), pathId);
+        return true;
+    }
+
+    /// <summary>
+    /// 测试钩子：驱动 Phase5 压实 —— **逐字同一个** <see cref="CompactGaps"/> 入口，不含任何桩。
+    /// 供「Phase5 快照重放」测试使用（见 <c>LPS.APS.Tests/Unit/PhaseFiveReplayTests.cs</c>）。
+    /// </summary>
+    internal static void CompactGapsForTest(
+        List<FinalTaskDraft> tasks, DomainSolveRequest request, ConstraintContext constraints)
+        => CompactGaps(tasks, request, constraints);
+
+    /// <summary>
+    /// 测试钩子：驱动 Phase5 段内 Setup 序列优化 —— **逐字同一个** <see cref="OptimizeSetupSequences"/> 入口。
+    /// 生产里它紧跟在 <see cref="CompactGaps"/> 之后、硬校验之前，重放必须照同序调用，否则验的不是真相。
+    /// </summary>
+    internal static void OptimizeSetupSequencesForTest(
+        List<FinalTaskDraft> tasks, DomainSolveRequest request, ConstraintContext constraints)
+        => OptimizeSetupSequences(tasks, request, constraints);
+
+    /// <summary>
+    /// 测试钩子：生成 TaskDependency —— **逐字同一个** <see cref="GenerateTaskDependencies"/> 实现，
+    /// 即硬校验建边用的那一份（重放侧用它检查压实后是否越序）。
+    /// </summary>
+    internal List<FinalTaskPeggingDraft> GenerateTaskDependenciesForTest(
+        List<FinalTaskDraft> tasks, DomainSolveRequest request, ConstraintContext constraints)
+        => GenerateTaskDependencies(tasks, request, constraints);
+
+    private static void CompactGaps(
+        List<FinalTaskDraft> tasks,
+        DomainSolveRequest request,
+        ConstraintContext constraints,
+        CancellationToken cancellationToken = default)
     {
         // 避免过早生产：BACKWARD/MIXED 的 JIT 倒排锚点不前拉（V1 最小口径，只做 FORWARD 压实）。
         // P1 整改（0号位 2026-10-09《未命名的Markdown文件 (3)(1).md》§一 第 3 行）：判据由 **Run 级原始策略值**
@@ -843,6 +1238,14 @@ internal class PhaseFiveCompression
             return;
         }
         SolverDiagnostics.CountPhase5CompactionRun();
+
+        // ── 2026-10-28：**差分对照开关**（只用于证明「连续数组扫描」与整改前逐位等价）──
+        //   设 `APS_PHASE5_LEGACY_RESOURCE_SCAN=1` ⇒「5) 保序界」退回**原对象扫描**实现；
+        //   未设（生产默认）⇒ 走连续数组。两条路径判据同源，只有取数方式不同。
+        //   用途：同一份快照跑两遍、对比压实后的时间表**逐位相同**，等价性有实测证据，不靠嘴说。
+        //   性能优化红线之一是「结果逐位相同」——本开关就是那条线的取证手段，不是第二套算法。
+        var legacyResourceScan =
+            Environment.GetEnvironmentVariable("APS_PHASE5_LEGACY_RESOURCE_SCAN") == "1";
 
         long swCgPrep = SolverDiagnostics.HotspotStart();
         var occupancy = PhaseFourLocalRepair.BuildResourceOccupancy(tasks, constraints);
@@ -863,11 +1266,97 @@ internal class PhaseFiveCompression
             }
         }
 
+        // ── 2026-10-28（run39：Phase5 硬校验 `TaskDependency 违反时间约束` ⇒ `FinalTask=0`）──
+        //   **取图口径不对称**：本方法算 floor 用 `TryGetRoutingGraph(任务自身 RouteCode/PathId)`（Q-3 红线：
+        //   缺任一 ⇒ false，**不得**按物料猜唯一 Path）；而校验边的生成方 `GenerateTaskDependencies`
+        //   走 `TryGetGraphForBatch`（批键/需求键优先，最后回落 `TryGetSingleRoutingGraph`）。
+        //   ⇒ 存在一类 Task：**校验方看得见前序边，压实方看不见 floor** ⇒ 被前拉到上游之前。
+        //   处置（**不猜路径**、不降目标）：只在该缺口成立时把该 Task 记为不可移动 ——
+        //     ① 自身取不到图（`TryGetRoutingGraph` false），**且**
+        //     ② 校验方按批键/需求键能取到图（`TryGetGraphForBatch` true，即**确实会建边**）。
+        //   两个条件同时成立才冻结；②不成立 ⇒ 根本没有边，照旧可压实（零回归）。
+        foreach (var t in tasks)
+        {
+            if (constraints.TryGetRoutingGraph(t.MaterialId, t.RouteCode, t.PathId, out _))
+            {
+                continue;
+            }
+
+            if (demandByKey.TryGetValue(t.SourceDraftId, out var ownDemand) &&
+                TryGetGraphForBatch(constraints, t.ExecutionBatchDraftKey, ownDemand, out _))
+            {
+                immovable.Add(t.FinalDraftId);
+            }
+        }
+
         SolverDiagnostics.HotspotEnd(swCgPrep, SolverDiagnostics.Hotspot.Phase5CompactPrep);
 
         long swCgIndex = SolverDiagnostics.HotspotStart();
         // P1-02 性能加固：三重索引消除每 Task 全表扫描（O(n²)→O(n·k)），10万 Task 标定前置。
         var index = TaskIndex.Build(tasks, demandByKey);
+
+        // ── 2026-10-28：`tasks` 原位下标表（落地移动的定位由 O(n) 降为 O(1)）──
+        //   原实现每落地一次移动就 `tasks.IndexOf(task)`，而 `tasks` 是**全部** Task 的大列表
+        //   ⇒ 单次 O(n)、整趟 O(n²)。实测（PV190，42,501 需求）：Phase5 压实跑 12 分钟仍未完成，
+        //   `dotnet-stack` 连采 6 次 6/6 落在 `CompactGaps`，其中 4/6 直接停在 `List.IndexOf`。
+        //   `tasks` 全程**无插入、无删除**，只在原下标替换引用 ⇒ 下标一次算好永久有效。
+        //   等价性：`FinalTaskDraft` 是 `sealed class` 且未覆写 `Equals`/`GetHashCode`
+        //   ⇒ 字典默认比较器即引用比较，与 `List.IndexOf`（`EqualityComparer<T>.Default`）逐位等价。
+        var positionInTasks = new Dictionary<FinalTaskDraft, int>(tasks.Count);
+        for (int i = 0; i < tasks.Count; i++)
+        {
+            positionInTasks.TryAdd(tasks[i], i);
+        }
+
+        // ── 2026-10-28：**占用起点缓存**（`PlannedStartTime − SetupTime`）──
+        //   下面「5) 保序界」要对**同资源的每一个 Task** 各算一次这个值：单资源 n 条 ⇒ 整趟 O(n²) 次重算。
+        //   实测（PV190，42,501 Task，run39）：Phase5 跑到 561 s 时 `dotnet-stack` 12/12 采样全部停在
+        //   `CompactGaps` 自身体内（不是任何子调用），折合 **≈311 ns / 次内层迭代**；两条属性读取远到不了
+        //   这个数，贵的是每轮都做的 `(double)decimal` 转换 + `TimeSpan.FromMinutes`。
+        //   ⇒ 一次算好、落定时同步刷新，内层循环退化为「字典取值 + 两个比较」。
+        //   **等价性**：全文件写 `tasks[...] = ...` 的只有 3 处 —— 本方法的「落地移动」一处，
+        //   以及 `OptimizeSegment` 里的「段内回写」「锚点回写」两处；后两者属**另一个方法**，与本法互不影响。
+        //   本法只有落地移动一处 ⇒ 只在那里刷新，刷新值恒等于 `movedTask` 的
+        //   `PlannedStartTime − FromMinutes(SetupTime)`（`WithTimes` 不改 SetupTime，故与就地重算逐位相同）。
+        //   键比较器与 `positionInTasks` 同源（sealed class 无 `Equals` 覆写 ⇒ 引用比较）。
+        var occStartByTask = new Dictionary<FinalTaskDraft, DateTime>(tasks.Count);
+        for (int i = 0; i < tasks.Count; i++)
+        {
+            var t = tasks[i];
+            occStartByTask[t] = t.PlannedStartTime - TimeSpan.FromMinutes((double)t.SetupTime);
+        }
+
+        // ── 2026-10-28：**同资源连续数组**（下面「5) 保序界」的唯一热点）──
+        //   该内层循环在 PV190 上约 **18 亿轮**（`Σ_资源 (该资源 Task 数)²`）—— 全是**散在堆上的对象**，
+        //   每轮要跨对象取 `PlannedEndTime`，缓存未命中占了绝大部分（上一版已把 `(double)decimal`
+        //   转换和 `TimeSpan.FromMinutes` 摘掉，实测仍 ≈311 ns/轮）。
+        //   ⇒ 把该资源要用的两个量**按资源打成连续 `long[]`**（占用起点 ticks / 结束 ticks），
+        //     顺序扫一遍就是一次顺序读。42,501 条 Task 的两条数组合计 ≈680KB，单核 L2 装得下。
+        //   **等价性**：`long` ticks 比较与 `DateTime` 比较同序（`DateTime` 比较即比 ticks）；
+        //     数组下标与 `index.ByResource[rid]` **严格同序**（落地移动时 `index.Replace` 是原位替换，
+        //     不增删元素），故「跳过自身」仍按原引用的 `ReferenceEquals` 判定 —— **一个 Task 都不漏判**。
+        var resourceOccStartTicks = new Dictionary<int, long[]>(index.ByResource.Count);
+        var resourceEndTicks = new Dictionary<int, long[]>(index.ByResource.Count);
+        var slotInResource = new Dictionary<FinalTaskDraft, int>(tasks.Count);
+        foreach (var kv in index.ByResource)
+        {
+            var sameResourceTasks = kv.Value;
+            var occArr = new long[sameResourceTasks.Count];
+            var endArr = new long[sameResourceTasks.Count];
+            for (int i = 0; i < sameResourceTasks.Count; i++)
+            {
+                var t = sameResourceTasks[i];
+                var tOcc = occStartByTask.TryGetValue(t, out var cachedOcc)
+                    ? cachedOcc
+                    : t.PlannedStartTime - TimeSpan.FromMinutes((double)t.SetupTime);
+                occArr[i] = tOcc.Ticks;
+                endArr[i] = t.PlannedEndTime.Ticks;
+                slotInResource.TryAdd(t, i);
+            }
+
+            resourceOccStartTicks[kv.Key] = occArr;
+            resourceEndTicks[kv.Key] = endArr;
+        }
 
         // demand → 当前完成时间（跨物料动态 floor 用），随压实推进刷新
         var completionByDemand = tasks
@@ -884,8 +1373,14 @@ internal class PhaseFiveCompression
         SolverDiagnostics.HotspotEnd(swCgIndex, SolverDiagnostics.Hotspot.Phase5CompactIndex);
 
         long swCgLoop = SolverDiagnostics.HotspotStart();
+        // 供给不足**不静默**（0号位 2026-10-26 四份整改单 P0 ③）：旧实现 `continue` 之后整个需求跳过压实，
+        //   结果与「本来就无需压实」**完全同形**，下游分不出「缺料压不动」。需求级去重。
+        var materialShortReported = new HashSet<string>(StringComparer.Ordinal);
         foreach (var task in order)
         {
+            // R11-2：压实主循环检查点（PV190 实测本循环单跑 12 分钟，此前不可中断）
+            cancellationToken.ThrowIfCancellationRequested();
+
             if (!demandByKey.TryGetValue(task.SourceDraftId, out var demand))
                 continue;
 
@@ -896,7 +1391,11 @@ internal class PhaseFiveCompression
 
             var setup = TimeSpan.FromMinutes((double)task.SetupTime);
             var totalDuration = (task.PlannedEndTime - task.PlannedStartTime) + setup;
-            var myOccStart = task.PlannedStartTime - setup;
+            // 缓存未命中时**就地重算**（与缓存值逐位相同）—— 保证「同一对象引用在 `tasks` 里出现两次」
+            // 这类边角情形也不会抛异常，行为与原实现（`positionInTasks` 未命中即 `continue`）一致。
+            var myOccStart = occStartByTask.TryGetValue(task, out var cachedMyOcc)
+                ? cachedMyOcc
+                : task.PlannedStartTime - setup;
 
             // ── floor（占用开始时间口径，与 Phase2/Phase4 的 FindForwardSlot 用法一致）──
             var floor = request.PlanningStart;
@@ -904,11 +1403,36 @@ internal class PhaseFiveCompression
             // 1) 物料可用时间（多段 Quantity-Time）；总量不足 → 保持原位不动
             var materialFloor = PhaseFourLocalRepair.GetMaterialEarliestTime(
                 demand.AllocationSequence, demand.NetOutputQty, constraints, request.PlanningStart, out var sufficient);
-            if (!sufficient) continue;
+            if (!sufficient)
+            {
+                if (materialShortReported.Add(task.SourceDraftId))
+                {
+                    constraints.TraceNotes.Add(new SolveTraceNote
+                    {
+                        Key = task.SourceDraftId,
+                        ReasonCode = "PHASE5_MATERIAL_INSUFFICIENT",
+                        Message = $"需求 `{task.SourceDraftId}`（物料 {demand.MaterialId}，"
+                                  + $"AllocationSequence {demand.AllocationSequence}）"
+                                  + $"供给累计量不足 `NetOutputQty={demand.NetOutputQty}` "
+                                  + "⇒ **整个需求跳过压实**（`CompactGaps` 保持原位不动）。"
+                                  + "这是「缺料压不动」，**不是「本来就无需压实」**；供给补齐后需重算。",
+                        Level = "Warning"
+                    });
+                }
+                continue;
+            }
             if (materialFloor > floor) floor = materialFloor;
 
             // 2) Routing 前序（同 Demand，含 Lag；Split 多前序 Task 取最大完成）
             // 0号位 2026-09-29 裁决 §5.3：节点身份 = (StageCode, OperationCode)
+            // ── 2026-10-28（run39：Phase5 硬校验 `TaskDependency 违反时间约束`，FinalTask=0）──
+            //   `constraints.TryGetRoutingGraph(material, task.RouteCode, task.PathId, …)` 按 **Task 自身**
+            //   路径身份精确取图，`PhaseOneConstraintBuilder.cs` 明定 Fail Closed：
+            //     RouteCode 空 / PathId 为 null ⇒ **返回 false，不得退回「按物料猜唯一 Path」**（Q-3 红线）。
+            //   ⇒ 取不到图时本段**不施加 Routing 前序 floor**。若就此放行压实，该 Task 会被前拉到上游之前
+            //     ⇒ 正是 run39 的 `TaskDependency 违反时间约束`。
+            //   故此类 Task **一律按不可移动处理**（与「非 FORWARD 需求」同一处置口径，见上方 `immovable`），
+            //   **不猜路径**、也**不前拉**。取图成功时行为与整改前逐字一致。
             if (constraints.TryGetRoutingGraph(task.MaterialId, task.RouteCode, task.PathId, out var graph) &&
                 graph.Dependencies.TryGetValue(
                     OperationNodeKey.Of(task.StageCode, task.OperationCode), out var preds) &&
@@ -921,6 +1445,13 @@ internal class PhaseFiveCompression
                         if (predTask.StageCode != pred.From.StageCode) continue;
                         if (predTask.OperationCode != pred.From.OperationCode) continue;
                         var predEnd = predTask.PlannedEndTime.AddMinutes((double)pred.LagTime);
+
+                        // ── R09-③（2026-10-29）：跨 Stage 时「中间无 Routing Stage」的提前期必须压住 floor ──
+                        //   不补这一支，本方法会把 Phase2 已经让出来的那段时间**又压回去**
+                        //   （实测 STAGE3 被 Phase2 排到 05:00，压实后回 01:00 ⇒ 等于没改）。
+                        predEnd = RoutelessLeadTimePolicy.Advance(
+                            constraints.Request, constraints, demand, pred.From.StageCode, task.StageCode, predEnd);
+
                         if (predEnd > floor) floor = predEnd;
                     }
                 }
@@ -944,23 +1475,62 @@ internal class PhaseFiveCompression
             }
 
             // 5) 保序界：同资源不得越过前序 Task 占用末端（floor）/后继 Task 占用起点（ceil）——绝不重排序
+            //   2026-10-28：扫描对象改为**连续 `long[]`**（见上方「同资源连续数组」）。判据**逐字未变**：
+            //     · 占用起点 **<** 自身  ⇒ 用其结束时间抬 floor（取最大）
+            //     · 否则（含**相等**）   ⇒ 用其占用起点压 ceil（取最小）
+            //   与 `foreach` 的唯一差别是拿数组下标取数，而两条数组与 `index.ByResource[rid]` 严格同序、
+            //   「跳过自身」仍用原引用的 `ReferenceEquals` ⇒ 判定集与整改前**完全相同**。
+            //   floor/ceil 均用 `AddTicks` 在原值上平移，**保留原 DateTimeKind**（`new DateTime(ticks)`
+            //   会把 Kind 打成 Unspecified，虽不改比较结果，但没必要留这种差异）。
             var orderCeil = DateTime.MaxValue;
-            if (index.ByResource.TryGetValue(resourceId, out var sameRes))
+            if (legacyResourceScan && index.ByResource.TryGetValue(resourceId, out var legacySameRes))
             {
-                foreach (var t in sameRes)
+                // ── 差分对照：**整改前的原实现**，一字未改（只供 `APS_PHASE5_LEGACY_RESOURCE_SCAN=1` 使用）──
+                foreach (var t in legacySameRes)
                 {
                     if (ReferenceEquals(t, task)) continue;
-                    var tOccStart = t.PlannedStartTime - TimeSpan.FromMinutes((double)t.SetupTime);
+                    var tOccStart = occStartByTask.TryGetValue(t, out var cachedT)
+                        ? cachedT
+                        : t.PlannedStartTime - TimeSpan.FromMinutes((double)t.SetupTime);
                     if (tOccStart < myOccStart)
                     {
-                        // 前序：占用末端（= 加工结束，占用窗 [start-setup, end]）作 floor
                         if (t.PlannedEndTime > floor) floor = t.PlannedEndTime;
                     }
                     else if (tOccStart < orderCeil)
                     {
-                        // 后继：占用起点（含其 Setup）作 ceil
                         orderCeil = tOccStart;
                     }
+                }
+            }
+            else if (!legacyResourceScan
+                && resourceOccStartTicks.TryGetValue(resourceId, out var resOccTicks)
+                && index.ByResource.TryGetValue(resourceId, out var sameRes))
+            {
+                var resEndTicks = resourceEndTicks[resourceId];
+                var myOccTicks = myOccStart.Ticks;
+                var floorTicks = floor.Ticks;
+                var ceilTicks = long.MaxValue;
+                for (int i = 0; i < resOccTicks.Length; i++)
+                {
+                    if (ReferenceEquals(sameRes[i], task)) continue;
+                    var tOccTicks = resOccTicks[i];
+                    if (tOccTicks < myOccTicks)
+                    {
+                        // 前序：占用末端（= 加工结束，占用窗 [start-setup, end]）作 floor
+                        var tEndTicks = resEndTicks[i];
+                        if (tEndTicks > floorTicks) floorTicks = tEndTicks;
+                    }
+                    else if (tOccTicks < ceilTicks)
+                    {
+                        // 后继：占用起点（含其 Setup）作 ceil
+                        ceilTicks = tOccTicks;
+                    }
+                }
+
+                floor = floor.AddTicks(floorTicks - floor.Ticks);
+                if (ceilTicks != long.MaxValue)
+                {
+                    orderCeil = task.PlannedEndTime.AddTicks(ceilTicks - task.PlannedEndTime.Ticks);
                 }
             }
 
@@ -996,15 +1566,31 @@ internal class PhaseFiveCompression
             }
 
             // ── 落地移动：替换 Task（init-only → 重建）、刷新占用/索引/完成时间 ──
-            var idx = tasks.IndexOf(task);
-            if (idx < 0)
+            if (!positionInTasks.TryGetValue(task, out var idx))
             {
                 windows?.Add(new TimeWindow(myOccStart, task.PlannedEndTime));
                 continue;
             }
             var movedTask = WithTimes(task, newStart, newEnd);
             tasks[idx] = movedTask;
+            // 新引用接原下标；旧引用已不在 `tasks` 中，一并摘除（防误命中陈旧下标）
+            positionInTasks.Remove(task);
+            positionInTasks[movedTask] = idx;
+            // 占用起点同步：`WithTimes` 只改时间、不改 SetupTime ⇒ 新占用起点 = 新加工开始 − 原 setup。
+            occStartByTask.Remove(task);
+            occStartByTask[movedTask] = newStart - setup;
             index.Replace(task, movedTask);   // FinalTaskDraft 不可变 → 索引同步换引用，防后续读到旧位置
+
+            // ── 2026-10-28：连续数组同步（`index.Replace` 是**原位替换**，不增删元素 ⇒ 下标不变）──
+            //   漏刷新 ⇒ 后面所有 Task 读到的都是这个 Task 的**旧位置** ⇒ 序界算错（会放行越序前拉）。
+            if (slotInResource.TryGetValue(task, out var packedSlot)
+                && resourceOccStartTicks.ContainsKey(resourceId))
+            {
+                resourceOccStartTicks[resourceId][packedSlot] = (newStart - setup).Ticks;
+                resourceEndTicks[resourceId][packedSlot] = newEnd.Ticks;
+                slotInResource.Remove(task);
+                slotInResource[movedTask] = packedSlot;
+            }
 
             if (windows != null)
             {
@@ -1062,11 +1648,60 @@ internal class PhaseFiveCompression
     // ═══════════════════════════════════════════════════════════
 
     /// <summary>
-    /// Setup 序列优化全局时钟守护（秒）——实现细节兜底，不进治理参数
+    /// Setup 序列优化的**回落**时限（秒）。只在冻结 `CandidateGuardrailBlock` 三档
+    /// （`NormalMs`/`SoftMs`/`LocalHardMs`）缺失或非法时使用，见 <see cref="SetupSearchBudget"/>。
     /// （0号位 红线「Setup 搜索不得破坏夜间总体性能目标」；相对约 15 分钟总目标留足余量。
-    /// 若需治理可调，按 1号位 四件套流程另行提请，不自造治理字段）。
+    /// 治理入口已改为三档，本常量仅作配置异常时的兜底，不再自造治理字段）。
     /// </summary>
     private const int SetupSearchGlobalTimeLimitSeconds = 120;
+
+    /// <summary>
+    /// R11（2026-10-29）：Phase5 Setup 序列优化的**三档限时**，取自冻结 `CandidateGuardrailBlock`
+    /// （载体 `DomainSolveRequest.CandidateGuardrail`，整块透传）。三档语义与落点：
+    ///   · <see cref="NormalSeconds"/>（`NormalMs`，正常预算）—— 用尽后**不再开新的生产窗口/新段**（窗口循环 `return`）；
+    ///   · <see cref="SoftSeconds"/>（`SoftMs`，软超时）—— 用尽后**停止当前段的邻域枚举**，直接采用当前 best；
+    ///   · <see cref="LocalHardSeconds"/>（`LocalHardMs`，局部硬上限）—— 用尽后**立即中止**整个序列优化
+    ///     （单个段仿真冲过软超时时的兜底）。
+    /// 红线：三档**只约束可选优化层**。任何一档生效时返回的都是「已完整硬合法」的当前 best
+    ///   （`bestOrder`/`bestSim` 初值即段基线；候选只在不新增延期、不升总延期、Setup 严格下降时被接受），
+    ///   因此不产生未排、不改批方向、不降低任何目标 —— 对应 0号位 R11「保留完整硬合法基础解的复检」。
+    /// 三档配置缺失或非法（任一 ≤ 0，或 正常≤软≤硬 不成立）时**不默默当成「无限」或「0」**：
+    ///   回落到 <see cref="SetupSearchGlobalTimeLimitSeconds"/> 单档，并留 Warning 级 TraceNote。
+    /// </summary>
+    private readonly struct SetupSearchBudget
+    {
+        public double NormalSeconds { get; }
+        public double SoftSeconds { get; }
+        public double LocalHardSeconds { get; }
+
+        private SetupSearchBudget(double normalSeconds, double softSeconds, double localHardSeconds)
+        {
+            NormalSeconds = normalSeconds;
+            SoftSeconds = softSeconds;
+            LocalHardSeconds = localHardSeconds;
+        }
+
+        public static SetupSearchBudget From(DomainSolveRequest request, out bool fellBack)
+        {
+            fellBack = false;
+            // 载体：`DomainSolveRequest.StrategySnapshot`（`SolverStrategySnapshot`）的 `CandidateGuardrail` 整块
+            var guardrail = request.StrategySnapshot?.CandidateGuardrail;
+
+            if (guardrail != null &&
+                guardrail.NormalMs > 0 && guardrail.SoftMs > 0 && guardrail.LocalHardMs > 0 &&
+                guardrail.NormalMs <= guardrail.SoftMs && guardrail.SoftMs <= guardrail.LocalHardMs)
+            {
+                return new SetupSearchBudget(
+                    guardrail.NormalMs / 1000.0,
+                    guardrail.SoftMs / 1000.0,
+                    guardrail.LocalHardMs / 1000.0);
+            }
+
+            fellBack = true;
+            double fallbackSeconds = SetupSearchGlobalTimeLimitSeconds;
+            return new SetupSearchBudget(fallbackSeconds, fallbackSeconds, fallbackSeconds);
+        }
+    }
 
     /// <summary>段内 Task 的预计算上下文（floor/deadline 全部冻结为原计划口径，保证段外消费者零重排）。</summary>
     private sealed class SegmentTaskInfo
@@ -1100,7 +1735,8 @@ internal class PhaseFiveCompression
     private static void OptimizeSetupSequences(
         List<FinalTaskDraft> tasks,
         DomainSolveRequest request,
-        ConstraintContext constraints)
+        ConstraintContext constraints,
+        CancellationToken cancellationToken = default)
     {
         // §17：白天 Candidate 局部优先，不做全天序列重排
         if (request.CandidateContext != null) return;
@@ -1123,6 +1759,25 @@ internal class PhaseFiveCompression
         int searchBudget = setupParams.SetupSearchBudget > 0 ? setupParams.SetupSearchBudget : 500;
         int maxStaleTries = setupParams.SetupMaxNeighborhoodTries > 0 ? setupParams.SetupMaxNeighborhoodTries : 50;
 
+        // R11（2026-10-29）：三档限时接线 —— 取自冻结 CandidateGuardrail（`NormalMs`/`SoftMs`/`LocalHardMs`）。
+        //   配置缺失/非法不默默放成「无限」：回落 120s 单档并留痕。
+        var searchTimeBudget = SetupSearchBudget.From(request, out bool budgetFellBack);
+        if (budgetFellBack)
+        {
+            constraints.TraceNotes.Add(new SolveTraceNote
+            {
+                Key = "PHASE5_SETUP_TIME_BUDGET",
+                ReasonCode = "PHASE5_GUARDRAIL_BUDGET_FALLBACK",
+                Message = "冻结 CandidateGuardrail 三档限时缺失或非单调"
+                          + $"（NormalMs={request.StrategySnapshot?.CandidateGuardrail?.NormalMs}、"
+                          + $"SoftMs={request.StrategySnapshot?.CandidateGuardrail?.SoftMs}、"
+                          + $"LocalHardMs={request.StrategySnapshot?.CandidateGuardrail?.LocalHardMs}；要求三者 >0 且 正常≤软≤硬）"
+                          + $"⇒ Phase5 Setup 序列优化回落单档 {SetupSearchGlobalTimeLimitSeconds}s。"
+                          + "只影响可选优化的搜索时长，不改变已排结果的硬合法性。",
+                Level = "Warning"
+            });
+        }
+
         // 可重放：种子由 Run/版本派生（同一 Run 重放 → 同一搜索轨迹 → 同一结果）
         var rng = new DeterministicRandom(request.ScheduleRunId ?? request.PlanVersionId);
         var stopwatch = System.Diagnostics.Stopwatch.StartNew();
@@ -1142,6 +1797,23 @@ internal class PhaseFiveCompression
         }
 
         var demandByKey = request.LogicalProductionDemands.ToDictionary(d => d.LogicalDemandKey);
+
+        // 2026-10-28：与 `CompactGaps` 同一处置 —— 「自身取不到图、而校验方按批键/需求键取得到」的 Task
+        //   其 Routing 前序 floor / 后继 deadline **不可评估** ⇒ 一律按不可移动处理（不猜路径、不越序）。
+        foreach (var t in tasks)
+        {
+            if (constraints.TryGetRoutingGraph(t.MaterialId, t.RouteCode, t.PathId, out _))
+            {
+                continue;
+            }
+
+            if (demandByKey.TryGetValue(t.SourceDraftId, out var ownDemand) &&
+                TryGetGraphForBatch(constraints, t.ExecutionBatchDraftKey, ownDemand, out _))
+            {
+                immovable.Add(t.FinalDraftId);
+            }
+        }
+
         var occupancy = PhaseFourLocalRepair.BuildResourceOccupancy(tasks, constraints);
         // P1-02 性能加固：段预计算的 deadline/floor 查询走三重索引（消除每 Task 全表扫描）
         var index = TaskIndex.Build(tasks, demandByKey);
@@ -1163,6 +1835,9 @@ internal class PhaseFiveCompression
 
         foreach (var resourceGroup in tasks.GroupBy(t => t.ResourceId).ToList())
         {
+            // R11-2：资源组边界检查（本循环是 Phase5 Setup 序列优化最外层，单组可有上千 Task）
+            cancellationToken.ThrowIfCancellationRequested();
+
             // 非资源工序 Task（ResourceId=NULL，不占资源）无资源日历、无 Setup 序列语义 → 整组跳过（保守：不动其时间）
             if (resourceGroup.Key is not int resourceId) continue;
             if (!constraints.ResourceCalendars.TryGetValue(resourceId, out var calendar)) continue;
@@ -1177,7 +1852,12 @@ internal class PhaseFiveCompression
 
             foreach (var window in windows)
             {
-                if (stopwatch.Elapsed.TotalSeconds > SetupSearchGlobalTimeLimitSeconds) return;
+                // R11（2026-10-29）：窗口循环也做取消检查 —— 单资源可有多个生产窗口，
+                //   此前只有资源组边界（上方）与段内循环（OptimizeSegment）两处检查点。
+                cancellationToken.ThrowIfCancellationRequested();
+                // R11 三档限时 ①（正常预算）：用尽后**不再开新的生产窗口/新段**；已在搜索中的段由
+                //   `OptimizeSegment` 按软超时/局部硬上限自行收尾 —— 不会把半成品段丢下（该段 best 始终完整硬合法）。
+                if (stopwatch.Elapsed.TotalSeconds > searchTimeBudget.NormalSeconds) return;
 
                 var windowTasks = resTasks.Where(t =>
                 {
@@ -1196,7 +1876,7 @@ internal class PhaseFiveCompression
                         if (current.Count >= 2)
                             OptimizeSegment(current, prevAnchor, t, window, resourceId, tasks, request,
                                 constraints, demandByKey, completionByDemand, parentsByChild, occupancy, index,
-                                searchBudget, maxStaleTries, rng, stopwatch);
+                                searchBudget, maxStaleTries, searchTimeBudget, rng, stopwatch, cancellationToken);
                         current = new List<FinalTaskDraft>();
                         prevAnchor = t;
                     }
@@ -1208,7 +1888,7 @@ internal class PhaseFiveCompression
                 if (current.Count >= 2)
                     OptimizeSegment(current, prevAnchor, null, window, resourceId, tasks, request,
                         constraints, demandByKey, completionByDemand, parentsByChild, occupancy, index,
-                        searchBudget, maxStaleTries, rng, stopwatch);
+                        searchBudget, maxStaleTries, searchTimeBudget, rng, stopwatch, cancellationToken);
             }
         }
     }
@@ -1229,9 +1909,13 @@ internal class PhaseFiveCompression
         TaskIndex index,
         int searchBudget,
         int maxStaleTries,
+        SetupSearchBudget searchTimeBudget,
         DeterministicRandom rng,
-        System.Diagnostics.Stopwatch stopwatch)
+        System.Diagnostics.Stopwatch stopwatch,
+        CancellationToken cancellationToken = default)
     {
+        // R11-2：段内搜索是本 Phase 最贵的循环（邻域枚举 + 全段重仿真），逐个候选前检查一次。
+        cancellationToken.ThrowIfCancellationRequested();
         var segmentIds = segment.Select(t => t.FinalDraftId).ToHashSet();
 
         // P1-02 验收观测（0号位 2026-10-09《APS_V1_2_20261009.md》§五.5）：本段**确实进入**有界局部优化体。
@@ -1242,6 +1926,9 @@ internal class PhaseFiveCompression
 
         // ── 预计算段内 Task 的 floor/deadline（全部冻结为原计划口径）──
         var infos = new List<SegmentTaskInfo>(segment.Count);
+        // 供给不足**不静默**（0号位 2026-10-26 P0 ③）：旧实现只把 floor 压回原位，
+        //   等于「这一段因为缺料不许前移」，但结果上和无约束、无空档完全同形。需求级去重。
+        var materialShortReported = new HashSet<string>(StringComparer.Ordinal);
         foreach (var task in segment)
         {
             if (!demandByKey.TryGetValue(task.SourceDraftId, out var demand)) return;  // 追溯不到需求 → 保守不优化该段
@@ -1251,7 +1938,24 @@ internal class PhaseFiveCompression
             // floor：物料（不足则不早于原位）
             var floor = PhaseFourLocalRepair.GetMaterialEarliestTime(
                 demand.AllocationSequence, demand.NetOutputQty, constraints, request.PlanningStart, out var sufficient);
-            if (!sufficient) floor = taskOccStart;
+            if (!sufficient)
+            {
+                floor = taskOccStart;   // 缺料 ⇒ 本段该 Task 不早于原位（行为不变，只补留痕）
+                if (materialShortReported.Add(task.SourceDraftId))
+                {
+                    constraints.TraceNotes.Add(new SolveTraceNote
+                    {
+                        Key = task.SourceDraftId,
+                        ReasonCode = "PHASE5_MATERIAL_INSUFFICIENT_FLOOR",
+                        Message = $"需求 `{task.SourceDraftId}`（物料 {demand.MaterialId}，"
+                                  + $"AllocationSequence {demand.AllocationSequence}）"
+                                  + $"供给累计量不足 `NetOutputQty={demand.NetOutputQty}` "
+                                  + "⇒ 本段换型序列优化的 floor **被压回原位**（该 Task 不许前移）。"
+                                  + "这是「缺料不许前移」，不是「本来就没有前移空间」。",
+                        Level = "Warning"
+                    });
+                }
+            }
 
             // floor：跨物料子件完成（子件未排则不早于原位）
             var crossFloor = PhaseFourLocalRepair.GetDynamicMaterialFloor(
@@ -1274,6 +1978,8 @@ internal class PhaseFiveCompression
             // floor：段外 Routing 前序（段内前序由模拟链处理）
             // 0号位 2026-09-29 裁决 §5.3：节点身份 = (StageCode, OperationCode)
             var taskNodeKey = OperationNodeKey.Of(task.StageCode, task.OperationCode);
+            // 2026-10-28：与 `CompactGaps` 同一处置 —— 取不到**自身**路径身份的图，**不猜**（Q-3 红线），
+            //   且**不得**当作「无前序、可自由前拉」；本 Task 直接不参与段内重排（见上方 graph 为 null 的提前返回）。
             RoutingGraph? graph = null;
             constraints.TryGetRoutingGraph(task.MaterialId, task.RouteCode, task.PathId, out graph);
             if (graph != null && graph.Dependencies.TryGetValue(taskNodeKey, out var preds) &&
@@ -1287,6 +1993,11 @@ internal class PhaseFiveCompression
                         if (predTask.OperationCode != pred.From.OperationCode) continue;
                         if (segmentIds.Contains(predTask.FinalDraftId)) continue;
                         var predEnd = predTask.PlannedEndTime.AddMinutes((double)pred.LagTime);
+
+                        // R09-③（2026-10-29）：与 `CompactGaps` 同一条下界 —— 段外跨 Stage 前序也要吃中间提前期。
+                        predEnd = RoutelessLeadTimePolicy.Advance(
+                            constraints.Request, constraints, demand, pred.From.StageCode, task.StageCode, predEnd);
+
                         if (predEnd > floor) floor = predEnd;
                     }
                 }
@@ -1309,6 +2020,11 @@ internal class PhaseFiveCompression
                             if (succTask.OperationCode != kvp.Key.OperationCode) continue;
                             if (segmentIds.Contains(succTask.FinalDraftId)) continue;
                             var latest = succTask.PlannedStartTime.AddMinutes(-(double)dep.LagTime);
+
+                            // R09-③（2026-10-29）：上界方向同样要让出中间提前期，否则段内重排会把它吃掉。
+                            latest = RoutelessLeadTimePolicy.Retreat(
+                                constraints.Request, constraints, demand, task.StageCode, kvp.Key.StageCode, latest);
+
                             if (latest < deadline) deadline = latest;
                         }
                     }
@@ -1343,12 +2059,14 @@ internal class PhaseFiveCompression
             {
                 Task = task,
                 Demand = demand,
-                // Duration-1 收尾：段内「加工时长」取有效加工，不取墙钟跨度 —— 单窗逐位相等（零行为变化），
-                //   `null`（锁定继承 Task）回落原算式；理由与 `PhaseFourLocalRepair` 同处一致。
-                //   ⚠ 别把本处与 `CompactGaps` 里的占用槽长混为一谈：那里 `(End−Start) + setup` 是**占用**口径，必须保留原算式。
-                ProcessDuration = task.EffectiveProcessMinutes is decimal taskEffectiveProcess
-                    ? TimeSpan.FromMinutes((double)taskEffectiveProcess)
-                    : task.PlannedEndTime - task.PlannedStartTime,
+                // Duration-1 收尾（2026-10-29 PV195 跨窗后修正）：段内「加工时长」取**墙钟跨度** `End − Start`。
+                //   · 单窗：`End − Start` **恒等于**有效加工 ⇒ 与旧式（取 `EffectiveProcessMinutes`）**逐位相同**，
+                //     `null`（锁定继承 Task）本来就走这条算式 ⇒ 零行为变化；
+                //   · 跨窗：`End − Start` 含窗间非工作空档，段内重仿真必须按它推进占用（`end = occStart + setup + ProcessDuration`），
+                //     否则会把跨窗 Task 压成一段连续加工 —— 实测（2026-10-29）旧式把 08:00~23:00 写成 08:00~18:00，
+                //     占用图与 Task 时间同时错。
+                //   ⚠ 别把本处与 `CompactGaps` 里的占用槽长混为一谈：那里 `(End−Start) + setup` 是**占用**口径，同样按墙钟。
+                ProcessDuration = task.PlannedEndTime - task.PlannedStartTime,
                 Floor = floor,
                 Deadline = deadline
             });
@@ -1391,9 +2109,18 @@ internal class PhaseFiveCompression
         var bestOrder = infos;
         var bestSim = baseSim;
         int tries = 0, stale = 0;
-        while (tries < searchBudget && stale < maxStaleTries &&
-               stopwatch.Elapsed.TotalSeconds <= SetupSearchGlobalTimeLimitSeconds)
+        while (tries < searchBudget && stale < maxStaleTries)
         {
+            // R11-2：搜索主循环检查点（每次迭代都要重仿真整段，是这个 Phase 最贵的一步）
+            cancellationToken.ThrowIfCancellationRequested();
+
+            // R11 三档限时 ②③：软超时后停止当前段的邻域枚举；局部硬上限立即收手。
+            //   两者都只**停止搜索**，不改变已有 best —— `bestOrder`/`bestSim` 初值就是本段基线，
+            //   且候选必须「不新增延期 + 总延期不升 + Setup 严格下降」才被接受 ⇒ 停在这里的返回值永远完整硬合法。
+            var elapsedSeconds = stopwatch.Elapsed.TotalSeconds;
+            if (elapsedSeconds >= searchTimeBudget.LocalHardSeconds) break;
+            if (elapsedSeconds >= searchTimeBudget.SoftSeconds) break;
+
             tries++;
             var candidate = new List<SegmentTaskInfo>(bestOrder);
 
@@ -1531,7 +2258,9 @@ internal class PhaseFiveCompression
             var info = order[i];
 
             var setupRes = SetupOptimizer.ResolveSetupCore(
-                info.Task.OperationCode, resourceId, prevProduct, info.Task.MaterialId,
+                info.Task.OperationCode,
+                SetupOptimizer.LookupDepartment(constraints.DepartmentByMaterialStage, info.Task.MaterialId, info.Task.StageCode),
+                info.Task.StageCode, resourceId, prevProduct, info.Task.MaterialId,
                 constraints.SetupExactRules, constraints.SetupDefaultRules);
             var setup = setupRes.SetupMinutes;
 
@@ -1573,7 +2302,8 @@ internal class PhaseFiveCompression
             simEndsByKey[(info.Task.SourceDraftId, info.Task.StageCode, info.Task.OperationCode)] = end;
 
             // 延期检查（Level 1/2 不恶化；M5 第一批：覆盖交期口径）
-            var due = constraints.EffectiveDue(info.Demand);
+            // 判定期上界：客户 DATE ⇒ 交期日整天算按期（0号位 2026-10-31 v3.0:18）。见 `EffectiveDueJudgementBound`。
+            var due = constraints.EffectiveDueJudgementBound(info.Demand);
             if (end > due)
             {
                 totalDelayMinutes += (end - due).TotalMinutes;
@@ -1595,7 +2325,9 @@ internal class PhaseFiveCompression
         if (nextAnchor != null)
         {
             var anchorRes = SetupOptimizer.ResolveSetupCore(
-                nextAnchor.OperationCode, resourceId, prevProduct, nextAnchor.MaterialId,
+                nextAnchor.OperationCode,
+                SetupOptimizer.LookupDepartment(constraints.DepartmentByMaterialStage, nextAnchor.MaterialId, nextAnchor.StageCode),
+                nextAnchor.StageCode, resourceId, prevProduct, nextAnchor.MaterialId,
                 constraints.SetupExactRules, constraints.SetupDefaultRules);
             anchorSetup = anchorRes.SetupMinutes;
             anchorOutcome = anchorRes.Outcome;   // SetupSource 填充：记录锚点重算命中类型
@@ -1844,6 +2576,28 @@ internal class PhaseFiveCompression
                 - unscheduledQtyByAllocation.GetValueOrDefault(allocationSeq);
             if (closureTarget < 0m) closureTarget = 0m;
 
+            // ── 2026-10-28 修复（PV190 run36 实跑：`Task 14b81910… 的 ShareQty <= 0: -0.4780`）──
+            //   旧实现：非末位**逐条独立** `Math.Round(closureTarget * c / total, 3)`，再把
+            //   **全部**舍入误差一次性压给排序末位的那个 Task（`closureTarget - Σ前 N−1`），**没有下界**。
+            //   逐条量化的误差同号累加时（每条精确值都落在千分位 `.5` 上、被 ToEven 一致进位），
+            //   前 N−1 条之和会**超过** `closureTarget` ⇒ 末位算出**负数** ⇒
+            //   `ValidateHardResult` 第 2 项判失败 ⇒ **整个 Domain 26,203 个 Task 全废**
+            //   （不是排不下，是硬校验一票否决）。可构造反例见
+            //   `LPS.APS.Tests/Unit/AllocationShareResidualOverflowTests.cs`。
+            //
+            //   现在：**前缀累计量化** —— 量化的是「前 i 条的累计值」，不是每一条：
+            //     · 任意前缀的漂移恒 ≤ 0.0005（旧实现是 ≤ 0.0005×i，i 越大越危险）；
+            //     · 前缀精确值单调不减 ⇒ `Math.Round` 单调 ⇒ 每条份额恒 **≥ 0**，负数**不可达**；
+            //     · 逐 Allocation 的 Σ 仍由末位补差**精确**闭合 ⇒ 不变量一条没放松（是收紧，不是放宽）。
+            //
+            //   ⚠ **不动**：分摊公式、闭合目标（甲式 `Q − U`）、`IsRatioOne` 判据、排序键、末位归属规则。
+            //     变的只有「非末位各条怎么分摊那 0.0005 级残差」。
+            //   ⚠ `allocatedSoFar` 就是旧的 `shares.Where(s => s.AllocationSequence == allocationSeq).Sum(…)`：
+            //     同值，但从 O(n²) 降为 O(n)（`0` 份额不入表也不影响求和）。
+            decimal exactCumulative = 0m;   // 精确前缀（**不量化**）
+            decimal allocatedSoFar = 0m;    // 该 Allocation 已发份额之和
+            var ratioIsOne = IsRatioOne(closureTarget, totalContribution);
+
             for (int i = 0; i < taskQtys.Count; i++)
             {
                 var c = taskQtys[i];
@@ -1852,12 +2606,9 @@ internal class PhaseFiveCompression
                 if (i == taskQtys.Count - 1)
                 {
                     // 最后一个：补差，使 Σ 恰等于 `closureTarget`（消除 3 位小数舍入漂移）
-                    var alreadyAllocated = shares
-                        .Where(s => s.AllocationSequence == allocationSeq)
-                        .Sum(s => s.ComponentQty);
-                    shareQty = closureTarget - alreadyAllocated;
+                    shareQty = closureTarget - allocatedSoFar;
                 }
-                else if (totalContribution == closureTarget)
+                else if (ratioIsOne)
                 {
                     // ── 2026-10-16 逐 Task 容差漂移修复（1号位）──
                     //   分摊比恰为 1（= 该 Allocation 全部落定）时，`closureTarget * c / totalContribution`
@@ -1880,14 +2631,28 @@ internal class PhaseFiveCompression
                 }
                 else if (totalContribution > 0)
                 {
-                    // 按**真实贡献占比**分摊 `closureTarget`（甲式闭合目标），与旧实现逐字一致。
+                    // 按**真实贡献占比**分摊 `closureTarget`（甲式闭合目标）。
                     // ⚠ N8-02 后本分支**不再恒不可达**：U > 0 时 `closureTarget < totalContribution`
                     //   ⇒ 分摊比 < 1，必须缩放 —— 这是「部分落定」的**正常路径**。
-                    shareQty = Math.Round(closureTarget * c.ContributionQty / totalContribution, 3);
+                    // ⚠ 2026-10-28：量化的对象由「本条份额」改为「**前缀累计份额**」（见本段开头注释）；
+                    //   分摊公式本身**逐字未动**（仍是 `closureTarget * c / totalContribution`）。
+                    exactCumulative += closureTarget * c.ContributionQty / totalContribution;
+                    shareQty = Math.Round(exactCumulative, 3) - allocatedSoFar;
                 }
                 else
                 {
                     shareQty = closureTarget / taskQtys.Count;
+                }
+
+                allocatedSoFar += shareQty;
+
+                // 份额恰为 0 ⇒ 该 Task 对本 Allocation **不承载任何数量**（量化后确实没有可分的量）。
+                //   `AllocationTaskShare` 是「Task 承担了该 Allocation 多少数量」的凭证，0 份额不构成凭证，
+                //   且硬校验第 2 项（`ComponentQty <= 0`）会把 0 也算违规 ⇒ 不入表。
+                //   ⚠ 这不是「丢数」：数量为 0，Σ 不受影响；逐 Allocation 的精确闭合仍由末位补差保证。
+                if (shareQty == 0m)
+                {
+                    continue;
                 }
 
                 shares.Add(new AllocationTaskShare
@@ -1900,6 +2665,41 @@ internal class PhaseFiveCompression
         }
 
         return shares;
+    }
+
+    /// <summary>
+    /// 2026-10-27：判「分摊比 `closureTarget / totalContribution` **是否恰为 1**」。
+    ///
+    /// **为什么不能再用 decimal 精确 `==`**（2026-10-16 那次修复的判据）：
+    ///   `totalContribution` 与 `closureTarget` 是**两条独立算路**——
+    ///     · `closureTarget` ← `allocationTotalQty` ← 直接对 `d.NetOutputQty` 求和（**没做除法**）；
+    ///     · `totalContribution` ← `GetTaskDemandComposition` 把需求量**摊到各个 Task** 后再求和。
+    ///   需求量一旦除不尽（`133/3 = 44.3333…`），摊完再累加就带十进制表示残渣。
+    ///   PV190 实跑（2026-10-27 全程档）实测：`closureTarget = 266.0000000000`、
+    ///   `totalContribution = 265.99999999999999999999999999`（差 **1e-26**）。
+    ///   ⇒ 精确 `==` 落空 ⇒ 掉进下方 `Math.Round(…, 3)` 分支 ⇒ 逐 Task 漂移重新出现
+    ///     ⇒ 越过 `ValidateHardResult` 第 3 项的 `+0.001m` 容差 ⇒ **合法全排定被判 Domain 失败**
+    ///     （该次实跑正是因此整单 FAILED，`Task 520bbfca` ΣShare=44.335 vs Quantity=44.3333…）。
+    ///
+    /// **判据**：差值 ≤ `1e-9`（绝对量）即视为同值。
+    ///   · 本域一切数量都以 **3 位小数**为粒度（份额落库 `DECIMAL(18,4)`），
+    ///     真正不同的量必 ≥ 0.001 ⇒ 与 1e-9 相隔 6 个数量级，**不会被误判成相等**；
+    ///   · 1e-26 级表示残渣比 1e-9 低 17 个数量级 ⇒ 一定被判为相等。
+    ///
+    /// **不影响任何不变量**：
+    ///   · Allocation 级 `ΣShare == closureTarget` 由**末位补差**分支逐 Allocation 精确达成，与本判据无关；
+    ///   · 本判据只决定「非末位 Task 要不要做 3 位量化」——判为相等时取 `c.ContributionQty` 原值，
+    ///     比量化**更精确**，是沿用 2026-10-16 修复的同一口径，**不是放宽硬校验**。
+    /// </summary>
+    private static bool IsRatioOne(decimal closureTarget, decimal totalContribution)
+    {
+        if (totalContribution == closureTarget)
+        {
+            return true;
+        }
+
+        // 0.000000001m —— 见上方判据说明，不是业务容差，只是「十进制表示残渣」的识别带。
+        return Math.Abs(closureTarget - totalContribution) <= 0.000000001m;
     }
 
     /// <summary>
@@ -1986,12 +2786,13 @@ internal class PhaseFiveCompression
         List<FinalTaskDraft> tasks,
         DomainSolveRequest request,
         ConstraintContext constraints,
-        Dictionary<string, List<(string DemandKey, decimal ShareQty)>> mergeLineage)
+        Dictionary<string, List<(string DemandKey, decimal ShareQty)>> mergeLineage,
+        Dictionary<long, decimal>? unscheduledQtyByAllocation = null)
         => GenerateAllocationShares(
             tasks,
             BuildTerminalContributions(tasks, request, constraints, mergeLineage),
             request,
-            new Dictionary<long, decimal>());
+            unscheduledQtyByAllocation ?? new Dictionary<long, decimal>());
 
     /// <summary>
     /// P0-05修复：展开一个末端Task承载的真实 (Demand, Qty) 构成。
@@ -2321,10 +3122,138 @@ internal class PhaseFiveCompression
     }
 
     /// <summary>
+    /// **TaskDependency 硬约束判据**（`ValidateHardResult` 第 7 项的唯一实现）。返回 null 表示通过。
+    ///
+    /// 2026-10-28 从 `ValidateHardResult` 就地抽出：判据/顺序/文本**一字未改**，
+    /// 目的是让「Phase5 快照重放」测试能用**同一份**判据检查压实后的任务表
+    /// （快照重放见 `LPS.APS.Tests/Unit/PhaseFiveReplayTests.cs`）。
+    /// 抽出的原因很实际：`ValidateHardResult` 需要份额、合批血缘、未排清单等 8 项入参，
+    /// 而依赖越序这条**只依赖任务表 + 依赖表**，重放侧刚好只有这两样。
+    /// </summary>
+    private static ValidationResult? CheckTaskDependencies(
+        List<FinalTaskDraft> tasks,
+        List<FinalTaskPeggingDraft> taskDependencies)
+    {
+        var taskDict = tasks.ToDictionary(t => t.FinalDraftId);
+        foreach (var dep in taskDependencies)
+        {
+            // 检查上游Task是否存在
+            if (!taskDict.TryGetValue(dep.UpstreamFinalDraftId, out var upstreamTask))
+            {
+                return new ValidationResult
+                {
+                    IsValid = false,
+                    ErrorMessage = $"TaskDependency引用的上游Task {dep.UpstreamFinalDraftId} 不存在"
+                };
+            }
+
+            // 检查下游Task是否存在
+            if (!taskDict.TryGetValue(dep.DownstreamFinalDraftId, out var downstreamTask))
+            {
+                return new ValidationResult
+                {
+                    IsValid = false,
+                    ErrorMessage = $"TaskDependency引用的下游Task {dep.DownstreamFinalDraftId} 不存在"
+                };
+            }
+
+            // 检查时间约束：下游开始时间必须 >= 上游结束时间 + Lag
+            var lagTime = TimeSpan.FromMinutes((double)dep.LagTime);
+            var earliestDownstreamStart = upstreamTask.PlannedEndTime + lagTime;
+            if (downstreamTask.PlannedStartTime < earliestDownstreamStart)
+            {
+                return new ValidationResult
+                {
+                    IsValid = false,
+                    // 2026-10-28：追加两侧身份（源需求 / 执行批键 / 工序 / 路线），用于区分
+                    //   ①「真·floor 漏算」（同源同批，工序不同）
+                    //   ②「依赖配对错位」（`GenerateTaskDependencies` 等数量按下标配对，而列表按压实后的
+                    //      `PlannedStartTime` 重排 ⇒ 批间交叉）—— 后者两侧的批键必然不同。
+                    //   原文本前缀一字未动（`grep LPS.APS.Tests` 证无测试钉该串）。
+                    ErrorMessage = $"TaskDependency违反时间约束: 下游Task {downstreamTask.FinalDraftId} 开始时间 {downstreamTask.PlannedStartTime:yyyy-MM-dd HH:mm:ss} 早于上游Task {upstreamTask.FinalDraftId} 结束时间 {upstreamTask.PlannedEndTime:yyyy-MM-dd HH:mm:ss} + Lag {dep.LagTime}分钟"
+                                   + $"｜上游[{upstreamTask.StageCode}/{upstreamTask.OperationCode} 源={upstreamTask.SourceDraftId} 批={upstreamTask.ExecutionBatchDraftKey ?? "null"} 路线={upstreamTask.RouteCode}/{upstreamTask.PathId}]"
+                                   + $"｜下游[{downstreamTask.StageCode}/{downstreamTask.OperationCode} 源={downstreamTask.SourceDraftId} 批={downstreamTask.ExecutionBatchDraftKey ?? "null"} 路线={downstreamTask.RouteCode}/{downstreamTask.PathId}]"
+                };
+            }
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// 测试钩子：跑 `ValidateHardResult` 的第 7 项（TaskDependency 越序检查），
+    /// **逐字同一份** <see cref="CheckTaskDependencies"/>。返回 null = 通过，否则为失败文本。
+    /// </summary>
+    internal static string? CheckTaskDependenciesForTest(
+        List<FinalTaskDraft> tasks,
+        List<FinalTaskPeggingDraft> taskDependencies)
+        => CheckTaskDependencies(tasks, taskDependencies)?.ErrorMessage;
+
+    /// <summary>
+    /// 测试钩子：按**原始**入参重建 `ConstraintContext`（= Phase1 本身，实测 3.6 秒）。
+    /// Phase5 快照只存 `request.json`，不存这个 30 多字段的内部上下文。
+    /// </summary>
+    internal static ConstraintContext BuildConstraintsForTest(DomainSolveRequest request)
+        => new PhaseOneConstraintBuilder().BuildConstraints(request);
+
+    /// <summary>
     /// 第4轮Item 10：Phase5最终硬约束校验（§十一）
     /// 验证FinalTask结果是否违反硬约束
     /// 第5轮修复：增加TaskDependency校验
     /// </summary>
+    /// <summary>
+    /// **Phase5 硬互斥冲突的逐任务明细**（2026-10-31，应 2号位《FAMILY_X 整域求解失败》§9.2）。
+    ///
+    /// <para>为什么要有：冲突只抛一行字符串、且 A 路把整份 FinalTask 清空 ⇒ Task 表零行，
+    /// 事后任何反查都无据可依，只能靠「16:59:56 → 15:47:06」反推「跨了几天」，判别成本极高。
+    /// 把涉事任务的属性直接写进消息，下一次同类失败一眼就能分开：
+    /// 是任务本身长、还是换型把起点推前了、还是时间戳根本不落在本次排程窗内。</para>
+    ///
+    /// <para><b>字段口径（别把死字段当依据）</b>：</para>
+    /// <list type="bullet">
+    ///   <item>`EffProc` = `EffectiveProcessMinutes`（**有效加工**，不含 Setup、不含窗间中断）。
+    ///     判「任务本身是不是超长」看这个，**不要看** `Duration`。</item>
+    ///   <item>`Duration` = `FinalTaskDraft.Duration`。该字段在求解侧**从不被计算**
+    ///     （全仓 `LPS.APS.Scheduling` 只有 `PhaseFourLocalRepair.cs:1902` 原样搬运上游值）
+    ///     ⇒ 输出 `null` 是正常的，不代表漏填。留着只为一眼确认它确实是空。</item>
+    ///   <item>`OccStart` = `PlannedStart − Setup`，与本项判据用的是**同一个算式**（不是另算一套）。</item>
+    ///   <item>`SpanMin` = `PlannedEnd − OccStart`，即**真实占用跨度**（含窗间非工作时间）。
+    ///     它比 `EffProc` 大多少，就是跨窗/跨非工作时段拉长了多少。</item>
+    ///   <item>`AllocSeq` = 该任务所属需求的 `AllocationSequence`。⚠ **不是任务自身的字段** ——
+    ///     `FinalTaskDraft` 上**没有** `AllocationSequence`（已 grep 确认）；这里按
+    ///     `SourceDraftId`（= `LogicalDemandKey`，见 `PhaseTwoInitialScheduler.cs:4954`）回查需求得到。
+    ///     查不到就写 `-`，不编造。</item>
+    /// </list>
+    /// </summary>
+    private static string DescribeConflictTask(
+        FinalTaskDraft task,
+        IReadOnlyDictionary<string, long> allocationSeqByDemandKey)
+    {
+        var occStart = task.PlannedStartTime.AddMinutes(-(double)task.SetupTime);
+        var allocSeq = allocationSeqByDemandKey is not null
+                       && allocationSeqByDemandKey.TryGetValue(task.SourceDraftId, out var seq)
+            ? seq.ToString()
+            : "-";
+
+        var effProc = task.EffectiveProcessMinutes is { } ep ? ep.ToString("F2") : "null";
+        var duration = task.Duration is { } d ? d.ToString("F2") : "null";
+
+        return $"FinalDraftId={task.FinalDraftId}"
+             + $";SourceDraftId={task.SourceDraftId}"
+             + $";Stage={task.StageCode}/{task.OperationCode}"
+             + $";MaterialId={task.MaterialId}"
+             + $";Qty={task.Quantity:F3}"
+             + $";PlanQty={task.PlannedProcessQty:F3}"
+             + $";EffProcMin={effProc}"
+             + $";SetupMin={task.SetupTime:F2}"
+             + $";DurationMin={duration}"
+             + $";OccStart={occStart:yyyy-MM-dd HH:mm:ss}"
+             + $";Start={task.PlannedStartTime:yyyy-MM-dd HH:mm:ss}"
+             + $";End={task.PlannedEndTime:yyyy-MM-dd HH:mm:ss}"
+             + $";SpanMin={(task.PlannedEndTime - occStart).TotalMinutes:F1}"
+             + $";AllocSeq={allocSeq}";
+    }
+
     private ValidationResult ValidateHardResult(
         List<FinalTaskDraft> tasks,
         List<AllocationTaskShare> allocationShares,
@@ -2437,10 +3366,17 @@ internal class PhaseFiveCompression
             {
                 if (share.ComponentQty <= 0)
                 {
+                    // 2026-10-28（run36 实跑 `ShareQty <= 0: -0.4780` 定位需要）：判据与阈值**一字未动**，
+                    //   只在报文尾部补出该 **Allocation 的上下文**——旧报文只有 Task 号与数值，
+                    //   看不出是「哪条算路出的负份额、该 Allocation 一共多少条、声明量多少」，
+                    //   下次再出同型只能重跑一遍。前缀 `Task … 的 ShareQty <= 0: …` 保持原样。
                     return new ValidationResult
                     {
                         IsValid = false,
                         ErrorMessage = $"Task {share.FinalDraftId} 的 ShareQty <= 0: {share.ComponentQty}"
+                            + $"（AllocationSequence={allocationSeq}, 该Allocation份额条数={shares.Count}"
+                            + $", ΣShareQty={totalShare}, 期望NetOutputQty={expectedQty}"
+                            + $", ΣUnscheduledQty={unscheduledQty}）"
                     };
                 }
             }
@@ -2554,12 +3490,41 @@ internal class PhaseFiveCompression
                 var currentOccupancyStart = current.PlannedStartTime.AddMinutes(-(double)current.SetupTime);
                 var nextOccupancyStart = next.PlannedStartTime.AddMinutes(-(double)next.SetupTime);
 
-                if (current.PlannedEndTime > nextOccupancyStart)
+                // ── 2026-10-27 修复：改为与调度侧 `PhaseTwoInitialScheduler.Overlaps` **逐字相同**的
+                //   **半开区间**判据 `a.Start < b.End && a.End > b.Start`。
+                //
+                //   原判据只有半边 `current.PlannedEndTime > nextOccupancyStart`（漏了
+                //   `next.PlannedEndTime > currentOccupancyStart`）⇒ 对**零时长占用窗** `[t, t)` 判错：
+                //   · 调度侧按半开区间认为空区间不与任何窗重叠 ⇒ 允许把它放在别的任务的起点上；
+                //   · Phase5 只比「我的结束 > 你的开始」⇒ 判成重叠 ⇒ **合法排程被判 Domain 失败**。
+                //   PV190 实跑（2026-10-27 整程档）实测反例：
+                //     `Resource 13394: Task 3623e9b8 [09:05:13-09:35:55] 与 Task 4c3ded1f [09:05:13-09:05:13] 重叠`
+                //     —— 后者是**零时长**（09:05:13-09:05:13），空区间，实际不占资源。
+                //   ⚠ 这不只是零时长的问题：半边判据的结论**还取决于同起点两个任务的排序先后**
+                //     （`OrderBy(t => t.PlannedStartTime)` 稳定排序 ⇒ 同起点时谁在前由原表次序决定），
+                //     同一个排程可能一次判失败、一次判通过 —— 不可重放。
+                //
+                //   **这不是放宽硬校验**：`Overlaps` 是调度侧判定「能不能放」的那同一个定义，
+                //   本项原本要守的「同资源不得同时被两个任务占用」**一字未松**；
+                //   真正重叠（`09:05-09:35` 与 `09:10-09:20`）仍然被下面的 `&&` 拦下。
+                // ── 2026-10-31（应 2号位《FAMILY_X 整域求解失败》§9.1／§9.2）：**只改诊断输出，判据一字未动** ──
+                //   ① 时间戳必须带日期。原来只有 `HH:mm:ss`，`16:59:56 → 15:47:06` 只能确定
+                //      「终点晚于起点 ⇒ 不同日」，**差一天还是差三天看不出来**
+                //      （差一天 = 22h47m10s，差三天 = 70h47m10s）—— 那次定位就卡在这个不可判上。
+                //   ② 失败只抛一行，且 A 路会把整份 FinalTask 清空（Task 表零行）⇒ 事后无任何反查依据，
+                //      只能靠反推。这里把两个涉事任务的属性直接写进消息，不必重跑。
+                if (currentOccupancyStart < next.PlannedEndTime
+                    && current.PlannedEndTime > nextOccupancyStart)
                 {
                     return new ValidationResult
                     {
                         IsValid = false,
-                        ErrorMessage = $"Resource {current.ResourceId} 时间冲突: Task {current.FinalDraftId} [{currentOccupancyStart:HH:mm:ss}-{current.PlannedEndTime:HH:mm:ss}] 与 Task {next.FinalDraftId} [{nextOccupancyStart:HH:mm:ss}-{next.PlannedEndTime:HH:mm:ss}] 重叠"
+                        ErrorMessage =
+                            $"Resource {current.ResourceId} 时间冲突: "
+                            + $"Task {current.FinalDraftId} [{currentOccupancyStart:yyyy-MM-dd HH:mm:ss}-{current.PlannedEndTime:yyyy-MM-dd HH:mm:ss}] "
+                            + $"与 Task {next.FinalDraftId} [{nextOccupancyStart:yyyy-MM-dd HH:mm:ss}-{next.PlannedEndTime:yyyy-MM-dd HH:mm:ss}] 重叠"
+                            + $" | A[{DescribeConflictTask(current, allocationSeqByDemandKey)}]"
+                            + $" | B[{DescribeConflictTask(next, allocationSeqByDemandKey)}]"
                     };
                 }
             }
@@ -2567,21 +3532,53 @@ internal class PhaseFiveCompression
 
         // 5. 验证Task不早于Material AvailableTime
         // 第5轮修复：必须按累计数量达到Task所需Qty，取真正Material Ready Time
+        //
+        // ── 2026-10-27 修复：所需数量必须与**调度侧**同一口径（**逐需求 `NetOutputQty`**），
+        //   不得取 `task.PlannedProcessQty`。
+        //
+        //   原实现 `requiredQty = task.PlannedProcessQty` 对**合批 Task** 恒为假失败：
+        //     · 合批后 `PlannedProcessQty = mergedQty`（**两个需求之和**）
+        //       —— `PhaseTwoInitialScheduler.cs:8582`，而 `SourceDraftId` 仍是**锚需求**
+        //       （`:8571` `SourceDraftId = targetTask.SourceDraftId`）；
+        //     · 而 `MaterialAvailability` 是**按 `AllocationSequence`（分配批）分组**的
+        //       （`PhaseOneConstraintBuilder.BuildMaterialAvailability:1249-1266`），
+        //       一组只覆盖**本分配批内需求**的量；
+        //     · ⇒ 拿「合并后总量」去凑「单个分配批的量」**永远凑不满** ⇒ 落进
+        //       「物料始终不足」分支 ⇒ 取**最后一段**的到货时间 ⇒ 一个**调度侧认为合法**的
+        //       合批 Task 被判「早于物料可用」⇒ 整域失败。
+        //
+        //   现改为：按 `GetTaskDemandComposition`（含 merge 血缘，与第 8 项同源）取该 Task 的
+        //   **真实需求构成**，**逐个构成需求**用**它自己的 `NetOutputQty`** 算物料可用时间 ——
+        //   这正是调度侧的口径：
+        //     `GetMaterialEarliestTime(demand.AllocationSequence, demand.NetOutputQty, …)`
+        //     （`PhaseTwoInitialScheduler.cs:3670` 倒排、`:3903` 正排；`PhaseFourLocalRepair.cs:1363` 同式）。
+        //
+        //   **不是放宽/绕过**：合批的**每一个**构成需求都被逐个检查（原实现只看锚需求那一个
+        //   AllocationSequence，别的构成需求根本没查）；且 `requiredQty` 从「合计」降到「单需求」
+        //   ⇒ 算出的可用时间只会**更早或相同**，判据单调不更严，也不会松掉真实违规 ——
+        //   真实「物料不够就开工」在调度侧已由 `isSufficient=false` 走 `MATERIAL_INSUFFICIENT`
+        //   出口报出（本项只兜底「时间早于物料」）。
+        var demandByKeyForMaterial = request.LogicalProductionDemands
+            .GroupBy(d => d.LogicalDemandKey)
+            .ToDictionary(g => g.Key, g => g.First());
+
         foreach (var task in tasks)
         {
-            var demand = request.LogicalProductionDemands
-                .FirstOrDefault(d => d.LogicalDemandKey == task.SourceDraftId);
-            if (demand == null) continue;
-
-            if (constraints.MaterialAvailability.TryGetValue(demand.AllocationSequence, out var segments) && segments.Count > 0)
+            foreach (var (compositionDemand, _) in GetTaskDemandComposition(task, demandByKeyForMaterial, mergeLineage))
             {
+                if (!constraints.MaterialAvailability.TryGetValue(compositionDemand.AllocationSequence, out var segments)
+                    || segments.Count == 0)
+                {
+                    continue;
+                }
+
                 // 按时间排序Segments，累计数量直到满足Task需求
                 var sortedSegments = segments.OrderBy(s => s.AvailableTime).ToList();
                 decimal cumulativeQty = 0m;
                 DateTime? materialReadyTime = null;
 
-                // Task所需的物料数量（取PlannedProcessQty，因为这是实际加工需要的数量）
-                var requiredQty = task.PlannedProcessQty;
+                // 该**构成需求**所需的物料数量（与调度侧同口径：`demand.NetOutputQty`）
+                var requiredQty = compositionDemand.NetOutputQty;
 
                 foreach (var segment in sortedSegments)
                 {
@@ -2605,6 +3602,7 @@ internal class PhaseFiveCompression
                     {
                         IsValid = false,
                         ErrorMessage = $"Task {task.FinalDraftId} 开始时间 {task.PlannedStartTime:yyyy-MM-dd HH:mm:ss} 早于物料累计可用时间 {materialReadyTime.Value:yyyy-MM-dd HH:mm:ss}"
+                            + $"（需求 {compositionDemand.LogicalDemandKey}，分配批 {compositionDemand.AllocationSequence}）"
                     };
                 }
             }
@@ -2633,40 +3631,13 @@ internal class PhaseFiveCompression
         }
 
         // 7. 第5轮修复：验证TaskDependency硬约束
-        var taskDict = tasks.ToDictionary(t => t.FinalDraftId);
-        foreach (var dep in taskDependencies)
+        //   2026-10-28：判据体抽到 `CheckTaskDependencies` —— 一份实现两处用：
+        //     ① 本条（生产硬校验）；② `CheckTaskDependenciesForTest`（Phase5 快照重放，见
+        //     `LPS.APS.Tests/Unit/PhaseFiveReplayTests.cs`）。抽出后判据/文本/顺序一字未改。
+        var dependencyViolation = CheckTaskDependencies(tasks, taskDependencies);
+        if (dependencyViolation != null)
         {
-            // 检查上游Task是否存在
-            if (!taskDict.TryGetValue(dep.UpstreamFinalDraftId, out var upstreamTask))
-            {
-                return new ValidationResult
-                {
-                    IsValid = false,
-                    ErrorMessage = $"TaskDependency引用的上游Task {dep.UpstreamFinalDraftId} 不存在"
-                };
-            }
-
-            // 检查下游Task是否存在
-            if (!taskDict.TryGetValue(dep.DownstreamFinalDraftId, out var downstreamTask))
-            {
-                return new ValidationResult
-                {
-                    IsValid = false,
-                    ErrorMessage = $"TaskDependency引用的下游Task {dep.DownstreamFinalDraftId} 不存在"
-                };
-            }
-
-            // 检查时间约束：下游开始时间必须 >= 上游结束时间 + Lag
-            var lagTime = TimeSpan.FromMinutes((double)dep.LagTime);
-            var earliestDownstreamStart = upstreamTask.PlannedEndTime + lagTime;
-            if (downstreamTask.PlannedStartTime < earliestDownstreamStart)
-            {
-                return new ValidationResult
-                {
-                    IsValid = false,
-                    ErrorMessage = $"TaskDependency违反时间约束: 下游Task {downstreamTask.FinalDraftId} 开始时间 {downstreamTask.PlannedStartTime:yyyy-MM-dd HH:mm:ss} 早于上游Task {upstreamTask.FinalDraftId} 结束时间 {upstreamTask.PlannedEndTime:yyyy-MM-dd HH:mm:ss} + Lag {dep.LagTime}分钟"
-                };
-            }
+            return dependencyViolation;
         }
 
         // 8. P0-04（0号位 2026-10-08 §七）：**最终物理数量闭合**（Final Quantity Closure 链）。

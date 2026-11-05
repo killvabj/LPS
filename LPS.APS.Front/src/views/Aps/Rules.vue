@@ -16,7 +16,8 @@
  *
  * 本页内容只有两块，与后端 RuleSetVersion 实体一致：
  *  - 需求优先级段位（`demandPriorityJson`；**草稿可编辑**，其余版本只读 —— 2026-10-22 加编辑器）
- *  - 换型规则子块（`setupTransitionRulesJson`；由「明确产品转换 / 默认换型规则」两页维护）
+ *  - 换型规则子块（`setupTransitionRulesJson`；2026-10-28 起在本页「换型规则」页签内直接增删改，
+ *    复用 Setup 两个 Dialog + 两个 store；权限仍走 aps.setup.view / aps.setup.edit）
  *
  * 4号位文档第 14 节约束：
  *  - DRAFT 可编辑；PUBLISHED 不可直接改；ARCHIVED 只读
@@ -27,30 +28,42 @@
  * 权限码：aps.rule.view / aps.rule.edit / aps.rule.publish
  */
 
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, onActivated, onMounted, ref, watch } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 import { storeToRefs } from 'pinia'
 import { useRulesStore } from '@/store/modules/aps/rules'
-import { formatUtcDateTime } from '@/utils/datetime'
+import { useSetupExactStore } from '@/store/modules/aps/setupExact'
+import { useSetupDefaultStore } from '@/store/modules/aps/setupDefault'
+import { useApsAuthStore } from '@/store/modules/aps/auth'
+import { formatLocalDateTime, formatUtcDateTime } from '@/utils/datetime'
 import {
+  ApiError,
   RULE_STATUS_LABELS,
   RULE_STATUS_TAG,
   NO_VERSION,
   NO_VERSION_LABEL,
   RULE_STATUSES_UI,
   roleLabelOf,
+  setupApi,
+  type FieldDiff,
   type RuleStatus,
   type RuleSetSummaryDto,
   type RuleVersionHistoryDto,
-  type PrioritySegmentDto
+  type PrioritySegmentDto,
+  type SetupRuleDto,
+  type SetupDialogPrefill
 } from '@/api/aps-v1'
 import { competitionRoundLabel, conditionText, sortFieldText } from '@/api/aps-v1/prioritySegment'
 import { toEditableSegments } from '@/api/aps-v1/prioritySegmentEditor'
 import PrioritySegmentEditor from './components/PrioritySegmentEditor.vue'
+import SetupExactDialog from './components/SetupExactDialog.vue'
+import SetupDefaultDialog from './components/SetupDefaultDialog.vue'
 
 import {
   ElAlert,
   ElButton,
   ElCard,
+  ElCheckbox,
   ElDescriptions,
   ElDescriptionsItem,
   ElDialog,
@@ -80,6 +93,8 @@ const {
   noVersionCount,
   currentDetail,
   currentDiff,
+  diffBaseVersionId,
+  diffTargetVersionId,
   lastValidation,
   statusFilter,
   loading,
@@ -100,13 +115,307 @@ const {
 const detailNN = computed(() => currentDetail.value!)
 
 /** 只保留真正发生变化的字段 —— 后端 `fieldDiffs` 是全字段平铺，未变字段 `isChanged=false` */
-const changedFields = computed(() =>
-  (currentDiff.value?.fieldDiffs ?? []).filter((f) => f.isChanged)
+const changedFields = computed<FieldDiff[]>(() =>
+  (currentDiff.value?.fieldDiffs ?? []).filter((f: FieldDiff) => f.isChanged)
 )
 
 /* ===== Tabs ===== */
-type TabKey = 'segments' | 'diff' | 'history'
+type TabKey = 'segments' | 'setup' | 'diff' | 'history'
 const activeTab = ref<TabKey>('segments')
+
+// ===== ⑦ 换型规则（2026-10-28 用户拍板：并入本页直接增删改） =====
+// 数据来自 Setup 两个正式端点（GET /setup-rules/exact|default?ruleSetVersionId=...），
+// 不是从 ContentSnapshotJson 反推；写操作复用 Setup 两个 Dialog + 两个 store，
+// 不在本页复制一套 CRUD。
+// 权限仍走 Setup 三码：查看 aps.setup.view / 增删改 aps.setup.edit（**不是** aps.rule.*）。
+// 编辑目标只能是「当前草稿版本」：没有草稿时整块只读，并提示先「新建草稿」。
+const apsAuth = useApsAuthStore()
+const router = useRouter()
+const route = useRoute()
+
+/** 需要有 aps.setup.view 才能读换型规则；无权限时整块降级为说明文字，绝不发请求 */
+const canViewSetup = computed<boolean>(() => apsAuth.has('aps.setup.view'))
+
+const setupSummaryLoading = ref(false)
+const setupSummaryError = ref<string | null>(null)
+/** 已加载的版本 Id（换版本 / 换规则集后重新拉取） */
+const setupSummaryVersionId = ref<number | null>(null)
+const setupExactRules = ref<SetupRuleDto[]>([])
+const setupDefaultRules = ref<SetupRuleDto[]>([])
+
+/** 当前展示的版本里最新的草稿（发布动作发布的就是它） */
+const currentDraftVersionId = computed<number | null>(() => {
+  const drafts = (detailNN.value?.history ?? []).filter(
+    (h: RuleVersionHistoryDto) => h.status === 'DRAFT'
+  )
+  return drafts.length ? (drafts[drafts.length - 1].versionId ?? null) : null
+})
+
+/** 换型规则按「要发布的那一版」看：有草稿看草稿，没有草稿退回当前展示的版本 */
+const setupTargetVersionId = computed<number | null>(
+  () => currentDraftVersionId.value ?? detailNN.value?.contentVersionId ?? null
+)
+
+async function loadSetupSummary(versionId: number): Promise<void> {
+  setupSummaryVersionId.value = versionId
+  setupSummaryLoading.value = true
+  setupSummaryError.value = null
+  setupExactRules.value = []
+  setupDefaultRules.value = []
+  try {
+    const [exact, defaults] = await Promise.all([
+      setupApi.listExactRules(versionId),
+      setupApi.listDefaultRules(versionId)
+    ])
+    setupExactRules.value = exact
+    setupDefaultRules.value = defaults
+  } catch (err) {
+    setupSummaryError.value =
+      err instanceof ApiError ? err.message : ((err as Error)?.message ?? '未知错误')
+  } finally {
+    setupSummaryLoading.value = false
+  }
+}
+
+/** 按需加载：同版本且已成功加载过就不重复请求 */
+async function ensureSetupSummary(): Promise<void> {
+  if (!canViewSetup.value) return
+  const versionId = setupTargetVersionId.value
+  if (versionId == null) return
+  if (setupSummaryVersionId.value === versionId && !setupSummaryError.value) return
+  await loadSetupSummary(versionId)
+}
+
+/** 页签上的「刷新」：目标版本为空时不动 */
+async function refreshSetupSummary(): Promise<void> {
+  const versionId = setupTargetVersionId.value
+  if (versionId == null) return
+  await loadSetupSummary(versionId)
+}
+
+/**
+ * 改完 ⑦ 后重跑字段级 diff
+ *
+ *  换型规则存在草稿版本自己的 ContentSnapshotJson 里（后端 SetupRuleService 写子块），
+ *  所以增删改 ⑦ 会改变「已发布版 vs 草稿版」的字段 diff —— 但版本对比页签读的是
+ *  loadDetail 时算好的旧快照 ⇒ 不重跑就看不到 SetupTransitionRules 这一行，
+ *  也就看不到「查看换型规则逐条差异 →」入口。
+ *  两端版本本身不会因改内容而变（改的是草稿内容，不是版本号）⇒ 重跑同一对即可。
+ */
+async function refreshDiff(): Promise<void> {
+  const base = diffBaseVersionId.value
+  const target = diffTargetVersionId.value
+  if (base == null || target == null) return
+  await rulesStore.loadDiff(base, target)
+}
+
+/** 清空汇总（切规则集 / 换内容版本时用，避免展示上一版的条数） */
+function resetSetupSummary(): void {
+  setupSummaryVersionId.value = null
+  setupExactRules.value = []
+  setupDefaultRules.value = []
+  setupSummaryError.value = null
+  setupSummaryLoading.value = false
+}
+
+watch(activeTab, (tab) => {
+  if (tab === 'setup') void ensureSetupSummary()
+})
+
+const exactStore = useSetupExactStore()
+const defaultStore = useSetupDefaultStore()
+
+/** 增删改需要 aps.setup.edit；与 aps.setup.view 分开，跟本页的 aps.rule.* 无关 */
+const canEditSetup = computed<boolean>(() => apsAuth.has('aps.setup.edit'))
+
+/** 可写目标 = 当前草稿（历史里最新一条 DRAFT） */
+const setupDraftVersionId = computed<number | null>(() => currentDraftVersionId.value)
+
+/** 页签展示的就是草稿这一版、且有 edit 权限，才允许新增/编辑/删除 */
+const setupEditable = computed<boolean>(
+  () =>
+    canEditSetup.value &&
+    setupDraftVersionId.value !== null &&
+    setupSummaryVersionId.value === setupDraftVersionId.value
+)
+
+/**
+ * 写操作前把两个 Setup store 对齐到草稿版本：
+ *  - Dialog 的 create 模式取 store.selectedRuleSetVersionId 填 ruleSetVersionId；
+ *  - store.canEdit 依赖 ruleSetVersions 里能找到该版本且状态为 DRAFT。
+ * 所以必须先按本规则集 loadRuleSetVersions 再 select，否则写入会被 store 自己拦下。
+ */
+async function syncSetupStores(versionId: number): Promise<boolean> {
+  const ruleSetId = detailNN.value?.summary.ruleSetId
+  const params = ruleSetId ? { ruleSetId } : undefined
+  await Promise.all([
+    exactStore.loadRuleSetVersions(params),
+    defaultStore.loadRuleSetVersions(params)
+  ])
+  exactStore.selectRuleSetVersion(versionId)
+  defaultStore.selectRuleSetVersion(versionId)
+  if (!exactStore.canEdit || !defaultStore.canEdit) {
+    ElMessage.warning('换型规则只能在草稿（DRAFT）版本上修改')
+    return false
+  }
+  return true
+}
+
+/** 增删改的前置检查（权限 → 有草稿 → store 对齐），通过后返回草稿版本 Id */
+async function startSetupWrite(): Promise<number | null> {
+  if (!canEditSetup.value) {
+    ElMessage.warning('当前操作者没有换型规则编辑权限（需权限码 aps.setup.edit）')
+    return null
+  }
+  const versionId = setupDraftVersionId.value
+  if (versionId === null) {
+    ElMessage.warning('当前没有草稿版本，换型规则只能改草稿；请先点「新建草稿」')
+    return null
+  }
+  if (!(await syncSetupStores(versionId))) return null
+  return versionId
+}
+
+const exactDialogVisible = ref(false)
+const exactDialogMode = ref<'create' | 'edit'>('create')
+const editingExactRule = ref<SetupRuleDto | null>(null)
+
+const defaultDialogVisible = ref(false)
+const defaultDialogMode = ref<'create' | 'edit'>('create')
+const editingDefaultRule = ref<SetupRuleDto | null>(null)
+/** 「缺失规则查询」跳转带入的 4 字段预填（部门/大工艺/工序/设备） */
+const defaultDialogPrefill = ref<SetupDialogPrefill | null>(null)
+
+/**
+ * 深链带回来的**来源版本**（缺失规则查询那一行所属的规则集版本）
+ *
+ *  2026-10-28（#4 绑定口径）：回填目标必须绑定到「不变 RuleSetVersionId」。
+ *  缺失规则那一行指向的通常是**已发布**版本（排产实际生效的那版），
+ *  而 ⑦ 只能改草稿 ⇒ 页面要明确说清「来源是哪个版本、保存写进哪个草稿」，
+ *  不能让用户以为改的就是那一版。
+ */
+const deepLinkSourceVersion = ref<{ versionCode: string; status: string } | null>(null)
+
+/** 当前草稿版本号（明示「保存写进哪一版」） */
+const currentDraftVersionCode = computed<string>(() => {
+  const id = currentDraftVersionId.value
+  if (id == null) return ''
+  const hit = (detailNN.value?.history ?? []).find((h) => h.versionId === id)
+  return hit?.versionCode ?? ''
+})
+
+async function openExactCreate(): Promise<void> {
+  if ((await startSetupWrite()) === null) return
+  exactDialogMode.value = 'create'
+  editingExactRule.value = null
+  exactDialogVisible.value = true
+}
+
+async function openExactEdit(rule: SetupRuleDto): Promise<void> {
+  if ((await startSetupWrite()) === null) return
+  exactDialogMode.value = 'edit'
+  editingExactRule.value = rule
+  exactDialogVisible.value = true
+}
+
+async function openDefaultCreate(prefill?: SetupDialogPrefill | null): Promise<void> {
+  if ((await startSetupWrite()) === null) return
+  defaultDialogMode.value = 'create'
+  editingDefaultRule.value = null
+  defaultDialogPrefill.value = prefill ?? null
+  defaultDialogVisible.value = true
+}
+
+async function openDefaultEdit(rule: SetupRuleDto): Promise<void> {
+  if ((await startSetupWrite()) === null) return
+  defaultDialogMode.value = 'edit'
+  editingDefaultRule.value = rule
+  defaultDialogPrefill.value = null
+  defaultDialogVisible.value = true
+}
+
+async function handleExactDelete(rule: SetupRuleDto): Promise<void> {
+  if ((await startSetupWrite()) === null) return
+  let confirmed = false
+  try {
+    await ElMessageBox.confirm(
+      `即将删除明确产品转换规则：${rule.departmentCode} / ${rule.stageCode} / ${rule.operationCode} / ${rule.resourceCode} / ${rule.fromMaterialCode} → ${rule.toMaterialCode}（${rule.setupMinutes} 分钟）。删除后要在本页上方点「发布」重新发布整版才生效。是否继续？`,
+      '删除确认',
+      {
+        type: 'warning',
+        confirmButtonText: '确认删除',
+        cancelButtonText: '取消',
+        confirmButtonClass: 'el-button--danger'
+      }
+    )
+    confirmed = true
+  } catch {
+    confirmed = false
+  }
+  if (!confirmed) return
+
+  const ok = await exactStore.deleteRule(rule.id)
+  if (ok) {
+    ElMessage.success('明确产品转换规则删除成功')
+    await refreshSetupSummary()
+    await refreshDiff()
+  } else if (exactStore.error) {
+    ElMessage.error(exactStore.error)
+  }
+}
+
+async function handleDefaultDelete(rule: SetupRuleDto): Promise<void> {
+  if ((await startSetupWrite()) === null) return
+  let confirmed = false
+  try {
+    await ElMessageBox.confirm(
+      `即将删除默认换型规则：${rule.departmentCode} / ${rule.stageCode} / ${rule.operationCode} / ${rule.resourceCode}（${rule.setupMinutes} 分钟）。删除后要在本页上方点「发布」重新发布整版才生效。是否继续？`,
+      '删除确认',
+      {
+        type: 'warning',
+        confirmButtonText: '确认删除',
+        cancelButtonText: '取消',
+        confirmButtonClass: 'el-button--danger'
+      }
+    )
+    confirmed = true
+  } catch {
+    confirmed = false
+  }
+  if (!confirmed) return
+
+  const ok = await defaultStore.deleteRule(rule.id)
+  if (ok) {
+    ElMessage.success('默认换型规则删除成功')
+    await refreshSetupSummary()
+    await refreshDiff()
+  } else if (defaultStore.error) {
+    ElMessage.error(defaultStore.error)
+  }
+}
+
+/** Dialog 保存成功：重取两个列表（发布弹窗里的条数也来自它们） */
+async function handleSetupSaved(): Promise<void> {
+  defaultDialogPrefill.value = null
+  await refreshSetupSummary()
+  await refreshDiff()
+}
+
+/**
+ * 「查看换型规则逐条差异」下钻到换型规则级 Diff 页
+ *
+ * 2026-10-28：该页已从菜单隐藏（meta.hidden），唯一入口就是这个按钮
+ * ⇒ 必须自带上下文：所属规则集（页面下拉按它收窄）+ 两端版本 Id（自动选中并直接出对比），
+ *    否则用户落到一个"全系统版本大杂烩"的下拉页还要自己重新挑一遍。
+ */
+function goSetupDiffPage(): void {
+  const query: Record<string, string> = {}
+  const ruleSetId = currentDetail.value?.summary.ruleSetId
+  if (ruleSetId != null) query.ruleSetId = String(ruleSetId)
+  if (diffBaseVersionId.value != null) query.versionId = String(diffBaseVersionId.value)
+  if (diffTargetVersionId.value != null) query.otherVersionId = String(diffTargetVersionId.value)
+  void router.push({ path: '/aps/setup/diff', query })
+}
 
 /* ===== 操作 ===== */
 /** 选中的规则集没有任何版本时的占位（右侧空态用；避免抛红条 + 外露内部 ID） */
@@ -123,6 +432,9 @@ const segmentsEditable = computed(
 watch(currentDetail, (d) => {
   editorSegments.value = toEditableSegments(d?.prioritySegments ?? [])
   segmentsDirty.value = false
+  // 换规则集后换型规则条数属于上一版，必须清掉；当前就在 setup 页签时按新版本重拉
+  resetSetupSummary()
+  if (activeTab.value === 'setup') void ensureSetupSummary()
 })
 
 function onEditorUpdate(value: PrioritySegmentDto[]): void {
@@ -146,8 +458,8 @@ async function blockIfDirty(action: string): Promise<boolean> {
   return true
 }
 
-async function selectRuleSet(ruleSet: RuleSetSummaryDto): Promise<void> {
-  if (await blockIfDirty('切换')) return
+async function selectRuleSet(ruleSet: RuleSetSummaryDto): Promise<boolean> {
+  if (await blockIfDirty('切换')) return false
   noVersionPicked.value = null
   rulesStore.reset()
   activeTab.value = 'segments'
@@ -155,9 +467,10 @@ async function selectRuleSet(ruleSet: RuleSetSummaryDto): Promise<void> {
   // 与其让用户看一条报错红条，不如直接告诉他「这个还没配版本」
   if (!ruleSet.hasVersion) {
     noVersionPicked.value = ruleSet
-    return
+    return false
   }
   await rulesStore.loadDetail(ruleSet.ruleSetId)
+  return true
 }
 
 async function onValidate(): Promise<void> {
@@ -260,14 +573,46 @@ async function onCreateDraft(): Promise<void> {
 const publishDialog = ref(false)
 const publishForm = ref({ changeReason: '' })
 
+/**
+ * 整版发布前的两个确认勾选（0号位 2026-10-26 文档要求）。
+ * 只存在于本次弹窗内，不落库、不进快照 —— 纯「你看过这两块内容」的确认动作。
+ */
+const confirmPriority = ref(false)
+const confirmSetup = ref(false)
+
+const canConfirmPublish = computed<boolean>(
+  () => canPublishAction.value && confirmPriority.value && confirmSetup.value
+)
+
+/** ① 需求优先级段位条数（发布弹窗内展示的核对依据） */
+const prioritySegmentCount = computed<number>(() => detailNN.value?.prioritySegments.length ?? 0)
+
+/* ===== ⑦ 每条规则的「最近修改信息」 =====
+ * SetupTransitionRule 落库用 DateTime.Now（服务器本地墙钟）⇒ 按字面本地直显，
+ * 不做 UTC→本地位移（0号位 2026-10-13「时间戳一律本地，禁 UTC」+ 3号位 10-28 回执正式口径）。 */
+function setupRuleModifiedText(rule: SetupRuleDto): string {
+  const t = rule.updatedAt ?? rule.createdAt
+  if (!t) return '—'
+  return `${rule.updatedAt ? '更新' : '创建'}于 ${formatLocalDateTime(t)}`
+}
+
+function setupRuleModifiedBy(rule: SetupRuleDto): string {
+  return rule.updatedBy || rule.createdBy || '—'
+}
+
 async function openPublishDialog(): Promise<void> {
   if (await blockIfDirty('发布')) return
   publishForm.value = { changeReason: '' }
+  confirmPriority.value = false
+  confirmSetup.value = false
   publishDialog.value = true
+  // 打开弹窗就取一次 ⑦ 的真实条数，勾选不是空勾
+  await ensureSetupSummary()
 }
 
 async function onPublish(): Promise<void> {
   if (!detailNN.value) return
+  if (!canConfirmPublish.value) return
   const reason = publishForm.value.changeReason.trim()
   if (!reason) {
     rulesStore.handleError(new Error('请填写变更原因'))
@@ -275,6 +620,72 @@ async function onPublish(): Promise<void> {
   }
   const ok = await rulesStore.publish(detailNN.value.summary.ruleSetId, reason)
   if (ok) publishDialog.value = false
+}
+
+/* ===== ⑦ 换型规则子块的结构化摘要（版本对比页签用） ===== */
+/**
+ * 后端的 fieldDiff 只给 SetupTransitionRules 子块的整串 JSON（CompareField 原文），
+ * 直接铺在表格里既不可读也容易把用户吓到。这里只做「数条数」的只读解析：
+ *  - 空值 → 0 条
+ *  - 不是数组 / 有未知 RuleType → 返回 null（如实显示「无法识别」，不回退整串 JSON）
+ *  - IsActive=false 的行不计入（与运行时投影口径一致）
+ */
+interface SetupBlockCounts {
+  exact: number
+  default: number
+  total: number
+}
+
+function parseSetupBlockCounts(raw: string | null | undefined): SetupBlockCounts | null {
+  if (!raw || !raw.trim()) return { exact: 0, default: 0, total: 0 }
+  try {
+    const parsed: unknown = JSON.parse(raw)
+    if (!Array.isArray(parsed)) return null
+    let exact = 0
+    let def = 0
+    for (const item of parsed) {
+      if (!item || typeof item !== 'object') return null
+      const rule = item as { RuleType?: unknown; IsActive?: unknown }
+      if (rule.IsActive === false) continue
+      const type = String(rule.RuleType ?? '').toUpperCase()
+      if (type === 'EXACT') exact += 1
+      else if (type === 'DEFAULT') def += 1
+      else return null
+    }
+    return { exact, default: def, total: exact + def }
+  } catch {
+    return null
+  }
+}
+
+/** 版本对比里是否包含 ⑦ 块的变更（决定要不要引导去逐条对比页） */
+const hasSetupBlockChange = computed<boolean>(() =>
+  changedFields.value.some((f: FieldDiff) => f.fieldName === 'SetupTransitionRules')
+)
+
+/** 对比表格行：⑦ 块附带「按类型计数」的解析结果，其余字段原样 */
+type DiffRow = FieldDiff & {
+  setupCounts?: { source: SetupBlockCounts | null; target: SetupBlockCounts | null }
+}
+
+const diffRows = computed<DiffRow[]>(() =>
+  changedFields.value.map((f: FieldDiff) =>
+    f.fieldName === 'SetupTransitionRules'
+      ? {
+          ...f,
+          setupCounts: {
+            source: parseSetupBlockCounts(f.sourceValue),
+            target: parseSetupBlockCounts(f.targetValue)
+          }
+        }
+      : f
+  )
+)
+
+/** ⑦ 块计数文案；null（无法识别）由模板单独处理 */
+function setupCountsText(counts: SetupBlockCounts | null | undefined): string {
+  if (!counts) return ''
+  return `明确产品转换 ${counts.exact} 条 / 默认换型 ${counts.default} 条（共 ${counts.total} 条）`
 }
 
 /* ===== [+ 新建规则集] Dialog（主表；2026-10-22 3号位 补 POST /rule-set 后才有入口） ===== */
@@ -400,8 +811,61 @@ async function onDeleteRuleSet(): Promise<void> {
   }
 }
 
-onMounted(() => {
-  rulesStore.loadList()
+/* ===== 深链：「缺失规则查询 → 去补默认换型规则」 ===== */
+/** 已处理过的深链 URL（onMounted / onActivated 会各跑一次，防重复弹窗） */
+let lastDeepLinkKey = ''
+/**
+ * 2026-10-28：两个 Setup 维护页已从菜单隐藏（路由保留），「默认换型规则」的维护入口
+ * 并入本页「换型规则」页签 ⇒ 缺失规则查询的出口改到这里：
+ * 带 4 字段（部门/大工艺/工序/设备）预填，直接打开「默认换型规则」弹窗。
+ * ⚠️ 本路由要 aps.rule.edit / aps.rule.publish（守卫 403），进不来的角色由
+ *    缺失规则查询页改跳旧的 /aps/setup/default（那边只有 aps.setup.view）。
+ */
+async function applySetupDeepLink(): Promise<void> {
+  const q = route.query
+  if (q.tab !== 'setup' || !q.operationCode) {
+    lastDeepLinkKey = ''
+    return
+  }
+  // onMounted 与 onActivated 首次都会跑一遍 ⇒ 同一个深链只处理一次
+  if (route.fullPath === lastDeepLinkKey) return
+  lastDeepLinkKey = route.fullPath
+  const prefill: SetupDialogPrefill = {
+    departmentCode: String(q.departmentCode ?? ''),
+    stageCode: String(q.stageCode ?? ''),
+    operationCode: String(q.operationCode),
+    resourceCode: String(q.resourceCode ?? '')
+  }
+  const ruleSetCode = typeof q.ruleSetCode === 'string' ? q.ruleSetCode : ''
+  // 来源版本（缺失规则那一行所属的规则集版本）——用于明示「来源版本 vs 写入草稿」
+  const sourceVersionId = Number(q.ruleSetVersionId ?? '')
+  // ⚠️ **不要在这里清参**（router.replace 去 query）：layout 的 <component :key="route.fullPath" />
+  //    (AppView.vue:30) 会因 fullPath 变化**重建整个页面组件** ⇒ 正在跑的深链连同弹窗一起被销毁。
+  //    深链参数留在 URL 上（刷新后仍回到同一处，这是深链的正常行为）。
+  if (rulesStore.ruleSets.length === 0) await rulesStore.loadList()
+  const target = ruleSetCode
+    ? rulesStore.ruleSets.find((r) => r.ruleSetCode === ruleSetCode)
+    : undefined
+  if (!target) return
+  if (!(await selectRuleSet(target))) return
+  activeTab.value = 'setup'
+  await ensureSetupSummary()
+  // 来源版本说明（#4）：找到就显示版本号与状态；找不到（历史数据/版本已删）就不显示，不编造
+  const src = Number.isFinite(sourceVersionId)
+    ? (detailNN.value?.history ?? []).find((h) => h.versionId === sourceVersionId)
+    : undefined
+  deepLinkSourceVersion.value = src ? { versionCode: src.versionCode, status: src.status } : null
+  await openDefaultCreate(prefill)
+}
+
+onMounted(async () => {
+  await rulesStore.loadList()
+  await applySetupDeepLink()
+})
+
+// 本页被 keep-alive 缓存（无 noCache）⇒ 再次从别处带参进来时走 onActivated，不是 onMounted
+onActivated(() => {
+  void applySetupDeepLink()
 })
 </script>
 
@@ -794,7 +1258,225 @@ onMounted(() => {
               </template>
             </ElTabPane>
 
-            <!-- 2. Diff -->
+            <!-- 2. 换型规则（本页直接增删改；写操作复用 Setup 两个 Dialog + 两个 store） -->
+            <ElTabPane label="换型规则" name="setup">
+              <ElAlert
+                v-if="!canViewSetup"
+                type="info"
+                :closable="false"
+                show-icon
+                class="tab-alert"
+              >
+                <template #title>当前账号看不到换型规则</template>
+                查看换型规则需要「换型规则查看」权限（aps.setup.view）。如需查看请联系系统管理员授权。
+              </ElAlert>
+
+              <template v-else>
+                <ElEmpty
+                  v-if="setupTargetVersionId == null"
+                  description="当前规则集还没有可查看的版本"
+                  :image-size="70"
+                />
+
+                <template v-else>
+                  <ElAlert
+                    v-if="!setupEditable"
+                    type="info"
+                    :closable="false"
+                    show-icon
+                    class="tab-alert"
+                  >
+                    <template #title>当前只读</template>
+                    <template v-if="setupDraftVersionId == null">
+                      现在看到的是已发布版本，换型规则只能改草稿。要修改请先在页面上方「新建草稿」。
+                    </template>
+                    <template v-else>
+                      当前账号没有换型规则编辑权限（需权限码 aps.setup.edit），只能查看。
+                    </template>
+                  </ElAlert>
+
+                  <ElAlert type="info" :closable="false" show-icon class="tab-alert">
+                    <template #title>换型规则与需求优先级段位一起整版生效</template>
+                    这里改的是当前草稿，改完要回页面上方「发布」才生效。命中顺序：明确产品转换 →
+                    当前工序+设备默认规则 → 0 分钟兜底；同一产品连续生产按 0 分钟算。
+                  </ElAlert>
+
+                  <!-- 来源版本说明（#4：从「缺失规则查询」回填时，明示来源版本与写入目标） -->
+                  <ElAlert
+                    v-if="deepLinkSourceVersion"
+                    type="warning"
+                    :closable="false"
+                    show-icon
+                    class="tab-alert"
+                  >
+                    <template #title>
+                      这条缺失规则来自版本 {{ deepLinkSourceVersion.versionCode }}（{{
+                        RULE_STATUS_LABELS[deepLinkSourceVersion.status] ??
+                        deepLinkSourceVersion.status
+                      }}）
+                    </template>
+                    <template v-if="currentDraftVersionCode">
+                      保存会写进当前草稿 {{ currentDraftVersionCode }}，发布后才生效。
+                    </template>
+                    <template v-else>
+                      这个规则集现在没有草稿版本，请先在页面上方「新建草稿」，否则保存不了。
+                    </template>
+                  </ElAlert>
+
+                  <ElAlert
+                    v-if="setupSummaryError"
+                    type="error"
+                    :closable="false"
+                    show-icon
+                    :title="`换型规则读取失败：${setupSummaryError}`"
+                  />
+
+                  <template v-else>
+                    <!-- 明确产品转换（EXACT） -->
+                    <div class="setup-block">
+                      <div class="seg-toolbar">
+                        <span class="setup-block-title">明确产品转换</span>
+                        <span class="muted">共 {{ setupExactRules.length }} 条 · 优先级最高</span>
+                        <span class="toolbar-spacer"></span>
+                        <ElButton
+                          size="small"
+                          :loading="setupSummaryLoading"
+                          @click="refreshSetupSummary"
+                        >
+                          <Icon icon="vi-mdi:refresh" /> 刷新
+                        </ElButton>
+                        <ElButton
+                          size="small"
+                          type="primary"
+                          :disabled="!setupEditable"
+                          @click="openExactCreate"
+                        >
+                          新增明确产品转换
+                        </ElButton>
+                      </div>
+                      <ElTable
+                        v-loading="setupSummaryLoading"
+                        :data="setupExactRules"
+                        size="small"
+                        border
+                        empty-text="这一版还没有明确产品转换规则"
+                      >
+                        <ElTableColumn prop="departmentCode" label="部门" width="110" />
+                        <ElTableColumn prop="stageCode" label="大工艺" width="110" />
+                        <ElTableColumn prop="operationCode" label="当前工序" width="120" />
+                        <ElTableColumn prop="resourceCode" label="设备" width="130" />
+                        <ElTableColumn label="前产品 → 后产品" min-width="240">
+                          <template #default="{ row }">
+                            {{ row.fromMaterialCode }} → {{ row.toMaterialCode }}
+                          </template>
+                        </ElTableColumn>
+                        <ElTableColumn
+                          prop="setupMinutes"
+                          label="换型分钟"
+                          width="100"
+                          align="right"
+                        />
+                        <ElTableColumn label="最近修改" width="180">
+                          <template #default="{ row }">
+                            <div>{{ setupRuleModifiedText(row) }}</div>
+                            <div class="muted">{{ setupRuleModifiedBy(row) }}</div>
+                          </template>
+                        </ElTableColumn>
+                        <ElTableColumn v-if="canEditSetup" label="操作" width="130" fixed="right">
+                          <template #default="{ row }">
+                            <ElButton
+                              type="primary"
+                              size="small"
+                              link
+                              :disabled="!setupEditable"
+                              @click="openExactEdit(row)"
+                            >
+                              编辑
+                            </ElButton>
+                            <ElButton
+                              type="danger"
+                              size="small"
+                              link
+                              :disabled="!setupEditable"
+                              @click="handleExactDelete(row)"
+                            >
+                              删除
+                            </ElButton>
+                          </template>
+                        </ElTableColumn>
+                      </ElTable>
+                    </div>
+
+                    <!-- 默认换型规则（DEFAULT） -->
+                    <div class="setup-block">
+                      <div class="seg-toolbar">
+                        <span class="setup-block-title">默认换型规则</span>
+                        <span class="muted">
+                          共 {{ setupDefaultRules.length }} 条 · 明确规则未命中时生效
+                        </span>
+                        <span class="toolbar-spacer"></span>
+                        <ElButton
+                          size="small"
+                          type="primary"
+                          :disabled="!setupEditable"
+                          @click="openDefaultCreate()"
+                        >
+                          新增默认换型规则
+                        </ElButton>
+                      </div>
+                      <ElTable
+                        v-loading="setupSummaryLoading"
+                        :data="setupDefaultRules"
+                        size="small"
+                        border
+                        empty-text="这一版还没有默认换型规则（命中不到明确/默认规则时按 0 分钟算）"
+                      >
+                        <ElTableColumn prop="departmentCode" label="部门" width="110" />
+                        <ElTableColumn prop="stageCode" label="大工艺" width="110" />
+                        <ElTableColumn prop="operationCode" label="当前工序" width="120" />
+                        <ElTableColumn prop="resourceCode" label="设备" width="130" />
+                        <ElTableColumn
+                          prop="setupMinutes"
+                          label="换型分钟"
+                          width="100"
+                          align="right"
+                        />
+                        <ElTableColumn label="最近修改" width="180">
+                          <template #default="{ row }">
+                            <div>{{ setupRuleModifiedText(row) }}</div>
+                            <div class="muted">{{ setupRuleModifiedBy(row) }}</div>
+                          </template>
+                        </ElTableColumn>
+                        <ElTableColumn v-if="canEditSetup" label="操作" width="130" fixed="right">
+                          <template #default="{ row }">
+                            <ElButton
+                              type="primary"
+                              size="small"
+                              link
+                              :disabled="!setupEditable"
+                              @click="openDefaultEdit(row)"
+                            >
+                              编辑
+                            </ElButton>
+                            <ElButton
+                              type="danger"
+                              size="small"
+                              link
+                              :disabled="!setupEditable"
+                              @click="handleDefaultDelete(row)"
+                            >
+                              删除
+                            </ElButton>
+                          </template>
+                        </ElTableColumn>
+                      </ElTable>
+                    </div>
+                  </template>
+                </template>
+              </template>
+            </ElTabPane>
+
+            <!-- 3. Diff -->
             <ElTabPane label="版本对比" name="diff">
               <!-- `fieldDiffs` 是后端**全字段平铺**（未变字段 isChanged=false），
                    只有 isChanged 的行才是差异；后端不返 added/modified/removed 计数
@@ -815,8 +1497,17 @@ onMounted(() => {
                   <span class="diff-meta">
                     {{ currentDiff.sourceVersionCode }} → {{ currentDiff.targetVersionCode }}
                   </span>
+                  <ElButton
+                    v-if="hasSetupBlockChange"
+                    size="small"
+                    type="primary"
+                    link
+                    @click="goSetupDiffPage"
+                  >
+                    查看换型规则逐条差异 →
+                  </ElButton>
                 </div>
-                <ElTable :data="changedFields" size="small" border>
+                <ElTable :data="diffRows" size="small" border>
                   <ElTableColumn label="字段" min-width="200">
                     <template #default="{ row }">
                       <div class="diff-field">
@@ -827,12 +1518,24 @@ onMounted(() => {
                   </ElTableColumn>
                   <ElTableColumn label="源版本值" min-width="180">
                     <template #default="{ row }">
-                      <span class="diff-old">{{ row.sourceValue ?? '（无）' }}</span>
+                      <template v-if="row.fieldName === 'SetupTransitionRules'">
+                        <span v-if="row.setupCounts.source" class="diff-old">
+                          {{ setupCountsText(row.setupCounts.source) }}
+                        </span>
+                        <span v-else class="muted">内容无法识别（请到「规则版本对比」页查看）</span>
+                      </template>
+                      <span v-else class="diff-old">{{ row.sourceValue ?? '（无）' }}</span>
                     </template>
                   </ElTableColumn>
                   <ElTableColumn label="目标版本值" min-width="180">
                     <template #default="{ row }">
-                      <span class="diff-new">{{ row.targetValue ?? '（无）' }}</span>
+                      <template v-if="row.fieldName === 'SetupTransitionRules'">
+                        <span v-if="row.setupCounts.target" class="diff-new">
+                          {{ setupCountsText(row.setupCounts.target) }}
+                        </span>
+                        <span v-else class="muted">内容无法识别（请到「规则版本对比」页查看）</span>
+                      </template>
+                      <span v-else class="diff-new">{{ row.targetValue ?? '（无）' }}</span>
                     </template>
                   </ElTableColumn>
                 </ElTable>
@@ -843,7 +1546,7 @@ onMounted(() => {
               </template>
             </ElTabPane>
 
-            <!-- 3. History -->
+            <!-- 4. History -->
             <ElTabPane label="历史版本" name="history">
               <ElTable :data="detailNN.history" size="small" border>
                 <ElTableColumn label="版本码" min-width="150">
@@ -866,17 +1569,17 @@ onMounted(() => {
                 </ElTableColumn>
                 <ElTableColumn label="发布时间" width="160">
                   <template #default="{ row }">
-                    {{ formatUtcDateTime(row.publishedAt) }}
+                    {{ formatLocalDateTime(row.publishedAt) }}
                   </template>
                 </ElTableColumn>
                 <ElTableColumn label="生效起" width="160">
                   <template #default="{ row }">
-                    {{ formatUtcDateTime(row.effectiveFrom) }}
+                    {{ formatLocalDateTime(row.effectiveFrom) }}
                   </template>
                 </ElTableColumn>
                 <ElTableColumn label="生效止" width="160">
                   <template #default="{ row }">
-                    {{ formatUtcDateTime(row.effectiveTo) }}
+                    {{ formatLocalDateTime(row.effectiveTo) }}
                   </template>
                 </ElTableColumn>
                 <ElTableColumn label="当前生效" width="100" align="center">
@@ -899,14 +1602,58 @@ onMounted(() => {
     <!-- ===== 加载态 ===== -->
     <div v-if="loading" class="loading-tip">加载规则集详情中…</div>
 
-    <!-- ===== Publish Dialog ===== -->
-    <ElDialog v-model="publishDialog" title="发布草稿" width="520px" :close-on-click-modal="false">
-      <ElForm label-width="100px" size="default">
+    <!-- ===== Publish Dialog（整版发布：① + ⑦ 一起生效） ===== -->
+    <ElDialog
+      v-model="publishDialog"
+      title="发布规则集版本（整版）"
+      width="620px"
+      :close-on-click-modal="false"
+    >
+      <ElForm label-width="110px" size="default">
         <ElFormItem label="规则集">
           <span class="d-val">{{ detailNN?.summary.ruleSetCode }}</span>
         </ElFormItem>
         <ElFormItem label="待发布版本">
           <span class="d-val">{{ detailNN?.summary.draftVersionCode || '（无草稿）' }}</span>
+        </ElFormItem>
+        <ElFormItem label="本次发布内容">
+          <div class="publish-blocks">
+            <div class="publish-block">
+              <span class="block-name">① 需求优先级段位</span>
+              <ElTag size="small" effect="plain">{{ prioritySegmentCount }} 个段位</ElTag>
+            </div>
+            <div class="publish-block">
+              <span class="block-name">⑦ 换型规则</span>
+              <span v-if="!canViewSetup" class="muted">当前账号没有查看权限，条数不可见</span>
+              <span v-else-if="setupSummaryLoading" class="muted">读取中…</span>
+              <span v-else-if="setupSummaryError" class="muted">
+                读取失败：{{ setupSummaryError }}
+              </span>
+              <ElTag v-else size="small" effect="plain">
+                明确产品转换 {{ setupExactRules.length }} 条 / 默认换型
+                {{ setupDefaultRules.length }} 条
+              </ElTag>
+            </div>
+          </div>
+        </ElFormItem>
+        <ElFormItem label="发布确认 (必选)">
+          <div class="publish-confirms">
+            <ElCheckbox v-model="confirmPriority">
+              我已核对「需求优先级段位」（{{ prioritySegmentCount }} 个段位）
+            </ElCheckbox>
+            <ElTooltip
+              :disabled="canViewSetup"
+              content="当前账号没有换型规则查看权限，无法核对 ⑦ 块；请联系系统管理员授予「换型规则查看」权限"
+              placement="top"
+            >
+              <span>
+                <ElCheckbox v-model="confirmSetup" :disabled="!canViewSetup">
+                  我已核对「换型规则」（明确 {{ setupExactRules.length }} 条 + 默认
+                  {{ setupDefaultRules.length }} 条）
+                </ElCheckbox>
+              </span>
+            </ElTooltip>
+          </div>
         </ElFormItem>
         <ElFormItem label="变更原因 (必填)">
           <ElInput
@@ -916,9 +1663,9 @@ onMounted(() => {
             placeholder="必须填写；将出现在审计记录"
           />
         </ElFormItem>
-        <ElAlert type="info" :closable="false" show-icon class="d-alert">
-          <template #title>发布产生新版本，历史不覆盖</template>
-          提交后此规则集版本进入已发布状态；原已发布版本成为历史版本，可随时回看。
+        <ElAlert type="warning" :closable="false" show-icon class="d-alert">
+          <template #title>整版发布：① 和 ⑦ 一起生效</template>
+          本次发布会把「需求优先级段位」和「换型规则」一起发布成新版本；已发布的历史版本不受影响，可随时回看。
         </ElAlert>
       </ElForm>
       <template #footer>
@@ -926,7 +1673,7 @@ onMounted(() => {
         <ElButton
           type="primary"
           :loading="actionRunning"
-          :disabled="!canPublishAction"
+          :disabled="!canConfirmPublish"
           @click="onPublish"
         >
           确认发布
@@ -1171,6 +1918,21 @@ onMounted(() => {
         <ElButton type="primary" :loading="saving" @click="onSaveDraft">保存</ElButton>
       </template>
     </ElDialog>
+
+    <!-- ===== ⑦ 换型规则 新增/编辑 Dialog（与 Setup 两个维护页同一组件，不复制表单） ===== -->
+    <SetupExactDialog
+      v-model="exactDialogVisible"
+      :mode="exactDialogMode"
+      :rule="editingExactRule"
+      @saved="handleSetupSaved"
+    />
+    <SetupDefaultDialog
+      v-model="defaultDialogVisible"
+      :mode="defaultDialogMode"
+      :rule="editingDefaultRule"
+      :prefill="defaultDialogPrefill"
+      @saved="handleSetupSaved"
+    />
   </div>
 </template>
 
@@ -1218,6 +1980,20 @@ onMounted(() => {
   align-items: center;
   gap: 12px;
   margin-bottom: 12px;
+}
+
+.setup-block {
+  margin-bottom: 20px;
+}
+
+.setup-block-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: #1e293b;
+}
+
+.toolbar-spacer {
+  flex: 1;
 }
 
 .muted {
@@ -1519,5 +2295,29 @@ onMounted(() => {
 
 .d-alert {
   margin-bottom: -10px;
+}
+
+/* 整版发布弹窗：发布内容清单 + 两个确认勾选 */
+.publish-blocks {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.publish-block {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.block-name {
+  min-width: 130px;
+  color: #475569;
+}
+
+.publish-confirms {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
 }
 </style>

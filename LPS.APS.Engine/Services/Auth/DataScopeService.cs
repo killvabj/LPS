@@ -50,6 +50,21 @@ public class DataScopeService : IDataScopeService
     }
 
     /// <inheritdoc />
+    public async Task<DataScopeContext?> ResolveScopeByUserCodeAsync(string userCode, CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(userCode))
+            return null;
+
+        // LoginName 唯一（UQ_User_LoginName）⇒ 解析出 userId 后复用既有并集逻辑，不复制策略查询
+        var userId = await _context.Users
+            .Where(x => x.LoginName == userCode)
+            .Select(x => (int?)x.Id)
+            .FirstOrDefaultAsync(cancellationToken);
+
+        return userId is null ? null : await ResolveScopeAsync(userId.Value, cancellationToken);
+    }
+
+    /// <inheritdoc />
     public async Task EnsureInScopeAsync(int userId, string scopeType, string value, CancellationToken cancellationToken = default)
     {
         var scope = await ResolveScopeAsync(userId, cancellationToken);

@@ -426,12 +426,13 @@ public sealed class SolverStrategySnapshot
     /// <summary>⑧ 批量策略（Batch Policy）规则（0号位 2026-10-07《未命名的Markdown文件 (7).md》§四/§十/§十一）。
     /// 粒度 = <c>Material + ProductionDepartment</c>（冻结 B-001）。**正式命中必须是明确部门**：
     /// <c>ProductionDepartmentId == null</c> 仅历史兼容，**不得**当 Material 级默认（AUD-1-004 已删除该兜底）。
-    /// 2号位 数据源 = **本 Run 冻结策略包的 ⑧ 块**（<c>ParameterSetVersion.ContentSnapshotJson.BatchPolicy</c>，
-    /// 经 <c>FrozenStrategySnapshotProvider.DeserializeBatchPolicy</c> 反序列化）；
-    /// **装载时不回读 <c>TaskSplitRuleConfig</c> 物理表**（该表只在策略包「发布」那一刻被读一次）。
-    /// ⚠ 2026-10-13 更正：本注释原写「**整块透传、不裁剪**」，**已失效** —— 2026-10-12 起装载期按域裁剪
-    /// （<c>PeggingOrchestrator.BatchPolicies = TaskSplitRuleConfigProjector.CropToDomain(...)</c>，
-    /// 按 <c>demandMaterialIds</c> 单轴裁，保留全部部门变体，≈85×）。⇒ **列表里看不到某物料 = 域裁剪结果，不是装载缺失。**
+    /// 2号位 数据源 = **<c>TaskSplitRuleConfig</c> 物理表直读**（2026-10-17 装载侧切换；PM 2026-10-15 §T-1038）：
+    /// 由 <c>PeggingOrchestrator.LoadBatchPolicyRulesAsync</c> 按本域需求物料**一条集合式 SELECT** 装载，
+    /// 生效时点与规则集在该语句内同时取得（`E1`，同一 RCSI 语句级快照）。
+    /// <c>FrozenStrategySnapshotProvider</c> 的 ⑧ 块**恒为空集合**（发布侧已停止注入，字段保留只为不改快照形态
+    /// 与 1号位 消费签名）⇒ **不得**再称「从冻结策略包的 ⑧ 块反序列化」。
+    /// 装载期按域裁剪（<c>TaskSplitRuleConfigProjector.CropToDomain(...)</c>，按 <c>demandMaterialIds</c>
+    /// 单轴裁、保留全部部门变体）⇒ **列表里看不到某物料 = 域裁剪结果，不是装载缺失。**
     /// ⚠ 本属性**只承载「已生效规则行」**，**无状态位** ⇒ 单看它无法区分 MISSING 与 INVALID
     /// （冻结 06 **v1.36 <c>:17</c>**／规则清单 **v1.7 <c>B-013</c>** 要求 <c>VALID/MISSING/INVALID</c> 三态）。
     /// **三态＋不可用载体已于 2026-10-13 落码 = <see cref="BatchPolicyStates"/>（同层，本 Run 逐业务键）**
@@ -472,6 +473,29 @@ public sealed class SolverStrategySnapshot
     /// ⚠ 消费侧口径**变更点**：旧口径「<c>BatchPolicies</c> 为空或查不到行 ⇒ 一律 MISSING」已判违规
     /// （06 <c>:17</c> 逐字「不能仅凭旧 <c>BatchPolicies</c> 规则行集合为空或查不到行就无差别返回 NULL」）。</summary>
     public IReadOnlyList<BatchPolicyStateSnapshot>? BatchPolicyStates { get; init; }
+
+    /// <summary>Stage 固定交接等待规则（合同 v1.1 §四/§五；1号位 2026-10-28《消费侧回执》§三 第 2 项点名加此字段）。
+    ///
+    /// **来源**：<c>ParameterSetVersion.ContentSnapshotJson</c> 顶层 <c>$.StageHandoffWaitRules</c>
+    /// （唯一物理路径，**非** <c>$.SolverStrategy.StageHandoffWaitRules</c>）→
+    /// <c>FrozenStrategySnapshotProvider</c> 装载到 <c>FrozenStrategySnapshot</c> →
+    /// <c>PeggingOrchestrator</c> 装配 <c>SolverStrategySnapshot</c> 时**整块透传**。
+    ///
+    /// **缺省语义**：键缺失 / 版本未配置 ⇒ **空集合 = 无交接等待规则**（合同 v1.1 §七 H-3「无源不阻断」）。
+    /// 与 ⑦ <see cref="SetupTransitionRules"/> / ⑧ <see cref="BatchPolicies"/> 的**按域裁剪**不同，
+    /// 本块**不裁剪**（全国仅 37 行量级；按厂裁剪须先定「按需求厂还是供给厂」这一新口径，未获 1号位 点名）。
+    ///
+    /// **消费语义**（1号位 落点 <c>PhaseTwoInitialScheduler.cs:4023</c> 正排起点下界，只抬不降、取 max）：
+    /// <c>IsActive == true</c> 且 <c>(FactoryCode, FromStageCode, ToStageCode, TimeBasis)</c> **四元组全等**命中；
+    /// <c>A→B</c> 与 <c>B→A</c> 是两条独立规则；同一 (需求, 执行批) 内取 <c>FromStage</c> 全部 Task 的最晚
+    /// <c>PlannedEndTime</c> 之后**加一次** <c>WaitMinutes</c>（**不按数量乘**）；不建物流 Task、不借
+    /// <c>StageLeadTimeParam</c>。<c>ELAPSED</c> = 自然时间；<c>WORK</c> 需日历级别（未指定则出 <c>WORK_NO_CALENDAR</c>）。
+    ///
+    /// ⚠ **本属性不携带「块是否存在」标志**——契约 C9 的 <c>(Rules, IsBlockPresent)</c> 中的存在性标志
+    /// **尚未上到 1↔2 载荷**。因此：装载器自身抛异常 = 未装载（Run 失败）；本集合为空 = 版本确实未配置该块。
+    /// 消费侧**不得**仅凭本集合为空推断「装载失败」。</summary>
+    public IReadOnlyList<StageHandoffWaitRule> StageHandoffWaitRules { get; init; }
+        = Array.Empty<StageHandoffWaitRule>();
 }
 
 /// <summary>

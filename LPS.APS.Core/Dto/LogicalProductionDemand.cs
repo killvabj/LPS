@@ -72,6 +72,19 @@ public sealed class LogicalProductionDemand
     public int FactoryId { get; init; }
 
     /// <summary>
+    /// 工厂代码（<c>Factory.Code</c>，实测取值 <c>CN</c>／<c>BJ</c>／<c>CN6课</c>／<c>SH</c>／<c>TJ</c>）。
+    ///
+    /// **与 <see cref="FactoryId"/> 同源**：订单装载 SQL 用一次
+    /// <c>INNER JOIN Factory f ON f.Id = o.FactoryId</c> 同时取 <c>o.FactoryId</c> 与 <c>f.Code</c>
+    /// （<c>PeggingOrchestrator.LoadOrdersForPeggingAsync</c>），随后作为参数逐层下传，**不在热循环里回查主档**。
+    ///
+    /// **用途**：Stage 固定交接等待规则的匹配四元组首键 <c>(FactoryCode, FromStageCode, ToStageCode, TimeBasis)</c>
+    /// （合同 v1.1 §五）。1号位 明确**拒绝**用 <c>ResourceDefinition.FactoryCode</c> 之类反推需求所属厂
+    /// （「拿派生值当判据，不合规」，其 2026-10-28《消费侧回执》§1.4），故必须由需求自身携带。
+    /// </summary>
+    public string FactoryCode { get; init; } = string.Empty;
+
+    /// <summary>
     /// 从哪里开始继续生产（大工艺阶段码，机加工/氧化级，对应 RoutingOperation.StageCode）。
     /// 2号位在 PeggingLoop 后据 Routing 有向图「无入边源结点」回填（原 init 改为 set 以支持回填，见 PeggingOrchestrator.FillStartStageCodes）。
     /// </summary>

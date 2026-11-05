@@ -34,13 +34,61 @@ using LPS.APS.Shared.Models;
 public class SetupOptimizer
 {
     /// <summary>
-    /// EXACT 规则键：当前工序 + 当前设备 + 前产品 + 后产品（方向性，(A,B) ≠ (B,A)）。
-    /// ProductionDepartment/Stage 作为规则裁剪与唯一性上下文由 2号位/3号位 治理，不进运行时查找键（v1.2 §19.3）。
+    /// EXACT 规则键：**生产部门 + Stage + 当前工序 + 当前设备 + 前产品 + 后产品**（方向性，(A,B) ≠ (B,A)）。
+    ///
+    /// ── 2026-10-28 0号位《R07R08_致1号位更正回复_v1.1》第 3 条「按冻结直接整改」──
+    ///   原文：「EXACT/DEFAULT 消费必须**精确区分 Department 和 Stage**；……**禁止同 Run 静默首条覆盖**」。
+    ///   依据 R08 v1.0 §二.1：「仅按 `ProductionDepartment+Stage+当前Operation+Resource+FromMaterial+ToMaterial`
+    ///   识别 EXACT；DEFAULT 按部门、Stage、当前Operation、Resource 四维」。
+    ///   ⇒ 本键由旧的「4 维 / 2 维」升级为「6 维 / 4 维」，部门与 Stage 进键。
+    ///   ⚠ 旧注释「ProductionDepartment/Stage 不进运行时查找键（v1.2 §19.3）」**已被本裁决覆盖**，
+    ///     不得再据旧注释把部门/Stage 从键里摘掉。
     /// </summary>
-    public readonly record struct SetupExactKey(string OperationCode, int ResourceId, int FromMaterialId, int ToMaterialId);
+    public readonly record struct SetupExactKey(
+        int ProductionDepartmentId,
+        string StageCode,
+        string OperationCode,
+        int ResourceId,
+        int FromMaterialId,
+        int ToMaterialId);
 
-    /// <summary>DEFAULT 规则键：当前工序 + 当前设备（v1.2 §四）。</summary>
-    public readonly record struct SetupDefaultKey(string OperationCode, int ResourceId);
+    /// <summary>DEFAULT 规则键：**生产部门 + Stage + 当前工序 + 当前设备**（R08 v1.0 §二.1 四维）。</summary>
+    public readonly record struct SetupDefaultKey(
+        int ProductionDepartmentId,
+        string StageCode,
+        string OperationCode,
+        int ResourceId);
+
+    /// <summary>
+    /// 规则装载报告（2026-10-28 0号位 R07R08 v1.1 第 3 条：**禁止同 Run 静默首条覆盖**）。
+    ///
+    /// 旧实现用 `Dictionary.TryAdd` 吞掉同键重复行 ⇒ 谁生效完全取决于**载荷到达顺序**，
+    /// 这正是 0号位 点名禁止的「静默首条覆盖」（与 2026-10-26 P0② 部门冲突同一种病灶）。
+    /// 现口径：
+    ///   · 同键**同值**重复 ⇒ 无害（结果唯一），只计数；
+    ///   · 同键**异值** ⇒ **无法判定真值**，该键**整条剔除**（不猜、不取首条），计数 + 留样；
+    ///     剔除后解析自然落到下一层（DEFAULT ⇒ RuleMissing 0 分钟 + WARNING），**可见、不静默**。
+    /// </summary>
+    public sealed class SetupRuleLoadReport
+    {
+        /// <summary>EXACT 同键异值（已剔除的键数）。</summary>
+        public int ExactConflictKeyCount { get; internal set; }
+
+        /// <summary>DEFAULT 同键异值（已剔除的键数）。</summary>
+        public int DefaultConflictKeyCount { get; internal set; }
+
+        /// <summary>同键同值重复（无害，未剔除）。</summary>
+        public int SameValueDuplicateCount { get; internal set; }
+
+        /// <summary>结构无效被跳过的行（EXACT 缺 From/To、未知 RuleType 等）。</summary>
+        public int UnusableRowCount { get; internal set; }
+
+        /// <summary>冲突留样（最多 20 条，供诊断定位到具体键）。</summary>
+        public List<string> ConflictExamples { get; } = new();
+
+        /// <summary>是否存在任何需要上游治理的装载问题。</summary>
+        public bool HasProblems => ExactConflictKeyCount > 0 || DefaultConflictKeyCount > 0 || UnusableRowCount > 0;
+    }
 
     /// <summary>Setup 解析结果类型（0号位 20260917 Q4 裁决：初始状态与规则缺失严格分开，不得合并分支）。</summary>
     public enum SetupOutcome
@@ -54,7 +102,15 @@ public class SetupOptimizer
         /// <summary>无上一产品 → 初始设备状态，Setup=0，记 INITIAL_SETUP_STATE 追踪说明（§14.3，非 ReasonCode）。</summary>
         InitialState,
         /// <summary>有前后产品但 EXACT/DEFAULT 均缺失 → 规则缺失降级 Setup=0，必须记「换型规则缺失」解释（§5 第三优先）。</summary>
-        RuleMissing
+        RuleMissing,
+        /// <summary>
+        /// **来源不可用**：本 Task 取不到「生产部门 / Stage」上下文 ⇒ 无法定位规则来源（键域升级后新增，
+        /// 0号位 R07R08 v1.1 第 4 条「区分可信无前态与来源不可用」）。
+        /// 与 <see cref="InitialState"/>（**可信**无前态）严格分开：前者是「没有前产品」，本值是「连查询键都拼不出」。
+        /// 落库 <see cref="SetupOutcomeToSource"/> 仍归 `SETUP_RULE_MISSING_ZERO_FALLBACK`
+        /// （4 态值域不动），区分靠 ExplainTrace 的 <see cref="RuleSourceUnavailableType"/>。
+        /// </summary>
+        SourceUnavailable
     }
 
     /// <summary>
@@ -72,6 +128,9 @@ public class SetupOptimizer
         SetupOutcome.SameProductZero => "DEFAULT",
         SetupOutcome.RuleMissing => RuleMissingZeroFallbackType,
         SetupOutcome.InitialState => InitialSetupStateType,
+        // 2026-10-28：来源不可用沿用「规则缺失 0 分钟兜底」的落库值（4 态值域不动），
+        // 区分靠 ExplainTrace 的 RuleSourceUnavailableType —— 见 0号位 R07R08 v1.1 第 4 条。
+        SetupOutcome.SourceUnavailable => RuleMissingZeroFallbackType,
         _ => RuleMissingZeroFallbackType
     };
 
@@ -89,6 +148,20 @@ public class SetupOptimizer
     /// Dept/Stage 不在运行时查找键内（2号位 已按 Domain 裁剪），由调用方（Phase 接线时）从 Task 上下文补齐。</summary>
     public const string RuleMissingZeroFallbackType = "SETUP_RULE_MISSING_ZERO_FALLBACK";
 
+    /// <summary>
+    /// 「来源不可用」解释类型符号锚（WARNING 级；0号位 R07R08 v1.1 第 4 条要求与「可信无前态」严格区分）。
+    /// 触发条件 = 本 Task 拼不出查询键（缺生产部门 / Stage 上下文）⇒ **不是**「没有前产品」，也不是「规则没配」。
+    /// 落库 <c>SetupSource</c> 仍归 <see cref="RuleMissingZeroFallbackType"/>（4 态值域不动），本符号只走 ExplainTrace。
+    /// </summary>
+    public const string RuleSourceUnavailableType = "SETUP_RULE_SOURCE_UNAVAILABLE";
+
+    /// <summary>
+    /// 「同产品默认 0」解释类型符号锚（INFO 级）。**仅在同键还存在 DEFAULT 规则时**才写 —— 此时
+    /// <c>SetupSource=DEFAULT + SetupTime=0</c> 与「DEFAULT 显式 0」同形，不写就无法追（0号位 R07R08 v1.1 第 4 条）。
+    /// 无 DEFAULT 规则时不写，避免 10 万 Task 级 trace 体积（同实施包 §19）。
+    /// </summary>
+    public const string SameProductDefaultZeroType = "SAME_PRODUCT_DEFAULT_ZERO";
+
     /// <summary>Setup 解析结果：分钟数 + 命中类型 + 追踪三元组（TraceLevel/ExplanationType/TraceMessage，按 0号位 §五口径；ExplainTrace 载体待 2号位 DTO 落地后写入）。</summary>
     public readonly record struct SetupResolution(
         decimal SetupMinutes,
@@ -101,55 +174,89 @@ public class SetupOptimizer
     /// 解析当前 Task 的换型时间（v1.2 §5 三层确定性命中，无额外 fallback）。
     /// </summary>
     /// <param name="operationCode">当前要排的 Task 自身小工序（不是上一 Task 的工序）。</param>
+    /// <param name="productionDepartmentId">当前 Task 所属生产部门（键维之一，R08 v1.0 §二.1）；null = 取不到部门上下文。</param>
+    /// <param name="stageCode">当前 Task 所属大工艺阶段码（键维之一）；null/空按空串参与匹配，不放弃匹配。</param>
     /// <param name="resourceId">当前候选/实际设备。</param>
-    /// <param name="fromMaterialId">该设备上一相邻 Task 的产品；null = 无可追溯上一产品（初始设备状态）。</param>
+    /// <param name="fromMaterialId">该设备上一相邻 Task 的产品；null = **未取到**上一产品
+    /// （可能是计划期首件，也可能是追溯断链 —— 本方法无法区分，一律按初始设备状态处理）。</param>
     /// <param name="toMaterialId">当前 Task 产品。</param>
     /// <param name="exactRules">EXACT 产品转换规则（2号位 装载，Phase1 适配传入）。</param>
     /// <param name="defaultRules">DEFAULT 工序+设备规则（同上）。</param>
     public SetupResolution ResolveSetup(
         string operationCode,
+        int? productionDepartmentId,
+        string? stageCode,
         int resourceId,
         int? fromMaterialId,
         int toMaterialId,
         IReadOnlyDictionary<SetupExactKey, decimal> exactRules,
         IReadOnlyDictionary<SetupDefaultKey, decimal> defaultRules)
-        => ResolveSetupCore(operationCode, resourceId, fromMaterialId, toMaterialId, exactRules, defaultRules);
+        => ResolveSetupCore(operationCode, productionDepartmentId, stageCode, resourceId,
+            fromMaterialId, toMaterialId, exactRules, defaultRules);
 
     /// <summary>纯函数解析核心（item1 接线阶段二：供 Phase2/Phase4 静态复用，实例方法 ResolveSetup 委托于此，行为一致）。</summary>
     internal static SetupResolution ResolveSetupCore(
         string operationCode,
+        int? productionDepartmentId,
+        string? stageCode,
         int resourceId,
         int? fromMaterialId,
         int toMaterialId,
         IReadOnlyDictionary<SetupExactKey, decimal> exactRules,
         IReadOnlyDictionary<SetupDefaultKey, decimal> defaultRules)
     {
+        var stage = stageCode ?? string.Empty;
+
+        // ── 来源不可用（功能放在最前：连查询键都拼不出，谈不上「命中/未命中」）──
+        //   0号位 R07R08 v1.1 第 4 条：必须与「可信无前态」严格区分。
+        //   触发条件 = **取不到生产部门**（部门是键的必要维）；Stage 为空是**值**不是缺值，照常参与匹配。
+        if (productionDepartmentId is not int dept)
+        {
+            return new SetupResolution(0m, SetupOutcome.SourceUnavailable,
+                $"工序[{operationCode}]/设备[{resourceId}]/Stage[{(stage.Length == 0 ? "空" : stage)}] 取不到生产部门上下文，"
+                + "规则来源不可用（**不等于**无前产品），本次按0分钟计算，请上游补齐部门上下文后重算。",
+                "WARNING", RuleSourceUnavailableType);
+        }
+
         // 初始设备状态：无上一产品 → 不存在转换关系，Setup=0（不人为构造虚拟前产品，§0.1-4/§14.3）。
         // 追踪规格：0号位 正式回复 §5.1（TraceType=TIME_CALCULATION / TraceLevel=INFO / INITIAL_SETUP_STATE）。
+        // R08（2026-10-29）措辞去歧义：`null` 有两种成因 —— (a) 计划期首件，本来就没有前产品；
+        //   (b) 有前产品但**追溯断链**（六维键碰撞 / 插入删除后邻接未重算）。求解器**无法区分**这两者，
+        //   旧措辞「无可追溯上一产品」把 (b) 洗成了 (a)，读数者会误以为初始状态已核实。
+        //   现措辞如实说明「取到 null」，并把「按 0 分钟计算」与「是否真首件未核实」分开写。
         if (fromMaterialId is null)
         {
             return new SetupResolution(0m, SetupOutcome.InitialState,
-                "当前资源无可追溯上一产品，按初始设备状态处理，Setup=0。",
+                "当前资源未取到上一相邻 Task 的产品（取值为 null）：既可能是计划期首件（本无前产品），也可能是追溯断链；"
+                + "求解器无法区分，本段按初始设备状态计 Setup=0（0 分钟不代表已核实无前产品）。",
                 "INFO", InitialSetupStateType);
         }
 
         var from = fromMaterialId.Value;
 
         // 第一优先：EXACT 产品对（同产品 A→A 显式规则可覆盖默认 0，§6）。
-        if (exactRules.TryGetValue(new SetupExactKey(operationCode, resourceId, from, toMaterialId), out var exactMinutes))
+        if (exactRules.TryGetValue(new SetupExactKey(dept, stage, operationCode, resourceId, from, toMaterialId), out var exactMinutes))
         {
             return new SetupResolution(exactMinutes, SetupOutcome.ExactHit, null);
         }
 
         // 同产品连续且无显式规则 → 0 分钟（§6；只比较前后产品，与上一工序无关）。
+        // 追踪：**仅当同键还有 DEFAULT 规则时**才写 —— 此时落库 `SetupSource=DEFAULT + SetupTime=0`
+        //   与「DEFAULT 显式 0」同形，不写就追不出来（0号位 R07R08 v1.1 第 4 条）；
+        //   无 DEFAULT 规则时该形态只可能是「同材默认 0」，不写以控 trace 体积。
         if (from == toMaterialId)
         {
-            return new SetupResolution(0m, SetupOutcome.SameProductZero, null);
+            return defaultRules.ContainsKey(new SetupDefaultKey(dept, stage, operationCode, resourceId))
+                ? new SetupResolution(0m, SetupOutcome.SameProductZero,
+                    $"前后产品同为[{from}]，按同产品默认0分钟计算；**同键存在 DEFAULT 规则**（本次未采用），"
+                    + "故落库来源为 DEFAULT 且分钟为 0，勿与「DEFAULT 显式 0」混淆。",
+                    "INFO", SameProductDefaultZeroType)
+                : new SetupResolution(0m, SetupOutcome.SameProductZero, null);
         }
 
         // 第二优先：当前工序+当前设备默认规则（§四）。
         // 追踪规格：0号位 正式回复 §5.2（正常 fallback，INFO 轻量追踪；符号采 2号位 20260920 建议 DEFAULT_SETUP_FALLBACK）。
-        if (defaultRules.TryGetValue(new SetupDefaultKey(operationCode, resourceId), out var defaultMinutes))
+        if (defaultRules.TryGetValue(new SetupDefaultKey(dept, stage, operationCode, resourceId), out var defaultMinutes))
         {
             return new SetupResolution(defaultMinutes, SetupOutcome.DefaultHit,
                 "未命中明确产品转换规则，使用当前工序/设备默认换型时间。",
@@ -159,7 +266,7 @@ public class SetupOptimizer
         // 第三优先：无规则 → 0 分钟 + 必须记录缺失解释（§5；禁止任何额外 fallback）。
         // 追踪规格：0号位 正式回复 §5.3（WARNING + SETUP_RULE_MISSING_ZERO_FALLBACK，进 4号位 数据质量查询）。
         return new SetupResolution(0m, SetupOutcome.RuleMissing,
-            $"当前部门/Stage/工序[{operationCode}]/设备[{resourceId}]/前后产品[{from}→{toMaterialId}]未维护Setup规则，本次按0分钟计算。",
+            $"当前部门[{dept}]/Stage[{(stage.Length == 0 ? "空" : stage)}]/工序[{operationCode}]/设备[{resourceId}]/前后产品[{from}→{toMaterialId}]未维护Setup规则，本次按0分钟计算。",
             "WARNING", RuleMissingZeroFallbackType);
     }
 
@@ -168,34 +275,132 @@ public class SetupOptimizer
     /// r13376 落地）适配为运行时 EXACT/DEFAULT 查找字典。
     /// - 只取 IsActive 语义已由装载端保证（快照只含有效规则），此处按 RuleType 分流；
     /// - EXACT 要求 From/To 均有值，DEFAULT 忽略产品字段；
-    /// - 同键重复时取第一条（唯一性由 3号位 发布前冲突校验保证，Solver 不随机选规则——v1.2 §十）。
+    /// - **键含生产部门 + Stage**（0号位 R07R08 v1.1 第 3 条）；
+    /// - **禁止同 Run 静默首条覆盖**：同键异值 ⇒ 该键整条剔除并计数留样（见 <see cref="SetupRuleLoadReport"/>），
+    ///   不再用 `TryAdd` 吞掉后来者。同键同值属无害重复，只计数。
     /// </summary>
-    public static (Dictionary<SetupExactKey, decimal> Exact, Dictionary<SetupDefaultKey, decimal> Default) BuildRuleLookups(
+    public static (Dictionary<SetupExactKey, decimal> Exact, Dictionary<SetupDefaultKey, decimal> Default, SetupRuleLoadReport Report) BuildRuleLookups(
         IEnumerable<SetupTransitionRuleSnapshot>? rules)
     {
         var exact = new Dictionary<SetupExactKey, decimal>();
         var def = new Dictionary<SetupDefaultKey, decimal>();
+        var report = new SetupRuleLoadReport();
 
-        if (rules is null) return (exact, def);
+        // 已判定冲突的键：其后同键行一律不再写入（避免「先剔后补」把冲突键又装回去）
+        var exactConflicts = new HashSet<SetupExactKey>();
+        var defaultConflicts = new HashSet<SetupDefaultKey>();
+
+        if (rules is null) return (exact, def, report);
 
         foreach (var rule in rules)
         {
+            if (rule is null)
+            {
+                report.UnusableRowCount++;
+                continue;
+            }
+
+            var stage = rule.StageCode ?? string.Empty;
+
             if (string.Equals(rule.RuleType, "EXACT", StringComparison.Ordinal))
             {
                 if (rule.FromMaterialId is null || rule.ToMaterialId is null)
-                    continue;   // EXACT 缺产品 → 无效行，防御性跳过
+                {
+                    report.UnusableRowCount++;   // EXACT 缺产品 → 无效行，防御性跳过（计入，不静默）
+                    continue;
+                }
 
-                exact.TryAdd(new SetupExactKey(rule.OperationCode, rule.ResourceId, rule.FromMaterialId.Value, rule.ToMaterialId.Value),
-                    rule.SetupMinutes);
+                var key = new SetupExactKey(rule.ProductionDepartmentId, stage, rule.OperationCode,
+                    rule.ResourceId, rule.FromMaterialId.Value, rule.ToMaterialId.Value);
+
+                if (exactConflicts.Contains(key)) continue;
+
+                if (exact.TryGetValue(key, out var existing))
+                {
+                    if (existing == rule.SetupMinutes)
+                    {
+                        report.SameValueDuplicateCount++;
+                    }
+                    else
+                    {
+                        exact.Remove(key);
+                        exactConflicts.Add(key);
+                        report.ExactConflictKeyCount++;
+                        AddConflictExample(report, "EXACT", key.ProductionDepartmentId, stage, key.OperationCode,
+                            key.ResourceId, $"{key.FromMaterialId}→{key.ToMaterialId}", existing, rule.SetupMinutes);
+                    }
+                    continue;
+                }
+
+                exact[key] = rule.SetupMinutes;
             }
             else if (string.Equals(rule.RuleType, "DEFAULT", StringComparison.Ordinal))
             {
-                def.TryAdd(new SetupDefaultKey(rule.OperationCode, rule.ResourceId), rule.SetupMinutes);
+                var key = new SetupDefaultKey(rule.ProductionDepartmentId, stage, rule.OperationCode, rule.ResourceId);
+
+                if (defaultConflicts.Contains(key)) continue;
+
+                if (def.TryGetValue(key, out var existing))
+                {
+                    if (existing == rule.SetupMinutes)
+                    {
+                        report.SameValueDuplicateCount++;
+                    }
+                    else
+                    {
+                        def.Remove(key);
+                        defaultConflicts.Add(key);
+                        report.DefaultConflictKeyCount++;
+                        AddConflictExample(report, "DEFAULT", key.ProductionDepartmentId, stage, key.OperationCode,
+                            key.ResourceId, "—", existing, rule.SetupMinutes);
+                    }
+                    continue;
+                }
+
+                def[key] = rule.SetupMinutes;
             }
-            // 其它 RuleType 值不识别，防御性忽略。
+            else
+            {
+                report.UnusableRowCount++;   // 未知 RuleType，计入不识别行数（不静默）
+            }
         }
 
-        return (exact, def);
+        return (exact, def, report);
+    }
+
+    /// <summary>
+    /// 按「物料 + Stage」反查生产部门（Setup 键域含部门后用；表来自 <c>ConstraintContext.DepartmentByMaterialStage</c>，
+    /// 与既有部门锁定**同源**，不另造部门）。
+    /// 返回 null = 查不到 ⇒ 调用方交给 <see cref="ResolveSetupCore"/> 判 <see cref="SetupOutcome.SourceUnavailable"/>
+    /// （WARNING，**不猜部门、不冒充「无前态」**）。
+    /// </summary>
+    public static int? LookupDepartment(
+        IReadOnlyDictionary<(int MaterialId, string StageCode), int>? map,
+        int materialId,
+        string? stageCode)
+    {
+        if (map is null) return null;
+        return map.TryGetValue((materialId, stageCode ?? string.Empty), out var dept) ? dept : null;
+    }
+
+    /// <summary>冲突留样（最多 20 条）：把「哪个键、哪两个值」直接写进报告，供诊断定位到具体行。</summary>
+    private static void AddConflictExample(
+        SetupRuleLoadReport report,
+        string ruleType,
+        int productionDepartmentId,
+        string stageCode,
+        string operationCode,
+        int resourceId,
+        string fromTo,
+        decimal firstMinutes,
+        decimal secondMinutes)
+    {
+        if (report.ConflictExamples.Count >= 20) return;
+
+        report.ConflictExamples.Add(
+            $"{ruleType} 键冲突｜部门[{productionDepartmentId}] Stage[{(stageCode.Length == 0 ? "空" : stageCode)}]"
+            + $" 工序[{operationCode}] 设备[{resourceId}] 前后产品[{fromTo}]"
+            + $" ⇒ 出现两个不同值 {firstMinutes} / {secondMinutes}（该键已整条剔除，不取首条）");
     }
 
     /// <summary>
@@ -248,6 +453,8 @@ public class SetupOptimizer
         TimeSpan processDuration,
         int resourceId,
         string operationCode,
+        int? productionDepartmentId,
+        string? stageCode,
         int toMaterialId,
         ResourceProductTimeline timeline,
         IReadOnlyDictionary<SetupExactKey, decimal> exactRules,
@@ -255,7 +462,7 @@ public class SetupOptimizer
         Func<DateTime, TimeSpan, TimeWindow?> findSlot,
         int maxIterations = 3)
     {
-        var resolution = ResolveSetupCore(operationCode, resourceId,
+        var resolution = ResolveSetupCore(operationCode, productionDepartmentId, stageCode, resourceId,
             timeline.GetPrevMaterial(resourceId, floor), toMaterialId, exactRules, defaultRules);
 
         for (int i = 0; i < maxIterations; i++)
@@ -263,14 +470,26 @@ public class SetupOptimizer
             var slot = findSlot(floor, processDuration + TimeSpan.FromMinutes((double)resolution.SetupMinutes));
             if (slot == null) return null;
 
-            var atSlot = ResolveSetupCore(operationCode, resourceId,
+            var atSlot = ResolveSetupCore(operationCode, productionDepartmentId, stageCode, resourceId,
                 timeline.GetPrevMaterial(resourceId, slot.Value.Start), toMaterialId, exactRules, defaultRules);
 
             if (atSlot.SetupMinutes <= resolution.SetupMinutes)
             {
                 // 解析值 ≤ 搜索值：占用窗按真实 Setup 重算，必落在已验证的日历窗/空闲段内 → 收敛
-                var occ = new TimeWindow(slot.Value.Start,
-                    slot.Value.Start + TimeSpan.FromMinutes((double)atSlot.SetupMinutes) + processDuration);
+                //
+                // ── PV195 跨窗（2026-10-29）：**不许用 `Start + 分钟数` 重算终点** ──
+                //   `findSlot` 返回的是**真实墙钟**一段：单窗下 `End == Start + 搜索总时长`（逐位相等），
+                //   跨日历窗下 `End` 更大 —— 差额正是窗间非工作空档（本 Task 也占住，别的 Task 不得插入）。
+                //   旧写法按分钟数重算 ⇒ 跨窗槽被**截断**成 `Start + 100`% 的连续段
+                //   （实测：08:00~23:00 被改写成 08:00~18:00），占用图与 Task 时间同时错。
+                //   改成「从真实终点里**减掉 Setup 的收缩量**」：
+                //     · 单窗：`End − (搜索Setup − 真实Setup)` **恒等于**旧式 `Start + 真实Setup + processDuration`
+                //       ⇒ 既有结果逐位不变；
+                //     · 跨窗：终点在最后一个窗的**工作段内部**，少要 `Δ` 分钟就提前 `Δ` 分钟，口径正确；
+                //       若 `Δ` 大到跨回空档，结果是**多占**（保守方向：不会漏占、不会与他人重叠），
+                //       且这种情形极罕见（Setup 收缩 > 末窗已累计分钟）。
+                var shrink = TimeSpan.FromMinutes((double)(resolution.SetupMinutes - atSlot.SetupMinutes));
+                var occ = new TimeWindow(slot.Value.Start, slot.Value.End - shrink);
                 return (occ, atSlot.SetupMinutes, atSlot);
             }
 
@@ -280,8 +499,10 @@ public class SetupOptimizer
         // 有界未收敛：按最后解析值终搜一次
         var finalSlot = findSlot(floor, processDuration + TimeSpan.FromMinutes((double)resolution.SetupMinutes));
         if (finalSlot == null) return null;
-        var finalOcc = new TimeWindow(finalSlot.Value.Start,
-            finalSlot.Value.Start + TimeSpan.FromMinutes((double)resolution.SetupMinutes) + processDuration);
+        // 本次搜索与回填用的是**同一个** Setup ⇒ 无需收缩。旧式 `Start + Setup + processDuration`
+        //   在单窗下**恒等于** `finalSlot.End`（逐位相同）；跨窗下 `finalSlot.End` 才是真实墙钟终点
+        //   （旧式会把窗间空档抹掉，见上方收敛分支的 PV195 注释）。
+        var finalOcc = finalSlot.Value;
         return (finalOcc, resolution.SetupMinutes, resolution);
     }
 }
@@ -582,7 +803,8 @@ internal sealed class ResourceProductTimeline
     }
 
     /// <summary>
-    /// 上一相邻 Task 产品：最晚占用结束时间 ≤ occStart 者；null = 无可追溯上一产品（初始设备状态，Setup=0）。
+    /// 上一相邻 Task 产品：最晚占用结束时间 ≤ occStart 者；null = **未取到**上一产品
+    /// （可能是计划期首件，也可能是追溯断链，本查询无法区分 ⇒ 按初始设备状态处理，Setup=0）。
     /// 合并顺序与旧的单条有序 list **逐字等价**（见 <see cref="Compact"/> 的同 `End` 口径）。
     /// </summary>
     public int? GetPrevMaterial(int resourceId, DateTime occStart)

@@ -64,6 +64,10 @@ public class SyntheticSchedulingIntegrationTest
         services.AddSchedulingServices();
         services.AddBusinessRuleServices();
         services.AddApplicationServices();
+        // 生产组合根对齐（2026-10-29 A 类修复）：SchedulingOrchestrator 自 r13864 起吃 IPlanVersionRepository，
+        // 而本宿主从未调用 AddGovernanceRepositories ⇒ 解析 SchedulingOrchestrator 必抛 Unable to resolve。
+        // 该扩展只注册治理仓储，不含 IFrozenStrategySnapshotProvider / IDemandPriorityConfigProvider，故不影响下列 fixture 覆盖。
+        services.AddGovernanceRepositories();
         // 联调专用：测试库无真实 PUBLISHED 策略包，Fixture 仅测试用，不得进生产 DI。
         services.AddScoped<IDemandPriorityConfigProvider, DemandPriorityFixtureProvider>();
         services.AddScoped<IFrozenStrategySnapshotProvider, FrozenStrategySnapshotFixtureProvider>();

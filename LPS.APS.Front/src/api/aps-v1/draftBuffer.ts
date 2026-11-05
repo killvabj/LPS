@@ -24,6 +24,7 @@ import {
   lookupParameterLimits,
   type ParameterEnumOption
 } from './parameterSetEnums'
+import { findBlockField, isInertBlockField } from './parameterBlockFields'
 
 /* ===== 类型 ===== */
 
@@ -42,12 +43,18 @@ export interface ParameterRow {
   /** 当前值（primitive） */
   value: JsonValue
   /** 启发式推断的类型（用于 ElInput/ElSwitch/ElSelect 渲染） */
-  type: 'NUMBER' | 'BOOLEAN' | 'STRING' | 'PERCENT' | 'DURATION'
+  type: 'NUMBER' | 'BOOLEAN' | 'STRING' | 'PERCENT' | 'DURATION' | 'TEXT_LIST'
+  /** 中文标签（来自 `parameterBlockFields` 字段目录；目录外老键为 undefined） */
+  label?: string
   /** 内容层枚举可选项（有值时渲染下拉；value 是写回 JSON 的数字序号） */
   options?: readonly ParameterEnumOption[]
   /** 数值边界（后端发布校验口径；有值时 ElInputNumber 夹住） */
   min?: number
   max?: number
+  /** 数字步长（字段目录口径；缺省按 1） */
+  step?: number
+  /** 运行期无消费者（3号位 2026-10-26 核证口径）⇒ 行上标「暂未生效」 */
+  inert?: boolean
   /** 启发式推断是否敏感 */
   sensitive: boolean
   /** 启发式推断是否可编辑 */
@@ -59,7 +66,9 @@ export interface ParameterRow {
 /**
  * 把 5 主题 JSON 块展开成扁平参数行数组
  *  - 嵌套对象递归展开（path-based）
- *  - 数组类型标记为只读（不展开内容，避免误改）
+ *  - 数组默认整体只读（不展开内容，避免误改）；**例外**：字段目录声明为
+ *    `TEXT_LIST` 且确是字符串数组时，保留原数组并标 `TEXT_LIST`（表格里按「每行一项」编辑）
+ *  - 顺带带上字段目录里的中文标签 / 步长 / 边界 ⇒ 表格不必再自己查目录
  *  - 空对象/空数组 → 返回空数组
  */
 export function flattenBlocks(blocks: ParameterSetBlocks): ParameterRow[] {
@@ -67,30 +76,39 @@ export function flattenBlocks(blocks: ParameterSetBlocks): ParameterRow[] {
   for (const block of Object.keys(blocks) as BlockKey[]) {
     const obj = (blocks[block] ?? {}) as JsonObject
     walkObject(obj, [], (path, value) => {
-      // 数组只读：标记一整行（用户可在 UI 看到，但不可编辑）
+      const keyPath = path.join('.')
+      const def = findBlockField(block, keyPath)
+      // 数组：只有字段目录声明为「文本清单」且确是字符串数组时才可编辑，
+      //   其余数组（对象数组等）保持只读一行 JSON —— 通用单值控件表达不了。
       if (Array.isArray(value)) {
+        const isTextList = def?.kind === 'TEXT_LIST' && value.every((v) => typeof v === 'string')
         rows.push({
           block,
           path,
-          value: JSON.stringify(value),
-          type: 'STRING',
-          sensitive: isSensitive(path.join('.')),
-          editable: false
+          value: isTextList ? value : JSON.stringify(value),
+          type: isTextList ? 'TEXT_LIST' : 'STRING',
+          label: def?.label,
+          inert: isInertBlockField(block, keyPath),
+          sensitive: isSensitive(keyPath),
+          editable: isTextList ? isEditable(keyPath) : false
         })
         return
       }
-      // primitive 行
-      const limits = lookupParameterLimits(block, path)
+      // 边界：发布校验口径（parameterSetEnums）优先，字段目录补其余字段的 min/max/step
+      const limits = lookupParameterLimits(block, path) ?? { min: def?.min, max: def?.max }
       rows.push({
         block,
         path,
         value,
         type: inferType(path[path.length - 1] ?? '', value),
+        label: def?.label,
         options: lookupParameterEnum(block, path),
-        min: limits?.min,
-        max: limits?.max,
-        sensitive: isSensitive(path.join('.')),
-        editable: isEditable(path.join('.'))
+        min: limits.min,
+        max: limits.max,
+        step: def?.step,
+        inert: isInertBlockField(block, keyPath),
+        sensitive: isSensitive(keyPath),
+        editable: isEditable(keyPath)
       })
     })
   }
@@ -161,6 +179,53 @@ export function applyEdit(
   }
   const lastKey = row.path[row.path.length - 1]
   target[lastKey] = newValue
+}
+
+/* ===== 算法 2b: removePath — 按 path 删除字段 ===== */
+
+/**
+ * 按 path 删除 blocks 中指定字段（把键从块 JSON 里拿掉）
+ *  - **语义 = 回到后端 DTO 默认值**：键不在 JSON 里 ⇒ 后端反序列化时取 DTO 属性默认值
+ *    （不是「置空」，也不是「这条配置失效」）
+ *  - 删完父对象若空了 ⇒ 父对象一并删掉（不留 `{"Trigger":{}}` 这种空壳）
+ *  - 块根删空 ⇒ 块保持 `{}`；`buildPutBody` 会把空块发成 `undefined` ⇒ 该块不进快照
+ *    ⇒ **仍被 `EMPTY_*` 拦**（保住 3号位「没配 = 空块 = 拦发布」的不变量）
+ *  - path 为空 / 中间节点不是对象 / 叶子键不存在 → 抛错（不做静默兜底）
+ */
+export function removePath(blocks: ParameterSetBlocks, block: BlockKey, path: string[]): void {
+  if (path.length === 0) {
+    throw new Error('[removePath] invalid path: empty')
+  }
+  const root = blocks[block] as JsonObject
+  // 沿 path 钻到末级父节点，同时记下每一级（供删完后剪空壳）
+  const chain: Array<{ container: JsonObject; key: string }> = []
+  let target: JsonObject = root
+  for (let i = 0; i < path.length - 1; i++) {
+    const key = path[i]
+    const next = target[key]
+    if (next === undefined || next === null || typeof next !== 'object' || Array.isArray(next)) {
+      throw new Error(
+        `[removePath] intermediate node is not an object at "${path.slice(0, i + 1).join('.')}"`
+      )
+    }
+    chain.push({ container: target, key })
+    target = next as JsonObject
+  }
+  const lastKey = path[path.length - 1]
+  if (!Object.prototype.hasOwnProperty.call(target, lastKey)) {
+    throw new Error(`[removePath] key not found: ${path.join('.')}`)
+  }
+  delete target[lastKey]
+  // 自底向上剪掉变空的父对象（块根保留：块根空了就是空块）
+  for (let i = chain.length - 1; i >= 0; i--) {
+    const { container, key } = chain[i]
+    const child = container[key] as JsonObject
+    if (Object.keys(child).length === 0) {
+      delete container[key]
+    } else {
+      break
+    }
+  }
 }
 
 /* ===== 算法 3: buildPutBody — full-object PUT（显式 DRAFT） ===== */

@@ -38,7 +38,15 @@ public static class HangfireServiceExtensions
 
         services.AddHangfireServer(options =>
         {
-            options.WorkerCount = Environment.ProcessorCount * 2;
+            // WorkerCount = 同时执行的最大任务数。
+            // 原写 Environment.ProcessorCount * 2：部署机 96 逻辑核 ⇒ 192（Hangfire 自己在
+            // HangfireSchema.Server.Data 里记的就是 192）。但本系统只有 17 个错开的周期任务、
+            // 全仓无 BackgroundJob.Enqueue，这个上限永远用不到。
+            // 而挂起的 worker 与 HTTP 请求共用同一个 .NET 线程池，且每个并发任务各占一条 SQL 连接
+            //（APS 库 MaxPoolSize = 100）—— 是线程池与连接池的双重隐患。
+            // 改为读配置，默认 16；Clamp 作保险，配置写错也不会失控。
+            var workerCount = configuration.GetValue<int?>("Hangfire:WorkerCount") ?? 16;
+            options.WorkerCount = Math.Clamp(workerCount, 1, Math.Max(1, Environment.ProcessorCount * 2));
             options.Queues = new[] { "critical", "default", "low" };
             options.ServerName = $"APS-{Environment.MachineName}";
         });
@@ -56,18 +64,29 @@ public static class HangfireServiceExtensions
 
     /// <summary>
     /// 注册所有Hangfire定时任务（在 app.Build() 之后调用）
-    /// 开发环境：注册但使用永不触发的cron，仅支持 Dashboard 手动触发
-    /// 生产环境：使用真实cron自动执行
+    /// 开关：<c>Hangfire:CronEnabled</c>
+    ///   · 未配置 ⇒ 沿用环境判据（开发＝只注册不触发、生产＝真定时），行为与改造前一致
+    ///   · false  ⇒ 注册但一律写永不触发的cron，只能从 Dashboard 点 Trigger Now 手动跑
+    ///   · true   ⇒ 写真实cron，到点自动执行
+    /// 为什么要有这个开关：开发阶段后端虽然部署到生产机，但夜间流水线还不该自己跑起来。
+    /// 注意 <c>APS_Hangfire</c> 库是**多实例共享**的，cron 值存在库里（不是各实例各一份）——
+    /// 「哪个实例写了什么」= 最后启动的那个说的算，而到点触发则是**任何连着该库的实例都会做**。
+    /// ⇒ 该开关只能保证「写进去的是永不触发」，并不能把另一台实例挡在外面；
+    ///    开发机的 Hangfire 实例必须一并关掉，否则两台会互相覆盖、并可能出现双跑。
     /// </summary>
     public static WebApplication UseHangfireJobs(this WebApplication app)
     {
         var isDev = app.Environment.IsDevelopment();
 
+        // null ⇒ 未配置，回落到原环境判据；显式 false 才禁
+        var cronEnabled = app.Configuration.GetValue<bool?>("Hangfire:CronEnabled") ?? !isDev;
+        var mute = !cronEnabled;
+
         // ERP订单增量同步（生产：每小时整点）
         RecurringJob.AddOrUpdate<IERPOrderSyncService>(
             "erp-order-incremental-sync",
             service => service.IncrementalSyncAsync(CancellationToken.None),
-            isDev ? NeverFireCron : "0 * * * *",
+            mute ? NeverFireCron :"0 * * * *",
             new RecurringJobOptions { TimeZone = TimeZoneInfo.Local });
 
         // BOM展开请求推送（生产：每日00:00）
@@ -76,7 +95,7 @@ public static class HangfireServiceExtensions
         RecurringJob.AddOrUpdate<IBOMRequestService>(
             "bom-request-push",
             service => service.PushBOMRequestToODSAsync(CancellationToken.None),
-            isDev ? NeverFireCron : "0 0 * * *",
+            mute ? NeverFireCron :"0 0 * * *",
             new RecurringJobOptions { TimeZone = TimeZoneInfo.Local });
 
         // BOM批展开（生产：每日00:05）—— 调用 ODS 的 sp_ExpandBOMBatch_vNext，
@@ -89,7 +108,7 @@ public static class HangfireServiceExtensions
         RecurringJob.AddOrUpdate<IBomBatchExpandService>(
             "bom-batch-expand",
             service => service.ExpandNightBatchAsync(CancellationToken.None),
-            isDev ? NeverFireCron : "5 0 * * *",
+            mute ? NeverFireCron :"5 0 * * *",
             new RecurringJobOptions { TimeZone = TimeZoneInfo.Local });
 
         // 主数据同步-ERP（生产：每日00:10）— §2.4.3
@@ -97,7 +116,7 @@ public static class HangfireServiceExtensions
         RecurringJob.AddOrUpdate<IMasterDataSyncService>(
             "master-data-sync-erp",
             service => service.SyncERPMasterDataAsync(CancellationToken.None),
-            isDev ? NeverFireCron : "10 0 * * *",
+            mute ? NeverFireCron :"10 0 * * *",
             new RecurringJobOptions { TimeZone = TimeZoneInfo.Local });
 
         // 主数据同步-MES（生产：每日00:20）— §2.4.3
@@ -105,7 +124,7 @@ public static class HangfireServiceExtensions
         RecurringJob.AddOrUpdate<IMasterDataSyncService>(
             "master-data-sync-mes",
             service => service.SyncMESMasterDataAsync(CancellationToken.None),
-            isDev ? NeverFireCron : "20 0 * * *",
+            mute ? NeverFireCron :"20 0 * * *",
             new RecurringJobOptions { TimeZone = TimeZoneInfo.Local });
 
         // 资源主数据同步（生产：每日00:15）— v5.0.16 新增
@@ -115,7 +134,7 @@ public static class HangfireServiceExtensions
         RecurringJob.AddOrUpdate<IResourceSyncService>(
             "resource-sync",
             service => service.SyncAsync(CancellationToken.None),
-            isDev ? NeverFireCron : "15 0 * * *",
+            mute ? NeverFireCron :"15 0 * * *",
             new RecurringJobOptions { TimeZone = TimeZoneInfo.Local });
 
         // 工艺路线同步（生产：每日00:25）— 核心流程文档 §阶段1 00:15
@@ -124,27 +143,34 @@ public static class HangfireServiceExtensions
         RecurringJob.AddOrUpdate<IRoutingSyncService>(
             "routing-sync",
             service => service.SyncAllAsync(CancellationToken.None),
-            isDev ? NeverFireCron : "25 0 * * *",
+            mute ? NeverFireCron :"25 0 * * *",
             new RecurringJobOptions { TimeZone = TimeZoneInfo.Local });
 
-        // 库存同步（生产：每日00:35）— 五层库存架构 L1→L4 全链路
+        // 库存同步（生产：每日00:26）— 五层库存架构 L1→L4 全链路
         // ⚠️ 排在 master-data-sync-mes（00:20）之后，确保 MaterialMapping 就绪供 SourceID→MaterialCode 反查
-        // ⚠️ 排在 nightly-batch（00:30）之前/之后均可，但必须早于 scheduling（02:00）
+        // ⚠️ **必须早于 nightly-batch（00:30）**：Run 的 DataCutoffTime 由 nightly-batch 用 GETDATE() 锁死，
+        //   早于 cutoff 采集的库存/XC 才是「本 Run 截止时点之前的事实」；排在其后会让 Run 声明一个
+        //   自己并未遵守的截止时点（旧顺序 00:35/00:37 就是这样，靠闸门宽容才没炸）。
         // sp_SyncInventory → InventoryFact_ERP/MES → sp_RefreshInventoryBalance → InventoryBalance
         RecurringJob.AddOrUpdate<IInventorySyncService>(
             "inventory-sync",
             service => service.SyncAsync(CancellationToken.None),
-            isDev ? NeverFireCron : "35 0 * * *",
+            mute ? NeverFireCron :"26 0 * * *",
             new RecurringJobOptions { TimeZone = TimeZoneInfo.Local });
 
-        // PI 级 XC 快照同步（生产：每日00:37）— 冻结 `11 v2.5 §174/§175`、`08 §8a`
+        // PI 级 XC 快照同步（生产：每日00:28）— 冻结 `11 v2.5 §174/§175`、`08 §8a`
         // sp_SyncPiXcSnapshot：ODS PI 号别 XC 余额 → APS 本地 InventoryFact_PiXc（单批 TRUNCATE+INSERT）
         // ⚠️ 目的：Run 期读本批快照，**不再直连** `[mes]` 链接服务器（跨机超时/断链会拖垮整轮）
         // ⚠️ 失败不清表：保留上一批，由 Pegging 侧新鲜度闸门显式拦截，不把缺源当 XC=0
+        // ⚠️ **必须早于 nightly-batch（00:30）**，理由同上：闸门按 `DataCutoffTime − 24h` 判新鲜度，
+        //   快照若采在 cutoff 之后（旧值 00:37），闸门等于在用 7 分钟的时间差给「漏跑一晚」兜底 ——
+        //   那不是设计，是巧合，且会让 Run 声明 00:30 截止却含 00:37 的切片。
+        //   采在 cutoff 之前后，口径变成「本 Run 的 XC 一定是 cutoff 之前采的」，漏跑即拒（Fail Closed）。
+        //   瞬时失败由服务内建的 3 次重试吸收，不靠闸门宽容。
         RecurringJob.AddOrUpdate<IPiXcSnapshotSyncService>(
             "pi-xc-snapshot-sync",
             service => service.SyncAsync(CancellationToken.None),
-            isDev ? NeverFireCron : "37 0 * * *",
+            mute ? NeverFireCron :"28 0 * * *",
             new RecurringJobOptions { TimeZone = TimeZoneInfo.Local });
 
         // 夜间批次管道（生产：每日00:30）
@@ -152,7 +178,7 @@ public static class HangfireServiceExtensions
         RecurringJob.AddOrUpdate<INightlyBatchOrchestrator>(
             "nightly-batch",
             service => service.RunAsync(CancellationToken.None),
-            isDev ? NeverFireCron : "30 0 * * *",
+            mute ? NeverFireCron :"30 0 * * *",
             new RecurringJobOptions { TimeZone = TimeZoneInfo.Local });
 
         // MES快照 Step1：工单级快照（生产：每日00:40）
@@ -161,7 +187,7 @@ public static class HangfireServiceExtensions
         RecurringJob.AddOrUpdate<IMESSnapshotSyncService>(
             "mes-snapshot-workorder",
             service => service.SyncWorkOrderAsync(CancellationToken.None),
-            isDev ? NeverFireCron : "40 0 * * *",
+            mute ? NeverFireCron :"40 0 * * *",
             new RecurringJobOptions { TimeZone = TimeZoneInfo.Local });
 
         // MES快照 Step2：工序进度快照（生产：每日00:45）
@@ -169,7 +195,7 @@ public static class HangfireServiceExtensions
         RecurringJob.AddOrUpdate<IMESSnapshotSyncService>(
             "mes-snapshot-operation-progress",
             service => service.SyncOperationProgressAsync(CancellationToken.None),
-            isDev ? NeverFireCron : "45 0 * * *",
+            mute ? NeverFireCron :"45 0 * * *",
             new RecurringJobOptions { TimeZone = TimeZoneInfo.Local });
 
         // MES快照 Step3：大工艺进度快照（生产：每日00:50）
@@ -178,7 +204,7 @@ public static class HangfireServiceExtensions
         RecurringJob.AddOrUpdate<IMESSnapshotSyncService>(
             "mes-snapshot-stage-progress",
             service => service.SyncStageProgressAsync(CancellationToken.None),
-            isDev ? NeverFireCron : "50 0 * * *",
+            mute ? NeverFireCron :"50 0 * * *",
             new RecurringJobOptions { TimeZone = TimeZoneInfo.Local });
 
         // 管道供给同步（生产：每日00:55）— §6.6 SupplyFact_Pipeline
@@ -188,7 +214,7 @@ public static class HangfireServiceExtensions
         RecurringJob.AddOrUpdate<IPipelineSupplySyncService>(
             "pipeline-supply-sync",
             service => service.SyncAsync(CancellationToken.None),
-            isDev ? NeverFireCron : "55 0 * * *",
+            mute ? NeverFireCron :"55 0 * * *",
             new RecurringJobOptions { TimeZone = TimeZoneInfo.Local });
 
         // 跨域依赖静态扫描（生产：每日01:50）— §阶段0.5 / 走查文档 v3.3
@@ -199,7 +225,7 @@ public static class HangfireServiceExtensions
         RecurringJob.AddOrUpdate<IDomainDependencyScanService>(
             "domain-dependency-scan",
             service => service.ScanAsync(CancellationToken.None),
-            isDev ? NeverFireCron : "50 1 * * *",
+            mute ? NeverFireCron :"50 1 * * *",
             new RecurringJobOptions { TimeZone = TimeZoneInfo.Local });
 
         // 物料×阶段→默认生产部门 上下文重建（生产：每日01:55）— §4.3c MaterialStageDeptContext
@@ -209,7 +235,7 @@ public static class HangfireServiceExtensions
         RecurringJob.AddOrUpdate<IMaterialStageDeptContextRebuildService>(
             "material-stage-dept-context-rebuild",
             service => service.RebuildAsync(CancellationToken.None),
-            isDev ? NeverFireCron : "55 1 * * *",
+            mute ? NeverFireCron :"55 1 * * *",
             new RecurringJobOptions { TimeZone = TimeZoneInfo.Local });
 
         // 排程推演（生产：每日02:00）— §2.5.1 排程发令枪
@@ -217,7 +243,7 @@ public static class HangfireServiceExtensions
         RecurringJob.AddOrUpdate<ISchedulingOrchestrator>(
             "scheduling-trigger",
             service => service.RunSchedulingAutoAsync(CancellationToken.None),
-            isDev ? NeverFireCron : "0 2 * * *",
+            mute ? NeverFireCron :"0 2 * * *",
             new RecurringJobOptions { TimeZone = TimeZoneInfo.Local });
 
         return app;

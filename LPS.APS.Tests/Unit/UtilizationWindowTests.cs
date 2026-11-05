@@ -139,7 +139,7 @@ public class UtilizationWindowTests
                 new()
                 {
                     MaterialId = 1, ProductionDepartmentId = DeptId, RouteCode = "DEFAULT",
-                    OperationCode = OpCode, StageCode = Stage, StandardDuration = durationMinutes, SetupTime = 0m
+                    OperationCode = OpCode, StageCode = Stage, StandardDuration = durationMinutes * 60m, SetupTime = 0m
                 }
             },
             OperationResourceEligibility = new List<OperationResourceEligibility>

@@ -317,7 +317,7 @@ public class CrossMaterialTimingConstraintTests
             RouteCode = "DEFAULT",
             OperationCode = opCode,
             StageCode = stage,
-            StandardDuration = 60m,
+            StandardDuration = 60m * 60m,
             SetupTime = 0m
         }).ToList();
 

@@ -192,6 +192,80 @@ public class AllocationShareToleranceTests
     }
 
     // ════════════════════════════════════════════════════════════════════
+    //  3bis. ★2026-10-27 PV190 实跑回归：decimal **除不尽**造成的表示残渣
+    // ════════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// PV190 2026-10-27 **全程档实跑失败**的同型反例
+    /// （实跑原文：`Task 520bbfca… 的 ΣShare=44.3350000000 超过 Quantity=44.333333…`；
+    ///   `Allocation 39788: 闭合目标Q-U=266.0000000000, 末端构成合计=265.99999999999999999999999999`）。
+    ///
+    /// 构型：同一个 Allocation 下 2 个需求各 **133**（声明量 `Q = 266`，**精确**），
+    ///   摊到 6 个末端 Task 上每个 `133/3`（**除不尽**）⇒ `totalContribution` 累加后
+    ///   与 `closureTarget` 相差 **1e-26 级表示残渣** —— 是十进制表示问题，**不是业务数量差**。
+    ///
+    /// 修复前（`totalContribution == closureTarget` 用 decimal **精确**比较）：
+    ///   残渣让判据落空 ⇒ 掉进 `Math.Round(…, 3)` 分支 ⇒ 前 5 个 Task 各被量化，
+    ///   末位补差把整块量化残差压到第 6 个 Task ⇒ 它得到 `44.335 > 44.3333… + 0.001`
+    ///   ⇒ `ValidateHardResult` 第 3 项判 Domain 失败（**与实跑逐字同型**）。
+    /// 修复后（`IsRatioOne` 认 1e-26 为同值）：不做量化 ⇒ 逐 Task `ΣShare` 回到 `Quantity` 本身。
+    /// </summary>
+    [Fact]
+    public void 十进制表示残渣_不得被判成比例不为1()
+    {
+        var third = 133m / 3m;
+        var tasks = new List<FinalTaskDraft>
+        {
+            Task("D1a", "D1", third, 8),
+            Task("D1b", "D1", third, 9),
+            Task("D1c", "D1", third, 10),
+            Task("D2a", "D2", third, 11),
+            Task("D2b", "D2", third, 12),
+            Task("D2c", "D2", third, 13),
+        };
+        var request = new DomainSolveRequest
+        {
+            LogicalProductionDemands = new List<LogicalProductionDemand>
+            {
+                Demand("D1", 1L, 133m),
+                Demand("D2", 1L, 133m),
+            },
+        };
+
+        var shares = new PhaseFiveCompression()
+            .GenerateAllocationSharesForTest(tasks, request, new ConstraintContext(), new());
+
+        // (a) 逐 Allocation 的 Σ 仍精确 = 声明量 266（末位补差保证，与本修复无关）
+        Assert.Equal(266m, shares.Sum(s => s.ComponentQty));
+
+        // (b) ★ 逐 Task 的 Σ 必须与 `Quantity` 只差**十进制表示残渣**（≤1e-9），
+        //     不得是修复前那种 **0.0016667** 的量化漂移（修复前 D2c = 44.335）。
+        //     ⚠ 不能写成逐位相等：末位补差那一步在 28 位 decimal 上仍可能差 1e-27
+        //       （实测 D2c = 44.33333333333333333333333334 vs Quantity …333），那是表示问题不是业务差。
+        var byTask = shares
+            .GroupBy(s => s.FinalDraftId)
+            .ToDictionary(g => g.Key, g => g.Sum(s => s.ComponentQty));
+
+        foreach (var task in tasks)
+        {
+            Assert.True(
+                Math.Abs(byTask[task.FinalDraftId] - task.Quantity) <= 0.000000001m,
+                $"{task.FinalDraftId}: ΣShare={byTask[task.FinalDraftId]} vs Quantity={task.Quantity} "
+                + $"(差 {byTask[task.FinalDraftId] - task.Quantity})");
+        }
+
+        // (b2) 钉死判别器本体：修复前末位 Task 拿到 44.335，必须不再是那个值
+        Assert.NotEqual(44.335m, byTask["D2c"]);
+
+        // (c) 真实硬校验放行
+        var (isValid, error) = PhaseFiveCompression.ValidateHardResultForTest(
+            tasks, shares, new List<FinalTaskPeggingDraft>(), request, new ConstraintContext(),
+            new HashSet<string>(), new());
+
+        Assert.True(isValid, error);
+    }
+
+    // ════════════════════════════════════════════════════════════════════
     //  3. ★鉴别性：**修复前**的份额（逐条 3 位量化）必被硬校验拒绝
     // ════════════════════════════════════════════════════════════════════
 

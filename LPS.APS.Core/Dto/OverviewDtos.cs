@@ -174,3 +174,30 @@ public sealed class CandidateBriefDto
     /// <summary>变更资源个数（ChangedResourceIds **去重后**计数——资源数非任务数，勿与 TaskChangeSummary.ResourceChanged 混用）。JSON: changedResourceCount</summary>
     public int? ChangedResourceCount { get; init; }
 }
+
+/// <summary>
+/// 某计划版本实际涉及的对象级业务维度去重集合（R11-3b 三维 Scope 最小整改·对象级，0号位 裁决 v1.1）。
+/// 承载接口 <c>IOverviewQueryRepository.GetPlanVersionObjectScopeDimensionsAsync</c> 的返回值——
+/// 供激活/发布前按「真实变更范围」复核的对象级权限裁判（3号位 RunLifecycleService）取数。
+/// 命名空间 LPS.APS.Core.Dto；字段为 Id 值（调用方经主档换算 Code 后逐值 EnsureInScope）。
+/// </summary>
+public sealed class PlanVersionObjectScopeDimensions
+{
+    /// <summary>工厂主键去重集合（Order.FactoryId，主体计划厂）。不含 Pegging 引用外厂只读 Supply。</summary>
+    public IReadOnlyList<int> FactoryIds { get; init; } = [];
+
+    /// <summary>产品族主键去重集合（Order.ProductFamilyId）。</summary>
+    public IReadOnlyList<int> ProductFamilyIds { get; init; } = [];
+
+    /// <summary>
+    /// 生产部门主键去重集合（Task.ProductionDepartmentId，v5.0 真实生产部门）。
+    /// 语义：该列 DDL 可空（历史兼容）；NULL 部门 Task 不入本集合，其数量由 <see cref="NullDepartmentTaskCount"/> 单独回传。
+    /// </summary>
+    public IReadOnlyList<int> DepartmentIds { get; init; } = [];
+
+    /// <summary>
+    /// 该版本中 <c>ProductionDepartmentId</c> 为 NULL 的 Task 计数（历史数据可能逃过部门维度判定）。
+    /// 调用方据此记 Warning 或拒绝（本实现取 Warning，不静默）；0 表全非空、部门维度判定无漏检。
+    /// </summary>
+    public int NullDepartmentTaskCount { get; init; }
+}

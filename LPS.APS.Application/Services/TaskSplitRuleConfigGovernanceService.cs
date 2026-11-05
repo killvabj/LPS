@@ -31,6 +31,7 @@ public sealed class TaskSplitRuleConfigGovernanceService : ITaskSplitRuleConfigG
     private const string ActionCreate = "Create";
     private const string ActionUpdate = "Update";
     private const string ActionDeactivate = "Deactivate";
+    private const string ActionActivate = "Activate";
 
     /// <summary>
     /// 治理投影列（v5.1.10 收口①：不含 MaxOptimizationSplitCount/MaxBatchCandidates（1号位 Solver 技术预算）
@@ -374,6 +375,86 @@ WHERE Id = @Id";
             AllowSplit = existing.AllowSplit,
             AllowMerge = existing.AllowMerge,
             IsActive = false,
+            EffectiveFrom = existing.EffectiveFrom,
+            EffectiveTo = existing.EffectiveTo,
+            CreatedAt = existing.CreatedAt,
+            UpdatedAt = now,
+        };
+    }
+
+    /// <inheritdoc />
+    public async Task<TaskSplitRuleConfigDto> ActivateAsync(
+        int id, int actorUserId, string actorUserCode, CancellationToken ct = default)
+    {
+        if (id <= 0)
+        {
+            throw new ArgumentException("id 须大于 0。", nameof(id));
+        }
+
+        var existing = await GetByIdAsync(id);
+        if (existing is null)
+        {
+            throw new ResourceNotFoundException($"执行批拆分规则（TaskSplitRuleConfig.Id={id}）不存在。");
+        }
+
+        // 幂等：已启用状态再次激活 → 原样返回、不追加第二条审计（与停用后恢复语义一致，避免重复记录）。
+        if (existing.IsActive)
+        {
+            return existing;
+        }
+
+        // P1-01 同 Deactivate：NULL 部门历史记录无法按部门鉴权——仅 Global 可恢复启用（fail-closed）。
+        if (existing.ProductionDepartmentId is null)
+        {
+            throw new SetupRuleDataRedLineException(
+                "NULL 部门历史执行批拆分规则不可恢复启用——须先编辑补充部门（新发布有效规则必须明确部门）。");
+        }
+
+        await EnsureDepartmentScopeAsync(existing.ProductionDepartmentId.Value, actorUserId, ct);
+
+        // P1-03：审计前置预检（同 Create/Update/Deactivate，先于 DML，审计库不可写则整操作失败、业务零变更）。
+        await _auditLogRepository.EnsureWritableAsync(ct);
+
+        var now = DateTime.Now;
+        // P1-02：激活与 Create/Update 同竞态（A1 唯一有效期检查与 UPDATE 分离）——同样放入事务 +
+        // (MaterialId, DeptId) 应用锁串行化，避免恢复启用撞上另一条 IsActive=1 有效规则窗口。
+        await _connectionManager.ExecuteInTransactionAsync(async (conn, tx) =>
+        {
+            await AcquireExclusiveLockAsync(conn, tx, existing.MaterialId, existing.ProductionDepartmentId.Value);
+            await EnsureUniqueEffectiveWindowAsync(
+                conn, tx, existing.MaterialId, existing.ProductionDepartmentId.Value, existing.EffectiveFrom, existing.EffectiveTo, excludeId: id, ct);
+
+            await conn.ExecuteAsync(
+                "UPDATE TaskSplitRuleConfig SET IsActive = 1, UpdatedAt = @UpdatedAt WHERE Id = @Id",
+                new { UpdatedAt = now, Id = id },
+                tx);
+            return true;
+        }, DatabaseId.APS);
+
+        await _auditLogRepository.AddAsync(new AuditLog
+        {
+            ActionCode = ActionActivate,
+            EntityType = EntityTypeTaskSplitRuleConfig,
+            EntityId = id.ToString(),
+            OldValue = "Inactive",
+            NewValue = "Active",
+            UserId = actorUserId,
+            UserCode = actorUserCode,
+            OccurredAt = now,
+            Remark = $"恢复启用执行批拆分规则 [Material={existing.MaterialId}/Dept={existing.ProductionDepartmentId}]",
+        }, ct);
+
+        return new TaskSplitRuleConfigDto
+        {
+            Id = existing.Id,
+            MaterialId = existing.MaterialId,
+            ProductionDepartmentId = existing.ProductionDepartmentId,
+            MinExecutionBatchQty = existing.MinExecutionBatchQty,
+            MaxExecutionBatchQty = existing.MaxExecutionBatchQty,
+            PreferredBatchQty = existing.PreferredBatchQty,
+            AllowSplit = existing.AllowSplit,
+            AllowMerge = existing.AllowMerge,
+            IsActive = true,
             EffectiveFrom = existing.EffectiveFrom,
             EffectiveTo = existing.EffectiveTo,
             CreatedAt = existing.CreatedAt,

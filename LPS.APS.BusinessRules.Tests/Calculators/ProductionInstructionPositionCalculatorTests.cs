@@ -255,6 +255,471 @@ public class ProductionInstructionPositionCalculatorTests
         Assert.That(result.Issues.Any(i => i.IssueType == "XC_EXCEEDS_STAGE"), Is.False);
     }
 
+    /// <summary>
+    /// F04c（0号位 2026-10-27《R03-27-04》）：跨厂 XC（库存实际厂 ≠ PI 所属厂）
+    /// —— 位置照记（物理事实），并登记 XC_CROSS_FACTORY（WARN）；
+    /// 位置成立 ≠ 该厂可开工 ⇒ 不产 NextOperationContext；Σ 仍闭合到 ERP Remaining。
+    /// </summary>
+    [Test]
+    public async Task F04c_CrossFactoryXc_ShouldCreatePositionAndWarnIssue()
+    {
+        var input = new ProductionInstructionPositionInput
+        {
+            ProductionInstructionNo = "PI-F04C-001",
+            MaterialId = 1040,
+            MaterialCode = "MAT-F04C",
+            FactoryId = 1,
+            FactoryCode = "CN",
+            ErpRemainingQty = 100m,
+            XcFacts = new[]
+            {
+                new XcFact
+                {
+                    ProductionInstructionNo = "PI-F04C-001",
+                    FactoryCode = "BJ",                    // 库存实际厂=BJ，PI 归属厂=CN ⇒ 跨厂
+                    XcWarehouseCode = "010699",
+                    Quantity = 100m,
+                    SnapshotTime = new DateTime(2026, 10, 26, 22, 6, 0)
+                }
+            }
+        };
+
+        var results = await _calculator.CalculateProductionInstructionPositionsAsync(new[] { input }, new FrozenFactParameters(), CancellationToken.None);
+        var result = results.First();
+
+        // 位置照记：跨厂不剔除、不降级
+        var xc = result.Positions.Single(p => p.PositionType == PositionType.XC);
+        Assert.That(xc.Quantity, Is.EqualTo(100m));
+        Assert.That(xc.LocationKey, Is.EqualTo("010699"));
+
+        // 跨厂留痕：恰好一条 XC_CROSS_FACTORY，携带量
+        var crossIssues = result.Issues.Where(i => i.IssueType == "XC_CROSS_FACTORY").ToList();
+        Assert.That(crossIssues, Has.Count.EqualTo(1));
+        Assert.That(crossIssues[0].Level, Is.EqualTo(PositionIssueLevel.WARN));
+        Assert.That(crossIssues[0].AffectedQuantity, Is.EqualTo(100m));
+
+        // 位置成立 ≠ 开工起点：XC 不进 NextOperationContext（同厂也如此，跨厂不得新增）
+        Assert.That(result.NextOperationContexts, Is.Empty);
+
+        // 总量闭合不破
+        Assert.That(result.Positions.Sum(p => p.Quantity), Is.EqualTo(100m));
+        Assert.That(result.IsSuccess, Is.True);
+    }
+
+    /// <summary>
+    /// F04f（R03-27-04 §二.5 类④/⑤复合例）：同 PI 同厂＋异厂两行 —— 两位置片都在、
+    /// 仅异厂行出一条 Issue、Σ 守恒（不因跨厂输入增加任何总量）。
+    /// </summary>
+    [Test]
+    public async Task F04f_MixedFactoryXc_EachCrossRowOwnsIssue_ClosurePreserved()
+    {
+        var input = new ProductionInstructionPositionInput
+        {
+            ProductionInstructionNo = "PI-F04F-001",
+            MaterialId = 1046,
+            MaterialCode = "MAT-F04F",
+            FactoryId = 1,
+            FactoryCode = "CN",
+            ErpRemainingQty = 100m,
+            XcFacts = new[]
+            {
+                new XcFact
+                {
+                    ProductionInstructionNo = "PI-F04F-001",
+                    FactoryCode = "CN",                    // 同厂
+                    XcWarehouseCode = "510699",
+                    Quantity = 30m
+                },
+                new XcFact
+                {
+                    ProductionInstructionNo = "PI-F04F-001",
+                    FactoryCode = "BJ",                    // 异厂
+                    XcWarehouseCode = "010699",
+                    Quantity = 70m
+                }
+            }
+        };
+
+        var results = await _calculator.CalculateProductionInstructionPositionsAsync(new[] { input }, new FrozenFactParameters(), CancellationToken.None);
+        var result = results.First();
+
+        Assert.That(result.Positions.Count(p => p.PositionType == PositionType.XC), Is.EqualTo(2));
+
+        var crossIssues = result.Issues.Where(i => i.IssueType == "XC_CROSS_FACTORY").ToList();
+        Assert.That(crossIssues, Has.Count.EqualTo(1), "仅异厂行出 Issue，同厂行不得出");
+        Assert.That(crossIssues[0].AffectedQuantity, Is.EqualTo(70m));
+
+        Assert.That(result.Positions.Sum(p => p.Quantity), Is.EqualTo(100m));
+        Assert.That(result.IsSuccess, Is.True);
+    }
+
+    /// <summary>
+    /// F04g 护栏：同厂 XC 不得出 XC_CROSS_FACTORY（误报=污染 Issue 台账）。
+    /// </summary>
+    [Test]
+    public async Task F04g_SameFactoryXc_ShouldNotRaiseCrossFactoryIssue()
+    {
+        var input = new ProductionInstructionPositionInput
+        {
+            ProductionInstructionNo = "PI-F04G-001",
+            MaterialId = 1047,
+            FactoryCode = "CN",
+            ErpRemainingQty = 50m,
+            XcFacts = new[]
+            {
+                new XcFact
+                {
+                    ProductionInstructionNo = "PI-F04G-001",
+                    FactoryCode = "CN",
+                    XcWarehouseCode = "510699",
+                    Quantity = 50m
+                }
+            }
+        };
+
+        var results = await _calculator.CalculateProductionInstructionPositionsAsync(new[] { input }, new FrozenFactParameters(), CancellationToken.None);
+        var result = results.First();
+
+        Assert.That(result.Positions.Count(p => p.PositionType == PositionType.XC), Is.EqualTo(1));
+        Assert.That(result.Issues.Any(i => i.IssueType == "XC_CROSS_FACTORY"), Is.False);
+    }
+
+    /// <summary>
+    /// F04h 护栏：厂不明（XcFact.FactoryCode=null 或 input.FactoryCode 空）不参与判定、
+    /// 不出 Issue——订阅方构造的非 PI 级行/旧样本保持既有行为（R03-27-04 §二.2 只裁"有真实厂事实"的行）。
+    /// </summary>
+    [Test]
+    public async Task F04h_UnknownFactoryXc_ShouldNotRaiseCrossFactoryIssue()
+    {
+        var input = new ProductionInstructionPositionInput
+        {
+            ProductionInstructionNo = "PI-F04H-001",
+            MaterialId = 1048,
+            FactoryCode = "CN",
+            ErpRemainingQty = 50m,
+            XcFacts = new[]
+            {
+                new XcFact
+                {
+                    ProductionInstructionNo = "PI-F04H-001",
+                    FactoryCode = null,                    // 厂不明
+                    XcWarehouseCode = "XC-01",
+                    Quantity = 50m
+                }
+            }
+        };
+
+        var results = await _calculator.CalculateProductionInstructionPositionsAsync(new[] { input }, new FrozenFactParameters(), CancellationToken.None);
+        var result = results.First();
+
+        Assert.That(result.Positions.Count(p => p.PositionType == PositionType.XC), Is.EqualTo(1));
+        Assert.That(result.Issues.Any(i => i.IssueType == "XC_CROSS_FACTORY"), Is.False);
+    }
+
+    /// <summary>
+    /// F04i（0号位 2026-10-28《R03-27-04 新DTO最小联测》件2·轨迹2）：PI 号合法但 XC 源物料与
+    /// PI 物料不符（r13926 起该事实照入池、取舍归 5号位）——
+    /// 不得计为有效 XC 位置；差额经既有闭合落 UNLOCATED（复用优先）；
+    /// 另出一条可追溯 WARN（哪个仓、源物料 vs PI 物料、量），因既有 Issue 均不携带错配原因，
+    /// 属"实际不适配⇒最小自举"的新增码 XC_MATERIAL_MISMATCH。
+    /// </summary>
+    [Test]
+    public async Task F04i_SamePiForeignMaterialXc_ShouldNotCountAsValidXc()
+    {
+        var input = new ProductionInstructionPositionInput
+        {
+            ProductionInstructionNo = "PI-F04I-001",
+            MaterialId = 1049,
+            MaterialCode = "MAT-F04I",
+            FactoryId = 1,
+            FactoryCode = "CN",
+            ErpRemainingQty = 100m,
+            XcFacts = new[]
+            {
+                new XcFact
+                {
+                    ProductionInstructionNo = "PI-F04I-001",
+                    MaterialCode = "MAT-F04I",             // 物料相符
+                    FactoryCode = "CN",
+                    XcWarehouseCode = "510699",
+                    Quantity = 30m
+                },
+                new XcFact
+                {
+                    ProductionInstructionNo = "PI-F04I-001",
+                    MaterialCode = "MAT-OTHER-PI",         // PI号合法、源物料不符 ⇒ 不得计有效XC
+                    FactoryCode = "CN",
+                    XcWarehouseCode = "010699",
+                    Quantity = 40m
+                }
+            }
+        };
+
+        var results = await _calculator.CalculateProductionInstructionPositionsAsync(new[] { input }, new FrozenFactParameters(), CancellationToken.None);
+        var result = results.First();
+
+        // 有效 XC 位置只有一条（30），错配 40 不得成位
+        var xcPositions = result.Positions.Where(p => p.PositionType == PositionType.XC).ToList();
+        Assert.That(xcPositions, Has.Count.EqualTo(1));
+        Assert.That(xcPositions[0].LocationKey, Is.EqualTo("510699"));
+        Assert.That(xcPositions[0].Quantity, Is.EqualTo(30m));
+
+        // 可追溯异常：一条 XC_MATERIAL_MISMATCH（WARN），带源物料/PI物料/仓/量
+        var mismatches = result.Issues.Where(i => i.IssueType == "XC_MATERIAL_MISMATCH").ToList();
+        Assert.That(mismatches, Has.Count.EqualTo(1));
+        Assert.That(mismatches[0].Level, Is.EqualTo(PositionIssueLevel.WARN));
+        Assert.That(mismatches[0].AffectedQuantity, Is.EqualTo(40m));
+
+        // 闭合复用 UNLOCATED：错配份额落 UNLOCATED=70（100−30），Σ 仍等于 ERP Remaining
+        var unloc = result.Positions.Single(p => p.PositionType == PositionType.UNLOCATED);
+        Assert.That(unloc.Quantity, Is.EqualTo(70m));
+        Assert.That(result.Positions.Sum(p => p.Quantity), Is.EqualTo(100m));
+        Assert.That(result.IsSuccess, Is.True);
+    }
+
+    /// <summary>
+    /// F04j 护栏：源物料不明（XcFact.MaterialCode=null，订阅方旧构造/非PI级行）不参与比较、
+    /// 行为与 r13923 完全一致（位置保留、不出错配 Issue）——null=不明，不猜。
+    /// </summary>
+    [Test]
+    public async Task F04j_UnknownSourceMaterialXc_ShouldKeepLegacyBehavior()
+    {
+        var input = new ProductionInstructionPositionInput
+        {
+            ProductionInstructionNo = "PI-F04J-001",
+            MaterialId = 1050,
+            MaterialCode = "MAT-F04J",
+            FactoryId = 1,
+            FactoryCode = "CN",
+            ErpRemainingQty = 50m,
+            XcFacts = new[]
+            {
+                new XcFact
+                {
+                    ProductionInstructionNo = "PI-F04J-001",
+                    MaterialCode = null,                   // 源物料不明
+                    FactoryCode = "CN",
+                    XcWarehouseCode = "510699",
+                    Quantity = 50m
+                }
+            }
+        };
+
+        var results = await _calculator.CalculateProductionInstructionPositionsAsync(new[] { input }, new FrozenFactParameters(), CancellationToken.None);
+        var result = results.First();
+
+        Assert.That(result.Positions.Count(p => p.PositionType == PositionType.XC), Is.EqualTo(1));
+        Assert.That(result.Issues.Any(i => i.IssueType == "XC_MATERIAL_MISMATCH"), Is.False);
+    }
+
+    [Test]
+    public async Task F04k_FirstStageInProgressNotCompleted_ShouldProduceStageWaitingPosition()
+    {
+        // 2号位 10-31《Stage 部分完工态落 UNLOCATED》§3.4 样例 PI=17145065：
+        // Stage 层 GoodCompletedQty=0（整 Stage 未完工），但 4 道工步中 3 道已完工 30。
+        // 冻结《Pegging供需承接》§9.2「MACH未完成100」⇒ Stage 未完工量本身就是一个位置。
+        var input = new ProductionInstructionPositionInput
+        {
+            ProductionInstructionNo = "17145065",
+            MaterialId = 2001,
+            MaterialCode = "FINAL_FG-25A-MHZ2-10D",
+            FactoryId = 2,
+            ErpRemainingQty = 30m,
+            StageProgress = new[]
+            {
+                new StageProgressFact
+                {
+                    StageCode = "CN_ASSY", StageSequence = 10,
+                    PlannedQty = 30m, GoodCompletedQty = 0m, RemainingQty = 30m, SnapshotId = 1
+                }
+            },
+            StagePath = new[]
+            {
+                new StagePathFact { StageCode = "CN_ASSY", StageSequence = 10, IsStartStage = true }
+            },
+            OperationProgress = new[]
+            {
+                new OperationProgressFact
+                {
+                    OperationCode = "OP-1", OperationName = "滑台组装", StageCode = "CN_ASSY",
+                    MESWorkOrderNo = "WO-1", PlannedQty = 30m, GoodQty = 0m, RemainingQty = 30m
+                },
+                new OperationProgressFact
+                {
+                    OperationCode = "OP-2", OperationName = "前盖ASSY", StageCode = "CN_ASSY",
+                    MESWorkOrderNo = "WO-1", PlannedQty = 30m, GoodQty = 30m, RemainingQty = 0m
+                },
+                new OperationProgressFact
+                {
+                    OperationCode = "OP-3", OperationName = "主体Assy", StageCode = "CN_ASSY",
+                    MESWorkOrderNo = "WO-1", PlannedQty = 30m, GoodQty = 30m, RemainingQty = 0m
+                },
+                new OperationProgressFact
+                {
+                    OperationCode = "OP-4", OperationName = "组装", StageCode = "CN_ASSY",
+                    MESWorkOrderNo = "WO-1", PlannedQty = 30m, GoodQty = 30m, RemainingQty = 0m
+                }
+            }
+        };
+
+        var results = await _calculator.CalculateProductionInstructionPositionsAsync(
+            new[] { input }, new FrozenFactParameters(), CancellationToken.None);
+        var result = results.First();
+
+        Assert.That(result.IsSuccess, Is.True);
+        Assert.That(result.Positions.Any(p => p.PositionType == PositionType.UNLOCATED), Is.False,
+            "Stage 已开工未完工的存量不得落 UNLOCATED");
+
+        var stageWaiting = result.Positions.Single(p => p.PositionType == PositionType.STAGE_WAITING);
+        Assert.That(stageWaiting.StageCode, Is.EqualTo("CN_ASSY"));
+        Assert.That(stageWaiting.Quantity, Is.EqualTo(30m));
+    }
+
+    [Test]
+    public async Task F04l_FirstStageNotStarted_ShouldStayFirstStagePending()
+    {
+        // 无任何工步完工 ⇒ 仍是"首Stage待生产"，不得因残差项改判为 STAGE_WAITING
+        var input = new ProductionInstructionPositionInput
+        {
+            ProductionInstructionNo = "PI-F04L-001",
+            MaterialId = 1051,
+            FactoryId = 2,
+            ErpRemainingQty = 30m,
+            StageProgress = new[]
+            {
+                new StageProgressFact
+                {
+                    StageCode = "CN_ASSY", StageSequence = 10,
+                    PlannedQty = 30m, GoodCompletedQty = 0m, RemainingQty = 30m, SnapshotId = 1
+                }
+            },
+            StagePath = new[]
+            {
+                new StagePathFact { StageCode = "CN_ASSY", StageSequence = 10, IsStartStage = true }
+            },
+            OperationProgress = new[]
+            {
+                new OperationProgressFact
+                {
+                    OperationCode = "OP-1", OperationName = "滑台组装", StageCode = "CN_ASSY",
+                    MESWorkOrderNo = "WO-1", PlannedQty = 30m, GoodQty = 0m, RemainingQty = 30m
+                }
+            }
+        };
+
+        var results = await _calculator.CalculateProductionInstructionPositionsAsync(
+            new[] { input }, new FrozenFactParameters(), CancellationToken.None);
+        var result = results.First();
+
+        Assert.That(result.IsSuccess, Is.True);
+        Assert.That(result.Positions.Any(p => p.PositionType == PositionType.UNLOCATED), Is.False);
+        var pending = result.Positions.Single(p => p.PositionType == PositionType.FIRST_STAGE_PENDING);
+        Assert.That(pending.StageCode, Is.EqualTo("CN_ASSY"));
+        Assert.That(pending.Quantity, Is.EqualTo(30m));
+        Assert.That(result.Positions.Any(p => p.PositionType == PositionType.STAGE_WAITING), Is.False);
+    }
+
+    [Test]
+    public async Task F04m_FirstStageResidualExceedsRemaining_ShouldCapAndWarn()
+    {
+        // Stage 计划量(100) > PI 剩余量(60)：残差不得放大位置总量 ⇒ 封顶到 60 + WARN
+        var input = new ProductionInstructionPositionInput
+        {
+            ProductionInstructionNo = "PI-F04M-001",
+            MaterialId = 1052,
+            FactoryId = 2,
+            ErpRemainingQty = 60m,
+            StageProgress = new[]
+            {
+                new StageProgressFact
+                {
+                    StageCode = "CN_ASSY", StageSequence = 10,
+                    PlannedQty = 100m, GoodCompletedQty = 0m, RemainingQty = 100m, SnapshotId = 1
+                }
+            },
+            StagePath = new[]
+            {
+                new StagePathFact { StageCode = "CN_ASSY", StageSequence = 10, IsStartStage = true }
+            },
+            OperationProgress = new[]
+            {
+                new OperationProgressFact
+                {
+                    OperationCode = "OP-1", OperationName = "滑台组装", StageCode = "CN_ASSY",
+                    MESWorkOrderNo = "WO-1", PlannedQty = 100m, GoodQty = 20m, RemainingQty = 80m
+                }
+            }
+        };
+
+        var results = await _calculator.CalculateProductionInstructionPositionsAsync(
+            new[] { input }, new FrozenFactParameters(), CancellationToken.None);
+        var result = results.First();
+
+        Assert.That(result.IsSuccess, Is.True);
+        Assert.That(result.Positions.Sum(p => p.Quantity), Is.EqualTo(60m));
+        Assert.That(result.Issues.Any(i => i.IssueType == "QUANTITY_OVERFLOW"), Is.False);
+        var stageWaiting = result.Positions.Single(p => p.PositionType == PositionType.STAGE_WAITING);
+        Assert.That(stageWaiting.Quantity, Is.EqualTo(60m));
+        Assert.That(result.Issues.Any(i => i.IssueType == "FIRST_STAGE_RESIDUAL_CAPPED"), Is.True);
+    }
+
+    [Test]
+    public async Task F04n_FirstStageResidualWithXc_ShouldNotDoubleDeduct()
+    {
+        // 残差是"未完成"量、XC 是"已完成"量的另一位置：互不扣减，总量按闭合缺口分配
+        var input = new ProductionInstructionPositionInput
+        {
+            ProductionInstructionNo = "PI-F04N-001",
+            MaterialId = 1053,
+            MaterialCode = "MAT-F04N",
+            FactoryId = 2,
+            FactoryCode = "CN",
+            ErpRemainingQty = 30m,
+            StageProgress = new[]
+            {
+                new StageProgressFact
+                {
+                    StageCode = "CN_ASSY", StageSequence = 10,
+                    PlannedQty = 30m, GoodCompletedQty = 0m, RemainingQty = 30m, SnapshotId = 1
+                }
+            },
+            StagePath = new[]
+            {
+                new StagePathFact { StageCode = "CN_ASSY", StageSequence = 10, IsStartStage = true }
+            },
+            OperationProgress = new[]
+            {
+                new OperationProgressFact
+                {
+                    OperationCode = "OP-1", OperationName = "滑台组装", StageCode = "CN_ASSY",
+                    MESWorkOrderNo = "WO-1", PlannedQty = 30m, GoodQty = 10m, RemainingQty = 20m
+                }
+            },
+            XcFacts = new[]
+            {
+                new XcFact
+                {
+                    ProductionInstructionNo = "PI-F04N-001",
+                    MaterialCode = "MAT-F04N",
+                    FactoryCode = "CN",
+                    XcWarehouseCode = "010699",
+                    Quantity = 10m,
+                    RelatedStageCode = "CN_ASSY"
+                }
+            }
+        };
+
+        var results = await _calculator.CalculateProductionInstructionPositionsAsync(
+            new[] { input }, new FrozenFactParameters(), CancellationToken.None);
+        var result = results.First();
+
+        Assert.That(result.IsSuccess, Is.True);
+        Assert.That(result.Positions.Sum(p => p.Quantity), Is.EqualTo(30m));
+        Assert.That(result.Positions.Single(p => p.PositionType == PositionType.XC).Quantity, Is.EqualTo(10m));
+        Assert.That(result.Positions.Single(p => p.PositionType == PositionType.STAGE_WAITING).Quantity, Is.EqualTo(20m));
+        Assert.That(result.Positions.Any(p => p.PositionType == PositionType.UNLOCATED), Is.False);
+    }
+
     [Test]
     public async Task F05_TransitIndependent_ShouldNotOverlapStage()
     {
@@ -814,10 +1279,12 @@ public class ProductionInstructionPositionCalculatorTests
 
     /// <summary>
     /// U04（TECH-03 §八）：PI 剩余 600，但互斥位置算出 650（Stage S10=600 ＋ 异 Stage 的 XC=50 未被扣）。
-    /// 断言：不把较大的位置结果当成新 PI 总量（仍以入参 600 为准）；超量记 QUANTITY_OVERFLOW、不静默、不截断。
+    /// 断言（冻结 Pegging v1.6 §9.7／§18.1／§24 + TECH-03 U04「Issue/UNLOCATED 或冻结允许的保守降级」）：
+    /// 不扩大 PI 至 650；**该 PI 剩余整体降级为 UNLOCATED（=600）**；
+    /// QUANTITY_OVERFLOW 登记（超出量 50，错误不静默）；总量闭合 ⇒ IsSuccess=true，Domain 继续。
     /// </summary>
     [Test]
-    public async Task U04_ExclusivePositionsExceedErp_ShouldIssueOverflowNotSilent()
+    public async Task U04_ExclusivePositionsExceedErp_ShouldDowngradeWholePiToUnlocated()
     {
         var input = new ProductionInstructionPositionInput
         {
@@ -850,16 +1317,23 @@ public class ProductionInstructionPositionCalculatorTests
         var results = await _calculator.CalculateProductionInstructionPositionsAsync(new[] { input }, new FrozenFactParameters(), CancellationToken.None);
         var result = results.First();
 
-        // 超量：不静默、不截断，位置合计仍如实 = 650（异常由 Issue 暴露，而非被悄悄改小）
-        Assert.That(result.Positions.Sum(p => p.Quantity), Is.EqualTo(650m));
+        // 不扩大 PI 至 650、也不静默改小：整体降级为单条 UNLOCATED，数量 = PI 剩余 600
+        Assert.That(result.Positions.Count, Is.EqualTo(1));
+        var downgraded = result.Positions.Single();
+        Assert.That(downgraded.PositionType, Is.EqualTo(PositionType.UNLOCATED));
+        Assert.That(downgraded.Quantity, Is.EqualTo(600m));
+        Assert.That(downgraded.SourceKey, Is.EqualTo("OVERFLOW_DOWNGRADE"));
+        Assert.That(result.Positions.Any(p => p.PositionType == PositionType.STAGE_WAITING), Is.False);
+        Assert.That(result.Positions.Any(p => p.PositionType == PositionType.XC), Is.False);
 
         // 错误不静默：QUANTITY_OVERFLOW 登记，超出量 50
         var overflow = result.Issues.FirstOrDefault(i => i.IssueType == "QUANTITY_OVERFLOW");
         Assert.That(overflow, Is.Not.Null);
         Assert.That(overflow.AffectedQuantity, Is.EqualTo(50m));
 
-        // 总量不闭合到入参 600 ⇒ IsSuccess=false（不把 650 当成新 PI 总量）
-        Assert.That(result.IsSuccess, Is.False);
+        // 总量闭合（Σ=入参 600）⇒ Domain 继续（§18.1「单PI事实冲突」可降级）
+        Assert.That(result.Positions.Sum(p => p.Quantity), Is.EqualTo(600m));
+        Assert.That(result.IsSuccess, Is.True);
     }
 
     /// <summary>

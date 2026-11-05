@@ -17,7 +17,11 @@
 /* ===== 22 路由 meta（与 router/modules/aps.ts 严格一致；v1.4 加 strategy-profile；v1.5 加 setup/* 4 条；09-20 加 audit）===== */
 const ROUTES = [
   // 第一波（规则 / Domain）
-  { path: '/aps/rules', meta: { apsRequiredPermissions: ['aps.rule.edit', 'aps.rule.publish'] } },
+  // 2026-10-28（3号位 自裁 W-2）：放开 aps.rule.view 只读入口 ⇒ viewer 可进 /aps/rules 只读
+  {
+    path: '/aps/rules',
+    meta: { apsRequiredPermissions: ['aps.rule.view', 'aps.rule.edit', 'aps.rule.publish'] }
+  },
   { path: '/aps/domain', meta: { apsRequiredRoles: ['aps.admin.system'] } },
   // 第二波（PMC 写操作）
   { path: '/aps/ctp', meta: { apsRequiredPermissions: ['aps.ctp.evaluate'] } },
@@ -43,11 +47,11 @@ const ROUTES = [
   // v1.5 Setup 专项：4 条 setup 路由（页面 2.1-2.4；2.5 红线为组件无路由）
   {
     path: '/aps/setup/exact',
-    meta: { apsRequiredPermissions: ['aps.setup.view', 'aps.setup.edit', 'aps.setup.publish'] }
+    meta: { apsRequiredPermissions: ['aps.setup.view', 'aps.setup.edit'] }
   },
   {
     path: '/aps/setup/default',
-    meta: { apsRequiredPermissions: ['aps.setup.view', 'aps.setup.edit', 'aps.setup.publish'] }
+    meta: { apsRequiredPermissions: ['aps.setup.view', 'aps.setup.edit'] }
   },
   {
     path: '/aps/setup/uncovered',
@@ -55,7 +59,7 @@ const ROUTES = [
   },
   {
     path: '/aps/setup/diff',
-    meta: { apsRequiredPermissions: ['aps.setup.view', 'aps.setup.publish'] }
+    meta: { apsRequiredPermissions: ['aps.setup.view'] }
   },
   // Pkg-8：RBAC 管理 UI（仅 aps.admin.system — 持 aps.auth.user.edit）
   { path: '/aps/rbac-users', meta: { apsRequiredPermissions: ['aps.auth.user.edit'] } },
@@ -192,7 +196,8 @@ function isRouteAllowed(meta, ctx) {
 const EXPECTED = {
   // 第一波（规则 / Domain）
   '/aps/rules': {
-    'aps.viewer.management': false,
+    // 2026-10-28（3号位 自裁 W-2）：放开 aps.rule.view 只读入口 ⇒ viewer 放行（页内只读）
+    'aps.viewer.management': true,
     'aps.planner': false,
     'aps.admin.aps': true,
     'aps.admin.system': true

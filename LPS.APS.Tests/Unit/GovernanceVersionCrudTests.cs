@@ -827,4 +827,122 @@ public class GovernanceVersionCrudTests
             ["SolverStrategy"] = new { Mode = "NORMAL" },
             ["CandidateGuardrail"] = new { Guardrail = "NORMAL" }
         });
+
+    // ==================== P0-B（2026-10-27）：Setup 冲突校验收拢——统一发布路径冲突分类 422 ====================
+
+    /// <summary>构造含 DemandPriority + 指定 SetupTransitionRules 子块的 ContentSnapshotJson（真实 DB 持久化载体形态）。</summary>
+    private static string SnapshotWithSetupRules(object[]? setupRules) =>
+        System.Text.Json.JsonSerializer.Serialize(new Dictionary<string, object>
+        {
+            ["DemandPriority"] = System.Text.Json.JsonSerializer.Deserialize<System.Text.Json.JsonElement>(
+                System.Text.Json.JsonSerializer.Serialize(new LPS.APS.Core.Dto.DemandPriorityBlock
+                {
+                    Segments =
+                    [
+                        new LPS.APS.Core.Dto.PrioritySegment
+                        {
+                            SegmentOrder = 1,
+                            SegmentName = "P0B",
+                            IsEnabled = true,
+                            MatchConditions =
+                            [
+                                new LPS.APS.Core.Dto.SegmentMatchCondition
+                                {
+                                    Field = LPS.APS.Core.Dto.DemandField.OrderType,
+                                    Operator = LPS.APS.Core.Dto.ConditionOperator.Equals,
+                                    Value = "SO"
+                                }
+                            ],
+                            SortFields =
+                            [
+                                new LPS.APS.Core.Dto.SegmentSortField
+                                {
+                                    Field = LPS.APS.Core.Dto.DemandField.DueDate,
+                                    Direction = LPS.APS.Core.Dto.SortDirection.Asc
+                                }
+                            ]
+                        }
+                    ]
+                })),
+            ["SetupTransitionRules"] = setupRules ?? Array.Empty<object>()
+        });
+
+    /// <summary>P0-B 负例：统一发布含同键冲突的 Setup 子块 —— 发布前校验抛 SetupRuleDataRedLineException（422 语义，不入 400）。</summary>
+    [Fact]
+    public async Task PublishRuleSet_Setup同键冲突_抛SetupRuleDataRedLineException()
+    {
+        // Arrange —— DRAFT 版本其 ContentSnapshotJson 含两个同键 EXACT（部门+大工艺+工序+设备+前产品+后产品 相同）→ 冲突
+        var version = new RuleSetVersion
+        {
+            Id = 1,
+            RuleSetId = 10,
+            VersionCode = "V1",
+            Status = GovernanceVersionStatus.Draft,
+            ContentSnapshotJson = SnapshotWithSetupRules(
+            [
+                new LPS.APS.Core.Entities.APS.SetupTransitionRule
+                {
+                    RuleType = LPS.APS.Core.Entities.APS.SetupTransitionRuleType.Exact,
+                    ProductionDepartmentId = 1, StageCode = "SMT", OperationCode = "OP10",
+                    ResourceId = 100, FromMaterialId = 1, ToMaterialId = 2,
+                    SetupMinutes = 30, IsActive = true
+                },
+                new LPS.APS.Core.Entities.APS.SetupTransitionRule
+                {
+                    RuleType = LPS.APS.Core.Entities.APS.SetupTransitionRuleType.Exact,
+                    ProductionDepartmentId = 1, StageCode = "SMT", OperationCode = "OP10",
+                    ResourceId = 100, FromMaterialId = 1, ToMaterialId = 2,
+                    SetupMinutes = 45, IsActive = true
+                }
+            ])
+        };
+        _ruleSetRepo.Setup(r => r.GetByIdAsync(1, It.IsAny<CancellationToken>())).ReturnsAsync(version);
+
+        // Act —— 统一发布路径（GovernanceController → PublishRuleSetVersionAsync → Validate 冲突拦截）
+        var act = () => _service.PublishRuleSetVersionAsync(1, "pub", ActorUserId);
+
+        // Assert —— 抛 SetupRuleDataRedLineException（Web 层映射 422），而非 InvalidOperationException（400）
+        await act.Should().ThrowAsync<LPS.APS.Core.Exceptions.SetupRuleDataRedLineException>();
+        version.Status.Should().Be(GovernanceVersionStatus.Draft, "冲突校验失败不得置 PUBLISHED");
+    }
+
+    /// <summary>P0-B 正例对照：统一发布 Setup 子块无冲突 —— 校验通过，版本转 PUBLISHED（回归不破坏合法发布）。</summary>
+    [Fact]
+    public async Task PublishRuleSet_Setup子块无冲突_校验通过转PUBLISHED()
+    {
+        // Arrange —— DRAFT 版本含不冲突的 DEFAULT + EXACT 各一，无同键碰撞
+        var version = new RuleSetVersion
+        {
+            Id = 2,
+            RuleSetId = 10,
+            VersionCode = "V2",
+            Status = GovernanceVersionStatus.Draft,
+            ContentSnapshotJson = SnapshotWithSetupRules(
+            [
+                new LPS.APS.Core.Entities.APS.SetupTransitionRule
+                {
+                    RuleType = LPS.APS.Core.Entities.APS.SetupTransitionRuleType.Default,
+                    ProductionDepartmentId = 1, StageCode = "SMT", OperationCode = "OP10",
+                    ResourceId = 100, SetupMinutes = 15, IsActive = true
+                },
+                new LPS.APS.Core.Entities.APS.SetupTransitionRule
+                {
+                    RuleType = LPS.APS.Core.Entities.APS.SetupTransitionRuleType.Exact,
+                    ProductionDepartmentId = 1, StageCode = "SMT", OperationCode = "OP10",
+                    ResourceId = 100, FromMaterialId = 1, ToMaterialId = 2,
+                    SetupMinutes = 30, IsActive = true
+                }
+            ])
+        };
+        _ruleSetRepo.Setup(r => r.GetByIdAsync(2, It.IsAny<CancellationToken>())).ReturnsAsync(version);
+        _ruleSetRepo.Setup(r => r.UpdateAsync(It.IsAny<RuleSetVersion>(), It.IsAny<CancellationToken>()))
+            .Returns(Task.CompletedTask);
+        _auditRepo.Setup(a => a.EnsureWritableAsync(It.IsAny<CancellationToken>())).Returns(Task.CompletedTask);
+
+        // Act —— 统一发布路径
+        await _service.PublishRuleSetVersionAsync(2, "pub", ActorUserId);
+
+        // Assert —— 无冲突则正常发布，状态转 PUBLISHED
+        version.Status.Should().Be(GovernanceVersionStatus.Published);
+    }
 }

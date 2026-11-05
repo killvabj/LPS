@@ -13,15 +13,17 @@
           仅当**三级计算后仍无权威合法窗口**才判不可排
         · 因此本页「未铺窗口」提示只能陈述本级事实，不得断言该资源不可排
         · 三级合并状态端点 **5号位 已于 2026-10-14 落地**
-          （`GET /api/resource-calendar/resolve-preview`，dev 实测 200；RC25b 动态探针守门）；
-          本页仍按「本级事实」表述 —— 是否有可排窗口由厂商/部门上级继承决定，
-          页面不重复判定，也不伪造三态
+          （`GET /api/resource-calendar/resolve-preview`，dev 实测 200；RC25b 动态探针守门）
+    - 冻结 13 v1.8:31：资源日历须明文展示「继承上级 / 本级明确工作 / 本级明确不工作」及**来源授权**
+      → 本页两个 Tab 各挂一块「三级合并后可排时段」（只读，ResolvePreviewPanel 组件）
     - 5号位 2026-09-24《ResourceCalendar与ManualCapacity接口对接函》（9 端点 / 6 权限码）
 
   页面结构：
     Tab1 设备资源日历：资源选择（资源主表 /api/resource 正式端点）→ 窗口列表 → 新增一段 / 批量铺窗 / 删窗
+                       → 三级合并后可排时段（设备侧 resolve-preview）
     Tab2 人工能力槽  ：部门/工序过滤 + 含软删开关 → 主档列表 → 新增 / 查看窗口 / 铺窗 / 软删
     Tab3 人工槽日历  ：由 Tab2 选中行驱动 → 窗口列表 → 新增一段 / 批量铺窗 / 删窗
+                       → 三级合并后可排时段（人工槽侧 resolve-preview，5号位 10-23 落码 / 10-26 上 dev）
 
   2026-10-14「放开一天多条」方向2（5号位 回执《放开一天多条已落地》）：
     - 同一天可登记多个**不重叠**时段（如上午 08-12 + 下午 13-17）
@@ -52,7 +54,6 @@ import {
   ElAlert,
   ElButton,
   ElCard,
-  ElDatePicker,
   ElDropdown,
   ElDropdownItem,
   ElDropdownMenu,
@@ -77,8 +78,6 @@ import {
   CALENDAR_CONFIG_META,
   type BulkWindowDraft,
   type CalendarConfigStatus,
-  type ResolveStatus,
-  type ResolveWindowSource,
   type ManualCapacitySlotDto,
   type ManualSlotCalendarDto,
   type ManualSlotDraft,
@@ -91,6 +90,7 @@ import { useResourceCalendarStore } from '@/store/modules/aps/resourceCalendar'
 import CalendarBulkDialog from './components/CalendarBulkDialog.vue'
 import CalendarSingleWindowDialog from './components/CalendarSingleWindowDialog.vue'
 import ManualSlotCreateDialog from './components/ManualSlotCreateDialog.vue'
+import ResolvePreviewPanel from './components/ResolvePreviewPanel.vue'
 
 const apsAuth = useApsAuthStore()
 const store = useResourceCalendarStore()
@@ -106,6 +106,8 @@ const {
   deviceCalendarStatus,
   resolvePreview,
   resolveLoading,
+  manualResolvePreview,
+  manualResolveLoading,
   slots,
   slotTotal,
   slotPage,
@@ -189,39 +191,18 @@ async function pickResource(resourceId: number): Promise<void> {
 }
 
 /* ===== 三级合并后可排时段（5号位 resolve-preview，只读） =====
- *  冻结 13 v1.8:31 要求「明确显示『继承上级 / 本级明确工作 / 本级明确不工作』及来源」。
+ *  冻结 13 v1.8:31 要求「明确显示『继承上级 / 本级明确工作 / 本级明确不工作』及来源授权」。
  *  本级窗口表看不到继承来的时段，故单独一块展示合并结果：
  *    status=WORK    → 看每片的 source（Factory/Department=继承上级，Resource=本级）
  *    status=OFF     → 本级明确停机（显式关闭/维修，不会被上级复活）
  *    status=MISSING → 本级没登记，且没从上级解析出窗口
- *  ⚠️ 端点只接受设备 id，无人工槽版本 → 仅 Tab1 展示。
+ *  设备侧端点 GET /api/resource-calendar/resolve-preview；
+ *  人工槽侧端点 GET /api/manual-capacity/resolve-preview（5号位 10-23 落码 / 10-26 上 dev）
+ *  —— 两者后端 DTO 同构，页面共用 ResolvePreviewPanel 组件（口径不许两边各写一套）。
  */
 const resolveRange = ref<[string, string] | undefined>(undefined)
-const resolveStatusMeta: Record<
-  ResolveStatus,
-  { label: string; tag: 'success' | 'danger' | 'info'; desc: string }
-> = {
-  WORK: { label: '可排', tag: 'success', desc: '三级合并后存在合法可排时段' },
-  OFF: {
-    label: '本级明确停机',
-    tag: 'danger',
-    desc: '本级显式关闭/维修，上级开放也不会复活'
-  },
-  MISSING: {
-    label: '未登记',
-    tag: 'info',
-    desc: '本级没登记，也没从工厂/部门继承到窗口'
-  }
-}
-
-const resolveSourceMeta: Record<
-  ResolveWindowSource,
-  { label: string; tag: 'warning' | 'primary' }
-> = {
-  Factory: { label: '继承自工厂', tag: 'warning' },
-  Department: { label: '继承自部门', tag: 'warning' },
-  Resource: { label: '本级', tag: 'primary' }
-}
+/** 人工槽侧的查询区间（与设备侧独立，切槽不互相影响） */
+const manualResolveRange = ref<[string, string] | undefined>(undefined)
 
 /** 默认区间：今天 ~ 今天+30 天（后端必填；endDate 含末日） */
 function defaultResolveRange(): [string, string] {
@@ -242,33 +223,24 @@ async function loadResolvePreview(): Promise<void> {
   await store.loadResolvePreview(id, startDate, endDate)
 }
 
-function onResolveRangeChange(v: [string, string] | null | undefined): void {
-  resolveRange.value = v ?? undefined
+function onResolveRangeChange(v: [string, string] | undefined): void {
+  resolveRange.value = v
   if (v) void loadResolvePreview()
 }
 
-/** 同一日内只显示 "08:00 ~ 17:00"；跨日才显示完整时间（窗口本不应跨天，兜底但不误导） */
-function resolveWindowRange(w: { start?: string; end?: string }): string {
-  if (!w?.start || !w?.end) return '—'
-  const sameDay = w.start.slice(0, 10) === w.end.slice(0, 10)
-  return sameDay
-    ? `${w.start.slice(11, 16)} ~ ${w.end.slice(11, 16)}`
-    : `${fmt(w.start)} ~ ${fmt(w.end)}`
+/** 人工槽版三级合并预览（只读；越界槽后端 fail-closed 剔除 ⇒ 查不到即空态） */
+async function loadManualResolvePreview(): Promise<void> {
+  const id = currentSlotId.value
+  if (id == null) return
+  if (!manualResolveRange.value) manualResolveRange.value = defaultResolveRange()
+  const [startDate, endDate] = manualResolveRange.value
+  await store.loadManualResolvePreview(id, startDate, endDate)
 }
 
-/** 预计算渲染行：表格用 prop 直接取字段，不依赖单元格里调用函数/查表（任一环节取不到值都会整行空白） */
-const resolveRows = computed(() =>
-  (resolvePreview.value?.windows ?? []).map((w, i) => {
-    const src = resolveSourceMeta[w.source]
-    return {
-      key: i,
-      date: w.start ? w.start.slice(0, 10) : '—',
-      timeLabel: resolveWindowRange(w),
-      sourceLabel: src?.label ?? w.source ?? '—',
-      sourceTag: src?.tag ?? ('info' as const)
-    }
-  })
-)
+function onManualResolveRangeChange(v: [string, string] | undefined): void {
+  manualResolveRange.value = v
+  if (v) void loadManualResolvePreview()
+}
 
 function openDeviceDialog(): void {
   if (currentResourceId.value == null) {
@@ -434,6 +406,7 @@ async function submitCreateSlot(draft: ManualSlotDraft): Promise<void> {
 /** 查看某人工槽窗口 → 载入并跳 Tab3 */
 async function viewSlotWindows(row: ManualCapacitySlotDto): Promise<void> {
   await store.loadSlotWindows(row.manualSlotId)
+  await loadManualResolvePreview()
   activeTab.value = 'manual-calendar'
   loadedTabs.value.add('manual-calendar')
 }
@@ -465,6 +438,14 @@ async function bulkForSlot(row: ManualCapacitySlotDto): Promise<void> {
 /* ===== Tab3：人工槽日历 ===== */
 const slotBulkDialogVisible = ref(false)
 
+/** Tab3 顶部「刷新」：本级窗口 + 三级合成结果一起重取（两者口径必须同步） */
+async function refreshSlotWindows(): Promise<void> {
+  const id = currentSlotId.value
+  if (id == null) return
+  await store.loadSlotWindows(id)
+  await loadManualResolvePreview()
+}
+
 function openSlotBulkDialog(): void {
   if (currentSlotId.value == null) return
   if (currentSlot.value && !currentSlot.value.isActive) {
@@ -489,6 +470,7 @@ async function submitSlotBulk(draft: BulkWindowDraft): Promise<void> {
   if (inserted != null) {
     ElMessage.success(`已生成 ${inserted} 条人工槽窗口`)
     slotBulkDialogVisible.value = false
+    await loadManualResolvePreview()
   }
 }
 
@@ -516,6 +498,7 @@ async function submitSlotSingle(payload: {
   if (newId != null) {
     ElMessage.success(`已新增一段人工槽时段（编号 ${newId}）`)
     slotSingleDialogVisible.value = false
+    await loadManualResolvePreview()
   }
 }
 
@@ -527,7 +510,10 @@ async function removeSlotWindow(row: ManualSlotCalendarDto): Promise<void> {
   ).catch(() => false)
   if (!ok) return
   const done = await store.removeSlotWindow(row.id, row.manualSlotId)
-  if (done) ElMessage.success('人工槽窗口已删除')
+  if (done) {
+    ElMessage.success('人工槽窗口已删除')
+    await loadManualResolvePreview()
+  }
 }
 
 const currentSlotLabel = computed<string>(() => {
@@ -816,88 +802,14 @@ onBeforeUnmount(() => {
             />
 
             <!-- ===== 三级合并后可排时段（本级表看不到继承来的时段，故单独展示） ===== -->
-            <div class="rc-resolve">
-              <div class="rc-resolve-head">
-                <ElTag
-                  v-if="resolvePreview"
-                  :type="resolveStatusMeta[resolvePreview.status].tag"
-                  size="small"
-                  effect="light"
-                >
-                  {{ resolveStatusMeta[resolvePreview.status].label }}
-                </ElTag>
-                <span class="rc-resolve-title">三级合并后可排时段</span>
-                <span v-if="resolvePreview?.hasAnyWindow" class="rc-resolve-count">
-                  {{ resolvePreview.windows.length }} 段
-                </span>
-
-                <span class="rc-resolve-spacer"></span>
-
-                <ElDatePicker
-                  v-model="resolveRange"
-                  class="rc-resolve-range"
-                  type="daterange"
-                  value-format="YYYY-MM-DD"
-                  range-separator="~"
-                  start-placeholder="开始"
-                  end-placeholder="结束"
-                  :clearable="false"
-                  size="small"
-                  @change="onResolveRangeChange"
-                />
-                <ElButton size="small" text :loading="resolveLoading" @click="loadResolvePreview">
-                  刷新
-                </ElButton>
-              </div>
-
-              <div v-loading="resolveLoading" class="rc-resolve-body">
-                <ElEmpty
-                  v-if="!resolvePreview"
-                  description="选择设备后展示工厂 / 部门 / 本级合并后的可排时段"
-                  :image-size="50"
-                />
-                <div v-else-if="!resolvePreview.hasAnyWindow" class="rc-resolve-empty">
-                  <ElTag
-                    :type="resolvePreview.status === 'OFF' ? 'danger' : 'info'"
-                    size="small"
-                    effect="plain"
-                  >
-                    {{ resolveStatusMeta[resolvePreview.status].label }}
-                  </ElTag>
-                  <span>
-                    {{
-                      resolvePreview.status === 'OFF'
-                        ? '本级已显式关闭／维修，即使工厂或部门开放也不会被复活。'
-                        : '本级没登记，工厂和部门也没开放窗口 —— 不补默认 8 小时。'
-                    }}
-                  </span>
-                </div>
-                <template v-else>
-                  <div class="rc-resolve-scroll">
-                    <ElTable
-                      :data="resolveRows"
-                      size="small"
-                      border
-                      row-key="key"
-                      style="width: 100%"
-                    >
-                      <ElTableColumn prop="date" label="日期" width="120" />
-                      <ElTableColumn prop="timeLabel" label="时段" min-width="140" />
-                      <ElTableColumn prop="sourceLabel" label="来源" width="120">
-                        <template #default="{ row }">
-                          <ElTag :type="row.sourceTag" size="small" effect="plain">
-                            {{ row.sourceLabel }}
-                          </ElTag>
-                        </template>
-                      </ElTableColumn>
-                    </ElTable>
-                  </div>
-                  <div class="rc-resolve-hint">
-                    继承自工厂 / 部门的时段要去「上级工作日历」改；标记「本级」的可在上方窗口表调整
-                  </div>
-                </template>
-              </div>
-            </div>
+            <ResolvePreviewPanel
+              :preview="resolvePreview"
+              :loading="resolveLoading"
+              :range="resolveRange"
+              empty-text="选择设备后展示工厂 / 部门 / 本级合并后的可排时段"
+              @update:range="onResolveRangeChange"
+              @refresh="loadResolvePreview"
+            />
           </template>
         </ElTabPane>
 
@@ -1057,7 +969,7 @@ onBeforeUnmount(() => {
                 class="rc-btn-gap"
                 size="small"
                 :loading="loading"
-                @click="currentSlotId != null && store.loadSlotWindows(currentSlotId)"
+                @click="refreshSlotWindows"
               >
                 刷新
               </ElButton>
@@ -1154,6 +1066,16 @@ onBeforeUnmount(() => {
               @current-change="onSlotWindowPageChange"
               @size-change="onSlotWindowSizeChange"
             />
+
+            <!-- ===== 三级合并后可排时段（人工槽侧，与设备侧同一 Resolver 口径） ===== -->
+            <ResolvePreviewPanel
+              :preview="manualResolvePreview"
+              :loading="manualResolveLoading"
+              :range="manualResolveRange"
+              empty-text="选择人工槽后展示工厂 / 部门 / 本级合并后的可排时段"
+              @update:range="onManualResolveRangeChange"
+              @refresh="loadManualResolvePreview"
+            />
           </template>
         </ElTabPane>
       </ElTabs>
@@ -1222,59 +1144,7 @@ onBeforeUnmount(() => {
   padding: 16px;
 }
 
-/* 三级合并后可排时段 */
-.rc-resolve {
-  margin-top: 14px;
-  border: 1px solid var(--el-border-color-lighter);
-  border-radius: 6px;
-  overflow: hidden;
-}
-.rc-resolve-head {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  flex-wrap: wrap;
-  padding: 8px 12px;
-  background: var(--el-fill-color-lighter);
-  border-bottom: 1px solid var(--el-border-color-lighter);
-}
-.rc-resolve-title {
-  font-size: 13px;
-  font-weight: 600;
-}
-.rc-resolve-count {
-  font-size: 12px;
-  color: var(--el-text-color-secondary);
-}
-.rc-resolve-spacer {
-  flex: 1;
-}
-.rc-resolve-range {
-  flex: 0 0 240px;
-  width: 240px;
-}
-.rc-resolve-body {
-  padding: 10px 12px;
-  min-height: 56px;
-}
-/* 表格高度由外层控制（不用 ElTable 的 max-height —— 其内部高度计算在部分浏览器会塌成一行） */
-.rc-resolve-scroll {
-  max-height: 260px;
-  overflow: auto;
-}
-.rc-resolve-empty {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 6px 0;
-  font-size: 13px;
-  color: var(--el-text-color-regular);
-}
-.rc-resolve-hint {
-  margin-top: 8px;
-  font-size: 12px;
-  color: var(--el-text-color-secondary);
-}
+/* 三级合并后可排时段的样式随 ResolvePreviewPanel 组件一起搬走（10-26） */
 .rc-intro {
   margin-bottom: 12px;
 }

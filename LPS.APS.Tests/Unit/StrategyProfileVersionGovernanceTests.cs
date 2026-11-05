@@ -212,7 +212,7 @@ public class StrategyProfileVersionGovernanceTests
             RuleSetVersionId = 100, ParameterSetVersionId = 200,
             Status = GovernanceVersionStatus.Published, IsDefault = true,
         };
-        _strategyProfileVersionRepo.Setup(r => r.GetDefaultByRunTypeAsync(StrategyProfileRunType.FullSchedule, It.IsAny<CancellationToken>()))
+        _strategyProfileVersionRepo.Setup(r => r.GetDefaultByRunTypeOrFallbackAsync(StrategyProfileRunType.FullSchedule, It.IsAny<DateTime>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(new List<StrategyProfileVersion> { candidate });
 
         // Act
@@ -227,7 +227,7 @@ public class StrategyProfileVersionGovernanceTests
     public async Task Resolve_无候选_返回Null()
     {
         // Arrange
-        _strategyProfileVersionRepo.Setup(r => r.GetDefaultByRunTypeAsync(StrategyProfileRunType.Simulation, It.IsAny<CancellationToken>()))
+        _strategyProfileVersionRepo.Setup(r => r.GetDefaultByRunTypeOrFallbackAsync(StrategyProfileRunType.Simulation, It.IsAny<DateTime>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(new List<StrategyProfileVersion>());
 
         // Act
@@ -243,7 +243,7 @@ public class StrategyProfileVersionGovernanceTests
         // Arrange —— 跨号位冻结语义：歧义报配置错误，不随机取一个
         var c1 = new StrategyProfileVersion { Id = 1, StrategyProfileId = 10, VersionCode = "V1" };
         var c2 = new StrategyProfileVersion { Id = 2, StrategyProfileId = 11, VersionCode = "V1" };
-        _strategyProfileVersionRepo.Setup(r => r.GetDefaultByRunTypeAsync(StrategyProfileRunType.FullSchedule, It.IsAny<CancellationToken>()))
+        _strategyProfileVersionRepo.Setup(r => r.GetDefaultByRunTypeOrFallbackAsync(StrategyProfileRunType.FullSchedule, It.IsAny<DateTime>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(new List<StrategyProfileVersion> { c1, c2 });
 
         // Act
@@ -255,29 +255,30 @@ public class StrategyProfileVersionGovernanceTests
     }
 
     [Fact]
-    public async Task Resolve_生效窗口过滤_窗口外不入选()
+    public async Task Resolve_生效窗口判定已下沉仓储_asOf原样透传()
     {
-        // Arrange —— asOf=2026-06-01，c1 在窗口内、c2 已过期 → 恰 1 个
+        // Arrange —— AE-007/Q8 落码后：生效窗口（EffectiveFrom/EffectiveTo）改由仓储 SQL 一次判定，
+        // 服务层不再做窗过滤（否则「精确层已过期」会错误挡住 NULL 兜底）。
+        // 本用例改为校验「截取时点」被原样透传给两级解析；窗过滤正确性由仓储 SQL／集成测试覆盖。
         var c1 = new StrategyProfileVersion
         {
             Id = 1, StrategyProfileId = 10, VersionCode = "V1",
             EffectiveFrom = new DateTime(2026, 1, 1), EffectiveTo = new DateTime(2026, 12, 31),
         };
-        var c2 = new StrategyProfileVersion
-        {
-            Id = 2, StrategyProfileId = 11, VersionCode = "V1",
-            EffectiveFrom = new DateTime(2025, 1, 1), EffectiveTo = new DateTime(2025, 6, 30),
-        };
-        _strategyProfileVersionRepo.Setup(r => r.GetDefaultByRunTypeAsync(StrategyProfileRunType.FullSchedule, It.IsAny<CancellationToken>()))
-            .ReturnsAsync(new List<StrategyProfileVersion> { c1, c2 });
+        var asOf = new DateTime(2026, 6, 1);
+        _strategyProfileVersionRepo.Setup(r => r.GetDefaultByRunTypeOrFallbackAsync(StrategyProfileRunType.FullSchedule, asOf, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new List<StrategyProfileVersion> { c1 });
 
         // Act
         var result = await _service.ResolveDefaultStrategyProfileVersionAsync(
-            StrategyProfileRunType.FullSchedule, new DateTime(2026, 6, 1), CancellationToken.None);
+            StrategyProfileRunType.FullSchedule, asOf, CancellationToken.None);
 
         // Assert
         result.Should().NotBeNull();
         result!.Id.Should().Be(1);
+        _strategyProfileVersionRepo.Verify(
+            r => r.GetDefaultByRunTypeOrFallbackAsync(StrategyProfileRunType.FullSchedule, asOf, It.IsAny<CancellationToken>()),
+            Times.Once);
     }
 
     [Fact]
@@ -308,5 +309,30 @@ public class StrategyProfileVersionGovernanceTests
         trace.RuleSetVersionCode.Should().Be("R1");
         trace.ParameterSetVersionCode.Should().Be("P1");
         trace.IsDefault.Should().BeTrue();
+    }
+
+    [Fact]
+    public async Task Disable_默认版本_清空自身IsDefault标志()
+    {
+        // Arrange（2号位 2026-10-27 附录判定）：ClearDefaultFlagAsync 第二参=排除本版本，只清同族其它；
+        // 若不在停用分支显式置 version.IsDefault=false，落库会为「DISABLED 且 IsDefault=1」，再发布时以默认身份静默复活。
+        var version = new StrategyProfileVersion
+        {
+            Id = 1, StrategyProfileId = 10, VersionCode = "V1", IsDefault = true,
+            RuleSetVersionId = 100, ParameterSetVersionId = 200,
+            Status = GovernanceVersionStatus.Published,
+        };
+        _strategyProfileVersionRepo.Setup(r => r.GetByIdAsync(1, It.IsAny<CancellationToken>())).ReturnsAsync(version);
+        _auditRepo.Setup(r => r.EnsureWritableAsync(It.IsAny<CancellationToken>())).Returns(Task.CompletedTask);
+        _strategyProfileVersionRepo.Setup(r => r.UpdateAsync(version, It.IsAny<CancellationToken>())).Returns(Task.CompletedTask);
+
+        // Act
+        await _service.DisableStrategyProfileVersionAsync(1, "tester", 1, ct: CancellationToken.None);
+
+        // Assert
+        version.Status.Should().Be(GovernanceVersionStatus.Disabled);
+        version.IsDefault.Should().BeFalse();
+        // 仍清同族其它默认（保留既有关联行为）
+        _strategyProfileVersionRepo.Verify(r => r.ClearDefaultFlagAsync(10, 1, It.IsAny<CancellationToken>()), Times.Once);
     }
 }

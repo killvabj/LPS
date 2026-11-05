@@ -54,7 +54,11 @@ import {
 import type { SetupDialogPrefill, SetupRuleDto, SetupRuleDefaultInput } from '@/api/aps-v1'
 import { opmApi } from '@/api/aps-v1'
 import { useSetupDefaultStore } from '@/store/modules/aps/setupDefault'
-import { useSetupMasterData, type SetupLookupOption } from '../composables/useSetupMasterData'
+import {
+  filterLookupOptions,
+  useSetupMasterData,
+  type SetupLookupOption
+} from '../composables/useSetupMasterData'
 
 defineOptions({ name: 'SetupDefaultDialog' })
 
@@ -129,6 +133,10 @@ const deviceRules = computed(() =>
 // ===== 远程搜索（后端 lookups 均 TOP 200 写死，见 useSetupMasterData 头注释） =====
 const searching = reactive({ department: false, resource: false })
 
+/** 每个下拉各自的输入关键词 —— EP 在 remote 模式下不做本地过滤，靠它收窄展示项 */
+const departmentQuery = ref('')
+const resourceQuery = ref('')
+
 /** 300ms 防抖：连续打字只发最后一次 */
 function debounce<A extends unknown[]>(fn: (...args: A) => void) {
   let timer: ReturnType<typeof setTimeout> | undefined
@@ -138,7 +146,7 @@ function debounce<A extends unknown[]>(fn: (...args: A) => void) {
   }
 }
 
-const onSearchDepartment = debounce((kw: string) => {
+const searchDepartment = debounce((kw: string) => {
   if (!kw.trim()) {
     searching.department = false
     return
@@ -146,7 +154,7 @@ const onSearchDepartment = debounce((kw: string) => {
   searching.department = true
   void masterData.searchDepartments(kw).finally(() => (searching.department = false))
 })
-const onSearchResource = debounce((kw: string) => {
+const searchResource = debounce((kw: string) => {
   if (!kw.trim()) {
     searching.resource = false
     return
@@ -155,17 +163,30 @@ const onSearchResource = debounce((kw: string) => {
   void masterData.searchResources(kw).finally(() => (searching.resource = false))
 })
 
+/** 关键词立即落到展示项（收窄），后端补拉只负责追加 TOP 200 之外的项 */
+function onSearchDepartment(kw: string): void {
+  departmentQuery.value = kw
+  searchDepartment(kw)
+}
+function onSearchResource(kw: string): void {
+  resourceQuery.value = kw
+  searchResource(kw)
+}
+
 // ===== 下拉源（后端主数据 lookup；Id-口径 v1.1 选项带 id 供写输入提交） =====
-const departmentOptions = masterData.departments
+const departmentOptions = computed(() =>
+  filterLookupOptions(masterData.departments.value, departmentQuery.value)
+)
 
 /** 设备选项追加后端给的真实所属部门（DEFAULT 无 eligibility 交集可用，只展示不据此收窄） */
-const resourceOptions = computed<SetupLookupOption[]>(() =>
-  masterData.resources.value.map((r) => {
+const resourceOptions = computed<SetupLookupOption[]>(() => {
+  const enriched = masterData.resources.value.map((r) => {
     const deptCode = masterData.departmentCodeOfResource(r.value)
     const base = r.label
     return deptCode ? { ...r, label: `${base} · ${deptCode}` } : r
   })
-)
+  return filterLookupOptions(enriched, resourceQuery.value)
+})
 
 /** 大工艺按所选部门收窄（部门选项自带 stageCode）；未选部门时给全部 */
 const stageOptions = computed(() => {
@@ -269,6 +290,8 @@ watch(
   () => props.modelValue,
   async (visible) => {
     if (!visible) return
+    departmentQuery.value = ''
+    resourceQuery.value = ''
     if (props.mode === 'edit' && props.rule) {
       form.ruleSetVersionId = props.rule.ruleSetVersionId
       form.departmentCode = props.rule.departmentCode ?? ''

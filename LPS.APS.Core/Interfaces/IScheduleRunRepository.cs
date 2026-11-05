@@ -34,7 +34,7 @@ public interface IScheduleRunRepository
     /// </summary>
     /// <param name="source">失败源 Run（继承只读基线；调用方须已限定 FULL_SCHEDULE）</param>
     /// <param name="shells">每预期 Domain 一个壳（计划窗口由调用方继承失败 Run 既有 PlanVersion）</param>
-    /// <param name="triggeredBy">触发来源（'Recover'）</param>
+    /// <param name="triggeredBy">触发来源：<b>恢复人登录名</b>（作为新 Run 的冻结主体，供装载侧业务范围判定；P0-08 初版为字面量 'Recover'，已废止）</param>
     /// <returns>新建 ScheduleRun.Id</returns>
     Task<int> InsertForRecoveryWithShellsAsync(
         ScheduleRunGov source,

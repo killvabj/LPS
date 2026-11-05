@@ -1011,6 +1011,27 @@
   },
   {
     "ContainingType": "LPS.APS.Web.Controllers.GovernanceController",
+    "Method": "SaveStageHandoffWaitRules",
+    "RelativePath": "api/Governance/parameter-set/version/{versionId}/stage-handoff-wait-rules",
+    "HttpMethod": "PUT",
+    "IsController": true,
+    "Order": 0,
+    "Parameters": [
+      {
+        "Name": "versionId",
+        "Type": "System.Int64",
+        "IsRequired": true
+      },
+      {
+        "Name": "body",
+        "Type": "System.Text.Json.JsonElement",
+        "IsRequired": true
+      }
+    ],
+    "ReturnTypes": []
+  },
+  {
+    "ContainingType": "LPS.APS.Web.Controllers.GovernanceController",
     "Method": "ValidateParameterSetVersionForPublish",
     "RelativePath": "api/Governance/parameter-set/version/{versionId}/validate",
     "HttpMethod": "GET",
@@ -1367,22 +1388,6 @@
       {
         "Name": "version",
         "Type": "LPS.APS.Core.Entities.APS.RuleSetVersion",
-        "IsRequired": true
-      }
-    ],
-    "ReturnTypes": []
-  },
-  {
-    "ContainingType": "LPS.APS.Web.Controllers.GovernanceController",
-    "Method": "DeleteRuleSetVersion",
-    "RelativePath": "api/Governance/rule-set/version/{versionId}",
-    "HttpMethod": "DELETE",
-    "IsController": true,
-    "Order": 0,
-    "Parameters": [
-      {
-        "Name": "versionId",
-        "Type": "System.Int64",
         "IsRequired": true
       }
     ],
@@ -1827,6 +1832,16 @@
         "Name": "materialId",
         "Type": "System.Nullable\u00601[[System.Int32, System.Private.CoreLib, Version=8.0.0.0, Culture=neutral, PublicKeyToken=7cec85d7bea7798e]]",
         "IsRequired": false
+      },
+      {
+        "Name": "pageIndex",
+        "Type": "System.Nullable\u00601[[System.Int32, System.Private.CoreLib, Version=8.0.0.0, Culture=neutral, PublicKeyToken=7cec85d7bea7798e]]",
+        "IsRequired": false
+      },
+      {
+        "Name": "pageSize",
+        "Type": "System.Nullable\u00601[[System.Int32, System.Private.CoreLib, Version=8.0.0.0, Culture=neutral, PublicKeyToken=7cec85d7bea7798e]]",
+        "IsRequired": false
       }
     ],
     "ReturnTypes": []
@@ -1904,6 +1919,22 @@
     "Method": "Deactivate",
     "RelativePath": "api/governance/stage-lead-time-params/{id}",
     "HttpMethod": "DELETE",
+    "IsController": true,
+    "Order": 0,
+    "Parameters": [
+      {
+        "Name": "id",
+        "Type": "System.Int32",
+        "IsRequired": true
+      }
+    ],
+    "ReturnTypes": []
+  },
+  {
+    "ContainingType": "LPS.APS.Web.Controllers.StageLeadTimeParamController",
+    "Method": "Activate",
+    "RelativePath": "api/governance/stage-lead-time-params/{id}/activate",
+    "HttpMethod": "POST",
     "IsController": true,
     "Order": 0,
     "Parameters": [
@@ -2032,6 +2063,27 @@
       {
         "Name": "version",
         "Type": "LPS.APS.Core.Entities.APS.StrategyProfileVersion",
+        "IsRequired": true
+      }
+    ],
+    "ReturnTypes": []
+  },
+  {
+    "ContainingType": "LPS.APS.Web.Controllers.GovernanceController",
+    "Method": "CompareStrategyProfileVersionWith",
+    "RelativePath": "api/Governance/strategy-profile/version/{compareVersionId}/compare-with/{baseVersionId}",
+    "HttpMethod": "GET",
+    "IsController": true,
+    "Order": 0,
+    "Parameters": [
+      {
+        "Name": "compareVersionId",
+        "Type": "System.Int64",
+        "IsRequired": true
+      },
+      {
+        "Name": "baseVersionId",
+        "Type": "System.Int64",
         "IsRequired": true
       }
     ],
@@ -2294,6 +2346,22 @@
     "Method": "Deactivate",
     "RelativePath": "api/governance/task-split-rule-configs/{id}",
     "HttpMethod": "DELETE",
+    "IsController": true,
+    "Order": 0,
+    "Parameters": [
+      {
+        "Name": "id",
+        "Type": "System.Int32",
+        "IsRequired": true
+      }
+    ],
+    "ReturnTypes": []
+  },
+  {
+    "ContainingType": "LPS.APS.Web.Controllers.TaskSplitRuleConfigController",
+    "Method": "Activate",
+    "RelativePath": "api/governance/task-split-rule-configs/{id}/activate",
+    "HttpMethod": "POST",
     "IsController": true,
     "Order": 0,
     "Parameters": [
@@ -4552,11 +4620,77 @@
         "Name": "resourceIds",
         "Type": "System.Int32[]",
         "IsRequired": false
+      },
+      {
+        "Name": "limit",
+        "Type": "System.Nullable\u00601[[System.Int32, System.Private.CoreLib, Version=8.0.0.0, Culture=neutral, PublicKeyToken=7cec85d7bea7798e]]",
+        "IsRequired": false
+      },
+      {
+        "Name": "afterResourceId",
+        "Type": "System.Nullable\u00601[[System.Int32, System.Private.CoreLib, Version=8.0.0.0, Culture=neutral, PublicKeyToken=7cec85d7bea7798e]]",
+        "IsRequired": false
+      },
+      {
+        "Name": "afterStartAt",
+        "Type": "System.Nullable\u00601[[System.DateTime, System.Private.CoreLib, Version=8.0.0.0, Culture=neutral, PublicKeyToken=7cec85d7bea7798e]]",
+        "IsRequired": false
+      },
+      {
+        "Name": "afterTaskId",
+        "Type": "System.Nullable\u00601[[System.Int64, System.Private.CoreLib, Version=8.0.0.0, Culture=neutral, PublicKeyToken=7cec85d7bea7798e]]",
+        "IsRequired": false
       }
     ],
     "ReturnTypes": [
       {
         "Type": "LPS.APS.Shared.Models.ApiResponse\u00601[[LPS.APS.Application.Services.Query.Dto.GanttDataDto, LPS.APS.Application, Version=1.0.0.0, Culture=neutral, PublicKeyToken=null]]",
+        "MediaTypes": [
+          "text/plain",
+          "application/json",
+          "text/json"
+        ],
+        "StatusCode": 200
+      }
+    ]
+  },
+  {
+    "ContainingType": "LPS.APS.Web.Controllers.ScheduleController",
+    "Method": "GetGanttBuckets",
+    "RelativePath": "api/Schedule/gantt/{planVersionId}/buckets",
+    "HttpMethod": "GET",
+    "IsController": true,
+    "Order": 0,
+    "Parameters": [
+      {
+        "Name": "planVersionId",
+        "Type": "System.Int32",
+        "IsRequired": true
+      },
+      {
+        "Name": "from",
+        "Type": "System.Nullable\u00601[[System.DateTime, System.Private.CoreLib, Version=8.0.0.0, Culture=neutral, PublicKeyToken=7cec85d7bea7798e]]",
+        "IsRequired": false
+      },
+      {
+        "Name": "to",
+        "Type": "System.Nullable\u00601[[System.DateTime, System.Private.CoreLib, Version=8.0.0.0, Culture=neutral, PublicKeyToken=7cec85d7bea7798e]]",
+        "IsRequired": false
+      },
+      {
+        "Name": "bucket",
+        "Type": "System.String",
+        "IsRequired": false
+      },
+      {
+        "Name": "resourceIds",
+        "Type": "System.Int32[]",
+        "IsRequired": false
+      }
+    ],
+    "ReturnTypes": [
+      {
+        "Type": "LPS.APS.Shared.Models.ApiResponse\u00601[[LPS.APS.Application.Services.Query.Dto.GanttBucketsDto, LPS.APS.Application, Version=1.0.0.0, Culture=neutral, PublicKeyToken=null]]",
         "MediaTypes": [
           "text/plain",
           "application/json",

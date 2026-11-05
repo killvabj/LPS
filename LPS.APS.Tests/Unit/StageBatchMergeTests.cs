@@ -719,6 +719,97 @@ public class StageBatchMergeTests
         Assert.Equal(20m, result.AllocationShares.Where(s => s.AllocationSequence == 2).Sum(s => s.ComponentQty));
     }
 
+    // ════════════════════════════════════════════════════════════════════
+    // M-08（2026-10-26 P1-01 ② 补齐的鉴别性反证）**多批需求不得做 Stage 合批**
+    //
+    //   契约（`PhaseTwoInitialScheduler.cs:1702`，P1-01 原文口径）：
+    //     多批需求 ⇒ `requireIdentityPreserving = true` ⇒ 合并目标必须是
+    //     **`ExecutionBatchDraftKey == null`（尚未归属任何执行批）** 的 Task，「目标已属别的执行批则拒绝」。
+    //
+    //   而 Stage 合批的锚批候选**一律出自 `AddToGroup`**，其首行
+    //     `if (task.ExecutionBatchDraftKey is not string key) return null;` ⇒ **锚批 100% 带批键**。
+    //   ⇒ 多批需求在 Stage 路径上**构造上不存在合法目标**。
+    //
+    //   整改前（实测 PV190）：`FindMergeableStageBatches` **从未收到**该标志 ⇒ 擂台照打，
+    //     且确有跨执行批合并被采纳（把本批身份并进别人的执行批，违反上述契约）。
+    //     代价：单条需求 233~389 个批 × 1,408 个锚批 = 32.8~54.8 万次整链重排，采纳 0 次（纯空转）。
+    //
+    //   **本用例的鉴别方式（不猜批数，只问语义）**：
+    //     同夹具跑两次，唯一变量 = `BatchPolicy.AllowMerge`。
+    //     · `AllowMerge = false` ⇒ 求解器不尝试合批 ⇒ 纯「按批独立排程」基线；
+    //     · `AllowMerge = true`  ⇒ 多批需求**不得**改变该基线（合批一个都不合法 ⇒ 必须逐位相同）。
+    //     整改前：第二次会合批 ⇒ 任务条数 / 批键 / 数量分布与基线**不同** ⇒ 本用例**红**。
+    //   夹具口径与 M-01 同源（三道工序、同产品换型 60min ⇒ 合批在冻结目标上真实更优），
+    //     只是额外把两个需求都拆成 2 批（`MaxExecutionBatchQty = 15`，A30 / B20）⇒ `multiBatch = true`。
+    // ════════════════════════════════════════════════════════════════════
+    [Fact]
+    public async Task M_08_多批需求_Stage合批目标全部已归批_须与AllowMerge关时逐位相同()
+    {
+        // ⚠ 政策里的 `AllowMerge` **必须**跟参数翻转：显式传 `batchPolicies` 会覆盖
+        //   `Build(allowMerge:)` 的登记（`Build` 只在 `batchPolicies is null` 时用该参建默认政策）。
+        //   第一版把这里写死 `true` ⇒ 基线自己在合批 ⇒ 用例恒绿，等于没测（已实测暴露）。
+        IReadOnlyList<BatchPolicyRuleSnapshot> Policies(bool allowMerge) => new[]
+        {
+            new BatchPolicyRuleSnapshot
+            {
+                MaterialId = MaterialId,
+                ProductionDepartmentId = DeptId,
+                MinExecutionBatchQty = null,
+                MaxExecutionBatchQty = 15m,
+                PreferredBatchQty = null,
+                AllowMerge = allowMerge,
+                AllowSplit = true
+            }
+        };
+
+        DomainSolveRequest BuildRequest(bool allowMerge) => Build(
+            paths: new[] { ThreeOpPath("RT", 1, 1, 2, 3, 1m) },
+            demands: new[]
+            {
+                new DemandSpec("A", 1, 30m, Day.AddDays(200)),
+                new DemandSpec("B", 2, 20m, Day.AddDays(200))
+            },
+            calendar: new[]
+            {
+                (1, Day.AddDays(120), Day.AddDays(125)),
+                (2, Day.AddDays(120), Day.AddDays(125)),
+                (3, Day.AddDays(120), Day.AddDays(125))
+            },
+            allowMerge: allowMerge,
+            allowSplit: true,
+            setupRules: SameProductSetup(60m, 1, 2, 3),
+            batchPolicies: Policies(allowMerge));
+
+        var baseline = await _solver.SolveAsync(BuildRequest(allowMerge: false));
+        var withMerge = await _solver.SolveAsync(BuildRequest(allowMerge: true));
+
+        Assert.True(baseline.Success, baseline.ErrorMessage);
+        Assert.True(withMerge.Success, withMerge.ErrorMessage);
+        Assert.Empty(baseline.UnscheduledTasks);
+        Assert.Empty(withMerge.UnscheduledTasks);
+
+        // 夹具前提：确实形成多批（否则本用例退化成单批场景，测不到 ⑧ 这条判据）
+        var baselineKeys = baseline.FinalTasks
+            .Select(t => t.ExecutionBatchDraftKey).Distinct().ToList();
+        Assert.True(baselineKeys.Count >= 3,
+            $"夹具没有形成多批（只有 {baselineKeys.Count} 个执行批：[{string.Join(",", baselineKeys)}]）"
+            + $"任务={baselineKeys.Count} 条数={baseline.FinalTasks.Count} "
+            + $"数量=[{string.Join(",", baseline.FinalTasks.Select(t => t.Quantity))}] ⇒ 本用例没打到多批路径，等于没测");
+
+        static string Sig(IEnumerable<FinalTaskDraft> tasks) => string.Join("\n", tasks
+            .Select(t => $"{t.ExecutionBatchDraftKey}|{t.OperationCode}|{t.Quantity}|{t.PlannedProcessQty}"
+                         + $"|{t.PlannedStartTime:O}|{t.PlannedEndTime:O}")
+            .OrderBy(x => x, StringComparer.Ordinal));
+
+        Assert.Equal(Sig(baseline.FinalTasks), Sig(withMerge.FinalTasks));
+        Assert.Equal(baseline.FinalTasks.Count, withMerge.FinalTasks.Count);
+        Assert.Equal(
+            string.Join(",", baseline.AllocationShares
+                .Select(s => $"{s.AllocationSequence}:{s.ComponentQty}").OrderBy(x => x, StringComparer.Ordinal)),
+            string.Join(",", withMerge.AllocationShares
+                .Select(s => $"{s.AllocationSequence}:{s.ComponentQty}").OrderBy(x => x, StringComparer.Ordinal)));
+    }
+
     // ─────────────────────────── 构造辅助 ───────────────────────────
 
     /// <summary>
@@ -842,7 +933,11 @@ public class StageBatchMergeTests
             .Select(rid => new SetupTransitionRuleSnapshot
             {
                 ProductionDepartmentId = DeptId,
-                StageCode = "",
+                // 2026-10-28：Setup 键域升维后**Stage 进键**（0号位 R07R08 v1.1 第 3 条）——
+                //   本夹具此前的 `StageCode = ""` 是「键里没 Stage」年代的写法，升维后必须与
+                //   `ThreeOpPath` 的真实 Stage 对齐（资源 1/2/3 ↔ STAGE1/STAGE2/STAGE3），
+                //   否则规则一条都命不中（不是放宽断言，是把夹具补成真实键形状）。
+                StageCode = $"STAGE{rid}",
                 OperationCode = $"OP{rid}0",     // 与 ThreeOpPath 的工序码一一对应（资源 1/2/3 → OP10/OP20/OP30）
                 ResourceId = rid,
                 FromMaterialId = MaterialId,
@@ -878,7 +973,7 @@ public class StageBatchMergeTests
                     MaterialId = MaterialId, ProductionDepartmentId = DeptId,
                     RouteCode = p.RouteCode, PathId = p.PathId,
                     OperationCode = op.OpCode, StageCode = op.StageCode,
-                    StandardDuration = op.Minutes, OperationPlanningMode = "FINITE_RESOURCE"
+                    StandardDuration = op.Minutes * 60m, OperationPlanningMode = "FINITE_RESOURCE"
                 });
                 elig.Add(new OperationResourceEligibility
                 {

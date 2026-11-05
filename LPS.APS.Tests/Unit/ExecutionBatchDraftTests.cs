@@ -126,7 +126,11 @@ public class ExecutionBatchDraftTests
         IReadOnlyList<ResourceCalendarSlot>? calendarSlots = null,
         bool allowSplit = false,
         CandidateContext? candidate = null,
-        decimal? opDurationStage2 = null)
+        decimal? opDurationStage2 = null,
+        // 2026-11-02：v1.15 `:1320` 起「无 PI」的完全缺配 C 桶改走软 Preferred，
+        //   ⇒ 想验证「缺策略 ⇒ 端到端 BATCH_POLICY_MISSING」的用例必须**带 PI**
+        //   （落到 `PiQuantityContractPending`，`IsMissingPolicy` 仍为 true）。
+        string? demandPiNo = null)
     {
         var ops = new List<RoutingOperation>();
         var deps = new List<RoutingDependency>();
@@ -143,7 +147,7 @@ public class ExecutionBatchDraftTests
                 MaterialId = MaterialId, ProductionDepartmentId = DeptId,
                 RouteCode = Route, PathId = Path,
                 OperationCode = code, StageCode = stage,
-                StandardDuration = duration, OperationPlanningMode = "FINITE_RESOURCE"
+                StandardDuration = duration * 60m, OperationPlanningMode = "FINITE_RESOURCE"
             });
             elig.Add(new OperationResourceEligibility
             {
@@ -182,7 +186,8 @@ public class ExecutionBatchDraftTests
                     StartStageCode = "STAGE1",
                     NetOutputQty = qty, PlannedProcessQty = qty,
                     RequiredAvailableTime = PlanningStart.AddDays(20), DemandSequence = 1,
-                    RouteCode = demandRouteCode, PathId = demandPathId
+                    RouteCode = demandRouteCode, PathId = demandPathId,
+                    ProductionInstructionNo = demandPiNo
                 }
             },
             RoutingOperations = ops,
@@ -309,19 +314,25 @@ public class ExecutionBatchDraftTests
 
     /// <summary>
     /// **P0-01（0号位 2026-10-08《未命名的Markdown文件 (1)(1).md》§四）**：
-    ///   C 桶**缺有效 Batch Policy**（`policy == null`）⇒ **`BATCH_POLICY_MISSING` / Fail Closed**，
-    ///   **不得**再被静默降级成「不拆、恒 1 批」。
+    ///   C 桶**缺有效 Batch Policy**（`policy == null`）且**构不成任何合法批**（非正净产出）
+    ///   ⇒ **`BATCH_POLICY_MISSING` / Fail Closed**，**不得**被静默降级成「不拆、恒 1 批」。
+    ///
+    /// ⚠ **2026-11-02 收窄**：原用例用 `netQty: 100m` 断言 Fail Closed —— 那是**旧口径**。
+    ///   v1.15 `:1320` 逐字「**完全缺配的合法C桶**（包含明确PI来源与**合法无PI来源**）…取…`Q_C`
+    ///   作为**仅本Run经济软Preferred建议**」⇒ 正净产出的合法 C 桶缺策略时**不再**硬未排，
+    ///   而是按 `Q_C` 出软 Preferred 批（正例见 `NoPiBatchSoftPreferredTests`）。
+    ///   本条保留的、仍然成立的 Fail Closed 情形 = **非正净产出**（构不成合法批，`:1320` 不管）。
     ///
     /// 正式兜底链（0号位 2026-09-28 §十五）：① Material + ProductionDepartment 精确 →
     ///   ② Material 级默认 → ③ 正式发布的 Global Batch Default → ④ `BATCH_POLICY_MISSING`。
-    ///   1号位 **不越权设计** ①②③ 的展开方式（归 2/3号位），但**收到最终输入后仍找不到有效 Policy 时必须 Fail Closed**。
+    ///   1号位 **不越权设计** ①②③ 的展开方式（归 2/3号位）。
     ///
     /// 反证性：旧实现 `policy == null → ExecutionBatchPlan.Legal(1)`（= 隐藏业务默认「默认策略 = 不拆批」）⇒ 本用例 **红**。
     /// </summary>
     [Fact]
-    public void 缺批策略_FailClosed_不产批()
+    public void 缺批策略_非正净产出_FailClosed_不产批()
     {
-        var formation = PhaseTwoInitialScheduler.FormExecutionBatches(Demand(netQty: 100m), null);
+        var formation = PhaseTwoInitialScheduler.FormExecutionBatches(Demand(netQty: 0m), null);
 
         Assert.False(formation.IsLegal);
         Assert.True(formation.IsMissingPolicy);
@@ -336,8 +347,9 @@ public class ExecutionBatchDraftTests
     ///   其余一律维持 Fail Closed（无 PI / 配置无效 / 无策略）。
     ///
     /// 本用例逐个反证五类边界：
-    ///   ① **无明确 PI 来源**（`ProductionInstructionNo` 为空）⇒ 兜底**不适用** ⇒ `IsPiContractPending=false`
-    ///      （走原 `BATCH_POLICY_MISSING`，不得因「可能是 PI」就造批）；
+    ///   ① **无明确 PI 来源**（`ProductionInstructionNo` 为空）⇒ 按 v1.15 `:1320` 走**软 Preferred**
+    ///      （不是 B-010 的 PI 量限路径，也不是 Fail Closed）：1 个 `Q_C` 批、`IsPiContractPending=false`；
+    ///      **旧断言「无 PI ⇒ `BATCH_POLICY_MISSING`」已于 2026-11-02 作废**（那是把 PI 当整条兜底总前提的误读）；
     ///   ② **有 PI 来源、但前置③事实未投影**（`piFacts=null`，= 当前生产真实调用口径）⇒ 兜底适用但前置缺失
     ///      ⇒ `IsPiContractPending=true`、不得凭空造批（`IsLegal=false`、0 批）；
     ///   ③ **前置③成立且 `PiRemainingQty ≥ Q_C`** ⇒ 兜底**成立**：1 个 Stage 执行批候选、`Q_C` 原值
@@ -350,14 +362,15 @@ public class ExecutionBatchDraftTests
     [Fact]
     public void PI保守兜底_仅在无匹配且有明确PI来源时适用_其余保持FailClosed()
     {
-        // ① 无明确 PI 来源 ⇒ 兜底不适用
+        // ① 无明确 PI 来源 ⇒ 走 v1.15 `:1320` 软 Preferred：1 个 Q_C 批，不进 PI 量门禁
         var noPi = PhaseTwoInitialScheduler.FormExecutionBatches(
             Demand(netQty: 30m, piNo: null), policy: null);
-        Assert.False(noPi.IsLegal);
-        Assert.True(noPi.IsMissingPolicy);
+        Assert.True(noPi.IsLegal, noPi.ConflictReason);
+        Assert.False(noPi.IsMissingPolicy);
         Assert.False(noPi.IsPiContractPending);
-        Assert.Empty(noPi.Batches);
-        Assert.Contains("BATCH_POLICY_MISSING", noPi.ConflictReason);
+        var noPiBatch = Assert.Single(noPi.Batches);
+        Assert.Equal(30m, noPiBatch.NetOutputQty);            // Q_C 原值，不扩大、不截断
+        Assert.Equal(1, noPiBatch.Ordinal);                    // 缺策略 ⇒ 无 Min/Max/Preferred ⇒ 不虚构拆批
 
         // ② 有 PI 来源，但前置③（PI 权威剩余量事实）未投影 ⇒ 契约待核，不得造批
         var pending = PhaseTwoInitialScheduler.FormExecutionBatches(
@@ -1074,10 +1087,12 @@ public class ExecutionBatchDraftTests
     ///   `BATCH_POLICY_STATE_UNAVAILABLE` ⇒ **红**。这正是 2号位 §三 所指「**真正缺配的键将由
     ///   `Unknown` 变为 `Missing`** ⇒ 按 06 `:281` **重新允许** `Q_C` 兜底」的行为变化。
     ///
-    /// ⚠ 本夹具需求**无 `ProductionInstructionNo`** ⇒ B-010 条件化保守兜底前置①不成立
-    ///   （`TryFormConservativePiBatch` 返 `null`）⇒ 仍 Fail Closed，但出口码是
-    ///   **`BATCH_POLICY_MISSING`**（与 `Unknown` 的 `..._STATE_UNAVAILABLE` **分列**）。
-    ///   兜底成批本身的前置（唯一 MTS PI 来源 + Stage 自由量）属**另一条链**，不在本用例。
+    /// ⚠ 本夹具需求**显式带 PI 号**（`demandPiNo`）⇒ 落到 B-010 的「PI 权威剩余量未投影」
+    ///   ⇒ `TryFormConservativePiBatch` 返 `PiQuantityContractPending`（`IsMissingPolicy` 仍为 true）
+    ///   ⇒ 端到端出口码仍是 **`BATCH_POLICY_MISSING`**（与 `Unknown` 的 `..._STATE_UNAVAILABLE` **分列**）。
+    ///   **为什么必须带 PI**：2026-11-02 起「无 PI 的完全缺配 C 桶」按 v1.15 `:1320` 走 `Q_C` 软 Preferred
+    ///   ⇒ 无 PI 夹具**不再**能验证本出口码（那已是「排上了」，不是「缺策略未排」）。
+    ///   软 Preferred 这条链的正反例见 `NoPiBatchSoftPreferredTests`。
     /// </summary>
     [Fact]
     public async Task 载体_Missing_判Missing而非Unknown_端到端Reason为缺策略()
@@ -1086,7 +1101,8 @@ public class ExecutionBatchDraftTests
         var request = BuildRequest(
             qty: 10m, demandRouteCode: Route, demandPathId: Path,
             batchPolicies: Array.Empty<BatchPolicyRuleSnapshot>(),
-            batchPolicyStates: new[] { StateEntry(BatchPolicyState.Missing, matchSource: src) });
+            batchPolicyStates: new[] { StateEntry(BatchPolicyState.Missing, matchSource: src) },
+            demandPiNo: "PI-UT-1");   // 2026-11-02：见 BuildRequest 参数注释（无 PI 已改走 §1320 软 Preferred）
 
         var constraints = new PhaseOneConstraintBuilder().BuildConstraints(request);
         var res = PhaseTwoInitialScheduler.ResolveExecutionBatchPolicy(
@@ -1352,7 +1368,10 @@ public class ExecutionBatchDraftTests
 
     /// <summary>
     /// G3③ **`Missing` 串测**：`BuildStates`（⑧块**完全缺配** ⇒ `rules` 空集）产出 `Missing`
-    ///   ⇒ 端到端 `BATCH_POLICY_MISSING`。
+    ///   ⇒ 端到端 `BATCH_POLICY_MISSING`（与 `Unknown` 的 `..._STATE_UNAVAILABLE` 分列）。
+    ///
+    /// ⚠ 2026-11-02：夹具**显式带 PI 号**。无 PI 的完全缺配 C 桶自 v1.15 `:1320` 起走 `Q_C` 软 Preferred
+    ///   ⇒ 不再落到本出口码（正反例见 `NoPiBatchSoftPreferredTests`）。
     /// </summary>
     [Fact]
     public async Task 串测_Missing_BuildStates真实产出_端到端为缺策略()
@@ -1363,7 +1382,8 @@ public class ExecutionBatchDraftTests
 
         var request = BuildRequest(
             qty: 10m, demandRouteCode: Route, demandPathId: Path,
-            batchPolicies: Array.Empty<BatchPolicyRuleSnapshot>(), batchPolicyStates: states);
+            batchPolicies: Array.Empty<BatchPolicyRuleSnapshot>(), batchPolicyStates: states,
+            demandPiNo: "PI-UT-1");   // 2026-11-02：见 BuildRequest 参数注释（无 PI 已改走 §1320 软 Preferred）
 
         var result = await _solver.SolveAsync(request);
 
@@ -1395,6 +1415,34 @@ public class ExecutionBatchDraftTests
         var request = BuildRequest(
             qty: 10m, demandRouteCode: Route, demandPathId: Path,
             batchPolicies: Array.Empty<BatchPolicyRuleSnapshot>(), batchPolicyStates: states);
+
+        var result = await _solver.SolveAsync(request);
+
+        Assert.Empty(result.FinalTasks);
+        var unscheduled = Assert.Single(result.UnscheduledTasks);
+        Assert.Equal("BATCH_POLICY_STATE_UNAVAILABLE", unscheduled.Reason);
+        Assert.NotEqual("BATCH_POLICY_MISSING", unscheduled.Reason);
+    }
+
+    /// <summary>
+    /// G3⑤ **`NoDept`（业务键不完整）串测**：本物料**有**规则行、但本 Run 未解析到部门 ⇒
+    ///   `BuildStates` 产出 `Unavailable` / `NO_DEPT` ⇒ 消费侧映射 `Unknown` ⇒ 端到端
+    ///   `BATCH_POLICY_STATE_UNAVAILABLE`，**不得**降格成 `BATCH_POLICY_MISSING`（那会启用 `Q_C` 软兜底）。
+    ///   依据：0号位 2026-10-28《R07/R08 更正回复 v1.1》§1「严禁一律补 `(物料,NULL)` 转成可按 `Q_C` 排的 MISSING」。
+    /// </summary>
+    [Fact]
+    public async Task 串测_NoDept_BuildStates真实产出_端到端为状态不可获得_不得当缺策略()
+    {
+        var row = G3InWindowRow();
+        var states = TaskSplitRuleConfigProjector.BuildStates(
+            new[] { row }, new[] { (MaterialId, (int?)null) }, G3AsOf);
+        var entry = Assert.Single(states);
+        Assert.Equal(BatchPolicyState.Unavailable, entry.State);                   // 产出端
+        Assert.Equal(BatchPolicyMatchSource.NoDept, entry.MatchSource);
+
+        var request = BuildRequest(
+            qty: 10m, demandRouteCode: Route, demandPathId: Path,
+            batchPolicies: new[] { row }, batchPolicyStates: states);
 
         var result = await _solver.SolveAsync(request);
 
@@ -1442,7 +1490,7 @@ public class ExecutionBatchDraftTests
                     MaterialId = MaterialId, ProductionDepartmentId = DeptId,
                     RouteCode = route, PathId = path,
                     OperationCode = code, StageCode = stage,
-                    StandardDuration = opDuration, OperationPlanningMode = "FINITE_RESOURCE"
+                    StandardDuration = opDuration * 60m, OperationPlanningMode = "FINITE_RESOURCE"
                 });
                 elig.Add(new OperationResourceEligibility
                 {
@@ -2190,7 +2238,7 @@ public class ExecutionBatchDraftTests
                     MaterialId = MaterialId, ProductionDepartmentId = DeptId,
                     RouteCode = Route, PathId = Path,
                     OperationCode = "OP10", StageCode = "STAGE1",
-                    StandardDuration = 60m, OperationPlanningMode = "FINITE_RESOURCE"
+                    StandardDuration = 60m * 60m, OperationPlanningMode = "FINITE_RESOURCE"
                 }
             },
             RoutingDependencies = new List<RoutingDependency>(),

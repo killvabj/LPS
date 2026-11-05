@@ -54,6 +54,47 @@ public class GanttDataDto
     /// 三种空态：版本不存在(<c>false</c>) / 越权(<c>scopeDenied</c>) / 存在但无任务(全 true + isEmpty)。
     /// </summary>
     public bool VersionExists { get; set; }
+
+    // ---- 10-29 大数据量分页契约（4号位 三步走·第 1 步；5号位 复函 2026-10-29 定稿） ----
+
+    /// <summary>
+    /// 本次生效的单次任务条上限（缺省 8000，硬上限 20000）。
+    /// ⚠ 向后兼容断点：<b>不传 limit 也不再返回整版本全量</b>——默认 8000 + hasMore（任何调用方不得再一次拉百万行）。
+    /// </summary>
+    public int Limit { get; set; }
+
+    /// <summary>
+    /// <b>当前过滤口径</b>（from/to/resourceIds）下的任务总数——同谓词 COUNT，不是版本总数，
+    /// 勿与 <c>PlanVersionSummaryDto.TotalTasks</c> 混用（4号位 10-29 §3.4 坑#3）。
+    /// 版本不存在 / 越权时为 null（无意义，不拿 0 冒充"没有"）。
+    /// </summary>
+    public int? TotalTasks { get; set; }
+
+    /// <summary>
+    /// 是否还有下一页。实现=多取 1 行判溢出后裁掉（TOP limit+1），零额外查询、永不撒谎；
+    /// 禁止静默截断（4号位 10-29 §3.4 坑#1）。
+    /// </summary>
+    public bool HasMore { get; set; }
+
+    /// <summary>
+    /// 游标回显：<c>hasMore=true</c> 时必给，原样回填 afterResourceId/afterStartAt/afterTaskId 即取下一页。
+    /// 排序键全序=<c>(ISNULL(ResourceId,-1), ISNULL(PlannedStartTime,'1753-01-01'), Id)</c>；
+    /// NULL 资源/NULL 起始时刻均已在此归一化回显（前端勿自拼原始行值）。
+    /// </summary>
+    public GanttCursorDto? NextAfter { get; set; }
+}
+
+/// <summary>甘特分页游标（排序键三元组；10-29 契约）</summary>
+public class GanttCursorDto
+{
+    /// <summary>排序键1：资源 Id；无资源任务归一为 -1</summary>
+    public int ResourceId { get; set; }
+
+    /// <summary>排序键2：计划开始时刻；未排（NULL）归一为 1753-01-01T00:00:00（SQL datetime 下限；0001 会参数溢出，勿改回）</summary>
+    public DateTime PlannedStartTime { get; set; }
+
+    /// <summary>排序键3：Task Id（唯一尾键，全序保证翻页不漏行不重行）</summary>
+    public long TaskId { get; set; }
 }
 
 public class GanttResourceDto
@@ -132,11 +173,11 @@ public class GanttTaskDto
     public bool IsCriticalPath { get; set; }
 
     /// <summary>
-    /// 计划工时，单位**小时**：取自库值 <c>Task.Duration</c>（DDL 08:4323，库值口径为**分钟**）
-    /// 并由查询层 ÷60 折算（<c>ScheduleQueryService.GetGanttAsync</c>）。以库值为准，不用前端时间差反算。
+    /// 计划工时，单位**小时**：取自库值 <c>Task.Duration</c>（DDL 08:4323，库值口径亦为**小时**）。
+    /// 以库值为准，不用前端时间差反算。
     ///
-    /// 单位口径（库值分钟 vs 冻结《字段说明》v5.1.15 <c>:3696</c> 标「小时」）已出订正提案待 0号位 裁，
-    /// 见 2号位 2026-10-26 提案；裁定前本字段行为不变。
+    /// 单位口径已按冻结《字段说明》v5.1.15 <c>:3696</c>「单位：小时」收敛（v5.1.16 <c>:3703</c> 同位同文）：
+    /// 写入方按小时落库，读取侧不再折半换算（0号位 2026-10-26 正式回复 §:60）。
     /// </summary>
     public decimal? Duration { get; set; }
 
@@ -192,9 +233,13 @@ public class GanttTaskDto
     public string? LockMarker { get; set; }
 
     /// <summary>
-    /// 多 Order 共担一个 Task 的份额（G2-b 档②；U04，未就绪返回 null，v1.3）
+    /// 多 Order 共担一个 Task 的份额（G2-b 档②；U04）。
+    /// 2026-10-31 落地（4号位 字段饥饿函 A2）：源=`AllocationTaskShare`（IX_ATS_Task 按 TaskId seek），
+    /// 键名按前端契约取单数 `taskShare`（JSON，原属性名 TaskShares 多一个 s 导致前端读不到）。
+    /// 行形状：orderId=RootOrderId；orderNo=join Order(RootOrderId)；shareQty=ShareQty；
+    /// shareRatio=ShareQty/ΣShareQty(同 Task)——**占比按同任务内份额归一，不是除以 Task 数量**。
     /// </summary>
-    public IReadOnlyList<GanttTaskShareDto>? TaskShares { get; set; }
+    public IReadOnlyList<GanttTaskShareDto>? TaskShare { get; set; }
 
     /// <summary>
     /// 数量-时间分段（G2-b 档②；U06，40+60 不压成 100，未就绪返回 null，v1.3）

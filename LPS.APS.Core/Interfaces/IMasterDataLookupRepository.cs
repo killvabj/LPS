@@ -19,6 +19,12 @@ public interface IMasterDataLookupRepository
     /// <summary>物料主键（Material.Id）→ 物料编码（MaterialCode）</summary>
     Task<string?> GetMaterialCodeAsync(int materialId, CancellationToken cancellationToken = default);
 
+    /// <summary>产品族主键 → 产品族编码（ProductFamily.Code）</summary>
+    Task<string?> GetProductFamilyCodeAsync(int productFamilyId, CancellationToken cancellationToken = default);
+
+    /// <summary>工厂主键 → 工厂编码（Factory.Code）</summary>
+    Task<string?> GetFactoryCodeAsync(int factoryId, CancellationToken cancellationToken = default);
+
     /// <summary>工序资源资格：某 Operation 对某物料合法（IsActive）的全部资源主键（#9 交集计算用）</summary>
     Task<IReadOnlyList<int>> GetEligibleResourceIdsAsync(string operationCode, int materialId, CancellationToken cancellationToken = default);
 
@@ -30,6 +36,14 @@ public interface IMasterDataLookupRepository
 
     /// <summary>全量规则集版本（#11 无规则集过滤场景；避免修改治理契约接口 IRuleSetVersionRepository）</summary>
     Task<IReadOnlyList<RuleSetVersion>> GetAllRuleSetVersionsAsync(CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// 规则集主表批查（#11 版本列表元素回带 RuleSetCode/RuleSetName，P2 2026-10-28 补：
+    /// 前端 Setup 三页需在 aps.setup.view（planner 持）权限内于版本下拉直接分辨所属规则集，
+    /// 避免回退调 GET /rule-sets（挂 aps.rule.view，planner 无 → 403）做侧映射）。
+    /// 仅返回 Id/RuleSetCode/RuleSetName（版本列表展示所需，不取 Description/IsActive 等）。
+    /// </summary>
+    Task<IReadOnlyList<RuleSet>> GetRuleSetsAsync(IReadOnlyCollection<long> ruleSetIds, CancellationToken cancellationToken = default);
 
     /// <summary>Code→Id 读：部门下拉（search 模糊 DeptCode；masterId=Id，code=DeptCode；红线 #4 返回列表）</summary>
     Task<IReadOnlyList<DepartmentLookupItem>> LookupDepartmentsAsync(string? search, int limit = 200, CancellationToken cancellationToken = default);

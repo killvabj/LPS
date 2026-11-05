@@ -112,7 +112,12 @@ export const asyncRouterMap: AppRouteRecordRaw[] = [
       title: t('router.dashboard'),
       icon: 'vi-ant-design:dashboard-filled',
       alwaysShow: true,
-      hidden: true
+      hidden: true,
+      // 10-27 用户裁决：框架演示页「分析页」默认不出现在页签栏。
+      // 这一组是 vben 的演示看板（走 mock，与 APS 业务无关），整组不参与页签。
+      // 父节点写 noTagsView 即可 —— Vue Router 的 route.meta 会把各级 meta 合并，
+      // 子路由（analysis / workplace）解析出的 meta 同样带 noTagsView。
+      noTagsView: true
     },
     children: [
       {
@@ -121,8 +126,12 @@ export const asyncRouterMap: AppRouteRecordRaw[] = [
         name: 'Analysis',
         meta: {
           title: t('router.analysis'),
-          noCache: true,
-          affix: true
+          noCache: true
+          // 10-27：原 affix:true 已撤。
+          // affix 会被 filterAffixTags 抓成「固定页签」，而固定页签两处都关不掉：
+          // ① TagsView.vue 的关闭图标 CSS 只对非 affix 页签 hover 显示；
+          // ② useTagsView.ts 的 closeCurrent 对 affix 直接 return。
+          // 框架演示页不该常驻 APS 页签栏 ⇒ 不再固定，也不再进页签。
         }
       },
       {

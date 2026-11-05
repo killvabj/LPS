@@ -114,7 +114,7 @@ public class PiGateWiringTests
                     MaterialId = MaterialId, ProductionDepartmentId = DeptId,
                     RouteCode = Route, PathId = Path,
                     OperationCode = "OP10", StageCode = Stage,
-                    StandardDuration = 60m, OperationPlanningMode = "FINITE_RESOURCE"
+                    StandardDuration = 60m * 60m, OperationPlanningMode = "FINITE_RESOURCE"
                 }
             },
             RoutingDependencies = Array.Empty<RoutingDependency>(),

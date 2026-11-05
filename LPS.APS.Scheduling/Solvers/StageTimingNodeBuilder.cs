@@ -46,11 +46,19 @@ public static class StageTimingNodeBuilder
     ///
     /// ⚠ 2026-10-15（0号位 第九轮 §3.1/§3.3）**口径更正**：命中本码 = **没有可用的合法参数**
     ///   ⇒ `BuildCore` **不产出时间段、不推进游标**，只留 Issue（不虚造时长）。
-    ///   原「72h 兜底」被明禁 —— 逐字：「不使用 0 或 72h 臆造时间」。这与 2026-09-29 §4.4
-    ///   「不得默认 0 小时 …… 对该 Stage 的后续正式时间无法证明时，应显式进入数据/参数 Issue」
-    ///   本来就一致；72h 是 1号位 侧早先自行加的，不是该裁决给的。
+    ///   原「72h 兜底」被明禁 —— 逐字（原件 `0号位代码审核意见/归档/20261015/
+    ///   APS_V1_20261015_致1号位第九轮代码审核正式复核回复_v1.0.md` `:32`）：
+    ///   「对无合法参数、Path不可判、Stage边界不明的情形，保留真实Issue与诊断，**不使用0或72h臆造时间**」。
+    ///   ℹ **出处更正（2026-10-26 自查）**：本处旧文写「72h 是 1号位 侧早先自行加的」，**不准确**。
+    ///   72 出自 0号位 2026-09-29 那次答复（「三级均未命中 ⇒ 记入 `STAGE_LEADTIME_MISSING`，并按 3 天兜底」），
+    ///   我方 09-29 件《…字段载体落码提请_v1.0_20260929》§四 是按「**据转述登记**」落的法（该节明写
+    ///   「未见书面件 …… 正式口径以 0号位 书面件为准」）。而 0号位 2026-10-19《规则与参数引擎…任务单》`:15`
+    ///   把这条定性为「**仅为历史证据，不得独自覆盖当前正式正文**」，并把「3天/72小时具体计算单位、
+    ///   StageTimingNode、标记/提示/**真实排程消费**」列为**待核项** ⇒ 72 只作标记、**不进时间累计**。
     /// </summary>
-    private const string MissingLevel = "STAGE_LEADTIME_MISSING";
+    // 可见性：`internal`（2026-10-29 R09-③）—— Phase1 的 `BuildRoutelessLeadSteps` 要用**同一个**
+    // 缺 LT 判据，不能自己另写一份字符串常量（两处口径一旦分叉，「排程约束」与「事后描述」就对不上）。
+    internal const string MissingLevel = "STAGE_LEADTIME_MISSING";
 
     /// <summary>④ 纯内存节点的显式标记（0号位 §9.3；2号位 写库口的判据）。</summary>
     private const string StageTimingNodeType = "STAGE_TIMING";
@@ -111,9 +119,11 @@ public static class StageTimingNodeBuilder
         var pathUndetermined = new List<string>();
         var completionTimeUnavailable = new List<string>();
         var missingLeadTimeStages = new List<(string DemandKey, string StageCode)>();
+        var workWindowUnavailableStages = new List<(string DemandKey, string StageCode, string Reason)>();
         var facts = BuildCore(
             request, constraints.EffectiveStages, terminalByDemandKey,
-            pathUndetermined, completionTimeUnavailable, missingLeadTimeStages);
+            pathUndetermined, completionTimeUnavailable, missingLeadTimeStages,
+            workWindowUnavailableStages, tasksByDemand);
 
         // ── S2-01（0号位 2026-10-14《…再次整改回执正式审核回复》§二）──
         //   判词逐字：「**对尚未选定Path或实际未排下的需求，不得把任意候选路径并集产生的时间当作权威承诺时间，
@@ -176,6 +186,35 @@ public static class StageTimingNodeBuilder
             });
         }
 
+        // ── R09-①（2026-10-29 落码）：无可信/不足够 WORK 窗口的 Stage 显式留痕，**不虚造时间** ──
+        //   冻结依据：0号位 2026-10-23《04》§3 逐字「无可信或不足够WORK时，不假设7×24/默认8h，不生成确定Stage
+        //   完成/下游AvailableTime；受影响份额局部未排、其它合法需求继续Run，数量守恒。」
+        //   **复用既有 ReasonCode**（`DEMAND_COMPLETION_TIME_UNAVAILABLE`），不自造新码（0号位 Q4 / 权威 15 码）。
+        foreach (var (demandKey, stageCode, reason) in workWindowUnavailableStages)
+        {
+            var why = reason switch
+            {
+                "MISSING_DEPARTMENT_CONTEXT" =>
+                    "该 (MaterialId, StageCode) 在 `MaterialStageDepartmentContexts` 无行 ⇒ **部门未知**",
+                "NO_WORK_WINDOW" =>
+                    "按 `(FactoryId, DepartmentId)` 精确取用 `DepartmentWorkWindows` **无任何窗口**（该 scope 该期无合法工时）",
+                "INSUFFICIENT_WORK" =>
+                    "`DepartmentWorkWindows` 窗口总计**不足以**消耗该 Stage 的有效生产小时",
+                _ => reason
+            };
+
+            constraints.TraceNotes.Add(new SolveTraceNote
+            {
+                Key = demandKey,
+                ReasonCode = TraceCompletionTimeUnavailable,
+                Message = $"Stage `{stageCode}` 无法按合法 WORK 窗口推进：{why}"
+                          + "⇒ **不产出时间段、不推进游标**，**不假设 7×24 / 默认 8h**。"
+                          + "该需求 `CompletionTime`/`AvailableTime` **不得**作确定承诺或下游可用时间；"
+                          + "待 2号位 补齐 G-2 窗口 / 5号位 补齐部门事实后重算。",
+                Level = "Warning"
+            });
+        }
+
         return facts;
     }
 
@@ -204,7 +243,9 @@ public static class StageTimingNodeBuilder
         IReadOnlyDictionary<string, FinalTaskDraft> terminalByDemandKey,
         ICollection<string>? pathUndeterminedDemandKeys = null,
         ICollection<string>? completionTimeUnavailableDemandKeys = null,
-        ICollection<(string DemandKey, string StageCode)>? missingLeadTimeStages = null)
+        ICollection<(string DemandKey, string StageCode)>? missingLeadTimeStages = null,
+        ICollection<(string DemandKey, string StageCode, string Reason)>? workWindowUnavailableStages = null,
+        IReadOnlyDictionary<string, List<FinalTaskDraft>>? tasksByDemandKey = null)
     {
         var result = new List<DemandCompletionFact>();
         if (request.LogicalProductionDemands.Count == 0)
@@ -234,6 +275,13 @@ public static class StageTimingNodeBuilder
 
             var segments = new List<StageTimingSegmentFact>();
             DateTime? requiredStageEnd = null;
+
+            // G-3 `CompletionTimeCertain` 判据①（缺 LT）：本 Demand 是否有 Stage 因三级均未命中而**不产段时间**。
+            var leadTimeMissingForDemand = false;
+
+            // R09-① 判据：本 Demand 是否有 Stage 因**无可信/不足够 WORK 窗口**而不产段时间。
+            //   与「缺 LT」分开记：成因不同，但两者都必须让 `CompletionTime` **不得**当确定承诺。
+            var workWindowUnavailableForDemand = false;
 
             // ①「严格改法」（2026-10-12 / 2026-10-14 S2-01）：传入本需求**末端真实 Task 的选中路径**。
             //   已确定唯一 Path ⇒ 严格过滤（权威）；仅确定到 Route / 未确定 ⇒ 并集（**候选口径**）。
@@ -311,10 +359,30 @@ public static class StageTimingNodeBuilder
                     if (string.Equals(level, MissingLevel, StringComparison.Ordinal))
                     {
                         missingLeadTimeStages?.Add((demand.LogicalDemandKey, stageCode));
+                        leadTimeMissingForDemand = true;
                         continue;
                     }
 
-                    var end = cursor.AddHours((double)hours);
+                    // ── R09-①（0号位 2026-10-23 §2/§3）：**按部门/工厂合法 WORK 窗口逐片推进** ──
+                    //   整改前逐字：`var end = cursor.AddHours((double)hours);` —— 按**墙钟**小时直接推进，
+                    //   不看 WORK/OFF，也没有「起始当天合法余时」。这正是 R09-① 点名未落码的那一行。
+                    //   整改后：`hours` 按**有效生产小时**在 `(FactoryId, DepartmentId)` 窗口内逐片消耗；
+                    //   无可信/不足够 WORK ⇒ **不产段、不推进游标**（不假设 7×24/默认 8h），
+                    //   由 `workWindowUnavailableForDemand` ⇒ `CompletionTimeCertain=false` 留痕。
+                    // 2026-11-04（2号位 r14030）：FINAL/OUTS 阶段无部门，按工厂级 WORK 日历推进
+                    var isLeadTimeOnly = leadTimeByKey.TryGetValue((demand.MaterialId, stageCode), out var ltFact)
+                                        && ltFact.IsLeadTimeOnly;
+                    if (!TryAdvanceByWorkHours(request, demand, stageCode, cursor, hours, out var end, out var workReason, isLeadTimeOnly))
+                    {
+                        workWindowUnavailableForDemand = true;
+                        if (workWindowUnavailableStages != null)
+                        {
+                            workWindowUnavailableStages.Add((demand.LogicalDemandKey, stageCode, workReason));
+                        }
+
+                        continue;
+                    }
+
 
                     segments.Add(new StageTimingSegmentFact
                     {
@@ -336,6 +404,34 @@ public static class StageTimingNodeBuilder
                 }
             }
 
+            // ── R09-②（2026-10-29 落码）：**结构上无法定位**的无 Routing Stage ──
+            //   在求解范围内、却「没有 StageSequenceChain」或「链里根本没有这个 Stage」时，
+            //   无法判定它在末端 Task **之前**还是**之后** ⇒ 提前期要么被漏计（时间低估）、
+            //   要么本不该计（时间虚高）。两种都**不能声称确定**。
+            //   0号位 2026-10-23《04》§1.5 逐字：「`StageDetail.StageSeq` 与真实 Routing、StageTiming
+            //   必须连续形成时间约束」⇒ 无 seq 的 Stage 本身就构不成合法时间约束。
+            //   Fail Closed：只有「每一个在范围内的无 Routing Stage 都能定位到链上」才允许 `true`。
+            //   注：`suppressCandidateLeadTimes` 分支下 `terminal == null` ⇒ 判据③ 已命中，此处不必重复。
+            var routelessUnplaceable = false;
+            if (!suppressCandidateLeadTimes && routelessStages.Count > 0)
+            {
+                if (!chainByMaterial.TryGetValue(demand.MaterialId, out var placementChain) ||
+                    placementChain.Stages.Count == 0)
+                {
+                    routelessUnplaceable = true;
+                }
+                else
+                {
+                    var placedStages = new HashSet<string>(StringComparer.Ordinal);
+                    foreach (var step in placementChain.Stages)
+                    {
+                        placedStages.Add(step.StageCode);
+                    }
+
+                    routelessUnplaceable = routelessStages.Any(s => !placedStages.Contains(s));
+                }
+            }
+
             // RequiredStageCompletionTime：做到供给阈值 Stage 为止的完成时间（0号位 §10.3 两个口径都给）
             DateTime? requiredCompletion = null;
             if (!string.IsNullOrEmpty(demand.RequiredStageCode))
@@ -352,10 +448,26 @@ public static class StageTimingNodeBuilder
                     var terminalStep = requiredChain.Stages.FirstOrDefault(
                         s => string.Equals(s.StageCode, terminal.StageCode, StringComparison.Ordinal));
 
-                    // 供给阈值 Stage 在末端真实 Task 处或之前已完成 ⇒ 完成时间即末端 Task.End
-                    if (requiredStep != null && terminalStep != null && requiredStep.StageSeq <= terminalStep.StageSeq)
+                    // ── R09-T11（2026-10-29 落码）：EDGE 供给阈值与 ROOT 最终完工**必须区分** ──
+                    //   0号位 2026-10-23《04》§3 R09-T11 逐字：「EDGE供给阈值在末端真实Task之前，
+                    //   ROOT最终完工更晚 | `RequiredStageCompletionTime` 与 ROOT 区分；
+                    //   **既不提前释放不合格供给，也不错误压到末端完工时点**」。
+                    //   · `==`：供给阈值 Stage **就是**末端 Stage（同一批 Task）⇒ 时间 = 末端 `Task.End`，正确。
+                    //   · 严格早于：该 Stage **自己有真实 Task**（在前序工序里）⇒ 取**它自己的** Task 末，
+                    //     不得压到末端完工时点（那是晚释放供给）。
+                    //   · 取不到该 Stage 的真实 Task（例如纯无 Routing 且无提前期段）⇒ `null`：
+                    //     **不臆造**、也不回落到末端完成时间 —— 宁可不释放供给（Fail Closed）。
+                    if (requiredStep != null && terminalStep != null)
                     {
-                        requiredCompletion = terminal.PlannedEndTime;
+                        if (requiredStep.StageSeq == terminalStep.StageSeq)
+                        {
+                            requiredCompletion = terminal.PlannedEndTime;
+                        }
+                        else if (requiredStep.StageSeq < terminalStep.StageSeq)
+                        {
+                            requiredCompletion = ResolveStageTaskEnd(
+                                tasksByDemandKey, demand.LogicalDemandKey, demand.RequiredStageCode);
+                        }
                     }
                 }
             }
@@ -363,7 +475,10 @@ public static class StageTimingNodeBuilder
             // ── S2-01 留痕判据（见 Build 的 TracePathUndetermined）──
             //   只有「路径未唯一确定」**且**「确实有提前期段进入了 CompletionTime」才算候选口径；
             //   无 Routing Stage 一个都没有 ⇒ 时间完全来自真实 Task.End ⇒ 与路径无关，**不误报**。
-            if (!routeless.PathDetermined && segments.Count > 0)
+            // 判据②（路径未唯一确定）**就地求值**，不依赖调用方是否传收集器：
+            //   `CompletionTimeCertain` 必须与留痕**同源**，不能因为没人订阅留痕就悄悄放弃标注。
+            var pathUndeterminedForDemand = !routeless.PathDetermined && segments.Count > 0;
+            if (pathUndeterminedForDemand)
             {
                 pathUndeterminedDemandKeys?.Add(demand.LogicalDemandKey);
             }
@@ -381,10 +496,36 @@ public static class StageTimingNodeBuilder
             //       已被上方 `suppressCandidateLeadTimes` 抑制（`segments` 因此为空）⇒ 同样无权威依据。
             //   ⚠ 两支**共用同一条留痕**（不新造码）：对下游而言「该 Demand 的 `CompletionTime` 不可作权威」
             //     是同一件事；分列会让 2号位 读模型侧出现两个等价的告警键。文案已覆盖两支。
-            if (terminal is null && segments.Count == 0)
+            // 判据③（时间无真实依据）同样**就地求值**。
+            var completionTimeUnavailableForDemand = terminal is null && segments.Count == 0;
+            if (completionTimeUnavailableForDemand)
             {
                 completionTimeUnavailableDemandKeys?.Add(demand.LogicalDemandKey);
             }
+
+            // ── G-3 `CompletionTimeCertain` 接线（0号位 2026-10-28《01_正式回复1号位_R04秒转分钟唯一装配
+            //    _WAIT_ONLY_AUTO与R06本地先修_v1.0》§二：认当前生产侧从未置值；同意先落 `false` 的
+            //    **缺 LT / 无真实 Task / 路径未定** 三种判据，「**不允许未证 WORK 就先填 `true`**」）──
+            //   判据全部是**本方法已有的三个留痕集合**，不新增判据、不新增载体、不新增 ReasonCode：
+            //     ① 缺 LT            ⇒ `leadTimeMissingForDemand`（上方 `MissingLevel` 分支）；
+            //     ② 路径未唯一确定   ⇒ `pathUndeterminedForDemand`（仅当确有提前期段进入时间）；
+            //     ③ 时间无真实依据   ⇒ `completionTimeUnavailableForDemand`（无末端 Task 且无段）；
+            //     ④ 无可靠 WORK      ⇒ `workWindowUnavailableForDemand`（R09-① 2026-10-29 落码）。
+            //   五判据均**就地求值**、与留痕同源，**不读收集器**（收集器是可选的订阅通道，
+            //   没订阅不等于判据不成立）。
+            //   **R09-②（2026-10-29 落码）三态转满**：五条判据全不命中 ⇒ 置 **`true`**。
+            //   0号位 此前只设了一道闸：「**不允许未证 WORK 就先填 `true`**」——WORK 的证明已由 R09-①
+            //   （按 `(FactoryId, DepartmentId)` 合法 WORK 窗口逐片累计）落地 ⇒ 该闸的前提已满足。
+            //   `true` 的含义 = 「该 `CompletionTime` 全部由真实 `Task.End` + 已证 WORK 推进的
+            //   无 Routing Stage 提前期构成，无缺参、无候选路径、无退化游标、无结构缺口」。
+            var completionTimeUncertain = leadTimeMissingForDemand
+                || pathUndeterminedForDemand
+                || completionTimeUnavailableForDemand
+                // R09-①（2026-10-29 落码）：无可信/不足够 WORK 窗口 ⇒ 同样**不得**声称确定完工。
+                //   0号位 同件逐字「不生成确定Stage完成/下游AvailableTime」。
+                || workWindowUnavailableForDemand
+                // R09-②（2026-10-29 落码）：无 Routing Stage 在范围内但链上无位置 ⇒ 时间可能漏计/虚计。
+                || routelessUnplaceable;
 
             result.Add(new DemandCompletionFact
             {
@@ -394,6 +535,7 @@ public static class StageTimingNodeBuilder
                 RequiredStageCode = demand.RequiredStageCode,
                 CompletionTime = cursor,
                 AvailableTime = cursor, // V1 与 CompletionTime 同值（已对齐）
+                CompletionTimeCertain = completionTimeUncertain ? false : (bool?)true,
                 RequiredStageCompletionTime = requiredCompletion,
                 TerminalFinalDraftId = terminal?.FinalDraftId,
                 StageTimings = segments
@@ -401,6 +543,311 @@ public static class StageTimingNodeBuilder
         }
 
         return result;
+    }
+
+    /// <summary>
+    /// R09-①（0号位 2026-10-23《04_APS_V1_R09_…联合技术核证包》§2/§3 逐字）：
+    /// 「Stage LT唯一业务维护及计算单位是**有效生产小时**……部门/工厂/全局任何一级命中LT时，
+    ///   无Routing Stage按唯一生产部门及所属工厂的合法WORK时间窗口**逐片累计，起始当天合法余时可计入，OFF不计**；
+    ///   无Routing不借设备/人工槽日历凑时间。」
+    /// 「无可信或不足够WORK时，不假设7×24/默认8h，不生成确定Stage完成/下游AvailableTime。」
+    ///
+    /// <para>**只吃 G-2 两个载体，绝不复用 `CalendarSlots`（资源槽）**——0号位同件逐字
+    /// 「**禁止复用ResourceId资源槽做替代**」：</para>
+    /// <list type="bullet">
+    ///   <item>部门取源 = <see cref="DomainSolveRequest.MaterialStageDepartmentContexts"/>（**不是**
+    ///     `StageSequenceChains[].ProductionDepartmentId`，见 `DomainSolveRequest.cs:223-228`）；
+    ///     缺该行 ⇒ 部门未知 ⇒ 返回 <c>false</c>（不猜部门）。</item>
+    ///   <item>窗口取源 = <see cref="DomainSolveRequest.DepartmentWorkWindows"/>，**按
+    ///     `(FactoryId, DepartmentId)` 精确取用、无任何回落分支**；`DepartmentId == null` 的厂级行
+    ///     **不是排程通道**，此处天然不会命中。</item>
+    /// </list>
+    ///
+    /// <para>**返回 false ＝ 时间无法证明**：调用方必须「不产段、不推进游标」，不得伪造确定完工时间。
+    /// 三种原因由 <paramref name="reason"/> 带回，仅供留痕，**不新增 ReasonCode**。</para>
+    /// </summary>
+    /// <param name="request">求解请求（读 `MaterialStageDepartmentContexts` / `DepartmentWorkWindows`）。</param>
+    /// <param name="demand">当前需求（取其 `MaterialId` 与 `FactoryId`）。</param>
+    /// <param name="stageCode">无 Routing 的大工艺阶段码。</param>
+    /// <param name="cursor">推进起点（含「起始当天合法余时」）。</param>
+    /// <param name="hours">该 Stage 的有效生产小时（`StageLeadTimeFact.LeadTimeHours`，装载侧已折算）。</param>
+    /// <param name="end">推进后的时间；仅当返回 <c>true</c> 时有意义。</param>
+    /// <param name="reason">失败原因（`MISSING_DEPARTMENT_CONTEXT` / `NO_WORK_WINDOW` / `INSUFFICIENT_WORK`）。</param>
+    internal static bool TryAdvanceByWorkHours(
+        DomainSolveRequest request,
+        LogicalProductionDemand demand,
+        string stageCode,
+        DateTime cursor,
+        decimal hours,
+        out DateTime end,
+        out string reason,
+        bool isLeadTimeOnly = false)
+    {
+        end = cursor;
+        reason = string.Empty;
+
+        // 0 小时是**合法命中值**（实测 4 行完工类 `LeadTimeDays = 0.00`，见 `StageLeadTimeFact.LeadTimeHours` 注释）
+        // ⇒ 不推进、但**时间确定**（不需要任何 WORK 窗口）。
+        //
+        // ── 2026-11-02 更正：**负值按契约夹到 0，不再拿负值做时钟算术** ──
+        //   契约逐字（`LPS.APS.Core/Dto/DomainSolveRequest.cs:99`）：
+        //     「折算值为 0（或负）**按命中产出**：`LeadTimeHours = 0`」
+        //   ⇒ 消费侧义务是「负值当 0 用」，**不是**「把负值原样加到时钟上」。
+        //   改前此处 `end = cursor.AddHours((double)hours)`：`hours = -5` 会让游标**倒退 5 小时**，
+        //     排程出现「后段完工早于前段」的时钟倒退（我方 2026-10-31 已向 0号位 认账）。
+        //   ⚠ 只夹**时间推进**；`StageLeadTimeFact.LeadTimeHours` 仍如实透传原值、`MatchLevel` 仍不改判
+        //     ——「值原样透传、不把命中改写成 MISSING」这条口径**照旧成立**。
+        if (hours <= 0m)
+        {
+            end = cursor;
+            return true;
+        }
+
+        // ── 部门：只能来自 `MaterialStageDepartmentContexts`，缺则未知（不猜）──
+        //   ⚠ 2026-11-04（2号位 r14030 ＋ Resource Calendar 专项 v1.4 `:17`/`:18`）：
+        //     `IsLeadTimeOnly=true`（StageDict 的 FINAL/OUTS）在 `ProductionDepartment` 字典里
+        //     **没有任何部门**；`:18` 明确「本层 MISSING ⇒ 允许继承**上级**已认证工作窗口」。
+        //     ⇒ 这类 Stage **不查部门**，改按**工厂级**（`DepartmentId == null`）WORK 窗口推进。
+        //     `IsLeadTimeOnly=false` 时本段**逐字不变**。
+        int? departmentId = null;
+        if (!isLeadTimeOnly)
+        {
+            foreach (var ctx in request.MaterialStageDepartmentContexts)
+            {
+                if (ctx.MaterialId == demand.MaterialId &&
+                    string.Equals(ctx.StageCode, stageCode, StringComparison.Ordinal))
+                {
+                    departmentId = ctx.ProductionDepartmentId;
+                    break;
+                }
+            }
+
+            if (departmentId is null)
+            {
+                reason = "MISSING_DEPARTMENT_CONTEXT";
+                return false;
+            }
+        }
+
+        // ── 窗口：(FactoryId, DepartmentId) 精确匹配，无回落；厂级行（DepartmentId=null）不得参与 ──
+        List<DepartmentWorkWindow>? windows = null;
+        foreach (var w in request.DepartmentWorkWindows)
+        {
+            if (w.FactoryId != demand.FactoryId) continue;
+            // IsLeadTimeOnly ⇒ 只取**厂级行**（DepartmentId == null）；其余仍按部门精确匹配
+            if (isLeadTimeOnly ? w.DepartmentId is not null : w.DepartmentId != departmentId!.Value)
+            {
+                continue;
+            }
+
+            (windows ??= new List<DepartmentWorkWindow>()).Add(w);
+        }
+
+        if (windows is null || windows.Count == 0)
+        {
+            reason = "NO_WORK_WINDOW";
+            return false;
+        }
+
+        windows.Sort(static (a, b) => a.Start.CompareTo(b.Start));
+
+        // ── 逐片累计：`segStart = max(窗口起, 游标)` ⇒ 「起始当天合法余时可计入」；窗口外的 OFF 自然不计 ──
+        var remaining = hours;
+        var t = cursor;
+        foreach (var w in windows)
+        {
+            if (w.End <= t)
+            {
+                continue;
+            }
+
+            var segStart = w.Start > t ? w.Start : t;
+            var available = (decimal)(w.End - segStart).TotalHours;
+            if (available <= 0m)
+            {
+                continue;
+            }
+
+            if (available >= remaining)
+            {
+                end = segStart.AddHours((double)remaining);
+                return true;
+            }
+
+            remaining -= available;
+            t = w.End;
+        }
+
+        // 窗口用尽仍不够 ⇒ 「不足够WORK」⇒ 不生成确定时间（不回落 8h/7×24）
+        reason = "INSUFFICIENT_WORK";
+        return false;
+    }
+
+    /// <summary>
+    /// **R09-③（2026-10-29）**：<see cref="TryAdvanceByWorkHours"/> 的**严格镜像反向版** ——
+    /// 从 <paramref name="cursor"/> 往回退 <paramref name="hours"/> 个**有效生产小时**。
+    ///
+    /// <para><b>为什么需要</b>：Phase2 倒排（`ScheduleBackward`）是把 Due 往前推，
+    /// 「中间无 Routing Stage 的提前期」在这里表现为「前一个 Routing Stage 必须**更早**结束」。
+    /// 若只在前推方向扣提前期、倒排方向不管，同一份输入换个方向排出来的结果就不一致。</para>
+    ///
+    /// <para><b>与正向版逐条对称</b>（部门/窗口/无回落口径**全部一致**，不另立规则）：</para>
+    /// <list type="bullet">
+    ///   <item>部门只来自 `MaterialStageDepartmentContexts`，缺 ⇒ `MISSING_DEPARTMENT_CONTEXT`；</item>
+    ///   <item>窗口只按 `(FactoryId, DepartmentId)` **精确**匹配，厂级行不参与，缺 ⇒ `NO_WORK_WINDOW`；</item>
+    ///   <item>`hours ≤ 0` **不移动游标**（同正向：0/负值是**合法命中值**，但负值按
+    ///     `DomainSolveRequest.cs:99` 契约夹到 0，不得让时钟倒退）；</item>
+    ///   <item>窗口倒序遍历，`segEnd = min(窗口止, 游标)` ⇒「截止那一刻所在当天的合法余时」可计入，
+    ///     OFF 段自然不计；不足 ⇒ `INSUFFICIENT_WORK`。</item>
+    /// </list>
+    ///
+    /// <para><b>返回 false ＝ 时间无法证明</b>：调用方必须「不改锚点」（等价正向的「不产段、不推进游标」），
+    /// 不得伪造确定时间；原因由 <paramref name="reason"/> 带回，**仅供留痕，不新增 ReasonCode**。</para>
+    /// </summary>
+    /// <param name="request">求解请求（读 `MaterialStageDepartmentContexts` / `DepartmentWorkWindows`）。</param>
+    /// <param name="demand">当前需求（取其 `MaterialId` 与 `FactoryId`）。</param>
+    /// <param name="stageCode">无 Routing 的大工艺阶段码。</param>
+    /// <param name="cursor">回退起点（通常是「后一个工序的开工时间」）。</param>
+    /// <param name="hours">该 Stage 的有效生产小时。</param>
+    /// <param name="start">回退后的时间；仅当返回 <c>true</c> 时有意义。</param>
+    /// <param name="reason">失败原因（与正向版同名，不新增码）。</param>
+    internal static bool TryRetreatByWorkHours(
+        DomainSolveRequest request,
+        LogicalProductionDemand demand,
+        string stageCode,
+        DateTime cursor,
+        decimal hours,
+        out DateTime start,
+        out string reason,
+        bool isLeadTimeOnly = false)
+    {
+        start = cursor;
+        reason = string.Empty;
+
+        // 与正向版同口径：0/负值是合法命中值 ⇒ 不查窗口；但**负值按契约夹到 0，不移动游标**
+        //   （`DomainSolveRequest.cs:99`「折算值为 0（或负）**按命中产出**：`LeadTimeHours = 0`」）。
+        //   改前此处 `start = cursor.AddHours(-(double)hours)`：`hours = -5` 会让起点**后移 5 小时**。
+        if (hours <= 0m)
+        {
+            start = cursor;
+            return true;
+        }
+
+        // ── 部门：只能来自 `MaterialStageDepartmentContexts`，缺则未知（不猜）──
+        //   2026-11-04：与 `TryAdvanceByWorkHours` **严格镜像**（2号位 r14030 §2.2 要求对称）——
+        //     `IsLeadTimeOnly=true`（FINAL/OUTS）不查部门，改按**工厂级** WORK 窗口回退。
+        int? departmentId = null;
+        if (!isLeadTimeOnly)
+        {
+            foreach (var ctx in request.MaterialStageDepartmentContexts)
+            {
+                if (ctx.MaterialId == demand.MaterialId &&
+                    string.Equals(ctx.StageCode, stageCode, StringComparison.Ordinal))
+                {
+                    departmentId = ctx.ProductionDepartmentId;
+                    break;
+                }
+            }
+
+            if (departmentId is null)
+            {
+                reason = "MISSING_DEPARTMENT_CONTEXT";
+                return false;
+            }
+        }
+
+        // ── 窗口：(FactoryId, DepartmentId) 精确匹配，无回落；厂级行（DepartmentId=null）不得参与 ──
+        List<DepartmentWorkWindow>? windows = null;
+        foreach (var w in request.DepartmentWorkWindows)
+        {
+            if (w.FactoryId != demand.FactoryId) continue;
+            if (isLeadTimeOnly ? w.DepartmentId is not null : w.DepartmentId != departmentId!.Value)
+            {
+                continue;
+            }
+
+            (windows ??= new List<DepartmentWorkWindow>()).Add(w);
+        }
+
+        if (windows is null || windows.Count == 0)
+        {
+            reason = "NO_WORK_WINDOW";
+            return false;
+        }
+
+        windows.Sort(static (a, b) => a.Start.CompareTo(b.Start));
+
+        // ── 反向逐片累计：`segEnd = min(窗口止, 游标)` ⇒ 「截止那天已过的合法工时」可计入 ──
+        var remaining = hours;
+        var t = cursor;
+        for (var i = windows.Count - 1; i >= 0; i--)
+        {
+            var w = windows[i];
+
+            // 窗口整体在游标之后（含恰好等于）⇒ 一个工时也用不上。
+            if (w.Start >= t)
+            {
+                continue;
+            }
+
+            var segEnd = w.End < t ? w.End : t;
+            var available = (decimal)(segEnd - w.Start).TotalHours;
+            if (available <= 0m)
+            {
+                continue;
+            }
+
+            if (available >= remaining)
+            {
+                start = segEnd.AddHours(-(double)remaining);
+                return true;
+            }
+
+            remaining -= available;
+            t = w.Start;
+        }
+
+        // 窗口用尽仍不够 ⇒ 「不足够WORK」⇒ 不生成确定时间（不回落 8h/7×24）
+        reason = "INSUFFICIENT_WORK";
+        return false;
+    }
+
+    /// <summary>
+    /// R09-T11（0号位 2026-10-23《04》§3）：取「供给阈值 Stage 自己的真实 Task 末」。
+    /// 用于 EDGE 与 ROOT **严格不同 Stage** 的那一支 —— 此时末端 `Task.End` 是 ROOT 时间，
+    /// 拿来当 EDGE 时间就是「错误压到末端完工时点」。
+    /// 取不到（无该 Stage 的 Task）⇒ `null`，**不回落到末端完成时间**（不释放未证供给）。
+    /// </summary>
+    private static DateTime? ResolveStageTaskEnd(
+        IReadOnlyDictionary<string, List<FinalTaskDraft>>? tasksByDemandKey,
+        string demandKey,
+        string? stageCode)
+    {
+        if (tasksByDemandKey is null || string.IsNullOrEmpty(stageCode))
+        {
+            return null;
+        }
+
+        if (!tasksByDemandKey.TryGetValue(demandKey, out var tasks) || tasks is null)
+        {
+            return null;
+        }
+
+        DateTime? end = null;
+        foreach (var task in tasks)
+        {
+            if (!string.Equals(task.StageCode, stageCode, StringComparison.Ordinal))
+            {
+                continue;
+            }
+
+            if (end is null || task.PlannedEndTime > end.Value)
+            {
+                end = task.PlannedEndTime;
+            }
+        }
+
+        return end;
     }
 
     /// <summary>
@@ -621,7 +1068,7 @@ public static class StageTimingNodeBuilder
     /// 见到该 Level 直接走 Issue 分支、不产出时间段（见 `MissingLevel` 注释）。
     /// 故此处回落值取 `0m` 只是占位，**不是**「按 0 小时排」。
     /// </summary>
-    private static (decimal Hours, string Level) ResolveLeadTime(
+    internal static (decimal Hours, string Level) ResolveLeadTime(
         Dictionary<(int MaterialId, string StageCode), StageLeadTimeFact> index,
         int materialId,
         string stageCode)

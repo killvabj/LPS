@@ -82,7 +82,8 @@ public class ParameterSetVersionRepository : IParameterSetVersionRepository
                    MAX(CASE WHEN j.[key] = N'Supply' THEN j.[value] END) AS [SupplyJson],
                    MAX(CASE WHEN j.[key] = N'Procurement' THEN j.[value] END) AS [ProcurementJson],
                    MAX(CASE WHEN j.[key] = N'SolverStrategy' THEN j.[value] END) AS [SolverStrategyJson],
-                   MAX(CASE WHEN j.[key] = N'CandidateGuardrail' THEN j.[value] END) AS [CandidateGuardrailJson]
+                   MAX(CASE WHEN j.[key] = N'CandidateGuardrail' THEN j.[value] END) AS [CandidateGuardrailJson],
+                   MAX(CASE WHEN j.[key] = N'StageHandoffWaitRules' THEN j.[value] END) AS [StageHandoffWaitRulesJson]
             FROM [dbo].[ParameterSetVersion] ps
             OUTER APPLY OPENJSON(CASE WHEN ISJSON(ps.[ContentSnapshotJson]) = 1 THEN ps.[ContentSnapshotJson] END) AS j
             WHERE ps.[Id] = @Id

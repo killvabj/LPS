@@ -223,7 +223,7 @@ public class SetupWiringTests
         {
             MaterialId = m, ProductionDepartmentId = 100, RouteCode = "DEFAULT",
             OperationCode = "OP10", StageCode = "STAGE1",
-            StandardDuration = 60m, SetupTime = legacySetupTime   // 旧字段：接线后不得被读取
+            StandardDuration = 60m * 60m, SetupTime = legacySetupTime   // 旧字段：接线后不得被读取
         }).ToList();
 
         var els = materials.Select(m => new OperationResourceEligibility

@@ -66,7 +66,9 @@ internal class PhaseThreeDiagnostics
             if (demandTasks.Count == 0) continue;
 
             var lastTask = demandTasks.Last();
-            var effectiveDue = constraints.EffectiveDue(demand);   // M5 第一批：延期诊断口径用覆盖交期
+            // M5 第一批：延期诊断口径用覆盖交期。判定期上界：客户 DATE ⇒ 交期日整天算按期
+            //   （0号位 2026-10-31 v3.0:18「最终完成 < nextMidnight」）。见 `EffectiveDueJudgementBound`。
+            var effectiveDue = constraints.EffectiveDueJudgementBound(demand);
             var delay = lastTask.PlannedEndTime - effectiveDue;
 
             if (delay > TimeSpan.Zero)
@@ -282,8 +284,9 @@ internal class PhaseThreeDiagnostics
         }
 
         // 3. Setup 边际延期：去掉 Setup 即不延期 → 延期由 Setup 时间决定
+        // 反事实「去掉 Setup 就不延期」用同一个判定期上界，否则归因口径与正式判定会打架。
         if (lastTask.SetupTime > 0m &&
-            lastTask.PlannedEndTime.AddMinutes(-(double)lastTask.SetupTime) <= constraints.EffectiveDue(demand))
+            lastTask.PlannedEndTime.AddMinutes(-(double)lastTask.SetupTime) <= constraints.EffectiveDueJudgementBound(demand))
         {
             // 15 码对齐：换型受限不出专属码（基线 v1.8:1297「不新增 Setup 专属 ReasonCode」）
             // ⇒ 归入资源等待（换型占用的是资源时间）。
@@ -540,8 +543,25 @@ internal class PhaseThreeDiagnostics
             if (group.Key is not int resourceId) continue;
 
             // 计算总占用时间
+            // ── PV195 跨窗（2026-10-29）：跨窗 Task 的墙钟 `End − Start` 含窗间空档，
+            //   直接累加会把利用率算虚高（可能 >100%，撞「设备负荷率必须 ≤ 100%」这条算法正确性红线）。
+            //   取 `min(墙钟跨度, 有效加工)`：
+            //   · 单窗下 `End − Start` **恒等于**有效加工（两处 CreateTask 都是
+            //     `PlannedStartTime = 占用起点 + Setup`、`PlannedEndTime = 占用终点`
+            //     ⇒ `End − Start = 占用长 − Setup = adjustedDuration`）⇒ `min` 取到的就是原值，**零行为变化**；
+            //   · 跨窗 `End − Start` 含空档、大于有效加工 ⇒ 取有效加工，负荷率不再虚高；
+            //   · `EffectiveProcessMinutes` 为 null（锁定继承 Task）⇒ 回落原算式，保持锚点原口径。
+            //   ⚠ 不要写成 `有效加工 + SetupTime`：`PlannedStartTime` 是**Setup 之后**的加工起点
+            //     （`PhaseTwoInitialScheduler.cs` 正/倒排两处 `taskStart = 槽起点 + setup`），
+            //     原式本就不含 Setup；加回去会把所有既有负荷率一起抬高，属于改变既有读数。
             var totalOccupiedMinutes = group
-                .Sum(t => (t.PlannedEndTime - t.PlannedStartTime).TotalMinutes);
+                .Sum(t =>
+                {
+                    var wallSpan = (t.PlannedEndTime - t.PlannedStartTime).TotalMinutes;
+                    if (t.EffectiveProcessMinutes is not decimal effective) return wallSpan;
+                    var effectiveMinutes = (double)effective;
+                    return wallSpan < effectiveMinutes ? wallSpan : effectiveMinutes;
+                });
 
             // 计算资源可用时间
             var availableMinutes = 0.0;

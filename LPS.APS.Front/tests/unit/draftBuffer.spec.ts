@@ -15,6 +15,7 @@ import assert from 'node:assert/strict'
 import {
   flattenBlocks,
   applyEdit,
+  removePath,
   buildPutBody,
   parseJsonSafe,
   parseParameterSetBlocks,
@@ -77,6 +78,75 @@ describe('US1-US5: flattenBlocks', () => {
       solverStrategy: { d: 4 }, candidateGuardrail: { e: 5 }
     }
     assert.equal(flattenBlocks(blocks).length, 5)
+  })
+})
+
+describe('字段目录元数据：中文标签 / 边界 / 文本清单', () => {
+  const only = (block: keyof ParameterSetBlocks, value: Record<string, unknown>) => {
+    const blocks = {
+      lock: {}, supply: {}, procurement: {}, solverStrategy: {}, candidateGuardrail: {}
+    } as ParameterSetBlocks
+    blocks[block] = value as never
+    return blocks
+  }
+
+  it('US15 目录内字段带中文标签（表格不再只显示英文路径）', () => {
+    const rows = flattenBlocks(only('lock', { Trigger: { ProtectDelayed: true } }))
+    assert.equal(rows.length, 1)
+    assert.equal(rows[0].label, '保护已延期需求')
+    assert.deepEqual(rows[0].path, ['Trigger', 'ProtectDelayed'])
+  })
+
+  it('US16 目录外老键没有中文标签（宁可不显示，不编造）', () => {
+    const rows = flattenBlocks(only('lock', { LegacyKey: 1 }))
+    assert.equal(rows[0].label, undefined)
+  })
+
+  it('US17 文本清单保留原数组 + type=TEXT_LIST + 可编辑', () => {
+    const rows = flattenBlocks(
+      only('lock', { Trigger: { ProtectedOrderTypes: ['SO', 'WO'] } })
+    )
+    assert.deepEqual(rows[0].value, ['SO', 'WO'])
+    assert.equal(rows[0].type, 'TEXT_LIST')
+    assert.equal(rows[0].editable, true)
+    assert.equal(rows[0].label, '指定订单类型')
+  })
+
+  it('US18 目录外的数组仍整体只读（不因新增清单编辑而放松）', () => {
+    const rows = flattenBlocks(only('lock', { UnknownArray: ['a', 'b'] }))
+    assert.equal(rows[0].value, '["a","b"]')
+    assert.equal(rows[0].type, 'STRING')
+    assert.equal(rows[0].editable, false)
+  })
+
+  it('US19 文本清单里含非字符串项 ⇒ 不当文本清单处理（保持只读）', () => {
+    const rows = flattenBlocks(
+      only('lock', { Trigger: { ProtectedOrderTypes: ['SO', 1] } })
+    )
+    assert.equal(rows[0].type, 'STRING')
+    assert.equal(rows[0].editable, false)
+  })
+
+  it('US20 边界与步长按目录并入（逾期修正比例 0~100 / 0.01）', () => {
+    const rows = flattenBlocks(only('procurement', { OverdueMargin: { MarginPercent: 8 } }))
+    assert.equal(rows[0].min, 0)
+    assert.equal(rows[0].max, 100)
+    assert.equal(rows[0].step, 0.01)
+    assert.equal(rows[0].label, '逾期修正比例')
+  })
+
+  it('US21 只有下界的字段不编造上限（最小批量 min=0.01 / max 缺省）', () => {
+    const rows = flattenBlocks(only('solverStrategy', { Split: { MinBatchQty: 2 } }))
+    assert.equal(rows[0].min, 0.01)
+    assert.equal(rows[0].max, undefined)
+  })
+
+  it('US22 parameterSetEnums 已有口径优先（换型搜索预算 100~5000）', () => {
+    const rows = flattenBlocks(
+      only('solverStrategy', { Setup: { SetupSearchBudget: 1200 } })
+    )
+    assert.equal(rows[0].min, 100)
+    assert.equal(rows[0].max, 5000)
   })
 })
 
@@ -312,5 +382,59 @@ describe('US14 round-trip（PUT body → JSON.parse → flatten）', () => {
     assert.ok(rows.some((r) => r.path.join('.') === 'x'))
     assert.ok(rows.some((r) => r.path.join('.') === 'y'))
     assert.ok(rows.some((r) => r.path.join('.') === 'z.nested'))
+  })
+})
+
+/* ============================================================
+ * removePath：删除参数（键从块 JSON 里拿掉）
+ * 语义 = 回到后端 DTO 默认值；块删空 ⇒ PUT 不带该块 ⇒ 仍被 EMPTY_* 拦
+ * ============================================================ */
+
+describe('removePath: 删除参数', () => {
+  const emptyBlocks = (): ParameterSetBlocks => ({
+    lock: {},
+    supply: {},
+    procurement: {},
+    solverStrategy: {},
+    candidateGuardrail: {}
+  })
+
+  it('删叶子键 ⇒ 该键从块 JSON 里消失', () => {
+    const blocks = emptyBlocks()
+    blocks.lock = { Trigger: { ProtectDelayed: true, ProtectVipTier: false } }
+    removePath(blocks, 'lock', ['Trigger', 'ProtectDelayed'])
+    assert.deepEqual(blocks.lock, { Trigger: { ProtectVipTier: false } })
+  })
+
+  it('删到父对象空了 ⇒ 父对象一并删掉（不留 {"Trigger":{}} 空壳）', () => {
+    const blocks = emptyBlocks()
+    blocks.lock = { Trigger: { ProtectDelayed: true } }
+    removePath(blocks, 'lock', ['Trigger', 'ProtectDelayed'])
+    assert.deepEqual(blocks.lock, {})
+  })
+
+  it('块删空 ⇒ PUT 不带该块 ⇒ 后端仍报 EMPTY_*', () => {
+    const blocks = emptyBlocks()
+    blocks.solverStrategy = { Mode: 0 }
+    removePath(blocks, 'solverStrategy', ['Mode'])
+    assert.deepEqual(blocks.solverStrategy, {})
+    const body = buildPutBody({ id: 1, status: 'DRAFT' } as never, blocks)
+    assert.equal(body.solverStrategyJson, undefined)
+  })
+
+  it('只删指定键 ⇒ 兄弟键不动', () => {
+    const blocks = emptyBlocks()
+    blocks.procurement = { OverdueMargin: { MarginPercent: 10, MinimumExtraDays: 2 } }
+    removePath(blocks, 'procurement', ['OverdueMargin', 'MinimumExtraDays'])
+    assert.deepEqual(blocks.procurement, { OverdueMargin: { MarginPercent: 10 } })
+  })
+
+  it('删不存在的键 / 空 path / 中间节点不是对象 ⇒ 抛错（不静默兜底）', () => {
+    const blocks = emptyBlocks()
+    blocks.lock = { Trigger: { ProtectDelayed: true } }
+    assert.throws(() => removePath(blocks, 'lock', ['Trigger', 'NotExist']))
+    assert.throws(() => removePath(blocks, 'lock', []))
+    blocks.supply = { Inventory: { IsEnabled: true } }
+    assert.throws(() => removePath(blocks, 'supply', ['Inventory', 'IsEnabled', 'Deep']))
   })
 })

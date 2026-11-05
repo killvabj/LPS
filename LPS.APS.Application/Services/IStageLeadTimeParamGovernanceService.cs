@@ -64,4 +64,17 @@ public interface IStageLeadTimeParamGovernanceService
         int actorUserId,
         string actorUserCode,
         CancellationToken ct = default);
+
+    /// <summary>恢复启用阶段提前期参数（IsActive 0→1；若 IsDefault=1，激活后须过全局默认唯一，窗口重叠 → 拒绝）。
+    /// 幂等：已启用再次调用原样返回、不追加审计。</summary>
+    /// <param name="id">参数主键（StageLeadTimeParam.Id）</param>
+    /// <param name="actorUserId">操作人用户 Id</param>
+    /// <param name="actorUserCode">操作人工号</param>
+    /// <param name="ct">取消令牌</param>
+    /// <returns>恢复启用后的参数投影（IsActive=true）</returns>
+    Task<StageLeadTimeParamDto> ActivateAsync(
+        int id,
+        int actorUserId,
+        string actorUserCode,
+        CancellationToken ct = default);
 }

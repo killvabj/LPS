@@ -243,6 +243,12 @@ public class RealDomainFullRunTest
         //   作用域走 `AsyncLocal`，`RunSchedulingAsync` 内部的 await 链沿用同一上下文。
         using var solverScope = LPS.APS.Scheduling.Solvers.SolverDiagnostics.BeginScope();
 
+        // ── 入参捕获（1号位 r13910 的 `OnSolveRequest` 钩子，2026-10-26 由我方接线）──────────
+        //   他要的是「PV190 真实入参的 JSON」，好在自己机器上离线重放、不必每次真跑 30 分钟。
+        //   按他 §13 的边界，`Scheduling` 里不开 I/O —— 落盘这一行由我方（调用侧）写。
+        //   开门：APS_CAPTURE_SOLVE_REQUEST=1。默认关（文件可达数百 MB，别让普通跑批顺手写盘）。
+        using var solveRequestCapture = SolveRequestCapture.Start(planVersionId, _output);
+
         // ── 运行中采样（2026-10-26 增）───────────────────────────────────────────
         //   `DumpSolverCounters` 写在 `RunSchedulingAsync` **之后** —— 求解器不返回就永远执行不到。
         //   10-25（31分12秒）／10-26 上午／10-26 中午（≈57分11秒）三次求解器零返回，
@@ -535,12 +541,28 @@ public class RealDomainFullRunTest
     /// </summary>
     internal sealed class SolverLiveSampler : IDisposable
     {
+        // ⚠ 列顺序是外部契约：`SolverLiveSamplerTests` 按 0 基下标断言 p2_done(7)/p2_total(8)/
+        //   rss_mb(19)/heap_mb(20)/cpu_ms(21)/threads(22)。**只许在末尾追加**，不许插队、不许重排。
+        //
+        // ── 2026-10-26 追加（2号位）────────────────────────────────────────────
+        //   ① gc0/gc1/gc2/alloc_mb：判「在算」还是「在分配」。alloc_mb 是**累计分配量**，
+        //      斜率大 = 每秒产垃圾多；gc2 涨 = Gen2 在反复收。1号位 说他分不出这两者，
+        //      这三列就是分它的依据（进程侧读数，不需要他在 `Scheduling` 里开任何出口）。
+        //   ② hs_*：热点**累计毫秒**（`Counters.HotspotMs`）。单看总量会被嵌套重复计，
+        //      但**逐拍做差**就是「这一段时间谁在涨」—— 这是唯一能证明 r13881 到底削掉多少的直接证据。
+        //   ③ mb_calls/dt_calls/clone_occ_calls：配套调用次数，用来算 µs/次，
+        //      分清「单次贵」与「次数多」—— 两者整改方向相反。
         internal const string Header =
             "elapsed_s,phase,p1_ms,p2_ms,p3_ms,p4_ms,p5_ms,"
             + "p2_done,p2_total,p4_done,p4_total,"
             + "batch_trials,run_batch_plan,merge_scan,slot_search,"
             + "clone_occ,rollback_unmatched,clone_task,clone_shares,"
-            + "rss_mb,heap_mb,cpu_ms,threads";
+            + "rss_mb,heap_mb,cpu_ms,threads,"
+            + "gc0,gc1,gc2,alloc_mb,"
+            + "hs_try_merge,hs_merge_detach,hs_detach_tail,hs_detach_locate,hs_detach_removeat,"
+            + "hs_clone_occ,hs_timeline_clone,hs_sched_ops,hs_slot_search,hs_find_fwd,"
+            + "hs_merge_scan,hs_batch_trial,hs_landing,"
+            + "mb_calls,dt_calls,clone_occ_calls";
 
         private readonly LPS.APS.Scheduling.Solvers.SolverDiagnostics.Counters _counters;
         private readonly string _path;
@@ -656,7 +678,33 @@ public class RealDomainFullRunTest
                 (_proc.WorkingSet64 / 1048576d).ToString("F1", inv), ",",
                 (GC.GetTotalMemory(false) / 1048576d).ToString("F1", inv), ",",
                 ((long)_proc.TotalProcessorTime.TotalMilliseconds).ToString(inv), ",",
-                _proc.Threads.Count.ToString(inv));
+                _proc.Threads.Count.ToString(inv), ",",
+                // ── 2026-10-26 追加段（列序见 Header 注释，只许末尾追加）──
+                GC.CollectionCount(0).ToString(inv), ",",
+                GC.CollectionCount(1).ToString(inv), ",",
+                GC.CollectionCount(2).ToString(inv), ",",
+                (GC.GetTotalAllocatedBytes(precise: false) / 1048576d).ToString("F0", inv), ",",
+                Hs(inv, LPS.APS.Scheduling.Solvers.SolverDiagnostics.Hotspot.TryMergeStageBatch), ",",
+                Hs(inv, LPS.APS.Scheduling.Solvers.SolverDiagnostics.Hotspot.MergeBatchDetach), ",",
+                Hs(inv, LPS.APS.Scheduling.Solvers.SolverDiagnostics.Hotspot.DetachTail), ",",
+                Hs(inv, LPS.APS.Scheduling.Solvers.SolverDiagnostics.Hotspot.DetachLocate), ",",
+                Hs(inv, LPS.APS.Scheduling.Solvers.SolverDiagnostics.Hotspot.DetachRemoveAt), ",",
+                Hs(inv, LPS.APS.Scheduling.Solvers.SolverDiagnostics.Hotspot.CloneOccupancy), ",",
+                Hs(inv, LPS.APS.Scheduling.Solvers.SolverDiagnostics.Hotspot.TimelineClone), ",",
+                Hs(inv, LPS.APS.Scheduling.Solvers.SolverDiagnostics.Hotspot.ScheduleDemandOps), ",",
+                Hs(inv, LPS.APS.Scheduling.Solvers.SolverDiagnostics.Hotspot.SlotSearch), ",",
+                Hs(inv, LPS.APS.Scheduling.Solvers.SolverDiagnostics.Hotspot.FindForwardSlot), ",",
+                Hs(inv, LPS.APS.Scheduling.Solvers.SolverDiagnostics.Hotspot.MergeAnchorScan), ",",
+                Hs(inv, LPS.APS.Scheduling.Solvers.SolverDiagnostics.Hotspot.BatchPlanTrial), ",",
+                Hs(inv, LPS.APS.Scheduling.Solvers.SolverDiagnostics.Hotspot.LandingRun), ",",
+                _counters.HotspotCallCount(LPS.APS.Scheduling.Solvers.SolverDiagnostics.Hotspot.MergeBatchDetach).ToString(inv), ",",
+                _counters.HotspotCallCount(LPS.APS.Scheduling.Solvers.SolverDiagnostics.Hotspot.DetachTail).ToString(inv), ",",
+                _counters.HotspotCallCount(LPS.APS.Scheduling.Solvers.SolverDiagnostics.Hotspot.CloneOccupancy).ToString(inv));
+
+            // 热点累计毫秒。`HotspotMs` 是 `Counters` 上的 public 方法（类本身 internal，
+            // 本程序集经 `InternalsVisibleTo("LPS.APS.Tests")` 可见）—— 不需要反射、不需要他改任何东西。
+            string Hs(System.Globalization.CultureInfo ci, int hotspot)
+                => _counters.HotspotMs(hotspot).ToString("F0", ci);
 
             System.IO.File.AppendAllText(_path, line + Environment.NewLine);
         }
@@ -726,6 +774,132 @@ public class RealDomainFullRunTest
             try
             {
                 _proc.Dispose();
+            }
+            catch
+            {
+                // ignore
+            }
+        }
+    }
+
+    /// <summary>
+    /// 【2号位 · 1号位 `OnSolveRequest` 钩子的落盘侧（2026-10-26）】
+    ///
+    /// <para><b>为什么由我方写</b>：1号位 r13910 只在求解器入口<b>回调</b>
+    /// （`SolverDiagnostics.OnSolveRequest`），按他的架构边界 <c>Scheduling</c> 里不开 I/O。
+    /// 落盘属于调用方的事，所以在他 §13 划的线内，这里就是那半边的实现。</para>
+    ///
+    /// <para><b>产物</b>：<c>PV{id}_solverequest_{序号}.json</c> —— 真实入参的完整 JSON，
+    /// 供他离线重放，不必每轮真跑。多个域会各来一次，序号按到达顺序累加。</para>
+    ///
+    /// <para><b>为什么默认关</b>：这份文件含全部需求 / 资源 / 日历 / 依赖边，PV190 量级可达数百 MB。
+    /// 普通跑批不该顺手写盘。开门：<c>APS_CAPTURE_SOLVE_REQUEST=1</c>。</para>
+    ///
+    /// <para><b>失败不影响求解</b>：序列化异常、磁盘满、路径不可写 —— 一律吞掉并记一行原因，
+    /// 求解器照跑。钩子本身在 1号位 侧也已 try/catch（`CaptureSolveRequest`），此处是第二道。</para>
+    /// </summary>
+    internal sealed class SolveRequestCapture : IDisposable
+    {
+        private static readonly System.Text.Json.JsonSerializerOptions JsonOptions = new()
+        {
+            WriteIndented = false,
+            // `DomainSolveRequest` 是图状 DTO（需求 ↔ 边 ↔ 资源互相引用）：
+            //   不设这两项，序列化会在环上抛 `JsonException` ⇒ 一个文件都拿不到。
+            ReferenceHandler = System.Text.Json.Serialization.ReferenceHandler.IgnoreCycles,
+            MaxDepth = 256,
+        };
+
+        private readonly Action<LPS.APS.Core.Dto.DomainSolveRequest>? _previous;
+        private readonly string _dir;
+        private readonly long _planVersionId;
+        private readonly ITestOutputHelper _output;
+        private readonly int _maxFiles;
+        private int _seq;
+
+        private SolveRequestCapture(
+            long planVersionId, string dir, ITestOutputHelper output,
+            Action<LPS.APS.Core.Dto.DomainSolveRequest>? previous, int maxFiles)
+        {
+            _planVersionId = planVersionId;
+            _dir = dir;
+            _output = output;
+            _previous = previous;
+            _maxFiles = maxFiles;
+        }
+
+        public static SolveRequestCapture Start(long planVersionId, ITestOutputHelper output)
+        {
+            var enabled = Environment.GetEnvironmentVariable("APS_CAPTURE_SOLVE_REQUEST") == "1";
+            var previous = LPS.APS.Scheduling.Solvers.SolverDiagnostics.OnSolveRequest;
+
+            // 每个域各来一次回调；PV190 单域，但别的场景是多域 ⇒ 只留前 N 份，免得顺手写十几份几百 MB。
+            var maxFiles = int.TryParse(
+                Environment.GetEnvironmentVariable("APS_CAPTURE_SOLVE_REQUEST_MAX"), out var m) && m > 0
+                ? m
+                : 1;
+
+            var capture = new SolveRequestCapture(
+                planVersionId, ResolveRunLogDirectory(), output, previous, maxFiles);
+
+            if (!enabled)
+            {
+                output.WriteLine("[SD-REQ] 入参捕获未开（APS_CAPTURE_SOLVE_REQUEST!=1）。"
+                    + "要 pv190.json 就开门重跑；本次不写盘。");
+                return capture;
+            }
+
+            LPS.APS.Scheduling.Solvers.SolverDiagnostics.OnSolveRequest = req =>
+            {
+                capture._previous?.Invoke(req);
+                capture.WriteOne(req);
+            };
+
+            output.WriteLine($"[SD-REQ] 入参捕获已开 → {capture._dir}\\PV{planVersionId}_solverequest_*.json");
+            return capture;
+        }
+
+        private void WriteOne(LPS.APS.Core.Dto.DomainSolveRequest req)
+        {
+            var n = Interlocked.Increment(ref _seq);
+            if (n > _maxFiles)
+            {
+                return;
+            }
+
+            try
+            {
+                System.IO.Directory.CreateDirectory(_dir);
+                var path = System.IO.Path.Combine(_dir, $"PV{_planVersionId}_solverequest_{n:00}.json");
+                var sw = System.Diagnostics.Stopwatch.StartNew();
+
+                // ⚠ 必须**流式**写盘：`JsonSerializer.Serialize(object)` 会先把整份 JSON 拼成一个
+                //   string。PV190 量级下那是数百 MB 的 LOH 常驻，而进程此刻已在 GB 级 —— 等于
+                //   拿一次取证把内存顶穿。写流只付缓冲区，峰值不随数据量线性涨。
+                using (var fs = new System.IO.FileStream(
+                           path, System.IO.FileMode.Create, System.IO.FileAccess.Write,
+                           System.IO.FileShare.Read, bufferSize: 1 << 20))
+                {
+                    System.Text.Json.JsonSerializer.Serialize(fs, req, JsonOptions);
+                }
+
+                sw.Stop();
+
+                var sizeMb = new System.IO.FileInfo(path).Length / 1048576d;
+                _output.WriteLine($"[SD-REQ] #{n} 已落盘 {path}（{sizeMb:F1} MB，序列化 {sw.ElapsedMilliseconds} ms）");
+            }
+            catch (Exception ex)
+            {
+                // 捕获失败绝不改变求解行为：一行原因，继续跑。
+                _output.WriteLine($"[SD-REQ] #{n} 落盘失败（已吞，不影响求解）：{ex.GetType().Name}: {ex.Message}");
+            }
+        }
+
+        public void Dispose()
+        {
+            // 恢复上一层钩子（单测/同进程多次跑不串）。
+            try
+            {
+                LPS.APS.Scheduling.Solvers.SolverDiagnostics.OnSolveRequest = _previous;
             }
             catch
             {
@@ -818,6 +992,155 @@ public class RealDomainFullRunTest
         Assert.Equal("COMPLETED", runStatusAfterSecond);
 
         await DumpEvidenceAsync(runId, planVersionId, ct);
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // 【2026-10-30】既有 ScheduleRun 走 ExecuteRunAsync
+    //   与定时服务同一条执行方法：`scheduling-trigger` → `RunSchedulingAutoAsync`
+    //   → 领取 `RUNNING + FULL_SCHEDULE + 有 BUILDING PlanVersion` 的 Run → `ExecuteRunAsync(runId)`。
+    //   本入口只把「领取」这一步改成人工点名 RunId，执行体**完全一样**（基线/策略版本/Domain 集合
+    //   都由 ExecuteRunAsync 自取，不经本测试传参）。
+    //   用途：夜间批次已建好 Run + 各域 BUILDING PlanVersion，但 scheduling-trigger 在那之后
+    //         从未执行（cron 关闭）⇒ Run 永久 RUNNING、域永久 BUILDING。本入口把这条链走完。
+    //   运行：APS_REAL_DOMAIN_RUN=1 APS_REAL_RUN_ID=<RunId> \
+    //         dotnet test --filter FullyQualifiedName~RunExistingScheduleRun
+    // ══════════════════════════════════════════════════════════════════
+    [SkippableFact(DisplayName = "2号位: 既有 ScheduleRun 走定时服务同一条 ExecuteRunAsync（生产口径，结果不回滚）")]
+    public async Task RunExistingScheduleRunAsync()
+    {
+        Skip.IfNot(Environment.GetEnvironmentVariable(GateEnvVar) == "1",
+            $"真实域跑批默认关闭（会写 APS_Production 并跑满主链）。设 {GateEnvVar}=1 显式开启。");
+
+        var runIdRaw = Environment.GetEnvironmentVariable("APS_REAL_RUN_ID");
+        Skip.IfNot(int.TryParse(runIdRaw, out var runId) && runId > 0,
+            $"未指定 APS_REAL_RUN_ID（当前值 '{runIdRaw ?? "(null)"}'）—— 本入口必须显式点名既有 ScheduleRunId。");
+
+        using var runCts = CreateRunCancellation("RunExistingScheduleRun");
+        var ct = runCts.Token;
+
+        using var provider = BuildProductionProvider();
+        _connectionManager = provider.GetRequiredService<DatabaseConnectionManager>();
+        var orchestrator = provider.GetRequiredService<SchedulingOrchestrator>();
+
+        LogBuildProvenance("RunExistingScheduleRun");
+        _output.WriteLine($"[0] 复用既有 ScheduleRunId={runId}（ExecuteRunAsync，与 scheduling-trigger 同一方法）");
+
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        var result = await orchestrator.ExecuteRunAsync(runId, ct);
+        sw.Stop();
+
+        _output.WriteLine($"[1] ExecuteRunAsync: IsSuccess={result.IsSuccess}, Scheduled={result.ScheduledCount}, "
+            + $"Unscheduled={result.UnscheduledCount}, ElapsedMs={result.ElapsedMs}, Error={result.ErrorMessage ?? "(null)"}");
+        _output.WriteLine($"[2] 墙钟 {sw.Elapsed.TotalMinutes:0.#} 分钟");
+
+        var runStatus = await _connectionManager.QueryFirstOrDefaultAsync<string>(
+            "SELECT Status FROM ScheduleRun WHERE Id = @Id", new { Id = runId }, db: DatabaseId.APS);
+        _output.WriteLine($"[3] ScheduleRun.Status={runStatus}");
+
+        var pvRows = await _connectionManager.QueryAsync<string>(
+            @"SELECT DomainKey + '=' + Status FROM PlanVersion
+              WHERE SourceScheduleRunId = @Id ORDER BY DomainKey",
+            new { Id = runId }, db: DatabaseId.APS);
+        foreach (var row in pvRows)
+            _output.WriteLine($"[4] {row}");
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // 【2026-10-31 · 2号位】既有 PV ＋ 既有 Run 走**候选单域 seam**
+    //
+    //   为什么需要它（现有四个入口都到不了目标）：
+    //     · `RunRealDomainAsync` 自建 `MANUAL_*` 壳 ⇒ 无 OBRL，Pegging fail-closed；
+    //     · `RunExistingPlanVersionAsync` 走 `RunSchedulingAsync`，**scheduleRunId=0**
+    //       ⇒ `LoadSchedulingContextAsync` 的 `if (scheduleRunId > 0)` 守卫使 MES 三张
+    //       进度快照**不装载**，连续性切片恒空 —— 验「Phase5 冲突」必须带在制，不能用它；
+    //     · `RunExistingScheduleRunAsync` 走 `ExecuteRunAsync`，会遍历该 Run 的**全部 12 个域**，
+    //       且受「全部域已达终态即跳过重跑」守卫约束（Run 999334 的 12 个域早已全终态）⇒ 只会跳过；
+    //     · `RunRealSeamAsync` 同样是自建壳。
+    //   本入口：**点名既有 PV ＋ 点名既有 Run**，走 `RunSchedulingAndFinalizeAsync`
+    //   ⇒ 单域、真实 scheduleRunId（MES 快照装载）、不受域集合与重入守卫影响。
+    //   ⚠ 跑完会把该 PV 写成终态，并触发 Run 收口 —— 这是真实跑批该有的副作用，结果**不回滚**。
+    //     收口口径自 2026-11-02 起：该 Run 冻结的预期域 ≤1 才按本域结果 Complete/Fail；
+    //     多域 Run 按「其余域终态 PV + 本域实测」重算（本域成功也只可能是 PARTIAL_SUCCESS）。
+    //     ⇒ 单域复跑**不会再**把这个多域 Run 覆盖成 COMPLETED（原为 Run 999334 的成因）。
+    //
+    //   运行：
+    //     APS_REAL_DOMAIN_RUN=1 APS_REAL_DOMAIN_PV_ID=999329 APS_REAL_RUN_ID=999334 \
+    //     APS_RUN_TIMEOUT_MIN=90 dotnet test --filter FullyQualifiedName~RunExistingPvWithRunAsync
+    // ══════════════════════════════════════════════════════════════════
+    [SkippableFact(DisplayName = "2号位: 既有 PV + 既有 Run 单域真跑（生产口径，装载 MES 快照，结果不回滚）")]
+    public async Task RunExistingPvWithRunAsync()
+    {
+        Skip.IfNot(Environment.GetEnvironmentVariable(GateEnvVar) == "1",
+            $"真实域跑批默认关闭（会写 APS_Production 并跑满主链）。设 {GateEnvVar}=1 显式开启。");
+
+        var pvRaw = Environment.GetEnvironmentVariable("APS_REAL_DOMAIN_PV_ID");
+        Skip.IfNot(int.TryParse(pvRaw, out var planVersionId) && planVersionId > 0,
+            $"未指定 APS_REAL_DOMAIN_PV_ID（当前值 '{pvRaw ?? "(null)"}'）。");
+
+        var runRaw = Environment.GetEnvironmentVariable("APS_REAL_RUN_ID");
+        Skip.IfNot(int.TryParse(runRaw, out var scheduleRunId) && scheduleRunId > 0,
+            $"未指定 APS_REAL_RUN_ID（当前值 '{runRaw ?? "(null)"}'）—— 本入口必须点名既有 ScheduleRunId 才能读到 MES 快照。");
+
+        using var runCts = CreateRunCancellation("RunExistingPvWithRun");
+        var ct = runCts.Token;
+
+        using var provider = BuildProductionProvider();
+        _connectionManager = provider.GetRequiredService<DatabaseConnectionManager>();
+        var orchestrator = provider.GetRequiredService<SchedulingOrchestrator>();
+
+        LogBuildProvenance("RunExistingPvWithRun");
+        var strategyVersionId = await ResolveDefaultStrategyVersionIdAsync(ct);
+        _output.WriteLine($"[0] PlanVersionId={planVersionId}, ScheduleRunId={scheduleRunId}, 策略包版本={strategyVersionId}");
+
+        // 改前基线：跑完对照用（1号位 §七.4 第 6 条要求把「修复效果」与「输入变化」分开归因）。
+        _output.WriteLine("══ 改前基线 ══");
+        await DumpEvidenceAsync(scheduleRunId, planVersionId, ct);
+
+        using var solverScope = LPS.APS.Scheduling.Solvers.SolverDiagnostics.BeginScope();
+        using var sampler = SolverLiveSampler.Start(solverScope.Counters, planVersionId, _output);
+
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        SchedulingRunResult? result = null;
+        var cancelled = false;
+        try
+        {
+            result = await orchestrator.RunSchedulingAndFinalizeAsync(
+                planVersionId, scheduleRunId, strategyVersionId, ct);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            cancelled = true;
+        }
+        finally
+        {
+            sw.Stop();
+            sampler.Stop();
+            DumpSolverCounters(solverScope.Counters);
+        }
+
+        if (cancelled)
+        {
+            _output.WriteLine($"[1] RunSchedulingAndFinalizeAsync 在 {sw.Elapsed.TotalMinutes:0.#} 分钟后**超时取消**"
+                + $"（APS_RUN_TIMEOUT_MIN={_runTimeoutMinutes:0.##}）—— 求解器未返回，本入口不判失败。"
+                + " 卡在哪一步看上面 [SD] 分段计数与同名 CSV 的逐拍读数。");
+            await DumpEvidenceAsync(scheduleRunId, planVersionId, CancellationToken.None);
+            return;
+        }
+
+        _output.WriteLine($"[1] RunSchedulingAndFinalizeAsync: IsSuccess={result!.IsSuccess}, Error={result.ErrorMessage ?? "(null)"}, "
+            + $"Scheduled={result.ScheduledCount}, Unscheduled={result.UnscheduledCount}, 耗时={sw.ElapsedMilliseconds}ms");
+
+        if (result.Metrics is { } m)
+        {
+            _output.WriteLine($"     Metrics: Demand={m.DemandCount}, LPD={m.LogicalProductionDemandCount}, "
+                + $"FinalTask={m.FinalTaskCount} | ContextBuild={m.ContextBuildMs}ms, Pegging={m.PeggingMs}ms, "
+                + $"Solver={m.SolverMs}ms, Persist={m.PersistMs}ms, Total={m.TotalMs}ms");
+        }
+
+        _output.WriteLine("══ 改后结果 ══");
+        await DumpEvidenceAsync(scheduleRunId, planVersionId, CancellationToken.None);
+
+        // 诊断入口：不把「0 任务 / 未排下」判成测试失败（求解器的丢弃原因在日志与 APS_ETL_Log 里）。
     }
 
     // ══════════════════════════════════════════════════════════════════

@@ -16,3 +16,6 @@ System.AggregateException: Some services are not able to be constructed (Error w
    at Microsoft.Extensions.Hosting.HostApplicationBuilder.Build()
    at Microsoft.AspNetCore.Builder.WebApplicationBuilder.Build()
    at Program.<Main>$(String[] args) in D:\WorkSpace_LocalLib\Windsurf WorkSpace\LPS_SVN\LPS.APS.Web\Program.cs:line 301
+[2026-10-26 19:41:40.210 WARN] [Hangfire.Server.BackgroundProcessingServer] Stopping the server due to DomainUnload or ProcessExit event...
+[2026-10-26 19:41:40.223 WARN] [Hangfire.Server.BackgroundServerProcess] Server aps-cn1000-7050d4hv:14380:7be8bf09 caught shutdown signal...
+[2026-10-26 19:41:40.227 WARN] [Hangfire.Server.BackgroundServerProcess] Server aps-cn1000-7050d4hv:14380:7be8bf09 stopped non-gracefully due to Worker. Outstanding work on those dispatchers could be aborted, and there can be delays in background processing. This server instance will be incorrectly shown as active for a while. To avoid non-graceful shutdowns, investigate what prevents from stopping gracefully and add CancellationToken support for those methods.

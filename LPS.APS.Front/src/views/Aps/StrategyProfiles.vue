@@ -44,6 +44,7 @@ import {
   ElOption,
   ElRow,
   ElSelect,
+  ElSwitch,
   ElTable,
   ElTableColumn,
   ElTag,
@@ -216,7 +217,7 @@ async function confirmPublish(): Promise<void> {
   let confirmed = true
   try {
     await ElMessageBox.confirm(
-      `即将发布策略版本「${currentVersion.value.versionCode}」。\n\n风险：若该版本设为默认，同一策略包下原有的默认版本会被自动取消默认。\n\n确认发布？`,
+      `即将发布策略版本「${currentVersion.value.versionCode}」。\n\n发布只是让版本进入可用状态，不会自动成为默认；如需运行侧使用它，请在发布后点「设为默认」。\n\n确认发布？`,
       '发布确认',
       {
         type: 'warning',
@@ -280,6 +281,41 @@ async function confirmDisable(): Promise<void> {
   if (ok) {
     ElMessage.success(`已退役策略版本 ${currentVersion.value.versionCode}`)
     disableDialogVisible.value = false
+  }
+}
+
+/* ==================== 设为默认（版本级，仅 PUBLISHED） ====================
+ * 端点 POST /strategy-profile/version/{id}/set-default（权限 aps.strategy.edit）。
+ * 发布 ≠ 默认：发布只是可用，默认才是运行侧（全量排产夜批）实际取用的那一个。
+ * 同策略包旧默认由后端清；跨策略包生效窗重叠后端会拒，前端不预判、如实回显。
+ */
+async function onSetDefault(row: StrategyProfileVersionDto): Promise<void> {
+  if (!canWrite.value) {
+    ElMessage.warning('当前操作者无设为默认权限，请联系系统管理员授予')
+    return
+  }
+  if (row.status !== 'PUBLISHED') {
+    ElMessage.warning(`仅已发布版本可设为默认（当前：${STRATEGY_STATUS_META[row.status].label}）`)
+    return
+  }
+  if (row.isDefault) return
+  try {
+    await ElMessageBox.confirm(
+      `即将把「${row.versionCode}」设为该策略包的默认版本。\n\n影响：同一策略包下原有的默认版本会被取消默认；运行侧（如全量排产夜批）会改用这个版本。\n\n确认设置？`,
+      '设为默认版本',
+      {
+        type: 'warning',
+        confirmButtonText: '确认设为默认',
+        cancelButtonText: '取消',
+        confirmButtonClass: 'el-button--primary'
+      }
+    )
+  } catch {
+    return
+  }
+  const ok = await store.setDefault(row.id)
+  if (ok) {
+    ElMessage.success(`已将策略版本 ${row.versionCode} 设为默认`)
   }
 }
 
@@ -351,6 +387,80 @@ async function onCreateProfile(): Promise<void> {
   createProfileDialog.value = false
   ElMessage.success('策略包已创建，请为它新建第一个版本')
   await selectProfile(id)
+}
+
+/* ==================== 编辑策略包（主表 PUT） ==================== */
+
+const editProfileDialog = ref(false)
+const editProfileForm = ref({
+  id: 0,
+  strategyProfileCode: '',
+  strategyProfileName: '',
+  description: '',
+  runType: '',
+  isActive: true
+})
+
+function openEditProfileDialog(): void {
+  const p = currentProfile.value
+  if (!p) return
+  editProfileForm.value = {
+    id: p.id,
+    strategyProfileCode: p.strategyProfileCode,
+    strategyProfileName: p.strategyProfileName,
+    description: p.description ?? '',
+    runType: p.runType ?? '',
+    isActive: p.isActive
+  }
+  editProfileDialog.value = true
+}
+
+async function onUpdateProfile(): Promise<void> {
+  const ok = await store.updateProfile({
+    id: editProfileForm.value.id,
+    strategyProfileCode: editProfileForm.value.strategyProfileCode,
+    strategyProfileName: editProfileForm.value.strategyProfileName,
+    description: editProfileForm.value.description,
+    runType: editProfileForm.value.runType || null,
+    isActive: editProfileForm.value.isActive
+  })
+  if (!ok) return
+  editProfileDialog.value = false
+  ElMessage.success('策略包已保存')
+}
+
+/* ==================== 删除策略包（主表 DELETE） ====================
+ * 3号位 2026-10-26 落码并上 dev，口径同规则集删除（R1）：
+ *  - 该族存在任何 PUBLISHED 版本 ⇒ 400「该策略包已发布过，不能删除（请先停用版本）」
+ *  - 版本被 ScheduleRun 引用 ⇒ 400「该策略包存在已被运行引用的版本，不能删除」（前端拿不到，不预判）
+ * 硬删 ≠ 停用：停用（编辑里的启用开关）保留历史、只关主表；删除是破坏性物理删。
+ */
+
+const deleteProfileDialog = ref(false)
+
+/** 删除按钮的禁用原因（破坏性操作：先说清为什么不让删） */
+const deleteProfileDisabledReason = computed(() => {
+  if (!canWrite.value) return '当前账号无删除权限'
+  if (hasPublished.value) return '该策略包已发布过，不能删除（请先停用版本）'
+  return ''
+})
+
+function openDeleteProfileDialog(): void {
+  if (deleteProfileDisabledReason.value) {
+    store.handleError(new Error(deleteProfileDisabledReason.value))
+    return
+  }
+  deleteProfileDialog.value = true
+}
+
+async function onDeleteProfile(): Promise<void> {
+  const p = currentProfile.value
+  if (!p) return
+  const ok = await store.removeStrategyProfile(p.id)
+  if (ok) {
+    deleteProfileDialog.value = false
+    ElMessage.success('策略包已删除')
+  }
 }
 
 /**
@@ -465,6 +575,18 @@ const statusTagEffect = (s: StrategyVersionStatus): 'light' | 'dark' | 'plain' |
               <div class="profile-head-actions">
                 <ElTooltip
                   :content="
+                    canWrite
+                      ? '修改名称 / 描述 / 运行类型 / 启停（编码不可改）'
+                      : '当前账号无编辑权限'
+                  "
+                  placement="top"
+                >
+                  <ElButton :disabled="!canWrite" @click="openEditProfileDialog"
+                    >编辑策略包</ElButton
+                  >
+                </ElTooltip>
+                <ElTooltip
+                  :content="
                     !currentProfile.isActive
                       ? '策略包已停用，无法新建草稿（7号 §5.5 IsActive=0 = 停用）'
                       : '仅创建草稿版本，不允许其它状态'
@@ -477,6 +599,20 @@ const statusTagEffect = (s: StrategyVersionStatus): 'light' | 'dark' | 'plain' |
                     @click="openCreateDraft"
                   >
                     新建草稿
+                  </ElButton>
+                </ElTooltip>
+                <!-- [删除]：破坏性操作，破坏性前先说清后果（3号位 2026-10-26 同 R1 口径） -->
+                <ElTooltip
+                  :content="deleteProfileDisabledReason || '删除该策略包（会连带删除它的草稿版本）'"
+                  placement="top"
+                >
+                  <ElButton
+                    type="danger"
+                    plain
+                    :disabled="!!deleteProfileDisabledReason"
+                    @click="openDeleteProfileDialog"
+                  >
+                    删除策略包
                   </ElButton>
                 </ElTooltip>
               </div>
@@ -576,7 +712,7 @@ const statusTagEffect = (s: StrategyVersionStatus): 'light' | 'dark' | 'plain' |
                   {{ row.publishedBy ?? '—' }}
                 </template>
               </ElTableColumn>
-              <ElTableColumn label="操作" width="280" fixed="right">
+              <ElTableColumn label="操作" width="360" fixed="right">
                 <template #default="{ row }: { row: StrategyProfileVersionDto }">
                   <ElButton
                     size="small"
@@ -602,6 +738,13 @@ const statusTagEffect = (s: StrategyVersionStatus): 'light' | 'dark' | 'plain' |
                     "
                   >
                     发布
+                  </ElButton>
+                  <ElButton
+                    size="small"
+                    :disabled="!canWrite || row.status !== 'PUBLISHED' || row.isDefault"
+                    @click.stop="onSetDefault(row)"
+                  >
+                    设为默认
                   </ElButton>
                   <ElButton
                     size="small"
@@ -810,7 +953,6 @@ const statusTagEffect = (s: StrategyVersionStatus): 'light' | 'dark' | 'plain' |
       :mode="draftMode"
       :profile="currentProfile"
       :version="currentVersion"
-      :has-published="hasPublished"
       :submitting="actionRunning"
       @submit="handleDraftSubmit"
     />
@@ -870,6 +1012,80 @@ const statusTagEffect = (s: StrategyVersionStatus): 'light' | 'dark' | 'plain' |
         <ElButton @click="createProfileDialog = false">取消</ElButton>
         <ElButton type="primary" :loading="actionRunning" @click="onCreateProfile">
           确认新建
+        </ElButton>
+      </template>
+    </ElDialog>
+
+    <!-- 编辑策略包 Dialog（主表；PUT /strategy-profile/{id}） -->
+    <ElDialog
+      v-model="editProfileDialog"
+      title="编辑策略包"
+      width="520px"
+      :close-on-click-modal="false"
+    >
+      <ElForm label-width="100px" size="default">
+        <ElFormItem label="策略包编码">
+          <ElInput v-model="editProfileForm.strategyProfileCode" disabled />
+        </ElFormItem>
+        <ElFormItem label="策略包名称 (必填)">
+          <ElInput v-model="editProfileForm.strategyProfileName" maxlength="200" />
+        </ElFormItem>
+        <ElFormItem label="适用运行类型">
+          <ElSelect
+            v-model="editProfileForm.runType"
+            clearable
+            placeholder="不选 = 适用所有运行类型"
+          >
+            <ElOption
+              v-for="rt in Object.keys(RUN_TYPE_LABELS)"
+              :key="rt"
+              :label="RUN_TYPE_LABELS[rt]"
+              :value="rt"
+            />
+          </ElSelect>
+        </ElFormItem>
+        <ElFormItem label="描述">
+          <ElInput v-model="editProfileForm.description" type="textarea" :rows="2" />
+        </ElFormItem>
+        <ElFormItem label="主表启用">
+          <ElSwitch v-model="editProfileForm.isActive" />
+          <span class="edit-hint">{{ editProfileForm.isActive ? '启用中' : '已停用' }}</span>
+        </ElFormItem>
+        <ElAlert v-if="!editProfileForm.isActive" type="warning" :closable="false" show-icon>
+          <template #title>停用只关主表</template>
+          不会改动已有版本的状态；停用后无法再为它新建草稿版本。
+        </ElAlert>
+      </ElForm>
+      <template #footer>
+        <ElButton @click="editProfileDialog = false">取消</ElButton>
+        <ElButton type="primary" :loading="actionRunning" @click="onUpdateProfile"> 保存 </ElButton>
+      </template>
+    </ElDialog>
+
+    <!-- 删除策略包 Dialog（主表；DELETE /strategy-profile/{id}，3号位 2026-10-26 同 R1 口径） -->
+    <ElDialog
+      v-model="deleteProfileDialog"
+      title="删除策略包"
+      width="480px"
+      :close-on-click-modal="false"
+    >
+      <ElForm label-width="100px" size="default">
+        <ElFormItem label="策略包">
+          <span class="d-val">{{ currentProfile?.strategyProfileCode }}</span>
+        </ElFormItem>
+        <ElFormItem label="名称">
+          <span class="d-val">{{ currentProfile?.strategyProfileName }}</span>
+        </ElFormItem>
+        <ElAlert type="error" :closable="false" show-icon>
+          <template #title>删除后不可恢复</template>
+          这个策略包和它的草稿版本会一起被删掉，删了就找不回来了。已发布过的策略包不能删（只能停用）；
+          如果它的版本已经被运行引用，也删不掉。
+        </ElAlert>
+      </ElForm>
+      <template #footer>
+        <ElButton @click="deleteProfileDialog = false">取消</ElButton>
+        <ElButton type="danger" :loading="actionRunning" @click="onDeleteProfile">
+          确认删除
         </ElButton>
       </template>
     </ElDialog>
@@ -1154,5 +1370,17 @@ const statusTagEffect = (s: StrategyVersionStatus): 'light' | 'dark' | 'plain' |
   display: flex;
   align-items: center;
   justify-content: space-between;
+}
+
+.profile-head-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.edit-hint {
+  margin-left: 8px;
+  font-size: 12px;
+  color: #64748b;
 }
 </style>

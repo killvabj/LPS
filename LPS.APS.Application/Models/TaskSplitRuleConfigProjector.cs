@@ -116,12 +116,17 @@ public static class TaskSplitRuleConfigProjector
     ///     来源值 = <see cref="BatchPolicyMatchSource.OutOfWindow"/>。</description></item>
     ///   <item><term>Missing</term><description>经完整核对后本业务键**确无匹配规则**：⑧块整体为空（完全缺配）／
     ///     本部门无命中而别的部门有记录／精确业务键无命中。三者**来源可区分**
-    ///     （<see cref="BatchPolicyMatchSource.NoRuleForMaterial"/>／<see cref="BatchPolicyMatchSource.OtherDeptOnly"/>／
-    ///     <see cref="BatchPolicyMatchSource.NoDept"/>；06 §「明确MTS PI来源时的运行时数量硬上限与缺配兜底」允许 <c>Q_C</c> 兜底）。</description></item>
-    ///   <item><term>Unavailable</term><description>技术失败。两条成因：① <paramref name="unavailableSource"/> 非空
+    ///     （<see cref="BatchPolicyMatchSource.NoRuleForMaterial"/>／<see cref="BatchPolicyMatchSource.OtherDeptOnly"/>；
+    ///     06 §「明确MTS PI来源时的运行时数量硬上限与缺配兜底」允许 <c>Q_C</c> 兜底）。
+    ///     ⚠ **业务键不完整（部门未解析）不再进本态**（0号位 2026-10-28 更正回复 §1）：本物料在域内有规则行时
+    ///     判 `Unavailable`（见下）；只有在「本物料在域内**一条规则行都没有**」时才仍判 `Missing`
+    ///     —— 那时「确无规则」与部门无关、**可证**，来源恒 <see cref="BatchPolicyMatchSource.NoRuleForMaterial"/>。</description></item>
+    ///   <item><term>Unavailable</term><description>技术失败／状态不可获得。三条成因：① <paramref name="unavailableSource"/> 非空
     ///     （装载失败／接口未传递状态；载体整体缺席由消费侧另判）；② **装载期一致性护栏** —— 本键的规则行
-    ///     未过 <see cref="IsSnapshotEligible"/>（2026-10-14 新增，1号位 回执 §一.3 择定「乙」）。
-    ///     来源值恒以 <see cref="BatchPolicyMatchSource.LoadError"/> 起头（可带明细）。**不得当作 MISSING**。</description></item>
+    ///     未过 <see cref="IsSnapshotEligible"/>（2026-10-14 新增，1号位 回执 §一.3 择定「乙」）；
+    ///     ③ **业务键不完整** —— 部门未解析且本物料在域内**有**规则行（无法判定本键命中与否，2026-10-29 增，
+    ///     来源值 <see cref="BatchPolicyMatchSource.NoDept"/>）。①② 来源值恒以
+    ///     <see cref="BatchPolicyMatchSource.LoadError"/> 起头（可带明细）。**不得当作 MISSING**。</description></item>
     /// </list>
     ///
     /// **来源值域**见 <see cref="BatchPolicyMatchSource"/>（9 值封闭，1号位 定稿）。
@@ -232,7 +237,17 @@ public static class TaskSplitRuleConfigProjector
 
             if (deptId is null)
             {
-                states.Add(Make(materialId, null, BatchPolicyState.Missing, BatchPolicyMatchSource.NoDept));
+                // 业务键不完整（本 Run 未解析到该物料的部门）⇒ 先问「本物料在域内到底有没有规则行」：
+                //   · 一条都没有 ⇒「确无规则」**与部门无关、可证** ⇒ 判 `Missing(NO_RULE_FOR_MATERIAL)`
+                //     （与「本部门无命中而别的部门有记录」同属合法 C 桶，06 § 允许 `Q_C` 兜底）；
+                //   · 有规则行 ⇒ 部门未知则**无法判定本键是否命中** ⇒「状态不可获得」判 `Unavailable`，
+                //     消费侧映射 `Unknown` ⇒ Fail Closed，**绝不冒充 `Missing` 触发 `Q_C`**。
+                // 依据：0号位 2026-10-28《R07/R08 更正回复 v1.1》§1 逐字「严禁**一律**补 `(物料,NULL)`
+                //   转成可按 `Q_C` 排的 MISSING」；同条件 1号位 自判口径亦为「业务键不完整 ⇒ 状态不可获得」
+                //   （`ResolveExecutionBatchPolicy` 末段），非 MISSING。
+                states.Add(materialsWithAnyRule.Contains(materialId)
+                    ? Make(materialId, null, BatchPolicyState.Unavailable, BatchPolicyMatchSource.NoDept)
+                    : Make(materialId, null, BatchPolicyState.Missing, BatchPolicyMatchSource.NoRuleForMaterial));
                 continue;
             }
 
@@ -336,31 +351,34 @@ public static class TaskSplitRuleConfigProjector
     }
 
     /// <summary>
-    /// `ContentSnapshotJson` 顶层子块键名白名单（**8 块**）。
+    /// `ContentSnapshotJson` 顶层子块键名白名单（**9 块**）。
     /// 来源：<c>FrozenStrategySnapshotProvider</c>（①–⑥ 逐字键名）＋ `EnsureRuleSetNormalized`（⑦）
-    /// ＋ `EnsureParameterSetNormalized`／<see cref="BatchPolicyBlockName"/>（⑧）。
-    /// **2026-10-14 已对全库实测**：RSV 4 份 ＋ PSV 4 份有内容，其顶层键**恰好**为下列 8 个，
+    /// ＋ `EnsureParameterSetNormalized`／<see cref="BatchPolicyBlockName"/>（⑧）＋ R05 `StageHandoffWaitRules`（⑨）。
+    /// **2026-10-14 已对全库实测**：RSV 4 份 ＋ PSV 4 份有内容，其顶层键**恰好**为下列 9 个，
     /// **零未知键** ⇒ 白名单完整，本检测器不会对现行数据产生噪音。
     /// </summary>
     private static readonly HashSet<string> KnownSnapshotBlockNames = new(StringComparer.Ordinal)
     {
         "DemandPriority", "Lock", "Supply", "Procurement",
         "SolverStrategy", "CandidateGuardrail", "SetupTransitionRules", "BatchPolicy",
+        // R05 Stage 固定交接等待（合同 v1.1 §四：唯一物理路径 $.StageHandoffWaitRules，顶层）
+        "StageHandoffWaitRules",
     };
 
     /// <summary>
-    /// 找出 `ContentSnapshotJson` 顶层**不在已知 8 块键名内**的键（发布/装载时告警用；纯函数、零 DB，单测可钉死）。
+    /// 找出 `ContentSnapshotJson` 顶层**不在已知 9 块键名内**的键（发布/装载时告警用；纯函数、零 DB，单测可钉死）。
     ///
     /// **为什么需要**：⑦⑧ 两个投影器（本类 <see cref="ExtractRules"/> 与
     /// <see cref="SetupTransitionRuleProjector.ExtractRules"/>）都是**单点 <c>TryGetProperty</c>** ——
     /// 键名拼错时与「合法未配置」**不可区分**，一律静默返回空列表。
     /// 对照：①–⑥ 块在 <c>FrozenStrategySnapshotProvider</c> 里键缺失/拼错会 **fail-fast** 抛
     /// <see cref="InvalidOperationException"/> ⇒ 唯独 ⑦⑧ 是「拼错 = 永远发现不了」。
-    /// 台账 §T-1014h 已记：**8 块键名一个都没冻结**（全库 grep 冻结文档 `SetupTransitionRules` 零命中）。
+    /// 台账 §T-1014h 已记：**8 块键名一个都没冻结**（全库 grep 冻结文档 `SetupTransitionRules` 零命中）；
+    /// R05 新增的 <c>StageHandoffWaitRules</c>（⑨）现为白名单第 9 键，仍只在 3号位 合同层登记，正式冻结待改冻门禁。
     ///
     /// 与 <see cref="FindOverlappingWindowIds"/>／<see cref="FindConfirmedDegenerateOneOneOneIds"/> 同形：
-    /// **只报键名，不决定处置**。⚠ 调用方**不得**据此抛异常 —— 8 块键名未冻结，未知键**可能**是
-    /// 3号位 合法新增的第 9 块，本函数只提供可见性。
+    /// **只报键名，不决定处置**。⚠ 调用方**不得**据此抛异常 —— 9 块键名未全冻结，未知键**可能**是
+    /// 3号位 合法新增的第 10+ 块，本函数只提供可见性。
     /// </summary>
     public static IReadOnlyList<string> FindUnknownSnapshotBlockNames(string? contentSnapshotJson)
     {
@@ -374,7 +392,7 @@ public static class TaskSplitRuleConfigProjector
             using var doc = JsonDocument.Parse(contentSnapshotJson);
             if (doc.RootElement.ValueKind != JsonValueKind.Object)
             {
-                // 根不是对象（如数组/标量）：不是 8 块形态，但也不是「未知键」——不承载该信号。
+                // 根不是对象（如数组/标量）：不是 9 块形态，但也不是「未知键」——不承载该信号。
                 return [];
             }
 

@@ -109,4 +109,15 @@ public class MaterialSupplyContext
 
     public DateTime CreatedAt { get; set; }
     public DateTime UpdatedAt { get; set; }
+
+    // ─────────── 源侧关系状态（N10，2026-10-28） ───────────
+
+    /// <summary>
+    /// 源侧「物料—仓库关系」当前启用状态（ERP = ITMaster.Activity；MES = MES_Material_View.IsActive）。
+    /// 1=该仓关系当前有效，0=已停用，NULL=尚未回填。
+    /// ⚠️ 这是「这条物料在该仓的关系还在不在用」，**不是**物料本体的活跃状态
+    /// （物料本体是否纳入看 Material.IsActive）。停用关系仍保留行以做追溯，
+    /// 但 sp_RebuildMaterialStageDeptContext 判部门唯一性时只让 SourceIsActive=1 的仓参与竞争。
+    /// </summary>
+    public bool? SourceIsActive { get; set; }
 }

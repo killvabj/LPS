@@ -76,6 +76,10 @@ public class RealSchedulingIntegrationTest
         services.AddSchedulingServices();
         services.AddBusinessRuleServices();
         services.AddApplicationServices();
+        // 生产组合根对齐（2026-10-29 A 类修复）：SchedulingOrchestrator 自 r13864 起吃 IPlanVersionRepository，
+        // 而本宿主从未调用 AddGovernanceRepositories ⇒ 解析 SchedulingOrchestrator 必抛 Unable to resolve。
+        // 该扩展只注册治理仓储，不含 IFrozenStrategySnapshotProvider / IDemandPriorityConfigProvider，故不影响下列 fixture 覆盖。
+        services.AddGovernanceRepositories();
         // 联调专用：DemandPriority 策略源使用 Fixture（3号位真实 FrozenStrategySnapshot 尚未接通，Fixture 仅用于测试，不得进入生产 DI）
         services.AddScoped<IDemandPriorityConfigProvider, DemandPriorityFixtureProvider>();
         // 联调专用：Supply 排序依赖的 FrozenStrategySnapshot 同样使用 Fixture（测试库无真实 PUBLISHED 策略包版本，不得进入生产 DI）
@@ -597,8 +601,10 @@ public class RealSchedulingIntegrationTest
             }
 
             // 检查Resource资源
+            // 2026-11-03：与装载侧口径对齐 —— 0号位 裁定「就当所有设备都可以用」，
+            // SchedulingOrchestrator 已改为 AVAILABLE ＋ MAINTENANCE 都可用（仅排除 DECOMMISSIONED 报废）。
             var resourceCount = await _connectionManager.QueryFirstOrDefaultAsync<int>(
-                @"SELECT COUNT(1) FROM Resource WHERE FactoryId = @FactoryId AND Status = 'AVAILABLE'",
+                @"SELECT COUNT(1) FROM Resource WHERE FactoryId = @FactoryId AND Status IN ('AVAILABLE','MAINTENANCE')",
                 new { FactoryId = TEST_FACTORY_ID },
                 db: DatabaseId.APS);
             Console.WriteLine($"  [深度诊断] Resource资源数（FactoryId={TEST_FACTORY_ID}）: {resourceCount}");

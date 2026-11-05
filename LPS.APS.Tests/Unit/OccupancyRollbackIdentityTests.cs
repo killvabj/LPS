@@ -314,4 +314,300 @@ public class OccupancyRollbackIdentityTests
                 $"有序不变式被破坏：下标 {i - 1}/{i} 的 Start 逆序");
         }
     }
+
+    // ══════════════════════════════════════════════════════════════════════════════════
+    // ⑥ **聚合压实 vs 逐条二分** 对拍（2026-10-26 A-4 第二刀）
+    // ══════════════════════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// **判别器**：日志条数 &gt; 32 时走「按资源聚合、一次压实」；≤ 32 时走「逐条二分 + `RemoveAt`」。
+    /// 同一夹具喂给**两条算法**（第二条在本文件内逐字复刻旧逐条语义），断言：
+    ///   · 全表有序占用窗集合**逐字相同**；
+    ///   · `unmatched` **数值相同**（含「值不存在」「键不存在」两类未命中）。
+    ///
+    /// **为什么要这个用例**：聚合路径（&gt;32）只在**生产**日志量下命中，1,472 个既有 Unit 覆盖不到；
+    ///   靠人工读代码担保不够，必须有个能在两条路径间对拍的钉子。
+    /// ⚠ 夹具窗铺在 `T0` 起 400 分钟内（同一自然日），签名用 `yyyyMMddHHmm`，
+    ///   避免 `Sig` 的 `HH:mm` 在跨日夹具上出现**不同集合同签名**的假绿。
+    /// </summary>
+    [Fact]
+    public void F01_聚合压实与大日志逐条回滚_全表与未命中数逐字一致()
+    {
+        var agg = BuildLargeFixture();
+        var legacy = BuildLargeFixture();
+
+        // 夹具自证：日志 42 条 > 聚合阈值 32 ⇒ 聚合路径真的被触发（不是又跑了一遍小路径）
+        Assert.True(agg.Log.Count > 32, $"夹具日志仅 {agg.Log.Count} 条，未达聚合阈值");
+
+        var aggUnmatched = PhaseTwoInitialScheduler.RollbackInsertedOccupancyWindows(agg.Occ, agg.Baseline, agg.Log);
+        var legacyUnmatched = LegacyRollbackByEntry(legacy.Occ, legacy.Baseline, legacy.Log);
+
+        // ① 未命中口径一致：1 条「值不存在」+ 1 条「键不存在」
+        Assert.Equal(2, aggUnmatched);
+        Assert.Equal(legacyUnmatched, aggUnmatched);
+
+        // ② 全表逐字一致（聚合压实不得改动任何一条既有窗，也不得漏删任何一条试排窗）
+        Assert.Equal(SigAllMinutes(legacy.Occ), SigAllMinutes(agg.Occ));
+
+        // ③ 回滚后两条列表都回到试排前：R1 = 200 条、R2 = 40 条
+        Assert.Equal(200, agg.Occ[1].Count);
+        Assert.Equal(40, agg.Occ[2].Count);
+
+        // ④ 有序不变式仍成立（读端二分前提）
+        foreach (var rid in new[] { 1, 2 })
+        {
+            var list = agg.Occ[rid];
+            for (var i = 1; i < list.Count; i++)
+            {
+                Assert.True(list[i - 1].Start < list[i].Start,
+                    $"R{rid} 有序不变式被破坏：下标 {i - 1}/{i}");
+            }
+        }
+    }
+
+    /// <summary>R1 200 窗 + R2 40 窗；插入 40 条（R1 30／R2 10）；再加 2 条未命中 ⇒ 日志 42 条。</summary>
+    private static (Dictionary<int, List<TimeWindow>> Occ, HashSet<int> Baseline, List<(int, TimeWindow)> Log)
+        BuildLargeFixture()
+    {
+        var occ = new Dictionary<int, List<TimeWindow>>();
+        for (var rid = 1; rid <= 2; rid++)
+        {
+            var count = rid == 1 ? 200 : 40;
+            var list = new List<TimeWindow>();
+            for (var i = 0; i < count; i++) list.Add(WM(2 * i, 2 * i + 1));
+            occ[rid] = list;
+        }
+
+        var baseline = PhaseTwoInitialScheduler.CaptureOccupancyResourceIds(occ);
+        var log = new List<(int, TimeWindow)>();
+        for (var i = 0; i < 30; i++) InsertSorted(occ, 1, WM(2 * i + 1, 2 * i + 2), log);
+        for (var i = 0; i < 10; i++) InsertSorted(occ, 2, WM(2 * i + 1, 2 * i + 2), log);
+
+        // 未命中两类：值不存在（键在表里）／键不存在
+        log.Add((1, WM(1000, 1001)));
+        log.Add((99, WM(0, 1)));
+        return (occ, baseline, log);
+    }
+
+    private static TimeWindow WM(int fromMinutes, int toMinutes) =>
+        new(T0.AddMinutes(fromMinutes), T0.AddMinutes(toMinutes));
+
+    /// <summary>按 `(Start, End)` 有序插入并登记身份（复刻 `AddOccupancyWindow` 的定位+插入，测试专用）。</summary>
+    private static void InsertSorted(
+        Dictionary<int, List<TimeWindow>> occ, int rid, TimeWindow window, List<(int, TimeWindow)> log)
+    {
+        if (!occ.TryGetValue(rid, out var list))
+        {
+            list = new List<TimeWindow>();
+            occ[rid] = list;
+        }
+
+        var i = 0;
+        while (i < list.Count
+               && (list[i].Start < window.Start
+                   || (list[i].Start == window.Start && list[i].End <= window.End)))
+        {
+            i++;
+        }
+        list.Insert(i, window);
+        log.Add((rid, window));
+    }
+
+    /// <summary>
+    /// **旧逐条语义复刻**（仅对拍用，不参与生产）：逆序逐条按值定位 + `RemoveAt`，再清空且非基线的键整键移除。
+    /// 这是 2026-10-26 之前 `RollbackInsertedOccupancyWindows` 的实现形状。
+    /// </summary>
+    private static int LegacyRollbackByEntry(
+        Dictionary<int, List<TimeWindow>> occ, HashSet<int> baseline, List<(int, TimeWindow)> log)
+    {
+        var unmatched = 0;
+        for (var i = log.Count - 1; i >= 0; i--)
+        {
+            var (rid, window) = log[i];
+            if (!occ.TryGetValue(rid, out var list))
+            {
+                unmatched++;
+                continue;
+            }
+
+            var index = -1;
+            for (var j = 0; j < list.Count; j++)
+            {
+                if (list[j].Start == window.Start && list[j].End == window.End)
+                {
+                    index = j;
+                    break;
+                }
+            }
+
+            if (index < 0)
+            {
+                unmatched++;
+                continue;
+            }
+
+            list.RemoveAt(index);
+        }
+
+        foreach (var rid in new List<int>(occ.Keys))
+        {
+            if (occ[rid].Count == 0 && !baseline.Contains(rid)) occ.Remove(rid);
+        }
+
+        return unmatched;
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════════════
+    // ⑦ **生产形状**对拍：k 小（≤32）× W 大（≥128）⇒ 靠「探测窗表长」进聚合（2026-10-26 A-4 第三刀）
+    // ══════════════════════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// **为什么必须补这一条（不是重复 ⑥）**：
+    /// ⑥ 的夹具日志 42 条 &gt; 32，走的是「**条数**多」这个判据；而 PV190 现场实测是
+    ///   `kMean = 4.3 / kMax = 10`、`wMax = 2,341` —— 条数**远小于** 32，
+    ///   聚合路径是靠「被触及资源的窗表 ≥ 128」这个**探测**条件才进得去的。
+    ///   ⇒ ⑥ 覆盖的是**另一条**入口，生产真正跑的那条它碰不到。本用例专门造小 k + 大 W。
+    ///
+    /// 对拍口径与 ⑥ 相同：同一夹具喂给「生产实现」与「本文件内逐字复刻的逐条语义」，
+    /// 断言全表有序窗集合**逐字相同**、`unmatched` **数值相同**、有序不变式仍成立。
+    ///
+    /// ⚠ 本用例只证「结果逐位相同」；「工作量真降了」由 2026-10-26 的现场探针读数证
+    ///   （单次 167 µs → 待复测），不能拿结果一致性当性能护栏。
+    /// </summary>
+    [Fact]
+    public void F01_小日志大窗表_探测进聚合_与逐条回滚逐字一致()
+    {
+        var rng = new Random(20261026);
+        var aggregateHits = 0;
+
+        for (var iter = 0; iter < 400; iter++)
+        {
+            // 至少一个资源窗表 ≥ 128（探测条件成立）；其余资源随机大小
+            var resourceCount = rng.Next(1, 4);
+            var current = new Dictionary<int, List<TimeWindow>>();
+            var log = new List<(int ResourceId, TimeWindow Window)>();
+            var inserted = new HashSet<(int Rid, long S, long E)>();
+
+            for (var r = 0; r < resourceCount; r++)
+            {
+                var rid = r + 1;
+                var total = r == 0 ? rng.Next(128, 320) : rng.Next(0, 60);
+                var all = new List<TimeWindow>(total);
+                var t = 0;
+                for (var i = 0; i < total; i++)
+                {
+                    var len = rng.Next(1, 5);
+                    all.Add(WM(t, t + len));
+                    t += len + rng.Next(0, 3);          // 间隙可 0 ⇒ 首尾相接，仍非重叠
+                }
+
+                current[rid] = new List<TimeWindow>(all);
+
+                // 随机挑一部分当成「本次试排插入的」—— 生产里 k 很小，这里保持多数迭代 k ≤ 32
+                var wantK = rng.Next(0, 8);
+                for (var j = 0; j < wantK && all.Count > 0; j++)
+                {
+                    var pick = all[rng.Next(all.Count)];
+                    if (!inserted.Add((rid, pick.Start.Ticks, pick.End.Ticks))) continue;
+                    log.Add((rid, pick));
+                }
+            }
+
+            // 加两类未命中：值不存在（键在表里）／资源键不存在 —— 与 ⑥ 同口径
+            if (rng.Next(0, 2) == 0) log.Add((1, WM(-100, -99)));
+            if (rng.Next(0, 2) == 0) log.Add((999, WM(0, 1)));
+
+            if (log.Count == 0) continue;
+
+            // 自证「本条真的测到了聚合分支」：复刻生产的两条判据（见 `RollbackInsertedOccupancyWindows`）。
+            //   ⚠ 只断言结果一致、不断言分支命中，就有可能在**小路径**上跑 400 次而全程没碰到我改的那段。
+            var goesAggregate = log.Count > 32;
+            if (!goesAggregate && log.Count > 1)
+            {
+                var probeLimit = log.Count < 4 ? log.Count : 4;
+                for (var i = 0; i < probeLimit; i++)
+                {
+                    if (current.TryGetValue(log[i].ResourceId, out var probe) && probe.Count >= 128)
+                    {
+                        goesAggregate = true;
+                        break;
+                    }
+                }
+            }
+            if (goesAggregate) aggregateHits++;
+
+            // 「试排前」的基线表 = 当前表 − 本次插入的窗
+            var baselineOcc = new Dictionary<int, List<TimeWindow>>();
+            foreach (var (rid, list) in current)
+            {
+                var kept = new List<TimeWindow>(list.Count);
+                foreach (var w in list)
+                {
+                    if (!inserted.Contains((rid, w.Start.Ticks, w.End.Ticks))) kept.Add(w);
+                }
+                baselineOcc[rid] = kept;
+            }
+
+            var aggOcc = Clone(current);
+            var legacyOcc = Clone(current);
+            var aggBaseline = PhaseTwoInitialScheduler.CaptureOccupancyResourceIds(baselineOcc);
+            var legacyBaseline = PhaseTwoInitialScheduler.CaptureOccupancyResourceIds(baselineOcc);
+            var aggLog = new List<(int, TimeWindow)>(log);
+            var legacyLog = new List<(int, TimeWindow)>(log);
+
+            var aggUnmatched = PhaseTwoInitialScheduler.RollbackInsertedOccupancyWindows(aggOcc, aggBaseline, aggLog);
+            var legacyUnmatched = LegacyRollbackByEntry(legacyOcc, legacyBaseline, legacyLog);
+
+            Assert.Equal(legacyUnmatched, aggUnmatched);
+            Assert.Equal(SigAllMinutes(legacyOcc), SigAllMinutes(aggOcc));
+
+            foreach (var (rid, list) in aggOcc)
+            {
+                for (var i = 1; i < list.Count; i++)
+                {
+                    Assert.True(list[i - 1].Start < list[i].Start,
+                        $"iter={iter} R{rid} 有序不变式被破坏：下标 {i - 1}/{i}");
+                }
+            }
+        }
+
+        Assert.True(aggregateHits >= 100,
+            $"只有 {aggregateHits} 次进入聚合分支 —— 夹具没打到本刀改的那段，本用例等于没测");
+    }
+
+    private static Dictionary<int, List<TimeWindow>> Clone(Dictionary<int, List<TimeWindow>> src)
+    {
+        var d = new Dictionary<int, List<TimeWindow>>(src.Count);
+        foreach (var (rid, list) in src) d[rid] = new List<TimeWindow>(list);
+        return d;
+    }
+
+    /// <summary>全表签名（资源键升序、窗按分钟精度逐字串联；空列表标 `(空)`）。</summary>
+    private static string SigAllMinutes(Dictionary<int, List<TimeWindow>> occ)
+    {
+        var keys = new List<int>(occ.Keys);
+        keys.Sort();
+        var sb = new StringBuilder();
+        foreach (var rid in keys)
+        {
+            sb.Append('R').Append(rid).Append('=');
+            var list = occ[rid];
+            if (list.Count == 0)
+            {
+                sb.Append("(空)");
+            }
+            else
+            {
+                foreach (var w in list)
+                {
+                    sb.Append('[').Append(w.Start.ToString("yyyyMMddHHmm"))
+                      .Append('-').Append(w.End.ToString("yyyyMMddHHmm")).Append(']');
+                }
+            }
+
+            sb.Append(' ');
+        }
+
+        return sb.ToString().TrimEnd();
+    }
 }

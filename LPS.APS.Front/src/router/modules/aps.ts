@@ -34,6 +34,12 @@
  *       routerHelper.ts 的 flatMultiLevelRoutes 摊平（那会让面包屑少一层）；
  *     - 前提：routerHelper.ts 的 pathResolve 对绝对子路径原样返回，否则菜单会跳到不存在的地址。
  *   框架自带的演示版「权限管理」（router/index.ts 的 /authorization，走 mock 未接后端）已 hidden。
+ *
+ * 甘特图（/aps/gantt）的页签相关 meta（10-27 用户裁决：点菜单后要出页签）：
+ *  - noTagsView 已撤 —— 该字段让 store.addVisitedView 直接 return，甘特图点菜单也不进页签栏。
+ *  - noCache:true 是配套的：以前甘特图不在 visitedViews 里 ⇒ 从不进 keep-alive 缓存；
+ *    进了页签后若参与缓存，切走再切回会命中 dhtmlx 未重算尺寸的旧实例。
+ *    不缓存则每次进入都是全新实例，行为与改动前一致。
  */
 
 const Layout = () => import('@/layout/Layout.vue')
@@ -81,7 +87,8 @@ export const apsV1Routes: AppRouteRecordRaw[] = [
         meta: {
           title: '甘特图/资源计划',
           icon: 'vi-mdi:chart-timeline',
-          noTagsView: true,
+          // 10-27 进页签栏（原先 noTagsView:true）；noCache:true 配套，详见文件头说明
+          noCache: true,
           stage: 'A',
           acceptance: 'U01 / U06 / U14',
           // 第三波 RBAC：只读页 - 需持有 aps.plan.view
@@ -338,8 +345,8 @@ export const apsV1Routes: AppRouteRecordRaw[] = [
           stage: 'C',
           acceptance: '3号位 T1 OPM 治理 / 字段三来源原则',
           // 路由守卫 OR 语义：持任一权限码即可访问
-          //  - aps.rule.view（VIEWER / RULE_ADMIN / RULE_PUBLISHER / SYSTEM_ADMIN 全持）
-          //  - aps.rule.edit（仅 RULE_ADMIN / RULE_PUBLISHER / SYSTEM_ADMIN 持）
+          //  - aps.rule.view（admin.system / admin.aps / viewer 持；planner 不持）
+          //  - aps.rule.edit（仅 admin.aps / admin.system 持）
           apsRequiredPermissions: ['aps.rule.view', 'aps.rule.edit']
         }
       },
@@ -426,6 +433,15 @@ export const apsV1Routes: AppRouteRecordRaw[] = [
       alwaysShow: true
     },
     children: [
+      /* --- ① 规则集维护（本页只管规则集；参数集已独立成「参数集维护」页）---
+       * RBAC：2026-10-28（3号位 自裁 W-2）**放开 aps.rule.view 只读入口** ——
+       *   viewer 持 aps.rule.view ⇒ 可进本页只读查看规则集/版本/段位；
+       *   页内所有写动作仍按 aps.rule.edit（新建/编辑/删除/新建草稿/保存段位）
+       *   与 aps.rule.publish（校验/发布/停用）逐个显隐 ⇒ view 进入天然只读。
+       *   后端读端点均挂 RuleView（GET rule-sets / rule-set/{id}/versions /
+       *   rule-set/version/{id} / version/diff / version/{id}/validate）。
+       *   PMC（aps.planner）**不持** aps.rule.view / edit / publish → 仍被守卫拒绝跳 /403
+       *   （PMC 的换型规则只读入口在 /aps/setup/* 三页）。 */
       {
         path: '/aps/rules',
         component: () => import('@/views/Aps/Rules.vue'),
@@ -436,10 +452,8 @@ export const apsV1Routes: AppRouteRecordRaw[] = [
           icon: 'vi-mdi:cog-outline',
           stage: 'C',
           acceptance: 'U21 / U22',
-          // 第一波 RBAC：需持有 rule.edit / rule.publish 权限码任一（OR 语义）
-          //  - RULE_ADMIN（持 aps.rule.edit / publish）/ RULE_PUBLISHER（同）/ SYSTEM_ADMIN（持全部）均可访问
-          //  - VIEWER / PMC 无 rule.* 权限码 → 被守卫拒绝，跳 /403
-          apsRequiredPermissions: ['aps.rule.edit', 'aps.rule.publish']
+          // RBAC：rule.view / rule.edit / rule.publish 任一（OR 语义）⇒ 见上方块注释
+          apsRequiredPermissions: ['aps.rule.view', 'aps.rule.edit', 'aps.rule.publish']
         }
       },
 
@@ -495,6 +509,13 @@ export const apsV1Routes: AppRouteRecordRaw[] = [
        *   - 同产品连续生产 = 0 分钟（除非 A→A 的 EXACT 显式配置）
        *   - 换型分钟 > 0
        *   - 仅 DRAFT 状态的规则集版本可编辑
+       *
+       * 2026-10-28 用户拍板：⑦ 的增删改并入「规则集维护 → 换型规则」页签，
+       * 这两页**从侧边栏隐藏**（meta.hidden）但**路由保留**：
+       *   - 静态路由表不按 hidden 过滤（permission.ts generateRoutes('static')），直接敲 URL 仍可打开；
+       *   - 保留 /aps/setup/exact 是因为 SetupUncovered.vue 的 router.push、verify-rbac.mjs 的
+       *     path 断言、以及老书签都依赖它；
+       *   - 菜单渲染侧 useRenderMenuItem.tsx:19 会过滤 meta.hidden。
        */
       {
         path: '/aps/setup/exact',
@@ -503,10 +524,11 @@ export const apsV1Routes: AppRouteRecordRaw[] = [
         meta: {
           title: '明确产品转换',
           icon: 'vi-mdi:swap-horizontal-bold',
+          hidden: true,
           noCache: true,
           stage: 'C',
           acceptance: 'Setup v1.2 §五 / §19.2',
-          apsRequiredPermissions: ['aps.setup.view', 'aps.setup.edit', 'aps.setup.publish']
+          apsRequiredPermissions: ['aps.setup.view', 'aps.setup.edit']
         }
       },
       {
@@ -516,10 +538,11 @@ export const apsV1Routes: AppRouteRecordRaw[] = [
         meta: {
           title: '默认换型规则',
           icon: 'vi-mdi:cog-outline',
+          hidden: true,
           noCache: true,
           stage: 'C',
           acceptance: 'Setup v1.2 §四 / §19.2',
-          apsRequiredPermissions: ['aps.setup.view', 'aps.setup.edit', 'aps.setup.publish']
+          apsRequiredPermissions: ['aps.setup.view', 'aps.setup.edit']
         }
       },
 
@@ -538,7 +561,13 @@ export const apsV1Routes: AppRouteRecordRaw[] = [
         }
       },
 
-      /* --- ⑤ 对比两版差异 + **第一级发布**：发布规则集版本 --- */
+      /* --- ⑤ 换型规则逐条 Diff：从「规则集维护 → 版本对比」页签下钻，不再占菜单 ---
+       * 2026-10-28 用户拍板：字段级 Diff 已在规则集页「版本对比」页签，
+       * 本页只做换型规则 added/modified/removed 的逐条下钻，页签按钮带
+       * `?ruleSetId=&versionId=&otherVersionId=` 直达。
+       * ⇒ meta.hidden:true 只影响菜单渲染（useRenderMenuItem.tsx:19），
+       *   静态路由表不按 hidden 过滤（permission.ts generateRoutes('static')），
+       *   路由必须保留：页签下钻、老书签、verify-rbac path 断言都靠这个 URL。 */
       {
         path: '/aps/setup/diff',
         component: () => import('@/views/Aps/SetupDiff.vue'),
@@ -546,10 +575,11 @@ export const apsV1Routes: AppRouteRecordRaw[] = [
         meta: {
           title: '规则版本对比',
           icon: 'vi-mdi:file-compare-outline',
+          hidden: true,
           noCache: true,
           stage: 'C',
           acceptance: 'Setup v1.2 §19.2',
-          apsRequiredPermissions: ['aps.setup.view', 'aps.setup.publish']
+          apsRequiredPermissions: ['aps.setup.view']
         }
       },
 

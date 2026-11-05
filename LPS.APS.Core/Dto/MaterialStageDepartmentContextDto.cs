@@ -138,4 +138,31 @@ public sealed class StageLeadTimeFact
     ///    **已不归本值** —— 命中就是命中，那 4 行按命中级（`FACTORY_STAGE_DEFAULT`）+ 值 0 产出。
     /// </summary>
     public string MatchLevel { get; init; } = string.Empty;
+
+    /// <summary>
+    /// 本阶段是否**只需时间、不需生产部门**（`StageDict.StageCategory ∈ {FINAL, OUTS}`）。
+    ///
+    /// 【0号位 2026-11-04《定向试跑方案 v1.1》§9.2 逐字】
+    ///   「`FINAL` 是出厂/最终入库的虚拟时间阶段，**不需要生产部门**、不下发 MES Operation Task，但有独立 LT。
+    ///     `OUTS` 外协也是时间占用型 Stage：应计算其 LT、参与先后依赖，但 **V1 不因此构造内部生产 Task**。」
+    ///
+    /// 【为什么需要这个字段】`ProductionDepartment` 字典 24 个阶段码里**没有 FINAL/OUTS**，
+    ///   所以这两类阶段永远拿不到部门。消费侧 `StageTimingNodeBuilder` 的流程是：
+    ///     `:596` `if (hours &lt;= 0m) { end = cursor; return true; }`  ← LT=0 在此短路，不查部门
+    ///     `:609` 查 `MaterialStageDepartmentContext`
+    ///     `:618` 查不到 ⇒ `MISSING_DEPARTMENT_CONTEXT`，返回 false ⇒ **该段不产时间节点、游标不推进**
+    ///   ⇒ **FINAL（四厂 LT=0.00h）恰好走短路分支，碰巧无影响；OUTS（五厂 LT=40.00h）必然失败。**
+    ///   本字段就是让消费侧在 OUTS 上也能区分「本来就不需要部门」与「数据缺部门」，
+    ///   前者跳过部门查找、后者仍报错 —— **不能用「有 LT 但无部门」去猜，那会把真缺的也放过去**。
+    ///
+    /// 【值域与来源】布尔，由**装载侧**按 `ext_MES_StageDict.StageCategory` 填：
+    ///   `FINAL` / `OUTS` ⇒ true，其余（ASSY/MACH/SURF/CAST/FORGE/EXTRU/MOLD/DRAW）⇒ false。
+    ///   同义词 `ext_MES_StageDict` 已存在（`sp_SyncInventorySnapshot` 的 XC 资格守卫在用 `StageCategory='SURF'`），
+    ///   APS 侧不落字典表、每次装载现算。
+    ///
+    /// 【配套】消费侧改动归 1号位（`LPS.APS.Scheduling`）：
+    ///   在 `:609` 之前加「`IsLeadTimeOnly` ⇒ 直接 `end = cursor` 推进并 return true，不查部门」。
+    ///   本字段是 `LPS.APS.Core` 契约扩展，**默认 false 保持既有行为**，加字段本身不改变任何现有结果。
+    /// </summary>
+    public bool IsLeadTimeOnly { get; init; }
 }

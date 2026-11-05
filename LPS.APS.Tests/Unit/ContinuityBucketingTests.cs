@@ -22,7 +22,8 @@ public class ContinuityBucketingTests
         string? pi,
         decimal netQty,
         decimal processQty = 0m,
-        string startStage = "ST")
+        string startStage = "ST",
+        string factoryCode = "")
         => new()
         {
             LogicalDemandKey       = key,
@@ -33,6 +34,7 @@ public class ContinuityBucketingTests
             OrderId                = 100L + allocSeq,
             MaterialId             = 5001,
             FactoryId              = 7,
+            FactoryCode            = factoryCode,
             StartStageCode         = startStage,
             NetOutputQty           = netQty,
             PlannedProcessQty      = processQty > 0m ? processQty : netQty,
@@ -444,6 +446,34 @@ public class ContinuityBucketingTests
 
         cont.RouteCode.Should().BeNull();
         cont.PathId.Should().BeNull();
+    }
+
+    [Fact]
+    public void 切片与截小克隆_厂码随血缘继承_不丢成空串()
+    {
+        // Stage 固定交接规则以 (FactoryCode, FromStageCode, ToStageCode, TimeBasis) 首键匹配。
+        // 克隆漏拷 ⇒ 该片厂码为空 ⇒ 规则**静默不命中**，与「该厂本就没配规则」同形、且无任何告警。
+        // 这属「只挑当前有人读的字段拷」的忠实克隆违约；与 1号位 `PhaseTwoInitialScheduler` 的
+        // 部分锁定剩余需求克隆同款（我方已提请其同步补拷）。
+        // ⚠ 本用例是**行为级**护栏，只钉 `FactoryCode` 一个字段。逐字段（含以后新加的字段）由
+        //   `PeggingDemandCloneFidelityTests` 用反射兜住 —— 加字段请一并跑那个文件。
+        var demands = new List<LogicalProductionDemand>
+        {
+            Demand("328_81", 81, "PI-C81", 100m, factoryCode: "CN"),   // 有工单上下文 ⇒ 切连续片 + 自由片
+            Demand("328_82", 82, "PI-C82", 300m, factoryCode: "BJ"),   // 无工单上下文、额度只剩 100 ⇒ 截小
+        };
+        var ctxs = Map(Ctx("PI-C81", "WO081", 30m));
+        var piRemaining = new Dictionary<string, decimal>
+        {
+            ["PI-C81"] = 400m,
+            ["PI-C82"] = 100m,
+        };
+
+        var result = BucketWithPiRoot(demands, ctxs, piRemaining);
+
+        result.Where(d => d.LogicalDemandKey.StartsWith("328_81", StringComparison.Ordinal))
+            .Should().HaveCount(2).And.OnlyContain(d => d.FactoryCode == "CN");
+        result.Single(d => d.LogicalDemandKey == "328_82").FactoryCode.Should().Be("BJ");
     }
 
     [Fact]

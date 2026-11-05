@@ -52,4 +52,12 @@ public interface ITaskSplitRuleConfigGovernanceService
         int actorUserId,
         string actorUserCode,
         CancellationToken ct = default);
+
+    /// <summary>恢复启用执行批拆分规则（IsActive 0→1；先过 A1 唯一有效期，与其它 IsActive=1 有效规则窗口重叠 → 拒绝）。
+    /// 幂等：已启用再次调用原样返回、不追加审计。</summary>
+    Task<TaskSplitRuleConfigDto> ActivateAsync(
+        int id,
+        int actorUserId,
+        string actorUserCode,
+        CancellationToken ct = default);
 }

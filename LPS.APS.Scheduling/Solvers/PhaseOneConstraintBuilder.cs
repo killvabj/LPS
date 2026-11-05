@@ -28,6 +28,13 @@ internal class PhaseOneConstraintBuilder
     {
         var context = new ConstraintContext();
 
+        // ── R09-③（2026-10-29 落码）：Phase2 要按 WORK 窗口推进「中间无 Routing Stage 的提前期」──
+        //   为什么挂在上下文上而不是改签名：`ScheduleForward`/`ScheduleBackward` 的形参里没有 request，
+        //   而它们的 5 个调用点**全在 Phase2 内部**（`PhaseTwoInitialScheduler.cs:3677/3683/3748/3771`）⇒
+        //   改签名要连测试夹具一起动；挂只读引用只动一处，行为面完全一样。
+        //   ⚠ 只持有**引用**：不改 request、不复制大表（试排克隆共用同一份，天然只读）。
+        context.Request = request;
+
         // R-2 设备口径白名单（1号位 2026-10-16 回执 §四）：**原样透传**、**不改一字**。
         //   本号位不做资源身份判别、不硬编码阈值 —— 判据（`ManualSlotResourceOffset`）在 2号位 装载侧。
         //   ⚠ 三态（`null` 未投影／非 null 纯设备白名单／**空集 ≠ null**）由 `ConstraintContext` 属性承载；
@@ -413,10 +420,50 @@ internal class PhaseOneConstraintBuilder
         out List<RoutingDependency> lockedDependencies,
         out List<OperationResourceEligibility> lockedEligibilities)
     {
-        // (MaterialId, StageCode) → ProductionDepartmentId（2号位保证 (MaterialId, StageCode) 唯一）
-        var deptContext = request.MaterialStageDepartmentContexts
-            .GroupBy(c => (c.MaterialId, c.StageCode))
-            .ToDictionary(g => g.Key, g => g.First().ProductionDepartmentId);
+        // (MaterialId, StageCode) → ProductionDepartmentId（上游保证 (MaterialId, StageCode) 唯一）
+        //
+        // ── 0号位 2026-10-26 四份整改单 P0 ② 「部门冲突 Fail Closed」──
+        //   旧实现 `g.First().ProductionDepartmentId`：同键出现**两个不同部门**时，取谁完全取决于
+        //   载荷到达顺序 ⇒ **不可复现**，而且锁进来的可能是「别的部门的小工序集合」
+        //   （v5.0.16 冻结：部门是「物料×阶段」联合属性，同码不同部门是**两套不同工序**）。
+        //   这种静默择一错了也不报错。现改为：先登记冲突，**不猜**，由下方 1.5 整条排除该物料。
+        //   ⚠ 只有「**不同**部门」才算冲突；同键同部门的重复行无害（照常取该部门）。
+        var deptContext = new Dictionary<(int MaterialId, string StageCode), int>();
+        var deptConflicts = new List<(int MaterialId, string StageCode, int FirstDept, int SecondDept)>();
+
+        foreach (var group in request.MaterialStageDepartmentContexts.GroupBy(c => (c.MaterialId, c.StageCode)))
+        {
+            var firstDept = 0;
+            var secondDept = 0;
+            var hasFirst = false;
+            var conflicted = false;
+
+            foreach (var entry in group)
+            {
+                if (!hasFirst)
+                {
+                    firstDept = entry.ProductionDepartmentId;
+                    hasFirst = true;
+                }
+                else if (!conflicted && entry.ProductionDepartmentId != firstDept)
+                {
+                    conflicted = true;
+                    secondDept = entry.ProductionDepartmentId;
+                }
+            }
+
+            if (!hasFirst)
+            {
+                continue;
+            }
+
+            deptContext[group.Key] = firstDept;
+
+            if (conflicted)
+            {
+                deptConflicts.Add((group.Key.MaterialId, group.Key.StageCode, firstDept, secondDept));
+            }
+        }
 
         // 1. 识别缺失 Context 的 Material：仅校验「本次求解在范围」的工序 Stage。
         //    P1-06修复：StartOperation/StartStage 之前的已完成 Stage 不再参与本次求解，
@@ -427,6 +474,10 @@ internal class PhaseOneConstraintBuilder
         // 供 Phase5 计算「无 Routing Stage」时间节点（0号位 2026-09-29 裁决 §十四第4项）。
         // 见 ConstraintContext.EffectiveStages 注释：语义不变，仅把原本的局部变量挂出来复用。
         context.EffectiveStages = reachableStages;
+
+        // R09-③（2026-10-29）：把「中间无 Routing Stage」的提前期前置算好，供 Phase2 当硬时间约束。
+        //   必须在 EffectiveStages 赋值**之后**调用 —— 它读 context.EffectiveStages 判「本范围无 Routing」。
+        BuildRoutelessLeadSteps(request, context);
         foreach (var op in request.RoutingOperations)
         {
             var stageCode = op.StageCode ?? string.Empty;
@@ -446,8 +497,60 @@ internal class PhaseOneConstraintBuilder
             if (!deptContext.ContainsKey((op.MaterialId, stageCode)))
             {
                 context.MissingDepartmentContextMaterialIds.Add(op.MaterialId);
+                // ── 2026-11-03｜**逐 (物料, Stage) 留痕**（纯观测，不参与判定）──────────────
+                //   起因：`MISSING_PRODUCTION_DEPARTMENT_CONTEXT` 这一档此前**只登记物料号、
+                //   不登记是哪个 Stage 缺**，Phase5 输出时只能给泛化原因 ⇒ 未排明细里
+                //   2,143 行全是「无明细」，数据方拿到只有 DraftId、定位不了要补哪一行。
+                //   这里把缺的 Stage 记下来，Phase5 据此拼「物料 + 缺的 Stage + 该物料现有部门」。
+                //   ⚠ 同一个 (物料, Stage) 有多条工序行 ⇒ 去重，避免同一 Stage 重复登记。
+                if (!context.MissingDepartmentContextStages.TryGetValue(op.MaterialId, out var missStages))
+                {
+                    missStages = new List<string>();
+                    context.MissingDepartmentContextStages[op.MaterialId] = missStages;
+                }
+                if (!missStages.Contains(stageCode))
+                {
+                    missStages.Add(stageCode);
+                }
             }
         }
+
+        // 1.5 部门冲突 ⇒ **Fail Closed**（0号位 2026-10-26 P0 ②）。
+        //   载体复用：与「缺 Context」同走 `MissingDepartmentContextMaterialIds`（物料整条不参与部门锁定
+        //   ⇒ Phase2 无路由 ⇒ 业务 Unscheduled），**不新增契约字段、不改冻结 ReasonCode**。
+        //   差别只在留痕：`PRODUCTION_DEPARTMENT_CONFLICT` 是**决策说明层**码（与 `PHASE5_BREACH_SCOPE`
+        //   同一先例），明确指出真因是「同键多部门」而不是「没有部门」，两条路要补的东西不一样。
+        //   ⚠ 只对**本次求解在范围内**的冲突 Stage 生效：起点之前已完成的 Stage 再怎么冲突也不牵连本批
+        //     （与上方缺失判定的 P1-06 裁剪同口径）。
+        foreach (var (materialId, stageCode, firstDept, secondDept) in deptConflicts)
+        {
+            if (!reachableStages.TryGetValue(materialId, out var conflictInScope) ||
+                !conflictInScope.Contains(stageCode))
+            {
+                continue;
+            }
+
+            context.MissingDepartmentContextMaterialIds.Add(materialId);
+            context.TraceNotes.Add(new SolveTraceNote
+            {
+                Key = materialId.ToString(),
+                ReasonCode = "PRODUCTION_DEPARTMENT_CONFLICT",
+                Message = $"物料 {materialId} 的 Stage `{stageCode}` 在 `MaterialStageDepartmentContexts` 中"
+                          + $"对应了**多个不同部门**（{firstDept} / {secondDept} …）⇒ **Fail Closed**："
+                          + "不猜任何一个部门，本物料整条不参与部门锁定（Phase2 无路由 ⇒ 业务未排）。"
+                          + "该键本应唯一，请上游消除「同物料同阶段多部门」后重算；"
+                          + "注意这不是「缺部门」，两者要补的数据不是一回事。",
+                Level = "Error"
+            });
+        }
+
+        // 1.6 挂出「(物料, Stage) → 部门」表（2026-10-28，供 Setup 键域含部门时反查）：
+        //      冲突键一律不进表 ⇒ 查不到即 Setup 判 SourceUnavailable（WARNING），**不猜部门**。
+        foreach (var (conflictMaterialId, conflictStageCode, _, _) in deptConflicts)
+        {
+            deptContext.Remove((conflictMaterialId, conflictStageCode));
+        }
+        context.DepartmentByMaterialStage = deptContext;
 
         // 2. 过滤 RoutingOperation：缺失 Material 整条剔除 + 部门不符剔除
         // v5.0.16 冻结：Routing 三件套唯一键升级为含 ProductionDepartmentId 的三元/四元组；
@@ -756,6 +859,115 @@ internal class PhaseOneConstraintBuilder
     }
 
     /// <summary>
+    /// **R09-③（2026-10-29 落码）**：把每个需求「**中间**无 Routing Stage」的提前期**前置算好**，
+    /// 挂到 <see cref="ConstraintContext.RoutelessLeadStepsByDemand"/>，供 Phase2 当硬时间约束。
+    ///
+    /// <para><b>缺陷是什么</b>：改造前 `StageLeadTimeFact` 的提前期**只在**
+    /// `StageTimingNodeBuilder.Build` 里被累加，而 `Build` **只在 `PhaseFiveCompression.cs:470`
+    /// 被调用一次**（排完 Phase2/3/4 之后）。⇒ 它是**事后描述**，Phase2 排程时压根不看它
+    /// ⇒ 链上「有 Routing → 无 Routing → 有 Routing」中间那个 Stage **不占任何时间**，
+    /// 下游工序被排得比工艺允许的更早。这就是 R09-③ 的原始缺陷。</para>
+    ///
+    /// <para><b>口径（不新造任何键域/原因码）</b>：</para>
+    /// <list type="bullet">
+    ///   <item>「无 Routing Stage」判定**复用** <see cref="StageTimingNodeBuilder.ResolveRoutelessStages"/> ——
+    ///     与事后描述**同一函数**，两处口径不可能分叉。</item>
+    ///   <item>提前期值**复用** <see cref="StageTimingNodeBuilder.ResolveLeadTime"/> ——
+    ///     同样只认契约 4 值，缺记录仍判 `STAGE_LEADTIME_MISSING`，**不臆造 0 或 72h 时间**。</item>
+    ///   <item>**逐 Stage 一片**（<see cref="RoutelessLeadLeg"/>），不先求总和 ——
+    ///     提前期是**有效生产小时**，要在**该 Stage 自己部门**的 WORK 窗口内消耗（R09-① 口径）。</item>
+    ///   <item>只登记**两端都是真实 Routing Stage** 的段（`From` / `To` 均非空）⇒ 恰好是「**中间**」。</item>
+    /// </list>
+    ///
+    /// <para><b>为什么不登记链首/链尾的无 Routing Stage</b>：链尾部分本来就由
+    /// `StageTimingNodeBuilder.BuildCore` 从末端 Task 往后累加（在 `:344` 按 `seq <= terminalSeq` 筛），
+    /// 重复登记会**双计**；链首部分不在 R09-③「**中间**」的字面范围内，本次不扩。</para>
+    /// </summary>
+    private static void BuildRoutelessLeadSteps(DomainSolveRequest request, ConstraintContext context)
+    {
+        if (request.LogicalProductionDemands.Count == 0 || request.StageSequenceChains.Count == 0)
+        {
+            return;
+        }
+
+        var chainByMaterial = BuildStageChainIndex(request);
+
+        var leadTimeByKey = new Dictionary<(int MaterialId, string StageCode), StageLeadTimeFact>();
+        foreach (var fact in request.StageLeadTimes)
+        {
+            leadTimeByKey[(fact.MaterialId, fact.StageCode)] = fact;
+        }
+
+        foreach (var demand in request.LogicalProductionDemands)
+        {
+            if (string.IsNullOrEmpty(demand.LogicalDemandKey))
+            {
+                continue;
+            }
+
+            // 权威链（已按起点裁剪）：顺序就是工艺顺序，跨 Stage 段的「中间」由它定义。
+            var chainStages = ResolveChainStagesInScope(request, demand, chainByMaterial);
+            if (chainStages.Count == 0)
+            {
+                continue;
+            }
+
+            // ⚠ 路径口径用**需求自述**的 RouteCode/PathId：Phase1 还没选路（Phase2 才选），
+            //   与 `ResolveRoutelessStages` 的「未确定 ⇒ 全部 Route 并集（候选口径）」一致。
+            var routeless = StageTimingNodeBuilder.ResolveRoutelessStages(
+                demand.MaterialId,
+                context.EffectiveStages,
+                request,
+                demand.RouteCode,
+                demand.PathId);
+
+            if (routeless.Stages.Count == 0)
+            {
+                continue;
+            }
+
+            var routelessSet = new HashSet<string>(routeless.Stages, StringComparer.Ordinal);
+
+            var steps = new List<ConstraintContext.RoutelessLeadStep>();
+            string? prevRoutingStage = null;
+            List<ConstraintContext.RoutelessLeadLeg>? run = null;
+
+            foreach (var stageCode in chainStages)
+            {
+                if (routelessSet.Contains(stageCode))
+                {
+                    run ??= new List<ConstraintContext.RoutelessLeadLeg>();
+
+                    var (hours, level) = StageTimingNodeBuilder.ResolveLeadTime(
+                        leadTimeByKey, demand.MaterialId, stageCode);
+
+                    run.Add(new ConstraintContext.RoutelessLeadLeg(
+                        stageCode,
+                        hours,
+                        !string.Equals(level, StageTimingNodeBuilder.MissingLevel, StringComparison.Ordinal)));
+                    continue;
+                }
+
+                // 碰到真实 Routing Stage：把「上一个 Routing Stage → 这一个」之间的无 Routing 段收口。
+                if (run is { Count: > 0 } && prevRoutingStage is not null)
+                {
+                    steps.Add(new ConstraintContext.RoutelessLeadStep(prevRoutingStage, stageCode, run));
+                }
+
+                run = null;
+                prevRoutingStage = stageCode;
+            }
+
+            // 循环结束时 run 若还非空 = 链尾那段（无 ToStageCode）⇒ 按上方注释**不登记**。
+
+            if (steps.Count > 0)
+            {
+                context.RoutelessLeadStepsByDemand[demand.LogicalDemandKey] = steps;
+            }
+        }
+    }
+
+    /// <summary>
     /// N8-01：取「该需求在本次求解范围内」的 BOM/Stage 权威链 Stage 集合。
     ///
     /// 取源 = <see cref="DomainSolveRequest.StageSequenceChains"/>（2号位 按
@@ -862,6 +1074,13 @@ internal class PhaseOneConstraintBuilder
         List<RoutingDependency> routingDependencies,
         ConstraintContext context)
     {
+        // ── 2026-11-02｜`P2_NO_ROUTING` 归因观测（纯观测）──
+        //   `P2_NO_ROUTING` 的报文说「本次输入里一条 Routing 图都没有」，但**分不出两种责任方**：
+        //     · 输入侧**根本没有**该物料的工序行（上游装载/过滤掉了）⇒ 上游；
+        //     · 输入里**有行**，但图没建出来（全被去重/裁掉）⇒ **我方** `BuildRoutingGraphs`。
+        //   把「输入里出现过该物料」这件事记下来，Phase2 出口处即可一次分清。不改任何判定。
+        context.MaterialsWithRoutingInput = routingOperations.Select(op => op.MaterialId).ToHashSet();
+
         // 按 MaterialId 分组
         var operationsByMaterial = routingOperations
             .GroupBy(op => op.MaterialId)
@@ -899,7 +1118,21 @@ internal class PhaseOneConstraintBuilder
                         OperationName = op.OperationName,
                         ProcessType = op.ProcessType,
                         StageCode = op.StageCode,
-                        StandardDuration = op.StandardDuration,
+                        // ── 2026-10-28｜R04-S-G-Units：秒 → 分钟，**只在本入口转一次** ──
+                        //   0号位 2026-10-27《01_正式回复1号位_R04秒转分钟唯一装配…》§1-R04-S-G-Units
+                        //   与 2026-10-28《00_0号位_3号位秒单位回执核证…》§一：批准方案C ——
+                        //   MES CycletTime（秒）→ ODS 原样透传 → APS `RoutingOperation.StandardDuration` **保留秒**，
+                        //   不改 ODS、不要求全量重灌；由 1号位 在**唯一 Operation 装配入口**（本行）÷60 成分钟，
+                        //   之后所有 Phase 一律按分钟求解。
+                        //   全仓 `new OperationNode` **只有这一处** ⇒ 所有下游消费点读的都是转换后的值
+                        //   （Phase2 `:3792/:4058/:4405/:4699/:8493`、Phase4 `:1187/:1725`、
+                        //     `ResourceEfficiencyEvaluator`、`SchedulingDirectionResolver` 的 Slack 估算）
+                        //   ⇒ **任何下游都不得再除一次 60**，否则就重复转换。
+                        //   ⚠ `Task.Duration` 对外小时合同**不因此改变**；本行只影响 Solver 内部时长。
+                        //   ⚠ 同数据结构里的 `op.SetupTime` **不除**：冻结 DDL v5.1.2 明确
+                        //     「SetupTime 准备时间 = 换型时间，单位：分钟」，未做秒改判 ⇒ 本次只转 StandardDuration。
+                        //   ⚠ 契约 `RoutingOperation.cs:52` 那句「标准工时（分钟）」是**待改冻的旧注释**，不是现行口径。
+                        StandardDuration = op.StandardDuration / 60m,
                         // item1 接线（阶段二）：不再拷贝 op.SetupTime——v1.2 §1.2/§20.3 废止其运行真相地位，
                         // Setup 一律走 SetupTransitionRule 规则查找（SetupExactRules/SetupDefaultRules）。
                         TransferBatchSize = op.TransferBatchSize,
@@ -1101,6 +1334,8 @@ internal class PhaseOneConstraintBuilder
         }
 
         context.CrossMaterialParentToChildren = parentToChildren;
+        // 2026-10-28：反向索引落库（合批守卫用，见 ConstraintContext.CrossMaterialChildToParents）。
+        context.CrossMaterialChildToParents = childrenToParents;
 
         // 层内按 DemandSequence 排序（保持 2号位 业务优先级）——索引只建一次
         var demandByKey = request.LogicalProductionDemands
@@ -1223,6 +1458,35 @@ internal class PhaseOneConstraintBuilder
             .Where(r => !string.IsNullOrEmpty(r.ResourceCode))
             .GroupBy(r => r.ResourceCode)
             .ToDictionary(g => g.Key, g => g.First().ResourceId);
+
+        // ── R06 动态瓶颈（0号位 2026-10-28《01_正式回复1号位_R04秒转分钟唯一装配_WAIT_ONLY_AUTO与R06本地先修…》§1-R06）──
+        //   0号位 原文：「Phase3 仅诊断不等于瓶颈策略进入 Phase1/2/4。先用你已有策略、Operation 资源资格、
+        //   Calendar、排程约束，证明四个 Mode 如何影响合法选择。」
+        //   本段只做**取值**，不改任何合法性：三个值全部来自既有输入（冻结策略字段 + 已建好的资格表），
+        //   真正起作用的地方是 `PhaseTwoInitialScheduler.OrderResourcesByPreference`（Phase2 正排/倒排 + Phase4 修
+        //   三处共用）的**候选顺序**，因此**不会**让任何原本不合法的排程变合法，反之亦然。
+        var solverStrategy = request.StrategySnapshot.SolverStrategy;
+        context.BottleneckMode = solverStrategy.BottleneckMode;
+
+        // 冻结字段口径：「Auto 忽略锚点编码；空 = 未指定 ⇒ 等价 Auto」。
+        //   故 Auto 下**不必**反查，锚点恒为 null；其余三个 Mode 才反查（反查不到 ⇒ null ⇒ 排序降级为不干预）。
+        if (solverStrategy.BottleneckMode != DynamicBottleneckMode.Auto
+            && !string.IsNullOrEmpty(solverStrategy.AnchorResourceCode)
+            && context.ResourceIdsByCode.TryGetValue(solverStrategy.AnchorResourceCode!, out var anchorResourceId))
+        {
+            context.BottleneckAnchorResourceId = anchorResourceId;
+        }
+
+        // 「有负荷」静态代理：谁在**任一条**需求的合格资源表里出现过 ⇒ 认为排程后可能有占用。
+        //   ⚠ 不含需求量级（本判据只回答「有没有」，量级大小在这里没有判据地位）。
+        context.ResourcesWithStaticLoad.Clear();
+        foreach (var eligible in context.OperationResourceEligibility.Values)
+        {
+            foreach (var resourceId in eligible)
+            {
+                context.ResourcesWithStaticLoad.Add(resourceId);
+            }
+        }
     }
 
     /// <summary>
@@ -1355,9 +1619,37 @@ internal class PhaseOneConstraintBuilder
     /// </summary>
     private void BuildSetupTransitionRules(DomainSolveRequest request, ConstraintContext context)
     {
-        var (exact, defaults) = SetupOptimizer.BuildRuleLookups(request.StrategySnapshot?.SetupTransitionRules);
+        var (exact, defaults, report) = SetupOptimizer.BuildRuleLookups(request.StrategySnapshot?.SetupTransitionRules);
         context.SetupExactRules = exact;
         context.SetupDefaultRules = defaults;
+        context.SetupRuleLoadReport = report;
+
+        // 0号位 R07R08 v1.1 第 3 条「禁止同 Run 静默首条覆盖」：同键异值不是静默吞掉，而是
+        //   该键整条剔除（解析落到下一层，0 分钟 + WARNING 可见）+ 在此留 WARNING 追踪。
+        //   同键同值 / 无法识别的行只计数，不逐行产 trace（控体积）。
+        if (report.ExactConflictKeyCount > 0 || report.DefaultConflictKeyCount > 0)
+        {
+            context.TraceNotes.Add(new SolveTraceNote
+            {
+                Key = "SetupTransitionRules",
+                ReasonCode = "SETUP_RULE_KEY_CONFLICT",
+                Message = $"Setup 规则同键异值：EXACT {report.ExactConflictKeyCount} 个键 / DEFAULT {report.DefaultConflictKeyCount} 个键"
+                          + " ⇒ 该键**整条剔除**（不取首条、不随机选），本次解析按下一层兜底并留 WARNING。留样："
+                          + string.Join("；", report.ConflictExamples),
+                Level = "Warning"
+            });
+        }
+
+        if (report.UnusableRowCount > 0)
+        {
+            context.TraceNotes.Add(new SolveTraceNote
+            {
+                Key = "SetupTransitionRules",
+                ReasonCode = "SETUP_RULE_UNUSABLE_ROWS",
+                Message = $"Setup 规则中 {report.UnusableRowCount} 行结构无效（EXACT 缺前后产品 / 未知 RuleType），已跳过并计数。",
+                Level = "Warning"
+            });
+        }
     }
 
     /// <summary>
@@ -1416,6 +1708,21 @@ internal class PhaseOneConstraintBuilder
 /// </summary>
 internal class ConstraintContext
 {
+    /// <summary>
+    /// **PV195 跨日历窗找槽的启用开关（2026-10-29）**。默认 <c>false</c>。
+    ///
+    /// <para><b>为什么要有这个开关（而不是让找槽方法自己判断）</b>：跨窗会改写「一个 Task 必须整体落在某个
+    /// 日历窗内」这条既有语义。实测代价（14:18 全量 Unit）：在 Phase2 常态找槽里无条件开跨窗后，6 个既有用例变红 ——
+    /// `P0_01`（90 分钟跨两个 60 分钟窗）本该「Phase2 排不下 → Phase4 拆 2×45」，
+    /// 被跨窗一次整段排下变成 1 个 Task；合批可行性、批数选择、批血缘同源变形。
+    /// 结论：**能排下的东西一律不许被跨窗改写**。</para>
+    ///
+    /// <para><b>唯一置 true 的地方</b>：`PhaseFourLocalRepair.RepairUnscheduledDemands` 里，
+    /// 一个执行批经**常规修复一个 Task 都没排出**之后的重试（`try/finally` 内临时置 true，出块即还原）。
+    /// 也就是说，跨窗只救「今天出来 0 个 Task」的那些需求，其余结果逐位不变。</para>
+    /// </summary>
+    internal bool AllowCrossWindowSlot { get; set; }
+
     /// <summary>
     /// 工序依赖图：MaterialId → <see cref="RoutePathKey"/>(RouteCode, PathId) → 工序依赖关系。
     /// 键升维依据见 <see cref="RoutePathKey"/>（v1.6 新增要求 + Q1「禁止跨 Path 连边」）。
@@ -1729,6 +2036,75 @@ internal class ConstraintContext
     public Dictionary<int, HashSet<string>> EffectiveStages { get; set; } = new();
 
     /// <summary>
+    /// **R09-③ 载体｜原始求解入参的只读引用**（2026-10-29）。
+    ///
+    /// 【为什么挂在这里】Phase2 的 `ScheduleForward` / `ScheduleBackward` 形参里**没有** request，
+    ///   而这两个方法要把「中间无 Routing Stage 的提前期」按 **WORK 窗口**推进/回退，
+    ///   必须拿到 `MaterialStageDepartmentContexts`（定部门）与 `DepartmentWorkWindows`（定窗口）。
+    ///   这两个表只在 `DomainSolveRequest` 上。它们的**全部 4 个调用点都在 Phase2 内部**
+    ///   （`PhaseTwoInitialScheduler.cs:3677/3683/3748/3771`）⇒ 改签名要连测试夹具一起动；
+    ///   挂只读引用只动一处，行为面完全一样。
+    ///
+    /// ⚠ **只持有引用、只读**：不改 request 任何字段、不复制大表；
+    ///   候选试排的 `ShallowCloneForTrial` 会 `MemberwiseClone` **共享同一个引用**（只读 ⇒ 安全）。
+    /// ⚠ 可能为 <c>null</c>（手工构造的测试夹具）：**读它之前必须判空**，判空即「无提前期推进」，
+    ///   与改造前逐字等价（零回归），不得因此抛异常。
+    /// </summary>
+    public DomainSolveRequest? Request { get; set; }
+
+    /// <summary>
+    /// **R09-③ 载体｜每个需求「中间无 Routing Stage」的提前期步骤**（2026-10-29）。
+    ///
+    /// 键 = `LogicalDemandKey`；值 = 按 Stage 链顺序排好的步骤，每条回答
+    /// 「从 `FromStageCode` 这一步跨到 `ToStageCode`，中间夹着哪些**没有 RoutingOperation** 的 Stage」。
+    ///
+    /// 【为什么需要】`StageLeadTimeFact` 的提前期原本只在 `StageTimingNodeBuilder.Build` 里被累加，
+    ///   而 `Build` **只在 `PhaseFiveCompression.cs:470` 被调用一次** —— 排完之后才建时间链。
+    ///   ⇒ 它是**事后描述**，Phase2 排程时**完全不看**它，无 Routing 的中间 Stage 因而
+    ///   **不占用任何时间**（R09-③ 的原始缺陷：中间 Stage 不成为硬时间约束）。
+    ///   本表把这部分提前期**前置到 Phase1 算好**，供 Phase2 在跨 Stage 边上前推/后回。
+    ///
+    /// 【只收「中间」的】`From` / `To` 两端**都必须是真实 Routing Stage** ⇒
+    ///   链首之前、链尾之后那些无 Routing Stage **不进本表**：链尾部分本来就是
+    ///   `StageTimingNodeBuilder.BuildCore` 从末端 Task 往后累加的范围（不重复算）；
+    ///   链首部分不属于 R09-③「**中间**无 Routing Stage」的字面范围。
+    ///
+    /// 【缺 LT 的处理】逐 leg 带 `LeadTimeResolved`。缺记录的 leg **不臆造 0 或 72h 时间**
+    ///   （0号位 2026-10-15 第九轮 `:32` 原话），排程时按「不推进」处理，
+    ///   由 `StageTimingNodeBuilder.BuildCore` **同一函数、同一输入**独立算出
+    ///   `CompletionTimeCertain=false` —— 本层**不自行造原因码、不写 TraceNotes**。
+    /// </summary>
+    public Dictionary<string, List<RoutelessLeadStep>> RoutelessLeadStepsByDemand { get; set; } =
+        new(StringComparer.Ordinal);
+
+    /// <summary>
+    /// 「中间无 Routing Stage」的一段（见 <see cref="RoutelessLeadStepsByDemand"/>）。
+    /// </summary>
+    /// <param name="FromStageCode">前一个**有 Routing** 的 Stage 编码（跨段起点，严格非空）。</param>
+    /// <param name="ToStageCode">后一个**有 Routing** 的 Stage 编码（跨段终点，严格非空）。</param>
+    /// <param name="Legs">中间那些无 Routing Stage，按 Stage 链顺序；逐 leg 各自带部门与提前期。</param>
+    internal readonly record struct RoutelessLeadStep(
+        string FromStageCode,
+        string ToStageCode,
+        IReadOnlyList<RoutelessLeadLeg> Legs);
+
+    /// <summary>
+    /// 一个「无 Routing Stage」的提前期片（见 <see cref="RoutelessLeadStepsByDemand"/>）。
+    /// **逐 Stage 分开**而不是先求和：提前期是**有效生产小时**，要在**该 Stage 自己的部门**
+    /// WORK 窗口内消耗（R09-① 口径），部门不同就不能先加再推。
+    /// </summary>
+    /// <param name="StageCode">该无 Routing Stage 的编码。</param>
+    /// <param name="Hours">`StageLeadTimeFact.LeadTimeHours` 原值（不做符号裁决）。</param>
+    /// <param name="LeadTimeResolved">
+    /// 是否命中契约 4 值之一。<c>false</c> = `STAGE_LEADTIME_MISSING` ⇒ **不得**当作「零提前期」，
+    /// 只是排程层编不出时长、不推进。
+    /// </param>
+    internal readonly record struct RoutelessLeadLeg(
+        string StageCode,
+        decimal Hours,
+        bool LeadTimeResolved);
+
+    /// <summary>
     /// 工序资源资格：<see cref="EligibilityLookupKey"/> → 合法 ResourceId 列表（按优先级排序）。
     /// ⚠ 旧键为字符串 <c>"{MaterialId}::{RouteCode}::{OperationCode}"</c> —— **缺部门维度**，
     /// 会把「同物料同工序码但分属不同部门」的两套资格**合并成一份** ⇒ 跨部门串资源。
@@ -1736,6 +2112,50 @@ internal class ConstraintContext
     /// 残留：契约 <c>OperationResourceEligibility</c> 无 StageCode 字段，无法再细到 Stage（见 <see cref="EligibilityLookupKey"/> 注释）。
     /// </summary>
     public Dictionary<EligibilityLookupKey, List<int>> OperationResourceEligibility { get; set; } = new();
+
+    /// <summary>
+    /// 2026-11-02（**纯观测**）：本次求解输入里**出现过工序行**的 `MaterialId` 集合。
+    /// 用途只有一个 —— `P2_NO_ROUTING` 出口处区分「输入里没有该物料」与「有行但图没建出来」。
+    /// 不参与任何判定；`MemberwiseClone` 走引用共享（见本类克隆注释），只读不写。
+    /// </summary>
+    public HashSet<int> MaterialsWithRoutingInput { get; set; } = new();
+
+    /// <summary>
+    /// 2026-11-03（**纯观测**）：`MaterialId` → 本次求解范围内**缺部门上下文**的 `StageCode` 列表。
+    /// 用途只有一个 —— Phase5 输出 `MISSING_PRODUCTION_DEPARTMENT_CONTEXT` 时，
+    /// 把「哪个 Stage 缺」写进人可读正文，让数据方能直接定位要补 `MaterialStageDeptContext` 的哪一行。
+    /// 不参与任何判定；与 <see cref="MissingDepartmentContextMaterialIds"/> 同源、只多一层 Stage 粒度。
+    /// </summary>
+    public Dictionary<int, List<string>> MissingDepartmentContextStages { get; set; } = new();
+
+    /// <summary>
+    /// 2026-11-02（**纯观测**）：`MaterialId` → 该物料在本输入里的**全部**资格键。
+    /// 用途只有一个 —— `P2_NO_ELIGIBLE_RESOURCE` 出口处区分「该物料一条资格行都没有」与
+    /// 「有资格行，但 (部门/Route/Path/工序) 五元组对不上」。懒建、只读。不参与任何判定。
+    /// </summary>
+    private Dictionary<int, List<EligibilityLookupKey>>? _eligibilityKeysByMaterial;
+
+    public IReadOnlyList<EligibilityLookupKey> GetEligibilityKeysForMaterial(int materialId)
+    {
+        if (_eligibilityKeysByMaterial is null)
+        {
+            var byMaterial = new Dictionary<int, List<EligibilityLookupKey>>();
+            foreach (var key in OperationResourceEligibility.Keys)
+            {
+                if (!byMaterial.TryGetValue(key.MaterialId, out var list))
+                {
+                    list = new List<EligibilityLookupKey>();
+                    byMaterial[key.MaterialId] = list;
+                }
+                list.Add(key);
+            }
+            _eligibilityKeysByMaterial = byMaterial;
+        }
+
+        return _eligibilityKeysByMaterial.TryGetValue(materialId, out var keys)
+            ? keys
+            : (IReadOnlyList<EligibilityLookupKey>)Array.Empty<EligibilityLookupKey>();
+    }
 
     /// <summary>
     /// P0-04修复：工序资源产能系数映射：(<see cref="EligibilityLookupKey"/>, ResourceId) → CapacityFactor
@@ -1757,6 +2177,30 @@ internal class ConstraintContext
     public Dictionary<string, int> ResourceIdsByCode { get; set; } = new();
 
     /// <summary>
+    /// **R06 动态瓶颈｜锚点 ResourceId**：`StrategySnapshot.SolverStrategy.AnchorResourceCode` 经
+    /// `ResourceIdsByCode` 反查的结果。<c>null</c> = 未指定编码／反查不到 ⇒ **等价 Auto**（冻结字段注释逐字：
+    /// 「Auto 忽略；空=未指定→等价 Auto」）。由 <c>BuildResourceCodes</c> 一次填好，Phase2/Phase4 候选取用。
+    /// </summary>
+    public int? BottleneckAnchorResourceId { get; set; }
+
+    /// <summary>
+    /// **R06 动态瓶颈｜策略**（`Auto` / `PreferAnchor` / `ForceAnchor` / `NotAnchor`）。
+    /// Phase3 原有用途 = 算瓶颈集诊断归属；2026-10-28 起 Phase2/Phase4 的**候选资源排序**也读它
+    /// （见 <c>PhaseTwoInitialScheduler.OrderResourcesByPreference</c>）。
+    /// </summary>
+    public DynamicBottleneckMode BottleneckMode { get; set; } = DynamicBottleneckMode.Auto;
+
+    /// <summary>
+    /// **R06 动态瓶颈｜「有负荷」判据载体**：在**至少一条**需求的合格工序上出现过资格的资源集合。
+    ///
+    /// ⚠ 这是**排程前**的静态代理，不是 Phase3 的事后利用率：真实利用率（`Σ占用时长 ÷ 日历可用时长`）
+    ///   只有在 Phase2 排完之后才算得出，**排程前不可得** ⇒ 排序阶段只能用「有没有需求排得上它」这个
+    ///   布尔代理。<c>PreferAnchor</c> 要求「锚点有负荷才优先」，无此集合就只能退化成 `ForceAnchor`
+    ///   （两者结果恒同、四模式分不开）。本代理**只用于排序取舍**，**不参与**可行性判定。
+    /// </summary>
+    public HashSet<int> ResourcesWithStaticLoad { get; } = new();
+
+    /// <summary>
     /// **R-2 设备口径白名单**（原样透传 `DomainSolveRequest.DeviceResourceIds`；1号位 2026-10-16 回执 §四）。
     /// **三态**（与契约逐字对齐）：
     ///   · `null` ⇒ **未投影** ⇒ ④.6 留痕**不产**设备口径段，行为与改造前**逐字一致**（零回归）；
@@ -1773,6 +2217,23 @@ internal class ConstraintContext
     /// 方向性键（A→B ≠ B→A）；源 = 第⑦块 SetupTransitionRules（2号位 按 Domain 裁剪投影，r13392）。
     /// </summary>
     public Dictionary<SetupOptimizer.SetupExactKey, decimal> SetupExactRules { get; set; } = new();
+
+    /// <summary>
+    /// 第⑦块 Setup 规则的装载报告（0号位 R07R08 v1.1 第 3 条）：同键异值剔除数 / 无效行数 / 冲突留样。
+    /// Phase1 装载时填，Phase3 出诊断用；**不参与排程计算**。
+    /// </summary>
+    public SetupOptimizer.SetupRuleLoadReport SetupRuleLoadReport { get; set; } = new();
+
+    /// <summary>
+    /// **(MaterialId, StageCode) → ProductionDepartmentId**（部门锁定时的同一张表，2026-10-28 挂出复用）。
+    ///
+    /// 【为什么需要】Setup 规则键自 2026-10-28 起含生产部门（0号位 R07R08 v1.1 第 3 条），
+    ///   而 Phase4/Phase5 手上只有 <see cref="FinalTaskDraft"/>（有 StageCode、**无部门**）⇒
+    ///   必须按「物料 + Stage」反查部门，**与既有部门锁定同源、不另造部门**。
+    /// 【口径】只登记**未冲突**的键（同键多部门的物料已被 Fail Closed 整条排除，不会进排程）。
+    /// 【缺键语义】查不到 ⇒ 返回 null ⇒ Setup 解析判 <c>SourceUnavailable</c>（WARNING，不冒充「无前态」）。
+    /// </summary>
+    public Dictionary<(int MaterialId, string StageCode), int> DepartmentByMaterialStage { get; set; } = new();
 
     /// <summary>Setup DEFAULT 换型规则：(当前工序, 当前设备) → 默认换型分钟（同源；EXACT 未命中时第二优先）。</summary>
     public Dictionary<SetupOptimizer.SetupDefaultKey, decimal> SetupDefaultRules { get; set; } = new();
@@ -1801,9 +2262,67 @@ internal class ConstraintContext
     /// </summary>
     public List<SolveTraceNote> TraceNotes { get; set; } = new();
 
+    /// <summary>
+    /// 2026-10-27 四十三刀：**候选试排用的浅拷贝上下文**（候选并行的前置条件）。
+    ///
+    /// 【为什么需要】候选试排会往上下文里写两个成员：`ProductTimeline`（逐候选 `realTimeline.Clone()` 后
+    ///   被占用/合批改写）与 `TraceNotes`（Setup 追踪三元组追加）。串行时「写 → 用完还原」没问题，
+    ///   并行时两条线程会同时写同一个对象 ⇒ 结果互串。
+    ///
+    /// 【做什么】`MemberwiseClone` 复制全部字段（**共享**所有只读集合的引用：RoutingGraphs / 各类规则表 /
+    ///   资源日历 / 锁定任务 / 跨物料 DAG 等 —— 这些在 Phase2 全程只读，抄一份既浪费又没必要），
+    ///   再给两个**可写**成员各配一份新的空实例：
+    ///     · `ProductTimeline`：调用方随后会 `= realTimeline.Clone()`，这里给空对象只为「赋值前也不与父共享」；
+    ///     · `TraceNotes`：给**空表**。候选的 trace 增量因此天然落在这张空表上，
+    ///       裁剪区间恒为 `[0, Count)` —— 与串行「按水位切片」得到的结果**逐条相同**。
+    ///
+    /// 【为什么别的不必经手】Phase2 候选试排对 `constraints` 的写入点已全仓核过：只有上面这两个。
+    ///   其余成员（含 `AmbiguousRoutingPathMaterialIds` / `MissingDepartmentContextMaterialIds` /
+    ///   `StageSequenceConflictMaterialIds` 三个 HashSet）在 `PhaseOneConstraintBuilder` 之外**只读**，
+    ///   且唯一会写它们的 `TryGetSingleRoutingGraph` 调用点在候选循环之外。
+    /// </summary>
+    public ConstraintContext ShallowCloneForTrial()
+    {
+        var clone = (ConstraintContext)MemberwiseClone();
+        clone.ProductTimeline = new ResourceProductTimeline();
+        clone.TraceNotes = new List<SolveTraceNote>();
+        return clone;
+    }
+
     /// <summary>demand 的有效交期 = Run 级覆盖（ManualTargetDueDate）?? 正式 RequiredAvailableTime（M5 第一批统一换用点）。</summary>
     public DateTime EffectiveDue(LogicalProductionDemand demand)
         => DueDateOverrides.TryGetValue(demand.LogicalDemandKey, out var due) ? due : demand.RequiredAvailableTime;
+
+    /// <summary>
+    /// **判定期**交期上界：与 <see cref="EffectiveDue"/> 只差「客户 DATE 交期当整天都算按期」这一件事。
+    ///
+    /// 裁决依据：0号位 2026-10-31《致1号位_二次回执完整审核回复_v3.0》`:18` ——
+    ///   「客户DATE业务当日23:59:59，技术以次日00:00**排他**上界（最终完成 `&lt; nextMidnight`），不写死100%」；
+    ///   Manual 手工覆盖走已冻结的精准时刻规则。
+    /// 与查询侧同口径：`ScheduleQueryService.DelayedOnDate` = `CAST(PlannedEndTime AS date) &gt; CustomerDueDate`
+    ///   （Q1 裁决 2026-10-17）—— 同一笔延期，Solver 与查询必须给同一个结论。
+    ///
+    /// **为什么返回「当日最后一刻」而不是字面上的次日00:00**：调用点全部沿用
+    ///   `完成 &gt; 上界 ⇒ 延期` / `完成 &lt;= 上界 ⇒ 按期` 的既有比较式。返回 `次日00:00 − 1 tick` 后，
+    ///   这些比较式**一字不改**即与 `完成 &lt; 次日00:00` 完全等价（`DateTime` 最小刻度就是 1 tick）。
+    ///   改值不改式 —— 十处调用点逐点翻比较符太容易写反一个。
+    ///
+    /// 原样返回的三种情形：`DateTime.MaxValue`（无交期哨兵）、Manual 覆盖（精确时刻，按 `&lt;=` 判）、
+    ///   值本身已带时刻成分（不是 DATE，例如将来若真有分支喂进 `Order_Canonical.DueDate` 这种 `DATETIME2`）。
+    /// </summary>
+    public DateTime EffectiveDueJudgementBound(LogicalProductionDemand demand)
+        => ToJudgementBound(
+            EffectiveDue(demand),
+            isManualOverride: DueDateOverrides.ContainsKey(demand.LogicalDemandKey));
+
+    /// <summary>纯函数形态（不依赖上下文，供 Unit 直接打正反例）。语义见 <see cref="EffectiveDueJudgementBound"/>。</summary>
+    internal static DateTime ToJudgementBound(DateTime effectiveDue, bool isManualOverride)
+    {
+        if (effectiveDue == DateTime.MaxValue) return effectiveDue;        // 无交期哨兵：原样（必须先判，MaxValue 自带时刻成分）
+        if (isManualOverride) return effectiveDue;                          // Manual 精确时刻：原样，沿用 `<=`
+        if (effectiveDue.TimeOfDay != TimeSpan.Zero) return effectiveDue;   // 已有时刻成分 ⇒ 不是 DATE：原样
+        return effectiveDue.AddDays(1).AddTicks(-1);                        // 客户 DATE ⇒ 交期日 23:59:59.9999999
+    }
 
     /// <summary>
     /// 资源日历：ResourceId → 可用时间窗列表（已排序）
@@ -1868,6 +2387,21 @@ internal class ConstraintContext
     /// 供 Phase2 在排父件时取子件的真实完成时间（动态物料可用时间合并）。
     /// </summary>
     public Dictionary<string, List<string>> CrossMaterialParentToChildren { get; set; } = new();
+
+    /// <summary>
+    /// 子 → 父 映射（子件 LogicalDemandKey → 直接父件 LogicalDemandKey 列表）。
+    /// 2026-10-28：与 <see cref="CrossMaterialParentToChildren"/> 同一份数据反向索引，供合批守卫使用 ——
+    ///   合批延长目标 Task 的 End 时，要能 O(1) 找到「谁会因为这个 End 变晚而被顶穿」。
+    /// </summary>
+    public Dictionary<string, List<string>> CrossMaterialChildToParents { get; set; } = new();
+
+    /// <summary>
+    /// 本域**已落定**需求的「最早 Task 起点」（需求键 → 该需求已排 Task 的最早 PlannedStartTime）。
+    /// 2026-10-28（PV190 真因）：只在 Phase2 外层需求循环**落定后**写入（合批落定的需求也写），
+    ///   候选试排期间**只读不写** ⇒ 不破坏候选隔离。用途 = 合批守卫：
+    ///   已发布的父件起点不会回推，故合批一旦会把目标 Task 的 End 顶过父件起点，就必须拒绝这次合批。
+    /// </summary>
+    public Dictionary<string, DateTime> DemandEarliestStart { get; set; } = new();
 
     /// <summary>
     /// P1-12：父 → (父, 子) 边界的滞后时间（分钟）。键为 (父 LogicalDemandKey, 子 LogicalDemandKey)。

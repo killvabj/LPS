@@ -121,4 +121,67 @@ public sealed class SolverStrategyValidator
             errors.Add($"Setup.SetupMaxNeighborhoodTries 必须在 [10, 500] 之间（当前：{block.Setup.SetupMaxNeighborhoodTries}）");
         }
     }
+
+    /// <summary>Stage 固定交接等待规则顶层子块名（合同 v1.1 §四：唯一物理路径 <c>$.StageHandoffWaitRules</c>）。</summary>
+    public const string StageHandoffWaitRulesBlockName = "StageHandoffWaitRules";
+
+    /// <summary>
+    /// Stage 固定交接等待规则校验（合同 v1.1 §五：纯 JSON 内容校验下限）。
+    /// 无状态纯校验、**不注入任何 DB 访问**（V-2 已关闭：日历资格归 Run 消费侧诊断，
+    /// <see cref="StageHandoffWaitRule.TimeBasis"/> = WORK 且无合法日历 → 消费侧 `WORK_NO_CALENDAR` 独立诊断类（勘误1），
+    /// 不在此校验器内伪装 0/ELAPSED）。
+    /// 校验六项：①必填（FactoryCode/From/To/WaitMinutes/TimeBasis 非空，IsActive 可空缺省 false）；
+    /// ②同厂格式（字符串结构，非存在性）；③From≠To；④重复键三键 (Factory,From,To) 每有效版本仅一条（TimeBasis 为值属性不并配）；
+    /// ⑤WaitMinutes ≥ 0（整数）；⑥TimeBasis 枚举 ∈ {WORK, ELAPSED}。
+    /// 存在性/日期/日历资格交装载/消费上下文判定（V-1/V-2 关闭）。反向不拒绝、仅禁误命中（v1.1 §二）。
+    /// </summary>
+    public static IReadOnlyList<string> ValidateStageHandoffWaitRules(IReadOnlyList<StageHandoffWaitRule> rules)
+    {
+        var errors = new List<string>();
+
+        var activeRules = rules.Where(r => r.IsActive == true).ToList();
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var rule in rules)
+        {
+            var prefix = $"StageHandoffWaitRules[{rule.FactoryCode}/{rule.FromStageCode}→{rule.ToStageCode}]";
+            if (string.IsNullOrWhiteSpace(rule.FactoryCode))
+            {
+                errors.Add($"{prefix}: FactoryCode 不能为空");
+            }
+            if (string.IsNullOrWhiteSpace(rule.FromStageCode))
+            {
+                errors.Add($"{prefix}: FromStageCode 不能为空");
+            }
+            if (string.IsNullOrWhiteSpace(rule.ToStageCode))
+            {
+                errors.Add($"{prefix}: ToStageCode 不能为空");
+            }
+            if (!string.IsNullOrWhiteSpace(rule.FromStageCode)
+                && !string.IsNullOrWhiteSpace(rule.ToStageCode)
+                && string.Equals(rule.FromStageCode, rule.ToStageCode, StringComparison.Ordinal))
+            {
+                errors.Add($"{prefix}: FromStageCode 必须 ≠ ToStageCode");
+            }
+            if (rule.WaitMinutes < 0)
+            {
+                errors.Add($"{prefix}: WaitMinutes 不能为负（当前：{rule.WaitMinutes}）");
+            }
+            if (!Enum.IsDefined(typeof(StageHandoffTimeBasis), rule.TimeBasis))
+            {
+                errors.Add($"{prefix}: TimeBasis 必须为 WORK/ELAPSED 之一（当前：{(int)rule.TimeBasis}）");
+            }
+        }
+
+        // 重复键三键 (Factory,From,To)：仅 IsActive=true 参与；TimeBasis 为值属性不并配
+        foreach (var rule in activeRules)
+        {
+            var key = $"{rule.FactoryCode}|{rule.FromStageCode}|{rule.ToStageCode}";
+            if (!seen.Add(key))
+            {
+                errors.Add($"StageHandoffWaitRules 重复键：同一有效参数版本内 (Factory={rule.FactoryCode}, From={rule.FromStageCode}, To={rule.ToStageCode}) 最多一条有效规则（TimeBasis 为值属性，不并配 WORK/ELAPSED）");
+            }
+        }
+
+        return errors;
+    }
 }

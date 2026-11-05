@@ -48,9 +48,10 @@ import {
   type SetupDialogPrefill,
   type SetupRuleDto
 } from '@/api/aps-v1'
-import { formatUtcDateTimeSec } from '@/utils/datetime'
+import { formatLocalDateTimeSec } from '@/utils/datetime'
 import SetupExactDialog from './components/SetupExactDialog.vue'
 import { useSetupMasterData } from './composables/useSetupMasterData'
+import { formatRuleSetVersionLabel } from './composables/ruleSetVersionLabels'
 
 defineOptions({ name: 'ApsSetupExact' })
 
@@ -126,9 +127,40 @@ const editingRule = ref<SetupRuleDto | null>(null)
 const dialogPrefill = ref<SetupDialogPrefill | null>(null)
 
 // ===== 加载 =====
+/**
+ * 从规则集页 / 缺失规则查询跳转时带来的目标版本。
+ * 返回值：number = 指定版本；'invalid' = 带了参数但不是合法 Id；null = 未指定。
+ */
+function readVersionIdQuery(): number | 'invalid' | null {
+  const raw = route.query.ruleSetVersionId
+  const text = Array.isArray(raw) ? raw[0] : raw
+  if (text == null || text === '') return null
+  const id = Number(text)
+  return Number.isInteger(id) && id > 0 ? id : 'invalid'
+}
+
 async function loadAll() {
   await exactStore.loadRuleSetVersions()
-  // 默认选中第一个 DRAFT 版本（无 DRAFT 时选第一个）
+  const wanted = readVersionIdQuery()
+  if (wanted === 'invalid') {
+    exactStore.selectRuleSetVersion(null)
+    ElMessage.warning('地址里的规则集版本参数无效，请重新选择版本')
+    return
+  }
+  if (wanted !== null) {
+    // 0号位 2026-10-26 任务书 SET-UI-01：指定了版本就必须是那一版，
+    // 找不到时报错空选，绝不回落到「第一个 DRAFT」。
+    const hit = ruleSetVersions.value.find((v) => v.id === wanted)
+    if (!hit) {
+      exactStore.selectRuleSetVersion(null)
+      ElMessage.warning('指定的规则集版本不存在或已删除，请重新选择版本')
+      return
+    }
+    exactStore.selectRuleSetVersion(hit.id)
+    await exactStore.loadRules(hit.id)
+    return
+  }
+  // 未指定：默认选中第一个 DRAFT 版本（无 DRAFT 时选第一个）
   const draft =
     ruleSetVersions.value.find((v) => v.status === 'DRAFT') ?? ruleSetVersions.value[0] ?? null
   if (draft) {
@@ -190,7 +222,7 @@ async function handleDelete(rule: SetupRuleDto) {
   let confirmed = false
   try {
     await ElMessageBox.confirm(
-      `即将删除明确产品转换规则：${rule.departmentCode} / ${rule.stageCode} / ${rule.operationCode} / ${rule.resourceCode} / ${rule.fromMaterialCode} → ${rule.toMaterialCode}（${rule.setupMinutes} 分钟）。删除后需重新发布版本才生效。是否继续？`,
+      `即将删除明确产品转换规则：${rule.departmentCode} / ${rule.stageCode} / ${rule.operationCode} / ${rule.resourceCode} / ${rule.fromMaterialCode} → ${rule.toMaterialCode}（${rule.setupMinutes} 分钟）。删除后需在「规则集维护」页重新发布整版才生效。是否继续？`,
       '删除确认',
       {
         type: 'warning',
@@ -288,10 +320,10 @@ const editDisabledReason = computed<string>(() => {
             <ElOption
               v-for="v in ruleSetVersions"
               :key="v.id"
-              :label="`${v.versionCode}（${getStatusTag(v.status).label}）`"
+              :label="`${formatRuleSetVersionLabel(v)}（${getStatusTag(v.status).label}）`"
               :value="v.id"
             >
-              <span>{{ v.versionCode }}</span>
+              <span>{{ formatRuleSetVersionLabel(v) }}</span>
               <ElTag :type="getStatusTag(v.status).tag" size="small" style="margin-left: 8px">
                 {{ getStatusTag(v.status).label }}
               </ElTag>
@@ -407,7 +439,7 @@ const editDisabledReason = computed<string>(() => {
         <!-- 09-20 交付回执偏差 #1：remark 字段撤除（备注列移除） -->
         <ElTableColumn prop="updatedAt" label="更新时间" width="170">
           <template #default="{ row }">
-            {{ formatUtcDateTimeSec(row.updatedAt ?? row.createdAt) }}
+            {{ formatLocalDateTimeSec(row.updatedAt ?? row.createdAt) }}
           </template>
         </ElTableColumn>
         <ElTableColumn label="操作" width="140" fixed="right">

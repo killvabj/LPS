@@ -20,6 +20,8 @@ export interface DhxGanttTask {
   status?: string
   details?: string
   changeReason?: string
+  /** 泳道行在该时间窗内没有任务（不画占用条，避免兜底假条） */
+  laneEmpty?: boolean
   warningCount?: number
   isCritical?: boolean
   zone?: 'frozen' | 'firm' | 'open'

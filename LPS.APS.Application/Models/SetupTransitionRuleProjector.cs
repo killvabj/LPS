@@ -156,6 +156,143 @@ public static class SetupTransitionRuleProjector
     /// <summary>治理 Id 解析：拆回 (ruleSetVersionId, 版本内序号)。</summary>
     public static (long RuleSetVersionId, int Seq) ParseRuleId(long id) => (id / 10_000_000L, (int)(id % 10_000_000L));
 
+    /// <summary>
+    /// 草稿副本重编（4号位 P0「草稿继承的换型规则不可改不可删」Q1 修复）：
+    /// 将随源版本快照整段照抄带进来的 ⑦ 子块，按**新草稿版本 Id 空间**重编——每条规则
+    /// <paramref name="ruleSetVersionId"/> 置为新版本、<c>Id</c> 高位改为新版本、低位序号按 1..N 重排。
+    /// 使继承行的写路径（SetupRuleService 经 <see cref="ParseRuleId"/> 反查版本）自然归入草稿，
+    /// 从而草稿内可改可删（422/400 消除）；已发布源块一字不动（改动仅作用于本函数读入的传入快照副本）。
+    /// **纯函数、无状态、无 IO**（同文件其它投影）。
+    /// </summary>
+    /// <remarks>
+    /// 语义边界：
+    ///   · 子块缺 / null / 显式 [] / 空串 → 原样返回（无可重编行，不误造负载）。
+    ///   · 子块 JSON 损坏 → 抛 <see cref="SetupRuleDataRedLineException"/>（与 <see cref="ExtractRules"/> 三态同轨，fail-fast）。
+    ///   · 仅重编 Id 高位与 RuleSetVersionId；业务字段（部门/工艺/工序/设备/产品/分钟/类型/IsActive）原样保持。
+    ///   · 重编语义是「复制时重编号」，非把已发布版规则改 Id——本函数不改读入快照的源版本凭据之外任何持久化对象。
+    /// </remarks>
+    public static string RenumberToVersion(string? contentSnapshotJson, long ruleSetVersionId)
+    {
+        var rules = ExtractRules(contentSnapshotJson);
+        if (rules.Count == 0)
+        {
+            return contentSnapshotJson; // 原样返回（null→null、空串→空串、无继承行→快照原文）
+        }
+
+        var seq = 0;
+        var renumbered = new List<SetupTransitionRule>(rules.Count);
+        foreach (var rule in rules)
+        {
+            seq++;
+            renumbered.Add(new SetupTransitionRule
+            {
+                Id                 = BuildRuleId(ruleSetVersionId, seq),
+                RuleSetVersionId   = ruleSetVersionId,
+                ProductionDepartmentId = rule.ProductionDepartmentId,
+                StageCode          = rule.StageCode,
+                OperationCode      = rule.OperationCode,
+                ResourceId         = rule.ResourceId,
+                FromMaterialId     = rule.FromMaterialId,
+                ToMaterialId       = rule.ToMaterialId,
+                RuleType           = rule.RuleType,
+                SetupMinutes       = rule.SetupMinutes,
+                IsActive           = rule.IsActive,
+                CreatedAt          = rule.CreatedAt,
+                CreatedBy          = rule.CreatedBy,
+                UpdatedAt          = rule.UpdatedAt,
+                UpdatedBy          = rule.UpdatedBy,
+            });
+        }
+
+        return SetRules(contentSnapshotJson, renumbered);
+    }
+
     /// <summary>子块序列化选项（属性名原样，不启用缩进——ContentSnapshotJson 单列存储）。</summary>
     private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = false };
+
+    // ==================== Setup 业务键单源（4号位 P0 Q2：CompareRuleSetVersions ⑦ 子块业务键对比口径） ====================
+    // 服务端唯一键「EXACT 七元组 / DEFAULT 五元组」此前散落在 SetupRuleService.BuildKey（GetDiffAsync 用）。
+    // Q2 要求版本 Diff 的 ⑦ 子块**按业务键**对比（非原始 JSON 串——Id 高低位重编/行序变化不判变更），
+    // 且与 GetDiffAsync **同口径防双实现漂移**。故把键构造抽到本投影器作单源，SetupRuleService.BuildKey 委托此处；
+    // 本文件 AllMeta（SetupTransitionRules 子块无状态纯函数）继续维持无状态、无 IO、供单测钉死。
+
+    /// <summary>
+    /// Setup 换型规则**业务键**（EXACT 七元组：DEPT|Stage|Op|Resource|From|To；DEFAULT 五元组：DEPT|Stage|Op|Resource；
+    /// 前缀 E/D 区分类型，杜绝跨类误并）。与 <see cref="SetupRuleService.GetDiffAsync"/> 同一口径（唯一键判重/变更定位），
+    /// 单源在投影器，防 SetupRuleService 与版本 Diff 两处实现漂移。
+    /// </summary>
+    public static string BuildBusinessKey(SetupTransitionRule rule)
+    {
+        if (rule.RuleType == SetupTransitionRuleType.Exact)
+        {
+            return $"E|{rule.ProductionDepartmentId}|{rule.StageCode}|{rule.OperationCode}|{rule.ResourceId}|{rule.FromMaterialId}|{rule.ToMaterialId}";
+        }
+
+        return $"D|{rule.ProductionDepartmentId}|{rule.StageCode}|{rule.OperationCode}|{rule.ResourceId}";
+    }
+
+    /// <summary>
+    /// ⑦ 子块**业务内容对比**结果（纯函数，供版本 Diff 消费；语义与 <see cref="SetupRuleService.GetDiffAsync"/> 一致，
+    /// 但后者做 Dept Scope 过滤 + Code/Before-After 投影，此处仅回答「业务键维度是否变更」三计数）。
+    /// 判定规则：按业务键对齐源/目标规则列表 ——
+    ///   · 目标有而源无 → Added；
+    ///   · 源有目标无 → Removed；
+    ///   · 双方都有但 SetupMinutes 不同 → Modified；
+    ///   · Id/顺序/审计字段差异一律不判变更（Q2：fork 重编高位、行序变化均为实现细节，非业务变更）。
+    /// 入参为已反序列化规则（调用方走 <see cref="ExtractRules"/>，缺子块/null/[] → 空列表，合法缺配）。
+    /// </summary>
+    public static SetupRuleBusinessDiffResult CompareBusinessContent(
+        IReadOnlyList<SetupTransitionRule> source,
+        IReadOnlyList<SetupTransitionRule> target)
+    {
+        ArgumentNullException.ThrowIfNull(source);
+        ArgumentNullException.ThrowIfNull(target);
+
+        var sourceByKey = source.ToDictionary(BuildBusinessKey);
+        var targetByKey = target.ToDictionary(BuildBusinessKey);
+
+        int added = 0, removed = 0, modified = 0;
+        foreach (var (key, targetRule) in targetByKey)
+        {
+            if (!sourceByKey.TryGetValue(key, out var sourceRule))
+            {
+                added++;
+            }
+            else if (sourceRule.SetupMinutes != targetRule.SetupMinutes)
+            {
+                modified++;
+            }
+        }
+
+        foreach (var key in sourceByKey.Keys)
+        {
+            if (!targetByKey.ContainsKey(key))
+            {
+                removed++;
+            }
+        }
+
+        return new SetupRuleBusinessDiffResult
+        {
+            AddedCount = added,
+            ModifiedCount = modified,
+            RemovedCount = removed,
+        };
+    }
+}
+
+/// <summary>⑦ 子块业务内容对比结果（纯数据；供版本 Diff/前端标「变化量」）。</summary>
+public class SetupRuleBusinessDiffResult
+{
+    /// <summary>目标有而源无的规则数（按业务键）</summary>
+    public int AddedCount { get; set; }
+
+    /// <summary>双方按业务键匹配但 SetupMinutes 不同的规则数</summary>
+    public int ModifiedCount { get; set; }
+
+    /// <summary>源有而目标无的规则数（按业务键）</summary>
+    public int RemovedCount { get; set; }
+
+    /// <summary>是否存在业务内容变更（任一计数不为 0）</summary>
+    public bool IsChanged => AddedCount != 0 || ModifiedCount != 0 || RemovedCount != 0;
 }

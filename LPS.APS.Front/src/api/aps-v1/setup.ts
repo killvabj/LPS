@@ -19,7 +19,7 @@
  *   10. GET    /setup-rules/uncovered-stats?runId=...&...filters     0 分钟兜底统计
  *   11. GET    /rule-set-versions                                    RuleSetVersion 列表（已有，复用）
  *   12. GET    /rule-set-versions/{id}/diff?otherVersionId=...       版本 Diff（需补 Setup 维度）
- *   13. POST   /rule-set-versions/{id}/publish                       发布（已有，复用）
+ *   13. POST   /rule-set-versions/{id}/publish                       整版发布 —— 前端**不封装**（越权端点，见文末）
  *
  * 设计要点：
  *  - mock 模式：读端点返回极小 fixture；写端点统一抛 503 防伪成功（与 strategyProfile.ts 同范式）
@@ -38,8 +38,7 @@ import type {
   OperationResourceEligibilityQuery,
   OperationResourceEligibilityDto,
   SetupDiffDto,
-  SetupRuleSetVersionDto,
-  PublishSetupRuleSetVersionRequest
+  SetupRuleSetVersionDto
 } from './types/setup'
 
 /* ==================== Mock Fixtures（仅离线 UI 演示） ==================== */
@@ -53,6 +52,8 @@ const MOCK_RULE_SET_VERSIONS: SetupRuleSetVersionDto[] = [
   {
     id: 2001,
     ruleSetId: 101,
+    ruleSetCode: 'RS_MOCK_A',
+    ruleSetName: '演示规则集甲',
     versionCode: 'RS-v1.0.0',
     status: 'PUBLISHED',
     effectiveFrom: fixedDate(30),
@@ -63,6 +64,8 @@ const MOCK_RULE_SET_VERSIONS: SetupRuleSetVersionDto[] = [
   {
     id: 2002,
     ruleSetId: 101,
+    ruleSetCode: 'RS_MOCK_A',
+    ruleSetName: '演示规则集甲',
     versionCode: 'RS-v1.1.0-draft',
     status: 'DRAFT',
     createdAt: now()
@@ -70,6 +73,8 @@ const MOCK_RULE_SET_VERSIONS: SetupRuleSetVersionDto[] = [
   {
     id: 2003,
     ruleSetId: 102,
+    ruleSetCode: 'RS_MOCK_B',
+    ruleSetName: '演示规则集乙',
     versionCode: 'RS-v2.0.0',
     status: 'PUBLISHED',
     effectiveFrom: fixedDate(20),
@@ -174,37 +179,52 @@ const MOCK_DEFAULT_RULES: SetupRuleDto[] = [
   }
 ]
 
-/** mock 0 分钟兜底统计 */
+/** mock 0 分钟兜底统计（字段对齐后端 SetupUncoveredStatDto 13 字段，10-28 补 RuleSetVersionId） */
 const MOCK_UNCOVERED_STATS: SetupUncoveredStatDto[] = [
   {
+    scheduleRunId: 1,
+    ruleSetVersionId: 2002,
+    departmentId: 101,
     departmentCode: 'DEPT_A',
     stageCode: 'STAGE_1',
     operationCode: 'OP20',
+    resourceId: 1,
     resourceCode: 'MC001',
-    fromMaterialCode: 'MAT_C',
-    toMaterialCode: 'MAT_D',
+    materialId: 9001,
+    materialCode: 'MAT_C',
+    hitCount: 12,
     count: 12,
-    lastOccurrence: fixedDate(1)
+    sampleTaskId: 1
   },
   {
+    scheduleRunId: 1,
+    ruleSetVersionId: 2002,
+    departmentId: 101,
     departmentCode: 'DEPT_A',
     stageCode: 'STAGE_1',
     operationCode: 'OP20',
+    resourceId: 2,
     resourceCode: 'MC002',
-    fromMaterialCode: 'MAT_D',
-    toMaterialCode: 'MAT_E',
+    materialId: 9002,
+    materialCode: 'MAT_D',
+    hitCount: 8,
     count: 8,
-    lastOccurrence: fixedDate(2)
+    sampleTaskId: 2
   },
   {
+    scheduleRunId: 1,
+    ruleSetVersionId: null,
+    departmentId: 102,
     departmentCode: 'DEPT_B',
     stageCode: 'STAGE_2',
     operationCode: 'OP30',
+    resourceId: 3,
     resourceCode: 'MC003',
-    fromMaterialCode: 'MAT_Y',
-    toMaterialCode: 'MAT_Z',
+    materialId: 9003,
+    materialCode: 'MAT_Z',
+    hitCount: 5,
     count: 5,
-    lastOccurrence: fixedDate(3)
+    sampleTaskId: 3
   }
 ]
 
@@ -414,19 +434,25 @@ export const setupApi = {
   async getUncoveredStats(query: SetupUncoveredQuery): Promise<SetupUncoveredStatDto[]> {
     if (APS_USE_MOCK) {
       let arr = MOCK_UNCOVERED_STATS
-      if (query.departmentCode) {
-        arr = arr.filter((s) => s.departmentCode === query.departmentCode)
+      if (query.departmentId) {
+        arr = arr.filter((s) => s.departmentId === query.departmentId)
       }
-      if (query.stageCode) {
-        arr = arr.filter((s) => s.stageCode === query.stageCode)
+      if (query.operationCode) {
+        arr = arr.filter((s) => s.operationCode === query.operationCode)
       }
-      if (query.resourceCode) {
-        arr = arr.filter((s) => s.resourceCode === query.resourceCode)
+      if (query.resourceId) {
+        arr = arr.filter((s) => s.resourceId === query.resourceId)
+      }
+      if (query.materialId) {
+        arr = arr.filter((s) => s.materialId === query.materialId)
       }
       return arr
     }
     return apsHttp.get<SetupUncoveredStatDto[]>({
       url: '/api/governance/setup-rules/uncovered-stats',
+      // 形参名必须与后端一致（SetupRuleController.cs:366-372）：
+      // runId / departmentId / operationCode / resourceId / materialId
+      // 发 Code（departmentCode/resourceCode/stageCode）后端绑不上 ⇒ 筛选静默失效
       params: { ...query } as Record<string, unknown>
     })
   },
@@ -469,19 +495,13 @@ export const setupApi = {
       url: `/api/governance/rule-set-versions/${ruleSetVersionId}/diff`,
       params: { otherVersionId }
     })
-  },
-
-  /* ===== 13. 发布（已有，复用） ===== */
-  async publishRuleSetVersion(
-    ruleSetVersionId: number,
-    request: PublishSetupRuleSetVersionRequest
-  ): Promise<void> {
-    if (APS_USE_MOCK) return rejectMockWrite('publishRuleSetVersion')
-    await apsHttp.post<void>({
-      url: `/api/governance/rule-set-versions/${ruleSetVersionId}/publish`,
-      data: request
-    })
   }
+
+  /* ===== 13. 发布：前端不封装 =====
+   * `POST /rule-set-versions/{id}/publish` 只凭 `aps.setup.publish` 就把含需求优先级的整版
+   * 置 PUBLISHED（0号位 2026-10-26 文档 §四 明确禁止）。整版发布统一走「规则集维护」页的
+   * `POST /api/governance/rule-set/version/{id}/publish`（aps.rule.publish）。
+   * 这里故意不提供调用封装：谁想加回来，探针 RP01 会转红。 */
 }
 
 /* ==================== 导出 mock actor（与 rule.ts 同范式） ==================== */

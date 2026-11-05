@@ -143,4 +143,27 @@ public class StageLeadTimeParamController : ControllerBase
             return HandleError(ex, "停用阶段提前期参数");
         }
     }
+
+    /// <summary>恢复启用阶段提前期参数（IsActive 0→1；若 IsDefault=1 须过全局默认唯一，窗口重叠 → 422）。幂等：已启用原样返回。</summary>
+    /// <param name="id">参数主键（StageLeadTimeParam.Id）</param>
+    /// <param name="ct">取消令牌</param>
+    [Authorize(Policy = PermissionCodes.RuleMaintain)]
+    [HttpPost("stage-lead-time-params/{id:int}/activate")]
+    public async Task<IActionResult> Activate(int id, CancellationToken ct)
+    {
+        if (id <= 0)
+        {
+            return BadRequest(ApiResponse.Fail(400, "路径 id 非法（须大于 0）。"));
+        }
+
+        try
+        {
+            var dto = await _service.ActivateAsync(id, GetCurrentUserId(), GetCurrentUserCode(), ct);
+            return Ok(ApiResponse<StageLeadTimeParamDto>.Success(dto));
+        }
+        catch (Exception ex)
+        {
+            return HandleError(ex, "恢复启用阶段提前期参数");
+        }
+    }
 }

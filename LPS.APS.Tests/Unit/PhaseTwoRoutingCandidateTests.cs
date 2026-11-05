@@ -78,7 +78,7 @@ public class PhaseTwoRoutingCandidateTests
                     PathId = p.PathId,
                     OperationCode = code,
                     StageCode = stage,
-                    StandardDuration = p.LeadMinutes,
+                    StandardDuration = p.LeadMinutes * 60m,
                     OperationPlanningMode = "FINITE_RESOURCE"
                 });
 
@@ -873,7 +873,7 @@ public class PhaseTwoRoutingCandidateTests
                 MaterialId = MaterialId, ProductionDepartmentId = DeptId,
                 RouteCode = p.RouteCode, PathId = p.PathId,
                 OperationCode = "OP10", StageCode = "STAGE1",
-                StandardDuration = p.LeadMinutes, OperationPlanningMode = "FINITE_RESOURCE"
+                StandardDuration = p.LeadMinutes * 60m, OperationPlanningMode = "FINITE_RESOURCE"
             });
             elig.Add(new OperationResourceEligibility
             {
@@ -993,7 +993,7 @@ public class PhaseTwoRoutingCandidateTests
                 MaterialId = MaterialId, ProductionDepartmentId = op.DepartmentId,
                 RouteCode = "RTA", PathId = 1,
                 OperationCode = op.OperationCode, StageCode = op.StageCode,
-                StandardDuration = op.LeadMinutes, OperationPlanningMode = "FINITE_RESOURCE"
+                StandardDuration = op.LeadMinutes * 60m, OperationPlanningMode = "FINITE_RESOURCE"
             });
             elig.Add(new OperationResourceEligibility
             {

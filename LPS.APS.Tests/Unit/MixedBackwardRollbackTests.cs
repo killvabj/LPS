@@ -151,7 +151,7 @@ public class MixedBackwardRollbackTests
             MaterialId = MaterialId, ProductionDepartmentId = DeptId,
             RouteCode = RouteCode, PathId = PathId,
             OperationCode = o.Op, StageCode = o.Stage,
-            StandardDuration = o.Min, OperationPlanningMode = "FINITE_RESOURCE"
+            StandardDuration = o.Min * 60m, OperationPlanningMode = "FINITE_RESOURCE"
         }).ToList();
 
         var elig = ops.Select(o => new OperationResourceEligibility

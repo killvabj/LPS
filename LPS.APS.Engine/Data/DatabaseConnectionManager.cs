@@ -2,6 +2,7 @@ using Microsoft.Data.SqlClient;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using System.Data;
+using System.Reflection;
 using Dapper;
 using LPS.APS.Engine.Configuration;
 
@@ -260,7 +261,7 @@ public class DatabaseConnectionManager : IDisposable
     /// 执行批量插入（使用SqlBulkCopy）
     /// 对应文档中的SqlBulkCopy极速推送/拉取场景
     /// </summary>
-    public async Task BulkInsertAsync(DataTable dataTable, string tableName, DatabaseId db = DatabaseId.APS)
+    public virtual async Task BulkInsertAsync(DataTable dataTable, string tableName, DatabaseId db = DatabaseId.APS)
     {
         var (_, connOptions) = GetDbResources(db);
         var connection = await GetConnectionAsync(db);
@@ -312,6 +313,282 @@ public class DatabaseConnectionManager : IDisposable
         }
 
         await bulkCopy.WriteToServerAsync(dataTable);
+    }
+
+    /// <summary>
+    /// 批量插入（SqlBulkCopy）**泛型版**：把一组「属性名＝列名」的行对象流式推给目标表，参与调用方事务。
+    /// </summary>
+    /// <remarks>
+    /// 【为什么加】2026-10-29 实测：Dapper 的 `ExecuteAsync(sql, IEnumerable)` 是**逐项执行**——
+    ///   看着像批量，实际是一行一次网络往返（实测 `[Task]` 833 行/s、`[Pegging]` 1,484 行/s）。
+    ///   `PlanVersionId=999328` 一轮落库 411 万行 ⇒ 落库段约 57 分钟，其中绝大部分是往返开销。
+    ///   同机试点（`#temp`，`[Task]` 全索引）实测：逐条 779~904 行/s、`SqlBulkCopy` 55,157 行/s
+    ///   ⇒ 慢在往返，不在索引维护（堆表 904 vs 带索引 779，仅差 14%）。
+    /// 【默认选项为什么是 CheckConstraints｜TableLock】
+    ///   `SqlBulkCopy` 默认**不校验** CHECK／FK——若沿用 `SqlBulkCopyOptions.Default`，
+    ///   `CK_AllocationTaskShare_Qty`、`CK_PSA_AllocatedQty`、`FK_SEF_ScheduleRun` 会被**静默绕过**，
+    ///   等于把现有的 fail-closed 拆掉。故默认显式打开约束校验；调用方如确知目标表无约束且要极限吞吐，
+    ///   可显式传 `SqlBulkCopyOptions.Default`（须在调用处写明理由）。
+    /// 【分块】只在内存里控峰值（默认 5 万行一块），不改变事务边界：全部块仍在同一个 `transaction` 内，
+    ///   任一块失败即整事务回滚，与逐条写入的原子性一致。
+    /// 【`onChunkDone`】仅供进度日志用；回调抛异常会中断落库，回调内不要做会失败的事。
+    /// </remarks>
+    public async Task BulkInsertToTransactionAsync<TRow>(
+        IReadOnlyList<TRow> rows,
+        string tableName,
+        IDbConnection connection,
+        IDbTransaction transaction,
+        SqlBulkCopyOptions options = SqlBulkCopyOptions.CheckConstraints | SqlBulkCopyOptions.TableLock,
+        int chunkRows = 50_000,
+        int timeoutSeconds = 600,
+        Action<int>? onChunkDone = null)
+        where TRow : class
+    {
+        if (rows.Count == 0) return;
+        if (connection is not SqlConnection sqlConnection)
+            throw new InvalidOperationException(
+                $"BulkInsertToTransactionAsync 需要 SqlConnection，实得 {connection?.GetType().FullName ?? "null"}");
+        if (transaction is not SqlTransaction sqlTransaction)
+            throw new InvalidOperationException(
+                $"BulkInsertToTransactionAsync 需要同连接的 SqlTransaction，实得 {transaction?.GetType().FullName ?? "null"}");
+
+        var columns = ResolveBulkColumns(rows);
+        for (var offset = 0; offset < rows.Count; offset += chunkRows)
+        {
+            var take = Math.Min(chunkRows, rows.Count - offset);
+            using var table = BuildBulkDataTable(rows, offset, take, columns);
+
+            using var bulkCopy = new SqlBulkCopy(sqlConnection, options, sqlTransaction)
+            {
+                DestinationTableName = tableName,
+                BulkCopyTimeout = timeoutSeconds,
+                BatchSize = 0   // 0＝整块一次提交
+            };
+            foreach (var column in columns)
+                bulkCopy.ColumnMappings.Add(column.Name, column.Name);
+
+            await bulkCopy.WriteToServerAsync(table);
+            onChunkDone?.Invoke(offset + take);
+        }
+    }
+
+    /// <summary>
+    /// 批量插入**带 IDENTITY 的表**，并回传「源行序号 → 数据库生成的 Id」。参与调用方事务。
+    /// </summary>
+    /// <remarks>
+    /// 【为什么不能直接 SqlBulkCopy】`SqlBulkCopy` 拿不回生成的 Id；而 `INSERT … OUTPUT INSERTED.Id`
+    ///   在批里**引用不到源表列**（实测报「无法绑定 `src.__i`」）⇒ 只能走 `MERGE`。
+    ///   本方法：① 同连接建 `#temp` 暂存表（`SELECT TOP 0 * INTO`，列结构自动与目标表逐列同源）
+    ///   ② 加一列 `__i`（源行序号）③ `SqlBulkCopy` 灌暂存表 ④ 一条 `MERGE … ON 1=0 … OUTPUT INSERTED.Id, src.__i`
+    ///   ⑤ 按 `__i` 回填并返回数组 ⑥ 删暂存表。
+    /// 【正确性】返回值的下标 = 传入 `rows` 的下标；不依赖任何自然键
+    ///   （`[Task].TaskNo` 在同 PlanVersionId 内只有 296,081 个不同值／121 万行，重复 75.6%，不能当键）。
+    /// 【实测】10 万行 2,142 ms ⇒ 46,685 行/s，且 `COUNT(*)=COUNT(DISTINCT Id)=100,000`（配对无错位）。
+    /// 【前提】`TRow` 的属性名必须与目标表列名逐一对应（`Id` 不在其中——由数据库生成）。
+    /// 【⚠ 硬前提：目标表的 NOT NULL 列必须**全部**出现在 `TRow` 上】暂存表由 `SELECT TOP 0 * INTO` 建，
+    ///   而 `SELECT INTO` **不复制 DEFAULT 约束** ⇒ 目标表里「NOT NULL 但有默认值」的列（如 `[Task]`
+    ///   的 `IsLocked` / `IsCriticalPath` / `CreatedAt` / `UpdatedAt`）在暂存表里会变成「NOT NULL 且无默认值」。
+    ///   本方法在灌数据**之前**会先查暂存表的非空列，缺列即抛并点名缺哪几列——
+    ///   否则只会收到一条指着 `#BulkStage_xxx` 的 SQL 错误，根本看不出缺的是哪一列。
+    /// </remarks>
+    public async Task<long[]> BulkInsertWithIdentityAsync<TRow>(
+        IReadOnlyList<TRow> rows,
+        string targetTable,
+        IDbConnection connection,
+        IDbTransaction transaction,
+        int chunkRows = 50_000,
+        int timeoutSeconds = 1800,
+        Action<int>? onChunkDone = null)
+        where TRow : class
+    {
+        if (rows.Count == 0) return Array.Empty<long>();
+        if (connection is not SqlConnection sqlConnection)
+            throw new InvalidOperationException(
+                $"BulkInsertWithIdentityAsync 需要 SqlConnection，实得 {connection?.GetType().FullName ?? "null"}");
+        if (transaction is not SqlTransaction sqlTransaction)
+            throw new InvalidOperationException(
+                $"BulkInsertWithIdentityAsync 需要同连接的 SqlTransaction，实得 {transaction?.GetType().FullName ?? "null"}");
+
+        var columns = ResolveBulkColumns(rows);
+        var stage = $"#BulkStage_{Guid.NewGuid():N}";
+        var columnList = string.Join(", ", columns.Select(c => c.Name));
+        var sourceValues = string.Join(", ", columns.Select(c => $"src.{c.Name}"));
+
+        // ① 暂存表：结构逐列同源（含 IDENTITY／类型／可空性），只多一列 __i
+        var ddl = $@"
+SELECT TOP 0 * INTO [{stage}] FROM {targetTable};
+ALTER TABLE [{stage}] ADD __i int NOT NULL;";
+        Execute(ddl, sqlConnection, sqlTransaction);
+
+        try
+        {
+            // ①' 预检：暂存表没有 DEFAULT（`SELECT INTO` 不复制默认约束），所以目标表的每个 NOT NULL 列
+            //     都必须在行对象里出现，否则灌数据时只会得到一条指着 `#BulkStage_xxx` 的错误。
+            var missingColumns = FindMissingNotNullColumns(sqlConnection, sqlTransaction, stage, columns);
+            if (missingColumns.Count > 0)
+            {
+                throw new InvalidOperationException(
+                    $"批量插入 {targetTable}：行对象缺少 {missingColumns.Count} 个 NOT NULL 列" +
+                    $"（{string.Join(", ", missingColumns)}）。暂存表由 SELECT INTO 建立、不继承 DEFAULT，" +
+                    "故这些列必须由行对象显式提供。");
+            }
+
+            // ② 灌暂存表——**分块**：一次把 121 万行建成一个 `DataTable` 会占 1~2 GB，
+            //    块大小只控内存峰值，不改变事务边界（全部块仍在同一 tx 内）。
+            //    暂存表无约束，用 Default 求吞吐；约束由 ④ 的 MERGE 对目标表全程校验。
+            for (var offset = 0; offset < rows.Count; offset += chunkRows)
+            {
+                var take = Math.Min(chunkRows, rows.Count - offset);
+                using var stageTable = BuildBulkDataTable(rows, offset, take, columns, includeIndex: true);
+                using var bulkCopy = new SqlBulkCopy(sqlConnection, SqlBulkCopyOptions.Default, sqlTransaction)
+                {
+                    DestinationTableName = $"[{stage}]",
+                    BulkCopyTimeout = timeoutSeconds,
+                    BatchSize = 0
+                };
+                foreach (var column in columns)
+                    bulkCopy.ColumnMappings.Add(column.Name, column.Name);
+                bulkCopy.ColumnMappings.Add("__i", "__i");
+                await bulkCopy.WriteToServerAsync(stageTable);
+                onChunkDone?.Invoke(offset + take);
+            }
+
+            // ③ 一条 MERGE 拿回 (Id, __i)：`ON 1=0` ⇒ 只走 WHEN NOT MATCHED 的 INSERT，
+            //    但 OUTPUT 里可以引用源列 `src.__i`，这正是 `INSERT … OUTPUT` 做不到的那一步。
+            var mergeSql = $@"
+MERGE INTO {targetTable} WITH (TABLOCK) AS t
+USING [{stage}] AS src ON 1 = 0
+WHEN NOT MATCHED THEN INSERT ({columnList}) VALUES ({sourceValues})
+OUTPUT INSERTED.Id, src.__i;";
+
+            var ids = new long[rows.Count];
+            var filled = new bool[rows.Count];
+            using (var command = sqlConnection.CreateCommand())
+            {
+                command.Transaction = sqlTransaction;
+                command.CommandText = mergeSql;
+                command.CommandTimeout = timeoutSeconds;
+                using var reader = command.ExecuteReader();
+                while (reader.Read())
+                {
+                    var id = reader.GetInt64(0);
+                    var index = reader.GetInt32(1);
+                    ids[index] = id;
+                    filled[index] = true;
+                }
+            }
+
+            // ④ 行数必须一一对上——对不上说明 MERGE 没插全，宁可让整事务回滚也不返回错位映射。
+            for (var i = 0; i < filled.Length; i++)
+            {
+                if (!filled[i])
+                    throw new InvalidOperationException(
+                        $"{targetTable} 批量插入回传的 Id 少了第 {i} 行（共 {rows.Count} 行）⇒ 拒绝返回错位的 Id 映射");
+            }
+
+            return ids;
+        }
+        finally
+        {
+            // ⑤ 暂存表清理：即便 MERGE 抛错也要删（事务回滚不会删 #temp）
+            try { Execute($"DROP TABLE IF EXISTS [{stage}];", sqlConnection, sqlTransaction); }
+            catch { /* 清理失败不掩盖原始异常 */ }
+        }
+    }
+
+    private readonly record struct BulkColumn(string Name, Type Type, PropertyInfo Property);
+
+    /// <summary>
+    /// 取列定义。默认按 `TRow` 的声明类型；当 `TRow` 就是 `object`（调用方用 `List&lt;object&gt;` 攒匿名行）时，
+    /// 退回按**首行的运行时类型**——否则反射到 `object` 上会得到 0 列，`SqlBulkCopy` 会灌进一张空表而不报错。
+    /// 这类调用一旦混入异构行，列映射必然错位 ⇒ 逐行校验类型，不同即抛。
+    /// </summary>
+    private static BulkColumn[] ResolveBulkColumns<TRow>(IReadOnlyList<TRow> rows) where TRow : class
+    {
+        var declared = typeof(TRow);
+        var actual = declared == typeof(object) ? rows[0].GetType() : declared;
+        if (actual != declared)
+        {
+            for (var i = 1; i < rows.Count; i++)
+            {
+                if (rows[i].GetType() != actual)
+                    throw new InvalidOperationException(
+                        $"BulkInsert 的行对象类型不一致：第 0 行是 {actual.FullName}，第 {i} 行是 {rows[i].GetType().FullName}" +
+                        "⇒ 列映射会错位，拒绝继续");
+            }
+        }
+
+        var columns = actual.GetProperties(BindingFlags.Public | BindingFlags.Instance)
+            .Where(p => p.CanRead && p.GetIndexParameters().Length == 0)
+            .Select(p => new BulkColumn(
+                p.Name,
+                Nullable.GetUnderlyingType(p.PropertyType) ?? p.PropertyType,
+                p))
+            .ToArray();
+
+        if (columns.Length == 0)
+            throw new InvalidOperationException(
+                $"BulkInsert 的行对象类型 {actual.FullName} 没有任何可读属性 ⇒ 无法建立列映射");
+
+        return columns;
+    }
+
+    private static DataTable BuildBulkDataTable<TRow>(
+        IReadOnlyList<TRow> rows, int offset, int count, BulkColumn[] columns, bool includeIndex = false)
+    {
+        var table = new DataTable();
+        foreach (var column in columns)
+            table.Columns.Add(column.Name, column.Type);
+        if (includeIndex)
+            table.Columns.Add("__i", typeof(int));
+
+        for (var i = 0; i < count; i++)
+        {
+            var source = rows[offset + i];
+            var row = table.NewRow();
+            for (var c = 0; c < columns.Length; c++)
+                row[c] = columns[c].Property.GetValue(source) ?? DBNull.Value;
+            if (includeIndex)
+                row[columns.Length] = offset + i;   // 全局行序：分块灌暂存表时必须是**源集合**里的绝对下标
+            table.Rows.Add(row);
+        }
+
+        return table;
+    }
+
+    /// <summary>暂存表里「NOT NULL 且非 IDENTITY」、但行对象没提供的列名。</summary>
+    private static List<string> FindMissingNotNullColumns(
+        SqlConnection connection, SqlTransaction transaction, string stage, BulkColumn[] columns)
+    {
+        using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        // ⚠ 必须是 `tempdb..`（**两个点**）：`OBJECT_ID('tempdb.' + @stage)` 在 @stage 是**变量**时恒返回 NULL
+        //   （`tempdb.#x` 被解析成「库.架构」），预检会因此变成永不触发的死代码 —— 2026-10-29 实测踩到，
+        //   由 `BulkInsertWithIdentityAsync_RejectsRowsMissingNotNullColumns` 断言守住。
+        // `__i` 是本方法自己加的序号列（调用方**必须**不提供它），故排除，否则每张表都会被误报「缺 1 列」。
+        command.CommandText =
+            "SELECT name FROM tempdb.sys.columns WHERE object_id = OBJECT_ID('tempdb..' + @stage) " +
+            "AND is_nullable = 0 AND is_identity = 0 AND name <> '__i'";
+        command.Parameters.AddWithValue("@stage", stage);
+
+        var provided = new HashSet<string>(columns.Select(c => c.Name), StringComparer.OrdinalIgnoreCase);
+        var missing = new List<string>();
+        using var reader = command.ExecuteReader();
+        while (reader.Read())
+        {
+            var name = reader.GetString(0);
+            if (!provided.Contains(name)) missing.Add(name);
+        }
+        return missing;
+    }
+
+    private static void Execute(string sql, SqlConnection connection, SqlTransaction transaction)
+    {
+        using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = sql;
+        command.CommandTimeout = 1800;
+        command.ExecuteNonQuery();
     }
 
     /// <summary>

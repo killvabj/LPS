@@ -179,9 +179,9 @@ SELECT TOP (@TopN)
     r.ResourceName,
     r.ResourceType,
     COUNT(*) AS TaskCount,
-    -- Duration 库值单位=分钟（2号位 PeggingOrchestrator 落库口径 TotalMinutes）。
-    -- 原 /3600.0 按秒换算 → 少算 60 倍（5号位 10-17 发现并知会）。改为 /60.0 换算为小时。
-    SUM(ISNULL(t.Duration, 0)) / 60.0 AS TotalPlannedHours,
+    -- Duration 库值单位=小时（2号位 PeggingOrchestrator 落库口径 = 分钟数 /60，对齐冻结 07 `:3696`）。
+    -- 读取侧不再 /60（0号位 2026-10-26 正式回复 §:60）。
+    SUM(ISNULL(t.Duration, 0)) AS TotalPlannedHours,
     NULL AS UtilizationRate,
     -- C2-a（4号位 10-19）：原 0 AS IsBottleneck 把「未判定」谎报成「判定为非瓶颈」。
     -- 判定归 2号位 正式 Query（见上方注释），5号位无数据源 ⇒ 与 UtilizationRate 同型改 NULL（键省略=诚实未判定）。
@@ -289,5 +289,86 @@ ORDER BY pv.CreatedAt DESC, pv.Id", null, CommandType.Text, DatabaseId.APS, comm
         public DateTime From { get; init; }
         public DateTime To { get; init; }
         public string? Reason { get; init; }
+    }
+
+    /// <summary>对象级维度内部行：工厂主键（Order 表，DISTINCT 去重）</summary>
+    private sealed class FactoryScopeDimensionRow
+    {
+        public int FactoryId { get; init; }
+    }
+
+    /// <summary>对象级维度内部行：产品族主键（Order 表，DISTINCT 去重）</summary>
+    private sealed class ProductFamilyScopeDimensionRow
+    {
+        public int ProductFamilyId { get; init; }
+    }
+
+    /// <summary>对象级维度内部行：生产部门（Task 表，DISTINCT 去重）</summary>
+    private sealed class TaskScopeDimensionRow
+    {
+        public int DepartmentId { get; init; }
+    }
+
+    /// <summary>对象级维度内部行：空部门 Task 计数（Task.ProductionDepartmentId IS NULL，历史兼容数据）</summary>
+    private sealed class TaskNullDepartmentCountRow
+    {
+        public int NullCount { get; init; }
+    }
+
+    /// <inheritdoc />
+    public async Task<PlanVersionObjectScopeDimensions> GetPlanVersionObjectScopeDimensionsAsync(
+        int planVersionId,
+        CancellationToken ct = default)
+    {
+        // R11-3b 对象级：直接读该版本已落 Order/Task 事实表取维度去重集，供激活/发布前按"真实变更范围"复核。
+        // 只读、DISTINCT 去重、幂等；该版本无 Order/Task → 空集合（调用方按"无对象可越权"放行，不误拒）。
+        // 工厂仅取 Order.FactoryId（主体计划厂），不含 Pegging 外厂只读 Supply（只读引用≠写权）。
+        // M2：Factory 与 ProductFamily **各自独立查询**，其 NULL 过滤互不解耦（任一 Null 不影响另一维度入集）；
+        //     避免「一行厂有值、族为空 → 整行丢弃 → 该厂逃脱 Factory 维度」的隐式 schema 不变量。
+        var factorySql = @"
+SELECT DISTINCT [FactoryId]
+FROM [dbo].[Order]
+WHERE [PlanVersionId] = @PlanVersionId
+    AND [FactoryId] IS NOT NULL";
+
+        var familySql = @"
+SELECT DISTINCT [ProductFamilyId]
+FROM [dbo].[Order]
+WHERE [PlanVersionId] = @PlanVersionId
+    AND [ProductFamilyId] IS NOT NULL";
+
+        // M1：ProductionDepartmentId 在 DDL 可空（历史兼容，v5.1.8.3:4157）。非空 Task 取部门维度判定；
+        //     空部门 Task（可能隐含越权）**单独计数**回传，由调用方决定记 Warning 或拒绝（本实现取 Warning，不静默）。
+        var deptSql = @"
+SELECT DISTINCT [ProductionDepartmentId] AS [DepartmentId]
+FROM [dbo].[Task]
+WHERE [PlanVersionId] = @PlanVersionId
+    AND [ProductionDepartmentId] IS NOT NULL";
+
+        var nullDeptSql = @"
+SELECT COUNT(*) AS [NullCount]
+FROM [dbo].[Task]
+WHERE [PlanVersionId] = @PlanVersionId
+    AND [ProductionDepartmentId] IS NULL";
+
+        var factories = await _connectionManager.QueryAsync<FactoryScopeDimensionRow>(
+            factorySql, new { PlanVersionId = planVersionId }, CommandType.Text, DatabaseId.APS, commandTimeout: 30);
+
+        var families = await _connectionManager.QueryAsync<ProductFamilyScopeDimensionRow>(
+            familySql, new { PlanVersionId = planVersionId }, CommandType.Text, DatabaseId.APS, commandTimeout: 30);
+
+        var departments = await _connectionManager.QueryAsync<TaskScopeDimensionRow>(
+            deptSql, new { PlanVersionId = planVersionId }, CommandType.Text, DatabaseId.APS, commandTimeout: 30);
+
+        var nullDepartment = await _connectionManager.QueryFirstOrDefaultAsync<TaskNullDepartmentCountRow>(
+            nullDeptSql, new { PlanVersionId = planVersionId }, CommandType.Text, DatabaseId.APS, commandTimeout: 30);
+
+        return new PlanVersionObjectScopeDimensions
+        {
+            FactoryIds = factories.Select(o => o.FactoryId).Distinct().ToList(),
+            ProductFamilyIds = families.Select(o => o.ProductFamilyId).Distinct().ToList(),
+            DepartmentIds = departments.Select(d => d.DepartmentId).Distinct().ToList(),
+            NullDepartmentTaskCount = nullDepartment?.NullCount ?? 0,
+        };
     }
 }

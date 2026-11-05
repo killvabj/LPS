@@ -118,12 +118,21 @@ public class StageTimingNodeBuilderTests
     /// 现行口径：**命中就是命中** —— 值 0（或负）**按命中产出**，`MatchLevel` 保持实际命中级。
     /// 理由：0 是参数行写下的值，装载层与消费侧都**不得替参数侧改判**。
     ///
-    /// ⇒ 本用例锁的是「我方**不做符号判断**」这条决定：值原样透传，层级**不得**被改写成 `MISSING`。
+    /// ⚠️ **2026-11-02 二次更正（本用例改名换断言）**：原用例
+    /// `ExplicitValue_IsPassedThroughVerbatim_NoSignJudgement` 锁的最后一行为
+    ///   `Assert.Equal(TerminalEnd.AddHours(hours), fact.CompletionTime)` ——
+    /// `hours = -5` 时等于**让时钟倒退 5 小时**。这与契约逐字冲突：
+    ///   `LPS.APS.Core/Dto/DomainSolveRequest.cs:99`「折算值为 0（或负）**按命中产出**：`LeadTimeHours = 0`」
+    /// ⇒ 消费侧义务是「负值当 0 用」，不是「拿负值去挪时钟」。
+    ///
+    /// **保留的**仍然是「不改判」：`seg.LeadTimeHours` 如实透传原值（含负值），
+    ///   `MatchLevel` 仍是实际命中级、**不得**变 `MISSING`。
+    /// **改掉的**只是「用负值推进/回退时钟」——0 与负值都**不移动游标**。
     /// </summary>
     [Theory]
     [InlineData(0)]
     [InlineData(-5)]
-    public void ExplicitValue_IsPassedThroughVerbatim_NoSignJudgement(int hours)
+    public void ExplicitValue_PassedThroughButClockNeverGoesBackward(int hours)
     {
         var result = Run(
             Req(new[] { Demand("D1", 1001) },
@@ -136,9 +145,10 @@ public class StageTimingNodeBuilderTests
         var fact = Assert.Single(result);
         var seg = Assert.Single(fact.StageTimings);
 
-        Assert.Equal((decimal)hours, seg.LeadTimeHours);
-        Assert.Equal("FACTORY_STAGE_DEFAULT", seg.MatchLevel);   // 不得被改写成 MISSING
-        Assert.Equal(TerminalEnd.AddHours(hours), fact.CompletionTime);
+        Assert.Equal((decimal)hours, seg.LeadTimeHours);          // 值仍如实透传（负值不改写）
+        Assert.Equal(seg.StartTime, seg.EndTime);                 // 本段零长度：不推进
+        Assert.Equal("FACTORY_STAGE_DEFAULT", seg.MatchLevel);    // 不得被改写成 MISSING
+        Assert.Equal(TerminalEnd, fact.CompletionTime);           // ★ 0 与负都停住，绝不倒退
     }
 
     /// <summary>
@@ -409,6 +419,65 @@ public class StageTimingNodeBuilderTests
         Assert.Equal(TerminalEnd.AddHours(4), fact.CompletionTime); // 整条仍算到 CN_FINAL
     }
 
+    /// <summary>
+    /// **R09-T11**（0号位 2026-10-23《04》§3）：「EDGE 供给阈值在末端真实 Task **之前**，
+    /// ROOT 最终完工更晚 ⇒ `RequiredStageCompletionTime` 与 ROOT **区分**；
+    /// **既不提前释放不合格供给，也不错误压到末端完工时点**」。
+    /// 本用例：阈值 Stage `CN_PRE` 自己有真实 Task（早于末端）⇒ 必须报**它自己的**结束时刻，
+    /// 整改前会被压成末端 `CN_MACH` 的 `Task.End`（晚释放供给）。
+    /// </summary>
+    [Fact]
+    public void RequiredStageStrictlyBeforeTerminal_ReportsThatStagesOwnEnd()
+    {
+        var preEnd = Start.AddDays(1).AddHours(8);
+
+        var result = RunWithAllTasks(
+            Req(new[] { Demand("D1", 1001, requiredStage: "CN_PRE") },
+                facts: new[] { Fact(1001, "CN_FINAL", 4m, "DEPT_EXACT") },
+                chains: new[] { Chain(1001, ("CN_PRE", 1), ("CN_MACH", 2), ("CN_FINAL", 3)) },
+                ops: new[] { Op(1001, "M01", "CN_MACH"), Op(1001, "M02", "CN_PRE") }),
+            Stages(1001, "CN_PRE", "CN_MACH", "CN_FINAL"),
+            Terminals(Task("F2", "D1", 1001, "CN_MACH", "M01", TerminalEnd)),
+            new Dictionary<string, List<FinalTaskDraft>>(StringComparer.Ordinal)
+            {
+                ["D1"] = new()
+                {
+                    Task("F1", "D1", 1001, "CN_PRE", "M02", preEnd),
+                    Task("F2", "D1", 1001, "CN_MACH", "M01", TerminalEnd)
+                }
+            });
+
+        var fact = Assert.Single(result);
+
+        Assert.Equal(preEnd, fact.RequiredStageCompletionTime);          // 阈值 Stage 自己的真实结束
+        Assert.NotEqual(TerminalEnd, fact.RequiredStageCompletionTime);   // 不再压到末端完工时点
+        Assert.Equal(TerminalEnd.AddHours(4), fact.CompletionTime);       // ROOT 仍是整条链的完工
+    }
+
+    /// <summary>
+    /// **R09-T11 负例**：阈值 Stage 严格早于末端、但**没有任何该 Stage 的真实 Task**
+    /// ⇒ `null`（**不臆造**，也**不回落**到末端完成时间 ⇒ 不释放未证供给）。
+    /// </summary>
+    [Fact]
+    public void RequiredStageStrictlyBeforeTerminal_NoOwnTask_StaysNull()
+    {
+        var result = RunWithAllTasks(
+            Req(new[] { Demand("D1", 1001, requiredStage: "CN_PRE") },
+                facts: new[] { Fact(1001, "CN_FINAL", 4m, "DEPT_EXACT") },
+                chains: new[] { Chain(1001, ("CN_PRE", 1), ("CN_MACH", 2), ("CN_FINAL", 3)) },
+                ops: new[] { Op(1001, "M01", "CN_MACH") }),
+            Stages(1001, "CN_PRE", "CN_MACH", "CN_FINAL"),
+            Terminals(Task("F2", "D1", 1001, "CN_MACH", "M01", TerminalEnd)),
+            new Dictionary<string, List<FinalTaskDraft>>(StringComparer.Ordinal)
+            {
+                ["D1"] = new() { Task("F2", "D1", 1001, "CN_MACH", "M01", TerminalEnd) }
+            });
+
+        var fact = Assert.Single(result);
+
+        Assert.Null(fact.RequiredStageCompletionTime);
+    }
+
     /// <summary>无供给阈值语义（`RequiredStageCode` 为 null）⇒ 该字段为 null，不臆造。</summary>
     [Fact]
     public void NoRequiredStage_LeavesRequiredStageCompletionTimeNull()
@@ -593,6 +662,18 @@ public class StageTimingNodeBuilderTests
         => StageTimingNodeBuilder.BuildCore(request, stages, terminals);
 
     /// <summary>
+    /// R09-T11 用重载：额外带「该需求**全部**真实 Task」（`Build` 在生产里本就持有）。
+    /// EDGE 供给阈值 Stage 严格早于末端时，只有拿到全部 Task 才能算出**它自己的**结束时刻。
+    /// </summary>
+    private static List<DemandCompletionFact> RunWithAllTasks(
+        DomainSolveRequest request,
+        IReadOnlyDictionary<int, HashSet<string>> stages,
+        IReadOnlyDictionary<string, FinalTaskDraft> terminals,
+        IReadOnlyDictionary<string, List<FinalTaskDraft>> tasksByDemandKey)
+        => StageTimingNodeBuilder.BuildCore(
+            request, stages, terminals, null, null, null, null, tasksByDemandKey);
+
+    /// <summary>
     /// 带 N8-01 缺参收集器的重载：缺参 Stage 由装配层 <see cref="StageTimingNodeBuilder.Build"/>
     /// 写 `STAGE_LEADTIME_MISSING` 的 `SolveTraceNote`（本纯逻辑入口只登记，不写留痕）。
     /// </summary>
@@ -603,20 +684,53 @@ public class StageTimingNodeBuilderTests
         ICollection<(string DemandKey, string StageCode)> missingLeadTimeStages)
         => StageTimingNodeBuilder.BuildCore(request, stages, terminals, null, null, missingLeadTimeStages);
 
+    /// <summary>本族夹具统一使用的测试部门 / 工厂（连续窗口，见 <see cref="Req"/>）。</summary>
+    private const int FixtureDepartmentId = 9001;
+    private const int FixtureFactoryId = 0;
+
     private static DomainSolveRequest Req(
         IReadOnlyList<LogicalProductionDemand> demands,
         IReadOnlyList<StageLeadTimeFact>? facts = null,
         IReadOnlyList<StageSequenceChain>? chains = null,
         IReadOnlyList<RoutingOperation>? ops = null)
-        => new()
+    {
+        var leadTimes = facts ?? Array.Empty<StageLeadTimeFact>();
+
+        // ── R09-①（2026-10-29 落码）夹具补齐：无 Routing Stage 现在按
+        //   `(FactoryId, DepartmentId)` 的合法 WORK 窗口逐片推进，不再按墙钟 `AddHours`。
+        //   本族测试的期望值仍是 `TerminalEnd.AddHours(n)` ⇒ 给**一条连续 24×7 窗口**即可
+        //   让「有效生产小时累计」与「墙钟小时」逐位相同，既有断言一个字都不用改。
+        //   ⚠ 这是**夹具**口径，不是生产回落：生产里无窗口 ⇒ 不推进、置 `CompletionTimeCertain=false`。
+        var contexts = leadTimes
+            .Select(f => new MaterialStageDepartmentContextDto
+            {
+                MaterialId = f.MaterialId,
+                StageCode = f.StageCode,
+                ProductionDepartmentId = FixtureDepartmentId
+            })
+            .ToList();
+
+        return new DomainSolveRequest
         {
             PlanningStart = Start,
             PlanningEnd = Start.AddYears(100),
             LogicalProductionDemands = demands,
-            StageLeadTimes = facts ?? Array.Empty<StageLeadTimeFact>(),
+            StageLeadTimes = leadTimes,
             StageSequenceChains = chains ?? Array.Empty<StageSequenceChain>(),
-            RoutingOperations = ops ?? Array.Empty<RoutingOperation>()
+            RoutingOperations = ops ?? Array.Empty<RoutingOperation>(),
+            MaterialStageDepartmentContexts = contexts,
+            DepartmentWorkWindows = new[]
+            {
+                new DepartmentWorkWindow
+                {
+                    FactoryId = FixtureFactoryId,
+                    DepartmentId = FixtureDepartmentId,
+                    Start = Start,
+                    End = Start.AddYears(100)
+                }
+            }
         };
+    }
 
     private static LogicalProductionDemand Demand(string key, int materialId, string? requiredStage = null)
         => new()

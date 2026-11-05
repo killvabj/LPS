@@ -26,7 +26,8 @@ export { parameterSetApi } from './parameterSet'
 export type {
   BackendParameterSetVersion,
   BackendParameterSet,
-  CreateParameterSetInput
+  CreateParameterSetInput,
+  UpdateParameterSetInput
 } from './parameterSet'
 export {
   DEMAND_FIELDS,

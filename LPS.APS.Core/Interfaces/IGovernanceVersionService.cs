@@ -1,4 +1,5 @@
 using LPS.APS.Core.DTOs.Governance;
+using LPS.APS.Core.Dto;
 using RuleSetVersion = LPS.APS.Core.Entities.APS.RuleSetVersion;
 using ParameterSetVersion = LPS.APS.Core.Entities.APS.ParameterSetVersion;
 using StrategyProfileVersion = LPS.APS.Core.Entities.APS.StrategyProfileVersion;
@@ -32,6 +33,29 @@ public interface IGovernanceVersionService
 
     /// <summary>对比两个策略包版本的差异（G5/D3：3-4联调；V1 可后置，4号位策略包对比页）</summary>
     Task<VersionDiffResult> CompareStrategyProfileVersionsAsync(long sourceVersionId, long targetVersionId, CancellationToken ct = default);
+
+    /// <summary>
+    /// 策略包版本<b>富对比</b>（S12：06 §6.4.1「版本富对比（H1）」；0号位 VG-004 定 06 为准）。
+    /// </summary>
+    /// <remarks>
+    /// 开发者：3号位。<b>新增成员，不修改 <see cref="CompareStrategyProfileVersionsAsync"/> 既有签名（红线 #5）</b>。
+    /// <para>
+    /// 与字段级 diff 的差别：富对比额外给出<b>双方版本概要</b>、<b>组合载体绑定差异</b>、<b>变更汇总计数</b>，
+    /// 字段明细与 diff <b>同口径同结构</b>（复用 <see cref="FieldDiff"/>），不存在第二套判等规则。
+    /// </para>
+    /// <para>
+    /// 参数方向与 <c>plan-version/{a}/compare-with/{b}</c> 同序：compareVersionId 为 a（对比方）、
+    /// baseVersionId 为 b（基准方）。版本不存在抛 <see cref="KeyNotFoundException"/>；绑定 Id 查不到的
+    /// 版本编码返回 <c>null</c>（绑定 Id 为准，不判对比失败）。
+    /// </para>
+    /// </remarks>
+    /// <param name="baseVersionId">基准方版本 Id（路径次段 b）</param>
+    /// <param name="compareVersionId">对比方版本 Id（路径首段 a）</param>
+    /// <param name="ct">取消令牌</param>
+    Task<StrategyProfileVersionComparisonDto> CompareStrategyProfileVersionRichAsync(
+        long baseVersionId,
+        long compareVersionId,
+        CancellationToken ct = default);
 
     /// <summary>校验规则集版本是否可发布（阶段 A-5：发布前完整校验）</summary>
     Task<PublishValidationResult> ValidateRuleSetVersionForPublishAsync(long ruleSetVersionId, CancellationToken ct = default);
@@ -147,6 +171,14 @@ public interface IGovernanceVersionService
 
     /// <summary>更新参数集版本（P0-02：PUBLISHED/DISABLED/ARCHIVED 拒绝；Status/治理字段冻结；P0-01：内容归一化；P1-04：Update 审计+预检）</summary>
     Task UpdateParameterSetVersionAsync(long parameterSetVersionId, ParameterSetVersion version, int actorUserId, CancellationToken ct = default);
+
+    /// <summary>
+    /// 写入参数集版本 Stage 固定交接等待规则（R05 治理写面补全，2026-11-02）。
+    /// <paramref name="rulesJson"/> 为规则数组 JSON 文本；服务内以本块专用选项反序列化（含枚举字符串转换器，
+    /// 不依赖 Web 全局无枚举转换器的选项）。仅 DRAFT/SUBMITTED/APPROVED 可改；写前校验 + P1-04 审计；
+    /// 空列表 = 删除该键（C9）。
+    /// </summary>
+    Task SaveStageHandoffWaitRulesAsync(long parameterSetVersionId, string? rulesJson, string? actorUserCode, int actorUserId, CancellationToken ct = default);
 
     /// <summary>获取参数集版本详情（P0-01：ContentSnapshotJson 五子块投影回五主题 JSON 内存字段）</summary>
     Task<ParameterSetVersion?> GetParameterSetVersionAsync(long parameterSetVersionId, CancellationToken ct = default);

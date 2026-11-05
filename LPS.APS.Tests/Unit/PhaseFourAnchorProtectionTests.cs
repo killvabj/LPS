@@ -145,7 +145,7 @@ public class PhaseFourAnchorProtectionTests
             {
                 MaterialId = m, ProductionDepartmentId = 100, RouteCode = "DEFAULT",
                 OperationCode = "OP10", StageCode = "STAGE1",
-                StandardDuration = 60m, SetupTime = 0m
+                StandardDuration = 60m * 60m, SetupTime = 0m
             }).ToList(),
             OperationResourceEligibility = materials.Select(m => new OperationResourceEligibility
             {

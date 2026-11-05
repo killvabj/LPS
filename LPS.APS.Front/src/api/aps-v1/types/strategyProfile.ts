@@ -103,6 +103,21 @@ export interface CreateStrategyProfileInput {
   runType?: string | null
 }
 
+/**
+ * 更新策略包主表入参（PUT /api/governance/strategy-profile/{id}）
+ *
+ * 编码必须原样回传（后端校验不可变更，改码返 400）；`runType=null` = 适用所有运行类型。
+ * `isActive=false` 只停用主表，不级联版本状态。
+ */
+export interface UpdateStrategyProfileInput {
+  id: number
+  strategyProfileCode: string
+  strategyProfileName: string
+  description?: string | null
+  runType?: string | null
+  isActive: boolean
+}
+
 /* ==================== 版本表 StrategyProfileVersion ==================== */
 
 /** 策略版本（绑定规则集版本 + 参数集版本，可发布可追溯）
@@ -135,7 +150,8 @@ export interface StrategyProfileVersionDto {
   parameterSetId?: number | null
 }
 
-/** 创建/更新 DRAFT 输入（对齐后端 StrategyProfileVersion 实体） */
+/** 创建/更新 DRAFT 输入（对齐后端 StrategyProfileVersion 实体）
+ *  IsDefault 不在入参内：Create 强制 false、Update 冻结既有值，只能经 set-default 显式置位。 */
 export interface StrategyVersionDraftInput {
   strategyProfileId: number
   versionCode: string
@@ -143,12 +159,11 @@ export interface StrategyVersionDraftInput {
   parameterSetVersionId: number
   effectiveFrom?: IsoDateTime | null
   effectiveTo?: IsoDateTime | null
-  isDefault: boolean
 }
 
 /* ==================== 发布/退役 请求体 ==================== */
 
-/** POST /publish 请求体（3号位 DTO 只含 ChangeReason；IsDefault 由 PUT /version/{id} 提前置） */
+/** POST /publish 请求体（3号位 DTO 只含 ChangeReason；默认标记须发布后另行 set-default） */
 export interface PublishStrategyVersionRequest {
   changeReason: string
 }

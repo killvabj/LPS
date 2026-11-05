@@ -3,7 +3,10 @@ namespace LPS.APS.Application.Services.Dto;
 /// <summary>
 /// 工厂/部门上级工作日历（dbo.ProductionWorkCalendarSlot）DTO 集
 /// 语义（G1 候选条款，生效等 G4）：MISSING=无行（继承/覆盖不足），表内仅 WORK/OFF；
-/// 日期例外优先于周周期；AllowLowerOverride 仅挂 OFF；IsAuthorizedOverride 仅 WORK+证据。
+/// 日期例外优先于周周期。
+/// ⚠ 2026-11-04 Owner 裁决「部门自主模式」：AllowLowerOverride / IsAuthorizedOverride
+///   恒=1（默认填1、拒绝显式0）；原"仅挂OFF/仅挂WORK+凭证"规则废止，与 07 §3.5c
+///   现行文本分叉=文档勘误欠账待0号位同步。解析器机制未改，旗位由数据恒1驱动。
 /// </summary>
 public sealed class ProductionWorkCalendarDto
 {
@@ -39,8 +42,8 @@ public sealed class WeeklyCalendarEntry
     /// <summary>WORK 必填；OFF 全天则两者均空</summary>
     public TimeSpan? StartAt { get; set; }
     public TimeSpan? EndAt { get; set; }
-    /// <summary>仅 OFF 行可=1（允许下级持授权加班覆盖本停机）</summary>
-    public bool AllowLowerOverride { get; set; }
+    /// <summary>部门自主模式(11-04)：恒=1；null=按默认1，显式 false 拒绝</summary>
+    public bool? AllowLowerOverride { get; set; }
 }
 
 /// <summary>周基准铺设计求（同范围同星期：未到生效期的旧行覆盖删、已到期的闭区间换版）</summary>
@@ -68,10 +71,10 @@ public sealed class WorkCalendarExceptionRequest
     public string WorkState { get; set; } = string.Empty;
     public TimeSpan? StartAt { get; set; }
     public TimeSpan? EndAt { get; set; }
-    /// <summary>仅 OFF 行；=1 允许下级授权覆盖本停机</summary>
-    public bool AllowLowerOverride { get; set; }
-    /// <summary>仅 WORK 行且必须携 SourceReference 证据（下级持授权覆盖上级 OFF）</summary>
-    public bool IsAuthorizedOverride { get; set; }
+    /// <summary>部门自主模式(11-04)：恒=1；null=按默认1，显式 false 拒绝</summary>
+    public bool? AllowLowerOverride { get; set; }
+    /// <summary>部门自主模式(11-04)：恒=1；null=按默认1，显式 false 拒绝；不再要求 SourceReference</summary>
+    public bool? IsAuthorizedOverride { get; set; }
     public string? SourceSystem { get; set; }
     public string? SourceReference { get; set; }
     public DateTime EffectiveFrom { get; set; }

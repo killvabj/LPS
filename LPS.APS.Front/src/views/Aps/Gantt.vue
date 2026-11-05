@@ -14,7 +14,7 @@
  *  - 验证只读模式不触发 drag 事件
  */
 
-import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { storeToRefs } from 'pinia'
 import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
@@ -55,7 +55,6 @@ import { REASON_CODE_LABELS, type ReasonCode } from '@/api/aps-v1/types/explanat
 import {
   ElAlert,
   ElButton,
-  ElCard,
   ElDescriptions,
   ElDescriptionsItem,
   ElDivider,
@@ -127,6 +126,18 @@ const dateRange = computed<{
   }
 })
 
+/* ===== 视图切换：甘特图 / 任务清单 =====
+ *  两者是同一份数据的两种看法（都是 `ganttData.tasks` + 同一个时间窗）：
+ *    - 上下并排 ⇒ 甘特只剩半屏，用户要看「整个甘特」；
+ *    - 拆成独立页面 ⇒ 那一页得再拉一次整包 gantt（后端只有 /api/schedule/gantt/{id}，无独立任务端点）；
+ *  ⇒ 同页 Tab：默认甘特占满整屏，任务清单切过去才出现，零额外请求。 */
+const viewTab = ref<'gantt' | 'tasks'>('gantt')
+
+// 切回甘特时让 dhtmlx 重算尺寸：隐藏期间容器宽高归零，不重算会留下一张缩成 0 宽的图
+watch(viewTab, (v) => {
+  if (v === 'gantt') nextTick(() => window.dispatchEvent(new Event('resize')))
+})
+
 /* ===== 任务清单（冻结 09 §六 / 01:1914「今日/未来任务清单」）=====
  *  - 数据源 = 甘特体 `ganttData.tasks`（同一个已部署端点，不另造查询）
  *  - 时间窗与甘特时间轴同源（dateRange：今日 / 7 / 30 / 90 天）
@@ -190,7 +201,9 @@ const GROUP_BY_OPTIONS: Array<{ value: GroupByKey; label: string }> = [
 ]
 
 /** Domain 染色（U01：ACTIVE 多 Domain 各 Domain 正确展示）
- *  - v1.2 Domain专项：键改 FAMILY_ 前缀；未识别 Domain 回退灰色
+ *  - v1.2 Domain专项：键改 FAMILY_ 前缀
+ *  - ⚠️ 真实 Domain 由后端字典配置（dev 上 15 个），这张表只覆盖早期 mock 键；
+ *    真实域的取色走 domainColor()，不在这张表里的键不再一律灰回退。
  */
 const DOMAIN_COLORS: Record<string, string> = {
   FAMILY_INJECTION: '#3b82f6',
@@ -199,8 +212,45 @@ const DOMAIN_COLORS: Record<string, string> = {
   ALL: '#94a3b8'
 }
 
+/** 域调色板（纯展示，非业务数据）：域字典数量会变，故按字典顺序取色而非硬编码色表 */
+const DOMAIN_PALETTE = [
+  '#3b82f6',
+  '#8b5cf6',
+  '#10b981',
+  '#f59e0b',
+  '#ef4444',
+  '#06b6d4',
+  '#ec4899',
+  '#84cc16',
+  '#f97316',
+  '#6366f1',
+  '#14b8a6',
+  '#a855f7',
+  '#d946ef',
+  '#22c55e',
+  '#eab308',
+  '#0ea5e9'
+]
+
 /** Domain 字典（v1.2 Domain专项：从 useDomainStore 派生） */
 const domainStore = useDomainStore()
+
+/**
+ * domainKey → 展示色
+ *  1) DOMAIN_COLORS 显式指定优先（早期 mock 域）
+ *  2) 否则按域字典（definitions，登录时 bootstrap 拉全量）顺序取色 ⇒ 每个域一个稳定色
+ *  3) 字典里没有（数据引用了未同步的域）⇒ 按 key 散列取色，不再灰回退
+ */
+function domainColor(domainKey: string): string {
+  const explicit = DOMAIN_COLORS[domainKey]
+  if (explicit) return explicit
+  const keys = domainStore.definitions.map((d) => d.domainKey).sort((a, b) => a.localeCompare(b))
+  const idx = keys.indexOf(domainKey)
+  if (idx >= 0) return DOMAIN_PALETTE[idx % DOMAIN_PALETTE.length]
+  let h = 0
+  for (let i = 0; i < domainKey.length; i++) h = (h * 31 + domainKey.charCodeAt(i)) >>> 0
+  return DOMAIN_PALETTE[h % DOMAIN_PALETTE.length]
+}
 
 /** Domain 过滤器（U01：多 Domain 多选；默认全选）
  *  - v1.2：选项以 useDomainStore.activeDomains 为全集（按 store sortOrder）
@@ -283,7 +333,7 @@ const lanes = computed<Lane[]>(() => {
     const seen = new Map<string, string>()
     for (const t of tasks) {
       if (!seen.has(t.domainKey)) {
-        seen.set(t.domainKey, DOMAIN_COLORS[t.domainKey] ?? '#94a3b8')
+        seen.set(t.domainKey, domainColor(t.domainKey))
       }
     }
     return Array.from(seen.entries())
@@ -302,7 +352,7 @@ const lanes = computed<Lane[]>(() => {
       const r = resourceMap.get(t.resourceId ?? -1)
       const stage = r?.stage ?? 'UNKNOWN'
       if (!seen.has(stage)) {
-        seen.set(stage, { color: DOMAIN_COLORS[r?.domainKey ?? ''] ?? '#94a3b8' })
+        seen.set(stage, { color: r?.domainKey ? domainColor(r.domainKey) : '#94a3b8' })
       }
     }
     return Array.from(seen.entries())
@@ -360,6 +410,17 @@ const STATUS_COLORS: Record<TaskStatus, string> = {
   COMPLETED: '#059669',
   CANCELLED: '#64748b'
 }
+
+/** 图例：条子填充色的含义（按 Domain 分组时填充色切换为域色） */
+const legendItems = computed<Array<{ label: string; color: string }>>(() => {
+  if (groupBy.value === 'domain') {
+    return availableDomains.value.map((dk) => ({ label: domainLabel(dk), color: domainColor(dk) }))
+  }
+  return (Object.keys(STATUS_COLORS) as TaskStatus[]).map((key) => ({
+    label: TASK_STATUS_LABELS[key],
+    color: STATUS_COLORS[key]
+  }))
+})
 
 const LOCK_LABEL: Record<TaskLockMarker, string> = {
   EXECUTION: '执行锁定',
@@ -496,7 +557,7 @@ function sanitizeStatus(input: string | undefined): TaskStatus {
  */
 function pickBarColor(task: GanttTaskDto, status: TaskStatus): string {
   if (groupBy.value === 'domain') {
-    return DOMAIN_COLORS[task.domainKey] ?? '#94a3b8'
+    return domainColor(task.domainKey)
   }
   return STATUS_COLORS[status] ?? '#94a3b8'
 }
@@ -537,23 +598,38 @@ const dhxTasks = computed<DhxGanttTask[]>(() => {
   const resourceMap = new Map(data.resources.map((r) => [r.resourceId, r]))
 
   // 泳道行（Y 轴；按 groupBy 维度动态生成）
+  // 泳道条 = 该行最早开工 → 最晚完工的占用区间（不是第一条任务的时长）
   const laneRows: DhxGanttTask[] = lanes.value.map((lane) => {
     const laneTasks = filteredTasks.value.filter((t) => getTaskGroupKey(t, resourceMap) === lane.id)
-    const firstTask = laneTasks[0]
+    let spanStart: string | undefined
+    let spanEnd: string | undefined
+    for (const t of laneTasks) {
+      if (
+        t.plannedStartTime &&
+        (!spanStart || dayjs(t.plannedStartTime).isBefore(dayjs(spanStart)))
+      ) {
+        spanStart = t.plannedStartTime
+      }
+      if (t.plannedEndTime && (!spanEnd || dayjs(t.plannedEndTime).isAfter(dayjs(spanEnd)))) {
+        spanEnd = t.plannedEndTime
+      }
+    }
     return {
       id: lane.id,
       text: lane.label,
-      start_date: formatDate(firstTask?.plannedStartTime),
-      duration: firstTask
-        ? hoursBetween(firstTask.plannedStartTime!, firstTask.plannedEndTime!)
-        : 1,
+      start_date: formatDate(spanStart),
+      duration: spanStart && spanEnd ? hoursBetween(spanStart, spanEnd) : 1,
       type: 'project',
       parent: 0,
       open: true,
       readonly: true,
       color: lane.color,
       textColor: lane.textColor,
-      details: lane.label
+      laneEmpty: laneTasks.length === 0,
+      details:
+        laneTasks.length && spanStart && spanEnd
+          ? `${lane.label}｜占用 ${formatUtcDateTimeSec(spanStart)} ~ ${formatUtcDateTimeSec(spanEnd)}｜${laneTasks.length} 个任务`
+          : `${lane.label}｜当前时间窗内无任务`
     }
   })
 
@@ -865,7 +941,11 @@ const EMPTY_TEXT: Record<Exclude<EmptyKind, null>, { title: string; hint: string
   }
 }
 
-/* ===== 加载 ===== */
+/* ===== 加载 =====
+ * 2026-10-27 用户要求撤掉工具栏的「刷新」按钮：它会走 loadVersions()，
+ * 而 loadVersions() 会把选中版本重置成「第一个 ACTIVE 版本」⇒ 手选的版本被冲掉。
+ * 数据更新仍有两条路径：切版本下拉（拉该版本甘特）、整页重载。
+ */
 async function refresh() {
   // P0：先加载用户信息（决定按钮可见性 Section 18 角色门控）
   if (!apsAuth.userInfo) {
@@ -880,6 +960,12 @@ async function refresh() {
 watch(currentVersionId, async (id) => {
   if (id !== null) await scheduleStore.loadCurrent()
 })
+
+/* ===== 回到今天（长时间窗横滚后一键回到今天竖线） ===== */
+const ganttRef = ref<InstanceType<typeof DhxGantt> | null>(null)
+function scrollToToday(): void {
+  ganttRef.value?.showDate(new Date())
+}
 
 onMounted(refresh)
 
@@ -1320,6 +1406,9 @@ function triggerRescheduleForResource(): void {
           <ElRadioButton value="D30">30 天</ElRadioButton>
           <ElRadioButton value="D90">90 天</ElRadioButton>
         </ElRadioGroup>
+        <ElButton size="default" text title="把时间轴滚动到今天" @click="scrollToToday">
+          回到今天
+        </ElButton>
 
         <span class="label">维度</span>
         <ElSelect v-model="groupBy" size="default" style="width: 130px">
@@ -1348,49 +1437,6 @@ function triggerRescheduleForResource(): void {
           </ElOption>
         </ElSelect>
         <DomainUnavailableBadge />
-
-        <span class="stat">
-          任务 <strong>{{ stats.total }}</strong> | 资源
-          <strong>{{ ganttData?.resources.length ?? 0 }}</strong> | 维度
-          <strong>{{ lanes.length }}</strong
-          ><span
-            v-for="dk in availableDomains"
-            :key="dk"
-            class="stat-domain"
-            :style="{ color: DOMAIN_COLORS[dk] ?? '#94a3b8' }"
-          >
-            | {{ domainLabel(dk) }} <strong>{{ domainCounts[dk] ?? 0 }}</strong></span
-          >
-          <!-- P5 §12 受影响订单：现有 KPI 行内追加；0 新面板 -->
-          <ElTooltip v-if="impactedTaskIds.length > 0" placement="bottom" :show-after="100">
-            <template #content>
-              <div class="impacted-tooltip">
-                <div class="impacted-tooltip-title">
-                  受设备故障影响的任务（{{ impactedTaskIds.length }} 个）：
-                </div>
-                <ul class="impacted-tooltip-list">
-                  <li v-for="t in impactedTaskList.slice(0, 10)" :key="t.taskId">
-                    <code>{{ t.taskNo }}</code>
-                    <span class="impacted-tooltip-res">@ {{ t.resourceCode }}</span>
-                  </li>
-                  <li v-if="impactedTaskList.length > 10" class="impacted-tooltip-more">
-                    …还有 {{ impactedTaskList.length - 10 }} 个
-                  </li>
-                </ul>
-              </div>
-            </template>
-            <span
-              class="stat-impacted"
-              :class="{ 'is-active': filterImpactedOnly }"
-              role="button"
-              :title="filterImpactedOnly ? '点击取消只看受影响' : '点击只看受影响任务'"
-              @click="filterImpactedOnly = !filterImpactedOnly"
-            >
-              <Icon icon="vi-mdi:alert-circle" />
-              | 受影响 <strong>{{ impactedTaskIds.length }}</strong>
-            </span>
-          </ElTooltip>
-        </span>
       </div>
       <div class="toolbar-right">
         <!-- 角色指示器 + 切换器（仅 mock 模式显示；生产模式自动隐藏） -->
@@ -1469,23 +1515,100 @@ function triggerRescheduleForResource(): void {
           <Icon icon="vi-mdi:flash-triangle-outline" />
           插单影响分析
         </ElButton>
-        <ElButton type="primary" :loading="loading" title="刷新数据" @click="refresh">
-          <Icon icon="vi-ep:refresh" />
-        </ElButton>
       </div>
     </div>
 
-    <!-- ===== 错误 / 空状态 ===== -->
-    <ElAlert v-if="error" type="error" :closable="false" show-icon :title="`加载失败：${error}`" />
-    <ElAlert
-      v-else-if="emptyKind"
-      :type="emptyKind === 'scope-denied' ? 'warning' : 'info'"
-      :closable="false"
-      show-icon
-      :title="EMPTY_TEXT[emptyKind].title"
-    >
-      {{ EMPTY_TEXT[emptyKind].hint }}
-    </ElAlert>
+    <!-- ===== 视图切换（甘特图 / 任务清单）：同一份数据，切 Tab 不重新请求 =====
+         提示（错误 / 空态）与 Tab 同一行：只放一行短标题，详细说明走 title 悬停 -->
+    <div class="view-bar">
+      <div class="view-tabs" role="tablist" aria-label="甘特图视图切换">
+        <button
+          type="button"
+          role="tab"
+          class="view-tab"
+          :class="{ 'is-active': viewTab === 'gantt' }"
+          :aria-selected="viewTab === 'gantt'"
+          @click="viewTab = 'gantt'"
+        >
+          甘特图
+        </button>
+        <button
+          type="button"
+          role="tab"
+          class="view-tab"
+          :class="{ 'is-active': viewTab === 'tasks' }"
+          :aria-selected="viewTab === 'tasks'"
+          @click="viewTab = 'tasks'"
+        >
+          任务清单
+          <span class="view-tab-count">{{ taskListTotal }}</span>
+        </button>
+      </div>
+
+      <!-- 错误 / 空状态：一行短提示（悬停看完整说明） -->
+      <span v-if="error" class="view-bar-note is-error" :title="`加载失败：${error}`">
+        <Icon icon="vi-ep:warning-filled" />
+        加载失败：{{ error }}
+      </span>
+      <span v-else-if="emptyKind" class="view-bar-note" :title="EMPTY_TEXT[emptyKind].hint">
+        <Icon icon="vi-ep:info-filled" />
+        {{ EMPTY_TEXT[emptyKind].title }}
+      </span>
+
+      <!-- 右侧：统计 KPI + 图例（图例只描述甘特条，任务清单页签下隐藏） -->
+      <div class="view-bar-right">
+        <span class="stat">
+          任务 <strong>{{ stats.total }}</strong> | 资源
+          <strong>{{ ganttData?.resources.length ?? 0 }}</strong> | 泳道
+          <strong>{{ lanes.length }}</strong
+          ><span
+            v-for="dk in availableDomains"
+            :key="dk"
+            class="stat-domain"
+            :style="{ color: domainColor(dk) }"
+          >
+            | {{ domainLabel(dk) }} <strong>{{ domainCounts[dk] ?? 0 }}</strong></span
+          >
+          <!-- P5 §12 受影响订单：现有 KPI 行内追加；0 新面板 -->
+          <ElTooltip v-if="impactedTaskIds.length > 0" placement="bottom" :show-after="100">
+            <template #content>
+              <div class="impacted-tooltip">
+                <div class="impacted-tooltip-title">
+                  受设备故障影响的任务（{{ impactedTaskIds.length }} 个）：
+                </div>
+                <ul class="impacted-tooltip-list">
+                  <li v-for="t in impactedTaskList.slice(0, 10)" :key="t.taskId">
+                    <code>{{ t.taskNo }}</code>
+                    <span class="impacted-tooltip-res">@ {{ t.resourceCode }}</span>
+                  </li>
+                  <li v-if="impactedTaskList.length > 10" class="impacted-tooltip-more">
+                    …还有 {{ impactedTaskList.length - 10 }} 个
+                  </li>
+                </ul>
+              </div>
+            </template>
+            <span
+              class="stat-impacted"
+              :class="{ 'is-active': filterImpactedOnly }"
+              role="button"
+              :title="filterImpactedOnly ? '点击取消只看受影响' : '点击只看受影响任务'"
+              @click="filterImpactedOnly = !filterImpactedOnly"
+            >
+              <Icon icon="vi-mdi:alert-circle" />
+              | 受影响 <strong>{{ impactedTaskIds.length }}</strong>
+            </span>
+          </ElTooltip>
+        </span>
+
+        <div v-show="viewTab === 'gantt'" class="gantt-legend" aria-hidden="true">
+          <span v-for="item in legendItems" :key="item.label" class="legend-item">
+            <i class="legend-swatch" :style="{ background: item.color }"></i>{{ item.label }}
+          </span>
+          <span class="legend-item"><i class="legend-swatch is-delay"></i>延期</span>
+          <span class="legend-item"><i class="legend-swatch is-lane"></i>资源占用区间</span>
+        </div>
+      </div>
+    </div>
 
     <!-- ===== 甘特图 =====
          软拖动（4号位文档第 6 节最后一句 + 第 24 节）：
@@ -1493,8 +1616,9 @@ function triggerRescheduleForResource(): void {
          - PMC+ 角色   :readonly=false，任务条可拖（lane 行仍然 task.readonly=true）
          - 拖完不直接写库：DhxGantt wrapper 的 onBeforeTaskChanged 永远 return false → 自动回滚位置
          - 然后 emit taskDragEnd → 这里弹确认 → 走 runApi.triggerReschedule（runType=LOCAL_RESCHEDULE）→ Candidate 页 -->
-    <div class="gantt-area" @dblclick.capture="handleAreaDblClick">
+    <div v-show="viewTab === 'gantt'" class="gantt-area" @dblclick.capture="handleAreaDblClick">
       <DhxGantt
+        ref="ganttRef"
         :tasks="dhxTasks"
         :readonly="!canManualReschedule"
         :allow-resize="false"
@@ -1515,18 +1639,16 @@ function triggerRescheduleForResource(): void {
 
     <!-- ===== 任务清单（今日 / 未来）：冻结 09 §六 / 01:1914 =====
          与甘特时间轴同窗；列表只展示后端已给字段，MES 下发/执行状态未接入不伪造 -->
-    <ElCard class="task-list-card">
-      <template #header>
+    <div v-show="viewTab === 'tasks'" class="task-list-pane">
+      <ElEmpty v-if="!taskListTotal" description="该时间范围内没有任务" :image-size="60" />
+      <template v-else>
         <div class="task-list-head">
           <span>任务清单（{{ TIME_RANGE_LABEL[timeRange] }}）</span>
           <span class="task-list-hint">
             共 {{ taskListTotal }} 条 · 按计划开始时间排序 · 仅含该时间窗内有计划时间的任务
           </span>
         </div>
-      </template>
-      <ElEmpty v-if="!taskListTotal" description="该时间范围内没有任务" :image-size="60" />
-      <template v-else>
-        <ElTable :data="taskListPaged" size="small" border max-height="420" style="width: 100%">
+        <ElTable :data="taskListPaged" size="small" border max-height="520" style="width: 100%">
           <ElTableColumn prop="taskNo" label="任务号" min-width="150" show-overflow-tooltip />
           <ElTableColumn label="订单号" min-width="140" show-overflow-tooltip>
             <template #default="{ row }">{{ row.orderNo ?? '—' }}</template>
@@ -1573,7 +1695,7 @@ function triggerRescheduleForResource(): void {
           />
         </div>
       </template>
-    </ElCard>
+    </div>
 
     <!-- ===== P3：双击任务条 → 轻量浮窗（Task 摘要 + 复制 TaskNo） ===== -->
     <div
@@ -2360,60 +2482,61 @@ function triggerRescheduleForResource(): void {
     font-size: 12px;
     color: #64748b;
   }
+}
 
-  .stat {
-    margin-left: 8px;
-    font-size: 11px;
-    color: #94a3b8;
-    white-space: nowrap;
+/* 统计 KPI（视图切换行右侧：任务 / 资源 / 泳道 / 各域任务数） */
+.stat {
+  margin: 0;
+  font-size: 11px;
+  color: #94a3b8;
+  white-space: nowrap;
+
+  strong {
+    color: #1e293b;
+  }
+
+  .stat-domain {
+    font-weight: 500;
 
     strong {
-      color: #1e293b;
+      font-family: 'Courier New', monospace;
+      font-weight: 700;
+    }
+  }
+
+  /* P5 §12：受影响 KPI 项（点切换只看受影响） */
+  .stat-impacted {
+    display: inline-flex;
+    padding: 1px 8px;
+    margin-left: 8px;
+    font-size: 12px;
+    color: #dc2626;
+    cursor: pointer;
+    background: #fef2f2;
+    border: 1px solid #fecaca;
+    border-radius: 10px;
+    transition: all 0.12s ease;
+    align-items: center;
+    gap: 2px;
+
+    strong {
+      margin-left: 2px;
+      font-family: 'Courier New', monospace;
+      font-weight: 700;
     }
 
-    .stat-domain {
-      font-weight: 500;
-
-      strong {
-        font-family: 'Courier New', monospace;
-        font-weight: 700;
-      }
+    &:hover {
+      background: #fee2e2;
+      border-color: #fca5a5;
     }
 
-    /* P5 §12：受影响 KPI 项（点切换只看受影响） */
-    .stat-impacted {
-      display: inline-flex;
-      padding: 1px 8px;
-      margin-left: 8px;
-      font-size: 12px;
-      color: #dc2626;
-      cursor: pointer;
-      background: #fef2f2;
-      border: 1px solid #fecaca;
-      border-radius: 10px;
-      transition: all 0.12s ease;
-      align-items: center;
-      gap: 2px;
+    &.is-active {
+      color: #fff;
+      background: #dc2626;
+      border-color: #dc2626;
 
       strong {
-        margin-left: 2px;
-        font-family: 'Courier New', monospace;
-        font-weight: 700;
-      }
-
-      &:hover {
-        background: #fee2e2;
-        border-color: #fca5a5;
-      }
-
-      &.is-active {
         color: #fff;
-        background: #dc2626;
-        border-color: #dc2626;
-
-        strong {
-          color: #fff;
-        }
       }
     }
   }
@@ -2465,8 +2588,95 @@ function triggerRescheduleForResource(): void {
   color: #94a3b8;
 }
 
+/* 视图切换（甘特图 / 任务清单） */
+/* 视图切换行：Tab 与提示同一行，整体压到一行高 */
+.view-bar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-height: 26px;
+  flex-wrap: nowrap;
+}
+
+/* 视图切换行右侧：统计 KPI + 图例（靠右对齐，不占图表高度） */
+.view-bar-right {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 24px;
+  margin-left: auto;
+  min-width: 0;
+  flex-wrap: nowrap;
+
+  .gantt-legend {
+    padding-left: 16px;
+    overflow: hidden;
+    border-left: 1px solid #e2e8f0;
+  }
+}
+
+.view-tabs {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 2px;
+  background: #fff;
+  border-radius: 6px;
+  box-shadow: 0 1px 4px rgb(0 0 0 / 6%);
+}
+
+.view-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 12px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  font-size: 13px;
+  line-height: 1.4;
+  color: #475569;
+  cursor: pointer;
+
+  &:hover {
+    color: #1e293b;
+    background: #f1f5f9;
+  }
+
+  &.is-active {
+    color: #2563eb;
+    font-weight: 600;
+    background: #eff6ff;
+  }
+}
+
+.view-tab-count {
+  padding: 0 5px;
+  border-radius: 8px;
+  background: #e2e8f0;
+  font-size: 11px;
+  font-weight: 400;
+  color: #475569;
+}
+
+/* 行内短提示（错误 / 空态）：一行标题，详细说明挂 title 悬停 */
+.view-bar-note {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  font-size: 12px;
+  color: #64748b;
+  cursor: help;
+
+  &.is-error {
+    color: #f56c6c;
+  }
+}
+
 /* 甘特图区 */
 .gantt-area {
+  position: relative;
   flex: 1;
   min-height: 0;
   overflow: hidden;
@@ -2476,6 +2686,45 @@ function triggerRescheduleForResource(): void {
 
   :deep(.dhx-gantt-root) {
     height: 100%;
+  }
+}
+
+/* 图例：视图切换行右侧，紧跟在统计 KPI 之后（与知名排产系统的图例位置一致） */
+.gantt-legend {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: nowrap;
+  font-size: 11px;
+  line-height: 16px;
+  color: #475569;
+  white-space: nowrap;
+}
+
+.legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  white-space: nowrap;
+}
+
+.legend-swatch {
+  width: 10px;
+  height: 10px;
+  border-radius: 2px;
+
+  &.is-delay {
+    width: 3px;
+    border-radius: 1px;
+    background: #ef4444;
+  }
+
+  &.is-lane {
+    width: 16px;
+    height: 8px;
+    background: linear-gradient(135deg, #d7e8ff 0%, #c6dbfb 100%);
+    border: 1px solid #aac8ef;
+    border-radius: 3px;
   }
 }
 
@@ -3232,9 +3481,14 @@ function triggerRescheduleForResource(): void {
 }
 
 /* ===== 任务清单（今日 / 未来） ===== */
-.task-list-card {
-  margin-top: 12px;
+.task-list-pane {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 12px 16px;
+  background: #fff;
   border-radius: 8px;
+  box-shadow: 0 1px 4px rgb(0 0 0 / 6%);
 
   .task-list-head {
     display: flex;

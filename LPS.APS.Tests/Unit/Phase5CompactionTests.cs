@@ -467,7 +467,7 @@ public class Phase5CompactionTests
         {
             MaterialId = materialId, ProductionDepartmentId = 100, RouteCode = "DEFAULT",
             OperationCode = opCode, StageCode = "STAGE1",
-            StandardDuration = standardDuration, SetupTime = setup
+            StandardDuration = standardDuration * 60m, SetupTime = setup
         };
 
     private static RoutingDependency Dep(int materialId, string from, string to)

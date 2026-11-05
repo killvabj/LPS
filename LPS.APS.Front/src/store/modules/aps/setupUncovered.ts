@@ -14,9 +14,14 @@
  *  - 不展示 Run 外的统计（避免与 RuleSetVersion 解耦）
  *
  * 出口操作：
- *  - 点击"去补明确产品转换" → 跳明确产品转换页，预填 6 字段
- *  - 点击"去补默认换型规则" → 跳默认换型规则页，预填 4 字段
+ *  - 点击"去补默认换型规则" → 跳默认换型规则页，预填 4 字段（部门/大工艺/工序/设备）
  *  - 导出 CSV
+ *
+ * 10-27 变更（3号位 P1 落码后）：
+ *  - 输出行改按后端 SetupUncoveredStatDto 12 字段；前产品/后产品/最近出现后端没有 ⇒ 不再产出
+ *  - 「去补明确产品转换」出口撤除：EXACT 入参必须同时给前/后产品主键
+ *    （SetupRuleExactInput.FromMaterialId/ToMaterialId，缺任一即 422），
+ *    而 [Task] 无 FromMaterial ⇒ 统计行永远补不出明确转换。3号位 Q4 已裁定降级为只补 DEFAULT。
  */
 
 import { defineStore } from 'pinia'
@@ -58,11 +63,18 @@ export const useSetupUncoveredStore = defineStore('aps.setupUncovered', () => {
     return groups
   })
 
-  /** 按大工艺分组统计 */
+  /**
+   * 按大工艺分组统计
+   *
+   * 10-27：原口径是 `${departmentCode}/${stageCode}` 复合键 —— 那是因为后端当时
+   * 不回带 stageCode，该列恒空，复合键让「涉及工艺」恒为 1。P1 落码后 stageCode
+   * 已有值（dev 实测 CN_ASSY 等），复合键会把「部门+大工艺」组合数当成工艺数，口径失真。
+   * 改为按大工艺单键分组；未回带的行归到「（未回带）」，不与真实大工艺混算。
+   */
   const statsByStage = computed<Record<string, SetupUncoveredStatDto[]>>(() => {
     const groups: Record<string, SetupUncoveredStatDto[]> = {}
     stats.value.forEach((s) => {
-      const key = `${s.departmentCode}/${s.stageCode}`
+      const key = s.stageCode?.trim() || '（未回带）'
       if (!groups[key]) groups[key] = []
       groups[key].push(s)
     })
@@ -89,27 +101,37 @@ export const useSetupUncoveredStore = defineStore('aps.setupUncovered', () => {
     }
   }
 
-  /** 导出 CSV（前端生成，不调后端） */
+  /** 导出 CSV（前端生成，不调后端）
+   *  10-27：列对齐后端实返字段（去掉不存在的 前产品/后产品/最近出现），并补 Id 列便于回溯
+   *  10-28：补 RuleSetVersionId（后端 P1 落码的归属维度） */
   function exportCsv(): string {
     const headers = [
+      'ScheduleRunId',
+      'RuleSetVersionId',
+      'DepartmentId',
       'DepartmentCode',
       'StageCode',
       'OperationCode',
+      'ResourceId',
       'ResourceCode',
-      'FromMaterialCode',
-      'ToMaterialCode',
+      'MaterialId',
+      'MaterialCode',
       'Count',
-      'LastOccurrence'
+      'SampleTaskId'
     ]
     const rows = stats.value.map((s) => [
+      String(s.scheduleRunId ?? ''),
+      String(s.ruleSetVersionId ?? ''),
+      String(s.departmentId),
       s.departmentCode,
-      s.stageCode,
+      s.stageCode ?? '',
       s.operationCode,
+      String(s.resourceId),
       s.resourceCode,
-      s.fromMaterialCode,
-      s.toMaterialCode,
+      String(s.materialId),
+      s.materialCode,
       String(s.count),
-      s.lastOccurrence ?? ''
+      String(s.sampleTaskId ?? '')
     ])
     return [headers.join(','), ...rows.map((r) => r.join(','))].join('\n')
   }

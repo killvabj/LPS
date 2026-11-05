@@ -22,6 +22,7 @@
  *      POST   /calendar/single          aps.manual_capacity.edit     单条追加（同设备侧）
  *      GET    /calendar/{manualSlotId}  aps.manual_capacity.view
  *      DELETE /calendar/{id}            aps.manual_capacity.delete（物理删）
+ *      GET    /resolve-preview           aps.manual_capacity.view   人工槽版三级合并预览（与设备侧同构）
  *
  * 已知缺口（10-12 复盘）：
  *  - G1：无资源主表列表端点 → 10-12 复盘发现 5号位 已落地（lps/LPS.APS.Web/Controllers/ResourceController.cs:34），4号位 已切
@@ -39,6 +40,7 @@ import type {
   CalendarWindowPageResult,
   ManualCapacitySlotDto,
   ManualCapacitySlotPageResult,
+  ManualCapacityResolvePreviewDto,
   ManualSlotCalendarBulkRequest,
   ManualSlotCalendarDto,
   ManualSlotQuery,
@@ -503,7 +505,8 @@ export const resourceCalendarApi = {
    *  - 5号位 2026-10-14 落地；**只读、不写库、不改任何日历数据**
    *  - 三级（工厂 → 部门 → 设备）逐时间片继承与显式覆盖后的**最终合法窗口**，
    *    每片带 `source` = 本片由哪一级 WORK 决定；`OFF` 不可被上级 WORK 复活
-   *  - ⚠️ 只接受设备 `resourceIds`；**无人工槽版本**
+   *  - 每片带 `isAuthorized` = 是否来自授权加班例外（13 v1.8:31「来源授权」维度）
+   *  - 本端点只收设备 `resourceIds`；人工槽版见 `getManualResolvePreview`
    *  - `endDate` 按 Resolver 语义**含末日**；`resourceIds` 逗号分隔、单次 ≤200
    */
   async getResolvePreview(
@@ -535,6 +538,46 @@ export const resourceCalendarApi = {
     return apsHttp.get<ResourceCalendarResolvePreviewDto[]>({
       url: '/api/resource-calendar/resolve-preview',
       params: { resourceIds: resourceIds.join(','), startDate, endDate }
+    })
+  },
+
+  /**
+   * 人工槽版三级合并解析预览（GET /api/manual-capacity/resolve-preview）
+   *  - 5号位 2026-10-23 落码、2026-10-26 已上 dev；与设备侧**同一 Resolver/上级装载器/ApplyAuthorization**
+   *    （= 运行期 SchedulingOrchestrator 同口径）⇒ 预览即运行期口径
+   *  - 归属链 槽 → 部门 → 工厂 上溯（人工槽无直接工厂列）
+   *  - 业务范围 fail-closed（越界槽剔除，不泄露存在性）
+   *  - `manualSlotIds` 逗号分隔、单次 ≤200；`endDate` 含末日
+   */
+  async getManualResolvePreview(
+    manualSlotIds: number[],
+    startDate: string,
+    endDate: string
+  ): Promise<ManualCapacityResolvePreviewDto[]> {
+    if (APS_USE_MOCK) {
+      await delay(200)
+      return manualSlotIds.map((id) => {
+        const rows = (MOCK_SLOT_WINDOWS[id] ?? []).filter(
+          (w) =>
+            w.startTime.slice(0, 10) >= startDate &&
+            w.startTime.slice(0, 10) <= endDate &&
+            w.availableFlag
+        )
+        return {
+          manualSlotId: id,
+          hasAnyWindow: rows.length > 0,
+          status: rows.length > 0 ? ('WORK' as const) : ('MISSING' as const),
+          windows: rows.map((w) => ({
+            start: w.startTime,
+            end: w.endTime,
+            source: 'Resource' as const
+          }))
+        }
+      })
+    }
+    return apsHttp.get<ManualCapacityResolvePreviewDto[]>({
+      url: '/api/manual-capacity/resolve-preview',
+      params: { manualSlotIds: manualSlotIds.join(','), startDate, endDate }
     })
   },
 

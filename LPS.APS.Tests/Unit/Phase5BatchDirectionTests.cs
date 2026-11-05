@@ -82,7 +82,7 @@ public class Phase5BatchDirectionTests
                     MaterialId = MaterialId, ProductionDepartmentId = DeptId,
                     RouteCode = route, PathId = path,
                     OperationCode = code, StageCode = stage,
-                    StandardDuration = duration, OperationPlanningMode = "FINITE_RESOURCE"
+                    StandardDuration = duration * 60m, OperationPlanningMode = "FINITE_RESOURCE"
                 });
                 elig.Add(new OperationResourceEligibility
                 {
@@ -393,7 +393,7 @@ public class Phase5BatchDirectionTests
                 MaterialId = MaterialId, ProductionDepartmentId = DeptId,
                 RouteCode = route, PathId = path,
                 OperationCode = code, StageCode = stage,
-                StandardDuration = 60m, OperationPlanningMode = "FINITE_RESOURCE"
+                StandardDuration = 60m * 60m, OperationPlanningMode = "FINITE_RESOURCE"
             });
             elig.Add(new OperationResourceEligibility
             {

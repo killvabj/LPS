@@ -12,6 +12,9 @@ public class OrderQueryRepository : IOrderQueryRepository
 {
     private readonly DatabaseConnectionManager _connectionManager;
 
+    /// <summary>冻结 07:4937 权威 15 码白名单（PrimaryReasonCode 只透出白名单内的码；白名单外=null）</summary>
+    private const string DeliveryReasonWhitelist = @"'RESOURCE_CAPACITY_WAIT','MATERIAL_SHORTAGE','PRECEDENCE_WAIT','FROZEN_ZONE_LOCK','ROUTING_FALLBACK','STAGE_LEADTIME_FALLBACK','BOM_DEGRADE','CROSS_ORG_HANDOFF','PRIORITY_LOWER_THAN_OTHERS','DUE_DATE_RISK','LOGISTICS_DELAY','PRIORITY_INHERITANCE','CROSS_DOMAIN_VERSION_MISMATCH_RISK','MANUAL_COMPLETED_SHORT','EQUIPMENT_BREAKDOWN_RISK'";
+
     public OrderQueryRepository(DatabaseConnectionManager connectionManager)
     {
         _connectionManager = connectionManager ?? throw new ArgumentNullException(nameof(connectionManager));
@@ -72,17 +75,13 @@ WHERE o.PlanVersionId = @PlanVersionId
         // ——BATCH_POLICY_MISSING/中文Phase/MISSING_PRODUCTION_DEPARTMENT_CONTEXT，源头=1号位 ExplanationFactDraft
         //   产出+2号位透传落库，07:4935 门禁"不作正式原因验收"）。库内历史行保留不动（10-12 裁决各侧维持姿态），
         // 但**不得经本端点透出给用户**：白名单外的码按"无可用原因"（null）处理，不造假也不代 0号位 洗白。
-        const string deliveryApply = @"
-OUTER APPLY (SELECT MAX(t.PlannedEndTime) AS PlannedCompletion
-             FROM [Task] t WHERE t.OrderId = o.Id AND t.PlanVersionId = o.PlanVersionId) dc
-OUTER APPLY (SELECT TOP 1 f.ReasonCode AS PrimaryReasonCode
-             FROM ScheduleExplanationFact f
-             WHERE f.PlanVersionId = o.PlanVersionId AND f.OrderId = o.Id
-               AND f.ReasonCode IN ('RESOURCE_CAPACITY_WAIT','MATERIAL_SHORTAGE','PRECEDENCE_WAIT','FROZEN_ZONE_LOCK',
-                                    'ROUTING_FALLBACK','STAGE_LEADTIME_FALLBACK','BOM_DEGRADE','CROSS_ORG_HANDOFF',
-                                    'PRIORITY_LOWER_THAN_OTHERS','DUE_DATE_RISK','LOGISTICS_DELAY','PRIORITY_INHERITANCE',
-                                    'CROSS_DOMAIN_VERSION_MISMATCH_RISK','MANUAL_COMPLETED_SHORT','EQUIPMENT_BREAKDOWN_RISK')
-             ORDER BY f.ImpactHours DESC) rs";
+        // 10-31 性能改造（4号位 R2-b）：三字段改为「分页后再批量富化」。
+        // 原实现把两个 OUTER APPLY 挂在带 ORDER BY+OFFSET/FETCH 的 SELECT 上，
+        // 实测优化器退化为逐行 0.25s（200 行 50s，前端 30s 超时）。APPLY 单独执行是 0ms，
+        // 只有与 ORDER BY/OFFSET 同句才退化 ⇒ 拆两段：先取本页 200 行（无富化），再按 OrderId 批量聚合。
+        // 语义逐字保留：MAX(PlannedEndTime)；原因码=15 码白名单内 ImpactHours 最大者（并列处理与原 TOP 1 相同，
+        // 均为无序并列，未新增 tiebreaker——4号位 R4 要求语义变化须回执，本处无变化）。
+        // 15 码白名单见类级常量 DeliveryReasonWhitelist（以下富化查询引用）。
 
         var dataSql = @"
 SELECT
@@ -108,15 +107,8 @@ SELECT
     o.DelayStatus,
     o.DemandMaturityStatus,
     o.MTS_InstructionNo,
-    o.BOMNO,
-    dc.PlannedCompletion     AS PlannedCompletionTime,
-    CASE WHEN dc.PlannedCompletion IS NOT NULL
-          AND o.CustomerDueDate IS NOT NULL
-          AND CAST(dc.PlannedCompletion AS date) > o.CustomerDueDate
-         THEN DATEDIFF(MINUTE, CAST(o.CustomerDueDate AS datetime2), dc.PlannedCompletion) / 60.0
-         ELSE NULL END       AS DelayHours,
-    rs.PrimaryReasonCode     AS PrimaryReasonCode"
-            + fromJoin + deliveryApply + wherePart + @"
+    o.BOMNO"
+            + fromJoin + wherePart + @"
 ORDER BY o.Priority DESC, o.CustomerDueDate, o.Id   -- tiebreaker：分页确定性（4号位 10-19 §二；全链清扫 8 处之一）
 OFFSET @Skip ROWS FETCH NEXT @Take ROWS ONLY";
 
@@ -150,9 +142,58 @@ OFFSET @Skip ROWS FETCH NEXT @Take ROWS ONLY";
         var total = await _connectionManager.QueryFirstOrDefaultAsync<int>(
             countSql, parameters, CommandType.Text, DatabaseId.APS, commandTimeout: 30);
 
+        var items = results.ToList();
+
+        // 10-31 R2-b 两段式富化：先取本页（无 APPLY），再按 OrderId 批量聚合。
+        // 原「APPLY 挂 ORDER BY+OFFSET」实测逐行 0.25s（200 行 50s → 前端 30s 超时）；
+        // 拆后实测：Task 聚合 ~0.3s、原因码 ~0.01s（20 万单量级版本）。
+        if (items.Count > 0)
+        {
+            var ids = string.Join(",", items.Select(i => i.Id));
+
+            var plannedRows = await _connectionManager.QueryAsync<OrderPlannedCompletionRow>(
+                @"SELECT t.OrderId, MAX(t.PlannedEndTime) AS PlannedCompletion
+                    FROM [Task] t
+                    WHERE t.PlanVersionId = @PlanVersionId
+                      AND t.OrderId IN (SELECT CAST(value AS bigint) FROM STRING_SPLIT(@Ids, ','))
+                    GROUP BY t.OrderId
+                    OPTION (RECOMPILE)",
+                new { PlanVersionId = planVersionId, Ids = ids },
+                CommandType.Text, DatabaseId.APS, commandTimeout: 30);
+
+            // 与原 TOP 1 ORDER BY ImpactHours DESC 同语义（并列均为无序，未新增 tiebreaker）
+            var reasonRows = await _connectionManager.QueryAsync<OrderReasonRow>(
+                $@"SELECT x.OrderId, x.ReasonCode
+                     FROM (SELECT f.OrderId, f.ReasonCode,
+                                  ROW_NUMBER() OVER (PARTITION BY f.OrderId ORDER BY f.ImpactHours DESC) AS rn
+                             FROM ScheduleExplanationFact f
+                            WHERE f.PlanVersionId = @PlanVersionId
+                              AND f.OrderId IN (SELECT CAST(value AS bigint) FROM STRING_SPLIT(@Ids, ','))
+                              AND f.ReasonCode IN ({DeliveryReasonWhitelist})) x
+                    WHERE x.rn = 1",
+                new { PlanVersionId = planVersionId, Ids = ids },
+                CommandType.Text, DatabaseId.APS, commandTimeout: 30);
+
+            var plannedById = plannedRows.ToDictionary(r => r.OrderId, r => r.PlannedCompletion);
+            var reasonById = reasonRows.ToDictionary(r => r.OrderId, r => r.ReasonCode);
+
+            foreach (var item in items)
+            {
+                plannedById.TryGetValue(item.Id, out var completion);
+                item.PlannedCompletionTime = completion;
+                item.PrimaryReasonCode = reasonById.TryGetValue(item.Id, out var code) ? code : null;
+                item.DelayHours = CalcDelayHours(completion, item.CustomerDueDate);
+                // 冻结 01 §64 计划派生延期判定（riskLevel，11-02 口径函 Q1）：无 Task 或无交期 ⇒ 缺键=不可判定（≠未延迟）；
+                // 日期口径与 delayHours 同判据家族（Q1/DelayedOnDate 族）。AT_RISK 无源不出（OrderScheduleSummary 空表）。
+                item.RiskLevel = completion is null || item.CustomerDueDate == default
+                    ? null
+                    : completion.Value.Date > item.CustomerDueDate.Date ? "DELAYED" : "ON_TRACK";
+            }
+        }
+
         return new PageResult<OrderListItemDto>
         {
-            Items = results.ToList(),
+            Items = items,
             Total = total,
             Page = take > 0 ? (skip / take) + 1 : 1,
             PageSize = take
@@ -276,21 +317,21 @@ ORDER BY t.OperationSeq";
         var hasFactories = allowedFactories is { Count: > 0 };
         var hasDomains = allowedDomains is { Count: > 0 };
 
-        // 口径修正（2026-10-17，4号位 联调缺口）：
-        //  ① OnTimeCount 原把 DelayStatus IS NULL 也计入按期 → 全表 DelayStatus 为 NULL 时虚报"全部按期"。
-        //     冻结 07:2666 值域 ON_TIME/FIRST_DELAY/REPEATED_DELAY 不含 NULL；NULL = 未计算，不得算按期。
-        //  ② RiskCount 原查 DelayStatus='RISK' —— 该值不在 DelayStatus 值域内，恒 0。
-        //     风险维度属 07:4965 OrderScheduleSummary.RiskLevel（ON_TRACK/AT_RISK/DELAYED），改从该表取。
-        //  ③ UnscheduledCount 原查 Status='UNSCHEDULED' —— 该值**不在两表任一冻结值域**（Order_Canonical 三值 07:3506 /
-        //     [Order] 六值 07:3611 均无 UNSCHEDULED），恒 0。两表值域系两个语义层、不互斥——0号位第二十轮（10-17）已裁
-        //     （07:3521 禁令限定对象=Order_Canonical+当前准入判断；本注释 10-19 曾误判"冻结内部冲突已转裁决"，据既有裁定撤回，见 2号位 10-19 回函 §1）。
-        //     "未排"无权威字段口径 ⇒ 返回 0，不造假。
+        // 口径史：2026-10-17 ①NULL≠按期 ②RiskCount 改从 OrderScheduleSummary 取（该表现空⇒恒 0，不造假）。
+        // ⚠ 2026-11-02 口径函 Q2 定稿（4号位 发现同页打架，本函数为根因之一）：
+        //   OnTime/Delayed **不再按 o.DelayStatus**——它是订单入库期 ERP 独立维度（07:2688），与本版本排产无关
+        //   （dev 实证：999328 的 5,490 单 FIRST_DELAY 全无 Task；999333 计划超期单反而挂 ON_TIME）。
+        //   冻结 01 §64：计划延期唯一判定 = 本版本 MAX(PlannedEndTime) 日期 vs CustomerDueDate。
+        //   UnscheduledCount（原"无权威口径⇒0"撤销）：本版本无 Task 行即未排产——§64 判定自带该判据，
+        //   与列表富化同一批数据，**未排产单列、不得混入"未延迟"**。RiskCount 维持从 OrderScheduleSummary（空表⇒0）。
         var sql = @"
 SELECT
     @PlanVersionId AS PlanVersionId,   -- 回填入参（此前漏挑该列 → Dapper 填默认 0，4号位 10-14 R5 报）
     COUNT(*) AS TotalCount,
-    SUM(CASE WHEN o.DelayStatus = 'ON_TIME' THEN 1 ELSE 0 END) AS OnTimeCount,
-    SUM(CASE WHEN o.DelayStatus IN ('FIRST_DELAY', 'REPEATED_DELAY') THEN 1 ELSE 0 END) AS DelayedCount,
+    SUM(CASE WHEN tc.OrderId IS NOT NULL AND o.CustomerDueDate IS NOT NULL
+              AND CAST(tc.MaxEnd AS date) <= o.CustomerDueDate THEN 1 ELSE 0 END) AS OnTimeCount,
+    SUM(CASE WHEN tc.OrderId IS NOT NULL AND o.CustomerDueDate IS NOT NULL
+              AND CAST(tc.MaxEnd AS date) >  o.CustomerDueDate THEN 1 ELSE 0 END) AS DelayedCount,
     (SELECT COUNT(*)
        FROM OrderScheduleSummary s
        INNER JOIN [Order] o2 ON o2.Id = s.OrderId AND o2.PlanVersionId = s.PlanVersionId
@@ -299,9 +340,11 @@ SELECT
         AND s.RiskLevel IN ('AT_RISK', 'DELAYED')
         AND (@HasFactories = 0 OR f2.Code IN @AllowedFactories)
         AND (@HasDomains = 0 OR o2.DomainKey IN @AllowedDomains)) AS RiskCount,
-    CAST(0 AS INT) AS UnscheduledCount
+    SUM(CASE WHEN tc.OrderId IS NULL OR o.CustomerDueDate IS NULL THEN 1 ELSE 0 END) AS UnscheduledCount
 FROM [Order] o
 LEFT JOIN Factory f ON f.Id = o.FactoryId
+LEFT JOIN (SELECT OrderId, MAX(PlannedEndTime) AS MaxEnd
+             FROM [Task] WHERE PlanVersionId = @PlanVersionId GROUP BY OrderId) tc ON tc.OrderId = o.Id
 WHERE o.PlanVersionId = @PlanVersionId
     AND (@HasFactories = 0 OR f.Code IN @AllowedFactories)
     AND (@HasDomains = 0 OR o.DomainKey IN @AllowedDomains)";
@@ -319,5 +362,33 @@ WHERE o.PlanVersionId = @PlanVersionId
             sql, parameters, CommandType.Text, DatabaseId.APS, commandTimeout: 10);
 
         return result ?? new OrderSummaryDto { PlanVersionId = planVersionId };
+    }
+
+    /// <summary>
+    /// 延期小时（与旧 SQL `DATEDIFF(MINUTE, CAST(due AS datetime2), completion)/60.0` 等价）：
+    /// 仅当 completion 的**日期** &gt; due 的**日期**时给值（Q1 日期口径）；未排/未延期=null（两态不混）。
+    /// DTO 的 CustomerDueDate 为非空 DateTime，库内 NULL 会落成 0001-01-01，此处按 null 处理（等价 SQL 的 IS NOT NULL 判据）。
+    /// </summary>
+    private static decimal? CalcDelayHours(DateTime? completion, DateTime due)
+    {
+        if (completion is null) return null;
+        if (due == default) return null;
+        if (completion.Value.Date <= due.Date) return null;
+        var minutes = (long)Math.Floor((completion.Value - due).TotalMinutes);
+        return minutes / 60m;
+    }
+
+    /// <summary>两段式富化行：订单预计完成（MAX(PlannedEndTime) 按 OrderId 聚合）</summary>
+    private sealed class OrderPlannedCompletionRow
+    {
+        public long OrderId { get; set; }
+        public DateTime? PlannedCompletion { get; set; }
+    }
+
+    /// <summary>两段式富化行：订单主要原因码（15 码白名单内 ImpactHours 最大者）</summary>
+    private sealed class OrderReasonRow
+    {
+        public long OrderId { get; set; }
+        public string ReasonCode { get; set; } = string.Empty;
     }
 }

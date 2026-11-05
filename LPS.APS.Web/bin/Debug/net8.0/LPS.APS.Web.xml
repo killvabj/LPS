@@ -368,6 +368,13 @@
             <summary>更新参数集版本（P0-02：状态机约束——已发布/失效/归档拒绝原地修改；Status/治理字段冻结，禁止越权改状态）</summary>
             <remarks>开发者：3号位</remarks>
         </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.SaveStageHandoffWaitRules(System.Int64,System.Text.Json.JsonElement,System.Threading.CancellationToken)">
+            <summary>
+            写入参数集版本 Stage 固定交接等待规则（R05 治理写面补全，2026-11-02；仅 DRAFT/SUBMITTED/APPROVED 可改）。
+            请求体为规则 JSON 数组；写前校验 + P1-04 审计；空数组 = 删除该键（C9：本版不用该块）。
+            </summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
         <member name="M:LPS.APS.Web.Controllers.GovernanceController.PublishRuleSetVersion(System.Int64,LPS.APS.Web.Controllers.PublishRequest,System.Threading.CancellationToken)">
             <summary>
             发布规则集版本（六态状态机 R01 验收）
@@ -456,6 +463,13 @@
             <summary>对比两个策略包版本的差异（G5/D3：策略包对比页；裸 DTO，同 D1/D2）</summary>
             <remarks>开发者：3号位</remarks>
         </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.CompareStrategyProfileVersionWith(System.Int64,System.Int64,System.Threading.CancellationToken)">
+            <summary>策略包版本富对比（S12：06 §6.4.1「版本富对比（H1）」；a＝对比方、b＝基准方）</summary>
+            <remarks>
+            开发者：3号位。06 该行只冻结「路径／a、b 为 VersionId／治理读／403」，**字段清单属契约空白**，
+            最小 DTO 已登记为 S-14。参数方向与 <c>plan-version/{a}/compare-with/{b}</c> 同序。
+            </remarks>
+        </member>
         <member name="M:LPS.APS.Web.Controllers.GovernanceController.ValidateRuleSetVersionForPublish(System.Int64,System.Threading.CancellationToken)">
             <summary>校验规则集版本是否可发布（阶段 A-5：发布前完整校验）</summary>
             <remarks>开发者：3号位</remarks>
@@ -475,6 +489,16 @@
         <member name="M:LPS.APS.Web.Controllers.GovernanceController.CreateStrategyProfileVersion(LPS.APS.Core.Entities.APS.StrategyProfileVersion,System.Threading.CancellationToken)">
             <summary>创建策略包版本（P0-02：Service 强制初始状态 DRAFT——入参 Status 一律被忽略覆盖）</summary>
             <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.ValidateVersionCreate(System.Int64,System.String,System.String)">
+            <summary>
+            建版入参边界校验（D-1）：空体或缺必填在入口拦成 400，
+            避免空实体直落数据库被约束拒绝、异常逃逸成 500。
+            </summary>
+            <param name="parentId">父载体 Id（规则集 / 参数集 / 策略包）</param>
+            <param name="parentField">父载体字段名，用于错误提示</param>
+            <param name="versionCode">版本编码</param>
+            <returns>不合法时返回提示文本；合法返回 <c>null</c></returns>
         </member>
         <member name="M:LPS.APS.Web.Controllers.GovernanceController.UpdateStrategyProfileVersion(System.Int64,LPS.APS.Core.Entities.APS.StrategyProfileVersion,System.Threading.CancellationToken)">
             <summary>更新策略包版本（P0-02：状态机约束——已发布/失效/归档拒绝原地修改；Status/治理字段/引用字段冻结，禁止越权改状态）</summary>
@@ -1250,13 +1274,27 @@
             获取计划版本列表（最新优先，默认 30 条，按当前用户业务范围过滤）
             </summary>
         </member>
-        <member name="M:LPS.APS.Web.Controllers.ScheduleController.GetGantt(System.Int32,System.Nullable{System.DateTime},System.Nullable{System.DateTime},System.Int32[],System.Threading.CancellationToken)">
+        <member name="M:LPS.APS.Web.Controllers.ScheduleController.GetGantt(System.Int32,System.Nullable{System.DateTime},System.Nullable{System.DateTime},System.Int32[],System.Nullable{System.Int32},System.Nullable{System.Int32},System.Nullable{System.DateTime},System.Nullable{System.Int64},System.Threading.CancellationToken)">
             <summary>
             获取指定计划版本的甘特图数据（资源行 + 任务条；越权返回空且 ScopeDenied=true）。
-            冻结 05:1013「Gantt按时间窗/资源加载」：支持可选 from / to / resourceIds，不传则全量（向后兼容）。
+            冻结 05:1013「Gantt按时间窗/资源加载」：支持可选 from / to / resourceIds。
             <para>⚠️ <c>resourceIds</c> 只认<b>重复键</b>写法：<c>?resourceIds=1&amp;resourceIds=2</c>。
             逗号形式（<c>1,2</c>）会被模型绑定拒绝（422）；<c>resourceIds[]=1</c> 形式会被静默忽略而返回全量，
             故下方显式拦截，避免调用方误以为过滤生效（4号位 10-17 §3.2）。</para>
+            <para>10-29 分页契约（4号位 三步走·第 1 步，5号位 复函定稿）：
+            <c>limit</c> 缺省 8,000、硬上限 20,000——<b>不传亦按默认截断，"裸调=全量"旧语义终结</b>；
+            翻页=把响应 <c>nextAfter</c> 三元组原样回填 <c>afterResourceId/afterStartAt/afterTaskId</c>（缺一按首页）。
+            响应新增 <c>limit/totalTasks/hasMore/nextAfter</c>；<c>totalTasks</c>=当前过滤口径数（非版本总数）。</para>
+            </summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.ScheduleController.GetGanttBuckets(System.Int32,System.Nullable{System.DateTime},System.Nullable{System.DateTime},System.String,System.Int32[],System.Threading.CancellationToken)">
+            <summary>
+            甘特「资源×时间桶」聚合层（三步走·第 2 步；5号位 2026-10-30 复函九条口径定稿）。
+            <c>from/to 必填</c>（缺→真 400）；<c>bucket=day|week|month</c>（缺省 day）；
+            行数>50,000 自动 day→week→month 降级（回显 <c>bucketWidth/bucketDowngraded</c>），月桶仍超→真 400 要求 resourceIds 收窄。
+            恒等式 <c>Σ items.taskCount == totalTasks</c>（钳制归桶+未排桶）；未排桶行 <c>bucketStart</c> 整键省略；
+            不存在/越权沿用 200+flag（versionExists/scopeDenied）与明细体同惯例。
+            <c>resourceIds</c> 与明细体同款拦截：只认重复键，<c>resourceIds[]</c> 真 400。
             </summary>
         </member>
         <member name="M:LPS.APS.Web.Controllers.ScheduleController.GetSummary(System.Int32,System.Threading.CancellationToken)">
@@ -1271,7 +1309,7 @@
             <summary>
             Setup 换型规则维护 API（4号位 Setup 契约 §11.1，#1-13 端点）。
             路径前缀 /api/governance（与 <see cref="T:LPS.APS.Web.Controllers.GovernanceController"/> 共享前缀，字面路由段不冲突）。
-            权限：查看 aps.setup.view；维护 aps.setup.edit；发布 aps.setup.publish。
+            权限：查看 aps.setup.view；维护 aps.setup.edit；**整版发布挂 aps.rule.publish（P0-A 2026-10-27 核证收口，不得仅持 aps.setup.publish 越权发布①＋⑦）**。
             错误映射：422 数据红线 / 404 不存在 / 400 状态红线与参数 / 403 权限不足（[Authorize]）。
             </summary>
         </member>
@@ -1318,7 +1356,13 @@
             <summary>#12 版本 Setup 换型规则差异（added/modified/removed + 计数）</summary>
         </member>
         <member name="M:LPS.APS.Web.Controllers.SetupRuleController.Publish(System.Int64,LPS.APS.Core.DTOs.Setup.SetupPublishRequest,System.Threading.CancellationToken)">
-            <summary>#13 发布规则集版本（发布前 Setup 冲突全量预校验；权限 aps.setup.publish）</summary>
+            <summary>
+            #13 发布规则集版本（发布前 Setup 冲突全量预校验）。
+            权限 aps.rule.publish（P0-A 2026-10-27 核证收口）：本端点发布的是含需求优先级①的整版规则集，
+            由仅持 aps.setup.publish 越权改为规则集发布权，语义与整版发布对齐（不得仅凭 setup.publish 发布①＋⑦）。
+            端到端 403 负例（仅持 aps.setup.publish、无 aps.rule.publish 主体 → 403 且版本仍 DRAFT）归 WebApplicationFactory
+            集成基建（2号位 运行域），见《…_统一发布门禁_端到端403负例协助请求_3号位致2号位_v1.0》。
+            </summary>
         </member>
         <member name="M:LPS.APS.Web.Controllers.SetupRuleController.LookupDepartments(System.String,System.Threading.CancellationToken,System.Int32)">
             <summary>部门下拉（masterId=Id，code=DeptCode；search 模糊 DeptCode；limit 默认 200，缺省行为不变）</summary>
@@ -1329,7 +1373,7 @@
         <member name="M:LPS.APS.Web.Controllers.SetupRuleController.LookupMaterials(System.String,System.Threading.CancellationToken,System.Boolean,System.Int32)">
             <summary>物料下拉（masterId=Material.Id，code=MaterialCode；search 模糊 MaterialCode/MaterialName/Spec；activeOnly=true 仅活动；limit 默认 200，缺省行为不变）</summary>
         </member>
-        <member name="M:LPS.APS.Web.Controllers.SetupRuleController.GetUncoveredStats(System.Nullable{System.Int32},System.Nullable{System.Int32},System.String,System.Nullable{System.Int32},System.Nullable{System.Int32},System.Threading.CancellationToken)">
+        <member name="M:LPS.APS.Web.Controllers.SetupRuleController.GetUncoveredStats(System.Nullable{System.Int32},System.Nullable{System.Int32},System.String,System.Nullable{System.Int32},System.Nullable{System.Int32},System.Nullable{System.Int32},System.Nullable{System.Int32},System.Threading.CancellationToken)">
             <summary>
             #14 规则缺失（0 分钟兜底）命中频次聚合（uncovered-stats）。
             数据源 = [Task].SetupSource='SETUP_RULE_MISSING_ZERO_FALLBACK' 聚合；四级下钻 runId → 部门 → 工序 → 设备 → 产品。
@@ -1376,6 +1420,11 @@
         </member>
         <member name="M:LPS.APS.Web.Controllers.StageLeadTimeParamController.Deactivate(System.Int32,System.Threading.CancellationToken)">
             <summary>停用阶段提前期参数（软删 IsActive=0，保留历史与生效窗口）。</summary>
+            <param name="id">参数主键（StageLeadTimeParam.Id）</param>
+            <param name="ct">取消令牌</param>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.StageLeadTimeParamController.Activate(System.Int32,System.Threading.CancellationToken)">
+            <summary>恢复启用阶段提前期参数（IsActive 0→1；若 IsDefault=1 须过全局默认唯一，窗口重叠 → 422）。幂等：已启用原样返回。</summary>
             <param name="id">参数主键（StageLeadTimeParam.Id）</param>
             <param name="ct">取消令牌</param>
         </member>
@@ -1436,6 +1485,11 @@
         </member>
         <member name="M:LPS.APS.Web.Controllers.TaskSplitRuleConfigController.Deactivate(System.Int32,System.Threading.CancellationToken)">
             <summary>停用执行批拆分规则（软删 IsActive=0，保留历史与生效窗口）。</summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.TaskSplitRuleConfigController.Activate(System.Int32,System.Threading.CancellationToken)">
+            <summary>恢复启用执行批拆分规则（IsActive 0→1；与其它有效规则窗口重叠 → 422）。幂等：已启用原样返回。</summary>
+            <param name="id">规则主键（TaskSplitRuleConfig.Id）</param>
+            <param name="ct">取消令牌</param>
         </member>
         <member name="T:LPS.APS.Web.Dto.Auth.LoginRequestDto">
             <summary>登录请求</summary>
@@ -1544,8 +1598,15 @@
         <member name="M:LPS.APS.Web.Extensions.HangfireServiceExtensions.UseHangfireJobs(Microsoft.AspNetCore.Builder.WebApplication)">
             <summary>
             注册所有Hangfire定时任务（在 app.Build() 之后调用）
-            开发环境：注册但使用永不触发的cron，仅支持 Dashboard 手动触发
-            生产环境：使用真实cron自动执行
+            开关：<c>Hangfire:CronEnabled</c>
+              · 未配置 ⇒ 沿用环境判据（开发＝只注册不触发、生产＝真定时），行为与改造前一致
+              · false  ⇒ 注册但一律写永不触发的cron，只能从 Dashboard 点 Trigger Now 手动跑
+              · true   ⇒ 写真实cron，到点自动执行
+            为什么要有这个开关：开发阶段后端虽然部署到生产机，但夜间流水线还不该自己跑起来。
+            注意 <c>APS_Hangfire</c> 库是**多实例共享**的，cron 值存在库里（不是各实例各一份）——
+            「哪个实例写了什么」= 最后启动的那个说的算，而到点触发则是**任何连着该库的实例都会做**。
+            ⇒ 该开关只能保证「写进去的是永不触发」，并不能把另一台实例挡在外面；
+               开发机的 Hangfire 实例必须一并关掉，否则两台会互相覆盖、并可能出现双跑。
             </summary>
         </member>
         <member name="T:LPS.APS.Web.Filters.CodeToStatusResultFilter">
@@ -1573,6 +1634,13 @@
             对外只回 message + traceId；异常类型/明细/堆栈**一律不出服务端**（含开发环境）——
             堆栈已由 <c>LogError</c> 完整落日志，响应体带栈帧仅利于排查、无功能价值（4号位 10-17 报障，
             Owner 2026-10-19 裁定本文件 5号位 可改后恢复 10-17 曾被回滚的同一收紧）。
+            </summary>
+        </member>
+        <member name="T:Program">
+            <summary>
+            顶层语句生成的 Program 类默认为 internal，外部工程无法以之作
+            <c>WebApplicationFactory&lt;Program&gt;</c> 的泛型实参（会产生 CS0060 可访问性不一致）。
+            此处显式声明为 public，仅供 <c>LPS.APS.IntegrationTests</c> 进程内启动真实管线使用；不改变任何运行时行为。
             </summary>
         </member>
     </members>

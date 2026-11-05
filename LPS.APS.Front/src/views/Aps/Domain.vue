@@ -14,9 +14,10 @@
  *  - 停用后下拉不可选、CTP/Candidate 不可见；已有 PlanVersion 不影响
  *
  * 角色权限：
- *  - aps.admin.system     可新增/修改/启停
+ *  - aps.admin.system     可新增/修改/启停（且须持权限码 aps.domain.edit）
  *  - 其它角色             只读列表 + 详情
  *  - 4号位不挂 meta.permission，按钮级门控；生产模式由 3号位后端二次校验
+ *  - 2026-10-25 3号位 方案甲：后端 4 写端点改挂 `aps.domain.edit`，授权矩阵 = 仅 aps.admin.system
  */
 
 import { computed, onMounted, reactive, ref, watch } from 'vue'
@@ -63,13 +64,24 @@ const domainStore = useDomainStore()
 const apsAuth = useApsAuthStore()
 const { loading, error, fetchStatus, allActive, byKey, definitions } = storeToRefs(domainStore)
 
-/* ===== 角色门控（v1.2 §23.1 DDL 角色码）=====
- *  - 仅 aps.admin.system 可写；其余角色只读
- *  - 与 router meta apsRequiredRoles: ['aps.admin.system'] 路由级门控双保险
- *  - 不用权限码的原因：排程域维护是「治理类」操作，没有特定「编辑排程域」权限码，
- *    且与后端 [Authorize(Roles = "aps.admin.system")] 一致用角色码
+/* ===== 写权限门控（3号位 2026-10-25 方案甲）=====
+ *  - 后端 4 个写端点改挂独立权限码 `aps.domain.edit`（原误挂 `aps.rule.edit`，
+ *    导致 aps.admin.aps 有 API 写权却无 UI 入口 —— 冻结 §4.1 冲突，10-25 已由后端修正）
+ *  - 授权矩阵：`aps.domain.edit` → 仅 `aps.admin.system`（3号位 §三）
+ *  - 故前端按「角色 + 权限码」双条件判：角色管「谁该维护」，权限码管「后端认不认」
+ *  - 与 router meta apsRequiredRoles: ['aps.admin.system'] 路由级门控一致（3号位 §五 P3：路由不改）
+ *  ⚠️ 权限码在 JWT 里 ⇒ 授权变更后必须**重新登录**才看得到（刷新页面不够）
  */
-const canWrite = computed(() => apsAuth.roles.includes('aps.admin.system'))
+const canWrite = computed(
+  () => apsAuth.roles.includes('aps.admin.system') && apsAuth.has('aps.domain.edit')
+)
+
+/** 不能写的原因（两态分说：不是系统管理员 vs 是系统管理员但没拿到域维护权限） */
+const writeDeniedReason = computed<string>(() => {
+  if (canWrite.value) return ''
+  if (!apsAuth.roles.includes('aps.admin.system')) return '需要系统管理员角色'
+  return '还没有排程域维护权限，请联系管理员开通'
+})
 
 /* ===== 字典 ===== */
 const SCOPE_TYPE_OPTIONS: Array<{ value: DomainScopeType; label: string }> = [
@@ -590,7 +602,7 @@ onMounted(async () => {
           </ElButton>
           <ElTooltip
             v-else-if="!canWrite && emptyReason === 'no-config'"
-            content="需要系统管理员角色"
+            :content="writeDeniedReason"
             placement="top"
           >
             <ElButton size="small" disabled>
@@ -814,7 +826,6 @@ onMounted(async () => {
               <ElTag :type="currentDetail.isActive ? 'success' : 'info'" size="small">
                 {{ currentDetail.isActive ? '已启用' : '已停用' }}
               </ElTag>
-              <span class="meta-hint"> · 启停用请用右上方按钮（专用端点） </span>
             </ElDescriptionsItem>
             <ElDescriptionsItem label="创建人">{{
               currentDetail.createdBy ?? '—'
@@ -832,7 +843,7 @@ onMounted(async () => {
 
           <!-- 保存按钮 -->
           <div class="detail-actions">
-            <ElTooltip v-if="!canWrite" content="需要系统管理员角色" placement="top">
+            <ElTooltip v-if="!canWrite" :content="writeDeniedReason" placement="top">
               <ElButton type="primary" disabled>
                 <Icon icon="vi-mdi:content-save" /> 保存
               </ElButton>
@@ -1296,11 +1307,6 @@ onMounted(async () => {
 
 .meta-desc {
   margin-bottom: 16px;
-}
-.meta-hint {
-  font-size: 12px;
-  color: var(--el-text-color-secondary);
-  margin-left: 4px;
 }
 
 .detail-actions {

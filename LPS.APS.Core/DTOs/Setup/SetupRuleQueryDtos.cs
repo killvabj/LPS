@@ -48,6 +48,17 @@ public sealed class SetupRuleSetVersionDto
     /// <summary>所属规则集</summary>
     public long RuleSetId { get; set; }
 
+    /// <summary>
+    /// 所属规则集编码（P2 2026-10-28 补：由 RuleSet 主表 JOIN 回带）。
+    /// 依据 aps.planner 仅持 aps.setup.view 不持 aps.rule.view（4号位 dev 实测 403），
+    /// 前端 Setup 三页在版本下拉需直接分辨所属规则集，故在 #11（挂 aps.setup.view）回带，
+    /// 使 planner 无需扩权即可满足 SET-UI-01「显示 RuleSet 编码 + 版本号 + 状态」。
+    /// </summary>
+    public string RuleSetCode { get; set; } = string.Empty;
+
+    /// <summary>所属规则集名称（P2 同批回带，前端展示 label）</summary>
+    public string? RuleSetName { get; set; }
+
     /// <summary>版本编码</summary>
     public string VersionCode { get; set; } = string.Empty;
 

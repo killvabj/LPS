@@ -20,7 +20,10 @@ public class PhaseTwoOperationPlanningModeTests
 {
     private readonly FiniteCapacitySolver _solver = new();
 
-    private static DomainSolveRequest BuildRequest(string planningMode, bool withEligibility)
+    private static DomainSolveRequest BuildRequest(
+        string planningMode,
+        bool withEligibility,
+        decimal plannedProcessQty = 1m)
     {
         var day = new DateTime(2026, 9, 1);
         return new DomainSolveRequest
@@ -34,13 +37,13 @@ public class PhaseTwoOperationPlanningModeTests
                 new() { LogicalDemandKey = "D1", PlanVersionId = 1L, DomainKey = "DOMAIN",
                     AllocationSequence = 1, DemandKey = "D1", MaterialId = 1, FactoryId = 1,
                     StartStageCode = "STAGE1",
-                    NetOutputQty = 1m, PlannedProcessQty = 1m,
+                    NetOutputQty = plannedProcessQty, PlannedProcessQty = plannedProcessQty,
                     RequiredAvailableTime = day.AddDays(20), DemandSequence = 1 }
             },
             RoutingOperations = new List<RoutingOperation>
             {
                 new() { MaterialId = 1, ProductionDepartmentId = 100, RouteCode = "DEFAULT",
-                    OperationCode = "OP10", StageCode = "STAGE1", StandardDuration = 30m,
+                    OperationCode = "OP10", StageCode = "STAGE1", StandardDuration = 30m * 60m,
                     OperationPlanningMode = planningMode }
             },
             OperationResourceEligibility = withEligibility
@@ -94,6 +97,38 @@ public class PhaseTwoOperationPlanningModeTests
         Assert.Null(task.ResourceId);   // 等待约束：不占资源，仅占工艺时间
     }
 
+    /// <summary>
+    /// **2026-10-28｜R05-27-09**（0号位《01_正式回复1号位_R04秒转分钟唯一装配_WAIT_ONLY_AUTO与R06本地先修…》§1-R05-27-09）：
+    /// `WAIT_ONLY` 是**整批固定等待** ⇒ 时长 = `StandardDuration`（**×1**，与件数无关）；
+    /// `UNCONSTRAINED` 仍是**每件标准工时** ⇒ 保留 `× PlannedProcessQty`。
+    /// 反例锁：Qty=100 时 WAIT_ONLY 若被倍乘就会从 30 分钟变成 3000 分钟。
+    /// </summary>
+    [Fact]
+    public async Task WAIT_ONLY_固定等待不随数量倍乘_UNCONSTRAINED仍按件累加()
+    {
+        // WAIT_ONLY：30 分钟固定等待，1 件与 100 件都是 30 分钟
+        var wait1 = await _solver.SolveAsync(BuildRequest("WAIT_ONLY", withEligibility: false, plannedProcessQty: 1m));
+        var wait100 = await _solver.SolveAsync(BuildRequest("WAIT_ONLY", withEligibility: false, plannedProcessQty: 100m));
+
+        Assert.True(wait1.Success, wait1.ErrorMessage);
+        Assert.True(wait100.Success, wait100.ErrorMessage);
+        Assert.Equal(30d, DurationMinutes(wait1), 3);
+        Assert.Equal(30d, DurationMinutes(wait100), 3);
+
+        // 对照：UNCONSTRAINED 是每件工时 ⇒ 100 件 = 3000 分钟（不得被同一条规矩误伤）
+        var unconstrained100 = await _solver.SolveAsync(
+            BuildRequest("UNCONSTRAINED", withEligibility: false, plannedProcessQty: 100m));
+
+        Assert.True(unconstrained100.Success, unconstrained100.ErrorMessage);
+        Assert.Equal(3000d, DurationMinutes(unconstrained100), 3);
+    }
+
+    private static double DurationMinutes(DomainSolveResult result)
+    {
+        var task = Assert.Single(result.FinalTasks);
+        return (task.PlannedEndTime - task.PlannedStartTime).TotalMinutes;
+    }
+
     [Fact]
     public async Task FINITE_RESOURCE_无资源工序_fail_closed不产Task()
     {
@@ -137,7 +172,7 @@ public class PhaseTwoOperationPlanningModeTests
             {
                 // 人工槽工序仍是 FINITE_RESOURCE（人工槽是「资源」，不改变 PlanningMode）
                 new() { MaterialId = 1, ProductionDepartmentId = 100, RouteCode = "DEFAULT",
-                    OperationCode = "OP10", StageCode = "STAGE1", StandardDuration = 30m,
+                    OperationCode = "OP10", StageCode = "STAGE1", StandardDuration = 30m * 60m,
                     OperationPlanningMode = "FINITE_RESOURCE" }
             },
             OperationResourceEligibility = new List<OperationResourceEligibility>

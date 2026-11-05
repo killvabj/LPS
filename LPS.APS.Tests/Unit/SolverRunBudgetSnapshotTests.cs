@@ -179,7 +179,7 @@ public class SolverRunBudgetSnapshotTests
                     MaterialId = MaterialId, ProductionDepartmentId = DeptId,
                     RouteCode = "RT", PathId = 1,
                     OperationCode = "OP10", StageCode = "STAGE1",
-                    StandardDuration = 1m, OperationPlanningMode = "FINITE_RESOURCE"
+                    StandardDuration = 1m * 60m, OperationPlanningMode = "FINITE_RESOURCE"
                 }
             },
             RoutingDependencies = Array.Empty<LPS.APS.Core.Entities.APS.RoutingDependency>(),

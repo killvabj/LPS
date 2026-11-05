@@ -191,7 +191,8 @@ OFFSET @Skip ROWS FETCH NEXT @Take ROWS ONLY;";
         {
             if (e.WeekdayIso is < 1 or > 7)
                 throw new ArgumentException($"WeekdayIso 须 1..7：{e.WeekdayIso}");
-            ValidateStateAndTimes(e.WorkState, e.StartAt, e.EndAt, e.AllowLowerOverride, false);
+            ValidateFlags(e.AllowLowerOverride, null);
+            ValidateStateAndTimes(e.WorkState, e.StartAt, e.EndAt);
         }
 
         // 校验①（多窗口版）：同星期允许多条并存（白班/小夜/大夜多班制），但窗口不得重叠；
@@ -241,7 +242,7 @@ WHERE ScopeType=@st AND FactoryId=@fid
                     wd = (byte?)wd, workDate = (DateTime?)null,
                     s = e.StartAt, en = e.EndAt,   // OFF 时段行的时间同样保留（全天 OFF 双 NULL）
                     stt = NormalizeState(e.WorkState),
-                    alo = e.AllowLowerOverride ? 1 : 0, aao = 0,
+                    alo = 1, aao = 1,   // 部门自主模式(11-04 Owner裁决)：两旗恒1，落库位与入参解耦
                     ss = request.SourceSystem, sr = request.SourceReference,
                     eff, effTo = (DateTime?)null, op = @operator
                 }, CommandType.Text, DatabaseId.APS, 30);
@@ -255,10 +256,9 @@ WHERE ScopeType=@st AND FactoryId=@fid
     public async Task<long> CreateExceptionAsync(WorkCalendarExceptionRequest request, int actorUserId, string @operator, CancellationToken ct = default)
     {
         var (scopeType, factoryId, deptId) = await ValidateScopeAsync(request.ScopeType, request.FactoryId, request.ProductionDepartmentId, actorUserId, ct);
-        ValidateStateAndTimes(request.WorkState, request.StartAt, request.EndAt, request.AllowLowerOverride, request.IsAuthorizedOverride);
-        // 校验④ 授权加班证据
-        if (request.IsAuthorizedOverride && string.IsNullOrWhiteSpace(request.SourceReference))
-            throw new ArgumentException("IsAuthorizedOverride=1 必须携 SourceReference（审批单号等证据）");
+        ValidateFlags(request.AllowLowerOverride, request.IsAuthorizedOverride);
+        ValidateStateAndTimes(request.WorkState, request.StartAt, request.EndAt);
+        // 校验④（授权加班证据）已随「部门自主模式」废止（11-04 Owner 裁决）：SourceReference 降为可选留痕字段。
         if (request.EffectiveTo is not null && request.EffectiveTo < request.EffectiveFrom)
             throw new ArgumentException("EffectiveTo 不得早于 EffectiveFrom");
 
@@ -286,7 +286,7 @@ WHERE ScopeType=@st AND FactoryId=@fid
             wd = (byte?)null, workDate = workDate,
             s = request.StartAt, en = request.EndAt,   // OFF 时段行的时间同样保留（全天 OFF 双 NULL）
             stt = NormalizeState(request.WorkState),
-            alo = request.AllowLowerOverride ? 1 : 0, aao = request.IsAuthorizedOverride ? 1 : 0,
+            alo = 1, aao = 1,   // 部门自主模式(11-04 Owner裁决)：两旗恒1
             ss = request.SourceSystem, sr = request.SourceReference,
             eff = request.EffectiveFrom == default ? workDate : request.EffectiveFrom.Date,
             effTo = request.EffectiveTo?.Date, op = @operator
@@ -457,7 +457,7 @@ VALUES
     private static string FmtEntry(WeeklyCalendarEntry e)
         => $"{NormalizeState(e.WorkState)} {e.StartAt:hh\\:mm}-{e.EndAt:hh\\:mm}";
 
-    private static void ValidateStateAndTimes(string state, TimeSpan? start, TimeSpan? end, bool allowLower, bool authOverride)
+    internal static void ValidateStateAndTimes(string state, TimeSpan? start, TimeSpan? end)
     {
         var s = NormalizeState(state);
         if (s != "WORK" && s != "OFF")
@@ -466,10 +466,15 @@ VALUES
             throw new ArgumentException("WORK 行必须含 StartAt<EndAt");
         if (s == "OFF" && start is not null && end is not null && start >= end)
             throw new ArgumentException("OFF 时段行须 StartAt<EndAt（全天则两者均空）");
-        if (allowLower && s != "OFF")
-            throw new ArgumentException("AllowLowerOverride 仅可挂 OFF 行");
-        if (authOverride && s != "WORK")
-            throw new ArgumentException("IsAuthorizedOverride 仅可挂 WORK 行");
+        // 原"AllowLowerOverride 仅可挂 OFF / IsAuthorizedOverride 仅可挂 WORK"两条分挂规则
+        //   已随「部门自主模式」废止（11-04 Owner 裁决）；旗位校验移入 ValidateFlags。
+    }
+
+    /// <summary>部门自主模式（11-04 Owner 裁决）：两旗恒=1——null（缺省）按默认1放行，显式 false 一律拒绝。</summary>
+    internal static void ValidateFlags(bool? allowLowerOverride, bool? isAuthorizedOverride)
+    {
+        if (allowLowerOverride == false || isAuthorizedOverride == false)
+            throw new ArgumentException("部门自主模式：AllowLowerOverride / IsAuthorizedOverride 固定为 1，不接受 0");
     }
 
     // 重叠判定：OFF 全天(双NULL)视作覆盖 00:00-24:00；区间半开 [start,end)，相切不重叠

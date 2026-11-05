@@ -244,7 +244,7 @@ public class ContinuityShareTests
             PathId = 1,   // 与 D() 中连续份额声明的 PathId 一致（固定路径图键 = ("DEFAULT", 1)）
             OperationCode = opCode,
             StageCode = stage,
-            StandardDuration = 60m,
+            StandardDuration = 60m * 60m,
             SetupTime = 0m
         }).ToList();
 

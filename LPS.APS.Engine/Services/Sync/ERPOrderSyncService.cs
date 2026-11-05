@@ -228,11 +228,35 @@ public class ERPOrderSyncService : IERPOrderSyncService
     /// 批量写入 ERP_Order_Staging 表（SyncStatus = PENDING）
     /// 使用 SqlBulkCopy 高性能写入
     /// ⚠️ 写入前按 OrderNo 去重，避免 ODS 视图返回重复数据导致违反唯一约束
-    /// ⚠️ 写入后按「同一 OrderNo 只保留最新一条 PENDING」收敛：增量同步整体失败时不推进水位线
+    /// ⚠️ 写入后按「同一 OrderNo 只保留最新一条（PENDING / FAILED / PROCESSED）」收敛：增量同步整体失败时不推进水位线
     ///    （见 IncrementalSyncAsync），下一轮会重新拉取同一批订单。若同一 OrderNo 存在两条 PENDING，
     ///    sp_ValidateAndPromoteOrders 的 MERGE 源侧无去重、按 OrderNo 匹配 ⇒ 8672「多行匹配同一目标行」
     ///    ⇒ 事务整体回滚 ⇒ 每次重试都失败，无法自愈。唯一约束为 (OrderNo, SyncedAt)，
     ///    重试写入新 SyncedAt 不会自动拦截，故须收敛。
+    ///
+    /// 【为什么 FAILED 也进收敛集】
+    ///   · sp_ValidateAndPromoteOrders 的 PHASE 0 只锁 `SyncStatus='PENDING'`，行一旦被判 FAILED
+    ///     就永远不再进入提升流程；若收敛只认 PENDING，每次全量同步都会在原处再留一份 FAILED 副本，
+    ///     表随同步轮次线性膨胀（2026-11-02 实测：602,826 行 FAILED 只对应 130,953 个单号，平均 4.6 份）。
+    ///   · 把 FAILED 纳入收敛**不影响提升到 Order_Canonical**：本语句删的每一行都满足
+    ///     「同 OrderNo 存在 SyncedAt/Id 更新的一行」，且 SP 全部判定都写死 `SyncStatus='PENDING'`
+    ///     （SP 第 63 行 PHASE 0、第 288 行 1g 及其余各处），删 FAILED 行与提升集合无交集。
+    ///   · 只要该单号没有再同步进来更新的行，它最近一次的 FAILED 就原样保留 ⇒ 失败诊断不丢。
+    ///
+    /// 【为什么 PROCESSED 也进收敛集】（2026-11-02 补，用户指出「Staging 与 Order_Canonical 应当一样多」）
+    ///   · 症结：PROCESSED 行**从来没被收敛过**，也没有任何兜底删除会跑到它头上 ——
+    ///     唯一的 `CleanupOldStagingRecordsAsync` 只在**全量同步前**删「7 天以上的 PROCESSED」，
+    ///     而全量是 00:30 定时任务，生产 `Hangfire:CronEnabled=false` 时根本不跑。
+    ///   · 后果：同一单号每被重新同步一次就多一行流水。实测 `P17180982` 在 2026-10-30 的
+    ///     10:43 / 10:59 / 11:35 各同步一次 ⇒ **3 行 PROCESSED，数据完全相同**；
+    ///     全库同 (OrderNo, SourceOrderId) 多行的有 **247,563 组**，
+    ///     `PROCESSED` 653,262 行只对应 259,586 个单号（2.5 倍）。
+    ///   · 纳入收敛后，每个 OrderNo 在 Staging 里**恒定只有 1 行**（最近一次同步的结果：
+    ///     PROCESSED=已进 Order / FAILED=没进 / PENDING=待校验），Staging 单号数
+    ///     ≡ `Order_Canonical` ∩ 源视图 ∪ 失败单，用户要的「两边对得上」才成立。
+    ///   · 会不会丢事实：**不会**。被删的是同单号的旧流水行，订单事实在 `Order_Canonical`
+    ///     （实测 368,015 行 / 368,015 个单号，**0 重复**）；SP 的判定集合只看 `PENDING`，
+    ///     删 PROCESSED 碰不到提升。
     ///
     /// 【为什么是「写入后收敛」，不是「写入前全表清空」（0号位 第二十二轮 J22-01 / P0）】
     ///   · 写入前 `DELETE … WHERE SyncStatus='PENDING'` 无批次／来源约束，会把**其它批次、并发调用
@@ -331,18 +355,24 @@ public class ERPOrderSyncService : IERPOrderSyncService
         // 先写本次批次：写入失败时上一轮的残留 PENDING 原样保留（不丢事实）。
         await _connectionManager.BulkInsertAsync(dataTable, "ERP_Order_Staging", DatabaseId.APS);
 
-        // 再收敛重复：同一 OrderNo 只保留 SyncedAt 最新的一条 PENDING（本次刚写入的那条）。
-        // 影响范围仅限「本 OrderNo 自己」，不触碰其它批次／并发调用的 PENDING；
-        // 被收敛的是同单号的旧待处理副本，该订单的最新事实仍在，不会造成订单事实丢失。
+        // 再收敛重复：同一 OrderNo 只保留 SyncedAt 最新的一条（PENDING / FAILED / PROCESSED 同属待收敛集）。
+        // 影响范围仅限「本 OrderNo 自己」，不触碰其它批次／并发调用的行；
+        // 被收敛的是同单号的旧副本，该订单的最新事实仍在，不会造成订单事实丢失。
+        //
+        // ⚠ FAILED 为什么必须一起收敛、以及为什么不会影响提升到 Order_Canonical：
+        //    见本方法 XML 注释「为什么 FAILED 也进收敛集」。一句话：SP 只读 PENDING，删 FAILED 碰不到提升集合。
+        // ⚠ PROCESSED 同理：见 XML 注释「为什么 PROCESSED 也进收敛集」。
+        //    SP 的判定集合是 PENDING（第 62 行）、提升源是 VALIDATED（第 382 行），
+        //    删 PROCESSED 既碰不到校验也碰不到提升；订单事实在 Order_Canonical（一单一行）。
         var purged = await _connectionManager.ExecuteAsync(
             @"DELETE stale
               FROM ERP_Order_Staging AS stale
-              WHERE stale.SyncStatus = 'PENDING'
+              WHERE stale.SyncStatus IN ('PENDING', 'FAILED', 'PROCESSED')
                 AND EXISTS (
                     SELECT 1
                     FROM ERP_Order_Staging AS newer
                     WHERE newer.OrderNo    = stale.OrderNo
-                      AND newer.SyncStatus = 'PENDING'
+                      AND newer.SyncStatus IN ('PENDING', 'FAILED', 'PROCESSED')
                       AND (newer.SyncedAt > stale.SyncedAt
                            OR (newer.SyncedAt = stale.SyncedAt AND newer.Id > stale.Id))
                 );",
@@ -351,7 +381,7 @@ public class ERPOrderSyncService : IERPOrderSyncService
         if (purged > 0)
         {
             _logger.LogWarning(
-                "写入后收敛同单号旧 PENDING: {Count} 条（上轮整体失败遗留，已被本次最新记录覆盖）", purged);
+                "写入后收敛同单号旧副本（PENDING/FAILED/PROCESSED）: {Count} 条（已被该单号最新记录覆盖）", purged);
         }
     }
 
@@ -438,28 +468,36 @@ public class ERPOrderSyncService : IERPOrderSyncService
     /// 清理Staging表历史数据
     /// 策略：
     /// - 全量同步前清理所有残留 PENDING 记录（马上要重新拉全量，旧的无意义）
-    /// - 保留7天内已处理(PROCESSED)的记录用于审计追溯
-    /// - 保留所有失败(FAILED)记录用于问题排查
-    /// - 删除7天前已处理的记录，避免表无限增长
+    /// - **不再按 7 天删除 PROCESSED**（2026-11-02 撤）
+    /// - 不删任何失败(FAILED)记录：本函数不做 FAILED 的收敛，表内「每单号一条 FAILED」
+    ///   由 BulkWriteToStagingAsync 的写入后收敛维持
+    ///
+    /// 【为什么撤掉「删 7 天以上 PROCESSED」】
+    ///   · 主因：这条是 PROCESSED 唯一的兜底删除，而它**只在全量同步前跑**；全量是 00:30 定时任务，
+    ///     生产 `Hangfire:CronEnabled=false` 时根本不跑 ⇒ 兜底长期失效，PROCESSED 无限膨胀
+    ///     （实测 653,262 行只对应 259,586 个单号）。
+    ///   · 副作用：它把「已掉出 ODS 源视图」的老单的 PROCESSED 行删掉，而这些单不会再有新行补进来
+    ///     ⇒ 制造出「`Order_Canonical` 有、`ERP_Order_Staging` 没有」的孤儿。实测 105,760 单，
+    ///     全部创建于 2026-10-08～10-19，且抽样到 ODS 视图查 5 个命中 0。
+    ///   · 撤掉后增长仍有界：收敛到「每单号 1 行」后，行数上限＝曾同步过的不同单号数，
+    ///     与 `Order_Canonical` 同量级，不会无限涨。保留最近一次同步结果也便于排查。
     /// 调用时机：全量同步开始前
     /// </summary>
     private async Task CleanupOldStagingRecordsAsync()
     {
         try
         {
-            var sql = @"
+            // ⚠ 只清残留 PENDING：全量马上重新拉一遍，旧 PENDING 若留着会被一并提升，
+            //   其中已掉出 ODS 源视图的老单会被「复活」进 Order_Canonical，故必须清。
+            const string sql = @"
                 DELETE FROM ERP_Order_Staging
-                WHERE SyncStatus = 'PENDING';
-
-                DELETE FROM ERP_Order_Staging
-                WHERE SyncStatus = 'PROCESSED'
-                  AND ProcessedAt < DATEADD(DAY, -7, GETDATE())";
+                WHERE SyncStatus = 'PENDING';";
 
             var deletedCount = await _connectionManager.ExecuteAsync(sql, db: DatabaseId.APS);
 
             if (deletedCount > 0)
             {
-                _logger.LogDebug("清理Staging历史: {Count} 条（含残留PENDING）", deletedCount);
+                _logger.LogDebug("清理Staging残留PENDING: {Count} 条", deletedCount);
             }
         }
         catch (Exception ex)

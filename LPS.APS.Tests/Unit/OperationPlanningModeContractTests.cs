@@ -638,7 +638,7 @@ public class OperationPlanningModeContractTests
                     MaterialId = MaterialId, ProductionDepartmentId = DeptId,
                     RouteCode = "RT", PathId = 1,
                     OperationCode = "OP10", StageCode = "STAGE1",
-                    StandardDuration = 1m, OperationPlanningMode = planningMode
+                    StandardDuration = 1m * 60m, OperationPlanningMode = planningMode
                 }
             },
             RoutingDependencies = new List<RoutingDependency>(),
@@ -722,7 +722,7 @@ public class OperationPlanningModeContractTests
                     MaterialId = p.MaterialId, ProductionDepartmentId = DeptId,
                     RouteCode = p.RouteCode, PathId = p.PathId,
                     OperationCode = op, StageCode = stage,
-                    StandardDuration = 1m, OperationPlanningMode = p.PlanningMode
+                    StandardDuration = 1m * 60m, OperationPlanningMode = p.PlanningMode
                 });
 
                 foreach (var (rid, cf) in p.Eligibility)
@@ -854,7 +854,7 @@ public class OperationPlanningModeContractTests
                                 OperationCode = "OP10", StageCode = "STAGE1",
                                 RouteCode = "RT", PathId = 1,
                                 ProductionDepartmentId = DeptId,
-                                StandardDuration = 1m,
+                                StandardDuration = 1m * 60m,
                                 OperationPlanningMode = "FINITE_RESOURCE"
                             }
                         },

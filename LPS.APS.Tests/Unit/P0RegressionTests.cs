@@ -311,7 +311,7 @@ public class P0RegressionTests
             RouteCode = "DEFAULT",
             OperationCode = opCode,
             StageCode = "STAGE1",
-            StandardDuration = standardDuration,
+            StandardDuration = standardDuration * 60m,
             SetupTime = setup
         };
 

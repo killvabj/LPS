@@ -9,7 +9,8 @@
     - parameterSetVersionId 必填，int —— 通过 ParameterSet → ParameterSetVersion 双级 ElSelect 选择
     - effectiveFrom      可选
     - effectiveTo        可选
-    - isDefault          仅在 Profile 已有 PUBLISHED 时显示（红线 UI 三重防护 #1）
+    - IsDefault 不在本表单内：Create 强制 false、Update 冻结既有值（C-7），
+      默认只能对 PUBLISHED 版本在列表点「设为默认」显式置位
 
   v1.6 4号位 补登（历史引用 v1.4 §十八.10）修复 P1-12 反馈 500 Internal Server Error：
     原 ElInputNumber 让用户自由填 ID；FK_StrategyProfileVersion_RuleSetVersion 不通过即 SqlException → 500。
@@ -42,7 +43,6 @@ import { computed, onMounted, reactive, ref, watch } from 'vue'
 import {
   ElAlert,
   ElButton,
-  ElCheckbox,
   ElDatePicker,
   ElDialog,
   ElForm,
@@ -71,8 +71,6 @@ const props = defineProps<{
   profile: StrategyProfileDto | null
   /** 编辑模式时：当前版本（创建模式可空） */
   version?: StrategyProfileVersionDto | null
-  /** 已有任何 PUBLISHED 版本 → 决定 IsDefault 勾选框是否显示 */
-  hasPublished: boolean
   /** 提交中（父组件 loading 状态） */
   submitting?: boolean
 }>()
@@ -90,7 +88,6 @@ interface DraftForm {
   parameterSetVersionId: number | undefined
   effectiveFrom: string | undefined
   effectiveTo: string | undefined
-  isDefault: boolean
 }
 
 const form = reactive<DraftForm>({
@@ -100,8 +97,7 @@ const form = reactive<DraftForm>({
   parameterSetId: undefined,
   parameterSetVersionId: undefined,
   effectiveFrom: undefined,
-  effectiveTo: undefined,
-  isDefault: false
+  effectiveTo: undefined
 })
 
 const formRef = ref<InstanceType<typeof ElForm> | null>(null)
@@ -228,7 +224,6 @@ watch(
       form.parameterSetVersionId = props.version.parameterSetVersionId
       form.effectiveFrom = props.version.effectiveFrom ?? undefined
       form.effectiveTo = props.version.effectiveTo ?? undefined
-      form.isDefault = props.version.isDefault
       // 10-14（A5）：列表 DTO 已带 ruleSetId / parameterSetId，一级下拉直接定位父主表，
       // 由 watch 触发版本加载（loader 会保留仍属该主表的已选版本）——零额外请求。
       if (props.version.ruleSetId != null) form.ruleSetId = props.version.ruleSetId
@@ -241,7 +236,6 @@ watch(
       form.parameterSetVersionId = undefined
       form.effectiveFrom = undefined
       form.effectiveTo = undefined
-      form.isDefault = false
       ruleSetVersions.value = []
       parameterSetVersions.value = []
     }
@@ -288,8 +282,7 @@ async function onSubmit(): Promise<void> {
     ruleSetVersionId: form.ruleSetVersionId!,
     parameterSetVersionId: form.parameterSetVersionId!,
     effectiveFrom: form.effectiveFrom ?? null,
-    effectiveTo: form.effectiveTo ?? null,
-    isDefault: form.isDefault
+    effectiveTo: form.effectiveTo ?? null
   }
   emit('submit', input)
 }
@@ -412,25 +405,11 @@ async function onSubmit(): Promise<void> {
         />
       </ElFormItem>
 
-      <ElFormItem v-if="hasPublished" label="设为默认">
-        <ElCheckbox v-model="form.isDefault"> 标记此版本为 Profile 的默认 PUBLISHED </ElCheckbox>
-      </ElFormItem>
-
       <ElAlert type="info" :closable="false" show-icon class="d-alert">
         <template #title>状态流转</template>
-        {{ mode === 'create' ? '创建后状态固定为「草稿」' : '仅「草稿」状态可编辑' }}； 发布时调用
-        <code>POST /strategy-profile/version/{id}/publish</code>， 退役仅对已发布状态生效。
-      </ElAlert>
-
-      <ElAlert
-        v-if="hasPublished && form.isDefault"
-        type="warning"
-        :closable="false"
-        show-icon
-        class="d-alert"
-      >
-        <template #title>设为默认版本的影响</template>
-        发布后，同一策略包下原有的默认版本会被自动取消默认。
+        {{ mode === 'create' ? '创建后状态固定为「草稿」' : '仅「草稿」状态可编辑' }}；
+        发布后版本变为「已发布」， 但不会自动成为默认 ——
+        需要运行侧使用它时，请在版本列表点「设为默认」。
       </ElAlert>
     </ElForm>
     <template #footer>

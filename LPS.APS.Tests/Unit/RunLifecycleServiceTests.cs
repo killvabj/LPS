@@ -1,5 +1,6 @@
 using FluentAssertions;
 using LPS.APS.Application.Services;
+using LPS.APS.Application.Services.Query;
 using LPS.APS.Core.Authorization;
 using LPS.APS.Core.Dto;
 using LPS.APS.Core.DTOs.Governance;
@@ -30,6 +31,9 @@ public class RunLifecycleServiceTests
     private readonly Mock<IParameterSetVersionRepository> _parameterSetRepo = new();
     private readonly Mock<IAuditLogRepository> _auditRepo = new();
     private readonly Mock<IDataScopeService> _dataScopeService = new();
+    private readonly Mock<IDomainDefinitionService> _domainDefinitionService = new();
+    private readonly Mock<IMasterDataLookupRepository> _masterDataLookup = new();
+    private readonly Mock<IOverviewQueryRepository> _overviewQueryRepo = new();
     private readonly Mock<ISchedulingOrchestrator> _schedulingOrchestrator = new();
     private readonly Mock<IScheduleRunService> _scheduleRunService = new();
     private readonly RunLifecycleService _service;
@@ -40,6 +44,15 @@ public class RunLifecycleServiceTests
         _dataScopeService
             .Setup(s => s.EnsureInScopeAsync(It.IsAny<int>(), It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
             .Returns(Task.CompletedTask);
+
+        // 缺口A（R11-3B 项1）：默认启用域集为空 → 跳过 ProductFamily/Factory 两维校验（既有用例零感知）；
+        // ResolveScopeAsync 默认 Global（全放行），仅显式配范围的用例才参与判定。
+        _domainDefinitionService
+            .Setup(s => s.GetActiveDomainsAsync(It.IsAny<CancellationToken>()))
+            .ReturnsAsync(Array.Empty<DomainDefinitionInfo>());
+        _dataScopeService
+            .Setup(s => s.ResolveScopeAsync(It.IsAny<int>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(DataScopeContext.Global);
 
         // P1-02：3→2 排程发令枪默认成功（2号位 主流程不在单测内重演）
         _schedulingOrchestrator
@@ -59,6 +72,9 @@ public class RunLifecycleServiceTests
             _parameterSetRepo.Object,
             _auditRepo.Object,
             _dataScopeService.Object,
+            _domainDefinitionService.Object,
+            _masterDataLookup.Object,
+            _overviewQueryRepo.Object,
             _schedulingOrchestrator.Object,
             _scheduleRunService.Object,
             NullLogger<RunLifecycleService>.Instance);
@@ -88,6 +104,22 @@ public class RunLifecycleServiceTests
             TriggeredBy = "API",
             DataCutoffTime = DateTime.Now,
             StrategyProfileVersionId = 11,
+            ExpectedDomainKeysJson = expectedJson,
+            StartedAt = DateTime.Now,
+        };
+
+    /// <summary>构造带冻结 Base 锚点的来源 Run（P0-08 项2：BasePlanVersionId 权威落盘，激活重查当前 ACTIVE 用）</summary>
+    private static ScheduleRunGov BaseFrozenCandidateRun(int id = 2, int? basePlanVersionId = null,
+        string? runType = "MANUAL_RESCHEDULE", string? expectedJson = """["D1"]""")
+        => new()
+        {
+            Id = id,
+            RunType = runType,
+            Status = "RUNNING",
+            TriggeredBy = "API",
+            DataCutoffTime = DateTime.Now,
+            StrategyProfileVersionId = 11,
+            BasePlanVersionId = basePlanVersionId,
             ExpectedDomainKeysJson = expectedJson,
             StartedAt = DateTime.Now,
         };
@@ -531,6 +563,56 @@ public class RunLifecycleServiceTests
             It.IsAny<PlanVersion>(), It.IsAny<string>(), It.IsAny<DateTime>(), It.IsAny<CancellationToken>()), Times.Never);
     }
 
+    [Fact]
+    public async Task Activate_Base已被顶替为新的ACTIVE_拒激活()
+    {
+        // Arrange（P0-08 项2 / R11-3B：Base 陈旧/被顶替禁直接采用，防并发竞态）
+        // 候选 5 的冻结 Base = 50（来源 Run.BasePlanVersionId）；但同域当前 ACTIVE 已是新的 60（50 已被顶替 ARCHIVED）
+        var version = CandidateVersion(5, "D1");
+        _planVersionRepo.Setup(r => r.GetByIdAsync(5, It.IsAny<CancellationToken>())).ReturnsAsync(version);
+        _auditRepo.Setup(r => r.GetByEntityAsync("PlanVersion", "5", It.IsAny<CancellationToken>()))
+            .ReturnsAsync(ConfirmedLogs());
+        _scheduleRunRepo.Setup(r => r.GetByIdAsync(2, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(BaseFrozenCandidateRun(2, basePlanVersionId: 50));
+        // 重查：冻结 Base(50) 存在，但当前 ACTIVE 已是 60 → Base 陈旧
+        _planVersionRepo.Setup(r => r.GetByIdAsync(50, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(ActiveBase(id: 50, domainKey: "D1"));
+        _planVersionRepo.Setup(r => r.GetActiveByDomainKeyAsync("D1", It.IsAny<CancellationToken>()))
+            .ReturnsAsync(ActiveBase(id: 60, domainKey: "D1"));
+
+        // Act
+        var act = async () => await _service.ActivateCandidateAsync(5, 1, "u1", CancellationToken.None);
+
+        // Assert：Base 已被顶替 → 拒直接采用，不触发原子替换
+        await act.Should().ThrowAsync<InvalidOperationException>()
+            .WithMessage("*Base 已被顶替/变更*");
+        _planVersionRepo.Verify(r => r.ReplaceActiveAsync(
+            It.IsAny<PlanVersion>(), It.IsAny<string>(), It.IsAny<DateTime>(), It.IsAny<CancellationToken>()), Times.Never);
+    }
+
+    [Fact]
+    public async Task Activate_Base仍为当前ACTIVE_可激活()
+    {
+        // Arrange（P0-08 项2 正例：冻结 Base 仍是当前 ACTIVE，不因重查误阻断）
+        var version = CandidateVersion(5, "D1");
+        _planVersionRepo.Setup(r => r.GetByIdAsync(5, It.IsAny<CancellationToken>())).ReturnsAsync(version);
+        _auditRepo.Setup(r => r.GetByEntityAsync("PlanVersion", "5", It.IsAny<CancellationToken>()))
+            .ReturnsAsync(ConfirmedLogs());
+        _scheduleRunRepo.Setup(r => r.GetByIdAsync(2, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(BaseFrozenCandidateRun(2, basePlanVersionId: 50));
+        _planVersionRepo.Setup(r => r.GetByIdAsync(50, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(ActiveBase(id: 50, domainKey: "D1"));
+        _planVersionRepo.Setup(r => r.GetActiveByDomainKeyAsync("D1", It.IsAny<CancellationToken>()))
+            .ReturnsAsync(ActiveBase(id: 50, domainKey: "D1"));
+
+        // Act
+        await _service.ActivateCandidateAsync(5, 1, "u1", CancellationToken.None);
+
+        // Assert：Base 仍为当前 ACTIVE → 正常激活（正式采用）
+        version.Status.Should().Be("ACTIVE");
+        _planVersionRepo.Verify(r => r.ReplaceActiveAsync(version, "u1", It.IsAny<DateTime>(), It.IsAny<CancellationToken>()), Times.Once);
+    }
+
     // ==================== GetRunDomainStatusAsync（G8 域级状态；先判 Status 再判身份） ====================
 
     /// <summary>构造某 Run 下属的 PlanVersion（身份 VersionCategory 与进度 Status 两列分别指定）</summary>
@@ -625,7 +707,7 @@ public class RunLifecycleServiceTests
         _scheduleRunRepo.Setup(r => r.GetByIdAsync(999, It.IsAny<CancellationToken>())).ReturnsAsync((ScheduleRunGov?)null);
 
         // Act
-        var act = async () => await _service.RecoverFailedRunAsync(999, 1, CancellationToken.None);
+        var act = async () => await _service.RecoverFailedRunAsync(999, 1, "zhangsan", CancellationToken.None);
 
         // Assert
         await act.Should().ThrowAsync<InvalidOperationException>();
@@ -640,7 +722,7 @@ public class RunLifecycleServiceTests
         _scheduleRunRepo.Setup(r => r.GetByIdAsync(1, It.IsAny<CancellationToken>())).ReturnsAsync(run);
 
         // Act
-        var act = async () => await _service.RecoverFailedRunAsync(1, 1, CancellationToken.None);
+        var act = async () => await _service.RecoverFailedRunAsync(1, 1, "zhangsan", CancellationToken.None);
 
         // Assert
         await act.Should().ThrowAsync<InvalidOperationException>();
@@ -663,7 +745,7 @@ public class RunLifecycleServiceTests
             .ReturnsAsync(new List<PlanVersion>());
 
         // Act
-        var newId = await _service.RecoverFailedRunAsync(1, 1, CancellationToken.None);
+        var newId = await _service.RecoverFailedRunAsync(1, 1, "zhangsan", CancellationToken.None);
 
         // Assert：返回新 Id、继承 StrategyProfileVersionId + ExpectedDomainKeysJson 基线、一域一壳（2 壳）、旧 FAILED 记录不动
         newId.Should().Be(100);
@@ -673,7 +755,7 @@ public class RunLifecycleServiceTests
                 && s.ExpectedDomainKeysJson == """["D1","D2"]"""
                 && s.RunType == "FULL_SCHEDULE"),
             It.Is<IReadOnlyList<RecoveryShellSpec>>(shells => shells.Count == 2),
-            It.IsAny<string>(),
+            "zhangsan",   // 冻结主体＝恢复人登录名，不再写死 'Recover'（否则范围守卫整轮拒）
             It.IsAny<CancellationToken>()), Times.Once);
         failed.Status.Should().Be("FAILED");   // 旧记录不回改 RUNNING
         _auditRepo.Verify(r => r.AddAsync(
@@ -693,7 +775,7 @@ public class RunLifecycleServiceTests
         _scheduleRunRepo.Setup(r => r.GetByIdAsync(1, It.IsAny<CancellationToken>())).ReturnsAsync(failed);
 
         // Act
-        var act = async () => await _service.RecoverFailedRunAsync(1, 1, CancellationToken.None);
+        var act = async () => await _service.RecoverFailedRunAsync(1, 1, "zhangsan", CancellationToken.None);
 
         // Assert：不新建、旧记录不动
         await act.Should().ThrowAsync<InvalidOperationException>();
@@ -711,7 +793,7 @@ public class RunLifecycleServiceTests
         _scheduleRunRepo.Setup(r => r.GetByIdAsync(2, It.IsAny<CancellationToken>())).ReturnsAsync(failed);
 
         // Act
-        var act = async () => await _service.RecoverFailedRunAsync(2, 1, CancellationToken.None);
+        var act = async () => await _service.RecoverFailedRunAsync(2, 1, "zhangsan", CancellationToken.None);
 
         // Assert：拒绝且不新建（旧记录不动、不产生 RUNNING 壳）
         await act.Should().ThrowAsync<InvalidOperationException>()
@@ -719,6 +801,25 @@ public class RunLifecycleServiceTests
         _scheduleRunRepo.Verify(r => r.InsertForRecoveryWithShellsAsync(
             It.IsAny<ScheduleRunGov>(), It.IsAny<IReadOnlyList<RecoveryShellSpec>>(), It.IsAny<string>(), It.IsAny<CancellationToken>()), Times.Never);
         failed.Status.Should().Be("FAILED");
+    }
+
+    [Fact]
+    public async Task Recover_操作人登录名为空_抛异常且不新建()
+    {
+        // Arrange：FAILED 的 FULL_SCHEDULE 基线合法，但操作人登录名缺失（JWT 无 Name 声明时 GetCurrentUserCode() 返回空串）
+        var failed = FullRun(1, expectedJson: """["D1"]""");
+        failed.Status = "FAILED";
+        _scheduleRunRepo.Setup(r => r.GetByIdAsync(1, It.IsAny<CancellationToken>())).ReturnsAsync(failed);
+
+        // Act
+        var act = async () => await _service.RecoverFailedRunAsync(1, 1, "  ", CancellationToken.None);
+
+        // Assert：fail-fast —— 不读旧 Run、不新建 RUNNING（否则新 Run 主体为空，范围守卫必整轮拒）
+        await act.Should().ThrowAsync<InvalidOperationException>()
+            .WithMessage("*actorUserCode*");
+        _scheduleRunRepo.Verify(r => r.GetByIdAsync(It.IsAny<int>(), It.IsAny<CancellationToken>()), Times.Never);
+        _scheduleRunRepo.Verify(r => r.InsertForRecoveryWithShellsAsync(
+            It.IsAny<ScheduleRunGov>(), It.IsAny<IReadOnlyList<RecoveryShellSpec>>(), It.IsAny<string>(), It.IsAny<CancellationToken>()), Times.Never);
     }
 
     // ==================== GetRunReferenceTraceAsync ====================
@@ -828,7 +929,7 @@ public class RunLifecycleServiceTests
     /// <summary>给每个用例铺默认策略版本 mock（合法窗口）</summary>
     private void SetupDefaultStrategyVersions(int count = 1)
         => _strategyProfileVersionRepo
-            .Setup(r => r.GetDefaultByRunTypeAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .Setup(r => r.GetDefaultByRunTypeOrFallbackAsync(It.IsAny<string>(), It.IsAny<DateTime>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(DefaultStrategyVersions(count));
 
     [Fact]
@@ -942,6 +1043,132 @@ public class RunLifecycleServiceTests
         await act.Should().ThrowAsync<InvalidOperationException>();
         _scheduleRunRepo.Verify(r => r.CreateCandidateRunAsync(
             It.IsAny<CandidateRunCreateSpec>(), It.IsAny<long>(), It.IsAny<string>(), It.IsAny<CancellationToken>()), Times.Never);
+    }
+
+    [Fact]
+    public async Task Create_业务范围未授权Domain_抛ScopeViolation()
+    {
+        // Arrange（R11-3B 项1「无权403」Service 端证明：F-G4 Domain 维度 fail-closed）
+        // 用户 DataScopePolicy 仅授权 D2，目标 Domain=D1 → EnsureDomainInScopeAsync（RunLifecycleService:487）抛 ScopeViolationException
+        // （Web 层 GovernanceController.CreateCandidateRun 现已有独立 catch 映射 403，不再被 InvalidOperation 分支吞成 400）
+        _planVersionRepo.Setup(r => r.GetActiveByDomainKeyAsync("D1", It.IsAny<CancellationToken>())).ReturnsAsync(ActiveBase());
+        SetupDefaultStrategyVersions();
+        _dataScopeService
+            .Setup(s => s.EnsureInScopeAsync(It.IsAny<int>(), DataScopeTypes.Domain, "D1", It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new ScopeViolationException(DataScopeTypes.Domain, "D1"));
+
+        // Act
+        var act = async () => await _service.CreateCandidateRunAsync(DaytimeSpec(), 1, CancellationToken.None);
+
+        // Assert：范围拒绝（派生 InvalidOperationException，Web 层映射 403），不触发任何仓储写
+        await act.Should().ThrowAsync<ScopeViolationException>();
+        _scheduleRunRepo.Verify(r => r.CreateCandidateRunAsync(
+            It.IsAny<CandidateRunCreateSpec>(), It.IsAny<long>(), It.IsAny<string>(), It.IsAny<CancellationToken>()), Times.Never);
+    }
+
+    // ==================== 缺口A（R11-3B 项1）：Domain 所属 ProductFamily / Factory 两维范围（范围C） ====================
+
+    /// <summary>铺 Create 走通所需的既有前置（Base ACTIVE + 唯一默认策略版本 + 原子写返回）</summary>
+    private void SetupCreateHappyPath()
+    {
+        _planVersionRepo.Setup(r => r.GetActiveByDomainKeyAsync("D1", It.IsAny<CancellationToken>())).ReturnsAsync(ActiveBase());
+        SetupDefaultStrategyVersions();
+        _scheduleRunRepo.Setup(r => r.CreateCandidateRunAsync(
+                It.IsAny<CandidateRunCreateSpec>(), It.IsAny<long>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new CandidateRunCreatedResult { NewScheduleRunId = 200, NewPlanVersionId = 300 });
+    }
+
+    /// <summary>铺 D1 域定义（FAMILY 类，无工厂）与用户范围策略</summary>
+    private void SetupFamilyDomainAndScope(params (string ScopeType, string ScopeValue)[] policies)
+    {
+        _domainDefinitionService
+            .Setup(s => s.GetActiveDomainsAsync(It.IsAny<CancellationToken>()))
+            .ReturnsAsync([new DomainDefinitionInfo("D1", "FAMILY", 1, null)]);
+        _dataScopeService
+            .Setup(s => s.ResolveScopeAsync(It.IsAny<int>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(DataScopeContext.FromPolicies(policies));
+    }
+
+    [Fact]
+    public async Task Create_产品族维度已配且命中_放行()
+    {
+        // Arrange：域 D1 → ProductFamily Id=1 → Code=CYL；用户授权 ProductFamily=CYL（交集命中）
+        SetupFamilyDomainAndScope((DataScopeTypes.ProductFamily, "CYL"));
+        _masterDataLookup.Setup(m => m.GetProductFamilyCodeAsync(1, It.IsAny<CancellationToken>())).ReturnsAsync("CYL");
+        SetupCreateHappyPath();
+
+        // Act
+        var result = await _service.CreateCandidateRunAsync(DaytimeSpec(), 1, CancellationToken.None);
+
+        // Assert
+        result.NewScheduleRunId.Should().Be(200);
+    }
+
+    [Fact]
+    public async Task Create_产品族维度已配但不命中_抛ScopeViolation且不写()
+    {
+        // Arrange：域 → CYL；用户只授权 FRL → 交集为空，拒绝
+        SetupFamilyDomainAndScope((DataScopeTypes.ProductFamily, "FRL"));
+        _masterDataLookup.Setup(m => m.GetProductFamilyCodeAsync(1, It.IsAny<CancellationToken>())).ReturnsAsync("CYL");
+        SetupCreateHappyPath();
+
+        // Act
+        var act = async () => await _service.CreateCandidateRunAsync(DaytimeSpec(), 1, CancellationToken.None);
+
+        // Assert
+        await act.Should().ThrowAsync<ScopeViolationException>();
+        _scheduleRunRepo.Verify(r => r.CreateCandidateRunAsync(
+            It.IsAny<CandidateRunCreateSpec>(), It.IsAny<long>(), It.IsAny<string>(), It.IsAny<CancellationToken>()), Times.Never);
+    }
+
+    [Fact]
+    public async Task Create_未配产品族维度_不构成拒绝理由_放行()
+    {
+        // Arrange：范围C——用户只配了 Domain 维度，未配 ProductFamily → 该维度不参与交集
+        SetupFamilyDomainAndScope((DataScopeTypes.Domain, "D1"));
+        SetupCreateHappyPath();
+
+        // Act
+        var result = await _service.CreateCandidateRunAsync(DaytimeSpec(), 1, CancellationToken.None);
+
+        // Assert
+        result.NewScheduleRunId.Should().Be(200);
+    }
+
+    [Fact]
+    public async Task Create_已配产品族但主档解析不出Code_拒绝()
+    {
+        // Arrange：域指向脏 Id（主档无该 Id → null），已配该维度用户不得因数据脏而放行（fail-closed）
+        SetupFamilyDomainAndScope((DataScopeTypes.ProductFamily, "FRL"));
+        _masterDataLookup.Setup(m => m.GetProductFamilyCodeAsync(1, It.IsAny<CancellationToken>())).ReturnsAsync((string?)null);
+        SetupCreateHappyPath();
+
+        // Act
+        var act = async () => await _service.CreateCandidateRunAsync(DaytimeSpec(), 1, CancellationToken.None);
+
+        // Assert
+        await act.Should().ThrowAsync<ScopeViolationException>();
+    }
+
+    [Fact]
+    public async Task Create_工厂维度已配但不命中_抛ScopeViolation()
+    {
+        // Arrange：FACTORY_FAMILY 域（FactoryId=7 → Code=BJ）；用户只授权 Factory=SUZ
+        _domainDefinitionService
+            .Setup(s => s.GetActiveDomainsAsync(It.IsAny<CancellationToken>()))
+            .ReturnsAsync([new DomainDefinitionInfo("D1", "FACTORY_FAMILY", 1, 7)]);
+        _dataScopeService
+            .Setup(s => s.ResolveScopeAsync(It.IsAny<int>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(DataScopeContext.FromPolicies([(DataScopeTypes.Factory, "SUZ")]));
+        _masterDataLookup.Setup(m => m.GetProductFamilyCodeAsync(1, It.IsAny<CancellationToken>())).ReturnsAsync("CYL");
+        _masterDataLookup.Setup(m => m.GetFactoryCodeAsync(7, It.IsAny<CancellationToken>())).ReturnsAsync("BJ");
+        SetupCreateHappyPath();
+
+        // Act
+        var act = async () => await _service.CreateCandidateRunAsync(DaytimeSpec(), 1, CancellationToken.None);
+
+        // Assert
+        await act.Should().ThrowAsync<ScopeViolationException>();
     }
 
     [Fact]
@@ -1069,5 +1296,258 @@ public class RunLifecycleServiceTests
         // Assert：异常向上传播；不产生审计（无孤立写入）
         await act.Should().ThrowAsync<InvalidOperationException>();
         _auditRepo.Verify(r => r.AddAsync(It.IsAny<AuditLog>(), It.IsAny<CancellationToken>()), Times.Never);
+    }
+
+    // ==================== 缺口A（R11-3B）：确认 / 激活两路径的三维业务范围（2026-10-30 补齐） ====================
+    // 背景：创建路径早已判 Domain + ProductFamily + Factory 三维，确认/激活两条路径原先只判 Domain 一维。
+    // 0号位 R11-3b 要求「创建/激活 Candidate 时」三维无权限一律 403 ⇒ 这两条用例钉住补齐后的行为。
+
+    /// <summary>铺「域 D1 → 产品族 Id=1 → Code=CYL」，用户授权 ProductFamily=FRL（不命中）。</summary>
+    private void SetupDomainAndMismatchedProductFamilyScope()
+    {
+        _domainDefinitionService
+            .Setup(s => s.GetActiveDomainsAsync(It.IsAny<CancellationToken>()))
+            .ReturnsAsync([new DomainDefinitionInfo("D1", "FAMILY", 1, null)]);
+        _dataScopeService
+            .Setup(s => s.ResolveScopeAsync(It.IsAny<int>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(DataScopeContext.FromPolicies(
+            [
+                (DataScopeTypes.Domain, "D1"),
+                (DataScopeTypes.ProductFamily, "FRL"),
+            ]));
+        _masterDataLookup
+            .Setup(m => m.GetProductFamilyCodeAsync(1, It.IsAny<CancellationToken>()))
+            .ReturnsAsync("CYL");
+    }
+
+    [Fact]
+    public async Task Confirm_产品族维度越界_抛ScopeViolation且不写审计()
+    {
+        // Arrange
+        var version = CandidateVersion(5, "D1");
+        _planVersionRepo.Setup(r => r.GetByIdAsync(5, It.IsAny<CancellationToken>())).ReturnsAsync(version);
+        SetupDomainAndMismatchedProductFamilyScope();
+
+        // Act
+        var act = async () => await _service.ConfirmCandidateAsync(5, 1, "u1", null, CancellationToken.None);
+
+        // Assert：与创建路径同口径——不能只判 Domain 一维
+        await act.Should().ThrowAsync<ScopeViolationException>();
+        _auditRepo.Verify(r => r.AddAsync(It.IsAny<AuditLog>(), It.IsAny<CancellationToken>()), Times.Never,
+            "越界确认不得留下 ConfirmCandidate 审计（否则会变成激活的硬前置）");
+    }
+
+    [Fact]
+    public async Task Activate_产品族维度越界_抛ScopeViolation且不改状态()
+    {
+        // Arrange
+        var version = CandidateVersion(5, "D1");
+        _planVersionRepo.Setup(r => r.GetByIdAsync(5, It.IsAny<CancellationToken>())).ReturnsAsync(version);
+        SetupDomainAndMismatchedProductFamilyScope();
+
+        // Act
+        var act = async () => await _service.ActivateCandidateAsync(5, 1, "u1", CancellationToken.None);
+
+        // Assert：越界在写状态之前拦住，PlanVersion 与同域 ACTIVE 都不动
+        await act.Should().ThrowAsync<ScopeViolationException>();
+        version.Status.Should().Be("CANDIDATE");
+        _planVersionRepo.Verify(
+            r => r.ReplaceActiveAsync(It.IsAny<PlanVersion>(), It.IsAny<string>(), It.IsAny<DateTime>(), It.IsAny<CancellationToken>()),
+            Times.Never, "越界激活不得触发同域 ACTIVE 的原子替换");
+    }
+
+    // ==================== R11-3b 对象级三维「真实变更范围」复核（0号位 裁决 v1.1）====================
+
+    /// <summary>激活常见 Setup：版本 + 已确认 + 来源 Run 可激活（对象级复核后置通过则走通整激活链）</summary>
+    private void SetupActivationBaseline(int planVersionId = 5)
+    {
+        var version = CandidateVersion(planVersionId, "D1");
+        _planVersionRepo.Setup(r => r.GetByIdAsync(planVersionId, It.IsAny<CancellationToken>())).ReturnsAsync(version);
+        _auditRepo.Setup(r => r.GetByEntityAsync("PlanVersion", planVersionId.ToString(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(ConfirmedLogs(planVersionId));
+        _scheduleRunRepo.Setup(r => r.GetByIdAsync(2, It.IsAny<CancellationToken>())).ReturnsAsync(CandidateRun(2));
+        // 来源 Run 冻结 Base = 50，且同域当前 ACTIVE 就是 50（Base 未顶替，可激活）
+        _planVersionRepo.Setup(r => r.GetByIdAsync(50, It.IsAny<CancellationToken>())).ReturnsAsync(ActiveBase());
+        _planVersionRepo.Setup(r => r.GetActiveByDomainKeyAsync("D1", It.IsAny<CancellationToken>())).ReturnsAsync(ActiveBase());
+    }
+
+    [Fact]
+    public async Task Activate_对象级部门未授权_抛ScopeViolation且不改状态()
+    {
+        // Arrange（切面3：真实变更范围——Task 实际落到未授权部门 → 激活前拒绝）
+        SetupActivationBaseline();
+        _domainDefinitionService
+            .Setup(s => s.GetActiveDomainsAsync(It.IsAny<CancellationToken>()))
+            .ReturnsAsync([new DomainDefinitionInfo("D1", "FAMILY", 1, null)]);
+        _dataScopeService
+            .Setup(s => s.ResolveScopeAsync(It.IsAny<int>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(DataScopeContext.FromPolicies(
+            [
+                (DataScopeTypes.Domain, "D1"),
+                (DataScopeTypes.Department, "DEP1"),
+            ]));
+        // 该版本实际 Task.ProductionDepartmentId=7 → 换算 Code=DEP OTHER，不在授权
+        _overviewQueryRepo
+            .Setup(r => r.GetPlanVersionObjectScopeDimensionsAsync(5, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new PlanVersionObjectScopeDimensions
+            {
+                DepartmentIds = [7],
+            });
+        _masterDataLookup.Setup(m => m.GetDepartmentCodeAsync(7, It.IsAny<CancellationToken>())).ReturnsAsync("DEP_OTHER");
+
+        // Act
+        var act = async () => await _service.ActivateCandidateAsync(5, 1, "u1", CancellationToken.None);
+
+        // Assert：真实部门越权 → 激活前拒绝，不改状态、不原子替换
+        await act.Should().ThrowAsync<ScopeViolationException>();
+        _planVersionRepo.Verify(r => r.ReplaceActiveAsync(
+            It.IsAny<PlanVersion>(), It.IsAny<string>(), It.IsAny<DateTime>(), It.IsAny<CancellationToken>()), Times.Never);
+    }
+
+    [Fact]
+    public async Task Activate_对象级工厂未授权_抛ScopeViolation()
+    {
+        // Arrange（切面2/6：真实 Order.FactoryId 越权 → 拒绝）
+        SetupActivationBaseline();
+        _dataScopeService
+            .Setup(s => s.ResolveScopeAsync(It.IsAny<int>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(DataScopeContext.FromPolicies(
+            [
+                (DataScopeTypes.Domain, "D1"),
+                (DataScopeTypes.Factory, "SUZ"),
+            ]));
+        _overviewQueryRepo
+            .Setup(r => r.GetPlanVersionObjectScopeDimensionsAsync(5, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new PlanVersionObjectScopeDimensions
+            {
+                FactoryIds = [7],          // 主档解析 BJ，不在 SUZ 授权
+                ProductFamilyIds = [1],    // 未配族维 → 不构成约束
+            });
+        _masterDataLookup.Setup(m => m.GetFactoryCodeAsync(7, It.IsAny<CancellationToken>())).ReturnsAsync("BJ");
+
+        // Act
+        var act = async () => await _service.ActivateCandidateAsync(5, 1, "u1", CancellationToken.None);
+
+        // Assert
+        await act.Should().ThrowAsync<ScopeViolationException>();
+        _planVersionRepo.Verify(r => r.ReplaceActiveAsync(
+            It.IsAny<PlanVersion>(), It.IsAny<string>(), It.IsAny<DateTime>(), It.IsAny<CancellationToken>()), Times.Never);
+    }
+
+    [Fact]
+    public async Task Activate_对象级全维度命中授权_正常激活()
+    {
+        // Arrange（切面1：合法局部 Candidate —— 工厂/族/部门全命中 → 放行）
+        SetupActivationBaseline();
+        _dataScopeService
+            .Setup(s => s.ResolveScopeAsync(It.IsAny<int>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(DataScopeContext.FromPolicies(
+            [
+                (DataScopeTypes.Domain, "D1"),
+                (DataScopeTypes.Factory, "SUZ"),
+                (DataScopeTypes.ProductFamily, "CYL"),
+                (DataScopeTypes.Department, "DEP1"),
+            ]));
+        _overviewQueryRepo
+            .Setup(r => r.GetPlanVersionObjectScopeDimensionsAsync(5, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new PlanVersionObjectScopeDimensions
+            {
+                FactoryIds = [7],
+                ProductFamilyIds = [1],
+                DepartmentIds = [9],
+            });
+        _masterDataLookup.Setup(m => m.GetFactoryCodeAsync(7, It.IsAny<CancellationToken>())).ReturnsAsync("SUZ");
+        _masterDataLookup.Setup(m => m.GetProductFamilyCodeAsync(1, It.IsAny<CancellationToken>())).ReturnsAsync("CYL");
+        _masterDataLookup.Setup(m => m.GetDepartmentCodeAsync(9, It.IsAny<CancellationToken>())).ReturnsAsync("DEP1");
+
+        // Act
+        await _service.ActivateCandidateAsync(5, 1, "u1", CancellationToken.None);
+
+        // Assert：三维全命中 → 正常激活，替换同域 ACTIVE 一次 + 审计
+        _planVersionRepo.Verify(r => r.ReplaceActiveAsync(
+            It.IsAny<PlanVersion>(), "u1", It.IsAny<DateTime>(), It.IsAny<CancellationToken>()), Times.Once);
+        _auditRepo.Verify(r => r.AddAsync(
+            It.Is<AuditLog>(l => l.ActionCode == "ActivateCandidate"),
+            It.IsAny<CancellationToken>()), Times.Once);
+    }
+
+    [Fact]
+    public async Task Activate_Global用户_对象级复核放行()
+    {
+        // Arrange（切面1反例：Global 全维度放行，不触发对象级取数）
+        SetupActivationBaseline();
+        _dataScopeService
+            .Setup(s => s.ResolveScopeAsync(It.IsAny<int>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(DataScopeContext.Global);
+
+        // Act
+        await _service.ActivateCandidateAsync(5, 1, "u1", CancellationToken.None);
+
+        // Assert：Global → 正常激活；对象级取数不应被调用（Global 早在 ResolveScope 即放行）
+        _planVersionRepo.Verify(r => r.ReplaceActiveAsync(
+            It.IsAny<PlanVersion>(), "u1", It.IsAny<DateTime>(), It.IsAny<CancellationToken>()), Times.Once);
+        _overviewQueryRepo.Verify(
+            r => r.GetPlanVersionObjectScopeDimensionsAsync(It.IsAny<int>(), It.IsAny<CancellationToken>()),
+            Times.Never, "Global 用户不得触发对象级取数");
+    }
+
+    [Fact]
+    public async Task Activate_对象级主档解析失败_抛ScopeViolation()
+    {
+        // Arrange（切面7）：真实对象指向脏主档（FactoryId=7 换算不出 Code）→ fail-closed 拒绝，不因数据脏而放行
+        SetupActivationBaseline();
+        _dataScopeService
+            .Setup(s => s.ResolveScopeAsync(It.IsAny<int>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(DataScopeContext.FromPolicies(
+            [
+                (DataScopeTypes.Domain, "D1"),
+                (DataScopeTypes.Factory, "SUZ"),
+            ]));
+        _overviewQueryRepo
+            .Setup(r => r.GetPlanVersionObjectScopeDimensionsAsync(5, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new PlanVersionObjectScopeDimensions { FactoryIds = [7] });
+        _masterDataLookup
+            .Setup(m => m.GetFactoryCodeAsync(7, It.IsAny<CancellationToken>()))
+            .ReturnsAsync((string?)null);   // 脏主档：解析不出
+
+        // Act
+        var act = async () => await _service.ActivateCandidateAsync(5, 1, "u1", CancellationToken.None);
+
+        // Assert：fail-closed，不改状态、不原子替换
+        await act.Should().ThrowAsync<ScopeViolationException>();
+        _planVersionRepo.Verify(r => r.ReplaceActiveAsync(
+            It.IsAny<PlanVersion>(), It.IsAny<string>(), It.IsAny<DateTime>(), It.IsAny<CancellationToken>()), Times.Never);
+    }
+
+    [Fact]
+    public async Task Activate_对象级空集合_放行()
+    {
+        // Arrange（边界）：该版本无 Order/Task 维度可越权 → 空集合放行；同域 ACTIVE 替换放行
+        SetupActivationBaseline();
+        _dataScopeService
+            .Setup(s => s.ResolveScopeAsync(It.IsAny<int>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(DataScopeContext.FromPolicies(
+            [
+                (DataScopeTypes.Domain, "D1"),
+                (DataScopeTypes.Factory, "SUZ"),
+                (DataScopeTypes.ProductFamily, "CYL"),
+                (DataScopeTypes.Department, "DEP1"),
+            ]));
+        _overviewQueryRepo
+            .Setup(r => r.GetPlanVersionObjectScopeDimensionsAsync(5, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new PlanVersionObjectScopeDimensions
+            {
+                FactoryIds = [],
+                ProductFamilyIds = [],
+                DepartmentIds = [],
+                NullDepartmentTaskCount = 0,
+            });
+
+        // Act
+        await _service.ActivateCandidateAsync(5, 1, "u1", CancellationToken.None);
+
+        // Assert：空集 → 无对象可越权 → 正常激活（替换同域 ACTIVE 一次）
+        _planVersionRepo.Verify(r => r.ReplaceActiveAsync(
+            It.IsAny<PlanVersion>(), "u1", It.IsAny<DateTime>(), It.IsAny<CancellationToken>()), Times.Once);
     }
 }

@@ -31,6 +31,17 @@ public class FiniteCapacitySolver : IFiniteCapacityScheduler
         DomainSolveRequest request,
         CancellationToken cancellationToken = default)
     {
+        // ── 2026-11-05 运行中进度信标 ──
+        //   背景：Run 999401 第 1 域进入本方法后日志 15 分钟一行不动，外部无法区分「在算」与「卡死」。
+        //   开关 `APS_SOLVER_BEACON=1` 时，每 30 秒往 stdout 打一行 ASCII：
+        //     phase      —— 当前阶段（Phase1..Phase5）
+        //     p2=x/y     —— Phase2 已处理需求 / 总需求
+        //     p4=x/y     —— Phase4 已修复单元 / 总单元
+        //     trials     —— 批方案候选试排累计次数
+        //     slotSearch / attempts —— 找槽检索次数 / 尝试次数
+        //   未设该环境变量时 `StartBeacon()` 返回 null，`using var` 对 null 是空操作 ⇒ **零行为变化**。
+        using var beacon = SolverDiagnostics.StartBeacon();
+
         // ── V1_4 NEW-06：**未开计数作用域时自动建立** ──
         //   复审 NEW-06 判词（本号位核对：**成立**）：V1_3 的预算快照只写 `SolverDiagnostics.Current`
         //   （`AsyncLocal`），而正常生产 Run **从未** `BeginScope()` ⇒ 全部记录静默丢弃 ⇒
@@ -39,13 +50,25 @@ public class FiniteCapacitySolver : IFiniteCapacityScheduler
         //     使 Phase 计时 / 计数器 / 预算快照在**任何** Run 下都被记录（作用域在本方法返回前释放）。
         //   成本：每次 Run 一个小对象 + 5 个 Phase 计时器（相对一次完整排程可忽略）；
         //     另有一条**与作用域无关**的进程级可检索快照（`SolverDiagnostics.LastRunBudgetSnapshot`）。
-        if (SolverDiagnostics.HasScope)
+        // ── R11（2026-10-29）：三类分类的「取消/超时」一半 ──
+        //   超时与人工取消在求解器内部同形（都是 `OperationCanceledException`），
+        //   只有调用方的 `CancellationTokenSource` 知道是哪一种。这里只记「在哪一阶段被中断」，
+        //   类别由调用方判定；异常**原样上抛**（不吞、不改对外契约、不伪造一个 Success=false 结果）。
+        try
         {
+            if (SolverDiagnostics.HasScope)
+            {
+                return await SolveCoreAsync(request, cancellationToken).ConfigureAwait(false);
+            }
+
+            using var autoScope = SolverDiagnostics.BeginScope();
             return await SolveCoreAsync(request, cancellationToken).ConfigureAwait(false);
         }
-
-        using var autoScope = SolverDiagnostics.BeginScope();
-        return await SolveCoreAsync(request, cancellationToken).ConfigureAwait(false);
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            SolverDiagnostics.RecordCancellation(SolverDiagnostics.LiveSnapshot?.CurrentPhase ?? "Unknown");
+            throw;
+        }
     }
 
     /// <summary>
@@ -92,7 +115,19 @@ public class FiniteCapacitySolver : IFiniteCapacityScheduler
             return await Task.FromResult(new DomainSolveResult
             {
                 Success = false,
-                ErrorMessage = "输入契约不满足（Fail Closed）：" + ex.Message,
+                // R11（2026-10-29）：三类分类的「硬不可行」一半 —— 机器可读前缀，类别不靠中文措辞猜。
+                ErrorMessage = "[HARD_INFEASIBLE] 输入契约不满足（Fail Closed）：" + ex.Message,
+                // R11：硬不可行**不静默** —— 留一条 Error 级痕迹；同时不伪造任何排程结果。
+                SolveTraceNotes = new[]
+                {
+                    new SolveTraceNote
+                    {
+                        Key = "PHASE1",
+                        ReasonCode = "HARD_INFEASIBLE_INPUT_CONTRACT",
+                        Message = ex.Message,
+                        Level = "Error"
+                    }
+                },
                 Summary = new SolveSummary
                 {
                     ElapsedMs = (long)(DateTime.UtcNow - startTime).TotalMilliseconds
@@ -121,7 +156,18 @@ public class FiniteCapacitySolver : IFiniteCapacityScheduler
             return await Task.FromResult(new DomainSolveResult
             {
                 Success = false,
-                ErrorMessage = "输入契约不满足（Fail Closed）：" + ex.Message,
+                // R11：同一类「硬不可行」，来源是 Phase2 的锁定数量闭合不自洽。
+                ErrorMessage = "[HARD_INFEASIBLE] 输入契约不满足（Fail Closed）：" + ex.Message,
+                SolveTraceNotes = new[]
+                {
+                    new SolveTraceNote
+                    {
+                        Key = "PHASE2",
+                        ReasonCode = "HARD_INFEASIBLE_INPUT_CONTRACT",
+                        Message = ex.Message,
+                        Level = "Error"
+                    }
+                },
                 Summary = new SolveSummary
                 {
                     ElapsedMs = (long)(DateTime.UtcNow - startTime).TotalMilliseconds
@@ -157,7 +203,9 @@ public class FiniteCapacitySolver : IFiniteCapacityScheduler
         cancellationToken.ThrowIfCancellationRequested();
         var phase5 = new PhaseFiveCompression();
         var p5 = SolverDiagnostics.StartPhase();
-        var finalResult = phase5.Compress(request, scheduleResult, repairResult, diagnostics, constraints);
+        // R11-2（0号位 2026-10-28 §R11-2）：Run 的 token 必须真正进入 Phase5 —— 此前只有 Phase2/4 收 token，
+        //   Phase5 内 `CancellationToken` 0 命中 ⇒ 一旦进入就不可停（PV190 实测单段 12 分钟不可中断）。
+        var finalResult = phase5.Compress(request, scheduleResult, repairResult, diagnostics, constraints, cancellationToken);
         SolverDiagnostics.EndPhase(p5, 5);
 
         // 补充耗时统计
@@ -192,6 +240,49 @@ public class FiniteCapacitySolver : IFiniteCapacityScheduler
                 UsedRoughCut = finalResult.Summary.UsedRoughCut
             }
         };
+
+        // ── A-6（2026-11-02）：需求口账三件套 ──
+        //   2号位 2026-11-02 回执 §五.3 指出：我方 2026-10-25 认领的
+        //   `DemandsReceived` / `DemandQtySum` / `DemandsWithLandedTask` 三个计数器**全仓零命中**。
+        //   如实答：**是没落，不是改名**。此处补齐，取值一律从**本次求解的真实入参与最终结果**算。
+        //   纯观测：不参与任何业务判定，不写 `DomainSolveResult`，不新增 ReasonCode。
+        //   ⚠ 口径三处必须看清，否则会读错：
+        //     ① `DemandsReceived` 按 `LogicalDemandKey` **去重**（同一需求重复下发只算一条）；
+        //     ② `DemandQtySum` 是**需求侧净量**（`NetOutputQty`），不是已排量，也不是 Task 加工量；
+        //     ③ `DemandsWithLandedTask` 只认 `SourceDraftId` 能归回**本次入参需求键**的 Task ——
+        //        锁定任务（`SourceDraftId = 既有 Task.DraftId`）**不计入**，它不是需求。
+        //   ⚠ 与 `Summary.TotalDrafts` 不可混读：后者是 **Task 条数**，不是需求条数。
+        if (SolverDiagnostics.HasScope)
+        {
+            var demandKeys = new HashSet<string>(StringComparer.Ordinal);
+            var qtySum = 0m;
+            var demands = request.LogicalProductionDemands;
+            if (demands is not null)
+            {
+                for (var i = 0; i < demands.Count; i++)
+                {
+                    var d = demands[i];
+                    if (d is null) continue;
+                    if (!demandKeys.Add(d.LogicalDemandKey ?? string.Empty)) continue;
+                    qtySum += d.NetOutputQty;
+                }
+            }
+
+            var landedKeys = new HashSet<string>(StringComparer.Ordinal);
+            var tasks = finalResult.FinalTasks;
+            if (tasks is not null)
+            {
+                for (var i = 0; i < tasks.Count; i++)
+                {
+                    var t = tasks[i];
+                    if (t is null) continue;
+                    // 只有能归回本次入参需求键的 Task 才算「需求落地」；锁定任务在此被自然排除。
+                    if (demandKeys.Contains(t.SourceDraftId)) landedKeys.Add(t.SourceDraftId);
+                }
+            }
+
+            SolverDiagnostics.SetDemandAccounting(demandKeys.Count, qtySum, landedKeys.Count);
+        }
 
         return await Task.FromResult(finalResult);
     }

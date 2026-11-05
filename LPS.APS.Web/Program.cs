@@ -190,7 +190,11 @@ var jwtSecretKey = builder.Configuration["Jwt:SecretKey"]
     ?? throw new InvalidOperationException("缺少 Jwt:SecretKey 配置");
 
 // 安全加固：占位符或长度不足的签名密钥会使 JWT 可被伪造，生产环境拒绝启动
-if (jwtSecretKey.Length < 32 || jwtSecretKey.StartsWith("REPLACE_WITH_YOUR_", StringComparison.OrdinalIgnoreCase))
+// 判据不能只认某一个固定前缀：历史上 appsettings.Production.json 里的
+// REPLACE_WITH_PRODUCTION_SECRET_KEY_MIN_32_BYTES（47 字符、不以 REPLACE_WITH_YOUR_ 开头）
+// 两个条件都不满足，被放行 ⇒ 服务带着写死在仓库里的公开密钥正常起服，任何人可伪造 token。
+// 故放宽为 REPLACE_WITH_ 前缀。（CHANGE_ME / your-key 之类仍拦不住，根治靠生产密钥只走环境变量。）
+if (jwtSecretKey.Length < 32 || jwtSecretKey.StartsWith("REPLACE_WITH_", StringComparison.OrdinalIgnoreCase))
 {
     if (builder.Environment.IsProduction())
         throw new InvalidOperationException("生产环境禁止使用占位符或长度不足的 Jwt:SecretKey，请通过环境变量/User Secrets 配置真实密钥");
@@ -396,4 +400,13 @@ finally
 {
     Log.Information("LPS.APS 应用程序关闭");
     Log.CloseAndFlush();
+}
+
+/// <summary>
+/// 顶层语句生成的 Program 类默认为 internal，外部工程无法以之作
+/// <c>WebApplicationFactory&lt;Program&gt;</c> 的泛型实参（会产生 CS0060 可访问性不一致）。
+/// 此处显式声明为 public，仅供 <c>LPS.APS.IntegrationTests</c> 进程内启动真实管线使用；不改变任何运行时行为。
+/// </summary>
+public partial class Program
+{
 }

@@ -139,4 +139,27 @@ public class TaskSplitRuleConfigController : ControllerBase
             return HandleError(ex, "停用执行批拆分规则");
         }
     }
+
+    /// <summary>恢复启用执行批拆分规则（IsActive 0→1；与其它有效规则窗口重叠 → 422）。幂等：已启用原样返回。</summary>
+    /// <param name="id">规则主键（TaskSplitRuleConfig.Id）</param>
+    /// <param name="ct">取消令牌</param>
+    [Authorize(Policy = PermissionCodes.RuleMaintain)]
+    [HttpPost("task-split-rule-configs/{id:int}/activate")]
+    public async Task<IActionResult> Activate(int id, CancellationToken ct)
+    {
+        if (id <= 0)
+        {
+            return BadRequest(ApiResponse.Fail(400, "路径 id 非法（须大于 0）。"));
+        }
+
+        try
+        {
+            var dto = await _service.ActivateAsync(id, GetCurrentUserId(), GetCurrentUserCode(), ct);
+            return Ok(ApiResponse<TaskSplitRuleConfigDto>.Success(dto));
+        }
+        catch (Exception ex)
+        {
+            return HandleError(ex, "恢复启用执行批拆分规则");
+        }
+    }
 }

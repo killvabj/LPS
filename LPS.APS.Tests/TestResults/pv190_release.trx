@@ -1,0 +1,89 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TestRun id="6305e293-04ef-4adc-a900-b54290e9be01" name="C02525@CN1000-7050D4HV 2026-10-29 19:33:24" runUser="SMC\C02525" xmlns="http://microsoft.com/schemas/VisualStudio/TeamTest/2010">
+  <Times creation="2026-10-29T19:33:24.4985186+08:00" queuing="2026-10-29T19:33:24.4985188+08:00" start="2026-10-29T18:59:12.9257212+08:00" finish="2026-10-29T19:33:24.5234619+08:00" />
+  <TestSettings name="default" id="0c70596c-292a-4108-9bc2-32dfa8faea58">
+    <Deployment runDeploymentRoot="C02525_CN1000-7050D4HV_2026-10-29_19_33_24" />
+  </TestSettings>
+  <Results>
+    <UnitTestResult executionId="ad073dbb-50fd-4ebd-a529-3c458fdbf47b" testId="be94127a-6353-e13f-af20-0f2d1ef3ce27" testName="1号位: PV190 只跑 Phase1~5（真实装载，不落库）" computerName="CN1000-7050D4HV" duration="00:34:00.5520590" startTime="2026-10-29T19:33:24.3070358+08:00" endTime="2026-10-29T19:33:24.3070488+08:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="ad073dbb-50fd-4ebd-a529-3c458fdbf47b">
+      <Output>
+        <StdOut>[S] 总超时 = 90 分钟（APS_RUN_TIMEOUT_MIN，覆盖装载+求解）&#xD;
+[S] PlanVersionId=190, Domain='FAMILY_X', SourceScheduleRunId=192, RunType=FULL_SCHEDULE, 策略包版本=1970, DataCutoff=2026-10-19 09:25:19&#xD;
+[S] 计划期 2026-10-19 00:00 ~ 2027-01-17 00:00&#xD;
+[S] 订单数 22128（全量口径，不收窄 BOM 宇宙）&#xD;
+&#xD;
+[S] 装载完成：88.5s（Pegging 回路 76133ms / 装载合计 76133ms）&#xD;
+[S] 载荷规模：需求 42507 / 资源 21865 / 日历槽 5829714 / 路由工序 52583 / 执行约束 0&#xD;
+[SD-LIVE] 运行中采样已启动：每 5s 一拍 → D:\WorkSpace_LocalLib\Windsurf WorkSpace\LPS_SVN\Database\Scripts\APS\04_测试与备份\运行日志\PV190_solver-live_20261029_190052.csv&#xD;
+[SD-LIVE] 求解器要是又卡住，这张 CSV 每 5 秒会多 1 行：看 phase 停在哪一步、p2_done/p2_total 还推不推进、rss_mb / heap_mb 是否单调上行、cpu_ms 是否随 elapsed_s 线性增长（涨＝在算，不涨＝在停）。&#xD;
+&#xD;
+── 分相（毫秒）──────────────────────────────────────────────&#xD;
+   P1 建约束      13054 | P2 排程    1766011 | P3 诊断      561 | P4 修复      763 | P5 压缩     171192&#xD;
+   合计    1951581（32.5 分），墙钟 1951.6s ⇒ P2 占比 90.5%&#xD;
+&#xD;
+── 热点（累计毫秒 / 调用次数 / 每次微秒）──────────────────────&#xD;
+   batch_trial             1365914 ms         48178 次   28351.39 µs/次&#xD;
+   trial_prep               513869 ms             — 次          —&#xD;
+   sched_ops                380574 ms         42507 次    8953.22 µs/次&#xD;
+   clone_task_list          336294 ms        538814 次     624.14 µs/次&#xD;
+   landing                  250431 ms             — 次          —&#xD;
+   batch_adopt              219193 ms             — 次          —&#xD;
+   occ_insert               194807 ms             — 次          —&#xD;
+   prep_index               153389 ms             — 次          —&#xD;
+   bg_incr                  153252 ms             — 次          —&#xD;
+   timeline_place           113401 ms             — 次          —&#xD;
+   merge_find_tasks         108942 ms             — 次          —&#xD;
+   occ_copy                 103218 ms             — 次          —&#xD;
+   occ_copy_real            100344 ms             — 次          —&#xD;
+   merge_anchor_scan         81114 ms        490383 次     165.41 µs/次&#xD;
+   ensure_own_delta          65243 ms             — 次          —&#xD;
+   clone_shares              43531 ms        648358 次      67.14 µs/次&#xD;
+   find_fwd                  24967 ms             — 次          —&#xD;
+   bg_adopt_reconcile        23661 ms             — 次          —&#xD;
+   slot_search               19608 ms      38187193 次       0.51 µs/次&#xD;
+   clone_occ                 12342 ms         55478 次     222.46 µs/次&#xD;
+   bg_trial_overlay           7128 ms             — 次          —&#xD;
+   detach_timeline            4524 ms             — 次          —&#xD;
+   bg_rebuild                 2699 ms             — 次          —&#xD;
+   detach_occ                 2420 ms             — 次          —&#xD;
+   timeline_read              2114 ms             — 次          —&#xD;
+   merge_eff                   359 ms             — 次          —&#xD;
+   detach_tail                 224 ms             — 次          —&#xD;
+   prep_direction              104 ms             — 次          —&#xD;
+   detach_copy                  38 ms             — 次          —&#xD;
+   bg_trial_fresh                0 ms             — 次          —&#xD;
+&#xD;
+   ⚠ `Counters.HotspotMs` 的跨度**会嵌套**（试排包含排程，排程包含找槽），所以各槽相加**大于** P2 是正常的；只有**逐拍做差**才能看出来这一段时间谁在涨。&#xD;
+&#xD;
+[S] 求解返回：Success=False, FinalTask=1212546, 未排需求=18364, 墙钟=1951.6s&#xD;
+[S] ErrorMessage 首行=[Technical] Routing图非法或存在环：MaterialId=850938, Route=DEFAULT::1 | [BatchPolicy] 硬失败需求 3342 条（BATCH_POLICY_MISSING 3110 / BATCH_POLICY_CONFLICT 232 / BATCH_POLICY_STATE_UNAVAILABLE 0）；示例：[190_114] BATCH_POLICY_MISSING：C 桶需求在 Solver 输入中找不到有效 Batch Policy（仅 (Material + 明确 ProductionDepartment) 精确命中一条路径；Material 级默认回落已于 AUD-1-004 删除） ; [190_155] BATCH_POLICY_MISSING：C 桶需求在 Solver 输入中找不到有效 Batch Policy（仅 (Material + 明确 ProductionDepartment) 精确命中一条路径；Material 级默认回落已于 AUD-1-004 删除） ; [190_160] BATCH_POLICY_MISSING：C 桶需求在 Solver 输入中找不到有效 Batch Policy（仅 (Material + 明确 ProductionDepartment) 精确命中一条路径；Material 级默认回落已于 AUD-1-004 删除）&#xD;
+&#xD;
+[S] 本轮**未落库**：没有写 [Task] / PeggingDraft / AllocationTaskShare / ScheduleExplanationFact / PI Position 任何一行。插库是 2号位 的段，不在本次测量内。</StdOut>
+      </Output>
+    </UnitTestResult>
+  </Results>
+  <TestDefinitions>
+    <UnitTest name="1号位: PV190 只跑 Phase1~5（真实装载，不落库）" storage="d:\workspace_locallib\windsurf workspace\lps_svn\lps.aps.tests\bin\release\net8.0\lps.aps.tests.dll" id="be94127a-6353-e13f-af20-0f2d1ef3ce27">
+      <Execution id="ad073dbb-50fd-4ebd-a529-3c458fdbf47b" />
+      <TestMethod codeBase="D:\WorkSpace_LocalLib\Windsurf WorkSpace\LPS_SVN\LPS.APS.Tests\bin\Release\net8.0\LPS.APS.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner2/netcoreapp" className="LPS.APS.Tests.Integration.PV190SolverOnlyPerfTest" name="RunSolverOnlyAsync" />
+    </UnitTest>
+  </TestDefinitions>
+  <TestEntries>
+    <TestEntry testId="be94127a-6353-e13f-af20-0f2d1ef3ce27" executionId="ad073dbb-50fd-4ebd-a529-3c458fdbf47b" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+  </TestEntries>
+  <TestLists>
+    <TestList name="列表中未列出的结果" id="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestList name="所有已加载的结果" id="19431567-8539-422a-85d7-44ee4e166bda" />
+  </TestLists>
+  <ResultSummary outcome="Completed">
+    <Counters total="1" executed="1" passed="1" failed="0" error="0" timeout="0" aborted="0" inconclusive="0" passedButRunAborted="0" notRunnable="0" notExecuted="0" disconnected="0" warning="0" completed="0" inProgress="0" pending="0" />
+    <Output>
+      <StdOut>[xUnit.net 00:00:00.00] xUnit.net VSTest Adapter v2.5.4.1+b9eacec401 (64-bit .NET 8.0.33)&#xD;
+[xUnit.net 00:00:09.96]   Discovering: LPS.APS.Tests&#xD;
+[xUnit.net 00:00:10.09]   Discovered:  LPS.APS.Tests&#xD;
+[xUnit.net 00:00:10.09]   Starting:    LPS.APS.Tests&#xD;
+[xUnit.net 00:34:10.68]   Finished:    LPS.APS.Tests&#xD;
+</StdOut>
+    </Output>
+  </ResultSummary>
+</TestRun>

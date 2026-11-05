@@ -9,8 +9,13 @@
  *  - loading 系列：UI 态
  *
  * 权限：
- *  - aps.setup.view    → 查看 Diff
- *  - aps.setup.publish → 发布（POST /rule-set-versions/{id}/publish）
+ *  - aps.setup.view → 查看 Diff
+ *
+ * 发布：本 store **不提供发布动作**。整版规则集发布统一在「规则集维护」页
+ * （aps.rule.publish → POST /rule-set/version/{id}/publish）。
+ * 依据 0号位 2026-10-26《规则集多主题协作与统一发布_V1最小实现建议》§四：
+ * `POST /rule-set-versions/{id}/publish` 仅凭 aps.setup.publish 就能把含
+ * 需求优先级的整版置 PUBLISHED，属整版发布权越界（已致函 3号位 收口）。
  *
  * Diff 边界：
  *  - 不展示非 Setup 维度的 Diff（ParameterSet/StrategyProfile 仍走原 v1.4 §十八 规则参数维护页）
@@ -23,13 +28,7 @@
 
 import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
-import {
-  setupApi,
-  ApiError,
-  type SetupDiffDto,
-  type SetupRuleSetVersionDto,
-  type PublishSetupRuleSetVersionRequest
-} from '@/api/aps-v1'
+import { setupApi, ApiError, type SetupDiffDto, type SetupRuleSetVersionDto } from '@/api/aps-v1'
 import { useApsAuthStore } from './auth'
 
 export const useSetupDiffStore = defineStore('aps.setupDiff', () => {
@@ -41,7 +40,6 @@ export const useSetupDiffStore = defineStore('aps.setupDiff', () => {
 
   const diffLoading = ref(false)
   const versionsLoading = ref(false)
-  const actionRunning = ref(false)
   const error = ref<string | null>(null)
 
   // ===== auth =====
@@ -55,9 +53,6 @@ export const useSetupDiffStore = defineStore('aps.setupDiff', () => {
   /** 查看权限 */
   const canView = computed<boolean>(() => apsAuth.has('aps.setup.view'))
 
-  /** 发布权限 */
-  const canPublishPerm = computed<boolean>(() => apsAuth.has('aps.setup.publish'))
-
   /** 当前选中的 RuleSetVersion */
   const currentVersion = computed<SetupRuleSetVersionDto | null>(() => {
     if (selectedVersionId.value === null) return null
@@ -69,9 +64,6 @@ export const useSetupDiffStore = defineStore('aps.setupDiff', () => {
     if (otherVersionId.value === null) return null
     return ruleSetVersions.value.find((v) => v.id === otherVersionId.value) ?? null
   })
-
-  /** 是否可发布（仅 DRAFT 状态） */
-  const canPublishAction = computed<boolean>(() => currentVersion.value?.status === 'DRAFT')
 
   /** 变更总数 */
   const totalChanges = computed<number>(() => {
@@ -122,33 +114,6 @@ export const useSetupDiffStore = defineStore('aps.setupDiff', () => {
     }
   }
 
-  /** 发布 RuleSetVersion（需 publish 权限 + DRAFT 状态） */
-  async function publish(
-    versionId: number,
-    request: PublishSetupRuleSetVersionRequest
-  ): Promise<boolean> {
-    if (!canPublishPerm.value) {
-      error.value = '当前操作者无发布权限（需权限码 aps.setup.publish）'
-      return false
-    }
-    if (!canPublishAction.value) {
-      error.value = '只能发布 DRAFT 状态的 RuleSetVersion'
-      return false
-    }
-    actionRunning.value = true
-    error.value = null
-    try {
-      await setupApi.publishRuleSetVersion(versionId, request)
-      await loadRuleSetVersions()
-      return true
-    } catch (err) {
-      handleError(err)
-      return false
-    } finally {
-      actionRunning.value = false
-    }
-  }
-
   function handleError(err: unknown): void {
     if (err instanceof ApiError) {
       error.value =
@@ -174,22 +139,18 @@ export const useSetupDiffStore = defineStore('aps.setupDiff', () => {
     ruleSetVersions,
     diffLoading,
     versionsLoading,
-    actionRunning,
     error,
     // getters
     hasDiff,
     canView,
-    canPublishPerm,
     currentVersion,
     otherVersion,
-    canPublishAction,
     totalChanges,
     // actions
     selectVersion,
     selectOtherVersion,
     loadRuleSetVersions,
     loadDiff,
-    publish,
     handleError,
     reset
   }

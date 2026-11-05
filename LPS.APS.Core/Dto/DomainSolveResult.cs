@@ -124,8 +124,10 @@ public sealed class FinalTaskDraft
     ///   **有效加工另由 <see cref="EffectiveProcessMinutes"/> 承载，两者不是一个数（差一个 Setup），不可互相顶替。**
     ///   若 0号位 裁定装「有效加工」，则以 <see cref="EffectiveProcessMinutes"/> 同值写入。
     ///
-    /// 【单位】现行库值口径＝**分钟**；冻结《字段说明》v5.1.15 <c>:3696</c> 标「小时」，
-    ///   单位订正已出提案、待 0号位 裁，我方不直改冻结件。
+    /// 【单位】本字段口径＝**分钟**（`EffectiveProcessMinutes + SetupTime`）。
+    ///   落库时由 2号位 在持久化处 /60 转为**小时**写入 <c>Task.Duration</c>，以对齐冻结《字段说明》
+    ///   v5.1.15 <c>:3696</c>「单位：小时」（v5.1.16 <c>:3703</c> 同文）；读取侧不再二次换算
+    ///   （0号位 2026-10-26《XC范围_影子计量与时间单位正式回复 v1.1》§:60）。
     ///
     /// 【现状】本属性在生产代码中**无赋值点、无消费点**（2026-10-26 核实）。
     ///   历史 <c>Task.Duration</c> 一直由我方以墙钟跨度 <c>PlannedEndTime − PlannedStartTime</c> 回写；

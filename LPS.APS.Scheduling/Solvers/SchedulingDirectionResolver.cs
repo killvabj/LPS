@@ -1,4 +1,5 @@
 using LPS.APS.Core.Dto;
+using LPS.APS.Shared.Models;
 
 namespace LPS.APS.Scheduling.Solvers;
 
@@ -72,6 +73,12 @@ internal static class SchedulingDirectionResolver
     internal const string SignalDueLoose = "DUE_LOOSE";
     internal const string SignalDueOverdue = "DUE_OVERDUE";
     internal const string SignalDueAbsent = "DUE_ABSENT";
+    /// <summary>
+    /// 2026-10-28｜R05-27-10 新增：Slack 估算**不全**（缺产能系数／缺资格资源／缺日历）⇒ 走不确定出口。
+    /// 0号位 2026-10-27《01_…》§1-R05-27-10：「无法准确得出时采取可解释保守方向或不确定出口」。
+    /// 只登记缺口，**不**据此判「交期紧/松」。
+    /// </summary>
+    internal const string SignalDueSlackUncertain = "DUE_SLACK_UNCERTAIN";
     internal const string SignalGoalCustomerCommitment = "GOAL_CUSTOMER_COMMITMENT";
     internal const string SignalGoalInventoryReplenishment = "GOAL_INVENTORY_REPLENISHMENT";
     internal const string SignalDemandGoalAbsent = "DEMAND_GOAL_ABSENT";
@@ -151,7 +158,9 @@ internal static class SchedulingDirectionResolver
         }
 
         // ── 判据 5：RequiredAvailableTime + Slack —— 交期驱动 vs 最早承诺 ──
-        var slackMinutes = ComputeSlackMinutes(demand, operations, materialFloor, planningStart, out var dueAbsent);
+        var slackMinutes = ComputeSlackMinutes(
+            demand, operations, constraints, materialFloor, planningStart,
+            out var dueAbsent, out var slackEstimated, out var leadCalendarMinutes);
         if (dueAbsent)
         {
             signals.Add(SignalDueAbsent);
@@ -161,17 +170,27 @@ internal static class SchedulingDirectionResolver
             // 交期**已过**：倒排（靠 DueDate 减少 WIP）已无意义 ⇒ 尽早产出 ⇒ 正排（最早承诺）。
             forwardSignals.Add(SignalDueOverdue);
         }
+        else if (slackEstimated)
+        {
+            // ── 2026-10-28｜R05-27-10：时长算不全就**不许判紧/松** ──
+            //   旧实现拿「工艺标准工时之和」当周期，既不含产能系数也不含日历，
+            //   在 AUTO 上直接把 slack 撑大 ⇒ 错的 `DUE_LOOSE ⇒ 正排`。
+            //   现在：缺资格/缺产能系数/缺日历/无工序任一成立 ⇒ 本判据**弃权**，
+            //   只登记 `DUE_SLACK_UNCERTAIN`（中性信号，不投正反任一票），方向交其它上下文裁决。
+            signals.Add(SignalDueSlackUncertain);
+        }
         else if (slackMinutes < 0m)
         {
-            // 交期未过但余量为负（工艺周期都装不下）⇒ 交期驱动 ⇒ 倒排。
+            // 交期未过但余量为负（周期都装不下）⇒ 交期驱动 ⇒ 倒排。
             backwardSignals.Add(SignalDueTight);
         }
-        else if (slackMinutes > TotalLeadMinutes(operations))
+        else if (slackMinutes > leadCalendarMinutes)
         {
-            // 余量超过一个完整工艺周期（leadMinutes）⇒ 明显不紧 ⇒ 最早承诺（正排）。
+            // 余量超过**一个完整日历周期**⇒ 明显不紧 ⇒ 最早承诺（正排）。
+            //   ⚠ 阈值必须是日历跨度（自然分钟），不能再用工艺分钟 —— 两边口径不同不能直接比。
             forwardSignals.Add(SignalDueLoose);
         }
-        // 0 <= slack <= lead：余量一般 ⇒ 不产生交期信号（交由其它上下文裁决）
+        // 0 <= slack <= 日历周期：余量一般 ⇒ 不产生交期信号（交由其它上下文裁决）
 
         // ── 判据 6：DemandGoal —— 客户承诺（交期驱动）vs 库存补充（非交期驱动）──
         if (string.IsNullOrEmpty(demandGoal))
@@ -218,11 +237,20 @@ internal static class SchedulingDirectionResolver
     }
 
     /// <summary>
-    /// Slack（派生量，**非契约字段**）= `RequiredAvailableTime − 最早可能完成时间`（分钟）。
+    /// Slack（派生量，**非契约字段**）= `RequiredAvailableTime − 最早可能完成时间`（自然分钟）。
     ///
-    /// 最早可能完成 = `max(PlanningStart, 物料/子件下界) + 该需求工序总标准工时`。
+    /// 最早可能完成 = `max(PlanningStart, 物料/子件下界)` 起，按工序顺序**过资源工作日历**推进：
+    ///   单工序有效时长 = `StandardDuration × PlannedProcessQty ÷ 最大产能系数`（与 Phase2 同口径）。
     ///   · 这是**估算**（不含资源争用与 Setup），仅用于「交期紧/松」的**方向判据**，
     ///     **不**作为可行性结论（可行性仍由 Phase2 找槽 / Phase3 诊断 / Phase4 修复给出）。
+    ///   · `estimated = true` ⇒ 这个估算**不可信**，调用方**不得**据此判紧/松（应登记
+    ///     `DUE_SLACK_UNCERTAIN` 并弃权）。触发条件任一成立：
+    ///       ① 该需求**无工序**；② 某工序查不到资格资源；③ 查到资源但**无产能系数**（≤0）；
+    ///       ④ 该资源**无日历**（只能按自然分钟硬推，工作日历缺口会把 slack 算小 ⇒ 不能判松）。
+    ///     ⚠ 注意方向：缺日历会让**周期变短**（少扣非工作时段）⇒ slack 偏**大** ⇒ 误判「松」。
+    ///       所以缺日历必须弃权，不能当「乐观下界」用。
+    ///   · `leadCalendarMinutes` = 同一行程在**日历上的跨度**，是判「松」的比较基准
+    ///     （`slackMinutes` 是自然分钟，与工艺分钟不同口径，不能直接比）。
     ///   · `dueAbsent = true` **仅当** `RequiredAvailableTime == default`（**无交期**），此时**不产生交期信号**。
     ///     ⚠ 「交期已过」**不**归入 absent（那是「已逾期」，是有效交期）—— 由调用方按
     ///     `DUE_OVERDUE ⇒ 正排` 处理，避免把「已逾期」误判成「无交期」而丢失方向信息。
@@ -230,11 +258,16 @@ internal static class SchedulingDirectionResolver
     internal static decimal ComputeSlackMinutes(
         LogicalProductionDemand demand,
         IReadOnlyList<OperationNode> operations,
+        ConstraintContext constraints,
         DateTime materialFloor,
         DateTime planningStart,
-        out bool dueAbsent)
+        out bool dueAbsent,
+        out bool estimated,
+        out decimal leadCalendarMinutes)
     {
         dueAbsent = false;
+        estimated = false;
+        leadCalendarMinutes = 0m;
 
         if (demand.RequiredAvailableTime == default)
         {
@@ -243,13 +276,158 @@ internal static class SchedulingDirectionResolver
         }
 
         var earliestStart = materialFloor > planningStart ? materialFloor : planningStart;
-        var earliestFinish = earliestStart.AddMinutes((double)TotalLeadMinutes(operations));
-        return (decimal)(demand.RequiredAvailableTime - earliestFinish).TotalMinutes;
+
+        // 无工序 ⇒ 算不出工艺周期，不能拿「0 分钟」冒充（旧实现正是这样把 slack 撑大的）
+        if (operations.Count == 0)
+        {
+            estimated = true;
+            return (decimal)(demand.RequiredAvailableTime - earliestStart).TotalMinutes;
+        }
+
+        var cursor = earliestStart;
+        foreach (var operation in operations)
+        {
+            var (processMinutes, resourceId, resolved) = EstimateOperationProcessMinutes(demand, operation, constraints);
+            if (!resolved)
+            {
+                estimated = true;
+            }
+
+            if (processMinutes <= 0m)
+            {
+                continue;
+            }
+
+            if (resourceId is int rid
+                && constraints.ResourceCalendars.TryGetValue(rid, out var windows)
+                && windows is { Count: > 0 })
+            {
+                cursor = AdvanceOverWorkCalendar(cursor, processMinutes, windows);
+            }
+            else
+            {
+                // 没有日历 ⇒ 只能按自然分钟推进（已标 estimated，调用方不会据此判紧/松）
+                cursor = cursor.AddMinutes((double)processMinutes);
+            }
+        }
+
+        // 判「松」的阈值必须是**日历跨度**，不能再用工艺分钟：slack 是自然分钟，
+        //   拿「自然分钟」比「工艺分钟」正是旧实现口径不一致的第二处错。
+        leadCalendarMinutes = (decimal)(cursor - earliestStart).TotalMinutes;
+        return (decimal)(demand.RequiredAvailableTime - cursor).TotalMinutes;
     }
 
-    /// <summary>该需求（已选定路径上的）工序总标准工时（分钟）。无工序 ⇒ 0。</summary>
-    internal static decimal TotalLeadMinutes(IReadOnlyList<OperationNode> operations)
-        => operations.Count == 0 ? 0m : operations.Sum(o => o.StandardDuration);
+    /// <summary>
+    /// 2026-10-28｜R05-27-10 整改：单工序的「真实加工分钟」估算，返回 (加工分钟, 用哪个资源估的, 是否算准了)。
+    ///   · 加工分钟 = `StandardDuration(分钟) × PlannedProcessQty ÷ CapacityFactor`
+    ///     —— `StandardDuration` 已由 Phase1 装配点 ÷60 成分钟（R04-S-G-Units），此处**不得再除 60**。
+    ///   · 产能系数取**该工序资格资源里最大的那个**：系数越大 ⇒ 时长越短 ⇒ 完工越早 ⇒ 乐观下界。
+    ///     乐观下界下 `slack` 只会**偏大** ⇒ 最多把「其实不松」判成「松」，不会把「能排下」误判成「排不下」。
+    ///   · 算不准的三种情形（`resolved=false`，由调用方走 <see cref="SignalDueSlackUncertain"/>）：
+    ///     ① 没有资格资源行 ② 有资格资源但没有任何产能系数 ③ 有产能系数但该资源没有日历行。
+    /// </summary>
+    private static (decimal Minutes, int? ResourceId, bool Resolved) EstimateOperationProcessMinutes(
+        LogicalProductionDemand demand,
+        OperationNode operation,
+        ConstraintContext constraints)
+    {
+        var fallback = operation.StandardDuration * demand.PlannedProcessQty;
+
+        var key = new EligibilityLookupKey(
+            demand.MaterialId, operation.ProductionDepartmentId,
+            operation.RouteCode, operation.PathId, operation.OperationCode);
+
+        if (!constraints.OperationResourceEligibility.TryGetValue(key, out var eligible) || eligible.Count == 0)
+        {
+            return (fallback, null, false);
+        }
+
+        decimal bestFactor = 0m;
+        int bestResourceId = eligible[0];
+        if (constraints.ResourceCapacityFactors.TryGetValue(key, out var factors))
+        {
+            foreach (var resourceId in eligible)
+            {
+                if (factors.TryGetValue(resourceId, out var factor) && factor > bestFactor)
+                {
+                    bestFactor = factor;
+                    bestResourceId = resourceId;
+                }
+            }
+        }
+
+        if (bestFactor <= 0m)
+        {
+            return (fallback, bestResourceId, false);
+        }
+
+        var minutes = operation.StandardDuration * demand.PlannedProcessQty / bestFactor;
+        var hasCalendar = constraints.ResourceCalendars.TryGetValue(bestResourceId, out var cal) && cal.Count > 0;
+        return (minutes, bestResourceId, hasCalendar);
+    }
+
+    /// <summary>
+    /// 把 `start` 起算的 `workMinutes` 分钟**按 WORK 日历**推进，返回可完工时刻。
+    /// 只累计窗内分钟；窗外（夜间/非工作日/OFF）不计。日历覆盖不到剩余量时按自然分钟顺延
+    /// （调用方已把「日历缺失/不足」标成不确定，这里不再重复标记）。
+    /// </summary>
+    private static DateTime AdvanceOverWorkCalendar(DateTime start, decimal workMinutes, List<TimeWindow> windows)
+    {
+        if (workMinutes <= 0m)
+        {
+            return start;
+        }
+
+        // 先看是否已升序（生产里日历行通常是升序的）：是就不排序，避免每条需求都排一遍。
+        var ascending = true;
+        for (int i = 1; i < windows.Count; i++)
+        {
+            if (windows[i].Start < windows[i - 1].Start)
+            {
+                ascending = false;
+                break;
+            }
+        }
+
+        var ordered = ascending ? (IReadOnlyList<TimeWindow>)windows : windows.OrderBy(w => w.Start).ToList();
+
+        var remaining = workMinutes;
+        var cursor = start;
+        foreach (var window in ordered)
+        {
+            if (window.End <= cursor)
+            {
+                continue;
+            }
+
+            var from = window.Start > cursor ? window.Start : cursor;
+            if (window.End <= from)
+            {
+                continue;
+            }
+
+            var available = (decimal)(window.End - from).TotalMinutes;
+            if (available <= 0m)
+            {
+                continue;
+            }
+
+            if (remaining <= available)
+            {
+                return from.AddMinutes((double)remaining);
+            }
+
+            remaining -= available;
+            cursor = window.End;
+        }
+
+        return cursor.AddMinutes((double)remaining);
+    }
+
+    // ── 2026-10-28｜R05-27-10：`TotalLeadMinutes(IReadOnlyList<OperationNode>)` 已删除 ──
+    //   它把「工序标准工时之和」当工艺周期（不含 PlannedProcessQty、不含产能系数、不含日历），
+    //   正是 Slack 误判「松」的根因；保留它只会再被误用。现在周期一律由
+    //   `EstimateOperationProcessMinutes` + `AdvanceOverWorkCalendar` 给出。
 
     /// <summary>该需求是否存在锁定任务（`LockedTasks` 键为 `(DraftId, StageCode, OperationCode)`，按 DraftId 归属需求）。</summary>
     private static bool HasLockedAnchor(LogicalProductionDemand demand, ConstraintContext constraints)

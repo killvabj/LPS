@@ -3,6 +3,7 @@ using RuleSetVersion = LPS.APS.Core.Entities.APS.RuleSetVersion;
 using ParameterSetVersion = LPS.APS.Core.Entities.APS.ParameterSetVersion;
 using StrategyProfileVersion = LPS.APS.Core.Entities.APS.StrategyProfileVersion;
 using LPS.APS.Core.Enum;
+using LPS.APS.Core.Exceptions;
 using LPS.APS.Core.Interfaces;
 using LPS.APS.Core.Dto;
 using LPS.APS.Core.DTOs.Governance;
@@ -49,6 +50,13 @@ public class GovernanceVersionService : IGovernanceVersionService
     /// <summary>Candidate Guardrail 业务校验器（无状态纯校验，E-4；P0-02b 接入参数集发布前校验）</summary>
     private readonly CandidateGuardrailValidator _candidateGuardrailValidator = new();
 
+    /// <summary>
+    /// Setup 换型规则同键冲突校验器（无状态纯校验，P0-B 2026-10-27 核证收口）。
+    /// 由 SetupRuleService.PublishAsync 收拢于此：统一发布与 Setup 发布共用同一份冲突校验，
+    /// 消除「Setup 两页写入的碰撞 DRAFT 被统一发布静默放出」倒挂；Setup 路径不再各自持有。
+    /// </summary>
+    private readonly SetupTransitionRuleConflictValidator _setupConflictValidator = new();
+
     public GovernanceVersionService(
         IRuleSetVersionRepository ruleSetVersionRepository,
         IParameterSetVersionRepository parameterSetVersionRepository,
@@ -79,6 +87,14 @@ public class GovernanceVersionService : IGovernanceVersionService
         var validation = await ValidateRuleSetVersionForPublishAsync(ruleSetVersionId, ct);
         if (!validation.IsValid)
         {
+            // P0-B（2026-10-27 核证收口）：Setup 同键冲突属数据红线（422），与通用校验失败（400）分途——
+            // 统一发布与 Setup 发布在冲突分类上共用语义；GovernanceController/SetupRuleController 分别映射 422。
+            var setupConflict = validation.Errors.FirstOrDefault(e =>
+                string.Equals(e.Code, "SETUP_TRANSITION_RULE_CONFLICT", StringComparison.OrdinalIgnoreCase));
+            if (setupConflict != null)
+            {
+                throw new SetupRuleDataRedLineException(setupConflict.Message);
+            }
             throw new InvalidOperationException($"规则集版本发布前校验失败：{validation.GetErrorMessage()}");
         }
 
@@ -228,7 +244,7 @@ public class GovernanceVersionService : IGovernanceVersionService
 
         _logger.LogWarning(
             "快照顶层出现未知子块键：{VersionKind}版本 {VersionId}，未知键=[{UnknownKeys}]。" +
-            "已知 8 块为 DemandPriority/Lock/Supply/Procurement/SolverStrategy/CandidateGuardrail/SetupTransitionRules/BatchPolicy。" +
+            "已知 9 块为 DemandPriority/Lock/Supply/Procurement/SolverStrategy/CandidateGuardrail/SetupTransitionRules/BatchPolicy/StageHandoffWaitRules。" +
             "⚠ 若这是 ⑦/⑧ 块被写错键名，装载侧投影器会**静默当未配置**（不报错）——请核对键名逐字。本告警不阻断发布。",
             versionKind, versionId, string.Join(", ", unknownKeys));
     }
@@ -392,6 +408,9 @@ public class GovernanceVersionService : IGovernanceVersionService
         // IsDefault=1 停用：需清默认标志（避免 DISABLED 默认版本残留于 ResolveDefault 查询范围）
         if (version.IsDefault)
         {
+            // ClearDefaultFlagAsync 第二参=「排除本版本」，清除的是同族其它默认，本版本自身 IsDefault 须显式置 false，
+            // 否则落库为「DISABLED 且 IsDefault=1」，再发布时 if (version.IsDefault) 分支会以默认身份静默复活（2号位 2026-10-27）。
+            version.IsDefault = false;
             await _strategyProfileVersionRepository.ClearDefaultFlagAsync(version.StrategyProfileId, strategyProfileVersionId, ct);
         }
 
@@ -454,10 +473,11 @@ public class GovernanceVersionService : IGovernanceVersionService
         // P1-03：审计前置预检（跨库无 2PC）——审计库不可写则整操作失败、业务零变更。
         await _auditLogRepository.EnsureWritableAsync(ct);
 
-        // 清同 Profile 其它默认，再置位；避免 UQ_StrategyProfileVersion_DefaultPublished 冲突
-        await _strategyProfileVersionRepository.ClearDefaultFlagAsync(version.StrategyProfileId, strategyProfileVersionId, ct);
+        // R12-O02 / S-04：单事务原子默认切换——同一事务内「清同 Profile 其它 IsDefault=1」+「置目标 IsDefault=1」，
+        // 修正此前 ClearDefaultFlagAsync + UpdateAsync 两条独立 SQL 的非原子缺陷（崩溃/并发下可能同族双默认，
+        // 曾致 UQ_StrategyProfileVersion_DefaultPublished 冲突）；镜像 RuleSetVersionRepository.SetDefaultAsync 一致语义。
         version.IsDefault = true;
-        await _strategyProfileVersionRepository.UpdateAsync(version, ct);
+        await _strategyProfileVersionRepository.SetDefaultAsync(version.StrategyProfileId, strategyProfileVersionId, ct);
 
         // P1-04 审计日志：记录默认设置操作
         await _auditLogRepository.AddAsync(new Core.Entities.Auth.AuditLog
@@ -631,10 +651,7 @@ public class GovernanceVersionService : IGovernanceVersionService
             CompareField("DemandPriority", "需求优先级配置",
                 ExtractBlockJson(sourceVersion.ContentSnapshotJson, "DemandPriority"),
                 ExtractBlockJson(targetVersion.ContentSnapshotJson, "DemandPriority")),
-            // S-6：Setup 换型规则子块对比（fail-open：缺失/为空 → 空规则集，对比仍可安全执行）
-            CompareField("SetupTransitionRules", "换型规则配置",
-                ExtractBlockJson(sourceVersion.ContentSnapshotJson, SetupTransitionRuleProjector.SetupTransitionRulesBlockName),
-                ExtractBlockJson(targetVersion.ContentSnapshotJson, SetupTransitionRuleProjector.SetupTransitionRulesBlockName)),
+            CompareSetupTransitionRules(sourceVersion, targetVersion),
             CompareField("EffectiveFrom", "生效起始", sourceVersion.EffectiveFrom?.ToString("yyyy-MM-dd HH:mm:ss"), targetVersion.EffectiveFrom?.ToString("yyyy-MM-dd HH:mm:ss")),
             CompareField("EffectiveTo", "生效截止", sourceVersion.EffectiveTo?.ToString("yyyy-MM-dd HH:mm:ss"), targetVersion.EffectiveTo?.ToString("yyyy-MM-dd HH:mm:ss")),
             CompareField("PublishedAt", "发布时间", sourceVersion.PublishedAt?.ToString("yyyy-MM-dd HH:mm:ss"), targetVersion.PublishedAt?.ToString("yyyy-MM-dd HH:mm:ss")),
@@ -719,7 +736,86 @@ public class GovernanceVersionService : IGovernanceVersionService
         var targetVersion = await _strategyProfileVersionRepository.GetByIdAsync(targetVersionId, ct)
             ?? throw new InvalidOperationException($"目标策略包版本不存在：{targetVersionId}");
 
-        var diffs = new List<FieldDiff>
+        var diffs = BuildStrategyProfileFieldDiffs(sourceVersion, targetVersion);
+
+        return new VersionDiffResult
+        {
+            SourceVersionId = sourceVersionId,
+            TargetVersionId = targetVersionId,
+            SourceVersionCode = sourceVersion.VersionCode,
+            TargetVersionCode = targetVersion.VersionCode,
+            EntityType = "StrategyProfileVersion",
+            FieldDiffs = diffs,
+            ComparedAt = DateTime.Now
+        };
+    }
+
+    /// <summary>
+    /// 策略包版本<b>富对比</b>（S12：06 §6.4.1「版本富对比（H1）」）。
+    /// </summary>
+    /// <remarks>
+    /// 开发者：3号位。<b>与 <see cref="CompareStrategyProfileVersionsAsync"/> 共用同一字段判等规则</b>
+    /// （<see cref="BuildStrategyProfileFieldDiffs"/> 单一来源，防双实现漂移），
+    /// 在其之上补「双方版本概要 + 绑定差异 + 变更汇总」三块，对齐 H1 读法。
+    /// <para>
+    /// 参数方向与 <c>plan-version/{a}/compare-with/{b}</c> 同序：compareVersionId = a（对比方）、baseVersionId = b（基准方）。
+    /// </para>
+    /// <para>
+    /// <b>缺失处理</b>：版本本身不存在 → <see cref="KeyNotFoundException"/>（对外 404）；
+    /// 绑定 Id 指向的规则集／参数集版本查不到 → 仅版本编码返 <c>null</c>，<b>不判对比失败</b>（绑定 Id 为准，fail-open 只影响展示）。
+    /// </para>
+    /// </remarks>
+    public async Task<StrategyProfileVersionComparisonDto> CompareStrategyProfileVersionRichAsync(
+        long baseVersionId,
+        long compareVersionId,
+        CancellationToken ct = default)
+    {
+        var baseVersion = await _strategyProfileVersionRepository.GetByIdAsync(baseVersionId, ct)
+            ?? throw new KeyNotFoundException($"基准策略包版本不存在：{baseVersionId}");
+
+        var compareVersion = await _strategyProfileVersionRepository.GetByIdAsync(compareVersionId, ct)
+            ?? throw new KeyNotFoundException($"对比策略包版本不存在：{compareVersionId}");
+
+        var diffs = BuildStrategyProfileFieldDiffs(baseVersion, compareVersion);
+        var changed = diffs.Where(d => d.IsChanged).ToList();
+
+        return new StrategyProfileVersionComparisonDto
+        {
+            Base = await BuildStrategyProfileVersionBriefAsync(baseVersion, ct),
+            Compare = await BuildStrategyProfileVersionBriefAsync(compareVersion, ct),
+            Binding = new StrategyProfileVersionBindingDiffDto
+            {
+                RuleSetChanged = baseVersion.RuleSetVersionId != compareVersion.RuleSetVersionId,
+                ParameterSetChanged = baseVersion.ParameterSetVersionId != compareVersion.ParameterSetVersionId,
+                BaseRuleSetVersionId = baseVersion.RuleSetVersionId,
+                CompareRuleSetVersionId = compareVersion.RuleSetVersionId,
+                BaseParameterSetVersionId = baseVersion.ParameterSetVersionId,
+                CompareParameterSetVersionId = compareVersion.ParameterSetVersionId,
+            },
+            Summary = new StrategyProfileVersionChangeSummaryDto
+            {
+                TotalFieldCount = diffs.Count,
+                ChangedFieldCount = changed.Count,
+                ChangedFieldNames = changed.Select(d => d.FieldName).ToList(),
+                StatusChanged = IsFieldChanged(diffs, "Status"),
+                DefaultFlagChanged = IsFieldChanged(diffs, "IsDefault"),
+                EffectiveWindowChanged = IsFieldChanged(diffs, "EffectiveFrom") || IsFieldChanged(diffs, "EffectiveTo"),
+                PublishInfoChanged = IsFieldChanged(diffs, "PublishedAt") || IsFieldChanged(diffs, "PublishedBy"),
+            },
+            FieldDiffs = diffs,
+            ComparedAt = DateTime.Now,
+        };
+    }
+
+    /// <summary>
+    /// 策略包版本字段级差异<b>唯一构造点</b>（diff 与富对比共用，防两套判等规则漂移）。
+    /// </summary>
+    /// <remarks>
+    /// 开发者：3号位。注：策略包版本表无 Remarks 列（与 RuleSet/ParameterSet 同），故不含 Remarks 对比字段。
+    /// </remarks>
+    private static List<FieldDiff> BuildStrategyProfileFieldDiffs(StrategyProfileVersion sourceVersion, StrategyProfileVersion targetVersion)
+    {
+        return new List<FieldDiff>
         {
             CompareField("VersionCode", "版本编码", sourceVersion.VersionCode, targetVersion.VersionCode),
             CompareField("Status", "状态", sourceVersion.Status, targetVersion.Status),
@@ -731,17 +827,42 @@ public class GovernanceVersionService : IGovernanceVersionService
             CompareField("PublishedAt", "发布时间", sourceVersion.PublishedAt?.ToString("yyyy-MM-dd HH:mm:ss"), targetVersion.PublishedAt?.ToString("yyyy-MM-dd HH:mm:ss")),
             CompareField("PublishedBy", "发布人", sourceVersion.PublishedBy, targetVersion.PublishedBy)
         };
+    }
 
-        // 注：策略包版本表无 Remarks 列（与 RuleSet/ParameterSet 同），故不含 Remarks 对比字段。
-        return new VersionDiffResult
+    /// <summary>指定字段是否发生变化（按 <see cref="FieldDiff.FieldName"/> 精确匹配）</summary>
+    /// <remarks>开发者：3号位</remarks>
+    private static bool IsFieldChanged(IEnumerable<FieldDiff> diffs, string fieldName)
+        => diffs.Any(d => d.IsChanged && string.Equals(d.FieldName, fieldName, StringComparison.Ordinal));
+
+    /// <summary>
+    /// 构造富对比的「双方版本概要」块（按 Id 只读回填规则集／参数集版本编码）。
+    /// </summary>
+    /// <remarks>开发者：3号位。编码查不到时返 <c>null</c>，不抛异常——绑定 Id 才是权威值。</remarks>
+    private async Task<StrategyProfileVersionBriefDto> BuildStrategyProfileVersionBriefAsync(StrategyProfileVersion version, CancellationToken ct)
+    {
+        var ruleSetVersion = version.RuleSetVersionId > 0
+            ? await _ruleSetVersionRepository.GetByIdAsync(version.RuleSetVersionId, ct)
+            : null;
+
+        var parameterSetVersion = version.ParameterSetVersionId > 0
+            ? await _parameterSetVersionRepository.GetByIdAsync(version.ParameterSetVersionId, ct)
+            : null;
+
+        return new StrategyProfileVersionBriefDto
         {
-            SourceVersionId = sourceVersionId,
-            TargetVersionId = targetVersionId,
-            SourceVersionCode = sourceVersion.VersionCode,
-            TargetVersionCode = targetVersion.VersionCode,
-            EntityType = "StrategyProfileVersion",
-            FieldDiffs = diffs,
-            ComparedAt = DateTime.Now
+            VersionId = version.Id,
+            StrategyProfileId = version.StrategyProfileId,
+            VersionCode = version.VersionCode,
+            Status = version.Status,
+            IsDefault = version.IsDefault,
+            RuleSetVersionId = version.RuleSetVersionId,
+            RuleSetVersionCode = ruleSetVersion?.VersionCode,
+            ParameterSetVersionId = version.ParameterSetVersionId,
+            ParameterSetVersionCode = parameterSetVersion?.VersionCode,
+            EffectiveFrom = version.EffectiveFrom,
+            EffectiveTo = version.EffectiveTo,
+            PublishedAt = version.PublishedAt,
+            PublishedBy = version.PublishedBy,
         };
     }
 
@@ -756,6 +877,33 @@ public class GovernanceVersionService : IGovernanceVersionService
             SourceValue = sourceValue,
             TargetValue = targetValue,
             IsChanged = sourceValue != targetValue
+        };
+    }
+
+    /// <summary>
+    /// ⑦ Setup 换型规则子块对比（4号位 P0 Q2）。
+    /// 此前按原始 block JSON 串对比——DRAFT 继承重编 Id 高位（Q1）、行序差异等实现细节都会误判成变更。
+    /// 现按**业务键**（EXACT 七元组 / DEFAULT 五元组）对比，与 <see cref="SetupRuleService.GetDiffAsync"/> 同口径
+    /// （键单源 <see cref="SetupTransitionRuleProjector.BuildBusinessKey"/>，防双实现漂移）；
+    /// 仅业务键增删/SetupMinutes 变才判 IsChanged。缺子块/null/[] → ExtractRules 空列表，合法缺配对比仍安全（fail-open）。
+    /// </summary>
+    private static FieldDiff CompareSetupTransitionRules(RuleSetVersion sourceVersion, RuleSetVersion targetVersion)
+    {
+        var fieldName = SetupTransitionRuleProjector.SetupTransitionRulesBlockName;
+        var sourceBlock = ExtractBlockJson(sourceVersion.ContentSnapshotJson, fieldName);
+        var targetBlock = ExtractBlockJson(targetVersion.ContentSnapshotJson, fieldName);
+
+        var diff = SetupTransitionRuleProjector.CompareBusinessContent(
+            SetupTransitionRuleProjector.ExtractRules(sourceVersion.ContentSnapshotJson),
+            SetupTransitionRuleProjector.ExtractRules(targetVersion.ContentSnapshotJson));
+
+        return new FieldDiff
+        {
+            FieldName = fieldName,
+            FieldDisplayName = "换型规则配置",
+            SourceValue = sourceBlock,
+            TargetValue = targetBlock,
+            IsChanged = diff.IsChanged,
         };
     }
 
@@ -890,8 +1038,23 @@ public class GovernanceVersionService : IGovernanceVersionService
 
         // S-6：Setup 换型规则子块发布前校验（fail-open：缺失/为空 → 通过，无规则 DEFAULT 兜底；
         // 存在但 JSON 损坏 → 阻断，不静默吞错——写入口严格、读出口宽容，与 SetupRuleService 合法写路径零冲突）
+        // P0-B（2026-10-27 核证收口）：JSON 有效后追加同键冲突校验——统一发布与 Setup 发布共用同一份
+        // ConflictValidator，消除「碰撞 DRAFT 被统一发布静默放出」倒挂。不引用 SetupRuleService（避免反向依赖），
+        // 二者共用无状态 _setupConflictValidator（§十 唯一键：EXACT=部门+大工艺+工序+设备+前产品+后产品；DEFAULT=部门+大工艺+工序+设备）。
+        // APS-V1 §三.3（2026-10-28 服务端落点）：Setup 主题全空/明显缺覆盖 → 给警告并要求发布者人工明确确认，
+        // 不改为整版硬失败（S-6 fail-open + 既有「规则缺失0分钟并追踪」兜底不变）。警告走 PublishValidationResult.Warnings
+        // 通道（既已由 GovernanceController 发布校验端点 :747 返回前端），空 Setup 不阻断发布，仅显式提示人工核对。
         var setupBlockJson = ExtractBlockJson(version.ContentSnapshotJson, SetupTransitionRuleProjector.SetupTransitionRulesBlockName);
-        if (!string.IsNullOrWhiteSpace(setupBlockJson))
+        if (string.IsNullOrWhiteSpace(setupBlockJson))
+        {
+            result.Warnings.Add(new ValidationWarning
+            {
+                Code = "EMPTY_SETUP_TRANSITION_RULES",
+                Message = "SetupTransitionRules 子块缺失/为空——请发布者人工确认 ⑦换型规则 已维护完成或本版本确有缺配依据；空 Setup 不阻断发布（S-6 兜底），仅提示人工核对（APS-V1 §三.3）",
+                FieldName = SetupTransitionRuleProjector.SetupTransitionRulesBlockName
+            });
+        }
+        else
         {
             try
             {
@@ -905,6 +1068,19 @@ public class GovernanceVersionService : IGovernanceVersionService
                         Message = "SetupTransitionRules 子块反序列化结果为空",
                         FieldName = SetupTransitionRuleProjector.SetupTransitionRulesBlockName
                     });
+                }
+                else
+                {
+                    var conflict = _setupConflictValidator.Validate(setupRules.Where(r => r.IsActive).ToList());
+                    if (!conflict.IsValid)
+                    {
+                        result.Errors.Add(new ValidationError
+                        {
+                            Code = "SETUP_TRANSITION_RULE_CONFLICT",
+                            Message = $"SetupTransitionRules 子块同键冲突：{conflict.GetErrorMessage()}",
+                            FieldName = SetupTransitionRuleProjector.SetupTransitionRulesBlockName
+                        });
+                    }
                 }
             }
             catch (System.Text.Json.JsonException ex)
@@ -991,8 +1167,18 @@ public class GovernanceVersionService : IGovernanceVersionService
         ValidateSolverStrategyJson(ExtractBlockJson(version.ContentSnapshotJson, "SolverStrategy"), result);
         ValidateCandidateGuardrailJson(ExtractBlockJson(version.ContentSnapshotJson, "CandidateGuardrail"), result);
 
+        // R05 Stage 固定交接等待（合同 v1.1 §五）：顶层 $.StageHandoffWaitRules 纯 JSON 校验接入发布链
+        // 缺配置（键缺失/为空/null）→ 不阻断（H-3：无源不阻断全 36 对、不默认填充），仅内容出现时才进入六项校验
+        ValidateStageHandoffWaitRulesJson(ExtractBlockJson(version.ContentSnapshotJson, SolverStrategyValidator.StageHandoffWaitRulesBlockName), result);
+
         // 0号位 裁决5：无效仓库引用校验（INVALID_WAREHOUSE_REF）——使用现有 APS 权威仓库事实源只读校验
         await ValidateWarehouseReferencesAsync(version.ContentSnapshotJson, result);
+
+        // R04 C-R04-2（2026-11-03）：无效物料引用校验（INVALID_MATERIAL_REF）——PlanningYield 引用的 MaterialId(=MaterialCode)
+        // 须存在于 APS 权威物料事实源（Material 表 IsActive=1）；镜像 INVALID_WAREHOUSE_REF 只读比对、可空/事实源空跳过。
+        // ⚠️ 未知 Stage 发布期判定本处**不跨号位硬做**：合法 Stage 值域（RoutingStage/APS_BOM_STAGE_PATH_RAW）带工厂前缀而
+        // 参数表 StageCode 不带，直接比对会误杀全部合法 Stage；须先经 S-004 值域归一，另行登记最小阶段覆盖（0号位 §五.1 三类差异）。
+        await ValidatePlanningYieldMaterialReferencesAsync(version.ContentSnapshotJson, result);
 
         result.IsValid = result.Errors.Count == 0;
         return result;
@@ -1101,6 +1287,81 @@ public class GovernanceVersionService : IGovernanceVersionService
         }
     }
 
+    /// <summary>
+    /// 无效物料引用校验（R04 C-R04-2 落码，2026-11-03，INVALID_MATERIAL_REF）。
+    /// 校验参数集 Procurement 块 PlanningYield 引用的 MaterialId（=物料**编码** MaterialCode，见
+    /// <see cref="Core.Dto.PlanningYieldRule"/> 注释；与需求侧同源，快照存编码直接等值比对）
+    /// 是否存在于现有 APS 权威物料事实源（Material 表 IsActive=1 的 DISTINCT MaterialCode）。
+    /// 约定（镜像 <see cref="ValidateWarehouseReferencesAsync"/>）：事实源为空（系统尚未同步任何物料事实）时跳过校验，
+    /// 避免对未就绪数据源误判；物料级默认行（StageCode 空）同样校验其 MaterialId。
+    /// ⚠️ 未知 Stage 发布期判定**不在此处做**：合法 Stage 值域（RoutingStage/APS_BOM_STAGE_PATH_RAW）带工厂前缀
+    /// 而参数表 StageCode 不带前缀，直接比对会误杀全部合法 Stage；须先经 S-004 值域统一后再可行，另行登记最小阶段覆盖。
+    /// </summary>
+    private async Task ValidatePlanningYieldMaterialReferencesAsync(string? contentSnapshotJson, PublishValidationResult result)
+    {
+        if (_connectionManager is null || string.IsNullOrWhiteSpace(contentSnapshotJson))
+        {
+            return;
+        }
+
+        // 1. 采集 Procurement.PlanningYields 引用的物料编码（去重、忽略空串）
+        var referenced = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        try
+        {
+            var procurementJson = ExtractBlockJson(contentSnapshotJson, "Procurement");
+            if (string.IsNullOrWhiteSpace(procurementJson))
+            {
+                return;
+            }
+
+            var procurement = System.Text.Json.JsonSerializer.Deserialize<ProcurementBlock>(procurementJson, JsonOptions);
+            if (procurement?.PlanningYields is { } yields)
+            {
+                foreach (var rule in yields)
+                {
+                    if (rule is null || string.IsNullOrWhiteSpace(rule.MaterialId)) continue;
+                    referenced.Add(rule.MaterialId);
+                }
+            }
+        }
+        catch (System.Text.Json.JsonException)
+        {
+            // 内容损坏已由五子块校验报错，此处不重复
+            return;
+        }
+
+        if (referenced.Count == 0)
+        {
+            return;
+        }
+
+        // 2. 读取权威物料事实源（Material 表 IsActive=1 的 DISTINCT MaterialCode）
+        var existing = await _connectionManager.QueryAsync<string>(
+            @"SELECT DISTINCT MaterialCode FROM [dbo].[Material] WHERE [IsActive] = 1",
+            null,
+            db: DatabaseId.APS);
+
+        var existingSet = new HashSet<string>(existing ?? [], StringComparer.OrdinalIgnoreCase);
+        if (existingSet.Count == 0)
+        {
+            // 事实源未就绪（系统尚未同步任何物料事实）：跳过校验，避免对未就绪数据源误判
+            return;
+        }
+
+        // 3. 引用不存在 → INVALID_MATERIAL_REF（缺失逐一报错，便于前端定位）
+        foreach (var code in referenced
+                     .Where(c => !existingSet.Contains(c))
+                     .OrderBy(c => c, StringComparer.Ordinal))
+        {
+            result.Errors.Add(new ValidationError
+            {
+                Code = "INVALID_MATERIAL_REF",
+                Message = $"PlanningYield 引用了不存在的物料编码：{code}（权威物料事实源：Material 表 IsActive=1）",
+                FieldName = "Procurement/PlanningYields"
+            });
+        }
+    }
+
     /// <summary>校验 SolverStrategyJson：缺失/损坏/业务约束（E-4 SolverStrategyValidator 接线，P0-02b）</summary>
     private void ValidateSolverStrategyJson(string? json, PublishValidationResult result)
     {
@@ -1178,6 +1439,49 @@ public class GovernanceVersionService : IGovernanceVersionService
         catch (System.Text.Json.JsonException ex)
         {
             result.Errors.Add(new ValidationError { Code = "INVALID_JSON", Message = "CandidateGuardrailJson 格式无效", FieldName = "CandidateGuardrailJson", Details = ex.Message });
+        }
+    }
+
+    /// <summary>校验顶层 Stage 固定交接等待子块（合同 v1.1 §五：纯 JSON 六项下限，校验器纯内容不注入 DB）。
+    /// 键缺失/为空/null = 缺配置 → 不阻断（H-3：无源不阻断全 36 对、不默认填充）；仅内容出现时才进入六项校验。</summary>
+    /// 2026-10-29：由 `private` 改 **`internal`**，仅供 `LPS.APS.Tests`（`InternalsVisibleTo`）对「`[]` 零行拦 / 缺省 null 放行 / 合法数组放行」直接断言。
+    internal static void ValidateStageHandoffWaitRulesJson(string? json, PublishValidationResult result)
+    {
+        if (string.IsNullOrWhiteSpace(json))
+        {
+            return; // 缺配置：无源不阻断全 36 对，不默认填充（合同 v1.1 §七 H-3）
+        }
+
+        try
+        {
+            // 2号位 2026-10-29 通报发布链同源缺陷、采甲方案处置：本块枚举 TimeBasis（StageHandoffTimeBasis）实库以字符串名（如 "ELAPSED"）存储，
+            // 通用 JsonOptions 无 JsonStringEnumConverter ⇒ 字符串枚举反序列化抛 JsonException（INVALID_JSON）。本块改走单列 StageHandoffJsonOptions
+            //（+JsonStringEnumConverter，收「字符串名 + 数值 0/1」两种写法），仅真正损坏才抛；不动通用 JsonOptions（六块载荷及其它子块零影响）。
+            var rules = System.Text.Json.JsonSerializer.Deserialize<List<StageHandoffWaitRule>>(json, StageHandoffJsonOptions);
+            if (rules == null)
+            {
+                result.Errors.Add(new ValidationError { Code = "INVALID_JSON", Message = "StageHandoffWaitRules 反序列化结果为空", FieldName = SolverStrategyValidator.StageHandoffWaitRulesBlockName });
+                return;
+            }
+
+            // C9「键存在但零行 `[]`」＝配置形态非法（不是格式错）：发布期 fail-closed，把错卡在发布而非运行。
+            // 与装载侧 FrozenStrategySnapshotProvider 同批上线的 STAGE_HANDOFF_WAIT_BLOCK_EMPTY 同词表（2号位 2026-10-29 通报）。
+            // 注意：键缺省 / 显式 null 已由 ExtractBlockJson 归 null 走上方早退，不在此分支；本分支只捕获「键在且为空数组」。
+            // 语义自洽：要表达「此版本这一块不用」应删除键（键缺省＝放行），不得留空数组。
+            if (rules.Count == 0)
+            {
+                result.Errors.Add(new ValidationError { Code = "STAGE_HANDOFF_WAIT_BLOCK_EMPTY", Message = "StageHandoffWaitRules 键存在但零行（配置形态非法：如不用该块应删除该键，不得留空数组）", FieldName = SolverStrategyValidator.StageHandoffWaitRulesBlockName });
+                return;
+            }
+
+            foreach (var err in SolverStrategyValidator.ValidateStageHandoffWaitRules(rules))
+            {
+                result.Errors.Add(new ValidationError { Code = "INVALID_STAGE_HANDOFF_WAIT", Message = err, FieldName = SolverStrategyValidator.StageHandoffWaitRulesBlockName });
+            }
+        }
+        catch (System.Text.Json.JsonException ex)
+        {
+            result.Errors.Add(new ValidationError { Code = "INVALID_JSON", Message = "StageHandoffWaitRules 格式无效", FieldName = SolverStrategyValidator.StageHandoffWaitRulesBlockName, Details = ex.Message });
         }
     }
 
@@ -1386,6 +1690,20 @@ public class GovernanceVersionService : IGovernanceVersionService
     };
 
     /// <summary>
+    /// Stage 固定交接等待子块专用反序列化选项（2号位 2026-10-29 通报发布链同源缺陷、采甲方案处置）：
+    /// 本块枚举 <see cref="StageHandoffTimeBasis"/> 实库以字符串名（如 "ELAPSED"）存储，通用 <see cref="JsonOptions"/>
+    /// 未含 <see cref="System.Text.Json.Serialization.JsonStringEnumConverter"/> ⇒ 字符串枚举反序列化抛 JsonException（INVALID_JSON）。
+    /// 处置：本块**单列**（+JsonStringEnumConverter）收「字符串名 + 数值 0/1」两种写法，仅真正损坏才抛；
+    /// **不动通用 JsonOptions**（六块载荷及其它子块反序列化零影响，与 2号位 装载侧单列选项对齐）。
+    /// </summary>
+    /// 2026-10-29：由 `private` 改 **`internal`**，仅供 `LPS.APS.Tests`（`InternalsVisibleTo`）对「字符串名/数值/bad value」三分例反序列化直接断言。
+    internal static readonly System.Text.Json.JsonSerializerOptions StageHandoffJsonOptions = new()
+    {
+        PropertyNameCaseInsensitive = true,
+        Converters = { new System.Text.Json.Serialization.JsonStringEnumConverter() }
+    };
+
+    /// <summary>
     /// 发布时取 RuleSet 侧 ContentSnapshotJson（契约 §6.10.5 内容归属：DemandPriority 子块）。
     /// P0-01：快照为唯一内容真相；兼容仅传主题 JSON 的装配路径（单测）——先归一化再取快照，幂等；
     /// 缺失时防御性抛出（发布链 Validate 已保证非空，不应走到）。
@@ -1465,6 +1783,15 @@ public class GovernanceVersionService : IGovernanceVersionService
         {
             blocks[TaskSplitRuleConfigProjector.BatchPolicyBlockName] =
                 System.Text.Json.JsonSerializer.Deserialize<System.Text.Json.JsonElement>(batchPolicyJson, JsonOptions);
+        }
+
+        // R05（2026-11-02 缺口补全）：StageHandoffWaitRules 亦为「独立写路径直写快照」的块（无主题列，同 BatchPolicy），
+        // 全量重建快照时须保留既有子块，否则仅改任一主题 JSON 即会把该块静默覆盖丢弃（数据丢失）。
+        var stageBlockJson = ExtractBlockJson(version.ContentSnapshotJson, SolverStrategyValidator.StageHandoffWaitRulesBlockName);
+        if (!string.IsNullOrWhiteSpace(stageBlockJson))
+        {
+            blocks[SolverStrategyValidator.StageHandoffWaitRulesBlockName] =
+                System.Text.Json.JsonSerializer.Deserialize<System.Text.Json.JsonElement>(stageBlockJson, JsonOptions);
         }
 
         version.ContentSnapshotJson = System.Text.Json.JsonSerializer.Serialize(blocks);
@@ -1761,14 +2088,14 @@ public class GovernanceVersionService : IGovernanceVersionService
             throw new InvalidOperationException("解析默认策略包需要 RunType（StrategyProfile.RunType 匹配）");
         }
 
-        var candidates = await _strategyProfileVersionRepository.GetDefaultByRunTypeAsync(runType, ct);
         var effective = asOf ?? DateTime.Now;
 
-        // 过滤生效窗口：EffectiveFrom <= now（有值才校验）、EffectiveTo >= now（有值才校验）
-        var inWindow = candidates
-            .Where(v => (!v.EffectiveFrom.HasValue || v.EffectiveFrom.Value <= effective)
-                     && (!v.EffectiveTo.HasValue || v.EffectiveTo.Value >= effective))
-            .ToList();
+        // AE-007 / Q8（2026-10-29 落码）：读侧改为「两级解析」——精确 RunType 优先，
+        // 该时点无任何精确生效默认时才回退到 RunType IS NULL（适用所有）兜底；两层不混合。
+        // 生效窗口（EffectiveFrom/EffectiveTo）已下沉到仓储 SQL 一并判定，
+        // 避免「精确层存在但已过期」错误地挡住 NULL 兜底（旧实现先取精确再做应用层窗过滤，兜底永不命中）。
+        var inWindow = await _strategyProfileVersionRepository
+            .GetDefaultByRunTypeOrFallbackAsync(runType, effective, ct);
 
         return inWindow.Count switch
         {
@@ -1920,6 +2247,19 @@ public class GovernanceVersionService : IGovernanceVersionService
         await _auditLogRepository.EnsureWritableAsync(ct);
 
         var created = await _ruleSetVersionRepository.AddAsync(version, ct);
+
+        // 4号位 P0（2026-10-28）「草稿继承的换型规则不可改不可删」Q1 修复：
+        // 前端 forkDraft 把源版本 ⑦ SetupTransitionRules 子块整段照抄（含旧 Id 高位）→ 继承行写路径
+        //（SetupRuleService 经 ParseRuleId 反查版本）打回已发布版（Update 422 / Delete 400）。
+        // 此处于 Add 之后（created.Id 由 DB identity 回填才可得）按新草稿版本 Id 空间重编子块副本并落回，
+        // 使继承行天然归入草稿（可改可删）；已发布源块一字不动 ≡ 红线#3「复制时重编号」语义。
+        // 子块缺/空则 RenumberToVersion 原样返回（无额外写）；仅当确有继承行需重编时才触发 Update。
+        var renumberedSnapshot = SetupTransitionRuleProjector.RenumberToVersion(created.ContentSnapshotJson, created.Id);
+        if (!string.Equals(renumberedSnapshot, created.ContentSnapshotJson, StringComparison.Ordinal))
+        {
+            created.ContentSnapshotJson = renumberedSnapshot;
+            await _ruleSetVersionRepository.UpdateAsync(created, ct);
+        }
 
         // P1-04 审计日志：记录创建操作
         await _auditLogRepository.AddAsync(new Core.Entities.Auth.AuditLog
@@ -2081,6 +2421,99 @@ public class GovernanceVersionService : IGovernanceVersionService
             OccurredAt = DateTime.Now,
             Remark = "参数集版本更新"
         }, ct);
+    }
+
+    /// <summary>
+    /// 写入参数集版本 Stage 固定交接等待规则（R05 StageHandoffWaitRules 治理写面补全，2026-11-02）。
+    /// <paramref name="rulesJson"/> 为规则数组的 JSON 文本（控制器以返回值/JsonElement 原样取最外层规则数组的原始 JSON 传入）。
+    /// 服务内统一用本块专用选项 <see cref="StageHandoffJsonOptions"/>（含 <see cref="System.Text.Json.Serialization.JsonStringEnumConverter"/>，
+    /// 兼容 <c>"ELAPSED"</c> 字符串与数值 0/1 两种枚举形态）反序列化——与装载侧既有解析同口径共享同套规则，
+    /// 不依赖 Web 全局 JSON 选项（其无枚举转换器）。
+    /// 将规则列表写入版本快照顶层 <c>$.StageHandoffWaitRules</c>（合同 v1.1 §四：唯一物理路径），回写同样走
+    /// <see cref="StageHandoffJsonOptions"/> 以保持 <c>"ELAPSED"</c> 字符串形态，与 2365 存量格式一致。
+    /// 红线：仅 DRAFT/SUBMITTED/APPROVED 可改（PUBLISHED 拒绝，历史不可变）；写前复用发布链同一校验器；
+    /// P1-04 审计前置预检 + AuditLog。
+    /// C9（2026-10-29 裁决）：空数组是「已配置却零行」的非法形态，本写面以**空列表 = 删除该键**表达「本版不用该块」，
+    /// 装载侧对缺键/null 按无规则放行、绝不持久化 <c>[]</c>。
+    /// </summary>
+    /// <exception cref="InvalidOperationException">版本不存在/不可改、JSON 损坏、校验不通过时抛出。</exception>
+    public async Task SaveStageHandoffWaitRulesAsync(long parameterSetVersionId, string? rulesJson, string? actorUserCode, int actorUserId, CancellationToken ct = default)
+    {
+        var existing = await _parameterSetVersionRepository.GetByIdAsync(parameterSetVersionId, ct)
+            ?? throw new InvalidOperationException($"参数集版本不存在：{parameterSetVersionId}");
+
+        EnsureUpdatable(existing.Status, parameterSetVersionId);
+
+        // 反序列化：复用本块专用选项（含 JsonStringEnumConverter），与装载侧同口径；损坏则拒绝
+        var rules = DeserializeStageHandoffWaitRules(rulesJson);
+
+        // 写前校验（复用发布链同一校验器，保证本块写入后可正常发布）
+        var errors = SolverStrategyValidator.ValidateStageHandoffWaitRules(rules);
+        if (errors.Count > 0)
+        {
+            throw new InvalidOperationException(string.Join("；", errors));
+        }
+
+        // 重写快照：读既有全部子块，upsert 顶层 StageHandoffWaitRules（空列表即删键，符合 C9）
+        var snapshot = string.IsNullOrWhiteSpace(existing.ContentSnapshotJson)
+            ? new System.Text.Json.Nodes.JsonObject()
+            : System.Text.Json.Nodes.JsonNode.Parse(existing.ContentSnapshotJson)?.AsObject()
+              ?? new System.Text.Json.Nodes.JsonObject();
+
+        if (rules.Count > 0)
+        {
+            snapshot[SolverStrategyValidator.StageHandoffWaitRulesBlockName] =
+                System.Text.Json.Nodes.JsonNode.Parse(System.Text.Json.JsonSerializer.Serialize(rules, StageHandoffJsonOptions));
+        }
+        else
+        {
+            snapshot.Remove(SolverStrategyValidator.StageHandoffWaitRulesBlockName);
+        }
+
+        existing.ContentSnapshotJson = snapshot.ToJsonString(JsonOptions);
+
+        // P1-04：审计前置预检（跨库无 2PC）——审计库不可写则整操作失败、业务零变更。
+        await _auditLogRepository.EnsureWritableAsync(ct);
+
+        await _parameterSetVersionRepository.UpdateAsync(existing, ct);
+
+        await _auditLogRepository.AddAsync(new Core.Entities.Auth.AuditLog
+        {
+            ActionCode = "Update",
+            EntityType = "ParameterSetVersion",
+            EntityId = parameterSetVersionId.ToString(),
+            VersionCode = existing.VersionCode,
+            OldValue = existing.VersionCode,
+            NewValue = existing.VersionCode,
+            UserId = actorUserId,
+            UserCode = actorUserCode,
+            OccurredAt = DateTime.Now,
+            Remark = "StageHandoffWaitRules 治理写入"
+        }, ct);
+    }
+
+    /// <summary>
+    /// 以本块专用选项 <see cref="StageHandoffJsonOptions"/> 反序列化 StageHandoffWaitRules 规则数组。
+    /// 接受的入参为规则数组 JSON 文本（可含前端包装 <c>{ "rules": [...] }</c> 时最外层数组部分）；
+    /// null/空白/顶层空数组一律视为空列表（空列表 = 删键，C9）。JSON 结构损坏时抛 <see cref="InvalidOperationException"/>。
+    /// </summary>
+    private static List<StageHandoffWaitRule> DeserializeStageHandoffWaitRules(string? rulesJson)
+    {
+        if (string.IsNullOrWhiteSpace(rulesJson))
+            return [];
+
+        List<StageHandoffWaitRule> rules;
+        try
+        {
+            rules = System.Text.Json.JsonSerializer.Deserialize<List<StageHandoffWaitRule>>(
+                    rulesJson, StageHandoffJsonOptions)
+                ?? [];
+        }
+        catch (System.Text.Json.JsonException ex)
+        {
+            throw new InvalidOperationException($"StageHandoffWaitRules JSON 格式无效：{ex.Message}", ex);
+        }
+        return rules;
     }
 
     /// <summary>

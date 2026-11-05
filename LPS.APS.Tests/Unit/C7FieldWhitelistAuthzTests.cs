@@ -217,8 +217,8 @@ public class C7FieldWhitelistAuthzTests
         var act = _service.SetDefaultStrategyProfileVersionAsync(5, "operator", ActorUserId);
 
         await act;
-        _strategyProfileVersionRepo.Verify(r => r.ClearDefaultFlagAsync(1, 5, It.IsAny<CancellationToken>()), Times.Once);   // 清同族其它默认
-        _strategyProfileVersionRepo.Verify(r => r.UpdateAsync(published, It.IsAny<CancellationToken>()), Times.Once);        // 置位
+        // 单事务原子切换（取代原两步 ClearDefaultFlagAsync+UpdateAsync）：清除同族其它默认并置位
+        _strategyProfileVersionRepo.Verify(r => r.SetDefaultAsync(1L, 5L, It.IsAny<CancellationToken>()), Times.Once);
         published.IsDefault.Should().BeTrue();
         _auditRepo.Verify(r => r.AddAsync(It.IsAny<LPS.APS.Core.Entities.Auth.AuditLog>(), It.IsAny<CancellationToken>()), Times.Once);   // 审计
     }
@@ -231,9 +231,8 @@ public class C7FieldWhitelistAuthzTests
 
         await _service.SetDefaultStrategyProfileVersionAsync(5, "operator", ActorUserId);
 
-        // 已是默认 → 不执行清冲突/置位/审计
-        _strategyProfileVersionRepo.Verify(r => r.ClearDefaultFlagAsync(It.IsAny<long>(), It.IsAny<long>(), It.IsAny<CancellationToken>()), Times.Never);
-        _strategyProfileVersionRepo.Verify(r => r.UpdateAsync(It.IsAny<StrategyProfileVersion>(), It.IsAny<CancellationToken>()), Times.Never);
+        // 已是默认 → 不执行原子切换/审计
+        _strategyProfileVersionRepo.Verify(r => r.SetDefaultAsync(It.IsAny<long>(), It.IsAny<long>(), It.IsAny<CancellationToken>()), Times.Never);
         _auditRepo.Verify(r => r.AddAsync(It.IsAny<LPS.APS.Core.Entities.Auth.AuditLog>(), It.IsAny<CancellationToken>()), Times.Never);
     }
 

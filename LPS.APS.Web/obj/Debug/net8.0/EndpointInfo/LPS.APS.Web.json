@@ -1064,16 +1064,16 @@
         }
       }
     },
-    "/api/Governance/rule-set/version/{versionId}": {
-      "delete": {
+    "/api/Governance/rule-set/{ruleSetId}/versions": {
+      "get": {
         "tags": [
           "Governance"
         ],
-        "summary": "物理删除单个草稿版本（DELETE /rule-set/version/{id}，R1 2026-10-25）：仅 Status=DRAFT 可删（清空白草稿壳）；\r\n已发布/停用/归档拒绝。被策略包引用则拒绝。审计前置后删单行。",
+        "summary": "获取规则集的所有版本（rule-set 同族 2026-10-15：摘要 DTO，镜像参数集 R2——不含 ContentSnapshotJson/DemandPriorityJson 大 JSON 载体；\r\n2026-10-15 4号位 来文 Q2：加补传输层——改调摘要查询，防将来规则集快照变大后版本下拉同方式不可用）",
         "description": "开发者：3号位",
         "parameters": [
           {
-            "name": "versionId",
+            "name": "ruleSetId",
             "in": "path",
             "required": true,
             "schema": {
@@ -1087,7 +1087,9 @@
             "description": "Success"
           }
         }
-      },
+      }
+    },
+    "/api/Governance/rule-set/version/{versionId}": {
       "get": {
         "tags": [
           "Governance"
@@ -1147,31 +1149,6 @@
             }
           }
         },
-        "responses": {
-          "200": {
-            "description": "Success"
-          }
-        }
-      }
-    },
-    "/api/Governance/rule-set/{ruleSetId}/versions": {
-      "get": {
-        "tags": [
-          "Governance"
-        ],
-        "summary": "获取规则集的所有版本（rule-set 同族 2026-10-15：摘要 DTO，镜像参数集 R2——不含 ContentSnapshotJson/DemandPriorityJson 大 JSON 载体；\r\n2026-10-15 4号位 来文 Q2：加补传输层——改调摘要查询，防将来规则集快照变大后版本下拉同方式不可用）",
-        "description": "开发者：3号位",
-        "parameters": [
-          {
-            "name": "ruleSetId",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "integer",
-              "format": "int64"
-            }
-          }
-        ],
         "responses": {
           "200": {
             "description": "Success"
@@ -1327,6 +1304,44 @@
               "schema": {
                 "$ref": "#/components/schemas/ParameterSetVersion"
               }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Success"
+          }
+        }
+      }
+    },
+    "/api/Governance/parameter-set/version/{versionId}/stage-handoff-wait-rules": {
+      "put": {
+        "tags": [
+          "Governance"
+        ],
+        "summary": "写入参数集版本 Stage 固定交接等待规则（R05 治理写面补全，2026-11-02；仅 DRAFT/SUBMITTED/APPROVED 可改）。\r\n请求体为规则 JSON 数组；写前校验 + P1-04 审计；空数组 = 删除该键（C9：本版不用该块）。",
+        "description": "开发者：3号位",
+        "parameters": [
+          {
+            "name": "versionId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": { }
+            },
+            "text/json": {
+              "schema": { }
+            },
+            "application/*+json": {
+              "schema": { }
             }
           }
         },
@@ -1781,6 +1796,40 @@
           {
             "name": "targetVersionId",
             "in": "query",
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          }
+        }
+      }
+    },
+    "/api/Governance/strategy-profile/version/{compareVersionId}/compare-with/{baseVersionId}": {
+      "get": {
+        "tags": [
+          "Governance"
+        ],
+        "summary": "策略包版本富对比（S12：06 §6.4.1「版本富对比（H1）」；a＝对比方、b＝基准方）",
+        "description": "开发者：3号位。06 该行只冻结「路径／a、b 为 VersionId／治理读／403」，**字段清单属契约空白**，\r\n最小 DTO 已登记为 S-14。参数方向与 `plan-version/{a}/compare-with/{b}` 同序。",
+        "parameters": [
+          {
+            "name": "compareVersionId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          },
+          {
+            "name": "baseVersionId",
+            "in": "path",
+            "required": true,
             "schema": {
               "type": "integer",
               "format": "int64"
@@ -6767,7 +6816,7 @@
         "tags": [
           "Schedule"
         ],
-        "summary": "获取指定计划版本的甘特图数据（资源行 + 任务条；越权返回空且 ScopeDenied=true）。\r\n冻结 05:1013「Gantt按时间窗/资源加载」：支持可选 from / to / resourceIds，不传则全量（向后兼容）。\r\n<br>⚠️ `resourceIds` 只认<b>重复键</b>写法：`?resourceIds=1&resourceIds=2`。\r\n逗号形式（`1,2`）会被模型绑定拒绝（422）；`resourceIds[]=1` 形式会被静默忽略而返回全量，\r\n故下方显式拦截，避免调用方误以为过滤生效（4号位 10-17 §3.2）。",
+        "summary": "获取指定计划版本的甘特图数据（资源行 + 任务条；越权返回空且 ScopeDenied=true）。\r\n冻结 05:1013「Gantt按时间窗/资源加载」：支持可选 from / to / resourceIds。\r\n<br>⚠️ `resourceIds` 只认<b>重复键</b>写法：`?resourceIds=1&resourceIds=2`。\r\n逗号形式（`1,2`）会被模型绑定拒绝（422）；`resourceIds[]=1` 形式会被静默忽略而返回全量，\r\n故下方显式拦截，避免调用方误以为过滤生效（4号位 10-17 §3.2）。<br>10-29 分页契约（4号位 三步走·第 1 步，5号位 复函定稿）：\r\n`limit` 缺省 8,000、硬上限 20,000——<b>不传亦按默认截断，\"裸调=全量\"旧语义终结</b>；\r\n翻页=把响应 `nextAfter` 三元组原样回填 `afterResourceId/afterStartAt/afterTaskId`（缺一按首页）。\r\n响应新增 `limit/totalTasks/hasMore/nextAfter`；`totalTasks`=当前过滤口径数（非版本总数）。",
         "parameters": [
           {
             "name": "planVersionId",
@@ -6804,6 +6853,38 @@
                 "format": "int32"
               }
             }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "format": "int32"
+            }
+          },
+          {
+            "name": "afterResourceId",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "format": "int32"
+            }
+          },
+          {
+            "name": "afterStartAt",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            }
+          },
+          {
+            "name": "afterTaskId",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
           }
         ],
         "responses": {
@@ -6823,6 +6904,81 @@
               "text/json": {
                 "schema": {
                   "$ref": "#/components/schemas/GanttDataDtoApiResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/Schedule/gantt/{planVersionId}/buckets": {
+      "get": {
+        "tags": [
+          "Schedule"
+        ],
+        "summary": "甘特「资源×时间桶」聚合层（三步走·第 2 步；5号位 2026-10-30 复函九条口径定稿）。\r\n`from/to 必填`（缺→真 400）；`bucket=day|week|month`（缺省 day）；\r\n行数>50,000 自动 day→week→month 降级（回显 `bucketWidth/bucketDowngraded`），月桶仍超→真 400 要求 resourceIds 收窄。\r\n恒等式 `Σ items.taskCount == totalTasks`（钳制归桶+未排桶）；未排桶行 `bucketStart` 整键省略；\r\n不存在/越权沿用 200+flag（versionExists/scopeDenied）与明细体同惯例。\r\n`resourceIds` 与明细体同款拦截：只认重复键，`resourceIds[]` 真 400。",
+        "parameters": [
+          {
+            "name": "planVersionId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int32"
+            }
+          },
+          {
+            "name": "from",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            }
+          },
+          {
+            "name": "to",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            }
+          },
+          {
+            "name": "bucket",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "resourceIds",
+            "in": "query",
+            "schema": {
+              "type": "array",
+              "items": {
+                "type": "integer",
+                "format": "int32"
+              }
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "$ref": "#/components/schemas/GanttBucketsDtoApiResponse"
+                }
+              },
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GanttBucketsDtoApiResponse"
+                }
+              },
+              "text/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GanttBucketsDtoApiResponse"
                 }
               }
             }
@@ -7210,7 +7366,7 @@
         "tags": [
           "SetupRule"
         ],
-        "summary": "#13 发布规则集版本（发布前 Setup 冲突全量预校验；权限 aps.setup.publish）",
+        "summary": "#13 发布规则集版本（发布前 Setup 冲突全量预校验）。\r\n权限 aps.rule.publish（P0-A 2026-10-27 核证收口）：本端点发布的是含需求优先级①的整版规则集，\r\n由仅持 aps.setup.publish 越权改为规则集发布权，语义与整版发布对齐（不得仅凭 setup.publish 发布①＋⑦）。\r\n端到端 403 负例（仅持 aps.setup.publish、无 aps.rule.publish 主体 → 403 且版本仍 DRAFT）归 WebApplicationFactory\r\n集成基建（2号位 运行域），见《…_统一发布门禁_端到端403负例协助请求_3号位致2号位_v1.0》。",
         "parameters": [
           {
             "name": "id",
@@ -7394,6 +7550,22 @@
               "type": "integer",
               "format": "int32"
             }
+          },
+          {
+            "name": "pageIndex",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "format": "int32"
+            }
+          },
+          {
+            "name": "pageSize",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "format": "int32"
+            }
           }
         ],
         "responses": {
@@ -7530,6 +7702,31 @@
           "StageLeadTimeParam"
         ],
         "summary": "停用阶段提前期参数（软删 IsActive=0，保留历史与生效窗口）。",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "参数主键（StageLeadTimeParam.Id）",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int32"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          }
+        }
+      }
+    },
+    "/api/governance/stage-lead-time-params/{id}/activate": {
+      "post": {
+        "tags": [
+          "StageLeadTimeParam"
+        ],
+        "summary": "恢复启用阶段提前期参数（IsActive 0→1；若 IsDefault=1 须过全局默认唯一，窗口重叠 → 422）。幂等：已启用原样返回。",
         "parameters": [
           {
             "name": "id",
@@ -7792,6 +7989,31 @@
           {
             "name": "id",
             "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int32"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          }
+        }
+      }
+    },
+    "/api/governance/task-split-rule-configs/{id}/activate": {
+      "post": {
+        "tags": [
+          "TaskSplitRuleConfig"
+        ],
+        "summary": "恢复启用执行批拆分规则（IsActive 0→1；与其它有效规则窗口重叠 → 422）。幂等：已启用原样返回。",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "规则主键（TaskSplitRuleConfig.Id）",
             "required": true,
             "schema": {
               "type": "integer",
@@ -9247,6 +9469,163 @@
         },
         "additionalProperties": false
       },
+      "GanttBucketRowDto": {
+        "type": "object",
+        "properties": {
+          "resourceId": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "resourceCode": {
+            "type": "string",
+            "nullable": true
+          },
+          "resourceName": {
+            "type": "string",
+            "nullable": true
+          },
+          "factoryName": {
+            "type": "string",
+            "nullable": true
+          },
+          "productionDepartmentName": {
+            "type": "string",
+            "nullable": true
+          },
+          "stage": {
+            "type": "string",
+            "nullable": true
+          },
+          "domainKey": {
+            "type": "string",
+            "nullable": true
+          },
+          "bucketStart": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          },
+          "taskCount": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "loadHours": {
+            "type": "number",
+            "format": "double",
+            "nullable": true
+          },
+          "firstStart": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          },
+          "lastEnd": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          }
+        },
+        "additionalProperties": false
+      },
+      "GanttBucketsDto": {
+        "type": "object",
+        "properties": {
+          "planVersionId": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "versionCode": {
+            "type": "string",
+            "nullable": true
+          },
+          "versionExists": {
+            "type": "boolean"
+          },
+          "scopeDenied": {
+            "type": "boolean"
+          },
+          "isEmpty": {
+            "type": "boolean"
+          },
+          "bucket": {
+            "type": "string",
+            "nullable": true
+          },
+          "bucketWidth": {
+            "type": "string",
+            "nullable": true
+          },
+          "bucketDowngraded": {
+            "type": "boolean"
+          },
+          "from": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          },
+          "to": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          },
+          "totalTasks": {
+            "type": "integer",
+            "format": "int32",
+            "nullable": true
+          },
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/GanttBucketRowDto"
+            },
+            "nullable": true
+          }
+        },
+        "additionalProperties": false
+      },
+      "GanttBucketsDtoApiResponse": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "message": {
+            "type": "string",
+            "nullable": true
+          },
+          "data": {
+            "$ref": "#/components/schemas/GanttBucketsDto"
+          },
+          "traceId": {
+            "type": "string",
+            "nullable": true
+          },
+          "timestamp": {
+            "type": "string",
+            "format": "date-time"
+          }
+        },
+        "additionalProperties": false
+      },
+      "GanttCursorDto": {
+        "type": "object",
+        "properties": {
+          "resourceId": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "plannedStartTime": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "taskId": {
+            "type": "integer",
+            "format": "int64"
+          }
+        },
+        "additionalProperties": false
+      },
       "GanttDataDto": {
         "type": "object",
         "properties": {
@@ -9297,6 +9676,21 @@
           },
           "versionExists": {
             "type": "boolean"
+          },
+          "limit": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "totalTasks": {
+            "type": "integer",
+            "format": "int32",
+            "nullable": true
+          },
+          "hasMore": {
+            "type": "boolean"
+          },
+          "nextAfter": {
+            "$ref": "#/components/schemas/GanttCursorDto"
           }
         },
         "additionalProperties": false
@@ -9532,7 +9926,7 @@
             "type": "string",
             "nullable": true
           },
-          "taskShares": {
+          "taskShare": {
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/GanttTaskShareDto"
@@ -10310,6 +10704,10 @@
             "nullable": true
           },
           "primaryReasonCode": {
+            "type": "string",
+            "nullable": true
+          },
+          "riskLevel": {
             "type": "string",
             "nullable": true
           }

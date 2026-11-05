@@ -23,7 +23,7 @@
 -->
 <script setup lang="tsx">
 import { computed, onMounted, reactive, ref } from 'vue'
-import { formatUtcDateTimeSec } from '@/utils/datetime'
+import { formatLocalDateTimeSec } from '@/utils/datetime'
 import {
   ElButton,
   ElDatePicker,
@@ -275,7 +275,7 @@ function prettyValue(v: string | null | undefined): string {
     >
       <ElTableColumn label="时间" width="170">
         <template #default="{ row }: { row: AuditLogDto }">
-          {{ formatUtcDateTimeSec(row.occurredAt) }}
+          {{ formatLocalDateTimeSec(row.occurredAt) }}
         </template>
       </ElTableColumn>
       <ElTableColumn label="操作人" width="120">
@@ -344,7 +344,7 @@ function prettyValue(v: string | null | undefined): string {
         <ElDescriptions :column="2" border size="small" class="audit-detail-block">
           <ElDescriptionsItem label="审计编号">{{ currentRow.id }}</ElDescriptionsItem>
           <ElDescriptionsItem label="时间">
-            {{ formatUtcDateTimeSec(currentRow.occurredAt) }}
+            {{ formatLocalDateTimeSec(currentRow.occurredAt) }}
           </ElDescriptionsItem>
           <ElDescriptionsItem label="操作人">
             {{ actorLabel(currentRow) }}

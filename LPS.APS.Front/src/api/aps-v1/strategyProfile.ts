@@ -1,5 +1,5 @@
 /**
- * APS V1 4号位 — 策略配置 API（12 端点）
+ * APS V1 4号位 — 策略配置 API（13 端点）
  *
  * @owner 3号位（后端已就绪，4号位 只接 API）
  * @see lps/LPS.APS.Web/Controllers/GovernanceController.cs（策略段 L393-510）
@@ -18,12 +18,14 @@
  *   10. GET    /api/governance/strategy-profile/{id}/published-version 当前 Published 直达
  *   11. GET    /api/governance/strategy-profile/default                默认版本解析
  *   12. GET    /api/governance/strategy-profile/version/{id}/trace     审计追溯
+ *   13. POST   /api/governance/strategy-profile/version/{id}/set-default 设为默认（仅 PUBLISHED）
  *
  * 设计要点：
  *  - mock 模式：读端点返回 3 Profile + 5 Version 极小 fixture；写端点统一抛 503 防伪成功
  *  - 前端不维护 status/createdAt/createdBy/publishedAt/publishedBy 等后端权威字段
  *    （POST /version 后端会强制 Status=DRAFT 并忽略入参 Status）
- *  - IsDefault 通过 PUT /version/{id} 提前置，POST /publish 时由后端自动清同 Profile 旧默认
+ *  - IsDefault 不在草稿入参内：Create 强制 false、Update 冻结既有值（C-7），
+ *    只能经 set-default 显式置位；发布本身不会自动成为默认
  *  - 上层组件调 strategyProfileApi.* 即可，store + page 不必关心 unwrap / mock fallback
  */
 
@@ -31,6 +33,7 @@ import { apsHttp, APS_USE_MOCK, ApiError } from './http'
 import type {
   StrategyProfileDto,
   CreateStrategyProfileInput,
+  UpdateStrategyProfileInput,
   StrategyProfileVersionDto,
   StrategyVersionDraftInput,
   PublishStrategyVersionRequest,
@@ -302,17 +305,50 @@ export const strategyProfileApi = {
 
   /* ===== 1'. 新建策略包主表（POST /api/governance/strategy-profile） =====
    *
-   * ⚠️ 2026-10-25 前端已接线，**后端端点尚未提供**：本仓 `GovernanceController` 只有
-   * `strategy-profile` **version 级** POST/PUT（:598/:608），主表零写端点，
-   * `IStrategyProfileRepository` 也只有查询 —— 已出函 3号位 请求补
-   * `POST /strategy-profile` + `PUT /strategy-profile/{id}`（对齐 10-22 已落码的 `rule-set` 主表范式）。
-   * 端点落地前调用会 404，如实失败、不伪造成功。
+   * 3号位 2026-10-25 已落码（含 `PUT /strategy-profile/{id}`）：只建壳、不自动跟建版本
+   * （首版需在「新建草稿」选两个已发布版本）；RunType 五值或留空，非法值 400。
    */
   async createProfile(input: CreateStrategyProfileInput): Promise<StrategyProfileDto> {
     if (APS_USE_MOCK) return rejectMockWrite('createProfile')
     return apsHttp.post<StrategyProfileDto>({
       url: '/api/governance/strategy-profile',
       data: input
+    })
+  },
+
+  /* ===== 1''. 更新策略包主表（PUT /api/governance/strategy-profile/{id}） =====
+   *
+   * 3号位 2026-10-25 已落码：编码不可变（改码 400）、RunType 五值或空（非法 400）、
+   * `isActive=false` 只停用主表不级联版本。
+   */
+  async updateProfile(input: UpdateStrategyProfileInput): Promise<StrategyProfileDto> {
+    if (APS_USE_MOCK) return rejectMockWrite('updateProfile')
+    return apsHttp.put<StrategyProfileDto>({
+      url: `/api/governance/strategy-profile/${input.id}`,
+      data: {
+        strategyProfileCode: input.strategyProfileCode,
+        strategyProfileName: input.strategyProfileName,
+        description: input.description,
+        runType: input.runType ?? null,
+        isActive: input.isActive
+      }
+    })
+  },
+
+  /* ===== 1'''. 删除策略包主表（DELETE /api/governance/strategy-profile/{id}） =====
+   *
+   * 3号位 2026-10-26 已落码并上 dev（实测 `DELETE /api/governance/strategy-profile/999999`
+   * → 400「策略包不存在：999999」）。口径同规则集删除（R1）：
+   *  - 该族存在任何 PUBLISHED 版本 ⇒ 400「该策略包已发布过，不能删除（请先停用版本）」
+   *  - 版本被 ScheduleRun 引用 ⇒ 400「该策略包存在已被运行引用的版本，不能删除」
+   * 成功 ⇒ 200 + `ApiResponse<bool>`（单事务连带删 DRAFT 版本 + 主表行，并写审计 Delete）
+   *
+   * 权限 aps.strategy.edit。**硬删 ≠ 停用**（updateProfile 的 isActive=false 是停用，不级联、留历史）。
+   */
+  async deleteStrategyProfile(id: number): Promise<void> {
+    if (APS_USE_MOCK) return rejectMockWrite('deleteStrategyProfile')
+    await apsHttp.delete<boolean>({
+      url: `/api/governance/strategy-profile/${id}`
     })
   },
 
@@ -347,7 +383,7 @@ export const strategyProfileApi = {
     })
   },
 
-  /* ===== 5. 更新 DRAFT（可改 IsDefault；后端会校验仅 DRAFT 可改） ===== */
+  /* ===== 5. 更新 DRAFT（IsDefault 不在入参内；后端冻结既有值） ===== */
   async updateVersion(
     versionId: number,
     input: StrategyVersionDraftInput
@@ -374,6 +410,14 @@ export const strategyProfileApi = {
     await apsHttp.post<void>({
       url: `/api/governance/strategy-profile/version/${versionId}/disable`,
       data: request
+    })
+  },
+
+  /* ===== 13. 设为默认（仅 PUBLISHED；同策略包旧默认由后端清） ===== */
+  async setDefaultVersion(versionId: number): Promise<void> {
+    if (APS_USE_MOCK) return rejectMockWrite('setDefaultVersion')
+    await apsHttp.post<void>({
+      url: `/api/governance/strategy-profile/version/${versionId}/set-default`
     })
   },
 

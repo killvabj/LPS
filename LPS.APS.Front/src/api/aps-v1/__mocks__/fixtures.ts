@@ -186,21 +186,27 @@ const TASKS: GanttTaskDto[] = (() => {
     const resource = RESOURCES[i % RESOURCES.length]
     const startDays = (i % 14) - 3 // -3 ~ 10
     const status = pickStatus(i)
-    const plannedStart = dayOffset(startDays, 8 + (i % 8))
-    // 时长多样化：4h ~ 32h，按 i 分段（OP10 切割 4-8h / OP20 焊接 8-16h / OP30 喷涂 6-12h
-    //   / OP40 总装 10-20h / OP50 测试 4-8h；少量跨日 24-32h）
+    // 开工时刻：06:00~22:00 每 2h 一档（多班制）
+    //  - 2026-10-27 演示调整：原先固定 08:00~15:00，每天的前 1/3 天列恒为空，
+    //    7 天视图看着很空；铺开到 6~22 点后条形能填满各天列。
+    const startHour = 6 + (i % 9) * 2
+    const plannedStart = dayOffset(startDays, startHour)
+    // 时长多样化：8h ~ 36h，按 i 分段（OP10 切割 8-12h / OP20 焊接 12-24h / OP30 喷涂 8-16h
+    //   / OP40 总装 12-22h / OP50 测试 8-12h；少量跨日 28-36h）
+    //  - 2026-10-27 演示调整：下限由 4h 提到 8h。7 天视图中一天列宽 152px，
+    //    4h 的条只有 25px（几乎点不到），8h 起条宽 51px 起，条形才读得出来。
     const opDurations: Record<string, number[]> = {
-      OP10: [4, 6, 8, 4, 6],
-      OP20: [10, 12, 14, 16, 8],
-      OP30: [6, 8, 10, 12, 6],
-      OP40: [12, 16, 20, 14, 10],
-      OP50: [4, 6, 8, 6, 4]
+      OP10: [8, 10, 12, 8, 10],
+      OP20: [12, 16, 20, 24, 12],
+      OP30: [8, 12, 14, 16, 10],
+      OP40: [14, 18, 22, 16, 12],
+      OP50: [8, 10, 12, 10, 8]
     }
-    const opDur = opDurations[op.code] ?? [4, 6, 8]
+    const opDur = opDurations[op.code] ?? [8, 10, 12]
     let durationH = opDur[i % opDur.length]
-    // 偶发跨日长 Task（i%11===2 → 24-32h，跨 2-3 天；让甘特条更长更好看）
-    if (i % 11 === 2) durationH = 24 + (i % 3) * 4 // 24/28/32
-    const plannedEndHours = 8 + (i % 8) + durationH
+    // 偶发跨日长 Task（i%11===2 → 28-36h，跨 2-3 天；让甘特条更长更好看）
+    if (i % 11 === 2) durationH = 28 + (i % 3) * 4 // 28/32/36
+    const plannedEndHours = startHour + durationH
     const plannedEnd = dayOffset(startDays + Math.floor(plannedEndHours / 24), plannedEndHours % 24)
     const isDelayed = i % 7 === 0 // 与下方根因类型选择器 i % 5 解耦，确保 5 类根因都能展开
 
@@ -245,8 +251,8 @@ const TASKS: GanttTaskDto[] = (() => {
       // 段 1 占用 60% 时长（向上取整），段 2 补剩余 40%
       const seg1Hours = Math.ceil(durationH * 0.6)
       const seg1End = dayOffset(
-        startDays + Math.floor((8 + (i % 8) + seg1Hours) / 24),
-        (8 + (i % 8) + seg1Hours) % 24
+        startDays + Math.floor((startHour + seg1Hours) / 24),
+        (startHour + seg1Hours) % 24
       )
       const seg2Start = seg1End
       const seg2End = plannedEnd

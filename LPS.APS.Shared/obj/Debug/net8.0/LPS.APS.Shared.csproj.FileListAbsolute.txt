@@ -10,3 +10,4 @@ D:\WorkSpace_LocalLib\Windsurf WorkSpace\LPS_SVN\LPS.APS.Shared\obj\Debug\net8.0
 D:\WorkSpace_LocalLib\Windsurf WorkSpace\LPS_SVN\LPS.APS.Shared\obj\Debug\net8.0\refint\LPS.APS.Shared.dll
 D:\WorkSpace_LocalLib\Windsurf WorkSpace\LPS_SVN\LPS.APS.Shared\obj\Debug\net8.0\LPS.APS.Shared.pdb
 D:\WorkSpace_LocalLib\Windsurf WorkSpace\LPS_SVN\LPS.APS.Shared\obj\Debug\net8.0\ref\LPS.APS.Shared.dll
+D:\WorkSpace_LocalLib\Windsurf WorkSpace\LPS_SVN\LPS.APS.Shared\obj\Debug\net8.0\LPS.APS..F1A636C1.Up2Date

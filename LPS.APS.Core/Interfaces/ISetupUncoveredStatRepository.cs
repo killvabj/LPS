@@ -22,4 +22,29 @@ public interface ISetupUncoveredStatRepository
         int? resourceId,
         int? materialId,
         CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// 按四级维度（runId → 部门 → 工序 → 设备 → 产品）聚合规则缺失命中分布的**服务端分页**版（方案 A 新增，2026-10-28）。
+    /// 与 <see cref="GetUncoveredAsync"/> 同一 WHERE / GROUP BY / ORDER，仅加 OFFSET/FETCH；Total 经窗口函数 COUNT(*) OVER() 同查询取得。
+    /// 另带 KPI summary（DepartmentCount/StageCount，distinct，与列表同 WHERE）——服务端分页后列表仅当页、三张 KPI 卡须由后端给全量口径。
+    /// 只读查询；空结果返回空 Items + Total 0 + 各计数 0。pageIndex/pageSize 须已由调用方规范化（≥1 且 pageSize ≤ 上限）。
+    /// </summary>
+    /// <param name="runId">排程 Run Id（可选）</param>
+    /// <param name="departmentId">生产部门 Id（可选）</param>
+    /// <param name="operationCode">工序编码（可选）</param>
+    /// <param name="resourceId">资源 Id（可选）</param>
+    /// <param name="materialId">物料 Id（可选）</param>
+    /// <param name="pageIndex">页码（1 基，调用方已 ≥1）</param>
+    /// <param name="pageSize">每页条数（调用方已规范化）</param>
+    /// <param name="cancellationToken">取消令牌</param>
+    /// <returns>分页容器（Items/Total/Page/PageSize + DepartmentCount/StageCount）</returns>
+    Task<SetupUncoveredStatsPage> GetUncoveredPageAsync(
+        int? runId,
+        int? departmentId,
+        string? operationCode,
+        int? resourceId,
+        int? materialId,
+        int pageIndex,
+        int pageSize,
+        CancellationToken cancellationToken = default);
 }

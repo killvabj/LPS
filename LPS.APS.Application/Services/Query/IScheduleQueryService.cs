@@ -33,17 +33,44 @@ public interface IScheduleQueryService
 
     /// <summary>
     /// 获取指定计划版本的甘特图数据（越权返回空，ScopeDenied=true）。
-    /// 冻结 05:1013 要求「Gantt按时间窗/资源加载」，故支持可选时间窗与资源过滤；
-    /// 不传则保持全量（向后兼容）。
+    /// 冻结 05:1013 要求「Gantt按时间窗/资源加载」，故支持可选时间窗与资源过滤。
+    /// ⚠ 10-29 分页契约（4号位 三步走·第 1 步）：<b>任务条单次上限恒存在</b>——
+    /// 不传 limit 亦按默认 8,000 截断返回（hasMore/totalTasks 显式声明），「不传=全量」旧语义终结；
+    /// 全量导出不属于本端点职责。翻页=游标三元组回填（排序键全序，不漏不重）。
     /// </summary>
     /// <param name="from">时间窗起（含）。按任务区间相交过滤：PlannedEndTime ≥ from；无计划时间的任务始终保留。</param>
     /// <param name="to">时间窗止（含）。PlannedStartTime ≤ to；无计划时间的任务始终保留。</param>
     /// <param name="resourceIds">资源过滤（可选）。空/ null = 不过滤。</param>
+    /// <param name="limit">单次任务条上限；null=8,000（缺省），钳制 1..20,000。</param>
+    /// <param name="afterResourceId">游标·排序键1（上页 nextAfter.resourceId）；三参须成套传，缺一即视为首页。</param>
+    /// <param name="afterStartAt">游标·排序键2（归一后时刻，NULL 起排传 1753-01-01）。</param>
+    /// <param name="afterTaskId">游标·排序键3（Task Id）。</param>
     Task<GanttDataDto> GetGanttAsync(
         int userId,
         int planVersionId,
         DateTime? from = null,
         DateTime? to = null,
+        IReadOnlyList<int>? resourceIds = null,
+        int? limit = null,
+        int? afterResourceId = null,
+        DateTime? afterStartAt = null,
+        long? afterTaskId = null,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// 甘特「资源×时间桶」聚合（三步走·第 2 步，2026-10-30 复函九条定稿）。
+    /// 与明细体共用窗口谓词与资源口径；naive 不转时区；钳制归桶+未排桶 ⇒ Σ taskCount ≡ totalTasks。
+    /// </summary>
+    /// <param name="from">必填（缺 ⇒ InvalidOperationException→真400）。</param>
+    /// <param name="to">必填。</param>
+    /// <param name="bucket">day|week|month（缺省 day）；行数>50,000 自动降级并回显 bucketWidth/bucketDowngraded。</param>
+    /// <param name="resourceIds">重复键写法，同明细体拦截。</param>
+    Task<GanttBucketsDto> GetGanttBucketsAsync(
+        int userId,
+        int planVersionId,
+        DateTime? from,
+        DateTime? to,
+        string? bucket = null,
         IReadOnlyList<int>? resourceIds = null,
         CancellationToken cancellationToken = default);
 

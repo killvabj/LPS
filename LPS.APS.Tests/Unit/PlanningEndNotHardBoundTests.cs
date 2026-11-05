@@ -246,7 +246,7 @@ public class PlanningEndNotHardBoundTests
                 PathId = 1,
                 OperationCode = op.OpCode,
                 StageCode = op.StageCode,
-                StandardDuration = op.Minutes,
+                StandardDuration = op.Minutes * 60m,
                 OperationPlanningMode = "FINITE_RESOURCE"
             });
             elig.Add(new OperationResourceEligibility

@@ -84,4 +84,28 @@ public interface ISetupRuleService
         int? resourceId,
         int? materialId,
         CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// #10 uncovered-stats **服务端分页**版（方案 A 新增，2026-10-28）：与 <see cref="GetUncoveredStatsAsync"/> 同一 WHERE/GROUP，
+    /// 分页返回 items/total + KPI summary（departmentCount/stageCount distinct）。pageIndex &lt; 1 归 1；pageSize 截断到 1..200（默认 20）。
+    /// 未覆盖转换对（未分组聚合行数）即 Total；DepartmentCount/StageCount 由仓储按同一 WHERE distinct 给出，服务端分页后 KPI 卡仍全量正确。
+    /// </summary>
+    /// <param name="runId">排程 Run Id（可选）</param>
+    /// <param name="departmentId">生产部门 Id（可选）</param>
+    /// <param name="operationCode">工序编码（可选）</param>
+    /// <param name="resourceId">资源 Id（可选）</param>
+    /// <param name="materialId">物料 Id（可选）</param>
+    /// <param name="pageIndex">页码（1 基，&lt;1 强制归 1）</param>
+    /// <param name="pageSize">每页条数（1~200，超限截断；默认 20）</param>
+    /// <param name="cancellationToken">取消令牌</param>
+    /// <returns>分页容器（同形 PageResult + KPI summary 字段）</returns>
+    Task<SetupUncoveredStatsPage> GetUncoveredStatsPageAsync(
+        int? runId,
+        int? departmentId,
+        string? operationCode,
+        int? resourceId,
+        int? materialId,
+        int pageIndex = 1,
+        int pageSize = 20,
+        CancellationToken cancellationToken = default);
 }

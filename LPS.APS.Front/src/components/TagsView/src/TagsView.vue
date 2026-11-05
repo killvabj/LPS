@@ -13,6 +13,7 @@ import { useTemplateRefsList } from '@vueuse/core'
 import { ElScrollbar } from 'element-plus'
 import { useScrollTo } from '@/hooks/event/useScrollTo'
 import { useTagsView } from '@/hooks/web/useTagsView'
+import { APS_HOME_PATH } from '@/constants'
 import { cloneDeep } from 'lodash-es'
 
 const { getPrefixCls } = useDesign()
@@ -81,15 +82,14 @@ const toLastView = () => {
   if (latestView) {
     push(latestView)
   } else {
-    if (
-      unref(currentRoute).path === permissionStore.getAddRouters[0].path ||
-      unref(currentRoute).path === permissionStore.getAddRouters[0].redirect
-    ) {
+    // 10-27：关完页签回落到 APS 首页「排产总览」。
+    // 原实现回落到 permissionStore.getAddRouters[0] —— 那是框架演示页 /dashboard
+    // （hidden，redirect 到「分析页」），关掉全部页签会被弹回演示页（见 M19 同源问题）。
+    if (unref(currentRoute).path === APS_HOME_PATH) {
       addTags()
       return
     }
-    // You can set another route
-    push(permissionStore.getAddRouters[0].path)
+    push(APS_HOME_PATH)
   }
 }
 

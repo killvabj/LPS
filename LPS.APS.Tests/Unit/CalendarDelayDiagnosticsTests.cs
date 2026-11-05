@@ -186,7 +186,7 @@ public class CalendarDelayDiagnosticsTests
             {
                 MaterialId = 1, ProductionDepartmentId = deptId, RouteCode = "DEFAULT",
                 OperationCode = opCode, StageCode = stage,
-                StandardDuration = (decimal)durationMinutes, SetupTime = 0m
+                StandardDuration = (decimal)durationMinutes * 60m, SetupTime = 0m
             }
         };
 
@@ -283,13 +283,13 @@ public class CalendarDelayDiagnosticsTests
             {
                 MaterialId = 1, ProductionDepartmentId = deptId, RouteCode = "DEFAULT",
                 OperationCode = shortOp, StageCode = stage,
-                StandardDuration = (decimal)shortOpMinutes, SetupTime = 0m
+                StandardDuration = (decimal)shortOpMinutes * 60m, SetupTime = 0m
             },
             new()
             {
                 MaterialId = 1, ProductionDepartmentId = deptId, RouteCode = "DEFAULT",
                 OperationCode = longOp, StageCode = stage,
-                StandardDuration = (decimal)longOpMinutes, SetupTime = 0m
+                StandardDuration = (decimal)longOpMinutes * 60m, SetupTime = 0m
             }
         };
 

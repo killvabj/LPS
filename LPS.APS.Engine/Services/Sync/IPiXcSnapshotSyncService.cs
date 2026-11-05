@@ -3,7 +3,7 @@ using LPS.APS.Engine.Services.Sync.Dto;
 namespace LPS.APS.Engine.Services.Sync;
 
 /// <summary>
-/// PI 级 XC 夜间快照同步（2号位职责 — 每日 00:37）
+/// PI 级 XC 夜间快照同步（2号位职责 — 每日 00:28，nightly-batch 锁 DataCutoffTime 之前）
 ///
 /// 链路：
 ///   ODS `ODS_ProductionInstructionInventoryBalance`（5号位，8 列）

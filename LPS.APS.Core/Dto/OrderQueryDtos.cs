@@ -98,22 +98,34 @@ public sealed class OrderListItemDto
 
     /// <summary>
     /// APS 预计完成时间 = 该订单在当前版本全部 Task 的 MAX(PlannedEndTime)（后端算，冻结 01:1908 第 2 项；
-    /// 13 §十一 前端禁算排程）。无 Task/未排 → null（WhenWritingNull 下键省略）。JSON: plannedCompletionTime
+    /// 13 §十一 前端禁算排程）。无 Task/未排 → null（WhenWritingNull 下键省略）。JSON: plannedCompletionTime。
+    /// 10-31 性能改造（4号位 R2-b 两段式）：本字段与 DelayHours/PrimaryReasonCode 由「分页后批量富化」赋值，
+    /// 故三属性由 init 改为 set（仍只在本 Repository 内赋值，无外部写入点）。
     /// </summary>
-    public DateTime? PlannedCompletionTime { get; init; }
+    public DateTime? PlannedCompletionTime { get; set; }
 
     /// <summary>
     /// 延期时长（自然小时）：仅当 预计完成日期 > CustomerDueDate（Q1 日期口径，与甘特/summary/candidate 同判据家族）
     /// 时有值；未延期/未排 = null（两态不混）。JSON: delayHours
     /// </summary>
-    public decimal? DelayHours { get; init; }
+    public decimal? DelayHours { get; set; }
 
     /// <summary>
     /// 主要原因码 = 该订单 Explanation 事实中 ImpactHours 最大、且**属于冻结 07:4937 权威 15 码白名单**的 ReasonCode
     /// （4号位 10-19 U2：库内存在 BATCH_POLICY_MISSING/中文Phase 等非冻结形态，07:4935 门禁不作正式原因——
     /// 白名单外一律不透出）。null = 无可用原因（≠无问题）。前端可去掉「待核对」降级（后端已把门）。JSON: primaryReasonCode
     /// </summary>
-    public string? PrimaryReasonCode { get; init; }
+    public string? PrimaryReasonCode { get; set; }
+
+    /// <summary>
+    /// 计划派生延期判定（冻结 01 §64 唯一业务判定；4号位 11-02 口径函 Q1 定稿）。JSON: riskLevel
+    /// `DELAYED` = 本版本有 Task 且 MAX(PlannedEndTime) 的**日期** > CustomerDueDate（Q1 日期口径，与 delayHours 同判据家族）；
+    /// `ON_TRACK` = 本版本有 Task 且未超交期（按期/提前同归此值；"提前 N 天"是展示文案非第二判定）；
+    /// **缺键 = 本版本无 Task（未排产/不可判定）⇒ 前端不得渲染成"未延迟"**。
+    /// `AT_RISK`（07 §八.2 三值之一）V1 无权威源**不出**——风险判定属 OrderScheduleSummary 实体（该表当前空、写方未产出），不造假。
+    /// ⚠ 与 delayStatus 无关：delayStatus=订单入库期 ERP 独立维度（07:2688），与计划派生判定同屏必打架（11-02 函根因）；本字段由富化赋值（set 同前三字段理由）。
+    /// </summary>
+    public string? RiskLevel { get; set; }
 }
 
 /// <summary>

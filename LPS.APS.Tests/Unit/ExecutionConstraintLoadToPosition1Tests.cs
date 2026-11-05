@@ -196,7 +196,7 @@ public class ExecutionConstraintLoadToPosition1Tests
                 {
                     MaterialId = MaterialId, ProductionDepartmentId = DepartmentId,
                     RouteCode = "DEFAULT", OperationCode = "OP10", StageCode = "STAGE1",
-                    StandardDuration = 60m, SetupTime = 0m
+                    StandardDuration = 60m * 60m, SetupTime = 0m
                 }
             },
             OperationResourceEligibility = new List<OperationResourceEligibility>

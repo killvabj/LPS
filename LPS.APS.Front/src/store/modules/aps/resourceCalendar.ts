@@ -34,6 +34,7 @@ import {
   type CalendarConfigStatus,
   type DepartmentCandidate,
   type ManualCapacitySlotDto,
+  type ManualCapacityResolvePreviewDto,
   type ManualSlotCalendarBulkRequest,
   type ManualSlotCalendarDto,
   type ManualSlotQuery,
@@ -74,9 +75,12 @@ export const useResourceCalendarStore = defineStore('aps.resourceCalendar', () =
   const deviceWindowTotals = ref<Record<number, number>>({})
   /* 2026-10-17：三级合并解析预览（5号位 GET /api/resource-calendar/resolve-preview）
    *  - 只读；给页面一个"实际能不能排、这片是谁给的"的真话口
-   *  - 只接受设备 id，无人工槽版本 */
+   *  - 10-26：人工槽版端点（GET /api/manual-capacity/resolve-preview）已上 dev ⇒ 补一路 */
   const resolvePreview = ref<ResourceCalendarResolvePreviewDto | null>(null)
   const resolveLoading = ref(false)
+  /** 人工槽版三级合并预览（键 = manualSlotId；与设备侧同一 Resolver + ApplyAuthorization） */
+  const manualResolvePreview = ref<ManualCapacityResolvePreviewDto | null>(null)
+  const manualResolveLoading = ref(false)
 
   /* ===== Tab2/3：人工能力槽 + 人工槽日历 ===== */
   // 10-12 RC22 收：人工槽 Tab2 接入分页（5号位 落地 PageResult，dev 15360 records）
@@ -274,6 +278,35 @@ export const useResourceCalendarStore = defineStore('aps.resourceCalendar', () =
     }
   }
 
+  /** 人工槽版三级合并解析预览（单槽；只读，不写库）
+   *  - 与设备侧同一 Resolver + ApplyAuthorization ⇒ 预览即运行期口径
+   *  - 越界槽后端 fail-closed 剔除 ⇒ 查不到即 null，页面按「未查证」呈现 */
+  async function loadManualResolvePreview(
+    manualSlotId: number,
+    startDate: string,
+    endDate: string
+  ): Promise<void> {
+    if (!Number.isFinite(manualSlotId) || manualSlotId <= 0) {
+      handleError(new ApiError('人工槽 Id 必须为正整数', 400))
+      return
+    }
+    manualResolveLoading.value = true
+    error.value = null
+    try {
+      const rows = await resourceCalendarApi.getManualResolvePreview(
+        [manualSlotId],
+        startDate,
+        endDate
+      )
+      manualResolvePreview.value = rows.find((r) => r.manualSlotId === manualSlotId) ?? null
+    } catch (err) {
+      handleError(err)
+      manualResolvePreview.value = null
+    } finally {
+      manualResolveLoading.value = false
+    }
+  }
+
   /** 物理删除设备窗口 */
   async function removeDeviceWindow(id: number, resourceId: number): Promise<boolean> {
     if (!canDeleteDevice.value) {
@@ -384,7 +417,11 @@ export const useResourceCalendarStore = defineStore('aps.resourceCalendar', () =
     }
     loading.value = true
     error.value = null
-    if (currentSlotId.value !== manualSlotId) slotWindowPage.value = 1
+    if (currentSlotId.value !== manualSlotId) {
+      slotWindowPage.value = 1
+      // 换槽 ⇒ 旧槽的合成结果作废，避免串号显示
+      manualResolvePreview.value = null
+    }
     currentSlotId.value = manualSlotId
     if (options.nextPageSize != null) slotWindowPageSize.value = options.nextPageSize
     if (options.nextPageIndex != null) slotWindowPage.value = options.nextPageIndex
@@ -483,6 +520,7 @@ export const useResourceCalendarStore = defineStore('aps.resourceCalendar', () =
     deviceWindowTotal.value = 0
     deviceWindowTotals.value = {}
     resolvePreview.value = null
+    manualResolvePreview.value = null
     slots.value = []
     slotQuery.value = {}
     currentSlotId.value = null
@@ -519,6 +557,8 @@ export const useResourceCalendarStore = defineStore('aps.resourceCalendar', () =
     deviceWindowTotals,
     resolvePreview,
     resolveLoading,
+    manualResolvePreview,
+    manualResolveLoading,
     slots,
     slotQuery,
     slotTotal,
@@ -554,6 +594,7 @@ export const useResourceCalendarStore = defineStore('aps.resourceCalendar', () =
     createDeviceWindows,
     appendDeviceWindow,
     loadResolvePreview,
+    loadManualResolvePreview,
     removeDeviceWindow,
     loadSlots,
     createSlot,

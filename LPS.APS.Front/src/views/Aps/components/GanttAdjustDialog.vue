@@ -77,6 +77,10 @@ async function rebuildRows(preIds: number[] = []): Promise<void> {
   if (!tableRef.value) return
   const pre = new Set(preIds)
   rows.value.forEach((r) => {
+    // 软目标时间默认取该任务当前计划开始时间（后端 naive UTC 原值，与「当前计划」列同一口径）；
+    // 拖拽入口的 preselectTargetTime 优先（那是用户拖到的新时间）。
+    // 不预填的话，工具栏入口选完任务直接提交会被「软目标时间不能为空」拦死。
+    r.targetTime = r.targetTime || r.plannedStartTime || ''
     if (pre.has(r.taskId)) {
       if (props.preselectTargetTime) r.targetTime = props.preselectTargetTime
       tableRef.value?.toggleRowSelection(r, true)
@@ -220,7 +224,7 @@ function onSubmit(): void {
 
       <ElAlert type="info" :closable="false" show-icon class="d-alert">
         <template #title>软目标语义</template>
-        目标时间为**软目标**（求解器可返回其它可行时间）；不直接改写正式任务，须经候选版本
+        目标时间为<strong>软目标</strong>（求解器可返回其它可行时间）；不直接改写正式任务，须经候选版本
         比较确认。默认取该任务当前计划开始时间，可逐行调整。
       </ElAlert>
 

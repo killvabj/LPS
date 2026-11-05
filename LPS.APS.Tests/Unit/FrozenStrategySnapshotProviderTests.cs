@@ -835,4 +835,177 @@ public class FrozenStrategySnapshotProviderTests
         await act.Should().ThrowAsync<InvalidOperationException>()
             .WithMessage("*非 PUBLISHED*");
     }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Stage 固定交接等待规则装载（合同 v1.1 §四/§五；1号位 2026-10-28《消费侧回执》§1.2 断点 1 / §三 第 1 项）
+    //
+    // 这组的**声明目的**（照 self-check-must-assert-its-stated-purpose）：
+    //   ① 缺块 ⇒ 空集合、**不抛**——这条就是「禁止套 DeserializeParameterSetBlock」的回归护栏。
+    //      现网绝大多数 PSV 没有该块；若有人把它并回六块 fail-fast 写法，本测试立刻转红，
+    //      而不是等到某个 Run 装载失败才发现（那会是全库级事故：除 PSV 2365 外全部装载失败）。
+    //   ② 有块 ⇒ 逐字段解析正确（含 TimeBasis 枚举与 IsActive 可空）。
+    //   ③ 装载侧**不筛 IsActive**——IsActive=false 的行必须一并带出，否则「规则存在但未命中」
+    //      与「规则不存在」重新同形，破坏 1号位 合同要求的「未命中不静默 0」独立诊断。
+    //   ④ 显式 null ⇒ 空集合（H-3 无源不阻断）。
+    //   ⑤ JSON 损坏（类型非法）⇒ **抛**，不静默降级成「合法缺配」。
+    //   ⑥ **零行空数组 `[]` ⇒ 抛**（契约 C9）——与 ④ 构成对照：字面都是「空」但语义相反，
+    //      要表达「本版不用这块」只能删键 / 置 null；留 `[]` 是「配了但零行」的非法形态。
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// <summary>测试辅助：装配一套三版本并装载快照；<paramref name="rawBlockJson"/> = null 表示**键缺失**。</summary>
+    private async System.Threading.Tasks.Task<FrozenStrategySnapshot> LoadSnapshotWithRawBlockAsync(
+        long strategyProfileVersionId,
+        long ruleSetVersionId,
+        long parameterSetVersionId,
+        string? rawBlockJson)
+    {
+        var strategyProfileVersion = new StrategyProfileVersion
+        {
+            Id = strategyProfileVersionId,
+            RuleSetVersionId = ruleSetVersionId,
+            ParameterSetVersionId = parameterSetVersionId,
+            Status = "PUBLISHED"
+        };
+
+        var ruleSetVersion = new RuleSetVersion
+        {
+            Id = ruleSetVersionId,
+            ContentSnapshotJson = BuildRuleSetSnapshot(new DemandPriorityBlock { Segments = [] }),
+            Status = "PUBLISHED"
+        };
+
+        var baseParameterJson = BuildParameterSetSnapshot(
+            new LockBlock(), new SupplyBlock(), new ProcurementBlock(),
+            new SolverStrategyBlock(), new CandidateGuardrailBlock());
+
+        var parameterSetJson = baseParameterJson;
+        if (rawBlockJson is not null)
+        {
+            // 追加顶层键（六块原样保留），模拟「六块齐全 + 该块存在」的真实 PSV 形态
+            var node = System.Text.Json.Nodes.JsonNode.Parse(baseParameterJson)!.AsObject();
+            node[SolverStrategyValidator.StageHandoffWaitRulesBlockName] =
+                System.Text.Json.Nodes.JsonNode.Parse(rawBlockJson);
+            parameterSetJson = node.ToJsonString();
+        }
+
+        var parameterSetVersion = new ParameterSetVersion
+        {
+            Id = parameterSetVersionId,
+            ContentSnapshotJson = parameterSetJson,
+            Status = "PUBLISHED"
+        };
+
+        _mockStrategyProfileRepo.Setup(r => r.GetByIdAsync(strategyProfileVersionId, It.IsAny<CancellationToken>())).ReturnsAsync(strategyProfileVersion);
+        _mockRuleSetRepo.Setup(r => r.GetByIdAsync(ruleSetVersionId, It.IsAny<CancellationToken>())).ReturnsAsync(ruleSetVersion);
+        _mockParameterSetRepo.Setup(r => r.GetByIdAsync(parameterSetVersionId, It.IsAny<CancellationToken>())).ReturnsAsync(parameterSetVersion);
+
+        return await _provider.GetFrozenStrategySnapshotAsync(strategyProfileVersionId, CancellationToken.None);
+    }
+
+    [Fact]
+    public async System.Threading.Tasks.Task GetFrozenStrategySnapshotAsync_参数集无StageHandoffWaitRules子块_空集合且不抛()
+    {
+        // Arrange：六块齐全、但**没有** StageHandoffWaitRules 键（= 现网绝大多数 PSV 的真实形态）
+        // Act
+        var snapshot = await LoadSnapshotWithRawBlockAsync(201, 211, 311, rawBlockJson: null);
+
+        // Assert：缺块 = 无交接等待规则（H-3 无源不阻断），**不是装载失败**
+        snapshot.Should().NotBeNull("套用六块 fail-fast 写法会让除 PSV 2365 外的所有 PSV 装载失败");
+        snapshot.StageHandoffWaitRules.Should().NotBeNull();
+        snapshot.StageHandoffWaitRules.Should().BeEmpty();
+    }
+
+    [Fact]
+    public async System.Threading.Tasks.Task GetFrozenStrategySnapshotAsync_参数集含StageHandoffWaitRules_逐字段解析且不筛IsActive()
+    {
+        // Arrange：3 行——2 行 IsActive=true、1 行 IsActive=false（装载侧必须一并带出）
+        const string blockJson = """
+        [
+          { "FactoryCode": "BJ", "FromStageCode": "MACH", "ToStageCode": "OXID", "WaitMinutes": 240, "TimeBasis": "ELAPSED", "IsActive": true },
+          { "FactoryCode": "CN6课", "FromStageCode": "OXID", "ToStageCode": "FINAL", "WaitMinutes": 60, "TimeBasis": "WORK", "IsActive": true },
+          { "FactoryCode": "SH", "FromStageCode": "FINAL", "ToStageCode": "OUTS", "WaitMinutes": 0, "TimeBasis": "ELAPSED", "IsActive": false }
+        ]
+        """;
+
+        // Act
+        var snapshot = await LoadSnapshotWithRawBlockAsync(202, 212, 312, blockJson);
+
+        // Assert
+        var rules = snapshot.StageHandoffWaitRules;
+        rules.Should().HaveCount(3, "装载侧不筛 IsActive：先筛行会让「规则存在但未命中」与「规则不存在」重新同形");
+
+        rules[0].FactoryCode.Should().Be("BJ");
+        rules[0].FromStageCode.Should().Be("MACH");
+        rules[0].ToStageCode.Should().Be("OXID");
+        rules[0].WaitMinutes.Should().Be(240);
+        rules[0].TimeBasis.Should().Be(StageHandoffTimeBasis.ELAPSED);
+        rules[0].IsActive.Should().BeTrue();
+
+        rules[1].FactoryCode.Should().Be("CN6课");
+        rules[1].TimeBasis.Should().Be(StageHandoffTimeBasis.WORK);
+        rules[1].WaitMinutes.Should().Be(60);
+
+        rules[2].IsActive.Should().BeFalse();
+        rules[2].WaitMinutes.Should().Be(0, "显式 0 分钟是合法配置（确实零交接等待），不与「未定义」混同");
+    }
+
+    [Fact]
+    public async System.Threading.Tasks.Task GetFrozenStrategySnapshotAsync_TimeBasis为数值写法_同样解析()
+    {
+        // Arrange：`TimeBasis` 用**数值** 0/1 写（System.Text.Json 默认枚举写法）。
+        // 声明目的：装载侧对**两种既有写法都宽容**——现网 2365 是字符串 `"ELAPSED"`，
+        // 而 DTO 默认序列化产物是数值 ⇒ 两种都可能出现在真实载荷里，窄口径会让其中一种静默装不进来。
+        const string blockJson = """
+        [
+          { "FactoryCode": "TJ", "FromStageCode": "TJ_A", "ToStageCode": "TJ_B", "WaitMinutes": 30, "TimeBasis": 0, "IsActive": true },
+          { "FactoryCode": "TJ", "FromStageCode": "TJ_B", "ToStageCode": "TJ_C", "WaitMinutes": 45, "TimeBasis": 1, "IsActive": true }
+        ]
+        """;
+
+        // Act
+        var snapshot = await LoadSnapshotWithRawBlockAsync(205, 215, 315, blockJson);
+
+        // Assert
+        snapshot.StageHandoffWaitRules.Should().HaveCount(2);
+        snapshot.StageHandoffWaitRules[0].TimeBasis.Should().Be(StageHandoffTimeBasis.WORK);
+        snapshot.StageHandoffWaitRules[1].TimeBasis.Should().Be(StageHandoffTimeBasis.ELAPSED);
+    }
+
+    [Fact]
+    public async System.Threading.Tasks.Task GetFrozenStrategySnapshotAsync_StageHandoffWaitRules为显式null_空集合且不抛()
+    {
+        // Arrange：`"StageHandoffWaitRules": null`（缺配置的另一种写法）
+        // Act
+        var snapshot = await LoadSnapshotWithRawBlockAsync(203, 213, 313, rawBlockJson: "null");
+
+        // Assert
+        snapshot.StageHandoffWaitRules.Should().BeEmpty();
+    }
+
+    [Fact]
+    public async System.Threading.Tasks.Task GetFrozenStrategySnapshotAsync_StageHandoffWaitRules为零行空数组_装载失败()
+    {
+        // Arrange：键存在、值是 `[]`（契约 C9，3号位 2026-10-29 裁决）
+        // 声明目的：`[]` **不是**「未配」——它是「配了但零行」的非法形态。若放行，下游再次无法区分
+        // 「规则存在但零行」与「根本没配」（这正是当初要求上游取消 OR 并集的原因）⇒ 必须 fail-closed。
+        // 与「显式 null 放行」构成对照：两者字面都是「空」，但语义相反，本用例锁死这条边界。
+        // Act
+        var act = async () => await LoadSnapshotWithRawBlockAsync(206, 216, 316, rawBlockJson: "[]");
+
+        // Assert
+        await act.Should().ThrowAsync<InvalidOperationException>()
+            .WithMessage("*STAGE_HANDOFF_WAIT_BLOCK_EMPTY*");
+    }
+
+    [Fact]
+    public async System.Threading.Tasks.Task GetFrozenStrategySnapshotAsync_StageHandoffWaitRules类型非法_装载失败()
+    {
+        // Arrange：块存在但类型非法（字符串而非数组） ⇒ 属「JSON 损坏」，不许静默降级成「合法缺配」
+        // Act
+        var act = async () => await LoadSnapshotWithRawBlockAsync(204, 214, 314, rawBlockJson: "\"not-an-array\"");
+
+        // Assert
+        await act.Should().ThrowAsync<InvalidOperationException>()
+            .WithMessage("*StageHandoffWaitRules*");
+    }
 }

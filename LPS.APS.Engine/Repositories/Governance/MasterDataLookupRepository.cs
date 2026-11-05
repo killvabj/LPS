@@ -42,6 +42,18 @@ public sealed class MasterDataLookupRepository : IMasterDataLookupRepository
             new { Id = materialId }, db: DatabaseId.APS);
 
     /// <inheritdoc />
+    public async Task<string?> GetProductFamilyCodeAsync(int productFamilyId, CancellationToken ct = default)
+        => await _connectionManager.QueryFirstOrDefaultAsync<string>(
+            "SELECT [Code] FROM [dbo].[ProductFamily] WHERE [Id] = @Id",
+            new { Id = productFamilyId }, db: DatabaseId.APS);
+
+    /// <inheritdoc />
+    public async Task<string?> GetFactoryCodeAsync(int factoryId, CancellationToken ct = default)
+        => await _connectionManager.QueryFirstOrDefaultAsync<string>(
+            "SELECT [Code] FROM [dbo].[Factory] WHERE [Id] = @Id",
+            new { Id = factoryId }, db: DatabaseId.APS);
+
+    /// <inheritdoc />
     public async Task<IReadOnlyList<int>> GetEligibleResourceIdsAsync(string operationCode, int materialId, CancellationToken ct = default)
         => (await _connectionManager.QueryAsync<int>(
             "SELECT DISTINCT [ResourceId] FROM [dbo].[OperationResourceEligibility] WHERE [OperationCode] = @OperationCode AND [MaterialId] = @MaterialId AND [IsActive] = 1",
@@ -82,6 +94,20 @@ public sealed class MasterDataLookupRepository : IMasterDataLookupRepository
             "SELECT [Id], [RuleSetId], [VersionCode], [Status], [EffectiveFrom], [EffectiveTo], [PublishedAt], [PublishedBy], [CreatedAt] FROM [dbo].[RuleSetVersion] ORDER BY [VersionCode]",
             db: DatabaseId.APS))
             .ToList();
+
+    /// <inheritdoc />
+    public async Task<IReadOnlyList<RuleSet>> GetRuleSetsAsync(IReadOnlyCollection<long> ruleSetIds, CancellationToken ct = default)
+    {
+        if (ruleSetIds == null || ruleSetIds.Count == 0)
+        {
+            return Array.Empty<RuleSet>();
+        }
+
+        return (await _connectionManager.QueryAsync<RuleSet>(
+            "SELECT [Id], [RuleSetCode], [RuleSetName] FROM [dbo].[RuleSet] WHERE [Id] IN @Ids",
+            new { Ids = ruleSetIds }, db: DatabaseId.APS))
+            .ToList();
+    }
 
     /// <inheritdoc />
     public async Task<IReadOnlyList<DepartmentLookupItem>> LookupDepartmentsAsync(string? search, int limit = 200, CancellationToken ct = default)

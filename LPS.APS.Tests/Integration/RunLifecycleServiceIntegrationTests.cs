@@ -1,5 +1,6 @@
 using FluentAssertions;
 using LPS.APS.Application.Services;
+using LPS.APS.Application.Services.Query;
 using LPS.APS.Core.Authorization;
 using LPS.APS.Core.Dto;
 using LPS.APS.Core.DTOs.Governance;
@@ -44,6 +45,8 @@ public class RunLifecycleServiceIntegrationTests : IDisposable
     private long _testStrategyProfileVersionId;
     private long _testRuleSetVersionId;
     private long _testParameterSetVersionId;
+    /// <summary>策略包版本是否为「采用环境既有默认」：为 true 时清理阶段不得删除（不属本用例）</summary>
+    private bool _strategyProfileVersionIsAdopted;
     private int _testScheduleRunId;
     private int _testPlanVersionId;
     private int _testBasePlanVersionId;
@@ -74,6 +77,20 @@ public class RunLifecycleServiceIntegrationTests : IDisposable
             .Setup(s => s.EnsureInScopeAsync(It.IsAny<int>(), It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
             .Returns(Task.CompletedTask);
 
+        // 缺口A（R11-3B 项1）：域集默认空 → 跳过 ProductFamily/Factory 两维校验（本集成测试聚焦真实落库链路）；
+        // 范围解析默认 Global（全放行），两维判定由单元测试覆盖。
+        var domainDefinitionService = new Mock<IDomainDefinitionService>();
+        domainDefinitionService
+            .Setup(s => s.GetActiveDomainsAsync(It.IsAny<CancellationToken>()))
+            .ReturnsAsync(Array.Empty<DomainDefinitionInfo>());
+        var masterDataLookup = new Mock<IMasterDataLookupRepository>();
+        // R11-3b 对象级：集成测试聚焦真实落库链路，对象级维度默认空集合放行（真实维度判定由单元测试覆盖）；
+        // 避免为真实激活路径留下未 Setup 的空引用 mock。
+        var overviewQueryRepo = new Mock<IOverviewQueryRepository>();
+        overviewQueryRepo
+            .Setup(r => r.GetPlanVersionObjectScopeDimensionsAsync(It.IsAny<int>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new PlanVersionObjectScopeDimensions());
+
         // P1-02：3→2 排程发令枪默认成功（真实 2号位 主流程不在集成测试内重演）
         var schedulingOrchestrator = new Mock<ISchedulingOrchestrator>();
         schedulingOrchestrator
@@ -95,6 +112,9 @@ public class RunLifecycleServiceIntegrationTests : IDisposable
             _parameterSetVersionRepo,
             auditRepo,
             dataScopeService.Object,
+            domainDefinitionService.Object,
+            masterDataLookup.Object,
+            overviewQueryRepo.Object,
             schedulingOrchestrator.Object,
             scheduleRunService.Object,
             loggerFactory.CreateLogger<RunLifecycleService>());
@@ -126,7 +146,7 @@ public class RunLifecycleServiceIntegrationTests : IDisposable
         await SetupFailedRunAsync();
 
         // 恢复：新建 RUNNING 继承基线（新 Run Id 必须存字段，供 Dispose 清理——否则引用策略版本残留，删版本 FK 冲突）
-        _testRecoveredRunId = await _service.RecoverFailedRunAsync(_testScheduleRunId, 1, CancellationToken.None);
+        _testRecoveredRunId = await _service.RecoverFailedRunAsync(_testScheduleRunId, 1, "IT_RECOVER", CancellationToken.None);
 
         // 新记录落库验证：RUNNING + 继承 RunType/StrategyProfileVersionId/ExpectedDomainKeysJson
         var newRun = await _scheduleRunRepo.GetByIdAsync(_testRecoveredRunId);
@@ -277,6 +297,52 @@ public class RunLifecycleServiceIntegrationTests : IDisposable
     /// </summary>
     private async Task SetupBaseActiveAndDefaultStrategyAsync(string domainKey)
     {
+        // 默认策略包版本：先看环境是否已有当前有效默认（口径同 RunLifecycleService.cs:652-671：
+        // 候选集 → 生效窗过滤 → 0/1/多）。已有则采用，无则自建，多于 1 条直接失败。
+        if (!await TryAdoptExistingDefaultStrategyAsync())
+        {
+            await CreateFixtureDefaultStrategyAsync();
+        }
+
+        await CreateCompletedRunAndBaseAsync(domainKey);
+    }
+
+    /// <summary>
+    /// 采用环境既有的 MANUAL_RESCHEDULE 当前有效默认版本（若存在且唯一）。
+    /// 夹具<b>不得</b>再插第二个默认版本：否则 <c>CreateCandidateRunAsync</c> 读到 2 条默认即按红线 #4
+    /// fail-closed 抛「歧义拒绝创建」——报错看起来像数据缺陷，实际是夹具与常驻真实默认撞车。
+    /// </summary>
+    /// <returns><c>true</c>＝已采用既有默认（本用例不再自建）；<c>false</c>＝环境无默认，需自建</returns>
+    private async Task<bool> TryAdoptExistingDefaultStrategyAsync()
+    {
+        var candidates = await _strategyProfileVersionRepo.GetDefaultByRunTypeAsync("MANUAL_RESCHEDULE");
+        var effective = candidates
+            .Where(v => (!v.EffectiveFrom.HasValue || v.EffectiveFrom.Value <= _now)
+                     && (!v.EffectiveTo.HasValue || v.EffectiveTo.Value >= _now))
+            .ToList();
+
+        if (effective.Count > 1)
+        {
+            // 环境本身就是歧义态：不掩盖、也不再造第三个默认，直接把事实摆出来
+            throw new InvalidOperationException(
+                $"测试环境 MANUAL_RESCHEDULE 存在 {effective.Count} 个当前有效默认策略包版本" +
+                $"（Id=[{string.Join(",", effective.Select(x => x.Id))}]）：属环境数据歧义，本用例不掩盖");
+        }
+
+        if (effective.Count == 0)
+        {
+            return false;
+        }
+
+        // 采用既有默认：清理阶段绝不能删除这条不属于本用例的真实默认（见 CleanupTestDataAsync）
+        _testStrategyProfileVersionId = effective[0].Id;
+        _strategyProfileVersionIsAdopted = true;
+        return true;
+    }
+
+    /// <summary>环境无默认时自建：规则集/参数集/策略包 + 各一条 PUBLISHED 版本 + 默认策略包版本</summary>
+    private async Task CreateFixtureDefaultStrategyAsync()
+    {
         var ruleSetId = await _cm.QueryFirstOrDefaultAsync<long>(
             "INSERT INTO [dbo].[RuleSet] ([RuleSetCode], [RuleSetName], [Description], [IsActive], [CreatedAt], [CreatedBy]) VALUES (@Code, @Name, @Description, 1, @CreatedAt, @CreatedBy); SELECT CAST(SCOPE_IDENTITY() AS BIGINT);",
             new { Code = $"TEST-RS-MR-{_uniqueSuffix}", Name = "集成测试规则集", Description = "Integration Test", CreatedAt = _now, CreatedBy = "IntegrationTest" },
@@ -324,8 +390,11 @@ public class RunLifecycleServiceIntegrationTests : IDisposable
             CreatedBy = "IntegrationTest",
         });
         _testStrategyProfileVersionId = spv.Id;
+    }
 
-        // COMPLETED 运行 + DomainKey 对应 ACTIVE Base 计划版本（白天 Candidate 锚定，只读）
+    /// <summary>建 COMPLETED 运行 + DomainKey 对应 ACTIVE Base 计划版本（白天 Candidate 锚定，只读）</summary>
+    private async Task CreateCompletedRunAndBaseAsync(string domainKey)
+    {
         _testScheduleRunId = await _cm.QueryFirstOrDefaultAsync<int>(
             @"INSERT INTO [dbo].[ScheduleRun]
                 ([RunType], [Status], [TriggeredBy], [DataCutoffTime],
@@ -536,7 +605,8 @@ public class RunLifecycleServiceIntegrationTests : IDisposable
             await _cm.ExecuteAsync("DELETE FROM PlanVersion WHERE SourceScheduleRunId = @Id", new { Id = _testRecoveredRunId }, db: DatabaseId.APS);
             await _cm.ExecuteAsync("DELETE FROM ScheduleRun WHERE Id = @Id", new { Id = _testRecoveredRunId }, db: DatabaseId.APS);
         }
-        if (_testStrategyProfileVersionId > 0)
+        // 采用环境既有默认时不删：该行不属本用例，删掉会破坏真实默认
+        if (_testStrategyProfileVersionId > 0 && !_strategyProfileVersionIsAdopted)
         {
             await _cm.ExecuteAsync("DELETE FROM StrategyProfileVersion WHERE Id = @Id", new { Id = _testStrategyProfileVersionId }, db: DatabaseId.APS);
         }

@@ -1,0 +1,37 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    端到端集成测试工程（2号位）。
+    目的：进程内启动真实 Web 应用（复用 LPS.APS.Web/Program.cs 的完整管线），发真实 HTTP 请求，
+          验「规则集统一发布」两个端点的 403 门禁。
+    红线：不连任何真实数据库。Hangfire 存储换内存版；权限判定与启动种子用替身。
+    新增于 2026-10-28，依据 3号位《403 负例协助——收悉与基建缺口 核证回执 v1.0》§四。
+  -->
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <IsPackable>false</IsPackable>
+    <IsTestProject>true</IsTestProject>
+    <!-- 本工程不钉 Microsoft.Extensions.Logging 8.x（现有 LPS.APS.Tests 的钉版是它与 Web 互斥的根因） -->
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.8.0" />
+    <PackageReference Include="xunit" Version="2.6.2" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="2.5.4">
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+      <PrivateAssets>all</PrivateAssets>
+    </PackageReference>
+    <PackageReference Include="Microsoft.AspNetCore.Mvc.Testing" Version="8.0.11" />
+    <PackageReference Include="Hangfire.MemoryStorage" Version="1.8.1" />
+    <PackageReference Include="Moq" Version="4.20.70" />
+    <PackageReference Include="FluentAssertions" Version="6.12.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\LPS.APS.Web\LPS.APS.Web.csproj" />
+    <ProjectReference Include="..\LPS.APS.Core\LPS.APS.Core.csproj" />
+  </ItemGroup>
+
+</Project>

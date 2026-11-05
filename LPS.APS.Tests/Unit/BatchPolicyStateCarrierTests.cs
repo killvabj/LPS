@@ -165,17 +165,35 @@ public class BatchPolicyStateCarrierTests
     }
 
     [Fact]
-    public void BuildStates_业务键不完整_判Missing而非未传递()
+    public void BuildStates_业务键不完整且整料有规则_判Unavailable而非Missing()
     {
-        // 域内需求物料本 Run 未解析到部门 ⇒ 显式出 (MaterialId, null) 键，避免消费侧
-        // 把「键缺失」误读成「接口未传递状态」（后者属 Unknown / 技术失败）。
+        // 域内需求物料本 Run 未解析到部门，但该物料**有规则行** ⇒ 部门未知就无法判定本键命中与否
+        // ⇒「状态不可获得」Unavailable（消费侧 → Unknown → Fail Closed，**不取 Q_C**）。
+        // 依据：0号位 2026-10-28 R07/R08 更正回复 §1「严禁一律补 (物料,NULL) 转成可按 Q_C 排的 MISSING」；
+        //       同条件 1号位 自判口径亦为「业务键不完整 ⇒ 状态不可获得」（`ResolveExecutionBatchPolicy` 末段）。
         var rules = new[] { Rule(100, 900) };
 
         var states = TaskSplitRuleConfigProjector.BuildStates(rules, [(100, null)], RunAt);
 
         var s = Single(states, 100, null);
-        s.State.Should().Be(BatchPolicyState.Missing);
+        s.State.Should().Be(BatchPolicyState.Unavailable,
+            "载体非 null 时，1号位 只把 Missing 映射成 Q_C 软兜底；状态不可获得必须是 Unavailable");
         s.MatchSource.Should().Be(BatchPolicyMatchSource.NoDept);
+    }
+
+    [Fact]
+    public void BuildStates_业务键不完整但整料无规则_仍判Missing_来源为整料无规则()
+    {
+        // 对照用例：本物料在域内**一条规则行都没有** ⇒「确无规则」与部门无关、**可证**
+        // ⇒ 仍是合法 C 桶（06 § 允许 Q_C），但来源必须记 `NO_RULE_FOR_MATERIAL` 而非 `NO_DEPT`
+        //   —— 让「NoDept」这个来源值 100% 只出现在 Fail Closed 的键上。
+        var rules = new[] { Rule(100, 900) };
+
+        var states = TaskSplitRuleConfigProjector.BuildStates(rules, [(200, null)], RunAt);
+
+        var s = Single(states, 200, null);
+        s.State.Should().Be(BatchPolicyState.Missing);
+        s.MatchSource.Should().Be(BatchPolicyMatchSource.NoRuleForMaterial);
     }
 
     // ── ④ Unavailable（不可用／技术失败）：不得静默降级为空集合 ──────────────────────
@@ -365,7 +383,7 @@ public class BatchPolicyStateCarrierTests
             Rule(300, 902, RunAt.AddDays(-1), RunAt.AddDays(1)),    // 别的部门有行 → 本键 Missing
             Rule(400, null),                                        // NULL 部门行（不参与正式命中）
         };
-        var keys = new List<(int, int?)> { (100, 900), (200, 901), (300, 903), (500, null), (600, 904) };
+        var keys = new List<(int, int?)> { (100, 900), (200, 901), (300, 903), (500, null), (600, 904), (300, null) };
 
         var states = TaskSplitRuleConfigProjector.BuildStates(rules, keys, RunAt);
 
@@ -387,7 +405,12 @@ public class BatchPolicyStateCarrierTests
         Single(states, 100, 900).MatchSource.Should().Be(BatchPolicyMatchSource.SnapshotHit);
         Single(states, 200, 901).MatchSource.Should().Be(BatchPolicyMatchSource.OutOfWindow);
         Single(states, 300, 903).MatchSource.Should().Be(BatchPolicyMatchSource.OtherDeptOnly);
-        Single(states, 500, null).MatchSource.Should().Be(BatchPolicyMatchSource.NoDept);
+        // 物料 500 在域内**无任何规则行** ⇒ 部门未知也「确无规则」可证 ⇒ Missing(NO_RULE_FOR_MATERIAL)。
+        Single(states, 500, null).State.Should().Be(BatchPolicyState.Missing);
+        Single(states, 500, null).MatchSource.Should().Be(BatchPolicyMatchSource.NoRuleForMaterial);
+        // 物料 300 有规则行（部门 902），部门未知 ⇒ 状态不可获得 ⇒ Unavailable(NO_DEPT)，不进 Q_C。
+        Single(states, 300, null).State.Should().Be(BatchPolicyState.Unavailable);
+        Single(states, 300, null).MatchSource.Should().Be(BatchPolicyMatchSource.NoDept);
         Single(states, 600, 904).MatchSource.Should().Be(BatchPolicyMatchSource.NoRuleForMaterial);
     }
 }

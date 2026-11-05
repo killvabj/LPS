@@ -51,6 +51,9 @@ export const useRulesStore = defineStore('aps.rules', () => {
   const ruleSets = ref<RuleSetSummaryDto[]>([])
   const currentDetail = ref<RuleSetDetailDto | null>(null)
   const currentDiff = ref<VersionDiffResultDto | null>(null)
+  /** 当前字段级 Diff 的两端版本 Id（「查看换型规则逐条差异」下钻 SetupDiff 时带参用） */
+  const diffBaseVersionId = ref<number | null>(null)
+  const diffTargetVersionId = ref<number | null>(null)
   const lastValidation = ref<PublishValidationResultDto | null>(null)
   const statusFilter = ref<RuleStatus | typeof NO_VERSION | 'ALL'>('ALL')
   const loading = ref(false)
@@ -170,10 +173,17 @@ export const useRulesStore = defineStore('aps.rules', () => {
     }
   }
 
+  /** 清空字段级 Diff 及其两端版本 Id（切规则集 / 删除 / 重新加载时） */
+  function clearDiff(): void {
+    currentDiff.value = null
+    diffBaseVersionId.value = null
+    diffTargetVersionId.value = null
+  }
+
   async function loadDetail(ruleSetId: number): Promise<void> {
     loading.value = true
     error.value = null
-    currentDiff.value = null
+    clearDiff()
     lastValidation.value = null
     try {
       const detail = await ruleApi.getRuleSet(ruleSetId)
@@ -208,7 +218,7 @@ export const useRulesStore = defineStore('aps.rules', () => {
       if (baseVer && targetVer && baseVer !== targetVer) {
         await loadDiff(baseVer, targetVer)
       } else {
-        currentDiff.value = null
+        clearDiff()
       }
     } catch (err) {
       handleError(err)
@@ -221,9 +231,11 @@ export const useRulesStore = defineStore('aps.rules', () => {
   async function loadDiff(base: number, target: number): Promise<void> {
     try {
       currentDiff.value = await ruleApi.diffVersions(base, target)
+      diffBaseVersionId.value = base
+      diffTargetVersionId.value = target
     } catch (err) {
       handleError(err)
-      currentDiff.value = null
+      clearDiff()
     }
   }
 
@@ -520,7 +532,7 @@ export const useRulesStore = defineStore('aps.rules', () => {
     try {
       await ruleApi.deleteRuleSet(ruleSetId)
       currentDetail.value = null
-      currentDiff.value = null
+      clearDiff()
       await loadList()
       return true
     } catch (err) {
@@ -534,7 +546,7 @@ export const useRulesStore = defineStore('aps.rules', () => {
       if (!stillThere) {
         console.warn('[规则集] 删除接口报错，但回列表发现该规则集已不存在，按已删除继续', err)
         currentDetail.value = null
-        currentDiff.value = null
+        clearDiff()
         return true
       }
       handleError(err)
@@ -654,7 +666,7 @@ export const useRulesStore = defineStore('aps.rules', () => {
 
   function reset(): void {
     currentDetail.value = null
-    currentDiff.value = null
+    clearDiff()
     lastValidation.value = null
     error.value = null
   }
@@ -664,6 +676,8 @@ export const useRulesStore = defineStore('aps.rules', () => {
     ruleSets,
     currentDetail,
     currentDiff,
+    diffBaseVersionId,
+    diffTargetVersionId,
     lastValidation,
     statusFilter,
     loading,

@@ -83,16 +83,40 @@ public class ScheduleQueryService : IScheduleQueryService
     }
 
     /// <inheritdoc />
+    /// <summary>
+    /// 窗口/资源过滤谓词——**明细计数、明细体、buckets 三处共用的单源**（Q1 收敛教训：口径修复必须单源，不抄第三份副本）。
+    /// NULL 计划时间恒保留；`from/to` 为 naive 比较（列无时区，Z 在绑参时已抹平——桶条同源定稿 2026-10-30）。
+    /// </summary>
+    private const string GanttWindowPredicate = @"
+                AND (@From IS NULL OR t.PlannedEndTime IS NULL OR t.PlannedEndTime >= @From)
+                AND (@To IS NULL OR t.PlannedStartTime IS NULL OR t.PlannedStartTime <= @To)
+                AND (@HasResources = 0 OR t.ResourceId IN @ResourceIds)";
+
     public async Task<GanttDataDto> GetGanttAsync(
         int userId,
         int planVersionId,
         DateTime? from = null,
         DateTime? to = null,
         IReadOnlyList<int>? resourceIds = null,
+        int? limit = null,
+        int? afterResourceId = null,
+        DateTime? afterStartAt = null,
+        long? afterTaskId = null,
         CancellationToken cancellationToken = default)
     {
+        // 10-29 分页契约（4号位 三步走·第 1 步；复函定稿）：单次上限恒存在。
+        // ⚠ 不传 limit ≠ 全量——默认 8,000；「裸调压百万」这条路径就此终结。
+        const int DefaultLimit = 8000;
+        const int MaxLimit = 20000;
+        // 游标/排序的 NULL 时刻归一下界：SQL datetime 下限 1753-01-01（实库无更早日期，语义与 0001 等同）
+        var sqlDateFloor = new DateTime(1753, 1, 1);
+        var effectiveLimit = Math.Clamp(limit ?? DefaultLimit, 1, MaxLimit);
+
         var allowed = await ResolveAllowedDomainKeysAsync(userId, cancellationToken);
+        var departmentCodes = await ResolveAllowedDepartmentCodesAsync(userId, cancellationToken);
         var hasResources = resourceIds is { Count: > 0 };
+        // 游标三参成套才算翻页（缺一律按首页处理，防半套游标错跳行）
+        var hasCursor = afterTaskId.HasValue && afterResourceId.HasValue && afterStartAt.HasValue;
 
         // 1. 版本信息（含 DomainKey 做范围校验；同时取 Status / BasePlanVersionId 供前端区分版本类型）
         var version = await _connectionManager.QueryFirstOrDefaultAsync<(int Id, string VersionCode, string DomainKey, DateTime PlanHorizonStart, DateTime PlanHorizonEnd, string Status, int? BasePlanVersionId)>(
@@ -129,7 +153,7 @@ public class ScheduleQueryService : IScheduleQueryService
         //    F-G4：资源 DomainKey 不再以 FACTORY_{id} 命名规则推导，改用 PlanVersion.DomainKey（版本唯一权威域）
         //    factoryName / productionDepartmentName / stage 由域主数据 JOIN 投影
         var resources = await _connectionManager.QueryAsync<GanttResourceDto>(
-            @"SELECT DISTINCT
+            $@"SELECT DISTINCT
                 r.Id AS ResourceId,
                 r.ResourceCode,
                 r.ResourceName,
@@ -147,9 +171,13 @@ public class ScheduleQueryService : IScheduleQueryService
                 -- 与任务条同口径过滤：资源行只保留过滤后仍可见的任务所用资源
                 AND (@From IS NULL OR t.PlannedEndTime IS NULL OR t.PlannedEndTime >= @From)
                 AND (@To IS NULL OR t.PlannedStartTime IS NULL OR t.PlannedStartTime <= @To)
-                AND (@HasResources = 0 OR t.ResourceId IN @ResourceIds)
-              ORDER BY r.FactoryId, r.ProductionDepartmentId, r.ResourceCode",
-            new
+                AND (@HasResources = 0 OR t.ResourceId IN @ResourceIds){DepartmentPredicate("t")}
+              -- 10-31 4号位 缺陷修复：资源行排序必须与任务游标同一把尺（资源 Id 升序）。
+              -- 前端照抄 resources[] 顺序摆泳道、任务流按游标序 → 两序不一致时首屏泳道全空。
+              -- INNER JOIN 保证本清单无 NULL ResourceId，故与游标键 ISNULL(t.ResourceId,-1) 完全等价；
+              -- 桶体本来就是尺②（ORDER BY g.ResourceId），改后同页三层（泳道/任务/负荷带）同序。
+              ORDER BY ResourceId",
+            WithDepartmentScope(new
             {
                 Id = planVersionId,
                 DomainKey = version.DomainKey,
@@ -157,7 +185,7 @@ public class ScheduleQueryService : IScheduleQueryService
                 To = to,
                 HasResources = hasResources,
                 ResourceIds = resourceIds
-            },
+            }, departmentCodes),
             db: DatabaseId.APS);
 
         // 3. 任务条
@@ -166,8 +194,24 @@ public class ScheduleQueryService : IScheduleQueryService
         //              plannedProcessQty 取 Task.PlannedProcessQty（DDL 08:4319，2号位已落盘）；
         //              mesEligible / crossDomainBlocked 仍无落盘来源，保持保守默认
         //              （4号位 2026-10-17 R2/R3/R4/R6 已落实；R5 DelayReasons 待事实粒度对齐）
+        // 3b. 过滤口径总数（同谓词 COUNT、不带游标）——分页器/护栏用；
+        //     实测 121 万行域 COUNT 毫秒级（IX_Task_Query 首列 PlanVersionId）。
+        var totalCount = await _connectionManager.QueryFirstOrDefaultAsync<int>(
+            $@"SELECT COUNT(*)
+                FROM [Task] t
+                WHERE t.PlanVersionId = @Id{GanttWindowPredicate}{DepartmentPredicate("t")}",
+            WithDepartmentScope(new
+            {
+                Id = planVersionId,
+                From = from,
+                To = to,
+                HasResources = hasResources,
+                ResourceIds = resourceIds
+            }, departmentCodes),
+            db: DatabaseId.APS);
+
         var tasks = await _connectionManager.QueryAsync<GanttTaskDto>(
-            $@"SELECT
+            $@"SELECT TOP (@Fetch)
                 t.Id                AS TaskId,
                 t.TaskNo,
                 t.OrderId,
@@ -185,13 +229,13 @@ public class ScheduleQueryService : IScheduleQueryService
                 t.Status,
                 t.SetupSource                 AS SetupSource,
                 t.IsCriticalPath              AS IsCriticalPath,
-                -- Duration 库值单位=分钟。落库口径（2号位 PeggingOrchestrator，`Duration-2` 2026-10-26 起）：
-                --   命中＝`EffectiveProcessMinutes + SetupTime`（工时，不含跨日历中断）；
-                --   缺值＝回落 `PlannedEnd-Start` 的 TotalMinutes 原值（**不再加 Setup**，跨度本就含）。
-                --   ⇒ 该列现在是「工时」而非墙钟跨度；跨窗 Task 的值会比 PlannedEnd-Start 小（少了中断段）。
-                -- 冻结 07:3696 写「单位：小时」，两者不一致；查询层按【小时】返回以对齐冻结契约，
-                -- 由前端按小时展示（4号位 R6/Q3）。库值本身不改（写入方归 2号位）。
-                t.Duration / 60.0             AS Duration,
+                -- Duration 库值单位=小时，与冻结 07 字段说明 `:3696`「单位：小时」一致（v5.1.16 `:3703` 同位同文）。
+                --   落库口径（2号位 PeggingOrchestrator，`Duration-2` 2026-10-26 起）：
+                --   命中＝`(EffectiveProcessMinutes + SetupTime) / 60`（工时，不含跨日历中断）；
+                --   缺值＝回落 `PlannedEnd-Start` 的 TotalMinutes / 60（**不再加 Setup**，跨度本就含）。
+                --   ⇒ 该列是「工时」而非墙钟跨度；跨窗 Task 的值会比 PlannedEnd-Start 小（少了中断段）。
+                -- 读取侧**不得再 /60**（0号位 2026-10-26 正式回复 §:60 明确要求）。由前端按小时展示（4号位 R6/Q3）。
+                t.Duration                    AS Duration,
                 o.CustomerDueDate             AS CustomerDueDate,
                 -- 延期判定按【日期】比较：CustomerDueDate 为 DATE，PlannedEndTime 为 DATETIME2，
                 -- 直接比较会隐式提升为「完工时刻 vs 交日零点」，导致交期当天完工被判延期（4号位 Q1）。
@@ -219,22 +263,97 @@ public class ScheduleQueryService : IScheduleQueryService
               LEFT JOIN [Order] o ON o.Id = t.OrderId
               LEFT JOIN Material m ON m.Id = t.MaterialId
               LEFT JOIN PlanVersion pv ON pv.Id = @Id
-              WHERE t.PlanVersionId = @Id
-                AND (@From IS NULL OR t.PlannedEndTime IS NULL OR t.PlannedEndTime >= @From)
-                AND (@To IS NULL OR t.PlannedStartTime IS NULL OR t.PlannedStartTime <= @To)
-                AND (@HasResources = 0 OR t.ResourceId IN @ResourceIds)
-              ORDER BY t.ResourceId, t.PlannedStartTime",
-            new
+              WHERE t.PlanVersionId = @Id{GanttWindowPredicate}{DepartmentPredicate("t")}
+                -- 游标谓词与排序键同式（ISNULL 归一：无资源=-1、未排=1753-01-01），全序三元组翻页不漏不重
+                AND (@HasCursor = 0
+                     OR ISNULL(t.ResourceId, -1) > @CurRes
+                     OR (ISNULL(t.ResourceId, -1) = @CurRes AND ISNULL(t.PlannedStartTime, '17530101') > @CurStart)
+                     OR (ISNULL(t.ResourceId, -1) = @CurRes AND ISNULL(t.PlannedStartTime, '17530101') = @CurStart
+                         AND t.Id > @CurTask))
+              ORDER BY ISNULL(t.ResourceId, -1), ISNULL(t.PlannedStartTime, '17530101'), t.Id",
+            WithDepartmentScope(new
             {
                 Id = planVersionId,
                 From = from,
                 To = to,
                 HasResources = hasResources,
-                ResourceIds = resourceIds
-            },
+                ResourceIds = resourceIds,
+                Fetch = effectiveLimit + 1,          // 多取1行判溢出：hasMore 零额外查询、永不撒谎
+                HasCursor = hasCursor,
+                CurRes = afterResourceId ?? -1,
+                CurStart = afterStartAt ?? sqlDateFloor,   // Dapper 将 DateTime 默认绑定为 SQL datetime（下限1753），MinValue 会 SqlTypeException 溢出
+                CurTask = afterTaskId ?? 0L
+            }, departmentCodes),
             db: DatabaseId.APS);
 
-        var taskList = tasks.ToList();
+        // 溢出裁剪：SQL 多取了 1 行——>limit 即还有下一页，裁掉探针行并回游标
+        var fetched = tasks.ToList();
+        var hasMore = fetched.Count > effectiveLimit;
+        var taskList = hasMore ? fetched.Take(effectiveLimit).ToList() : fetched;
+        var last = taskList.Count > 0 ? taskList[^1] : null;
+
+        // 3c. 页内富化（2026-10-31 字段饥饿函 A2/A9）：
+        //   taskShare  ← AllocationTaskShare（真实数据，IX_ATS_Task 可 seek）
+        //   delayReasons ← ScheduleExplanationFact（ObjectType='TASK'；**当前全库 TASK 级事实=0**，写方 2号位 尚未产出，
+        //                  接线即生效、有值即透出，不伪造）
+        // 传参用 STRING_SPLIT 单参（页内最多 limit 个 TaskId，IN 参数化会撞 SQL Server 2100 上限）
+        if (taskList.Count > 0)
+        {
+            var pageIds = string.Join(",", taskList.Select(t => t.TaskId));
+
+            // 显式 HASH JOIN（实测 1.3s→0.12s）：IN(子查询) 会让 8,000 个 id 逐个 seek，改成等值连接强制一次扫描
+            var shareRows = await _connectionManager.QueryAsync<GanttShareRow>(
+                @"SELECT s.TaskId, s.RootOrderId AS OrderId, o.OrderNo, s.ShareQty
+                    FROM (SELECT CAST(value AS bigint) AS TaskId FROM STRING_SPLIT(@Ids, ',')) v
+                    JOIN AllocationTaskShare s ON s.TaskId = v.TaskId
+                    LEFT JOIN [Order] o ON o.Id = s.RootOrderId
+                    ORDER BY s.TaskId, s.AllocationSequence
+                    OPTION (HASH JOIN)",
+                new { Ids = pageIds }, db: DatabaseId.APS);
+
+            var sharesByTask = shareRows
+                .GroupBy(s => s.TaskId)
+                .ToDictionary(g => g.Key, g =>
+                {
+                    // 占比按同任务内份额归一分母（ShareQty/ΣShareQty），不除以 Task 数量——
+                    // 实库存在"单份额 50 / 任务 100"形态，除任务量会得出误导性的 0.5
+                    var sum = g.Sum(x => x.ShareQty);
+                    return (IReadOnlyList<GanttTaskShareDto>)g.Select(x => new GanttTaskShareDto
+                    {
+                        OrderId = x.OrderId,
+                        OrderNo = x.OrderNo,
+                        ShareQty = x.ShareQty,
+                        ShareRatio = sum == 0 ? 0 : x.ShareQty / sum
+                    }).ToList();
+                });
+
+            var reasonRows = await _connectionManager.QueryAsync<GanttReasonRow>(
+                @"SELECT f.TaskId, f.ReasonCode, f.Severity, f.ImpactHours
+                    FROM (SELECT CAST(value AS bigint) AS TaskId FROM STRING_SPLIT(@Ids, ',')) v
+                    JOIN ScheduleExplanationFact f ON f.TaskId = v.TaskId
+                    WHERE f.ObjectType = 'TASK'
+                    ORDER BY f.TaskId, f.Severity, f.ReasonCode
+                    OPTION (HASH JOIN)",
+                new { Ids = pageIds }, db: DatabaseId.APS);
+
+            // IssueCategory/Description/RelatedObjectRef 三键在 ScheduleExplanationFact 无载体（只存在于 EvidenceJson），
+            // 本期不给（缺键），不以空串占位（4号位 字段饥饿函 A9）。
+            var reasonsByTask = reasonRows
+                .GroupBy(r => r.TaskId)
+                .ToDictionary(g => g.Key, g => (IReadOnlyList<GanttDelayReasonDto>)g.Select(x => new GanttDelayReasonDto
+                {
+                    ReasonCode = x.ReasonCode,
+                    Severity = x.Severity,
+                    ImpactHours = x.ImpactHours
+                }).ToList());
+
+            foreach (var task in taskList)
+            {
+                if (sharesByTask.TryGetValue(task.TaskId, out var shares)) task.TaskShare = shares;
+                if (reasonsByTask.TryGetValue(task.TaskId, out var reasons)) task.DelayReasons = reasons;
+            }
+        }
+
         var resourceList = resources.ToList();
 
         return new GanttDataDto
@@ -249,8 +368,146 @@ public class ScheduleQueryService : IScheduleQueryService
             Tasks              = taskList,
             ScopeDenied        = false,
             VersionExists      = true,
+            // 10-29 分页契约：limit 回显 / 过滤口径总数 / 溢出标志 / 游标（hasMore 时必给）
+            Limit              = effectiveLimit,
+            TotalTasks         = totalCount,
+            HasMore            = hasMore,
+            NextAfter          = hasMore && last is not null
+                ? new GanttCursorDto
+                {
+                    ResourceId = last.ResourceId ?? -1,
+                    PlannedStartTime = last.PlannedStartTime ?? sqlDateFloor,
+                    TaskId = last.TaskId
+                }
+                : null,
             // 空态标志：区分"该版本（在过滤条件下）确实没有任务"
             IsEmpty            = taskList.Count == 0 && resourceList.Count == 0
+        };
+    }
+
+    /// <summary>
+    /// 甘特「资源×时间桶」聚合（三步走·第 2 步；口径=2026-10-30 复函九条定稿）。
+    /// 桶条同源：共用 <see cref="GanttWindowPredicate"/>、naive 比较不转时区；
+    /// 钳制归桶（起点早于窗头归首桶）+ 未排桶（bucketStart=null）⇒ **Σ taskCount ≡ totalTasks 恒等**。
+    /// 降级三闸：稀疏输出 → >50,000 行 day→week→month → 月桶仍超抛 400（真 400 走全局 Filter，同明细体惯例）。
+    /// </summary>
+    public async Task<GanttBucketsDto> GetGanttBucketsAsync(
+        int userId,
+        int planVersionId,
+        DateTime? from,
+        DateTime? to,
+        string? bucket,
+        IReadOnlyList<int>? resourceIds,
+        CancellationToken cancellationToken = default)
+    {
+        const int MaxBucketRows = 50000;
+
+        // 入参校验（400 走全局 Filter，同 resourceIds[] 拦截惯例）：from/to 必填、bucket 值域
+        if (from is null || to is null)
+            throw new InvalidOperationException("buckets 端点要求 from 与 to 均必填（naive 比较，不传时区换算）");
+        var requested = (bucket ?? "day").ToLowerInvariant();
+        if (requested is not ("day" or "week" or "month"))
+            throw new InvalidOperationException($"bucket 仅支持 day|week|month，收到：{bucket}");
+
+        var allowed = await ResolveAllowedDomainKeysAsync(userId, cancellationToken);
+        var departmentCodes = await ResolveAllowedDepartmentCodesAsync(userId, cancellationToken);
+        var hasResources = resourceIds is { Count: > 0 };
+
+        var version = await _connectionManager.QueryFirstOrDefaultAsync<(int Id, string VersionCode, string DomainKey)>(
+            "SELECT pv.Id, pv.VersionCode, pv.DomainKey FROM PlanVersion pv WHERE pv.Id = @Id",
+            new { Id = planVersionId },
+            db: DatabaseId.APS);
+
+        if (version.Id == 0)
+            return new GanttBucketsDto { PlanVersionId = planVersionId, VersionExists = false, IsEmpty = true,
+                                         Bucket = requested, BucketWidth = requested };
+        if (!IsDomainAllowed(allowed, version.DomainKey))
+            return new GanttBucketsDto { PlanVersionId = planVersionId, VersionCode = version.VersionCode,
+                                         VersionExists = true, ScopeDenied = true, IsEmpty = true,
+                                         Bucket = requested, BucketWidth = requested };
+
+        var totalTasks = await _connectionManager.QueryFirstOrDefaultAsync<int>(
+            $@"SELECT COUNT(*)
+                FROM [Task] t
+                WHERE t.PlanVersionId = @Id{GanttWindowPredicate}{DepartmentPredicate("t")}",
+            WithDepartmentScope(
+                new { Id = planVersionId, From = from, To = to, HasResources = hasResources, ResourceIds = resourceIds },
+                departmentCodes),
+            db: DatabaseId.APS);
+
+        // 桶表达式：未排（start NULL）→ 独立行(null)；否则**钳制** GREATEST(start,from) 后按自然日历截断
+        // 周锚=周一（DATEDIFF 以 1900-01-01 周一为基，与 DATEFIRST 无关）
+        static string BucketExpr(string unit, string clamped) => unit switch
+        {
+            "day" => $"DATEADD(day, DATEDIFF(day, 0, {clamped}), 0)",
+            "week" => $"DATEADD(week, DATEDIFF(week, 0, {clamped}), 0)",
+            _ => $"DATEADD(month, DATEDIFF(month, 0, {clamped}), 0)",
+        };
+        var clamped = "(CASE WHEN t.PlannedStartTime < @From THEN @From ELSE t.PlannedStartTime END)";
+
+        IReadOnlyList<GanttBucketRowDto> rows;
+        var effective = requested;
+        while (true)
+        {
+            var bucketStartExpr = $"CASE WHEN t.PlannedStartTime IS NULL THEN CAST(NULL AS datetime2) ELSE {BucketExpr(effective, clamped)} END";
+            rows = (await _connectionManager.QueryAsync<GanttBucketRowDto>(
+                $@"SELECT g.ResourceId,
+                          r.ResourceCode,
+                          r.ResourceName,
+                          f.Name  AS FactoryName,
+                          pd.DeptName AS ProductionDepartmentName,
+                          pd.StageCode AS Stage,
+                          @DomainKey AS DomainKey,
+                          g.BucketStart,
+                          g.TaskCount,
+                          g.LoadHours,
+                          g.FirstStart,
+                          g.LastEnd
+                     FROM (
+                         SELECT ISNULL(t.ResourceId, -1) AS ResourceId,
+                                {bucketStartExpr} AS BucketStart,
+                                COUNT(*)              AS TaskCount,
+                                -- Duration 库值已是小时 ⇒ 直接求和，不再 /60
+                                SUM(t.Duration)       AS LoadHours,
+                                MIN(t.PlannedStartTime) AS FirstStart,
+                                MAX(t.PlannedEndTime)   AS LastEnd
+                         FROM [Task] t
+                         WHERE t.PlanVersionId = @Id{GanttWindowPredicate}{DepartmentPredicate("t")}
+                         GROUP BY ISNULL(t.ResourceId, -1),
+                                  {bucketStartExpr}
+                     ) g
+                     LEFT JOIN Resource r ON r.Id = g.ResourceId
+                     LEFT JOIN Factory f ON f.Id = r.FactoryId
+                     LEFT JOIN ProductionDepartment pd ON pd.Id = r.ProductionDepartmentId
+                     ORDER BY g.ResourceId, g.BucketStart",
+                WithDepartmentScope(
+                    new { Id = planVersionId, From = from, To = to, HasResources = hasResources,
+                          ResourceIds = resourceIds, DomainKey = version.DomainKey },
+                    departmentCodes),
+                db: DatabaseId.APS)).ToList();
+
+            if (rows.Count <= MaxBucketRows || effective == "month") break;
+            effective = effective == "day" ? "week" : "month";   // ②降级链 day→week→month
+        }
+
+        if (rows.Count > MaxBucketRows)
+            throw new InvalidOperationException(
+                $"桶行数 {rows.Count} 仍超上限 {MaxBucketRows}（月桶口径），请用 resourceIds 收窄资源范围后重试");
+
+        return new GanttBucketsDto
+        {
+            PlanVersionId      = version.Id,
+            VersionCode        = version.VersionCode,
+            VersionExists      = true,
+            ScopeDenied        = false,
+            IsEmpty            = rows.Count == 0,
+            Bucket             = requested,
+            BucketWidth        = effective,
+            BucketDowngraded   = effective != requested,
+            From               = System.DateTime.SpecifyKind(from.Value, DateTimeKind.Unspecified),  // 回显 naive（无 Z），与明细同款
+            To                 = System.DateTime.SpecifyKind(to.Value, DateTimeKind.Unspecified),
+            TotalTasks         = totalTasks,
+            Items              = rows
         };
     }
 
@@ -261,6 +518,7 @@ public class ScheduleQueryService : IScheduleQueryService
         CancellationToken cancellationToken = default)
     {
         var allowed = await ResolveAllowedDomainKeysAsync(userId, cancellationToken);
+        var departmentCodes = await ResolveAllowedDepartmentCodesAsync(userId, cancellationToken);
 
         var versionKey = await _connectionManager.QueryFirstOrDefaultAsync<(int Id, string DomainKey)>(
             "SELECT Id, DomainKey FROM PlanVersion WHERE Id = @Id",
@@ -289,22 +547,24 @@ public class ScheduleQueryService : IScheduleQueryService
                 -- 原 SQL 引用不存在列 → 端点必然 500（4号位 10-10/10-17 两次报障）。
                 -- DTO 字段保留为可空，契约不变；如需「求解耗时」请另走 ScheduleRun 维度端点。
 
-                (SELECT COUNT(*) FROM [Task] WHERE PlanVersionId = @Id)
+                (SELECT COUNT(*) FROM [Task] t
+                    WHERE t.PlanVersionId = @Id{DepartmentPredicate("t")})
                     AS TotalTasks,
-                (SELECT COUNT(*) FROM [Task]
-                    WHERE PlanVersionId = @Id AND PlannedStartTime IS NOT NULL)
+                (SELECT COUNT(*) FROM [Task] t
+                    WHERE t.PlanVersionId = @Id AND t.PlannedStartTime IS NOT NULL{DepartmentPredicate("t")})
                     AS ScheduledTasks,
-                (SELECT COUNT(*) FROM [Task]
-                    WHERE PlanVersionId = @Id AND PlannedStartTime IS NULL)
+                (SELECT COUNT(*) FROM [Task] t
+                    WHERE t.PlanVersionId = @Id AND t.PlannedStartTime IS NULL{DepartmentPredicate("t")})
                     AS UnscheduledTasks,
                 (SELECT COUNT(*) FROM [Task] t
                     INNER JOIN [Order] o ON o.Id = t.OrderId
                     WHERE t.PlanVersionId = @Id
                       AND t.PlannedEndTime IS NOT NULL
                       AND o.CustomerDueDate IS NOT NULL
-                      AND {DelayedOnDate("t.PlannedEndTime", "o.CustomerDueDate")})
+                      AND {DelayedOnDate("t.PlannedEndTime", "o.CustomerDueDate")}{DepartmentPredicate("t")})
                     AS DelayedTasks,   -- 10-19 补 Q1 日期判据（原裸 datetime=191，与甘特体 179 分叉 12 条）
 
+                -- ⚠ TotalOrders 是**版本级事实**，不随部门范围收窄（订单本身不带部门）；其余计数均 Task 派生
                 (SELECT COUNT(*) FROM [Order] WHERE PlanVersionId = @Id)
                     AS TotalOrders,
                 (SELECT COUNT(DISTINCT o.Id) FROM [Order] o
@@ -312,16 +572,18 @@ public class ScheduleQueryService : IScheduleQueryService
                     WHERE o.PlanVersionId = @Id
                       AND t.PlannedEndTime IS NOT NULL
                       AND o.CustomerDueDate IS NOT NULL
-                      AND {DelayedOnDate("t.PlannedEndTime", "o.CustomerDueDate")})
+                      AND {DelayedOnDate("t.PlannedEndTime", "o.CustomerDueDate")}{DepartmentPredicate("t")})
                     AS DelayedOrders,   -- 同上一并补（v2 恰好两口径同值=1，换版本即分叉）
 
-                (SELECT MIN(PlannedStartTime) FROM [Task] WHERE PlanVersionId = @Id)
+                (SELECT MIN(t.PlannedStartTime) FROM [Task] t
+                    WHERE t.PlanVersionId = @Id{DepartmentPredicate("t")})
                     AS FirstTaskStart,
-                (SELECT MAX(PlannedEndTime) FROM [Task] WHERE PlanVersionId = @Id)
+                (SELECT MAX(t.PlannedEndTime) FROM [Task] t
+                    WHERE t.PlanVersionId = @Id{DepartmentPredicate("t")})
                     AS LastTaskEnd
               FROM PlanVersion pv
               WHERE pv.Id = @Id",
-            new { Id = planVersionId },
+            WithDepartmentScope(new { Id = planVersionId }, departmentCodes),
             db: DatabaseId.APS);
 
         if (summary is null)
@@ -341,6 +603,7 @@ public class ScheduleQueryService : IScheduleQueryService
         CancellationToken cancellationToken = default)
     {
         var allowed = await ResolveAllowedDomainKeysAsync(userId, cancellationToken);
+        var departmentCodes = await ResolveAllowedDepartmentCodesAsync(userId, cancellationToken);
 
         // 1. 双版本概要 + 存在性/状态校验（缺失 → 404；候选非 CANDIDATE → 400）
         var versions = (await _connectionManager.QueryAsync<PlanVersionBriefDto>(
@@ -370,51 +633,52 @@ public class ScheduleQueryService : IScheduleQueryService
             throw new KeyNotFoundException("候选或基础计划版本不存在或超出当前用户业务范围");
         }
 
-        var parameters = new { CandidateId = candidatePlanVersionId, BaseId = basePlanVersionId };
+        var parameters = WithDepartmentScope(
+            new { CandidateId = candidatePlanVersionId, BaseId = basePlanVersionId }, departmentCodes);
 
         // 2. 任务变化汇总（主键差集：OrderId+MaterialId+OperationSeq+OperationCode+RouteCode+PathId）
+        //    ⚠ 部门范围必须**内外一视同仁**（0号位 2026-10-31 R11-3b 裁决）：
+        //    内层"另一版本有没有同键任务"的存在性判定，直接决定外层 NOT EXISTS 成不成立，
+        //    因此它本身就是可见行计数的一部分 —— 只滤主侧别名会让权限外任务把可见增/减吞掉
+        //    （同键任务 A部门→B部门 时，顶层看到 0/0，等于泄漏"另一部门有该任务"）。
+        //    @ScopeHasDepartments = 0 时谓词整体短路 ⇒ 未配部门范围的用户行为不变。
         var added = await CountScalarAsync(
             $@"SELECT COUNT(*)
                FROM [Task] t_c
-               WHERE t_c.PlanVersionId = @CandidateId
+               WHERE t_c.PlanVersionId = @CandidateId{DepartmentPredicate("t_c")}
                  AND NOT EXISTS (
                    SELECT 1 FROM [Task] t_b
-                   WHERE t_b.PlanVersionId = @BaseId{TaskKeyMatchFragment})",
+                   WHERE t_b.PlanVersionId = @BaseId{TaskKeyMatchFragment}{DepartmentPredicate("t_b")})",
             parameters);
 
         var removed = await CountScalarAsync(
             $@"SELECT COUNT(*)
                FROM [Task] t_b
-               WHERE t_b.PlanVersionId = @BaseId
+               WHERE t_b.PlanVersionId = @BaseId{DepartmentPredicate("t_b")}
                  AND NOT EXISTS (
                    SELECT 1 FROM [Task] t_c
-                   WHERE t_c.PlanVersionId = @CandidateId{TaskKeyMatchFragment})",
+                   WHERE t_c.PlanVersionId = @CandidateId{TaskKeyMatchFragment}{DepartmentPredicate("t_c")})",
             parameters);
 
         var timeShifted = await CountScalarAsync(
             $@"SELECT COUNT(*)
                FROM [Task] t_c
-               WHERE t_c.PlanVersionId = @CandidateId
+               WHERE t_c.PlanVersionId = @CandidateId{DepartmentPredicate("t_c")}
                  AND EXISTS (
                    SELECT 1 FROM [Task] t_b
-                   WHERE t_b.PlanVersionId = @BaseId{TaskKeyMatchFragment}
-                     AND (
-                       (t_c.PlannedStartTime IS NULL) <> (t_b.PlannedStartTime IS NULL)
-                       OR t_c.PlannedStartTime <> t_b.PlannedStartTime
-                       OR (t_c.PlannedEndTime IS NULL) <> (t_b.PlannedEndTime IS NULL)
-                       OR t_c.PlannedEndTime <> t_b.PlannedEndTime))",
+                   WHERE t_b.PlanVersionId = @BaseId{TaskKeyMatchFragment}{DepartmentPredicate("t_b")}
+                     AND {NullSafeNeq("t_c", "t_b", "PlannedStartTime")}
+                     AND {NullSafeNeq("t_c", "t_b", "PlannedEndTime")})",
             parameters);
 
         var resourceChanged = await CountScalarAsync(
             $@"SELECT COUNT(*)
                FROM [Task] t_c
-               WHERE t_c.PlanVersionId = @CandidateId
+               WHERE t_c.PlanVersionId = @CandidateId{DepartmentPredicate("t_c")}
                  AND EXISTS (
                    SELECT 1 FROM [Task] t_b
-                   WHERE t_b.PlanVersionId = @BaseId{TaskKeyMatchFragment}
-                     AND (
-                       (t_c.ResourceId IS NULL) <> (t_b.ResourceId IS NULL)
-                       OR t_c.ResourceId <> t_b.ResourceId))",
+                   WHERE t_b.PlanVersionId = @BaseId{TaskKeyMatchFragment}{DepartmentPredicate("t_b")}
+                     AND {NullSafeNeq("t_c", "t_b", "ResourceId")})",
             parameters);
 
         var impactedOrders = await CountScalarAsync(
@@ -423,29 +687,25 @@ public class ScheduleQueryService : IScheduleQueryService
                  SELECT DISTINCT OrderId FROM (
                    SELECT t_c.OrderId
                    FROM [Task] t_c
-                   WHERE t_c.PlanVersionId = @CandidateId
+                   WHERE t_c.PlanVersionId = @CandidateId{DepartmentPredicate("t_c")}
                      AND (
                        NOT EXISTS (
                          SELECT 1 FROM [Task] t_b
-                         WHERE t_b.PlanVersionId = @BaseId{TaskKeyMatchFragment})
+                         WHERE t_b.PlanVersionId = @BaseId{TaskKeyMatchFragment}{DepartmentPredicate("t_b")})
                        OR EXISTS (
                          SELECT 1 FROM [Task] t_b
-                         WHERE t_b.PlanVersionId = @BaseId{TaskKeyMatchFragment}
-                           AND (
-                             (t_c.PlannedStartTime IS NULL) <> (t_b.PlannedStartTime IS NULL)
-                             OR t_c.PlannedStartTime <> t_b.PlannedStartTime
-                             OR (t_c.PlannedEndTime IS NULL) <> (t_b.PlannedEndTime IS NULL)
-                             OR t_c.PlannedEndTime <> t_b.PlannedEndTime
-                             OR (t_c.ResourceId IS NULL) <> (t_b.ResourceId IS NULL)
-                             OR t_c.ResourceId <> t_b.ResourceId))
+                         WHERE t_b.PlanVersionId = @BaseId{TaskKeyMatchFragment}{DepartmentPredicate("t_b")}
+                           AND {NullSafeNeq("t_c", "t_b", "PlannedStartTime")}
+                           AND {NullSafeNeq("t_c", "t_b", "PlannedEndTime")}
+                           AND {NullSafeNeq("t_c", "t_b", "ResourceId")})
                      )
                    UNION
                    SELECT t_b.OrderId
                    FROM [Task] t_b
-                   WHERE t_b.PlanVersionId = @BaseId
+                   WHERE t_b.PlanVersionId = @BaseId{DepartmentPredicate("t_b")}
                      AND NOT EXISTS (
                        SELECT 1 FROM [Task] t_c
-                       WHERE t_c.PlanVersionId = @CandidateId{TaskKeyMatchFragment})
+                       WHERE t_c.PlanVersionId = @CandidateId{TaskKeyMatchFragment}{DepartmentPredicate("t_c")})
                  ) changed
                ) cnt",
             parameters);
@@ -454,7 +714,7 @@ public class ScheduleQueryService : IScheduleQueryService
             $@"SELECT COUNT(*)
                FROM [Task] t_c
                INNER JOIN [Order] o ON o.Id = t_c.OrderId
-               WHERE t_c.PlanVersionId = @CandidateId
+               WHERE t_c.PlanVersionId = @CandidateId{DepartmentPredicate("t_c")}
                  AND t_c.PlannedEndTime IS NOT NULL
                  AND o.CustomerDueDate IS NOT NULL
                  AND {DelayedOnDate("t_c.PlannedEndTime", "o.CustomerDueDate")}
@@ -462,7 +722,7 @@ public class ScheduleQueryService : IScheduleQueryService
                    SELECT 1
                    FROM [Task] t_b
                    INNER JOIN [Order] ob ON ob.Id = t_b.OrderId
-                   WHERE t_b.PlanVersionId = @BaseId{TaskKeyMatchFragment}
+                   WHERE t_b.PlanVersionId = @BaseId{TaskKeyMatchFragment}{DepartmentPredicate("t_b")}
                      AND t_b.PlannedEndTime IS NOT NULL
                      AND ob.CustomerDueDate IS NOT NULL
                      AND {DelayedOnDate("t_b.PlannedEndTime", "ob.CustomerDueDate")})",
@@ -498,6 +758,7 @@ public class ScheduleQueryService : IScheduleQueryService
         CancellationToken cancellationToken = default)
     {
         var allowed = await ResolveAllowedDomainKeysAsync(userId, cancellationToken);
+        var departmentCodes = await ResolveAllowedDepartmentCodesAsync(userId, cancellationToken);
 
         var run = await _connectionManager.QueryFirstOrDefaultAsync<(int Id, string Status)>(
             "SELECT Id, Status FROM ScheduleRun WHERE Id = @Id",
@@ -518,10 +779,11 @@ public class ScheduleQueryService : IScheduleQueryService
             throw new KeyNotFoundException($"候选运行不存在或超出当前用户业务范围：{candidateRunId}");
 
         var counts = await _connectionManager.QueryFirstOrDefaultAsync<(int OrderCount, int TaskCount)>(
-            @"SELECT
+            $@"SELECT
+                -- 订单数是版本级事实，不随部门范围收窄；任务数按可见 Task 集合计
                 (SELECT COUNT(*) FROM [Order] WHERE PlanVersionId = @PvId) AS OrderCount,
-                (SELECT COUNT(*) FROM [Task] WHERE PlanVersionId = @PvId) AS TaskCount",
-            new { PvId = pv.Id },
+                (SELECT COUNT(*) FROM [Task] t WHERE t.PlanVersionId = @PvId{DepartmentPredicate("t")}) AS TaskCount",
+            WithDepartmentScope(new { PvId = pv.Id }, departmentCodes),
             db: DatabaseId.APS);
 
         return new CandidateSummaryDto
@@ -542,6 +804,7 @@ public class ScheduleQueryService : IScheduleQueryService
         CancellationToken cancellationToken = default)
     {
         var allowed = await ResolveAllowedDomainKeysAsync(userId, cancellationToken);
+        var departmentCodes = await ResolveAllowedDepartmentCodesAsync(userId, cancellationToken);
 
         var run = await _connectionManager.QueryFirstOrDefaultAsync<(int Id, int? BasePlanVersionId)>(
             "SELECT Id, BasePlanVersionId FROM ScheduleRun WHERE Id = @Id",
@@ -562,25 +825,25 @@ public class ScheduleQueryService : IScheduleQueryService
         if (run.BasePlanVersionId is not int baseId)
             throw new InvalidOperationException($"候选运行 {candidateRunId} 无基础计划版本（BasePlanVersionId 为空）");
 
-        var parameters = new { CandidateId = pv.Id, BaseId = baseId };
+        var parameters = WithDepartmentScope(new { CandidateId = pv.Id, BaseId = baseId }, departmentCodes);
 
         var addedOrders = (await _connectionManager.QueryAsync<int?>(
             $@"SELECT DISTINCT t_c.OrderId
                FROM [Task] t_c
-               WHERE t_c.PlanVersionId = @CandidateId
+               WHERE t_c.PlanVersionId = @CandidateId{DepartmentPredicate("t_c")}
                  AND NOT EXISTS (
                    SELECT 1 FROM [Task] t_b
-                   WHERE t_b.PlanVersionId = @BaseId{TaskKeyMatchFragment})",
+                   WHERE t_b.PlanVersionId = @BaseId{TaskKeyMatchFragment}{DepartmentPredicate("t_b")})",
             parameters, db: DatabaseId.APS))
             .Where(x => x.HasValue).Select(x => x!.Value).ToList();
 
         var removedOrders = (await _connectionManager.QueryAsync<int?>(
             $@"SELECT DISTINCT t_b.OrderId
                FROM [Task] t_b
-               WHERE t_b.PlanVersionId = @BaseId
+               WHERE t_b.PlanVersionId = @BaseId{DepartmentPredicate("t_b")}
                  AND NOT EXISTS (
                    SELECT 1 FROM [Task] t_c
-                   WHERE t_c.PlanVersionId = @CandidateId{TaskKeyMatchFragment})",
+                   WHERE t_c.PlanVersionId = @CandidateId{TaskKeyMatchFragment}{DepartmentPredicate("t_c")})",
             parameters, db: DatabaseId.APS))
             .Where(x => x.HasValue).Select(x => x!.Value).ToList();
 
@@ -590,17 +853,13 @@ public class ScheduleQueryService : IScheduleQueryService
                  t_c.RouteCode, t_c.PathId, t_c.ResourceId,
                  t_c.PlannedStartTime, t_c.PlannedEndTime
                FROM [Task] t_c
-               WHERE t_c.PlanVersionId = @CandidateId
+               WHERE t_c.PlanVersionId = @CandidateId{DepartmentPredicate("t_c")}
                  AND EXISTS (
                    SELECT 1 FROM [Task] t_b
-                   WHERE t_b.PlanVersionId = @BaseId{TaskKeyMatchFragment}
-                     AND (
-                       (t_c.PlannedStartTime IS NULL) <> (t_b.PlannedStartTime IS NULL)
-                       OR t_c.PlannedStartTime <> t_b.PlannedStartTime
-                       OR (t_c.PlannedEndTime IS NULL) <> (t_b.PlannedEndTime IS NULL)
-                       OR t_c.PlannedEndTime <> t_b.PlannedEndTime
-                       OR (t_c.ResourceId IS NULL) <> (t_b.ResourceId IS NULL)
-                       OR t_c.ResourceId <> t_b.ResourceId))",
+                   WHERE t_b.PlanVersionId = @BaseId{TaskKeyMatchFragment}{DepartmentPredicate("t_b")}
+                     AND {NullSafeNeq("t_c", "t_b", "PlannedStartTime")}
+                     AND {NullSafeNeq("t_c", "t_b", "PlannedEndTime")}
+                     AND {NullSafeNeq("t_c", "t_b", "ResourceId")})",
             parameters, db: DatabaseId.APS)).ToList();
 
         return new CandidateDiffDto
@@ -621,6 +880,19 @@ public class ScheduleQueryService : IScheduleQueryService
         AND t_b.OperationCode = t_c.OperationCode
         AND t_b.RouteCode     = t_c.RouteCode
         AND t_b.PathId        = t_c.PathId";
+
+    /// <summary>
+    /// 跨版本「NULL 安全不相等」片段：一空一非空，或两者均非空且值不等；两边都为空 ⇒ 不命中。
+    ///
+    /// ⚠ 不能用 `(a IS NULL) &lt;&gt; (b IS NULL)` 的直白写法 —— T-SQL **不允许把两个布尔谓词相互比较**，
+    ///    该写法在 SQL Server 上是语法错误（报「'&lt;' 附近有语法错误」），整条语句无法编译执行。
+    ///    这里必须先把 NULL 与否落成 0/1 整数再比。
+    /// </summary>
+    private static string NullSafeNeq(string leftAlias, string rightAlias, string column)
+        => $@"(
+                       (CASE WHEN {leftAlias}.{column} IS NULL THEN 1 ELSE 0 END)
+                         <> (CASE WHEN {rightAlias}.{column} IS NULL THEN 1 ELSE 0 END)
+                       OR {leftAlias}.{column} <> {rightAlias}.{column})";
 
     /// <summary>
     /// 解析当前用户有效范围并映射为可落 SQL 的 DomainKey 约束（F-G4）。
@@ -653,6 +925,62 @@ public class ScheduleQueryService : IScheduleQueryService
         => allowed == null || allowed.Contains(domainKey);
 
     /// <summary>
+    /// 部门维度范围解析（F-G4 三维之一；2026-10-30 R11-3b 接线，**本轮只接本维**）。
+    ///
+    /// 语义：
+    ///   - 用户**配置了** Department 范围 ⇒ Task 明细只保留其授权 `ProductionDepartment.DeptCode` 下的行；
+    ///   - 用户**未配置**该维度（或 Global）⇒ 不构成约束（返回 null，谓词整体短路）；
+    ///   - 授权值两端 Trim 归一（库值可能带前后空格，直接比对会恒判不中），纯空白视同未配置。
+    ///
+    /// ⚠ 授权值是 **`DeptCode` 字符串**，与 `Task.ProductionDepartmentId`(int) 不同域；这里**按 Code 直接比**
+    ///    （`ProductionDepartment` 主档自带 `DeptCode`），不引入 Id↔Code 转换服务，也不新增表/字段。
+    /// ⚠ 只作用于 **Task 派生的行/计数**；版本级 `Order` 计数（如 Summary.TotalOrders）保持版本口径 ——
+    ///    「订单数是否也按部门收窄」是另一个口径决定，未定前不擅自改。
+    /// </summary>
+    private async Task<IReadOnlyList<string>?> ResolveAllowedDepartmentCodesAsync(
+        int userId, CancellationToken cancellationToken)
+    {
+        var scope = await _dataScopeService.ResolveScopeAsync(userId, cancellationToken);
+        if (scope.IsGlobal)
+            return null;
+
+        var codes = scope.GetValues(DataScopeTypes.Department);
+        if (codes is null || codes.Count == 0)
+            return null;
+
+        var normalized = codes
+            .Where(c => !string.IsNullOrWhiteSpace(c))
+            .Select(c => c.Trim())
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        return normalized.Count == 0 ? null : normalized;
+    }
+
+    /// <summary>
+    /// 部门范围谓词片段（**必须与 <see cref="WithDepartmentScope"/> 成对使用**，否则参数缺失会报错）。
+    /// `@ScopeHasDepartments = 0` 时整体短路 ⇒ 未配置该维度的用户，行为与本改造前完全一致。
+    /// 别名用 `_scpd`，避免与各查询里已有的 `pd`（资源所属部门）别名冲突。
+    /// </summary>
+    private static string DepartmentPredicate(string taskAlias)
+        => $@"
+                AND (@ScopeHasDepartments = 0 OR EXISTS (
+                        SELECT 1 FROM ProductionDepartment _scpd
+                        WHERE _scpd.Id = {taskAlias}.ProductionDepartmentId
+                          AND _scpd.DeptCode IN @ScopeDepartmentCodes))";
+
+    /// <summary>把部门范围两个参数并入既有参数对象（Dapper 的 DynamicParameters 可叠加匿名对象）。</summary>
+    private static DynamicParameters WithDepartmentScope(object parameters, IReadOnlyList<string>? departmentCodes)
+    {
+        var dp = new DynamicParameters();
+        dp.AddDynamicParams(parameters);
+        var hasScope = departmentCodes is { Count: > 0 };
+        dp.Add("ScopeHasDepartments", hasScope ? 1 : 0);
+        dp.Add("ScopeDepartmentCodes", hasScope ? departmentCodes! : Array.Empty<string>());
+        return dp;
+    }
+
+    /// <summary>
     /// 「延期」判定单一判据（**本服务所有延期口径 SQL 必须走此方法**）：按**日期**比较。
     /// PlannedEndTime 为 DATETIME2、CustomerDueDate 为 DATE，裸比较会隐式提升为「完工时刻 vs 交日零点」，
     /// 交期当天完工被误判延期（Q1 裁决 2026-10-17；summary×2/candidate×2 漏改于 2026-10-19 补齐，
@@ -664,4 +992,22 @@ public class ScheduleQueryService : IScheduleQueryService
     /// <summary>标量 COUNT 查询（只读 APS_Production；T=int 无约束时 T? 仅为注解，须显式 int? 类型参数才能 ?? 0 兜底）</summary>
     private async Task<int> CountScalarAsync(string sql, object parameters)
         => await _connectionManager.QueryFirstOrDefaultAsync<int?>(sql, parameters, db: DatabaseId.APS) ?? 0;
+
+    /// <summary>AllocationTaskShare 页内富化行（Dapper 映射用；非契约 DTO）</summary>
+    private sealed class GanttShareRow
+    {
+        public long TaskId { get; set; }
+        public long OrderId { get; set; }
+        public string? OrderNo { get; set; }
+        public decimal ShareQty { get; set; }
+    }
+
+    /// <summary>ScheduleExplanationFact 页内富化行（ObjectType='TASK'；非契约 DTO）</summary>
+    private sealed class GanttReasonRow
+    {
+        public long TaskId { get; set; }
+        public string ReasonCode { get; set; } = string.Empty;
+        public string? Severity { get; set; }
+        public decimal? ImpactHours { get; set; }
+    }
 }

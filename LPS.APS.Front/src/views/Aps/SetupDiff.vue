@@ -5,26 +5,27 @@
 
   职责：对比两个规则集版本的换型规则差异（EXACT/DEFAULT 规则的 added/modified/removed）
   Diff 操作：选定两个规则集版本 → 调 GET /rule-set-versions/{id}/diff?otherVersionId=...
-  边界：只读对比，不在此页直接编辑规则；发布入口在对比结果确认之后
+  边界：只读对比，不在此页直接编辑规则
 
-  权限：aps.setup.view（查看 Diff）+ aps.setup.publish（发布）
+  发布：本页**不再提供发布按钮**。整版规则集发布统一在「规则集维护」页
+  （aps.rule.publish）。原按钮调 `POST /rule-set-versions/{id}/publish`，该端点
+  仅凭 aps.setup.publish 就把含需求优先级的整版置 PUBLISHED —— 0号位 2026-10-26
+  文档 §四 明确禁止；前端撤按钮不替代后端修复（已致函 3号位）。
+
+  权限：aps.setup.view（查看 Diff）
 -->
 
 <script setup lang="ts">
-import { onMounted, ref } from 'vue'
+import { computed, onMounted } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 import { storeToRefs } from 'pinia'
 import {
   ElAlert,
   ElButton,
   ElCard,
   ElCol,
-  ElDialog,
   ElEmpty,
-  ElForm,
-  ElFormItem,
-  ElInput,
   ElMessage,
-  ElMessageBox,
   ElOption,
   ElRow,
   ElSelect,
@@ -35,6 +36,7 @@ import {
 } from 'element-plus'
 import { useSetupDiffStore } from '@/store/modules/aps/setupDiff'
 import { useApsAuthStore } from '@/store/modules/aps/auth'
+import { formatRuleSetVersionLabel } from './composables/ruleSetVersionLabels'
 import {
   SETUP_RULE_STATUS_META,
   SETUP_VERSION_STATUS_META,
@@ -45,6 +47,8 @@ import { formatUtcDateTimeSec } from '@/utils/datetime'
 
 defineOptions({ name: 'ApsSetupDiff' })
 
+const router = useRouter()
+const route = useRoute()
 const diffStore = useSetupDiffStore()
 const apsAuth = useApsAuthStore()
 
@@ -55,27 +59,47 @@ const {
   ruleSetVersions,
   diffLoading,
   versionsLoading,
-  actionRunning,
   error,
   hasDiff,
-  canPublishPerm,
   currentVersion,
   otherVersion,
-  canPublishAction,
   totalChanges
 } = storeToRefs(diffStore)
 
-// ===== 发布 Dialog =====
-const publishDialogVisible = ref(false)
-const publishForm = ref({ changeReason: '' })
+/** 只有整版发布权（aps.rule.publish）才引导去规则集页发布 */
+const canRulePublish = computed<boolean>(() => apsAuth.has('aps.rule.publish'))
 
 // ===== 加载 =====
+/**
+ * 2026-10-28：本页已从菜单隐藏（meta.hidden），唯一入口是「规则集维护 → 版本对比」页签的
+ * 「查看换型规则逐条差异 →」，那个按钮带 `?ruleSetId=&versionId=&otherVersionId=`。
+ * ⇒ 带参进来时：版本下拉按规则集收窄（原来是不限规则集的全系统版本大杂烩，
+ *    用户得自己从几十个版本里挑两个，还可能跨规则集乱比）→ 自动选中两端 → 直接出对比。
+ */
 async function loadAll() {
-  await diffStore.loadRuleSetVersions()
-  // 默认选中第一个 DRAFT 版本
-  const draftVersion = ruleSetVersions.value.find((v) => v.status === 'DRAFT')
-  if (draftVersion) {
-    diffStore.selectVersion(draftVersion.id)
+  const ruleSetId = Number(route.query.ruleSetId)
+  const scoped = Number.isFinite(ruleSetId) && ruleSetId > 0
+  await diffStore.loadRuleSetVersions(scoped ? { ruleSetId } : undefined)
+
+  const versionId = Number(route.query.versionId)
+  const otherId = Number(route.query.otherVersionId)
+  const versions = ruleSetVersions.value
+  const hasVersion = versions.some((v) => v.id === versionId)
+  const hasOther = versions.some((v) => v.id === otherId)
+
+  if (hasVersion) {
+    diffStore.selectVersion(versionId)
+  } else {
+    // 默认选中第一个 DRAFT 版本
+    const draftVersion = versions.find((v) => v.status === 'DRAFT')
+    if (draftVersion) diffStore.selectVersion(draftVersion.id)
+  }
+  if (hasOther) {
+    diffStore.selectOtherVersion(otherId)
+    // 两端都在当前规则集里 ⇒ 直接出对比，不让用户再点一次「对比」
+    if (hasVersion && versionId !== otherId) {
+      await diffStore.loadDiff(versionId, otherId)
+    }
   }
 }
 
@@ -96,52 +120,9 @@ async function applyDiff() {
   await diffStore.loadDiff(selectedVersionId.value, otherVersionId.value)
 }
 
-// ===== 发布操作 =====
-function openPublishDialog() {
-  if (!canPublishPerm.value) {
-    ElMessage.warning('当前操作者无发布权限，请联系系统管理员授予')
-    return
-  }
-  if (!canPublishAction.value) {
-    ElMessage.warning('只能发布草稿（DRAFT）状态的版本')
-    return
-  }
-  publishForm.value.changeReason = ''
-  publishDialogVisible.value = true
-}
-
-async function confirmPublish() {
-  const reason = publishForm.value.changeReason.trim()
-  if (!reason) {
-    ElMessage.error('变更原因必填')
-    return
-  }
-
-  let confirmed = false
-  try {
-    await ElMessageBox.confirm(
-      `即将发布规则集版本 "${currentVersion.value?.versionCode}"。发布后该版本的换型规则将生效，且不可再编辑。是否继续？`,
-      '发布确认',
-      {
-        type: 'warning',
-        confirmButtonText: '确认发布',
-        cancelButtonText: '取消',
-        confirmButtonClass: 'el-button--primary'
-      }
-    )
-    confirmed = true
-  } catch {
-    confirmed = false
-  }
-
-  if (!confirmed) return
-
-  const ok = await diffStore.publish(selectedVersionId.value!, { changeReason: reason })
-  if (ok) {
-    ElMessage.success('发布成功')
-    publishDialogVisible.value = false
-    await loadAll()
-  }
+// ===== 发布：统一去规则集维护页（本页不再直接发布整版） =====
+function goPublishInRules() {
+  void router.push({ path: '/aps/rules' })
 }
 
 // ===== 格式化 =====
@@ -220,10 +201,10 @@ function formatRuleChange(change: SetupRuleChangeDto) {
             <ElOption
               v-for="v in ruleSetVersions"
               :key="v.id"
-              :label="`${v.versionCode}（${getStatusTag(v.status).label}）`"
+              :label="`${formatRuleSetVersionLabel(v)}（${getStatusTag(v.status).label}）`"
               :value="v.id"
             >
-              <span>{{ v.versionCode }}</span>
+              <span>{{ formatRuleSetVersionLabel(v) }}</span>
               <ElTag :type="getStatusTag(v.status).tag" size="small" style="margin-left: 8px">
                 {{ getStatusTag(v.status).label }}
               </ElTag>
@@ -242,10 +223,10 @@ function formatRuleChange(change: SetupRuleChangeDto) {
             <ElOption
               v-for="v in ruleSetVersions"
               :key="v.id"
-              :label="`${v.versionCode}（${getStatusTag(v.status).label}）`"
+              :label="`${formatRuleSetVersionLabel(v)}（${getStatusTag(v.status).label}）`"
               :value="v.id"
             >
-              <span>{{ v.versionCode }}</span>
+              <span>{{ formatRuleSetVersionLabel(v) }}</span>
               <ElTag :type="getStatusTag(v.status).tag" size="small" style="margin-left: 8px">
                 {{ getStatusTag(v.status).label }}
               </ElTag>
@@ -265,14 +246,10 @@ function formatRuleChange(change: SetupRuleChangeDto) {
             <Icon icon="vi-ep:switch" class="mr-4" />
             对比
           </ElButton>
-          <ElButton
-            v-if="canPublishPerm"
-            type="success"
-            :disabled="!canPublishAction"
-            @click="openPublishDialog"
-          >
-            <Icon icon="vi-ep:upload" class="mr-4" />
-            发布
+          <!-- 整版发布统一在「规则集维护」页：本页只做导航，不再直接调发布端点 -->
+          <ElButton v-if="canRulePublish" type="success" plain @click="goPublishInRules">
+            <Icon icon="vi-ep:right" class="mr-4" />
+            去规则集维护页发布
           </ElButton>
         </ElCol>
       </ElRow>
@@ -387,45 +364,6 @@ function formatRuleChange(change: SetupRuleChangeDto) {
     </ElCard>
 
     <ElEmpty v-else-if="!diffLoading" description="请选择源版本和目标版本进行对比" />
-
-    <!-- 发布 Dialog -->
-    <ElDialog
-      v-model="publishDialogVisible"
-      title="发布规则集版本"
-      width="480px"
-      :close-on-click-modal="false"
-    >
-      <ElAlert type="warning" :closable="false" show-icon style="margin-bottom: 16px">
-        <template #title>发布后不可再编辑</template>
-        发布后该版本的换型规则将生效，且不可再编辑。
-      </ElAlert>
-      <ElForm label-width="100px">
-        <ElFormItem label="版本">
-          <ElTag>{{ currentVersion?.versionCode }}</ElTag>
-        </ElFormItem>
-        <ElFormItem label="变更原因" required>
-          <ElInput
-            v-model="publishForm.changeReason"
-            type="textarea"
-            :rows="3"
-            placeholder="请填写变更原因（必填）"
-            maxlength="500"
-            show-word-limit
-          />
-        </ElFormItem>
-      </ElForm>
-      <template #footer>
-        <ElButton @click="publishDialogVisible = false">取消</ElButton>
-        <ElButton
-          type="primary"
-          :loading="actionRunning"
-          :disabled="!publishForm.changeReason.trim()"
-          @click="confirmPublish"
-        >
-          确认发布
-        </ElButton>
-      </template>
-    </ElDialog>
   </div>
 </template>
 

@@ -37,6 +37,20 @@ public static class SolverDiagnostics
         /// <summary>`RunBatchPlan` 里每个（执行批 × Routing 候选）触发一次候选试排。</summary>
         public long RoutingTrials;
 
+        /// <summary>
+        /// R08（2026-10-29）：Phase2 **实际落下**的 Task 中，Setup 解析结果为 `InitialState` 的个数
+        /// —— 即「本资源取到 `fromMaterialId = null`，按初始设备状态算 0 分钟」的落点位。
+        ///
+        /// <para><b>为什么只数 Phase2 落点、不数 `ResolveSetupCore` 调用</b>：后者在
+        /// <see cref="SetupOptimizer.FindSlotWithDynamicSetup"/> 的有界迭代里被反复调用（试排/收敛重解），
+        /// 数出来是「试排次数」而不是「最终排程里有多少个 0 分钟 Setup」，读数会骗人。</para>
+        ///
+        /// <para><b>读数含义的边界（不得当过硬的证据）</b>：`InitialState` 把
+        /// 「真的没有前产品（计划期首件）」和「有前产品但追溯断链」写成同一种结果 ——
+        /// 本计数**不能**区分这两者，只能告诉 4号位 「有这么多落点用的是这条不确定路径」。</para>
+        /// </summary>
+        public long SetupInitialStatePlacements;
+
         /// <summary>`CloneOccupancy` 调用次数（每次复制全资源占用表）。</summary>
         public long CloneOccupancy;
 
@@ -204,6 +218,71 @@ public static class SolverDiagnostics
         /// </summary>
         public long OccupancyRollbackUnmatched;
 
+        /// <summary>2026-10-26 A-4 第二刀：`RollbackInsertedOccupancyWindows` 的**调用次数**（形状峰值的分母）。纯观测。</summary>
+        public long OccupancyRollbackCalls;
+
+        /// <summary>2026-10-26 A-4 第二刀：单次回滚**日志条数 `k`** 的峰值。搬移量 ≈ `k × W`，两个都要看。</summary>
+        public long OccupancyRollbackInsertMax;
+
+        /// <summary>2026-10-26 A-4 第二刀：单次回滚**被触及资源窗表长度 `W`** 的峰值（同一资源上的窗条数）。</summary>
+        public long OccupancyRollbackWindowMax;
+
+        /// <summary>
+        /// 2026-10-27 形状探针：`CloneOccupancy` 克隆时**源字典键数**（资源数）的峰值 / 累计值。
+        ///   【为什么必须量】PV190 直测 `CloneOccupancy` = 202,119 次 × **696 µs/次**，
+        ///     而该方法的全部工作只有一句 `new Dictionary&lt;int, List&lt;TimeWindow&gt;&gt;(source)`
+        ///     —— 写时复制的**浅拷**，不碰任何窗表内容。696 µs 只能来自「字典本身很大」。
+        ///     键数不读出来，「缩小拷贝」往哪个方向改全是猜的（且空间/时间两条路的修法相反）。
+        ///   纯观测，不参与任何业务判定。
+        /// </summary>
+        public long CloneOccupancyKeyMax;
+        public long CloneOccupancyKeySum;
+
+        /// <summary>2026-10-27 形状探针：`new List&lt;FinalTaskDraft&gt;(scheduledTasks)` 克隆时**任务表长度**的峰值。</summary>
+        public long CloneTaskListLenMax;
+
+        /// <summary>
+        /// 2026-10-27 形状探针：批分组**覆盖层尾部长度**（`AppendBatchGroupsOverlayTail` 的 `tasks.Count - from`）
+        ///   的峰值 / 累计值。判据用途：该步骤是 O(尾部)，2,301 µs/次 只可能来自尾部很长 ⇒ 先量长度。
+        ///   纯观测，不参与任何业务判定。
+        /// </summary>
+        public long BatchGroupOverlayTailMax;
+        public long BatchGroupOverlayTailSum;
+
+        /// <summary>2026-10-27 形状探针：覆盖层**回滚键数**（`counts.Count + created.Count`）的峰值。纯观测。</summary>
+        public long BatchGroupOverlayRestoreKeyMax;
+
+        /// <summary>
+        /// 2026-10-27 形状探针：进 `BuildBatchGroupsIndex` 时 **`scheduledTasks.Count` 与快照长度之差** 的峰值。
+        ///   判据用途：差值就是前缀比对 + 尾部追加要扫的长度；它也决定了 `IsPrefixSameReferences` 的 O(N)。
+        ///   纯观测，不参与任何业务判定。
+        /// </summary>
+        public long BatchGroupPrefixGapMax;
+
+        /// <summary>
+        /// 2026-10-27 诊断：候选并行的**执行形状**。
+        ///   【为什么必须量】run24（候选并行 ON）的 `p2_done` @600s 只比 run23（OFF）高 17%，
+        ///     而几乎所有热点「单次耗时」齐刷刷掉 18~19% —— 这是「这台机器这一次跑快了」的形状，
+        ///     不是并行的形状（真并行只会压低**外层** `BatchPlanTrial`，压不动 `LandingRun` 这类区外项）。
+        ///   并行的唯一硬证据：**候选耗时之和 ≫ `Parallel.For` 墙钟**。
+        ///     比值 ≈ 1 ⇒ 根本没并行；比值 ≈ 候选数 ⇒ 真并行。
+        ///   纯观测，不参与任何业务判定。
+        /// </summary>
+        /// <summary>
+        /// 2026-10-27 四十四刀：**外层**（`SelectBestBatchPlan` 的批方案候选）并行/串行派发次数。
+        ///   【为什么单独计数】四十三刀栽过一次 —— Unit 全绿、但 `[SHAPE] 并行批=0`，
+        ///     说明并行分支一次都没进过，所谓「并行」只是纸面。这次把外层派发也钉成读数，
+        ///     **没有这两个数就不许说「并行生效了」**。
+        /// </summary>
+        public long OuterBatchPlanParallel;
+        public long OuterBatchPlanSerial;
+
+        public long CandidateParallelDispatches;   // `parallelCandidates == true` 的批数
+        public long CandidateSerialDispatches;     // 走串行分支的批数
+        public long CandidateDispatchCountSum;     // 上述两类的候选数之和
+        public long CandidateTrialWorkTicks;       // 各候选 `RunCandidate` 耗时之和
+        public long CandidateParallelWallTicks;    // `Parallel.For` 本体墙钟之和
+
         /// <summary>
         /// V1_3 F-03：B-009 合法量门禁**因输入整体未投影而不可评估**的批形成次数累计
         ///   （`piFacts is null`）。纯观测、不参与任何业务判定；**非 0 即表示生产态该门禁不可达**。
@@ -249,6 +328,44 @@ public static class SolverDiagnostics
         ///   ⇒ 不进 <see cref="PiLegalQuantityGatePassed"/> 的放行档。纯观测、不参与任何业务判定。
         /// </summary>
         public long PiLegalQuantityGateSkippedOrderOnly;
+
+        /// <summary>
+        /// 2026-11-02：**完全缺配的合法无 PI 来源 C 桶**按 v1.15 §1320 取 `Q_C` 作经济软 Preferred
+        ///   并成功形成一个执行批的次数。
+        ///   口径：`ProductionInstructionNo` 空 + `IsMissingPolicy` + `NetOutputQty &gt; 0`
+        ///   ⇒ 出一个 `Q_C` 批（**不进** PI 合法量门禁 —— §1319「无PI来源时不得猜造PI或借用PI数量公式」）。
+        ///   与 <see cref="PiLegalQuantityGatePassedViaB010Fallback"/> **分列**：那条是「有 PI、过了门禁」，
+        ///   本条是「无 PI、门禁**不适用**」。纯观测、不参与任何业务判定。
+        /// </summary>
+        public long BatchSoftPreferredNoPi;
+
+        /// <summary>
+        /// 2026-11-03：**Stage 交接等待**（`StageHandoffWaitRules`）落地后的可观测性。全部纯观测、不参与判定。
+        ///   `Total` = 载荷里的规则条数；`Active` = `IsActive==true` 的条数（每轮**覆写**，非累加）；
+        ///   `Matched` = 命中次数（同一工序可能多次）；`Applied` = ELAPSED 真加进起点的次数；
+        ///   `SkippedWork` = WORK 基准因缺日历级别而跳过的次数；`AppliedMinutes` = 累计加进起点的分钟数。
+        /// </summary>
+        public long StageHandoffRulesTotal;
+        public long StageHandoffRulesActive;
+        public long StageHandoffMatched;
+        public long StageHandoffApplied;
+        public long StageHandoffSkippedWork;
+        public long StageHandoffAppliedMinutes;
+
+        /// <summary>
+        /// 2026-11-03：`ResolvePiStageContext` 的**分因**计数（定位 `PI_LEGAL_QTY_CONTRACT_PENDING`）。
+        ///   返回 null 有四种互斥成因，此前全被并成一句「缺 Stage 合法自由量上下文」，无法归因。
+        ///   `PiStageIndexEntries` / `PiStageIndexDistinctPi` 是输入规模（每轮**覆写**）；
+        ///   其余为调用次数累加。
+        /// </summary>
+        public long PiStageIndexEntries;
+        public long PiStageIndexDistinctPi;
+        public long PiStageResolveCalls;
+        public long PiStageNull_IndexEmpty;
+        public long PiStageNull_PiMissing;
+        public long PiStageNull_StageMissing;
+        public long PiStageNull_KeyNotFound;
+        public long PiStageResolveHit;
 
         /// <summary>
         /// 2026-10-22：`ORDER_ONLY` 因**本次 Run 的 PI 权威事实集为空**而被**拒绝采信**、回落到
@@ -359,6 +476,34 @@ public static class SolverDiagnostics
         /// <summary>Phase4 已处理的修复单元条数。</summary>
         public long Phase4UnitsProcessed;
 
+        // ── A-6（2026-11-02 落码）：三个需求口账计数器 ──
+        //   背景：2026-10-25 我方《FAMILY_X 四份对账回执》认领 A-6 时就点了这三个名字
+        //   （`DemandsReceived` / `DemandQtySum` / `DemandsWithLandedTask`），当轮**没有落码** ——
+        //   2号位 2026-11-02 回执 §五.3「全仓零命中，请确认是还没落、还是改了名」。
+        //   如实答：**是没落**，不是改名。此处补齐。
+        //   ⚠ 只在本程序集 / 测试宿主内可见（**不进** `SolverLiveSnapshot` —— 那是 2号位 的对外契约，
+        //     往 public record 加字段＝破坏性变更）。
+        //   纯观测：不参与任何业务判定。
+
+        /// <summary>
+        /// 本次求解**收到的需求条数**（按 `LogicalDemandKey` 去重；同一需求重复下发只算一条）。
+        ///   取的是 **Solver 入口入参**，不是 `SolveSummary.TotalDrafts`（后者是 **Task 条数**，口径不同）。
+        /// </summary>
+        public long DemandsReceived;
+
+        /// <summary>
+        /// 本次求解**收到需求的净量合计**（`NetOutputQty`，按 `LogicalDemandKey` 去重后求和）。
+        ///   口径：**需求侧净量**，不是已排量、也不是 Task 加工量。
+        /// </summary>
+        public decimal DemandQtySum;
+
+        /// <summary>
+        /// **至少落了一条 `FinalTask` 的需求条数**（按 `SourceDraftId` 归属回需求键后去重）。
+        ///   ⚠ 锁定任务（`SourceDraftId = 既有 Task.DraftId`）**不计入** —— 它不是需求。
+        ///   ⚠ 与 `DemandsReceived` 之差 ≠ 「未排需求数」：硬失败需求与部分落地的需求都在里面。
+        /// </summary>
+        public long DemandsWithLandedTask;
+
         /// <summary>
         /// 当前阶段名（`Phase1` / `Phase2` / `Phase3` / `Phase4` / `Phase5` / `Idle`）。
         ///   由 <see cref="SolverDiagnostics.SetPhase"/> 在 Phase 边界写入，供运行中轮询。
@@ -394,14 +539,19 @@ public static class SolverDiagnostics
         private readonly long[] _hotspotCalls = new long[HotspotCount];
 
         /// <summary>热点数量（= <c>SolverDiagnostics.Hotspot</c> 枚举项数）。</summary>
-        public const int HotspotCount = 66;
+        public const int HotspotCount = 68;
 
+        // 2026-10-27 四十二刀：**并发安全**（候选并行前置条件）。
+        //   原来用 `+=` / `++`，多线程同时写会丢更新 —— 而这两个数组正是判断「改快了没有」的唯一依据，
+        //   丢更新会让读数**偏小**，等于把优化效果说小。改 `Interlocked` 后读数为真值。
+        //   ⚠ 计数器是**只写遥测**：改它不可能影响任何排程判定（最坏只是数字偏一点），
+        //     所以这一步对「结果逐位相同」零风险。
         internal void AddHotspotTicks(int hotspot, long ticks)
         {
             if ((uint)hotspot < HotspotCount)
             {
-                _hotspotTicks[hotspot] += ticks;
-                _hotspotCalls[hotspot]++;
+                System.Threading.Interlocked.Add(ref _hotspotTicks[hotspot], ticks);
+                System.Threading.Interlocked.Increment(ref _hotspotCalls[hotspot]);
             }
         }
 
@@ -753,6 +903,25 @@ public static class SolverDiagnostics
         ///   替代「整表重建」（实测 8,334 × 913 µs）与「克隆」（8,334 × 583 µs）。
         /// </summary>
         public const int BatchGroupTrialOverlay = 65;
+
+        /// <summary>
+        /// 2026-10-26 A-4 第二刀：`RollbackInsertedOccupancyWindows` **整个方法**的墙钟（含内部分配与清理）。
+        ///   为什么加这个槽：回滚段原先**落在所有子计时之外** —— `MergeBatchDetach` 在调用点之前就已
+        ///   `HotspotEnd`，回滚在其后开始 ⇒ 剖面里它只是「`TryMergeStageBatch` 的未分解余量」，没有名字。
+        ///   2号位 2026-10-26 现场只能靠托管栈采样（21 次中 15 次落此方法），拿不到秒数。
+        ///   纯观测：不改任何判定、不参与业务。
+        /// </summary>
+        public const int OccupancyRollback = 66;
+
+        /// <summary>
+        /// 2026-10-27 覆盖层拆解：`RestoreBatchGroupsOverlay` 单独计时（`BatchGroupTrialOverlay` 的**第一半**）。
+        ///   为什么加这个槽：PV190 实测 `BatchGroupTrialOverlay` = 62,906 次 × **2,301 µs = 144,761 ms（≈24%）**，
+        ///     是当前**唯一**超过 20% 的具名单项。而该覆盖层由两个**理论上都是 O(尾部)**的步骤组成
+        ///     （① 撤销上一批并进去的尾巴 ② 并入本批尾巴）—— 慢成这样必有一半的「尾部」其实很长。
+        ///   拆开后 `AppendBatchGroupsOverlayTail` 的耗时 = 本槽 − 上面的 `BatchGroupTrialOverlay` 差值，
+        ///   不必再猜是哪一半。纯观测：不改任何判定、不参与业务。
+        /// </summary>
+        public const int BatchGroupOverlayRestore = 67;
     }
 
     private static readonly AsyncLocal<Counters?> Current = new();
@@ -844,6 +1013,10 @@ public static class SolverDiagnostics
     internal static void SetPhase(string phase)
     {
         if (Current.Value is { } c) { c.CurrentPhase = phase; Interlocked.Increment(ref c.Sequence); }
+
+        // 2026-11-05：阶段一换就**立刻**打一行信标，不等下一个 15 秒 tick。
+        //   阶段切换只在 Phase1..Phase5 边界发生（全程 ≤5 次），不在热路径上。
+        Volatile.Read(ref _activeBeacon)?.Tick();
     }
 
     /// <summary>登记 Phase2 待处理需求总条数（进主循环前拍一次）。纯观测。</summary>
@@ -868,6 +1041,22 @@ public static class SolverDiagnostics
     internal static void SetPhase4UnitProgress(long processed)
     {
         if (Current.Value is { } c) { c.Phase4UnitsProcessed = processed; Interlocked.Increment(ref c.Sequence); }
+    }
+
+    /// <summary>
+    /// A-6（2026-11-02）：登记需求口账三件套。**求解收尾时一次性写入**（跑完再取，运行中不轮询）。
+    ///   纯观测，不参与任何业务判定；未开作用域时零开销返回。
+    /// </summary>
+    /// <param name="demandsReceived">按 `LogicalDemandKey` 去重后的需求条数。</param>
+    /// <param name="demandQtySum">同口径去重后 `NetOutputQty` 之和。</param>
+    /// <param name="demandsWithLandedTask">至少落了一条 `FinalTask` 的需求条数。</param>
+    internal static void SetDemandAccounting(long demandsReceived, decimal demandQtySum, long demandsWithLandedTask)
+    {
+        if (Current.Value is not { } c) return;
+        c.DemandsReceived = demandsReceived;
+        c.DemandQtySum = demandQtySum;
+        c.DemandsWithLandedTask = demandsWithLandedTask;
+        Interlocked.Increment(ref c.Sequence);
     }
 
     // ══════════════════════════════════════════════════════════════════
@@ -904,6 +1093,35 @@ public static class SolverDiagnostics
         long RunBatchPlanInvocations);
 
     /// <summary>
+    /// R11（2026-10-29）：**最后一次取消/超时记录**。
+    ///
+    /// <para><b>为什么只记「阶段 + 时刻」，不记「超时 / 人工取消」</b>：两者在求解器内部**完全同形**
+    /// （都是 `OperationCanceledException`，`CancellationToken` 本身不携带来源）——
+    /// 是超时还是人工取消，**只有触发方的 `CancellationTokenSource` 知道**。
+    /// 求解器替调用方猜，等于把不可知的事实编一个值出来；那比不分类更糟。</para>
+    ///
+    /// <para><b>三类分类的落点</b>（0号位 R11 第 4 条）：</para>
+    /// <list type="bullet">
+    ///   <item><b>超时 / 人工取消</b> —— 走本记录：求解器给出**在哪一阶段被中断**，类别由调用方按自己的 token 源判定；
+    ///     `OperationCanceledException` 仍**原样上抛**（不吞、不改契约）。</item>
+    ///   <item><b>硬不可行</b> —— 不走这里：走 `DomainSolveResult.Success = false`，
+    ///     `ErrorMessage` 带 `[HARD_INFEASIBLE]` 前缀，且 `SolveTraceNotes` 里有一条
+    ///     `HARD_INFEASIBLE_*` 的 Error 级痕迹。</item>
+    /// </list>
+    ///
+    /// <para>纯观测：不参与任何业务判定，不加字段到 Core 契约 DTO。</para>
+    /// </summary>
+    public sealed record SolverCancellationRecord(string Phase, DateTime ObservedAtUtc);
+
+    private static SolverCancellationRecord? _lastCancellation;
+
+    /// <summary>最后一次取消记录（任意线程可读；从未取消过则 `null`）。</summary>
+    public static SolverCancellationRecord? LastCancellation => Volatile.Read(ref _lastCancellation);
+
+    internal static void RecordCancellation(string phase)
+        => Volatile.Write(ref _lastCancellation, new SolverCancellationRecord(phase, DateTime.UtcNow));
+
+    /// <summary>
     /// 运行中快照：**任意线程、任意程序集**可读，不要求 `InternalsVisibleTo`。
     ///   当前没有活跃求解作用域时返回 `null`。
     /// </summary>
@@ -922,6 +1140,106 @@ public static class SolverDiagnostics
     ///   进程内以最后一次求解为准（单槽、最后写入者胜；V1 求解串行）。
     /// </summary>
     public static SolverLiveSnapshot? LastSnapshot => Volatile.Read(ref _lastSnapshot);
+
+    // ══════════════════════════════════════════════════════════════════
+    // 运行中进度信标（2026-11-05）
+    //
+    // 【为什么要有它】Run 999401 实测：第 1 域进入「⑤ 求解器」后，**日志 15 分钟一行不动**。
+    //   宿主侧（2号位 `ComputeStageProgressMonitor`）只有「本阶段在跑」的心跳，看不到求解器内部
+    //   处理到第几条需求、试排了多少次 ⇒「在算」与「卡死」只能靠 CPU 使用率去猜。
+    //   `LiveCounters` 其实早就能跨线程读，但**全仓没有任何人定时去读**，等于没有。
+    //
+    // 【为什么走 Console 不走文件】本程序集零 I/O 红线（不读库、不写库）。既有 `DumpShapeProbe`
+    //   （同文件、`APS_CLONE_SHAPE=1`）已经用 Console 且实测能落进 `dotnet test` 的控制台日志，
+    //   本信标沿用同一通道、同一开关风格 ⇒ 不新开 I/O 口子。
+    //
+    // 【为什么全 ASCII】实测控制台重定向会把中文写成「锟斤拷」且**不可恢复**（Run 999401 日志即如此）。
+    //   ASCII 一个字节都不会丢，是唯一稳的写法。
+    //
+    // 【边界】纯观测，不参与任何业务判定。默认关（`APS_SOLVER_BEACON=1` 才开）；
+    //   未开时 `StartBeacon()` 返回 null，热路径只多一次静态 bool 读。回调内异常一律吞掉。
+    // ══════════════════════════════════════════════════════════════════
+
+    private static readonly bool _beaconEnabled = string.Equals(
+        Environment.GetEnvironmentVariable("APS_SOLVER_BEACON"), "1", StringComparison.Ordinal);
+
+    /// <summary>当前活跃信标（进程内单槽；V1 求解串行）。供 <see cref="SetPhase"/> 在阶段切换时立刻打一行。</summary>
+    private static ProgressBeacon? _activeBeacon;
+
+    /// <summary>
+    /// 开一个 30 秒一次的进度信标；未设 <c>APS_SOLVER_BEACON=1</c> 时返回 <c>null</c>（零开销）。
+    /// 调用方 <c>using var beacon = SolverDiagnostics.StartBeacon();</c> 即可。
+    /// </summary>
+    internal static IDisposable? StartBeacon() => _beaconEnabled ? new ProgressBeacon() : null;
+
+    /// <summary>10 秒一次把 <see cref="LiveSnapshot"/> 打成一行 ASCII。独立线程，不占求解线程。</summary>
+    private sealed class ProgressBeacon : IDisposable
+    {
+        // 2026-11-05：15s → 10s。用户要「看得见百分比」，15 秒一行的粒度在小时级跑批里太稀。
+        //   间隔可用 `APS_SOLVER_BEACON_SEC` 覆盖（正整数秒）；非法值退回 10s。
+        private static readonly TimeSpan Interval = TimeSpan.FromSeconds(
+            int.TryParse(Environment.GetEnvironmentVariable("APS_SOLVER_BEACON_SEC"), out var sec) && sec > 0
+                ? sec
+                : 10);
+
+        private readonly System.Diagnostics.Stopwatch _sw = System.Diagnostics.Stopwatch.StartNew();
+        private readonly Timer _timer;
+
+        public ProgressBeacon()
+        {
+            // 首次 tick 立刻打一行（dueTime=0），让「到底进没进求解器、进的哪一阶段」马上可见。
+            _timer = new Timer(_ => Tick(), state: null, dueTime: TimeSpan.Zero, period: Interval);
+            Volatile.Write(ref _activeBeacon, this);
+        }
+
+        // internal（非 private）：外层 `SetPhase` 要在阶段切换时立刻调它。
+        //   C# 里嵌套类能访问外层的私有成员，**反向不行** ⇒ 这里放开到 internal。
+        internal void Tick()
+        {
+            try
+            {
+                var s = LiveSnapshot;
+                if (s is null) return;
+
+                var t = _sw.Elapsed;
+
+                // 2026-11-05：加百分比 —— 用户明确要「看得见百分之多少」。
+                //   分母为 0 时打 `?` 而不是 0.0%，避免「还没开始」被误读成「卡在 0%」。
+                var p2Pct = s.Phase2DemandsTotal > 0
+                    ? (100d * s.Phase2DemandsProcessed / s.Phase2DemandsTotal).ToString("F1") + "%"
+                    : "?";
+                var p4Pct = s.Phase4UnitsTotal > 0
+                    ? (100d * s.Phase4UnitsProcessed / s.Phase4UnitsTotal).ToString("F1") + "%"
+                    : "?";
+
+                Console.WriteLine(
+                    $"[SOLVER-BEACON] +{(int)t.TotalHours:00}:{t.Minutes:00}:{t.Seconds:00}"
+                    + $" phase={s.CurrentPhase}"
+                    + $" p2={s.Phase2DemandsProcessed}/{s.Phase2DemandsTotal}({p2Pct})"
+                    + $" p4={s.Phase4UnitsProcessed}/{s.Phase4UnitsTotal}({p4Pct})"
+                    + $" trials={s.BatchPlanCandidateTrials}"
+                    + $" slotSearch={s.SlotSearches}"
+                    + $" attempts={s.SlotSearchAttempts}"
+                    + $" clone={s.CloneOccupancy}"
+                    + $" heapMb={GC.GetTotalMemory(false) / 1024d / 1024d:F0}"
+                    + $" gc2={GC.CollectionCount(2)}"
+                    + $" seq={s.Sequence}");
+            }
+            catch
+            {
+                // 观测失败不许影响求解。
+            }
+        }
+
+        public void Dispose()
+        {
+            // 先摘静态引用，再停定时器：避免「已 Dispose 的实例仍被打一行」。
+            if (ReferenceEquals(Volatile.Read(ref _activeBeacon), this))
+                Volatile.Write(ref _activeBeacon, null);
+
+            try { _timer.Dispose(); } catch { /* 收尾不抛 */ }
+        }
+    }
 
     /// <summary>拼一份快照；`Sequence` 前后不一致时重取一次，两次仍不一致则照用最后一次。</summary>
     private static SolverLiveSnapshot BuildSnapshot(Counters c, bool isRunning, DateTime? completedAt)
@@ -953,6 +1271,296 @@ public static class SolverDiagnostics
             c.SlotSearchAttempts,
             c.RunBatchPlanInvocations);
 
+    // ══════════════════════════════════════════════════════════════════
+    // 2026-11-05 需求分类耗时画像
+    //
+    // 【为什么要有它】用户问「哪些类的订单最耗时间」。现有热点槽（`DemandSchedule` 等）只有
+    //   **全局合计**，看不出「哪一类需求把时间吃了」—— 是工序多的、批量大的、有指定路径的，
+    //   还是根需求/子需求差别。没有分类就没法做针对性优化，只能说「慢」。
+    //
+    // 【分类维度】每次试排按**单一维度**各记一笔（不是笛卡尔积）：工序数 / 数量档 /
+    //   `DemandGoal` / `QuantityAuthority` / 根需求 / 是否指定 PathId / 连续性 / 是否禁拆合 /
+    //   目标 Stage / 工厂。每个维度独立出边际分布 ⇒ 一眼看出哪个维度有区分度。
+    //
+    // 【口径】记的是 `RunDemandSchedule` 的墙钟，**每候选试排各记一次**（一次需求可能被
+    //   多个候选各试排一次）⇒ 数值是「为这类需求做的活」，不是「这类需求排一次要多久」；
+    //   均摊看 `均` 列，总量看 `ms` 列。
+    //
+    // 【开销】开关默认关（`APS_DEMAND_PROFILE=1` 才开），关时只多一次静态 bool 读。
+    //   开时每次试排一次 lock + 10 次字典查；相对 `RunDemandSchedule`（毫秒级）可忽略。
+    //   纯观测：不改任何业务判定，不写 `SolveTraceNotes`，不动契约 DTO。
+    // ══════════════════════════════════════════════════════════════════
+
+    private static readonly bool _demandProfileEnabled = string.Equals(
+        Environment.GetEnvironmentVariable("APS_DEMAND_PROFILE"), "1", StringComparison.Ordinal);
+
+    /// <summary>一个分桶的累计：次数 / 累计 ticks / 单次峰值 ticks。</summary>
+    internal sealed class DemandProfileSlot
+    {
+        internal long Count;
+        internal long Ticks;
+        internal long MaxTicks;
+    }
+
+    private static readonly object _demandProfileLock = new();
+    private static readonly Dictionary<string, Dictionary<string, DemandProfileSlot>> _demandProfiles
+        = new(StringComparer.Ordinal);
+
+    /// <summary>记一笔需求试排耗时（按多个单一维度各记一次）。纯观测，异常全吞。</summary>
+    internal static void ProfileDemand(LogicalProductionDemand d, int opsCount, long ticks)
+    {
+        if (!_demandProfileEnabled || ticks <= 0L) return;
+
+        try
+        {
+            lock (_demandProfileLock)
+            {
+                Bump("ops", OpsBucket(opsCount), ticks);
+                Bump("qty", QtyBucket(d.PlannedProcessQty), ticks);
+                Bump("goal", TextBucket(d.DemandGoal), ticks);
+                Bump("auth", TextBucket(d.QuantityAuthority), ticks);
+                Bump("root", d.IsRootDemand ? "根需求" : "子需求", ticks);
+                Bump("path", d.PathId.HasValue ? "指定" : "未指定", ticks);
+                Bump("cont", d.IsContinuation ? "续单" : "新单", ticks);
+                Bump("split", d.NoSplitMerge ? "禁拆合" : "可拆合", ticks);
+                Bump("tgtstage", TextBucket(d.RequiredStageCode), ticks);
+                Bump("factory", TextBucket(d.FactoryCode), ticks);
+            }
+        }
+        catch
+        {
+            // 观测失败不许影响求解。
+        }
+    }
+
+    private static void Bump(string dim, string bucket, long ticks)
+    {
+        if (!_demandProfiles.TryGetValue(dim, out var buckets))
+        {
+            buckets = new Dictionary<string, DemandProfileSlot>(StringComparer.Ordinal);
+            _demandProfiles[dim] = buckets;
+        }
+
+        if (!buckets.TryGetValue(bucket, out var slot))
+        {
+            slot = new DemandProfileSlot();
+            buckets[bucket] = slot;
+        }
+
+        slot.Count++;
+        slot.Ticks += ticks;
+        if (ticks > slot.MaxTicks) slot.MaxTicks = ticks;
+    }
+
+    private static string OpsBucket(int n)
+        => n <= 0 ? "0" : n == 1 ? "1" : n == 2 ? "2" : n <= 4 ? "3-4" : "5+";
+
+    private static string QtyBucket(decimal q)
+        => q <= 0m ? "<=0" : q <= 1m ? "<=1" : q <= 10m ? "<=10" : q <= 100m ? "<=100"
+         : q <= 1000m ? "<=1000" : ">1000";
+
+    private static string TextBucket(string? s) => string.IsNullOrWhiteSpace(s) ? "(空)" : s!;
+
+    /// <summary>把需求分类画像打进当前输出（Run 结束、`Scope.Dispose` 时一次）。</summary>
+    private static void DumpDemandProfiles()
+    {
+        if (!_demandProfileEnabled) return;
+
+        try
+        {
+            Dictionary<string, Dictionary<string, DemandProfileSlot>> copy;
+            lock (_demandProfileLock)
+            {
+                copy = new Dictionary<string, Dictionary<string, DemandProfileSlot>>(StringComparer.Ordinal);
+                foreach (var kv in _demandProfiles)
+                {
+                    var inner = new Dictionary<string, DemandProfileSlot>(StringComparer.Ordinal);
+                    foreach (var b in kv.Value)
+                    {
+                        inner[b.Key] = new DemandProfileSlot
+                        {
+                            Count = b.Value.Count,
+                            Ticks = b.Value.Ticks,
+                            MaxTicks = b.Value.MaxTicks,
+                        };
+                    }
+
+                    copy[kv.Key] = inner;
+                }
+
+                // 一次 Run 只出一份；清空避免多 Run 累加（进程内可能跑多个域）。
+                _demandProfiles.Clear();
+            }
+
+            var ticksToMs = 1000d / System.Diagnostics.Stopwatch.Frequency;
+
+            Console.WriteLine("[PROFILE] ================= 需求分类耗时画像 =================");
+
+            foreach (var dim in copy)
+            {
+                var rows = new List<KeyValuePair<string, DemandProfileSlot>>(dim.Value);
+                long dimTicks = 0L;
+                long dimCount = 0L;
+                foreach (var r in rows) { dimTicks += r.Value.Ticks; dimCount += r.Value.Count; }
+
+                Console.WriteLine(
+                    $"[PROFILE] 维度 {dim.Key}：{dimCount:N0} 次试排，合计 {dimTicks * ticksToMs:N0}ms");
+
+                rows.Sort((a, b) => b.Value.Ticks.CompareTo(a.Value.Ticks));
+                foreach (var r in rows)
+                {
+                    var ms = r.Value.Ticks * ticksToMs;
+                    var pct = dimTicks > 0 ? 100d * r.Value.Ticks / dimTicks : 0d;
+                    var avgMs = r.Value.Count > 0 ? ms / r.Value.Count : 0d;
+                    var maxMs = r.Value.MaxTicks * ticksToMs;
+
+                    Console.WriteLine(
+                        $"[PROFILE]   {dim.Key,-9} {r.Key,-22} {r.Value.Count,9:N0} 次"
+                        + $" {ms,12:N0}ms ({pct,5:F1}%) 均 {avgMs,9:N2}ms 峰 {maxMs,9:N0}ms");
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            // 观测失败不改变求解行为。
+            Console.WriteLine($"[PROFILE] 需求画像输出异常（已吞）: {ex.GetType().Name}: {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// 2026-10-27 形状探针输出。**只有环境变量 `APS_CLONE_SHAPE=1` 才输出**，默认一行不打。
+    ///
+    /// 【为什么用 `Console` 而不是走宿主夹具的转储】宿主 `RealDomainFullRunTest.DumpSolverCounters`
+    ///   只固定打印 14 个热点槽，新增的计数器**没有入口**；而本程序集是零 I/O 的（不许开文件），
+    ///   所以只能走 `Console`。已实测 `Console` 输出会落进 `dotnet test` 的 console.log
+    ///   （同文件 `:857` 的「入参捕获钩子异常」走的就是这条路）。
+    /// 纯观测，不参与任何业务判定。
+    /// </summary>
+    private static void DumpShapeProbe(Counters c)
+    {
+        if (!string.Equals(
+                Environment.GetEnvironmentVariable("APS_CLONE_SHAPE"),
+                "1",
+                StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        try
+        {
+            var occCalls = c.CloneOccupancy;
+            var occMean = occCalls > 0 ? c.CloneOccupancyKeySum / (double)occCalls : 0d;
+            var occMs = c.HotspotMs(Hotspot.CloneOccupancy);
+            var occUs = occCalls > 0 ? occMs * 1000d / occCalls : 0d;
+
+            var taskCalls = c.CloneTaskList;
+            var taskMs = c.HotspotMs(Hotspot.CloneTaskList);
+            var taskUs = taskCalls > 0 ? taskMs * 1000d / taskCalls : 0d;
+
+            Console.WriteLine(
+                $"[SHAPE] CloneOccupancy: {occCalls:N0} 次, 平均键数={occMean:N1}, 峰值键数={c.CloneOccupancyKeyMax:N0}, "
+                + $"总耗时={occMs:N0}ms, 每次={occUs:N1}µs "
+                + $"⇒ 每键每次={occUs / Math.Max(occMean, 1d):N3}µs/键");
+
+            Console.WriteLine(
+                $"[SHAPE] CloneTaskList: {taskCalls:N0} 次, 峰值长度={c.CloneTaskListLenMax:N0}, "
+                + $"总耗时={taskMs:N0}ms, 每次={taskUs:N1}µs");
+
+            // ── 候选并行到底有没有真并行（2026-10-27 诊断）──────────────────
+            //   判据：候选耗时之和 ÷ Parallel.For 墙钟。
+            //     ≈1  ⇒ 一点没并行（Parallel.For 退化成串行）；
+            //     ≈候选数 ⇒ 满并行。
+            //   再配 `Environment.ProcessorCount`：若它返回 1，`MaxDegreeOfParallelism` 就是 1，
+            //     Parallel.For 会老老实实串行跑 —— 这是最容易犯又最看不出来的错。
+            Console.WriteLine(
+                $"[SHAPE] 批方案候选并行（外层）: 并行派发={c.OuterBatchPlanParallel:N0}, "
+                + $"串行派发={c.OuterBatchPlanSerial:N0}");
+            if (c.OuterBatchPlanParallel == 0 && c.OuterBatchPlanSerial > 0
+                && string.Equals(Environment.GetEnvironmentVariable("APS_P2_PARALLEL_CANDIDATES"), "1", StringComparison.Ordinal))
+            {
+                Console.WriteLine(
+                    "[SHAPE] ⚠ 开关已开但**并行派发 0 次** ⇒ 回退条件把并行全挡掉了"
+                    + "（最可能：`_bgReal.SnapshotValid == false` 或 `candidates.Count != 2`）。别拿这个谈提速。");
+            }
+
+            var parBatches = c.CandidateParallelDispatches;
+            var serBatches = c.CandidateSerialDispatches;
+            var workMs = c.CandidateTrialWorkTicks * 1000d / System.Diagnostics.Stopwatch.Frequency;
+            var wallMs = c.CandidateParallelWallTicks * 1000d / System.Diagnostics.Stopwatch.Frequency;
+            var candPerBatch = parBatches + serBatches > 0
+                ? c.CandidateDispatchCountSum / (double)(parBatches + serBatches)
+                : 0d;
+            Console.WriteLine(
+                $"[SHAPE] 候选并行: 并行批={parBatches:N0}, 串行批={serBatches:N0}, 平均候选数={candPerBatch:N2}, "
+                + $"ProcessorCount={Environment.ProcessorCount}, "
+                + $"候选耗时合计={workMs:N0}ms, Parallel.For 墙钟={wallMs:N0}ms, "
+                + $"加速比={(wallMs > 0d ? workMs / wallMs : 0d):N2}×");
+
+            // ── GC 到底吃了多少墙钟（2026-10-27 诊断）──────────────────────
+            //   【为什么要量这个】「并行没效果是不是 GC 太频繁」是最大的猜疑，但**猜不算数**。
+            //     两个硬指标一次说清：
+            //       · 总停顿 = GC 真正拿走的墙钟（`GC.GetTotalPauseDuration`，.NET 7+）
+            //       · 总分配 = 整场 Run `new` 出来的字节数（与串行/并行无关，活一样多就该一样大）
+            //   判据：总停顿 ÷ Phase2 墙钟 < 5% ⇒ GC 洗清，问题在别处（多半是 Parallel.For 没生效）；
+            //         > 20% ⇒ GC 是主嫌，`DOTNET_gcServer=1` 值得一试。
+            //   纯观测，不参与任何业务判定。
+            var pauseMs = GC.GetTotalPauseDuration().TotalMilliseconds;
+            var allocGb = GC.GetTotalAllocatedBytes(precise: false) / 1024d / 1024d / 1024d;
+            Console.WriteLine(
+                $"[SHAPE] GC: 服务器GC={System.Runtime.GCSettings.IsServerGC}, "
+                + $"回收次数 Gen0={GC.CollectionCount(0):N0} Gen1={GC.CollectionCount(1):N0} Gen2={GC.CollectionCount(2):N0}, "
+                + $"总分配={allocGb:N1}GB, 总停顿={pauseMs:N0}ms, "
+                + $"当前托管堆={GC.GetTotalMemory(false) / 1024d / 1024d:N0}MB");
+
+            // ── 批分组覆盖层拆解（2026-10-27）──────────────────────────────
+            //   覆盖层 = 撤销上一批 + 并入本批，两半都应是 O(尾部)。先把「尾部到底多长」量出来，
+            //   再决定修哪一半 —— 覆盖层实测占全程 ~24%，是当前唯一超过 20% 的具名单项。
+            var ovlCalls = c.HotspotCallCount(Hotspot.BatchGroupTrialOverlay);
+            var ovlMs = c.HotspotMs(Hotspot.BatchGroupTrialOverlay);
+            var rstMs = c.HotspotMs(Hotspot.BatchGroupOverlayRestore);
+            var appMs = ovlMs - rstMs;
+            var tailSum = c.BatchGroupOverlayTailSum;
+            Console.WriteLine(
+                $"[SHAPE] 覆盖层拆解: 合计 {ovlMs:N0}ms/{ovlCalls:N0} 次"
+                + $" ⇒ 撤销={rstMs:N0}ms, 并入={appMs:N0}ms; "
+                + $"尾部长度 峰值={c.BatchGroupOverlayTailMax:N0} 平均={(ovlCalls > 0 ? tailSum / (double)ovlCalls : 0d):N1}, "
+                + $"回滚键数 峰值={c.BatchGroupOverlayRestoreKeyMax:N0}, "
+                + $"表长−快照长 峰值={c.BatchGroupPrefixGapMax:N0}");
+
+            // ── 全 68 槽分项（2026-10-27）──────────────────────────────────────
+            //   【为什么必须打全】宿主夹具 `RealDomainFullRunTest.DumpSolverCounters` 只固定打印 14 个槽，
+            //     导致 PV190 剖面里每次都有一大块「没名字」（run14 里 `BatchPlanTrial` 334.8 s 中
+            //     130 s 无名）。名字不在那 14 个里的槽（`BatchAdopt` / `BatchGroupIndex` /
+            //     `MergeEffEval` / `OccupancyRollback` …）全部**测了但看不见**。
+            //   这里用反射枚举 `Hotspot` 的常量 ⇒ **新增槽自动出现**，不需要再改这份清单。
+            //   纯观测；只在 `APS_CLONE_SHAPE=1` 时执行，且一处 Run 只跑一次。
+            var slots = typeof(Hotspot)
+                .GetFields(System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static)
+                .Where(f => f.IsLiteral && f.FieldType == typeof(int))
+                .Select(f => (Name: f.Name, Slot: (int)f.GetRawConstantValue()!))
+                .ToList();
+
+            var totalNamed = slots.Sum(s => c.HotspotMs(s.Slot));
+            Console.WriteLine($"[SHAPE] 全槽分项（共 {slots.Count} 槽, 累计 {totalNamed:N0}ms, 含嵌套）:");
+            foreach (var (name, slot) in slots
+                         .Select(s => (s.Name, s.Slot, Ms: c.HotspotMs(s.Slot)))
+                         .Where(x => x.Ms >= 1d)
+                         .OrderByDescending(x => x.Ms)
+                         .Select(x => (x.Name, x.Slot)))
+            {
+                var ms = c.HotspotMs(slot);
+                var calls = c.HotspotCallCount(slot);
+                var perCall = calls > 0 ? ms * 1000d / calls : 0d;
+                Console.WriteLine($"[SHAPE]   {name,-26} {ms,12:N0}ms / {calls,12:N0} 次 = {perCall,10:N1}µs/次");
+            }
+        }
+        catch (Exception ex)
+        {
+            // 观测失败不改变求解行为。
+            Console.WriteLine($"[SHAPE] 形状探针输出异常（已吞）: {ex.GetType().Name}: {ex.Message}");
+        }
+    }
+
     /// <summary>计数作用域：`Counters` 在 <see cref="Dispose"/> 后仍可安全读取（只是不再累加）。</summary>
     internal sealed class Scope : System.IDisposable
     {
@@ -974,6 +1582,10 @@ public static class SolverDiagnostics
 
         public void Dispose()
         {
+            // 2026-10-27 形状探针：默认环境变量关闭 ⇒ 生产/CI 零变化。
+            DumpShapeProbe(Counters);
+            // 2026-11-05 需求分类耗时画像：同样默认关（`APS_DEMAND_PROFILE=1` 才开）。
+            DumpDemandProfiles();
             Current.Value = _previous;
             // 事先留一份终值：`_liveCounters` 一旦还原（通常是 null），「跑完再取」就再也拿不到了。
             Volatile.Write(ref _lastSnapshot, BuildSnapshot(Counters, isRunning: false, completedAt: DateTime.UtcNow));
@@ -1007,27 +1619,119 @@ public static class SolverDiagnostics
 
     internal static void CountBatchPlanCandidateTrial()
     {
-        if (Current.Value is { } c) c.BatchPlanCandidateTrials++;
+        if (Current.Value is { } c) System.Threading.Interlocked.Increment(ref c.BatchPlanCandidateTrials);
     }
 
     internal static void CountRoutingTrial()
     {
-        if (Current.Value is { } c) c.RoutingTrials++;
+        if (Current.Value is { } c) System.Threading.Interlocked.Increment(ref c.RoutingTrials);
+    }
+
+    /// <summary>
+    /// R08（2026-10-29）：登记一次「Task 按 `InitialState`（`fromMaterialId = null`）落下」。
+    ///   只在本工程内 / 测试可见（**不进** <see cref="SolverLiveSnapshot"/> —— 那是 2号位 运行中探针的公开契约）。
+    /// </summary>
+    internal static void CountSetupInitialStatePlacement()
+    {
+        if (Current.Value is { } c) System.Threading.Interlocked.Increment(ref c.SetupInitialStatePlacements);
     }
 
     internal static void CountCloneOccupancy()
     {
-        if (Current.Value is { } c) c.CloneOccupancy++;
+        if (Current.Value is { } c) System.Threading.Interlocked.Increment(ref c.CloneOccupancy);
+    }
+
+    /// <summary>
+    /// 2026-10-27 形状探针：登记 `CloneOccupancy` 源字典的**键数**（资源数）。
+    ///   判据用途：`new Dictionary&lt;K,V&gt;(source)` 的耗时 ≈ O(容量)，键数直接决定 696 µs 是否合理。
+    ///   纯观测；调用点在热路径上，故只做 2 次 long 写，不分配、不加锁。
+    /// </summary>
+    internal static void CountCloneOccupancyKeyShape(int keyCount)
+    {
+        if (Current.Value is not { } c) return;
+        System.Threading.Interlocked.Add(ref c.CloneOccupancyKeySum, keyCount);
+        if (keyCount > c.CloneOccupancyKeyMax) c.CloneOccupancyKeyMax = keyCount;
+    }
+
+    /// <summary>2026-10-27 形状探针：登记 `new List&lt;FinalTaskDraft&gt;(scheduledTasks)` 的**任务表长度**。纯观测。</summary>
+    internal static void CountCloneTaskListShape(int taskCount)
+    {
+        if (Current.Value is not { } c) return;
+        if (taskCount > c.CloneTaskListLenMax) c.CloneTaskListLenMax = taskCount;
+    }
+
+    /// <summary>
+    /// 2026-10-27 诊断：登记一次候选调度（`parallel == true` 走 `Parallel.For`，否则串行 for）。
+    ///   配套 <see cref="AddCandidateTrialWorkTicks"/> / <see cref="AddCandidateParallelWallTicks"/>：
+    ///   三者合起来才能判「并行到没到」。纯观测。
+    /// </summary>
+    /// <summary>
+    /// 2026-10-27 四十四刀：`SelectBestBatchPlan` 每次派发登记一次（并行 / 串行）。
+    ///   ⚠ 这两个数任一为 0 而另一个很大 ⇒ 说明开关或回退条件把并行路径整个挡掉了，先查那里再谈提速。
+    /// </summary>
+    internal static void CountOuterBatchPlanDispatch(bool parallel)
+    {
+        if (Current.Value is not { } c) return;
+        if (parallel)
+            System.Threading.Interlocked.Increment(ref c.OuterBatchPlanParallel);
+        else
+            System.Threading.Interlocked.Increment(ref c.OuterBatchPlanSerial);
+    }
+
+    internal static void CountCandidateDispatch(bool parallel, int candidateCount)
+    {
+        if (Current.Value is not { } c) return;
+        if (parallel)
+            System.Threading.Interlocked.Increment(ref c.CandidateParallelDispatches);
+        else
+            System.Threading.Interlocked.Increment(ref c.CandidateSerialDispatches);
+        System.Threading.Interlocked.Add(ref c.CandidateDispatchCountSum, candidateCount);
+    }
+
+    /// <summary>2026-10-27 诊断：累加**单个候选** `RunCandidate` 的耗时（Stopwatch ticks）。纯观测。</summary>
+    internal static void AddCandidateTrialWorkTicks(long ticks)
+    {
+        if (Current.Value is not { } c) return;
+        System.Threading.Interlocked.Add(ref c.CandidateTrialWorkTicks, ticks);
+    }
+
+    /// <summary>2026-10-27 诊断：累加 `Parallel.For` 本体墙钟（Stopwatch ticks）。纯观测。</summary>
+    internal static void AddCandidateParallelWallTicks(long ticks)
+    {
+        if (Current.Value is not { } c) return;
+        System.Threading.Interlocked.Add(ref c.CandidateParallelWallTicks, ticks);
+    }
+
+    /// <summary>2026-10-27 形状探针：登记批分组覆盖层的**尾部长度**（`tasks.Count - from`）。纯观测。</summary>
+    internal static void CountBatchGroupOverlayTailShape(int tailLen)
+    {
+        if (Current.Value is not { } c) return;
+        System.Threading.Interlocked.Add(ref c.BatchGroupOverlayTailSum, tailLen);
+        if (tailLen > c.BatchGroupOverlayTailMax) c.BatchGroupOverlayTailMax = tailLen;
+    }
+
+    /// <summary>2026-10-27 形状探针：登记覆盖层回滚要处理的**键数**（`counts.Count + created.Count`）。纯观测。</summary>
+    internal static void CountBatchGroupOverlayRestoreShape(int keyCount)
+    {
+        if (Current.Value is not { } c) return;
+        if (keyCount > c.BatchGroupOverlayRestoreKeyMax) c.BatchGroupOverlayRestoreKeyMax = keyCount;
+    }
+
+    /// <summary>2026-10-27 形状探针：登记 `scheduledTasks.Count - snapshot.Count`（前缀比对 + 尾部追加要扫的长度）。纯观测。</summary>
+    internal static void CountBatchGroupPrefixGapShape(int gap)
+    {
+        if (Current.Value is not { } c) return;
+        if (gap > c.BatchGroupPrefixGapMax) c.BatchGroupPrefixGapMax = gap;
     }
 
     internal static void CountCloneTaskList()
     {
-        if (Current.Value is { } c) c.CloneTaskList++;
+        if (Current.Value is { } c) System.Threading.Interlocked.Increment(ref c.CloneTaskList);
     }
 
     internal static void CountCloneShares()
     {
-        if (Current.Value is { } c) c.CloneShares++;
+        if (Current.Value is { } c) System.Threading.Interlocked.Increment(ref c.CloneShares);
     }
 
     /// <summary>2026-10-19 性能定位：累计摘除 Task 数 Σk 与摘除时列表长度 Σn。</summary>
@@ -1035,15 +1739,15 @@ public static class SolverDiagnostics
     {
         if (Current.Value is { } c)
         {
-            c.DetachTaskCount += removedCount;
-            c.DetachListLen += listLength;
+            System.Threading.Interlocked.Add(ref c.DetachTaskCount, removedCount);
+            System.Threading.Interlocked.Add(ref c.DetachListLen, listLength);
         }
     }
 
     /// <summary>2026-10-20 六次定位：占用窗二分未命中（回落线性扫）。纯观测。</summary>
     internal static void CountDetachOccupancyBinaryMiss()
     {
-        if (Current.Value is { } c) c.DetachOccupancyBinaryMiss++;
+        if (Current.Value is { } c) System.Threading.Interlocked.Increment(ref c.DetachOccupancyBinaryMiss);
     }
 
     /// <summary>2026-10-20 六次定位：摘除段触达一个资源时登记「是否真拷 + 该资源窗列表长度」。纯观测。</summary>
@@ -1051,21 +1755,21 @@ public static class SolverDiagnostics
     {
         if (Current.Value is not { } c) return;
 
-        c.DetachOccupancyWindowLen += windowCount;
-        if (copied) c.DetachOccupancyCopies++;
+        System.Threading.Interlocked.Add(ref c.DetachOccupancyWindowLen, windowCount);
+        if (copied) System.Threading.Interlocked.Increment(ref c.DetachOccupancyCopies);
     }
 
     /// <summary>2026-10-20 六次定位：产品时间线二分未命中（回落线性扫）。纯观测。</summary>
     internal static void CountDetachTimelineBinaryMiss()
     {
-        if (Current.Value is { } c) c.DetachTimelineBinaryMiss++;
+        if (Current.Value is { } c) System.Threading.Interlocked.Increment(ref c.DetachTimelineBinaryMiss);
     }
 
 
     /// <summary>2026-10-19 二次定位：`RunBatchPlan` 总调用次数。</summary>
     internal static void CountRunBatchPlanInvocation()
     {
-        if (Current.Value is { } c) c.RunBatchPlanInvocations++;
+        if (Current.Value is { } c) System.Threading.Interlocked.Increment(ref c.RunBatchPlanInvocations);
     }
 
     /// <summary>
@@ -1077,8 +1781,8 @@ public static class SolverDiagnostics
     {
         if (Current.Value is not { } c) return;
 
-        c.AnchorLoopEntries++;
-        c.AnchorBatchCountSum += stageBatchCount;
+        System.Threading.Interlocked.Increment(ref c.AnchorLoopEntries);
+        System.Threading.Interlocked.Add(ref c.AnchorBatchCountSum, stageBatchCount);
         if (stageBatchCount > c.AnchorBatchCountMax) c.AnchorBatchCountMax = stageBatchCount;
 
         var bounds = Counters.AnchorBucketBounds;
@@ -1092,7 +1796,7 @@ public static class SolverDiagnostics
             }
         }
 
-        c.AnchorBatchBuckets[bucket]++;
+        System.Threading.Interlocked.Increment(ref c.AnchorBatchBuckets[bucket]);
     }
 
     /// <summary>
@@ -1104,8 +1808,8 @@ public static class SolverDiagnostics
     {
         if (Current.Value is not { } c) return;
 
-        c.MergeScanCalls++;
-        c.MergeScanGroupSum += groupCount;
+        System.Threading.Interlocked.Increment(ref c.MergeScanCalls);
+        System.Threading.Interlocked.Add(ref c.MergeScanGroupSum, groupCount);
         if (groupCount > c.MergeScanGroupMax) c.MergeScanGroupMax = groupCount;
     }
 
@@ -1117,7 +1821,7 @@ public static class SolverDiagnostics
     {
         if (Current.Value is not { } c) return;
         if ((uint)outcome >= (uint)c.BatchGroupReconcileOutcomes.Length) return;
-        c.BatchGroupReconcileOutcomes[outcome]++;
+        System.Threading.Interlocked.Increment(ref c.BatchGroupReconcileOutcomes[outcome]);
     }
 
     /// <summary>
@@ -1128,32 +1832,32 @@ public static class SolverDiagnostics
     {
         if (Current.Value is not { } c) return;
         if ((uint)reason >= (uint)c.BatchGroupRebuildReasons.Length) return;
-        c.BatchGroupRebuildReasons[reason]++;
+        System.Threading.Interlocked.Increment(ref c.BatchGroupRebuildReasons[reason]);
     }
 
     /// <summary>2026-10-20 十一次定位：`scheduledTasks` 整表替换次数。</summary>
     internal static void CountTaskTableReplaced()
     {
         if (Current.Value is not { } c) return;
-        c.TaskTableReplaced++;
+        System.Threading.Interlocked.Increment(ref c.TaskTableReplaced);
     }
 
     /// <summary>2026-10-20 十一次定位：`scheduledTasks` 尾部追加次数。</summary>
     internal static void CountTaskTableAppended()
     {
         if (Current.Value is not { } c) return;
-        c.TaskTableAppended++;
+        System.Threading.Interlocked.Increment(ref c.TaskTableAppended);
     }
 
     /// <summary>2026-10-20 十二次定位：`ComputeDetachPositions` 被调用次数。</summary>
     internal static void CountDetachPosCall()
     {
-        if (Current.Value is { } c) c.DetachPosCalls++;
+        if (Current.Value is { } c) System.Threading.Interlocked.Increment(ref c.DetachPosCalls);
     }
 
     internal static void CountSlotSearch()
     {
-        if (Current.Value is { } c) c.SlotSearches++;
+        if (Current.Value is { } c) System.Threading.Interlocked.Increment(ref c.SlotSearches);
     }
 
     /// <summary>
@@ -1162,7 +1866,7 @@ public static class SolverDiagnostics
     /// </summary>
     internal static void CountSlotSearchAttempt(Counters? cached)
     {
-        if (cached is not null) cached.SlotSearchAttempts++;
+        if (cached is not null) System.Threading.Interlocked.Increment(ref cached.SlotSearchAttempts);
     }
 
     // ══════════════════════════════════════════════════════════════════
@@ -1185,7 +1889,7 @@ public static class SolverDiagnostics
     /// <summary><see cref="CountSlotSearch()"/> 的缓存重载（语义逐字相同）。</summary>
     internal static void CountSlotSearch(Counters? cached)
     {
-        if (cached is not null) cached.SlotSearches++;
+        if (cached is not null) System.Threading.Interlocked.Increment(ref cached.SlotSearches);
     }
 
     /// <summary><see cref="HotspotStart()"/> 的缓存重载（语义逐字相同）。</summary>
@@ -1202,61 +1906,92 @@ public static class SolverDiagnostics
 
     internal static void CountPhase4PropagatedTask()
     {
-        if (Current.Value is { } c) c.Phase4PropagatedTasks++;
+        if (Current.Value is { } c) System.Threading.Interlocked.Increment(ref c.Phase4PropagatedTasks);
     }
 
     /// <summary>Phase5 `CompactGaps` 门控放行（进入压实优化体）时 +1。纯观测，不参与判定。</summary>
     internal static void CountPhase5CompactionRun()
     {
-        if (Current.Value is { } c) c.Phase5CompactionRuns++;
+        if (Current.Value is { } c) System.Threading.Interlocked.Increment(ref c.Phase5CompactionRuns);
     }
 
     /// <summary>Phase5 `OptimizeSetupSequences` 门控放行（进入序列优化体）时 +1。纯观测，不参与判定。</summary>
     internal static void CountPhase5SetupOptimizationRun()
     {
-        if (Current.Value is { } c) c.Phase5SetupOptimizationRuns++;
+        if (Current.Value is { } c) System.Threading.Interlocked.Increment(ref c.Phase5SetupOptimizationRuns);
     }
 
     /// <summary>Phase5 `OptimizeSegment` 真正进入有界局部优化体（可重排段）时 +1。纯观测，不参与判定。</summary>
     internal static void CountPhase5SetupSegmentOptimized()
     {
-        if (Current.Value is { } c) c.Phase5SetupSegmentsOptimized++;
+        if (Current.Value is { } c) System.Threading.Interlocked.Increment(ref c.Phase5SetupSegmentsOptimized);
     }
 
     /// <summary>V1_3 F-01：按插入身份回滚占用表时**未命中**条目数 +n。纯观测，不参与判定。</summary>
     internal static void CountOccupancyRollbackUnmatched(int n)
     {
-        if (n > 0 && Current.Value is { } c) c.OccupancyRollbackUnmatched += n;
+        if (n > 0 && Current.Value is { } c) System.Threading.Interlocked.Add(ref c.OccupancyRollbackUnmatched, n);
     }
+
+    /// <summary>
+    /// 2026-10-26 A-4 第二刀：登记一次回滚的**形状** —— 日志条数 `k` 与**被触及资源窗表长度 `W`** 的峰值。
+    ///   为什么要 `W`：搬移量是 `k × W`，只登记 `k` 会误判「日志小就不贵」。整链重跑一次通常只插 3~15 个窗，
+    ///   但被触及资源上若有**上万条窗**，逐条 `RemoveAt` 仍是 k 次整表搬移 —— 这正是「小 k 也慢」的唯一解释路径。
+    ///   纯观测，不参与任何判定；未开 scope 时只做一次 `null` 判断。
+    ///   ⚠ **不进** <see cref="SolverLiveSnapshot"/>：那是 2号位 运行中探针在读的公开 record，加字段即改契约。
+    /// </summary>
+    internal static void CountOccupancyRollbackShape(int insertCount, int maxWindowLength)
+    {
+        if (Current.Value is not { } c) return;
+
+        System.Threading.Interlocked.Increment(ref c.OccupancyRollbackCalls);
+        if (insertCount > c.OccupancyRollbackInsertMax) c.OccupancyRollbackInsertMax = insertCount;
+        if (maxWindowLength > c.OccupancyRollbackWindowMax) c.OccupancyRollbackWindowMax = maxWindowLength;
+    }
+
+    /// <summary>本 Run 回滚日志条数峰值（未开 scope ⇒ 0）。纯观测。</summary>
+    internal static long OccupancyRollbackInsertMax => Current.Value?.OccupancyRollbackInsertMax ?? 0;
+
+    /// <summary>本 Run 回滚被触及资源窗表长度峰值（未开 scope ⇒ 0）。纯观测。</summary>
+    internal static long OccupancyRollbackWindowMax => Current.Value?.OccupancyRollbackWindowMax ?? 0;
+
+    /// <summary>本 Run 回滚调用次数（未开 scope ⇒ 0）。纯观测。</summary>
+    internal static long OccupancyRollbackCalls => Current.Value?.OccupancyRollbackCalls ?? 0;
+
+    /// <summary>
+    /// 本 Run 某热点槽的累计毫秒（未开 scope ⇒ 0）。纯观测。
+    ///   给「逐需求自报」用：在擂台前后各取一次差，即得**该需求**的回滚耗时，而不是全 Run 聚合值。
+    /// </summary>
+    internal static double HotspotMsTotal(int hotspot) => Current.Value?.HotspotMs(hotspot) ?? 0;
 
     /// <summary>V1_4 NEW-05：MIXED 回落正排时按身份撤销的倒排残留占用窗数 +n。纯观测，不参与判定。</summary>
     internal static void CountMixedBackwardRollbackWindows(int n)
     {
-        if (n > 0 && Current.Value is { } c) c.MixedBackwardRollbackWindows += n;
+        if (n > 0 && Current.Value is { } c) System.Threading.Interlocked.Add(ref c.MixedBackwardRollbackWindows, n);
     }
 
     /// <summary>V1_4 NEW-04：本 Run 累计登记账 <c>Commit</c> 次数 +1。纯观测，不参与判定。</summary>
     internal static void CountPiStageLedgerCommit()
     {
-        if (Current.Value is { } c) c.PiStageLedgerCommits++;
+        if (Current.Value is { } c) System.Threading.Interlocked.Increment(ref c.PiStageLedgerCommits);
     }
 
     /// <summary>V1_4 NEW-04：本 Run 累计登记账按身份回滚次数 +1。纯观测，不参与判定。</summary>
     internal static void CountPiStageLedgerRollback()
     {
-        if (Current.Value is { } c) c.PiStageLedgerRollbacks++;
+        if (Current.Value is { } c) System.Threading.Interlocked.Increment(ref c.PiStageLedgerRollbacks);
     }
 
     /// <summary>V1_3 F-03：B-009 合法量门禁因输入未投影而不可评估 +1。纯观测，不参与判定。</summary>
     internal static void CountPiLegalQuantityGateUnevaluated()
     {
-        if (Current.Value is { } c) c.PiLegalQuantityGateUnevaluated++;
+        if (Current.Value is { } c) System.Threading.Interlocked.Increment(ref c.PiLegalQuantityGateUnevaluated);
     }
 
     /// <summary>V1_3 F-03：B-009 合法量门禁判越限/事实不可信并 Fail Closed +1。纯观测，不参与判定。</summary>
     internal static void CountPiLegalQuantityGateBlocked()
     {
-        if (Current.Value is { } c) c.PiLegalQuantityGateBlocked++;
+        if (Current.Value is { } c) System.Threading.Interlocked.Increment(ref c.PiLegalQuantityGateBlocked);
     }
 
     /// <summary>
@@ -1265,25 +2000,88 @@ public static class SolverDiagnostics
     /// </summary>
     internal static void CountPiLegalQuantityGatePassed()
     {
-        if (Current.Value is { } c) c.PiLegalQuantityGatePassed++;
+        if (Current.Value is { } c) System.Threading.Interlocked.Increment(ref c.PiLegalQuantityGatePassed);
     }
 
     /// <summary>2026-10-12：B-010 缺策略兜底路径被同一门禁判未满足 +1。纯观测，不参与判定。</summary>
     internal static void CountPiLegalQuantityGateBlockedViaB010Fallback()
     {
-        if (Current.Value is { } c) c.PiLegalQuantityGateBlockedViaB010Fallback++;
+        if (Current.Value is { } c) System.Threading.Interlocked.Increment(ref c.PiLegalQuantityGateBlockedViaB010Fallback);
     }
 
     /// <summary>2026-10-12：B-010 缺策略兜底路径过闸并成批 +1。纯观测，不参与判定。</summary>
+    /// <summary>
+    /// 2026-11-02：**完全缺配的合法无 PI 来源 C 桶**按 v1.15 §1320 取 Q_C 作经济软 Preferred 并成批 +1。
+    /// 纯观测，不参与任何业务判定。
+    /// </summary>
+    internal static void CountBatchSoftPreferredNoPi()
+    {
+        if (Current.Value is { } c) System.Threading.Interlocked.Increment(ref c.BatchSoftPreferredNoPi);
+    }
+
+    // ── 2026-11-03：Stage 交接等待 / PI Stage 上下文 的观测入口（全部纯观测）──────────────
+    internal static void SetStageHandoffRuleShape(int total, int active)
+    {
+        if (Current.Value is { } c)
+        {
+            System.Threading.Interlocked.Exchange(ref c.StageHandoffRulesTotal, total);
+            System.Threading.Interlocked.Exchange(ref c.StageHandoffRulesActive, active);
+        }
+    }
+
+    internal static void CountStageHandoffMatched()
+    {
+        if (Current.Value is { } c) System.Threading.Interlocked.Increment(ref c.StageHandoffMatched);
+    }
+
+    internal static void CountStageHandoffApplied(int minutes)
+    {
+        if (Current.Value is { } c)
+        {
+            System.Threading.Interlocked.Increment(ref c.StageHandoffApplied);
+            if (minutes > 0) System.Threading.Interlocked.Add(ref c.StageHandoffAppliedMinutes, minutes);
+        }
+    }
+
+    internal static void CountStageHandoffSkippedWork()
+    {
+        if (Current.Value is { } c) System.Threading.Interlocked.Increment(ref c.StageHandoffSkippedWork);
+    }
+
+    internal static void SetPiStageIndexShape(int entries, int distinctPi)
+    {
+        if (Current.Value is { } c)
+        {
+            System.Threading.Interlocked.Exchange(ref c.PiStageIndexEntries, entries);
+            System.Threading.Interlocked.Exchange(ref c.PiStageIndexDistinctPi, distinctPi);
+        }
+    }
+
+    internal enum PiStageResolveMiss { IndexEmpty, PiMissing, StageMissing, KeyNotFound }
+
+    internal static void CountPiStageResolve(PiStageResolveMiss? miss)
+    {
+        if (Current.Value is not { } c) return;
+        System.Threading.Interlocked.Increment(ref c.PiStageResolveCalls);
+        switch (miss)
+        {
+            case null: System.Threading.Interlocked.Increment(ref c.PiStageResolveHit); break;
+            case PiStageResolveMiss.IndexEmpty: System.Threading.Interlocked.Increment(ref c.PiStageNull_IndexEmpty); break;
+            case PiStageResolveMiss.PiMissing: System.Threading.Interlocked.Increment(ref c.PiStageNull_PiMissing); break;
+            case PiStageResolveMiss.StageMissing: System.Threading.Interlocked.Increment(ref c.PiStageNull_StageMissing); break;
+            case PiStageResolveMiss.KeyNotFound: System.Threading.Interlocked.Increment(ref c.PiStageNull_KeyNotFound); break;
+        }
+    }
+
     internal static void CountPiLegalQuantityGatePassedViaB010Fallback()
     {
-        if (Current.Value is { } c) c.PiLegalQuantityGatePassedViaB010Fallback++;
+        if (Current.Value is { } c) System.Threading.Interlocked.Increment(ref c.PiLegalQuantityGatePassedViaB010Fallback);
     }
 
     /// <summary>2026-10-22：`QuantityAuthority=ORDER_ONLY` 使 B-009 门禁**不适用**并放行 +1。纯观测，不参与判定。</summary>
     internal static void CountPiLegalQuantityGateSkippedOrderOnly()
     {
-        if (Current.Value is { } c) c.PiLegalQuantityGateSkippedOrderOnly++;
+        if (Current.Value is { } c) System.Threading.Interlocked.Increment(ref c.PiLegalQuantityGateSkippedOrderOnly);
     }
 
     /// <summary>
@@ -1292,7 +2090,7 @@ public static class SolverDiagnostics
     /// </summary>
     internal static void CountPiLegalQuantityGateOrderOnlyRejectedEmptyFacts()
     {
-        if (Current.Value is { } c) c.PiLegalQuantityGateOrderOnlyRejectedEmptyFacts++;
+        if (Current.Value is { } c) System.Threading.Interlocked.Increment(ref c.PiLegalQuantityGateOrderOnlyRejectedEmptyFacts);
     }
 
     /// <summary>
@@ -1301,7 +2099,7 @@ public static class SolverDiagnostics
     /// </summary>
     internal static void CountBatchPolicyInvalid(int n = 1)
     {
-        if (Current.Value is { } c) c.BatchPolicyInvalids += n;
+        if (Current.Value is { } c) System.Threading.Interlocked.Add(ref c.BatchPolicyInvalids, n);
     }
 
     /// <summary>
@@ -1310,12 +2108,12 @@ public static class SolverDiagnostics
     /// </summary>
     internal static void CountBatchPolicyUnknown(int n = 1)
     {
-        if (Current.Value is { } c) c.BatchPolicyUnknowns += n;
+        if (Current.Value is { } c) System.Threading.Interlocked.Add(ref c.BatchPolicyUnknowns, n);
     }
 
     internal static void CountEconomicBatchDeviation(int n = 1)
     {
-        if (Current.Value is { } c) c.EconomicBatchDeviations += n;
+        if (Current.Value is { } c) System.Threading.Interlocked.Add(ref c.EconomicBatchDeviations, n);
     }
 
     /// <summary>

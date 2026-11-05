@@ -144,6 +144,44 @@ public class SetupRuleServiceScopeTests
         _versionRepo.Verify(r => r.UpdateAsync(It.IsAny<RuleSetVersion>(), It.IsAny<CancellationToken>()), Times.Never);
     }
 
+    // ---- 0号位 2026-10-28 更正（R08 显式 A→A 按冻结放开同材 EXACT）：正反例 ----
+
+    [Fact]
+    public async Task CreateExactAsync_同材EXACT_通过同材校验走到Scope_不再抛同材红线()
+    {
+        // Arrange：From == To（同材 A→A，0号位 指示放开）且部门越权 → 应越过同材/缺产品校验、被 Scope 拦。
+        SetupDepartmentCodeLookup();
+        SetupScopePolicy();
+        var svc = CreateService();
+        var sameMaterial = BuildExactInput(DeptOldOutOfScope);
+        sameMaterial.FromMaterialId = 100;
+        sameMaterial.ToMaterialId = 100; // 同材：2026-10-28 前抛 SetupRuleDataRedLineException("fromMaterialId == toMaterialId") → 现应放行到 Scope
+
+        // Act / Assert：抛 ScopeViolationException（而非同材红线）= 同材 EXACT 已按冻结放开；未触版本仓储。
+        var act = () => svc.CreateExactAsync(sameMaterial, ActorUserId, "u", CancellationToken.None);
+
+        await act.Should().ThrowAsync<ScopeViolationException>();
+        _versionRepo.Verify(r => r.GetByIdAsync(It.IsAny<long>(), It.IsAny<CancellationToken>()), Times.Never);
+        _versionRepo.Verify(r => r.UpdateAsync(It.IsAny<RuleSetVersion>(), It.IsAny<CancellationToken>()), Times.Never);
+    }
+
+    [Fact]
+    public async Task CreateExactAsync_同材却缺产品_仍抛数据红线_非放宽必填()
+    {
+        // Arrange：From == To == MissingMaterialId(0) —— 同材放开的例外边界，缺产品校验（先于同材判断）必须保留，防把"放开同材"当成放宽必填。
+        var svc = CreateService();
+        var missing = BuildExactInput(DeptInScope);
+        missing.FromMaterialId = 0;
+        missing.ToMaterialId = 0;
+
+        // Act / Assert：仍抛"必须携带前产品"红线（SetupRuleDataRedLineException），未触版本仓储。
+        var act = () => svc.CreateExactAsync(missing, ActorUserId, "u", CancellationToken.None);
+
+        await act.Should().ThrowAsync<SetupRuleDataRedLineException>();
+        _versionRepo.Verify(r => r.GetByIdAsync(It.IsAny<long>(), It.IsAny<CancellationToken>()), Times.Never);
+        _versionRepo.Verify(r => r.UpdateAsync(It.IsAny<RuleSetVersion>(), It.IsAny<CancellationToken>()), Times.Never);
+    }
+
     [Fact]
     public async Task CreateExactAsync_部门不存在_抛ResourceNotFoundException_404()
     {

@@ -356,3 +356,169 @@ public class CandidateGuardrailValidatorTests
         result.Errors.Should().Contain(e => e.Contains("MaxRepairAttempts"));
     }
 }
+
+/// <summary>
+/// Stage 固定交接等待规则校验单元测试（合同 v1.1 §五：纯 JSON 六项下限）
+/// 覆盖六项校验 + H-3 缺配置语义（无源不阻断）+ 反向不拒绝/仅禁误命中。纯内容校验，零 DB。
+/// </summary>
+public class StageHandoffWaitRulesValidatorTests
+{
+    /// <summary>一条合法的有效规则（合成数据，非业务真值）</summary>
+    private static StageHandoffWaitRule ValidRule() => new()
+    {
+        FactoryCode = "BJ",
+        FromStageCode = "BJ_MACH",
+        ToStageCode = "BJ_FINAL",
+        WaitMinutes = 40,
+        TimeBasis = StageHandoffTimeBasis.WORK,
+        IsActive = true
+    };
+
+    [Fact]
+    public void R05_空列表_校验通过()
+    {
+        // 缺配置（空 List / 键缺失反序列化为空）= 无源不阻断全 36 对（H-3）
+        var errors = SolverStrategyValidator.ValidateStageHandoffWaitRules([]);
+        errors.Should().BeEmpty();
+    }
+
+    [Fact]
+    public void R05_合法规则_校验通过()
+    {
+        var errors = SolverStrategyValidator.ValidateStageHandoffWaitRules([ValidRule()]);
+        errors.Should().BeEmpty();
+    }
+
+    [Fact]
+    public void R05_FactoryCode为空_拒绝()
+    {
+        var rule = ValidRule();
+        rule.FactoryCode = " ";
+        var errors = SolverStrategyValidator.ValidateStageHandoffWaitRules([rule]);
+        errors.Should().Contain(e => e.Contains("FactoryCode"));
+    }
+
+    [Fact]
+    public void R05_From等于To_拒绝()
+    {
+        var rule = ValidRule();
+        rule.ToStageCode = rule.FromStageCode;
+        var errors = SolverStrategyValidator.ValidateStageHandoffWaitRules([rule]);
+        errors.Should().Contain(e => e.Contains("FromStageCode 必须 ≠ ToStageCode"));
+    }
+
+    [Fact]
+    public void R05_WaitMinutes为负_拒绝()
+    {
+        var rule = ValidRule();
+        rule.WaitMinutes = -1;
+        var errors = SolverStrategyValidator.ValidateStageHandoffWaitRules([rule]);
+        errors.Should().Contain(e => e.Contains("WaitMinutes 不能为负"));
+    }
+
+    [Fact]
+    public void R05_TimeBasis枚举越界_拒绝()
+    {
+        var rule = ValidRule();
+        rule.TimeBasis = (StageHandoffTimeBasis)99;
+        var errors = SolverStrategyValidator.ValidateStageHandoffWaitRules([rule]);
+        errors.Should().Contain(e => e.Contains("TimeBasis 必须为 WORK/ELAPSED"));
+    }
+
+    [Fact]
+    public void R05_重复三键_拒绝()
+    {
+        var rule = ValidRule();
+        var dup = ValidRule(); // 同 (Factory,From,To) 且 IsActive=true
+        var errors = SolverStrategyValidator.ValidateStageHandoffWaitRules([rule, dup]);
+        errors.Should().Contain(e => e.Contains("重复键"));
+    }
+
+    [Fact]
+    public void R05_反向成对_互不拒绝()
+    {
+        // A→B 与 B→A 为两条独立可配置规则（真实双向合法）——反向不拒，仅禁误命中（v1.1 §二 修订1）
+        var ab = ValidRule();
+        var ba = new StageHandoffWaitRule
+        {
+            FactoryCode = "BJ",
+            FromStageCode = ab.ToStageCode,
+            ToStageCode = ab.FromStageCode,
+            WaitMinutes = 50,
+            TimeBasis = StageHandoffTimeBasis.ELAPSED,
+            IsActive = true
+        };
+        var errors = SolverStrategyValidator.ValidateStageHandoffWaitRules([ab, ba]);
+        errors.Should().BeEmpty();
+    }
+
+    [Fact]
+    public void R05_重复三键_仅IsActive命中()
+    {
+        // 重复键仅对 IsActive=true 判；IsActive=false（缺省）不参与
+        var rule = ValidRule();
+        var inactive = ValidRule();
+        inactive.IsActive = null; // 缺省非有效规则，不参与重复键
+        var errors = SolverStrategyValidator.ValidateStageHandoffWaitRules([rule, inactive]);
+        errors.Should().BeEmpty();
+    }
+
+    // === 发布链枚举放开三分例（2026-10-29：2号位 通报 StageHandoffWaitRules 发布链同源缺陷、3号位 采甲方案处置） ===
+    // 缺陷：发布链用通用 JsonOptions（无 JsonStringEnumConverter）反序列化，实库 TimeBasis 以字符串名（如 "ELAPSED"）存储 ⇒ 抛 JsonException→INVALID_JSON。
+    // 处置（本应验证）：StageHandoffJsonOptions 单列 +JsonStringEnumConverter，收「字符串名 + 数值 0/1」两种写法，仅真正损坏才抛。
+
+    /// <summary>字符串名写法（实库 PSV 2365 实际存储形态），应能被 甲方案 选项反序列化为 ELAPSED，不抛异常。</summary>
+    [Fact]
+    public void 发布链_TimeBasis字符串名_可反序列化()
+    {
+        var json = """[{"TimeBasis":"ELAPSED"}]""";
+        var rules = System.Text.Json.JsonSerializer.Deserialize<List<StageHandoffWaitRule>>(json, GovernanceVersionService.StageHandoffJsonOptions);
+        rules!.Should().ContainSingle(r => r.TimeBasis == StageHandoffTimeBasis.ELAPSED);
+    }
+
+    /// <summary>数值 0/1 写法（原通用 JsonOptions 唯一能收的形态），甲方案 选项仍兼容，不应回归。</summary>
+    [Fact]
+    public void 发布链_TimeBasis数值_可反序列化()
+    {
+        var json = """[{"TimeBasis":0}]""";
+        var rules = System.Text.Json.JsonSerializer.Deserialize<List<StageHandoffWaitRule>>(json, GovernanceVersionService.StageHandoffJsonOptions);
+        rules!.Should().ContainSingle(r => r.TimeBasis == StageHandoffTimeBasis.WORK);
+    }
+
+    /// <summary>真正损坏的枚举值，应抛 JsonException（发布链 catch → INVALID_JSON），与缺陷前行为一致。</summary>
+    [Fact]
+    public void 发布链_TimeBasis非法字符串_抛JsonException()
+    {
+        var json = """[{"TimeBasis":"BOGUS"}]""";
+        Action act = () => System.Text.Json.JsonSerializer.Deserialize<List<StageHandoffWaitRule>>(json, GovernanceVersionService.StageHandoffJsonOptions);
+        act.Should().Throw<System.Text.Json.JsonException>();
+    }
+
+    // === 发布链 `[]` 零行 fail-closed（队列1，2026-10-29；与装载侧 STAGE_HANDOFF_WAIT_BLOCK_EMPTY 同批同词表） ===
+
+    [Fact]
+    public void 发布链_零行空数组_报BLOCK_EMPTY()
+    {
+        var result = new LPS.APS.Core.DTOs.Governance.PublishValidationResult();
+        GovernanceVersionService.ValidateStageHandoffWaitRulesJson("[]", result);
+        result.Errors.Should().Contain(e => e.Code == "STAGE_HANDOFF_WAIT_BLOCK_EMPTY");
+    }
+
+    [Fact]
+    public void 发布链_缺省null或空白_放行不报BLOCK_EMPTY()
+    {
+        var result = new LPS.APS.Core.DTOs.Governance.PublishValidationResult();
+        GovernanceVersionService.ValidateStageHandoffWaitRulesJson(null!, result);
+        GovernanceVersionService.ValidateStageHandoffWaitRulesJson("   ", result);
+        result.Errors.Should().NotContain(e => e.Code == "STAGE_HANDOFF_WAIT_BLOCK_EMPTY");
+    }
+
+    [Fact]
+    public void 发布链_合法数组_放行不报BLOCK_EMPTY()
+    {
+        var result = new LPS.APS.Core.DTOs.Governance.PublishValidationResult();
+        var json = """[{"FactoryCode":"BJ","FromStageCode":"S1","ToStageCode":"S2","WaitMinutes":10,"TimeBasis":"WORK","IsActive":true}]""";
+        GovernanceVersionService.ValidateStageHandoffWaitRulesJson(json, result);
+        result.Errors.Should().NotContain(e => e.Code == "STAGE_HANDOFF_WAIT_BLOCK_EMPTY");
+    }
+}

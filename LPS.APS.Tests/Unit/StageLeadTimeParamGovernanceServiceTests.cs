@@ -6,6 +6,7 @@ using FluentAssertions;
 using LPS.APS.Application.Services;
 using LPS.APS.Core.Authorization;
 using LPS.APS.Core.DTOs.Governance;
+using LPS.APS.Core.Entities.Auth;
 using LPS.APS.Core.Exceptions;
 using LPS.APS.Core.Interfaces;
 using LPS.APS.Engine.Configuration;
@@ -394,5 +395,48 @@ public class StageLeadTimeParamGovernanceServiceTests
 
         created.Id.Should().Be(9); // INSERT 第 2 跳回带 Id
         created.IsDefault.Should().BeTrue();
+    }
+
+    [Fact]
+    public async Task ActivateAsync_id非正_抛ArgumentException()
+    {
+        var svc = CreateService(CreateConnectionMock());
+        Func<Task> act = () => svc.ActivateAsync(0, 1, "u", CancellationToken.None);
+        await act.Should().ThrowAsync<ArgumentException>();
+    }
+
+    [Fact]
+    public async Task ActivateAsync_记录不存在_抛ResourceNotFound()
+    {
+        var conn = CreateConnectionMock();
+        conn.SetupSequence(c => c.QueryFirstOrDefaultAsync<StageLeadTimeParamDto>(
+                It.IsAny<string>(), It.IsAny<object?>(), It.IsAny<CommandType>(), It.IsAny<DatabaseId>(), It.IsAny<int?>()))
+            .ReturnsAsync((StageLeadTimeParamDto?)null); // GetById 未命中
+        var svc = CreateService(conn);
+
+        Func<Task> act = () => svc.ActivateAsync(1, 1, "u", CancellationToken.None);
+        await act.Should().ThrowAsync<ResourceNotFoundException>();
+    }
+
+    [Fact]
+    public async Task ActivateAsync_已启用幂等_原样返回且不写审计()
+    {
+        // 幂等：GetById 返回 IsActive=true → 直接原样返回，不再查库、不写审计（EnsureWritable 不调用）
+        var conn = CreateConnectionMock();
+        conn.SetupSequence(c => c.QueryFirstOrDefaultAsync<StageLeadTimeParamDto>(
+                It.IsAny<string>(), It.IsAny<object?>(), It.IsAny<CommandType>(), It.IsAny<DatabaseId>(), It.IsAny<int?>()))
+            .ReturnsAsync(new StageLeadTimeParamDto
+            {
+                Id = 7, FactoryCode = "BJ", StageCode = "BJ_ASSY", LeadTimeDays = 1,
+                EffectiveFrom = new DateTime(2026, 1, 1), IsDefault = false, IsActive = true,
+            });
+        var svc = CreateService(conn);
+
+        var result = await svc.ActivateAsync(7, 1, "u", CancellationToken.None);
+
+        result.IsActive.Should().BeTrue();
+        result.Id.Should().Be(7);
+        _auditRepo.Verify(a => a.EnsureWritableAsync(It.IsAny<CancellationToken>()), Times.Never);
+        _auditRepo.Verify(a => a.AddAsync(It.IsAny<AuditLog>(), It.IsAny<CancellationToken>()), Times.Never);
     }
 }

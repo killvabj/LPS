@@ -34,12 +34,33 @@ public interface IStrategyProfileVersionRepository
     System.Threading.Tasks.Task ClearDefaultFlagAsync(long strategyProfileId, long exceptVersionId, CancellationToken ct = default);
 
     /// <summary>
+    /// 单事务原子默认切换（R12-O02 / S-04 落码，2026-11-03）：同一事务内「清同 Profile 其它 IsDefault=1」
+    /// +「置目标 IsDefault=1」，修正 <see cref="ClearDefaultFlagAsync"/> + <see cref="UpdateAsync"/>
+    /// 两条独立 SQL 的非原子缺陷（崩溃/并发下可能同族双默认；镜像 RuleSet/ParameterSet 已修的
+    /// <c>SetDefaultAsync</c> 一致语义，规避 UQ_StrategyProfileVersion_DefaultPublished 过滤唯一索引冲突）。
+    /// </summary>
+    System.Threading.Tasks.Task SetDefaultAsync(long strategyProfileId, long versionId, CancellationToken ct = default);
+
+    /// <summary>
     /// 按 RunType 获取所有候选默认版本（P0-06：歧义检测用）
     /// 语义：RunType 匹配 IsActive=1 父 StrategyProfile 的 IsDefault=1 + PUBLISHED 版本全集。
     /// 返回 IReadOnlyList 而非单对象（红线 #4：禁止盲目 First()），
     /// 由 Application 层结合 EffectiveFrom/EffectiveTo 生效窗口过滤后判定 0/1/多（多 → 歧义报错）。
     /// </summary>
     System.Threading.Tasks.Task<IReadOnlyList<StrategyProfileVersion>> GetDefaultByRunTypeAsync(string runType, CancellationToken ct = default);
+
+    /// <summary>
+    /// 按 RunType 解析默认候选，**含 NULL 通用兜底**（AE-007 / Q8 落码，2026-10-29）。
+    /// 语义（AE-007 ＋ 06 §S5）：**精确 `RunType` 优先；仅当该时点「精确 `RunType`」下无任何生效默认时，
+    /// 才回退到 `RunType IS NULL`（「适用所有」）的默认；两层不混合**。
+    /// 生效窗口（`EffectiveFrom`/`EffectiveTo`，有值才校验）与 `IsDefault`/`PUBLISHED`/父 `IsActive`
+    /// 在 SQL 内一次判定，避免「精确层存在但已过期」错误地挡住 NULL 兜底。
+    /// 返回 IReadOnlyList 而非单对象（红线 #4）；**同层多默认由调用方判歧义并返回 HTTP 409**，不得随机取第一个。
+    /// 与 <see cref="GetDefaultByRunTypeAsync"/> 的关系：后者保持**精确匹配**语义不变（写侧跨包收敛等仍用它），
+    /// 本方法是**新增**的读侧两级解析入口，不改既有签名（红线 #5）。
+    /// </summary>
+    System.Threading.Tasks.Task<IReadOnlyList<StrategyProfileVersion>> GetDefaultByRunTypeOrFallbackAsync(
+        string runType, DateTime asOf, CancellationToken ct = default);
 
     /// <summary>
     /// C-5/D-2 引用关系检查（3号位，2026-10-17）：

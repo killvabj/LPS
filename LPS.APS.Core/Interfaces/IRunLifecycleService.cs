@@ -53,9 +53,19 @@ public interface IRunLifecycleService
     /// </summary>
     /// <param name="failedScheduleRunId">已 FAILED 的 ScheduleRun.Id</param>
     /// <param name="actorUserId">操作人用户 Id（JWT 解析，用于业务范围校验）</param>
+    /// <param name="actorUserCode">
+    /// 操作人登录名（JWT 解析，后端取身份，禁止信任请求体）。写入新 Run 的 <c>TriggeredBy</c> 作为<b>本 Run 的冻结主体</b>，
+    /// 供装载侧业务范围判定（部门/工厂/产品族）按登录名解析授权范围。
+    /// 恢复＝新建 Run，其主体＝恢复发起人；恢复溯源由审计 <c>ActionCode='RecoverFailedRun'</c> 承担，
+    /// <b>不再写死字面量 <c>'Recover'</c></b>（旧口径会使配置了 Department 范围的用户恢复时被整轮拒绝）。
+    /// </param>
     /// <param name="ct">取消令牌</param>
     /// <returns>新建的 ScheduleRun.Id</returns>
-    Task<int> RecoverFailedRunAsync(int failedScheduleRunId, int actorUserId, CancellationToken ct = default);
+    Task<int> RecoverFailedRunAsync(
+        int failedScheduleRunId,
+        int actorUserId,
+        string actorUserCode,
+        CancellationToken ct = default);
 
     /// <summary>
     /// Run 引用追溯（P0-08 第 12 项）：ScheduleRun → StrategyProfileVersion → RuleSet/ParameterSet

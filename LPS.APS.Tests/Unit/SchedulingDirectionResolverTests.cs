@@ -4,6 +4,7 @@ using System.Linq;
 using Xunit;
 using LPS.APS.Core.Dto;
 using LPS.APS.Scheduling.Solvers;
+using LPS.APS.Shared.Models;
 
 namespace LPS.APS.Tests.Unit;
 
@@ -23,11 +24,73 @@ public class SchedulingDirectionResolverTests
     private static readonly DateTime Start = new(2026, 10, 8, 8, 0, 0);
     private static readonly DateTime NoMaterialFloor = DateTime.MinValue;
 
-    /// <summary>单工序、60 分钟工时的工序节点（lead = 60min）。</summary>
-    private static List<OperationNode> Ops60() => new()
+    private const int TestResourceId = 1;
+    private const string TestRouteCode = "R1";
+
+    /// <summary>
+    /// 单工序、60 分钟**单件**工时的工序节点。
+    /// ⚠ 2026-10-28 起 Slack 按 Phase2 同口径算有效时长（`标准工时 × PlannedProcessQty ÷ 产能系数`），
+    ///   不再是「标准工时之和」⇒ `Demand()` 的 `PlannedProcessQty = 10`、系数 1 ⇒ **一整批 = 600 分钟**。
+    /// </summary>
+    private static List<OperationNode> Ops60() => Ops(60m);
+
+    private static List<OperationNode> Ops(decimal standardDurationMinutes) => new()
     {
-        new OperationNode { OperationCode = "OP10", StageCode = "STAGE1", StandardDuration = 60m }
+        new OperationNode
+        {
+            OperationCode = "OP10",
+            StageCode = "STAGE1",
+            StandardDuration = standardDurationMinutes,
+            RouteCode = TestRouteCode,
+            PathId = 1,
+            ProductionDepartmentId = 0
+        }
     };
+
+    /// <summary>Ops60 的资格键（与 `PhaseOneConstraintBuilder.cs:222` / `PhaseTwoInitialScheduler.cs:4206` 同口径）。</summary>
+    private static EligibilityLookupKey Ops60Key() => new(1, 0, TestRouteCode, 1, "OP10");
+
+    /// <summary>
+    /// **数据齐全**的上下文：资格 + 产能系数 1 + 工作日历。
+    /// ⚠ 2026-10-28 起 Slack 判据**要求这三样齐全**才可信；缺任一（或直接用 `new ConstraintContext()`）
+    ///   ⇒ `estimated = true` ⇒ 弃权并发 `DUE_SLACK_UNCERTAIN`，不判紧/松。
+    /// </summary>
+    private static ConstraintContext Ctx()
+    {
+        var ctx = new ConstraintContext();
+        var key = Ops60Key();
+        ctx.OperationResourceEligibility[key] = new List<int> { TestResourceId };
+        ctx.ResourceCapacityFactors[key] = new Dictionary<int, decimal> { [TestResourceId] = 1m };
+        ctx.ResourceCalendars[TestResourceId] = BuildCalendar();
+        return ctx;
+    }
+
+    /// <summary>
+    /// 基准日历：**全天候**（每天 00:00→次日 00:00，共 60 天）。
+    /// 用全天历是为了让「日历跨度 == 自然分钟」⇒ 紧/松用例的断言能直接对数字；
+    /// 「跳过非工作时段」这件事由 <c>Slack_日历跳过非工作时段</c> 单独覆盖。
+    /// </summary>
+    private static List<TimeWindow> BuildCalendar()
+    {
+        var windows = new List<TimeWindow>();
+        for (var i = 0; i < 60; i++)
+        {
+            var day = Start.Date.AddDays(i);
+            windows.Add(new TimeWindow(day, day.AddDays(1)));
+        }
+        return windows;
+    }
+
+    /// <summary>同上，但换成指定的日历（用于「跳过非工作时段」用例）。</summary>
+    private static ConstraintContext CtxWithCalendar(List<TimeWindow> calendar)
+    {
+        var ctx = new ConstraintContext();
+        var key = Ops60Key();
+        ctx.OperationResourceEligibility[key] = new List<int> { TestResourceId };
+        ctx.ResourceCapacityFactors[key] = new Dictionary<int, decimal> { [TestResourceId] = 1m };
+        ctx.ResourceCalendars[TestResourceId] = calendar;
+        return ctx;
+    }
 
     private static LogicalProductionDemand Demand(
         DateTime? due = null,
@@ -35,7 +98,8 @@ public class SchedulingDirectionResolverTests
         string? preferredResourceCode = null,
         int? preferredResourceId = null,
         int? fallbackResourceId = null,
-        string key = "D1")
+        string key = "D1",
+        decimal plannedProcessQty = 10m)
         => new()
         {
             LogicalDemandKey = key,
@@ -44,7 +108,7 @@ public class SchedulingDirectionResolverTests
             MaterialId = 1,
             FactoryId = 1,
             NetOutputQty = 10m,
-            PlannedProcessQty = 10m,
+            PlannedProcessQty = plannedProcessQty,
             RequiredAvailableTime = due ?? Start.AddDays(30),
             DemandSequence = 1,
             IsContinuation = isContinuation,
@@ -53,8 +117,6 @@ public class SchedulingDirectionResolverTests
             PreferredResourceId = preferredResourceId,
             FallbackResourceId = fallbackResourceId
         };
-
-    private static ConstraintContext Ctx() => new();
 
     private static ConstraintContext CtxWithLock(string draftId)
     {
@@ -275,26 +337,136 @@ public class SchedulingDirectionResolverTests
         Assert.Equal(a.Reason, b.Reason);
     }
 
-    /// <summary>Slack 是派生量：`Due − (max(起点,物料下界) + 总工时)`；无有效交期时不产生交期信号。</summary>
+    // ════════════════════════════════════════════════════════════
+    // R05-27-10：Slack 必须用「可信时长」—— 0号位 点名的最小三例
+    //   紧交期 / 正常 / 数据不全
+    //   口径 = `标准工时 × PlannedProcessQty ÷ 产能系数`（与 Phase2 `:3792` 同式），再过资源日历
+    // ════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// **紧交期**：一整批 600 分钟（60分/件 × 10件 ÷ 系数1），交期只给 3 小时 ⇒ slack = −420 ⇒ 倒排。
+    /// 旧实现拿「标准工时之和 60 分钟」当周期 ⇒ slack 会算成 +120 ⇒ **误判极松、错判正排**。本用例锁死这个回归。
+    /// </summary>
     [Fact]
-    public void Slack派生口径_按最早可能完成计算()
+    public void Slack_紧交期_判DueTight且倒排()
     {
         var d = Demand(due: Start.AddHours(3));
 
-        // 起点 08:00 + lead 60min = 09:00 ⇒ slack = 3h - 1h = 120min
         var slack = SchedulingDirectionResolver.ComputeSlackMinutes(
-            d, Ops60(), Start, Start, out var absent);
+            d, Ops60(), Ctx(), Start, Start, out var absent, out var estimated, out var leadCalendar);
+
         Assert.False(absent);
-        Assert.Equal(120m, slack);
+        Assert.False(estimated);            // 资格 / 系数 / 日历齐全 ⇒ 估算可信
+        Assert.Equal(600m, leadCalendar);   // 全天历 ⇒ 日历跨度 == 600 分钟
+        Assert.Equal(-420m, slack);         // 11:00 − 18:00
 
-        // 物料下界推到 10:00 ⇒ 最早完成 11:00 ⇒ slack = 3h - 3h = 0
-        var slackLate = SchedulingDirectionResolver.ComputeSlackMinutes(
-            d, Ops60(), Start.AddHours(2), Start, out _);
-        Assert.Equal(0m, slackLate);
+        var decision = SchedulingDirectionResolver.Resolve(d, Ops60(), Ctx(), Start, NoMaterialFloor);
+        Assert.True(decision.Has(SchedulingDirectionResolver.SignalDueTight));
+        Assert.Equal(SchedulingDirectionResolver.Backward, decision.Direction);
+    }
 
-        // 无有效交期（default）⇒ 明确标记 absent（不得被当成「交期极紧」）
+    /// <summary>
+    /// **正常**：slack 落在 `[0, 一个日历周期]` 之间 ⇒ 交期判据**不投票**（既不紧也不松），
+    /// 方向交由其它上下文裁决（此处全无 ⇒ BACKWARD + NO_CONTEXT_SIGNAL）。
+    /// </summary>
+    [Fact]
+    public void Slack_正常区间_交期判据弃权不投票()
+    {
+        var d = Demand(due: Start.AddHours(15));   // slack = 900 − 600 = 300，落在 [0, 600]
+
+        var slack = SchedulingDirectionResolver.ComputeSlackMinutes(
+            d, Ops60(), Ctx(), Start, Start, out var absent, out var estimated, out var leadCalendar);
+
+        Assert.False(absent);
+        Assert.False(estimated);
+        Assert.Equal(600m, leadCalendar);
+        Assert.Equal(300m, slack);
+
+        var decision = SchedulingDirectionResolver.Resolve(d, Ops60(), Ctx(), Start, NoMaterialFloor);
+        Assert.False(decision.Has(SchedulingDirectionResolver.SignalDueTight));
+        Assert.False(decision.Has(SchedulingDirectionResolver.SignalDueLoose));
+        Assert.True(decision.Has(SchedulingDirectionResolver.SignalNoContext));
+    }
+
+    /// <summary>**明显松**：slack 超过一个日历周期 ⇒ 最早承诺 ⇒ 正排。</summary>
+    [Fact]
+    public void Slack_明显松_判DueLoose且正排()
+    {
+        var d = Demand(due: Start.AddDays(30));
+
+        var decision = SchedulingDirectionResolver.Resolve(d, Ops60(), Ctx(), Start, NoMaterialFloor);
+
+        Assert.True(decision.Has(SchedulingDirectionResolver.SignalDueLoose));
+        Assert.Equal(SchedulingDirectionResolver.Forward, decision.Direction);
+    }
+
+    /// <summary>
+    /// **数据不全**：资格 / 产能系数 / 日历任一缺失 ⇒ `estimated = true` ⇒ **不许判紧/松**，
+    /// 只发中性 `DUE_SLACK_UNCERTAIN`。这是本条整改的核心：宁可弃权，不许拿不可信时长投票。
+    /// </summary>
+    [Fact]
+    public void Slack_数据不全_标记不可信并弃权()
+    {
+        var d = Demand(due: Start.AddMinutes(30));   // 表面上「极紧」
+
+        var slack = SchedulingDirectionResolver.ComputeSlackMinutes(
+            d, Ops60(), new ConstraintContext(), Start, Start,
+            out var absent, out var estimated, out _);
+
+        Assert.False(absent);
+        Assert.True(estimated);
+
+        var decision = SchedulingDirectionResolver.Resolve(
+            d, Ops60(), new ConstraintContext(), Start, NoMaterialFloor);
+
+        Assert.True(decision.Has(SchedulingDirectionResolver.SignalDueSlackUncertain));
+        Assert.False(decision.Has(SchedulingDirectionResolver.SignalDueTight));
+        Assert.False(decision.Has(SchedulingDirectionResolver.SignalDueLoose));
+    }
+
+    /// <summary>无工序也算数据不全（算不出工艺周期，不能拿 0 分钟冒充）。</summary>
+    [Fact]
+    public void Slack_无工序_标记不可信()
+    {
         SchedulingDirectionResolver.ComputeSlackMinutes(
-            Demand(due: DateTime.MinValue), Ops60(), Start, Start, out var absent2);
-        Assert.True(absent2);
+            Demand(due: Start.AddDays(30)), new List<OperationNode>(), Ctx(), Start, Start,
+            out _, out var estimated, out _);
+
+        Assert.True(estimated);
+    }
+
+    /// <summary>
+    /// 日历必须**真的跳非工作时段**：08:00-09:00 只给 60 分钟，工时要 90 分钟
+    /// ⇒ 剩余 30 分钟落到 11:00 ⇒ 完成 11:30、日历跨度 210 分钟（不是 90）。
+    /// </summary>
+    [Fact]
+    public void Slack_日历跳过非工作时段()
+    {
+        var day = Start.Date;
+        var calendar = new List<TimeWindow>
+        {
+            new(day.AddHours(8), day.AddHours(9)),
+            new(day.AddHours(11), day.AddHours(12))
+        };
+
+        // 单件 90 分钟 ⇒ PlannedProcessQty 取 1 让有效时长正好 90 分钟
+        var slack = SchedulingDirectionResolver.ComputeSlackMinutes(
+            Demand(due: day.AddHours(23), plannedProcessQty: 1m), Ops(90m), CtxWithCalendar(calendar),
+            Start, Start, out _, out var estimated, out var leadCalendar);
+
+        Assert.False(estimated);
+        Assert.Equal(210m, leadCalendar);                 // 08:00 → 11:30
+        Assert.Equal((decimal)(day.AddHours(23) - day.AddHours(11).AddMinutes(30)).TotalMinutes, slack);
+    }
+
+    /// <summary>无有效交期时不算 slack（`absent`），且标记为 absent 之外不产生交期信号。</summary>
+    [Fact]
+    public void Slack_无交期_标记Absent()
+    {
+        var slack = SchedulingDirectionResolver.ComputeSlackMinutes(
+            Demand(due: DateTime.MinValue), Ops60(), Ctx(), Start, Start, out var absent, out _, out _);
+
+        Assert.True(absent);
+        Assert.Equal(0m, slack);
     }
 }

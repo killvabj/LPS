@@ -24,6 +24,7 @@ public sealed class StageLeadTimeParamGovernanceService : IStageLeadTimeParamGov
     private const string ActionCreate = "Create";
     private const string ActionUpdate = "Update";
     private const string ActionDeactivate = "Deactivate";
+    private const string ActionActivate = "Activate";
 
     private const string SelectColumns =
         "Id, FactoryCode, StageCode, ProductionDeptCode, MaterialCode, ProductFamilyCode, " +
@@ -315,6 +316,78 @@ WHERE Id = @Id";
             EffectiveTo = existing.EffectiveTo,
             IsDefault = existing.IsDefault,
             IsActive = false,
+            CreatedAt = existing.CreatedAt,
+            UpdatedAt = now,
+        };
+    }
+
+    /// <inheritdoc />
+    public async Task<StageLeadTimeParamDto> ActivateAsync(
+        int id, int actorUserId, string actorUserCode, CancellationToken ct = default)
+    {
+        if (id <= 0)
+        {
+            throw new ArgumentException("id 须大于 0。", nameof(id));
+        }
+
+        var existing = await GetByIdAsync(id);
+        if (existing is null)
+        {
+            throw new ResourceNotFoundException($"阶段提前期参数（StageLeadTimeParam.Id={id}）不存在。");
+        }
+
+        // 幂等：已启用状态再次激活 → 原样返回、不追加第二条审计。
+        if (existing.IsActive)
+        {
+            return existing;
+        }
+
+        await EnsureTargetInScopeAsync(existing.FactoryCode, existing.ProductionDeptCode, actorUserId, ct);
+
+        // R09-V-A：若该行是全局默认（IsDefault=1），激活后重新进入生效 → 须过全局默认唯一（窗口重叠内不得
+        // 存在另一条 active IsDefault=1 行），否则 1号位 全局兜底命中判歧义。非默认行无此闸（该表无同键 A1 窗口唯一）。
+        if (existing.IsDefault)
+        {
+            await EnsureDefaultUniquenessAsync(existing.EffectiveFrom, existing.EffectiveTo, excludeId: id, ct);
+        }
+
+        // P1-03：审计前置预检（同 Deactivate，先于 DML）。
+        await _auditLogRepository.EnsureWritableAsync(ct);
+
+        var now = DateTime.Now;
+        await _connectionManager.ExecuteAsync(
+            "UPDATE StageLeadTimeParam SET IsActive = 1, UpdatedAt = @UpdatedAt WHERE Id = @Id",
+            new { UpdatedAt = now, Id = id },
+            db: DatabaseId.APS);
+
+        await _auditLogRepository.AddAsync(new AuditLog
+        {
+            ActionCode = ActionActivate,
+            EntityType = EntityTypeStageLeadTimeParam,
+            EntityId = id.ToString(),
+            OldValue = "Inactive",
+            NewValue = "Active",
+            UserId = actorUserId,
+            UserCode = actorUserCode,
+            OccurredAt = now,
+            Remark = $"恢复启用阶段提前期参数 [{existing.FactoryCode}/{existing.StageCode}]",
+        }, ct);
+
+        return new StageLeadTimeParamDto
+        {
+            Id = existing.Id,
+            FactoryCode = existing.FactoryCode,
+            StageCode = existing.StageCode,
+            ProductionDeptCode = existing.ProductionDeptCode,
+            MaterialCode = existing.MaterialCode,
+            ProductFamilyCode = existing.ProductFamilyCode,
+            LeadTimeDays = existing.LeadTimeDays,
+            LeadTimeHours = existing.LeadTimeHours,
+            Priority = existing.Priority,
+            EffectiveFrom = existing.EffectiveFrom,
+            EffectiveTo = existing.EffectiveTo,
+            IsDefault = existing.IsDefault,
+            IsActive = true,
             CreatedAt = existing.CreatedAt,
             UpdatedAt = now,
         };

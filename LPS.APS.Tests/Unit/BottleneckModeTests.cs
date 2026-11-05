@@ -105,8 +105,8 @@ public class BottleneckModeTests
         // M1 工时 60、M2 工时 90；日历窗口各 100 分钟 → R1 利用率 0.6、R2 利用率 0.9。
         var routingOps = new List<RoutingOperation>
         {
-            new() { MaterialId = 1, ProductionDepartmentId = deptId, RouteCode = "DEFAULT", OperationCode = opCode, StageCode = stage, StandardDuration = 60m, SetupTime = 0m },
-            new() { MaterialId = 2, ProductionDepartmentId = deptId, RouteCode = "DEFAULT", OperationCode = opCode, StageCode = stage, StandardDuration = 90m, SetupTime = 0m }
+            new() { MaterialId = 1, ProductionDepartmentId = deptId, RouteCode = "DEFAULT", OperationCode = opCode, StageCode = stage, StandardDuration = 60m * 60m, SetupTime = 0m },
+            new() { MaterialId = 2, ProductionDepartmentId = deptId, RouteCode = "DEFAULT", OperationCode = opCode, StageCode = stage, StandardDuration = 90m * 60m, SetupTime = 0m }
         };
 
         var eligibilities = new List<OperationResourceEligibility>

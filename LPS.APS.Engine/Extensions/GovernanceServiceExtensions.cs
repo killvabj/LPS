@@ -39,6 +39,10 @@ public static class GovernanceServiceExtensions
         services.AddScoped<IMasterDataLookupRepository, MasterDataLookupRepository>();
         // Setup换型：规则缺失（uncovered-stats）只读聚合查询仓储（#10 端点；3号位 依 G4 只读查询归属自写，Setup 治理域只读事实）
         services.AddScoped<ISetupUncoveredStatRepository, SetupUncoveredStatRepository>();
+        // B-6（2026-10-30，2号位）：策略包绑定内容指纹读取器——快照缓存键的内容维度。
+        // Scrutor 只扫 Repositories.Auth / Repositories.Pegging，Governance 命名空间历来手动注册，
+        // 故此处跟随本方法既有风格显式登记。
+        services.AddScoped<ISnapshotContentFingerprintReader, SnapshotContentFingerprintReader>();
 
         return services;
     }

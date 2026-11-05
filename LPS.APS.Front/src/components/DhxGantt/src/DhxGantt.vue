@@ -67,8 +67,24 @@ let compareLayerId: string | number | null = null
 let actualLayerId: string | number | null = null
 let laneOverlayLayerId: string | number | null = null
 let progressLayerId: string | number | null = null
+let todayMarkerId: string | number | null = null
 const dragSnapshots = new Map<string | number, DhxGanttTask>()
 const formatDate = gantt.date.date_to_str('%Y-%m-%d %H:%i')
+const pad2 = (n: number) => String(n).padStart(2, '0')
+const WEEKDAY_CN = ['日', '一', '二', '三', '四', '五', '六'] as const
+const isWeekendDate = (date: Date) => date.getDay() === 0 || date.getDay() === 6
+// 时间轴日刻度：10-27周二；月视图的日刻度只保留「27周二」
+const dayScaleLabel = (date: Date) =>
+  `${pad2(date.getMonth() + 1)}-${pad2(date.getDate())}周${WEEKDAY_CN[date.getDay()]}`
+const dayOfMonthScaleLabel = (date: Date) => `${date.getDate()}周${WEEKDAY_CN[date.getDay()]}`
+
+/** 左表单元格文本转义（单元格内容按 HTML 插入，防注入） */
+const escapeHtml = (value: unknown): string =>
+  String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
 
 const cloneTask = (task: any): DhxGanttTask => JSON.parse(JSON.stringify(task)) as DhxGanttTask
 const compareTaskMap = () => new Map(props.compareTasks.map((item) => [String(item.taskId), item]))
@@ -112,23 +128,23 @@ const buildDragPayload = (id: string | number, mode: string): DhxGanttDragPayloa
 }
 
 const applyScaleConfig = (scaleUnit: DhxGanttScaleUnit) => {
-  // 设置时间轴刻度
+  // 设置时间轴刻度（format 支持函数，dhtmlx 官方 d.ts 只声明了 string，故走 any）
   if (scaleUnit === 'hour') {
-    gantt.config.scales = [
-      { unit: 'day', step: 1, format: '%m-%d' },
+    ganttApi.config.scales = [
+      { unit: 'day', step: 1, format: dayScaleLabel },
       { unit: 'hour', step: 1, format: '%H:%i' }
     ]
   } else if (scaleUnit === 'day') {
-    gantt.config.scales = [{ unit: 'day', step: 1, format: '%m-%d' }]
+    ganttApi.config.scales = [{ unit: 'day', step: 1, format: dayScaleLabel }]
   } else if (scaleUnit === 'week') {
-    gantt.config.scales = [
+    ganttApi.config.scales = [
       { unit: 'week', step: 1, format: '第%W周' },
-      { unit: 'day', step: 1, format: '%m-%d' }
+      { unit: 'day', step: 1, format: dayScaleLabel }
     ]
   } else if (scaleUnit === 'month') {
-    gantt.config.scales = [
+    ganttApi.config.scales = [
       { unit: 'month', step: 1, format: '%Y-%m' },
-      { unit: 'day', step: 1, format: '%d' }
+      { unit: 'day', step: 1, format: dayOfMonthScaleLabel }
     ]
   }
 
@@ -174,6 +190,9 @@ const applyConfig = () => {
   gantt.config.drag_resize = !props.readonly && props.allowResize
   gantt.config.drag_move = !props.readonly
   gantt.config.drag_progress = !props.readonly && props.allowProgress
+  // 禁用「建依赖」拖拽点：本组件 links 恒为空（后端不下发任务间依赖），
+  // 留着这两个圆点只能拖出只在内存里的假连线，刷新即消失
+  gantt.config.drag_links = false
   gantt.config.open_tree_initially = true
   gantt.config.grid_width = 580
   gantt.config.bar_height = 28
@@ -192,16 +211,37 @@ const applyConfig = () => {
     ;(gantt as any).showEvent = function () {}
   }
   gantt.config.columns = [
-    { name: 'text', label: '任务 / 订单 / 物料', tree: true, width: 360 },
+    {
+      name: 'text',
+      label: '任务 / 订单 / 物料',
+      tree: true,
+      width: 360,
+      // 首列固定 360px，「任务号 | 订单号 | 物料」「资源编码 | 名称 | 工厂/部门」必然放不下，
+      // 用原生 title 让鼠标悬停显示完整文本（与「任务清单」页签的溢出提示同一套交互）
+      // dhtmlx 官方 d.ts 的 GanttColumn 未声明 template，运行时支持 ⇒ 走 any 通道
+      template: (task: any) =>
+        `<span title="${escapeHtml(task.text)}">${escapeHtml(task.text)}</span>`
+    } as any,
     { name: 'start_date', label: '开始', align: 'center', width: 140 },
     { name: 'duration', label: '时长(h)', align: 'center', width: 80 }
   ]
 
   applyScaleConfig(props.scaleUnit)
 
+  // 左表「开始」列显示到时分（条子按小时摆放，只给日期看不出几点开工）
+  gantt.templates.date_grid = (date: Date) =>
+    `${date.getFullYear()}-${pad2(date.getMonth() + 1)}-${pad2(date.getDate())} ${pad2(date.getHours())}:${pad2(date.getMinutes())}`
+  // 周末底纹：表头刻度 + 时间轴背景格
+  gantt.templates.scale_cell_class = (date: Date) =>
+    isWeekendDate(date) ? 'dhx-scale-weekend' : ''
+  gantt.templates.timeline_cell_class = (_task: any, date: Date) =>
+    isWeekendDate(date) ? 'dhx-timeline-weekend' : ''
+
   gantt.templates.task_class = (_, __, task) => {
     const classes: string[] = []
     if (task.type === 'project') classes.push('dhx-task-lane')
+    // 泳道在该时间窗内没有任务时不画条（避免 1 小时兜底假条）
+    if (task.type === 'project' && task.laneEmpty) classes.push('dhx-lane-empty')
     if (task.readonly) classes.push('dhx-task-readonly')
     if (highlightTaskIdSet().has(String(task.id))) classes.push('dhx-task-impacted')
     if (task.type === 'project' && highlightLaneIdSet().has(String(task.id)))
@@ -219,14 +259,12 @@ const applyConfig = () => {
     return classes.join(' ')
   }
 
-  // 任务条本身不写字：条宽按真实工时绘制（4 小时 ≈ 1/6 个日列），
-  // 放不下「任务号 | 订单号」，且 .gantt_task_content 是 overflow:visible，文字会溢出盖到相邻条上。
-  // 这些信息左侧表格列同源展示，悬浮 tooltip / 双击浮窗另有详情。
-  // 泳道（project）行跨度大，保留名称。
-  gantt.templates.task_text = (_, __, task) => {
-    if (task.type === 'project') return task.text || ''
-    return ''
-  }
+  // 条子上一律不写字：
+  //  - 任务条按真实工时绘制（4 小时 ≈ 1/6 个日列），放不下「任务号 | 订单号」，
+  //    且 .gantt_task_content 是 overflow:visible，文字会溢出盖到相邻条上；
+  //  - 泳道条的区间与左侧行名重复（左侧表格已展示），留空只做「占用区间」视觉。
+  // 信息走左侧表格列 + 悬浮 tooltip / 双击浮窗。
+  gantt.templates.task_text = () => ''
 
   gantt.templates.tooltip_text = (_, __, task) => {
     const lines = [`任务：${task.text || '-'}`]
@@ -425,6 +463,21 @@ const syncLayers = () => {
     | number
 }
 
+/**
+ * 今天竖线。gantt.clearAll() 会把 marker 数据源一起清掉（marker 走 datastores 服务注册），
+ * 所以每次 parseData 之后都要重建，不能只在 onMounted 建一次。
+ */
+const ensureTodayMarker = (): void => {
+  if (typeof ganttApi.addMarker !== 'function') return
+  todayMarkerId = null
+  todayMarkerId = ganttApi.addMarker({
+    start_date: new Date(),
+    css: 'dhx-today-marker',
+    text: '今天',
+    title: '今天'
+  })
+}
+
 const parseData = async () => {
   if (!initialized || !rootRef.value) return
   await nextTick()
@@ -437,6 +490,7 @@ const parseData = async () => {
     gantt.config.end_date = new Date(props.dateTo)
   }
   syncLayers()
+  ensureTodayMarker()
   // 使用 ganttApi.render() 确保强制重绘
   ganttApi.render()
 }
@@ -477,9 +531,21 @@ const getTaskIdFromEvent = (e: MouseEvent): string | number | null => {
   return null
 }
 
+/** 把时间轴滚动到指定日期（「回到今天」按钮用） */
+const showDate = (date: Date | string): void => {
+  const target = date instanceof Date ? date : new Date(date)
+  if (Number.isNaN(target.getTime())) return
+  ganttApi.showDate?.(target)
+  ganttApi.render?.()
+}
+
+defineExpose({ showDate })
+
 onMounted(async () => {
   if (!rootRef.value) return
   applyConfig()
+  // addMarker/deleteMarker 由 marker 扩展提供，未 plugins 前这两个方法根本不存在
+  ganttApi.plugins({ marker: true })
   gantt.init(rootRef.value)
 
   // 原生 contextmenu 事件监听，确保右键菜单能触发
@@ -686,6 +752,11 @@ onBeforeUnmount(() => {
   compareLayerId = null
   actualLayerId = null
   laneOverlayLayerId = null
+  // clearAll 不清 marker 数据源，不主动删会随组件重挂载叠加
+  if (todayMarkerId !== null) {
+    ganttApi.deleteMarker?.(todayMarkerId)
+    todayMarkerId = null
+  }
   if (initialized) {
     gantt.clearAll()
   }
@@ -708,6 +779,30 @@ onBeforeUnmount(() => {
 :deep(.gantt_task_scale) {
   background: linear-gradient(180deg, #f6f9ff 0%, #edf4ff 100%);
   border-bottom: 1px solid #dce8f8;
+}
+
+// 周末底纹：刻度格 + 时间轴背景格（知名排产系统的通用做法，便于分辨非工作日）
+:deep(.gantt_scale_cell.dhx-scale-weekend) {
+  background: #eef2f7;
+}
+
+:deep(.gantt_task_cell.dhx-timeline-weekend) {
+  background-color: #f8fafc;
+}
+
+// 今天竖线
+:deep(.gantt_marker.dhx-today-marker) {
+  width: 2px;
+  background-color: rgb(239 68 68 / 90%);
+}
+
+:deep(.gantt_marker.dhx-today-marker .gantt_marker_content) {
+  padding: 0 4px;
+  font-size: 10px;
+  line-height: 14px;
+  color: #fff;
+  background: #ef4444;
+  border-radius: 0 0 3px;
 }
 
 :deep(.gantt_row),
@@ -844,8 +939,14 @@ onBeforeUnmount(() => {
   box-shadow: inset 0 0 0 2px rgb(245 158 11 / 82%);
 }
 
+// 延期标记：红色左边缘（原先的白色虚线在 88% 任务都延期的图上毫无区分度）
 :deep(.dhx-task-warning .gantt_task_content) {
-  border: 1px dashed rgb(255 255 255 / 88%);
+  border-left: 3px solid #ef4444;
+}
+
+// 时间窗内无任务的泳道：不画兜底 1 小时假条
+:deep(.gantt_task_line.dhx-lane-empty) {
+  display: none;
 }
 
 // 状态背景色（status优先级低）

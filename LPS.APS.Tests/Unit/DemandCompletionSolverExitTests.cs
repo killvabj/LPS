@@ -630,7 +630,7 @@ public class DemandCompletionSolverExitTests
         => new()
         {
             MaterialId = M, ProductionDepartmentId = Dept, RouteCode = route, PathId = pathId,
-            OperationCode = op, StageCode = stage, StandardDuration = 1m,
+            OperationCode = op, StageCode = stage, StandardDuration = 1m * 60m,
             OperationPlanningMode = "FINITE_RESOURCE"
         };
 
@@ -693,6 +693,17 @@ public class DemandCompletionSolverExitTests
                     MaterialId = M, StageCode = s.Stage, ProductionDepartmentId = Dept
                 })
                 .ToList(),
+            // R09-①（2026-10-29 落码）夹具补齐：无 Routing Stage 改按 `(FactoryId, DepartmentId)`
+            // 的合法 WORK 窗口逐片推进。本族期望值仍按 `AddHours(n)` 写 ⇒ 给一条**连续 24×7 窗口**
+            // 使「有效生产小时累计」与「墙钟小时」逐位相同（需求 FactoryId = 1，部门 = Dept）。
+            DepartmentWorkWindows = new[]
+            {
+                new DepartmentWorkWindow
+                {
+                    FactoryId = 1, DepartmentId = Dept,
+                    Start = Day, End = Day.AddYears(100)
+                }
+            },
             StageLeadTimes = leadTimes
                 .Select(l => new StageLeadTimeFact
                 {

@@ -206,7 +206,7 @@ public class RunScopeConsumptionTests
         var ops = new List<RoutingOperation>
         {
             new() { MaterialId = 1, ProductionDepartmentId = 100, RouteCode = "DEFAULT",
-                OperationCode = "OP10", StageCode = "STAGE1", StandardDuration = 60m, SetupTime = 0m }
+                OperationCode = "OP10", StageCode = "STAGE1", StandardDuration = 60m * 60m, SetupTime = 0m }
         };
 
         var els = new List<OperationResourceEligibility>

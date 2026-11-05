@@ -75,6 +75,10 @@ internal class PhaseFourLocalRepair
     {
         var result = new RepairResult();
 
+        // R08 §二.3：插入后邻接校验用的「后继 Task」索引（懒建，代价只在首次查询）。
+        //   本路径会**原地替换** `scheduleResult.ScheduledTasks` 里的 Task ⇒ 排序键可能失效，替换处须 `Invalidate()`。
+        var successorLookup = new SuccessorLookup(scheduleResult.ScheduledTasks);
+
         // 1. 识别受ChangeSeed直接影响的任务和需求
         var affectedTasks = new HashSet<string>(); // FinalDraftId
         var affectedDemands = new HashSet<string>(); // LogicalDemandKey
@@ -171,6 +175,14 @@ internal class PhaseFourLocalRepair
 
         bool shouldTriggerFallback = false; // 超警戒线标志
 
+        // R11（2026-10-29）：`WarnOnlyOnMaxImpacted` 接线。
+        //   冻结语义（`FrozenStrategySnapshot.cs:375-376` 逐字）：
+        //   「红线（清单 35）：MaxImpactedOrders 超阈值**仅 Warning + 人工确认**，不得停止传播返回伪可行结果」。
+        //   · true（默认）⇒ 超阈值**只留 Warning，不中断传播、不提前改道 Fallback**；轮次耗尽仍按 `MaxPropagationRounds` 兜底。
+        //   · false ⇒ 保持整改前行为（超阈值即置 Fallback 标志并退出传播）。
+        //   两种取值都不会「把半修的盘当可行交出去」：true 走完传播再看轮次，false 走全量重排，产出都是硬合法排程。
+        bool warnOnlyOnMaxImpacted = request.StrategySnapshot.CandidateGuardrail.WarnOnlyOnMaxImpacted;
+
         // 3. 传播循环：识别受影响任务，做最小修改，只在真实变化时继续传播
         var propagationRound = 0;
         var taskSnapshots = new Dictionary<string, TaskSnapshot>(); // FinalDraftId -> 快照
@@ -206,11 +218,31 @@ internal class PhaseFourLocalRepair
         {
             propagationRound++;
 
-            // 检查警戒线：受影响任务超过30%，触发Fallback标志
+            // 检查警戒线：受影响任务超过30%
             if (affectedTasks.Count > maxAffectedTasks)
             {
-                shouldTriggerFallback = true;
-                break; // 超警戒，退出传播，进入Fallback
+                // R11：超警戒线**必须留痕**（旧实现是静默置标志）—— 这是「人工确认」的唯一依据。
+                constraints.TraceNotes.Add(new SolveTraceNote
+                {
+                    Key = "PHASE4_PROPAGATION",
+                    ReasonCode = "PHASE4_PROPAGATION_THRESHOLD_BREACH",
+                    Message = $"传播第 {propagationRound} 轮受影响 Task {affectedTasks.Count} 个，"
+                              + $"超警戒阈值 {maxAffectedTasks} 个"
+                              + $"（`ImpactedTaskWarningPercent={request.StrategySnapshot.Parameters.ImpactedTaskWarningPercent}%`，"
+                              + $"已排 Task {totalScheduledTasks} 个）；处置："
+                              + (warnOnlyOnMaxImpacted
+                                  ? "仅 Warning 并继续传播（`WarnOnlyOnMaxImpacted=true`），轮次上限仍为 "
+                                    + $"`MaxPropagationRounds={maxPropagationRounds}`。"
+                                  : "中断传播并走本 Domain 全量重排 Fallback（`WarnOnlyOnMaxImpacted=false`）。"),
+                    Level = "Warning"
+                });
+
+                if (!warnOnlyOnMaxImpacted)
+                {
+                    shouldTriggerFallback = true;
+                    break; // 超警戒，退出传播，进入Fallback
+                }
+                // warnOnlyOnMaxImpacted=true：不中断，继续下一轮；只是每轮都留一条 Warning。
             }
 
             var nextRoundAffected = new HashSet<string>();
@@ -279,6 +311,12 @@ internal class PhaseFourLocalRepair
                                 if (predecessorTask != null)
                                 {
                                     var predEnd = predecessorTask.PlannedEndTime.AddMinutes((double)pred.LagTime);
+
+                                    // R09-③（2026-10-29）：跨 Stage 时「中间无 Routing Stage」的提前期也要算进下界，
+                                    //   否则 Phase4 重排会把 Phase2 让出来的那段时间压回去。
+                                    predEnd = RoutelessLeadTimePolicy.Advance(
+                                        request, constraints, demand, pred.From.StageCode, task.StageCode, predEnd);
+
                                     if (predEnd > earliestStart)
                                     {
                                         earliestStart = predEnd;
@@ -302,6 +340,11 @@ internal class PhaseFourLocalRepair
                             if (successorTask != null)
                             {
                                 var succStart = successorTask.PlannedStartTime.AddMinutes(-(double)succ.LagMinutes);
+
+                                // R09-③（2026-10-29）：上界方向同样要让出中间提前期。
+                                succStart = RoutelessLeadTimePolicy.Retreat(
+                                    request, constraints, demand, task.StageCode, succ.ToNode.StageCode, succStart);
+
                                 if (succStart < latestEnd)
                                 {
                                     latestEnd = succStart;
@@ -324,9 +367,14 @@ internal class PhaseFourLocalRepair
                     : task.PlannedEndTime - task.PlannedStartTime;
 
                 // 非资源 Task（ResourceId=NULL）不占资源、无槽可找 → 跳过重排（found=null，走"保持原位置"分支）
+                // Setup 键域含生产部门（0号位 R07R08 v1.1 第 3 条）：FinalTaskDraft 只有 StageCode、
+                //   无部门 ⇒ 按「物料 + Stage」反查（与部门锁定同源）；查不到 ⇒ null ⇒ 解析判 SourceUnavailable。
+                var taskDept = SetupOptimizer.LookupDepartment(
+                    constraints.DepartmentByMaterialStage, task.MaterialId, task.StageCode);
+
                 var found = task.ResourceId is int ridSlot
                     ? SetupOptimizer.FindSlotWithDynamicSetup(
-                        earliestStart, duration, ridSlot, task.OperationCode, task.MaterialId,
+                        earliestStart, duration, ridSlot, task.OperationCode, taskDept, task.StageCode, task.MaterialId,
                         constraints.ProductTimeline, constraints.SetupExactRules, constraints.SetupDefaultRules,
                         (f, total) => FindForwardSlot(f, total, ridSlot, constraints, resourceOccupancy, request.PlanningEnd))
                     : ((TimeWindow Slot, decimal SetupMinutes, SetupOptimizer.SetupResolution Resolution)?)null;
@@ -386,6 +434,8 @@ internal class PhaseFourLocalRepair
                     if (taskIndex >= 0)
                     {
                         scheduleResult.ScheduledTasks[taskIndex] = updatedTask;
+                        // R08 §二.3：Task 被原地替换 ⇒ 后继索引的排序键（PlannedStartTime − SetupTime）可能变了
+                        successorLookup.Invalidate();
                     }
 
                     // 5. 更新resourceOccupancy（P0-02：占用窗口含Setup；found.Slot 即 [newStart-Setup, newEnd]）
@@ -621,7 +671,8 @@ internal class PhaseFourLocalRepair
         }
 
         // 4. 第9轮P0-03修复：Fallback兜底 - 调用同一Solver对本Domain全部可移动任务重排
-        if (shouldTriggerFallback || affectedTasks.Count > maxAffectedTasks)
+        // R11：`WarnOnlyOnMaxImpacted=false` 时超阈值才改道 Fallback；默认(true)只留 Warning。
+        if (shouldTriggerFallback || (!warnOnlyOnMaxImpacted && affectedTasks.Count > maxAffectedTasks))
         {
             // 构建Fallback重排请求：Phase2 Schedule 会重新继承所有 LockedTasks（原地保留不可移动部分）
             var fallbackScheduler = new PhaseTwoInitialScheduler();
@@ -694,11 +745,23 @@ internal class PhaseFourLocalRepair
                 dynamicMaterialFloor = contEnd;
             }
 
+            // 调试 trace（未设 APS_PHASE5_FLOOR_TRACE 时零开销）
+            PhaseTwoInitialScheduler.TraceCrossMaterialFloor(
+                "P4_FLOOR", demandKey, dynamicMaterialFloor,
+                $"childUnavailable={childUnavailable};path=propagation");
+
             // P0-03：**逐批**修复 —— 局部修复的基本单位 = **执行批**（0号位 (7).md §六），
             //   每批带本批键 + 本批数量；不得用整份需求数量重建，不得把 Batch-002 写回 Batch-001 的键。
             //   P0-03 整改：单元 = **未落定执行批**（已成功批不展开）。
             var repairUnits = ExpandRepairUnits(demand, scheduleResult, constraints);
             var repairedBatchCount = 0;
+
+            // R11：`MaxRepairAttempts` 诊断阈值（超阈值只留痕，不砍尝试 —— 理由见方法注释）。
+            ReportRepairAttemptsThreshold(request, constraints, demandKey, repairUnits.Count, "propagation");
+
+            // 缺料原因码**需求级**去重：`ExpandRepairUnits` 会按执行批展开成多个单元，
+            //   同一需求每个单元都缺料 ⇒ 不去重会在 TraceNotes 里堆出等价重复行。
+            var materialShortReported = new HashSet<string>(StringComparer.Ordinal);
 
             foreach (var (unitBatchKey, unitDemand) in repairUnits)
             {
@@ -708,17 +771,50 @@ internal class PhaseFourLocalRepair
                     unitBatchKey,
                     constraints,
                     resourceOccupancy,
+                    successorLookup,   // R08 §二.3：插入后邻接重算要按资源二分找「后继 Task」（索引懒建，见 SuccessorLookup）
                     request,
-                    dynamicMaterialFloor);
+                    dynamicMaterialFloor,
+                    out var materialInsufficient);
                 SolverDiagnostics.HotspotEnd(swP4Try, SolverDiagnostics.Hotspot.Phase4TrySwitch);
 
                 if (repairedTasks.Count == 0)
                 {
+                    // **不静默**（0号位 2026-10-26 P0 ③）：缺料 ⇒ 单独原因码，
+                    //   与「无可用时间槽 / 无合格资源」分开，否则下游无法定位到底该找采购还是找工艺。
+                    if (materialInsufficient && materialShortReported.Add(demandKey))
+                    {
+                        ReportPhase4MaterialInsufficient(constraints, demand, unitDemand);
+                    }
                     continue;
                 }
 
                 repairedBatchCount++;
                 result.RepairedTasks.AddRange(repairedTasks);
+
+                // ── 2026-10-28（跨物料越序真因）：修复出的 Task 必须回灌 `demandCompletion` ──
+                //   原实现 `demandCompletion` 只在本方法开头由 `scheduleResult.ScheduledTasks` **建一次**、
+                //   整段循环不刷新 ⇒ 本需求修复出的 Task（更晚的 End）对**后继父件**不可见，
+                //   父件在 `GetDynamicMaterialFloor` 里读到的是「子件修复之前」的旧完成时间
+                //   ⇒ 正排按过早下界开工 ⇒ 跨物料越序（Phase5 校验一票打成 FinalTask=0）。
+                //   与紧随其后的 `continuityCompletionByPI` 同纪律：**只取 max、单调不减**，
+                //   不存在把任何时间提前的可能，故不降低任何已排目标。
+                //   ⚠ 定性口径（0号位 2026-10-28《R07R08_致1号位更正回复_v1.1_20261028.md》第 5 条）：
+                //     本段是「**机理可疑、待 Run 证因果**」的整改 —— 它消除的是一条**可达的**陈旧读路径
+                //     （隔离用例 `CrossMaterialPhase4RepairFloorTests` 可证：去掉本段即父件提前）；
+                //     但 PV190 run 的现场失败**已查明不是它**（真因是合批延长，见
+                //     `CrossMaterialMergeFloorTests`）。故**不得**据此宣称已修好任何实跑缺陷。
+                //   键域：`SourceDraftId == LogicalDemandKey`（`PhaseTwoInitialScheduler.cs:4851`/`:6375`），
+                //   与 `GetDynamicMaterialFloor` 的查表键同域（`PhaseTwoInitialScheduler.cs:1538`）。
+                foreach (var repairedGroup in repairedTasks.GroupBy(t => t.SourceDraftId))
+                {
+                    if (string.IsNullOrEmpty(repairedGroup.Key)) continue;
+                    var repairedEnd = repairedGroup.Max(t => t.PlannedEndTime);
+                    if (!demandCompletion.TryGetValue(repairedGroup.Key, out var existingCompletion)
+                        || repairedEnd > existingCompletion)
+                    {
+                        demandCompletion[repairedGroup.Key] = repairedEnd;
+                    }
+                }
 
                 // ── NEW-P1-01（0号位 2026-10-09《APS_V1_4_20261009.md》§三）：**Phase4 修复批亦须留批级方向痕** ──
                 //   复审判词（成立）：Phase2 只在**有胜出候选**时登记 `ResolvedBatchDirections`；未落定批
@@ -794,6 +890,9 @@ internal class PhaseFourLocalRepair
     {
         var result = new RepairResult();
 
+        // R08 §二.3：插入后邻接校验用的「后继 Task」索引（懒建；本路径不替换已排 Task ⇒ 不会失效）。
+        var successorLookup = new SuccessorLookup(scheduleResult.ScheduledTasks);
+
         // 2026-10-20 二十四次定位：Phase4 5.5 s（ΣPhase 的 18.7%）此前**零埋点**，先切三块。纯观测。
         long swP4Prep = SolverDiagnostics.HotspotStart();
 
@@ -818,8 +917,20 @@ internal class PhaseFourLocalRepair
             if (d0.LogicalDemandKey is string k0) demandByLogicalKey.TryAdd(k0, d0);
         }
 
+        // ── 2026-10-28 运行中进度探针（补 FULL 路径缺口）──
+        //   原实现只在 Candidate/传播路径（`RepairWithPropagation:658`/`:663`）接了
+        //   `SetPhase4UnitTotal` / `SetPhase4UnitProgress`，而 PV190 这类 FULL Run 走的是**本方法**
+        //   ⇒ CSV 的 `p4_done/p4_total` 全程 0/0，跑批中途只能看耗时、给不出百分比
+        //   （2026-10-28 实测：Phase4 已跑 361 秒仍是 0/0，只能靠 CPU 占用反推它在干活）。
+        //   口径与传播路径一致：**按待修复需求条数**（`ExpandRepairUnits` 的单元数事先不可知）。
+        //   纯观测，不参与任何业务判定。
+        SolverDiagnostics.SetPhase4UnitTotal(scheduleResult.UnscheduledDemandKeys.Count);
+        int phase4Processed = 0;
+
         foreach (var demandKey in scheduleResult.UnscheduledDemandKeys)
         {
+            SolverDiagnostics.SetPhase4UnitProgress(++phase4Processed);
+
             var demand = FindDemandByLogicalKey(request, demandByLogicalKey, demandKey);
 
             if (demand == null) continue;
@@ -851,10 +962,21 @@ internal class PhaseFourLocalRepair
                 dynamicMaterialFloor = contEnd;
             }
 
+            // 调试 trace（未设 APS_PHASE5_FLOOR_TRACE 时零开销）
+            PhaseTwoInitialScheduler.TraceCrossMaterialFloor(
+                "P4_FLOOR", demandKey, dynamicMaterialFloor,
+                $"childUnavailable={childUnavailable};path=unscheduled");
+
             // P0-03：**逐批**修复（同上方 Base 路径；基本单位 = 执行批）。
             //   P0-03 整改：单元 = **未落定执行批**（已成功批不展开）。
             var repairUnits = ExpandRepairUnits(demand, scheduleResult, constraints);
             var repairedBatchCount = 0;
+
+            // R11：`MaxRepairAttempts` 诊断阈值（超阈值只留痕，不砍尝试 —— 理由见方法注释）。
+            ReportRepairAttemptsThreshold(request, constraints, demandKey, repairUnits.Count, "unscheduled");
+            // 缺料原因码**需求级**去重：`ExpandRepairUnits` 会按执行批展开成多个单元，
+            //   同一需求每个单元都缺料 ⇒ 不去重会在 TraceNotes 里堆出等价重复行。
+            var materialShortReported = new HashSet<string>(StringComparer.Ordinal);
 
             foreach (var (unitBatchKey, unitDemand) in repairUnits)
             {
@@ -864,17 +986,82 @@ internal class PhaseFourLocalRepair
                     unitBatchKey,
                     constraints,
                     resourceOccupancy,
+                    successorLookup,   // R08 §二.3：插入后邻接重算要按资源二分找「后继 Task」（索引懒建，见 SuccessorLookup）
                     request,
-                    dynamicMaterialFloor);
+                    dynamicMaterialFloor,
+                    out var materialInsufficient);
                 SolverDiagnostics.HotspotEnd(swP4Try, SolverDiagnostics.Hotspot.Phase4TrySwitch);
+
+                // ── PV195 跨窗最后兜底（2026-10-29）──
+                //   常规修复（Resource Switch / Routing 裁剪 / 有限 Split）对本批**一个 Task 都没排出**
+                //   ⇒ 本批今天的结果就是 0 个 Task。**只有这种时候**才允许跨日历窗重试**一次**：
+                //   临时把 `AllowCrossWindowSlot` 置 true，`FindForwardSlot` 末尾才会走 `CrossWindowSlotLocator`
+                //   （那里还有第二层闸门：时长必须长于该资源**最长**日历窗）。出块即还原，不残留给后面的批。
+                //   ⚠ 不做这一步的后果就是 PV195：2,898.56 分钟的工序 vs 最长日历窗 540 分钟，
+                //     单窗恒装不下 ⇒ 该需求每一轮都是 0 Task。
+                //   ⚠ 为什么不在常态找槽里开：14:18 全量 Unit 实测，无条件开跨窗会让 6 个既有用例变形
+                //     （`P0_01` 的「Phase2 排不下 → Phase4 拆 2×45」被跨窗整段排下成 1 个 Task；合批、批数、批血缘同源）。
+                //   ⚠ 只做**一次**重试，不递归：重试仍为 0 ⇒ 照旧进 `StillUnscheduledKeys`，原因码不变。
+                if (repairedTasks.Count == 0)
+                {
+                    var previousAllowCrossWindow = constraints.AllowCrossWindowSlot;
+                    constraints.AllowCrossWindowSlot = true;
+                    try
+                    {
+                        repairedTasks = TryResourceSwitch(
+                            unitDemand,
+                            unitBatchKey,
+                            constraints,
+                            resourceOccupancy,
+                            successorLookup,
+                            request,
+                            dynamicMaterialFloor,
+                            out materialInsufficient);
+                    }
+                    finally
+                    {
+                        constraints.AllowCrossWindowSlot = previousAllowCrossWindow;
+                    }
+                }
 
                 if (repairedTasks.Count == 0)
                 {
+                    // **不静默**（0号位 2026-10-26 P0 ③）：缺料 ⇒ 单独原因码，
+                    //   与「无可用时间槽 / 无合格资源」分开，否则下游无法定位到底该找采购还是找工艺。
+                    if (materialInsufficient && materialShortReported.Add(demandKey))
+                    {
+                        ReportPhase4MaterialInsufficient(constraints, demand, unitDemand);
+                    }
                     continue;
                 }
 
                 repairedBatchCount++;
                 result.RepairedTasks.AddRange(repairedTasks);
+
+                // ── 2026-10-28（跨物料越序真因）：修复出的 Task 必须回灌 `demandCompletion` ──
+                //   原实现 `demandCompletion` 只在本方法开头由 `scheduleResult.ScheduledTasks` **建一次**、
+                //   整段循环不刷新 ⇒ 本需求修复出的 Task（更晚的 End）对**后继父件**不可见，
+                //   父件在 `GetDynamicMaterialFloor` 里读到的是「子件修复之前」的旧完成时间
+                //   ⇒ 正排按过早下界开工 ⇒ 跨物料越序（Phase5 校验一票打成 FinalTask=0）。
+                //   与紧随其后的 `continuityCompletionByPI` 同纪律：**只取 max、单调不减**，
+                //   不存在把任何时间提前的可能，故不降低任何已排目标。
+                //   ⚠ 定性口径（0号位 2026-10-28《R07R08_致1号位更正回复_v1.1_20261028.md》第 5 条）：
+                //     本段是「**机理可疑、待 Run 证因果**」的整改 —— 它消除的是一条**可达的**陈旧读路径
+                //     （隔离用例 `CrossMaterialPhase4RepairFloorTests` 可证：去掉本段即父件提前）；
+                //     但 PV190 run 的现场失败**已查明不是它**（真因是合批延长，见
+                //     `CrossMaterialMergeFloorTests`）。故**不得**据此宣称已修好任何实跑缺陷。
+                //   键域：`SourceDraftId == LogicalDemandKey`（`PhaseTwoInitialScheduler.cs:4851`/`:6375`），
+                //   与 `GetDynamicMaterialFloor` 的查表键同域（`PhaseTwoInitialScheduler.cs:1538`）。
+                foreach (var repairedGroup in repairedTasks.GroupBy(t => t.SourceDraftId))
+                {
+                    if (string.IsNullOrEmpty(repairedGroup.Key)) continue;
+                    var repairedEnd = repairedGroup.Max(t => t.PlannedEndTime);
+                    if (!demandCompletion.TryGetValue(repairedGroup.Key, out var existingCompletion)
+                        || repairedEnd > existingCompletion)
+                    {
+                        demandCompletion[repairedGroup.Key] = repairedEnd;
+                    }
+                }
 
                 // ── NEW-P1-01（0号位 2026-10-09《APS_V1_4_20261009.md》§三）：**Phase4 修复批亦须留批级方向痕** ──
                 //   复审判词（成立）：Phase2 只在**有胜出候选**时登记 `ResolvedBatchDirections`；未落定批
@@ -947,7 +1134,8 @@ internal class PhaseFourLocalRepair
     ///     <item><b>Firm</b> ⇒ **明确不入**。<c>PM回复0923-1</c> §三.2 逐字「**Firm 不是锁。Firm 不是不可移动。**」
     ///       ⇒ Firm 走**契约②**只作通报（见下条），**不得**据以禁移。</item>
     ///     <item><b>Protection（契约② <c>request.OrderProtections</c>）</b> ⇒ **只通报、不约束**。
-    ///       <c>DomainSolveRequest.cs:409</c> 逐字：「**只通报、不约束**：1号位 **不得**据此禁止移动任何 Task」；
+    ///       <c>DomainSolveRequest.cs:643</c> 逐字：「**只通报、不约束**：1号位 **不得**据此禁止移动任何 Task」
+    ///       （2026-10-29 校正：原引 <c>:409</c> 已漂移，该行现为 <c>Parameters</c> 属性）；
     ///       <c>OrderProtectionType.Frozen</c> 自述「本类型在**契约② 里只作事实通报**；其**物理位置保护**由
     ///       **契约①**（同订单 Task 的 <c>ExecutionConstraint</c>）承担」。⇒ **本方法刻意不新增
     ///       <c>OrderProtection</c> 来源**（2号位 已于 2026-10-13 落契约②生产端，见 <c>PeggingOrchestrator.cs:421</c>）。</item>
@@ -1092,14 +1280,85 @@ internal class PhaseFourLocalRepair
     /// <summary>
     /// 尝试资源切换（换到其他合格资源）
     /// </summary>
+    /// <summary>
+    /// Phase4 **供给不足**的原因码出口（0号位 2026-10-26 四份整改单 P0 ③「Phase4／5 供给不足补原因码」）。
+    ///
+    /// 【为什么走 `TraceNotes` 而不是扩契约】沿用既有 `ConstraintContext.TraceNotes` →
+    ///   `DomainSolveResult.SolveTraceNotes`（2号位 r13494 已落地载体）。`ReasonCode` 属**决策说明层**，
+    ///   **不进冻结 `ReasonCode` 字典**（0号位 Q4 裁决），与 `PHASE5_BREACH_SCOPE` 同一先例 ⇒ 不扩契约。
+    ///
+    /// 【为什么必须报】旧形态下缺料与「无可用时间槽」「无合格资源」在结果上**完全同形**（该批不出 Task），
+    ///   而三者该找的人完全不同：缺料 → 采购/齐套；无槽 → 产能日历；无资源 → 工艺主数据。
+    /// </summary>
+    private static void ReportPhase4MaterialInsufficient(
+        ConstraintContext constraints,
+        LogicalProductionDemand demand,
+        LogicalProductionDemand unitDemand)
+    {
+        constraints.TraceNotes.Add(new SolveTraceNote
+        {
+            Key = demand.LogicalDemandKey,
+            ReasonCode = "PHASE4_MATERIAL_INSUFFICIENT",
+            Message = $"需求 `{demand.LogicalDemandKey}`（物料 {demand.MaterialId}，"
+                      + $"AllocationSequence {unitDemand.AllocationSequence}）"
+                      + $"供给累计量不足 `NetOutputQty={unitDemand.NetOutputQty}` "
+                      + "⇒ Phase4 局部修复**一个 Task 也没落下**（`TryResourceSwitch` 在物料下界处直接返回空表），"
+                      + "该执行批留在 `StillUnscheduledKeys`。"
+                      + "**这不是「无可用时间槽」也不是「无合格资源」，是缺料**；供给补齐后需重算。",
+            Level = "Warning"
+        });
+    }
+
+    /// <summary>
+    /// R11（2026-10-29）：`MaxRepairAttempts` 接线 —— **诊断阈值，不是硬上限**。
+    ///
+    /// <para><b>为什么不按硬上限截断</b>：Phase4 的修复尝试单位是**未落定执行批**
+    /// （`ExpandRepairUnits`，P0-03）。若「尝试次数」到 `MaxRepairAttempts` 就停，
+    /// 剩下的执行批**必然留在未排** ⇒ 直接降目标，撞 0号位「排不下红线」（排到 100 年后也得排下）。
+    /// 两条红线冲突时以「不降目标」为准，故本字段按**判别证据**消费：
+    /// 超过阈值只留 Warning、不砍尝试，全部单元照旧逐一尝试。</para>
+    ///
+    /// <para>这样接线仍是真消费（阈值真影响输出：留不留痕、痕里带真实单元数），
+    /// 且一旦某个 Run 反复出现该痕，就说明「修复尝试次数」这个治理量在设计层面与排不下红线相抵，
+    /// 需要 0号位 裁口径，而不是让求解器悄悄丢任务。</para>
+    /// </summary>
+    private static void ReportRepairAttemptsThreshold(
+        DomainSolveRequest request,
+        ConstraintContext constraints,
+        string demandKey,
+        int repairUnitCount,
+        string path)
+    {
+        int maxRepairAttempts = request.StrategySnapshot.CandidateGuardrail.MaxRepairAttempts;
+        if (maxRepairAttempts <= 0 || repairUnitCount <= maxRepairAttempts) return;
+
+        constraints.TraceNotes.Add(new SolveTraceNote
+        {
+            Key = demandKey,
+            ReasonCode = "PHASE4_REPAIR_ATTEMPTS_EXCEEDED",
+            Message = $"需求 `{demandKey}`（{path} 路径）有 {repairUnitCount} 个未落定执行批需要修复，"
+                      + $"超过 `MaxRepairAttempts={maxRepairAttempts}`。"
+                      + "处置：**全部单元照旧逐一尝试**（按硬上限截断会把剩余批留在未排 ⇒ 降目标，撞排不下红线），"
+                      + "此处按诊断阈值留痕。若该痕反复出现，说明 `MaxRepairAttempts` 与排不下红线在设计上相抵，需 0号位 裁口径。",
+            Level = "Warning"
+        });
+    }
+
     private List<FinalTaskDraft> TryResourceSwitch(
         LogicalProductionDemand demand,
         string batchDraftKey,
         ConstraintContext constraints,
         Dictionary<int, List<TimeWindow>> resourceOccupancy,
+        SuccessorLookup successorLookup,
         DomainSolveRequest request,
-        DateTime dynamicMaterialFloor)
+        DateTime dynamicMaterialFloor,
+        out bool materialInsufficient)
     {
+        // 供给不足**不得静默**（0号位 2026-10-26 四份整改单 P0 ③「Phase4／5 供给不足补原因码」）：
+        //   缺料时本方法返回空表，旧实现的调用方只看到「没修出 Task」⇒ 分不清是**缺料**、
+        //   **无可用时间槽**、还是**无合格资源** —— 三者指向完全相反的方向（采购 / 产能日历 / 工艺主数据）。
+        //   由本出参把「缺料」这一条因回传，调用方在需求级去重后登记原因码。
+        materialInsufficient = false;
         // **批级**取图（P0-03；RT-002「局部修复不得换路径」）：本批选中路径 → 需求固定路径 → 唯一那条。
         //   多批时各批可能走不同 Path ⇒ 必须按**批键**取，不能按需求键取（否则串批）。
         if (!constraints.TryGetBatchRoutingGraph(
@@ -1136,6 +1395,7 @@ internal class PhaseFourLocalRepair
         // P0-05修复：物料总量不足时，标记为业务Unscheduled（不是技术失败）
         if (!isMaterialSufficient)
         {
+            materialInsufficient = true;        // ← 原因回传（调用方据此登记 `PHASE4_MATERIAL_INSUFFICIENT`）
             return new List<FinalTaskDraft>(); // 物料总量不足
         }
 
@@ -1146,6 +1406,12 @@ internal class PhaseFourLocalRepair
         }
 
         // P0-17修复：改为for循环以便访问下一道工序，应用Routing LagTime
+        // R08 §二.3：本轮接纳插入后需要重算 Setup 的同资源后继（单元全部落定后才落值，见 ApplySuccessorSetupRewrites）
+        var successorSetupRewrites = new List<(FinalTaskDraft Task, decimal SetupMinutes)>();
+
+        // R11（2026-10-29）：`ResourceTopN` 接线 —— 判定证据只留一次（同一修复单元内多道工序可能都超窗）。
+        bool resourceTopNExceededReported = false;
+
         for (int i = 0; i < operations.Count; i++)
         {
             var operation = operations[i];
@@ -1162,8 +1428,16 @@ internal class PhaseFourLocalRepair
             FinalTaskDraft? scheduledTask = null;
 
             // 遍历合格资源，找第一个可用的
-            foreach (var resourceId in eligibleResources)
+            // R11（2026-10-29）：`ResourceTopN` 接线 —— **软优先窗口，不是硬截断**。
+            //   先按偏好顺序试前 TopN 个；前 TopN 全试不通时**继续试其余**（绝不把需求拖成未排，
+            //   撞 0号位「排不下红线」），只在「靠 TopN 之外的资源才落下」时留一条 Warning，
+            //   作为「TopN 配小了」的判别证据。TopN ≤ 0 视为未配置 ⇒ 不设窗口、不留痕。
+            int resourceTopN = request.StrategySnapshot.CandidateGuardrail.ResourceTopN;
+            for (int ri = 0; ri < eligibleResources.Count; ri++)
             {
+                var resourceId = eligibleResources[ri];
+                bool beyondResourceTopN = resourceTopN > 0 && ri >= resourceTopN;
+
                 // P0-04修复：Duration = StandardDuration × PlannedProcessQty ÷ CapacityFactor
                 // 第4轮Setup修复：加上SetupTime占用资源时间轴
                 // 第5轮修复：CapacityFactor缺失或非法时跳过该资源
@@ -1178,9 +1452,12 @@ internal class PhaseFourLocalRepair
                 // item1 接线（阶段二）：Setup = 规则查找「当前工序+当前设备+前产品→当前产品」（v1.2 §2/§5），
                 // 不再读 RoutingOperation.SetupTime（§1.2/§20.3 废止）；§12 候选评价即含 Setup。
                 var found = SetupOptimizer.FindSlotWithDynamicSetup(
-                    earliestStart, processDuration, resourceId, operation.OperationCode, demand.MaterialId,
+                    earliestStart, processDuration, resourceId,
+                    operation.OperationCode, operation.ProductionDepartmentId, operation.StageCode, demand.MaterialId,
                     constraints.ProductTimeline, constraints.SetupExactRules, constraints.SetupDefaultRules,
-                    (f, total) => FindForwardSlot(f, total, resourceId, constraints, resourceOccupancy, request.PlanningEnd));
+                    // R08 §二.3：候选槽先过「插入后邻接校验」—— 会顶到同资源后继的槽直接不合法（不再事后补救）
+                    (f, total) => FindSlotAvoidingSuccessorSetup(
+                        f, total, resourceId, demand.MaterialId, constraints, resourceOccupancy, successorLookup, request.PlanningEnd));
 
                 if (found.HasValue)
                 {
@@ -1198,6 +1475,50 @@ internal class PhaseFourLocalRepair
                     }
                     resourceOccupancy[resourceId].Add(occSlot);
                     constraints.ProductTimeline.Place(resourceId, occSlot.End, demand.MaterialId);
+
+                    // R11：靠 TopN 之外的资源才落下 ⇒ 记「TopN 配小了」的证据（不阻断、不回滚）。
+                    if (beyondResourceTopN && !resourceTopNExceededReported)
+                    {
+                        resourceTopNExceededReported = true;
+                        constraints.TraceNotes.Add(new SolveTraceNote
+                        {
+                            Key = demand.LogicalDemandKey ?? batchDraftKey,
+                            ReasonCode = "PHASE4_RESOURCE_TOPN_EXCEEDED",
+                            Message = $"需求 `{demand.LogicalDemandKey}`（批 `{batchDraftKey}`，物料 {demand.MaterialId}）"
+                                      + $"工序 `{operation.StageCode}/{operation.OperationCode}` 的合格资源共 "
+                                      + $"{eligibleResources.Count} 个，前 `ResourceTopN={resourceTopN}` 个均无可用槽，"
+                                      + $"最后由第 {ri + 1} 个（资源 {resourceId}）落下 ⇒ **未丢任务**，"
+                                      + "但 TopN 窗口偏小。`ResourceTopN` 按软优先窗口消费（硬截断会造出未排，撞排不下红线）。",
+                            Level = "Warning"
+                        });
+                    }
+
+                    // R08 §二.3：接纳本槽后，同资源紧邻后继的「前产品」变成本需求 ⇒ 它的 Setup 要重算。
+                    //   ① 判定阶段（FindSlotAvoidingSuccessorSetup）已保证**变大也不会顶到我**；
+                    //   ② 这里登记「落值」意图，单元全部落定后再改（单元失败 ⇒ 邻居旧值原样保留）；
+                    //   ③ Setup **变大**时立刻把扩出来的那段记进占用图（保守方向）：同一单元后续工序
+                    //      若还落在本资源上，不得把邻居的新 Setup 段当成空档。
+                    var (succBlockUntil, succTask, succSetup) =
+                        EvaluateSuccessorSetup(resourceId, occSlot, demand.MaterialId, constraints, successorLookup);
+                    if (succBlockUntil is null && succTask is not null && succSetup != succTask.SetupTime)
+                    {
+                        successorSetupRewrites.Add((succTask, succSetup));
+
+                        if (succSetup > succTask.SetupTime)
+                        {
+                            var newSuccOccStart = succTask.PlannedStartTime.AddMinutes(-(double)succSetup);
+                            var succWindows = resourceOccupancy[resourceId];
+                            for (var w = 0; w < succWindows.Count; w++)
+                            {
+                                var window = succWindows[w];
+                                if (window.End != succTask.PlannedEndTime) continue;
+                                if (window.Start <= newSuccOccStart) break;   // 已经是更早的起点，无需再扩
+
+                                succWindows[w] = new TimeWindow(newSuccOccStart, window.End);
+                                break;
+                            }
+                        }
+                    }
 
                     // P0-17修复：应用Routing LagTime到下道工序的最早开始时间
                     earliestStart = occSlot.End;
@@ -1280,6 +1601,9 @@ internal class PhaseFourLocalRepair
             tasks.Add(scheduledTask);
         }
 
+        // R08 §二.3：整只修复单元落定后才给邻居落值（单元失败 ⇒ 邻居旧对象原样保留）
+        ApplySuccessorSetupRewrites(successorSetupRewrites, successorLookup, resourceOccupancy);
+
         return tasks;
     }
 
@@ -1344,6 +1668,248 @@ internal class PhaseFourLocalRepair
 
         return floor;
     }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // R08 §二.3 · **插入后邻接重算**（0号位 2026-10-28《R07R08_致1号位更正回复_v1.1_20261028.md》第 3 条
+    //   ／《01_正式致1号位_R08_Setup真实占用与邻接优化核查整改_v1.0.md》§二.3）
+    //
+    // 缺口：`FindSlotWithDynamicSetup` 只解「**前置** Setup（槽起点前产品）+ 当前加工」，
+    //   **没有**看「我插进去之后，紧邻我后面的那条 Task 的『前产品』变成了我的物料 ⇒ 它的 Setup 也要变」。
+    //   ⇒ 插入后（1）后继的真实占用起点前移、可能压到我身上（合法时窗判定漏了这条）；
+    //            （2）后继的 `SetupTime` 字段停留在旧值（邻接未重算）。
+    // 本节只补 **Phase4 插入** 这一条链；Phase2（append-only，`ScheduleDemandOperations` 不接收任务表）
+    //   与 Phase5 `CompactGaps` 的同类缺口见 2026-10-28 回执的「未完成项」，不在此处硬凑。
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// R08 §二.3：资源级「后继 Task」索引（按**占用起点**升序 + 二分）。
+    ///
+    /// 为什么必须有它：`EvaluateSuccessorSetup` 若在每次槽查找时线性扫全表，Phase4 的槽查找会退化成
+    ///   O(需求数)/次 —— 本文件历次实测都表明 Phase4 的热点就在槽查找（`TryResourceSwitch`），
+    ///   42k 需求规模下等于把本身 5 秒级的阶段直接拖成小时级。故**一次建索引、O(log n) 查询**。
+    ///
+    /// 失效：邻居 Setup 被重算后其占用起点会变（`PlannedStartTime − SetupTime`），索引排序键随之失效
+    ///   ⇒ 由 <see cref="Invalidate"/> 标记、下次查询按需重建（只有真的改过值才会重建，代价可忽略）。
+    /// </summary>
+    private sealed class SuccessorLookup
+    {
+        private readonly List<FinalTaskDraft> _tasks;
+        private Dictionary<int, (DateTime[] Starts, FinalTaskDraft[] Tasks)>? _index;
+
+        public SuccessorLookup(List<FinalTaskDraft> tasks) => _tasks = tasks;
+
+        public List<FinalTaskDraft> Tasks => _tasks;
+
+        public void Invalidate() => _index = null;
+
+        /// <summary>返回该资源上「占用起点 &gt;= time」中最早的一条；没有则 null。</summary>
+        public FinalTaskDraft? FindFirstAtOrAfter(int resourceId, DateTime time)
+        {
+            var index = _index ??= Build();
+            if (!index.TryGetValue(resourceId, out var entry)) return null;
+
+            var starts = entry.Starts;
+            int lo = 0, hi = starts.Length;
+            while (lo < hi)
+            {
+                var mid = (lo + hi) >> 1;
+                if (starts[mid] < time) lo = mid + 1;
+                else hi = mid;
+            }
+
+            return lo < entry.Tasks.Length ? entry.Tasks[lo] : null;
+        }
+
+        private Dictionary<int, (DateTime[] Starts, FinalTaskDraft[] Tasks)> Build()
+        {
+            var map = new Dictionary<int, (DateTime[], FinalTaskDraft[])>();
+            foreach (var group in _tasks.Where(t => t.ResourceId is not null).GroupBy(t => t.ResourceId!.Value))
+            {
+                var ordered = group
+                    .OrderBy(t => t.PlannedStartTime.AddMinutes(-(double)t.SetupTime))
+                    .ToArray();
+                var starts = ordered
+                    .Select(t => t.PlannedStartTime.AddMinutes(-(double)t.SetupTime))
+                    .ToArray();
+                map[group.Key] = (starts, ordered);
+            }
+            return map;
+        }
+    }
+
+    /// <summary>
+    /// 判定「我把一条 Task 放进 (resourceId, occSlot) 后，同资源**时间上紧邻其后**的那条 Task 会不会被我顶到」。
+    ///
+    /// 语义（与 <see cref="SetupOptimizer.FindSlotWithDynamicSetup"/> 同源，都走 `ResolveSetupCore` 三层命中）：
+    ///   · 后继的 **加工开始时间不变**（`PlannedStartTime` = Setup 之后的加工开始），Setup 变大 ⇒ 占用起点前移；
+    ///   · 前移后压进我的占用窗（`&lt; occSlot.End`）⇒ **本槽不合法**，返回该后继的占用末端（调用方跳过整条后继再找）；
+    ///   · Setup 不变或变小 ⇒ 无冲突，返回 null。
+    ///
+    /// 返回 `(BlockUntil, Successor, SetupMinutes)`：无后继时 `(null, null, 0)`；
+    /// `BlockUntil` 非 null ＝ 冲突，须从该时刻继续找槽。
+    /// ⚠ 本方法**只判定、不改值**（`FinalTaskDraft` 全字段 `init`）；改值见 <see cref="ApplySuccessorSetupRewrites"/>。
+    /// </summary>
+    private static (DateTime? BlockUntil, FinalTaskDraft? Successor, decimal SetupMinutes) EvaluateSuccessorSetup(
+        int resourceId,
+        TimeWindow occSlot,
+        int materialId,
+        ConstraintContext constraints,
+        SuccessorLookup successorLookup)
+    {
+        // 后继 = 该资源上「占用起点 >= 我这条占用窗末端」中最早的一条（索引按占用起点升序 ⇒ 二分）
+        var successor = successorLookup.FindFirstAtOrAfter(resourceId, occSlot.End);
+
+        if (successor is null) return (null, null, 0m);
+
+        // 部门键域与 Phase4 落码同源：`FinalTaskDraft` 无部门字段 ⇒ 按「物料 + Stage」反查。
+        var successorDept = SetupOptimizer.LookupDepartment(
+            constraints.DepartmentByMaterialStage, successor.MaterialId, successor.StageCode);
+
+        var resolution = SetupOptimizer.ResolveSetupCore(
+            successor.OperationCode, successorDept, successor.StageCode, resourceId,
+            materialId, successor.MaterialId,
+            constraints.SetupExactRules, constraints.SetupDefaultRules);
+
+        if (resolution.SetupMinutes <= successor.SetupTime)
+        {
+            return (null, successor, resolution.SetupMinutes);
+        }
+
+        var grownStart = successor.PlannedStartTime.AddMinutes(-(double)resolution.SetupMinutes);
+        return grownStart < occSlot.End
+            ? (successor.PlannedEndTime, successor, resolution.SetupMinutes)   // 顶到我身上 ⇒ 本槽不合法
+            : (null, successor, resolution.SetupMinutes);
+    }
+
+    /// <summary>
+    /// 带「插入后邻接校验」的槽查找：与 `FindForwardSlot` 同源，只是候选槽先过一遍
+    /// <see cref="EvaluateSuccessorSetup"/>；若会顶到后继，就整条跳过该后继继续往后找。
+    /// 无后继 / 无冲突 ⇒ 行为与直接调用 `FindForwardSlot` **逐位一致**。
+    /// </summary>
+    private static TimeWindow? FindSlotAvoidingSuccessorSetup(
+        DateTime floor,
+        TimeSpan totalDuration,
+        int resourceId,
+        int materialId,
+        ConstraintContext constraints,
+        Dictionary<int, List<TimeWindow>> resourceOccupancy,
+        SuccessorLookup successorLookup,
+        DateTime planningEnd)
+    {
+        var from = floor;
+
+        // 上界：一条资源上与候选槽冲突的后继数有限，64 次足够；超出按「无槽」处理（保守，不硬塞）。
+        for (var guard = 0; guard < 64; guard++)
+        {
+            var candidate = FindForwardSlot(from, totalDuration, resourceId, constraints, resourceOccupancy, planningEnd);
+            if (candidate is not TimeWindow slot) return null;
+
+            var (blockUntil, _, _) = EvaluateSuccessorSetup(resourceId, slot, materialId, constraints, successorLookup);
+            if (blockUntil is null) return slot;
+
+            from = blockUntil.Value;
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// R08 §二.3「Task 插删移换后两侧邻接重算」的**落值**部分：
+    /// 把本轮已接纳插入所影响的同资源后继 Task 的 `SetupTime` 写成重解析值，并同步占用图。
+    ///
+    /// `FinalTaskDraft` 全字段 `init` ⇒ 只能整只重建；字段表与本文件既有重建样板（`RepairWithPropagation`
+    ///   的 `updatedTask`）逐字对齐，并**补回**该样板漏拷的 `Duration`（29 个属性一个不漏）。
+    ///   身份键 `FinalDraftId` 原样带走（下游按它归属份额 / 快照）。
+    ///
+    /// 只在**整个修复单元全部落定后**调用：单元失败 ⇒ 邻居旧对象原样保留，不会留下半改状态。
+    /// </summary>
+    private static void ApplySuccessorSetupRewrites(
+        List<(FinalTaskDraft Task, decimal SetupMinutes)> rewrites,
+        SuccessorLookup successorLookup,
+        Dictionary<int, List<TimeWindow>> resourceOccupancy)
+    {
+        if (rewrites.Count == 0) return;
+
+        var scheduledTasks = successorLookup.Tasks;
+        var changed = false;
+
+        // 同一后继可能被多次插入先后命中 ⇒ 以**最后一次**解析值为准（时间序即注册序）。
+        var byDraftId = new Dictionary<string, decimal>(StringComparer.Ordinal);
+        foreach (var (task, setupMinutes) in rewrites)
+        {
+            byDraftId[task.FinalDraftId] = setupMinutes;
+        }
+
+        foreach (var kvp in byDraftId)
+        {
+            var index = scheduledTasks.FindIndex(t => string.Equals(t.FinalDraftId, kvp.Key, StringComparison.Ordinal));
+            if (index < 0) continue;
+
+            var task = scheduledTasks[index];
+            if (kvp.Value == task.SetupTime) continue;
+
+            var oldOccStart = task.PlannedStartTime.AddMinutes(-(double)task.SetupTime);
+            var newOccStart = task.PlannedStartTime.AddMinutes(-(double)kvp.Value);
+
+            scheduledTasks[index] = CloneTaskWithSetup(task, kvp.Value);
+            changed = true;
+
+            if (task.ResourceId is int rid && resourceOccupancy.TryGetValue(rid, out var windows))
+            {
+                for (var w = 0; w < windows.Count; w++)
+                {
+                    var window = windows[w];
+                    if (window.End == task.PlannedEndTime && window.Start == oldOccStart)
+                    {
+                        windows[w] = new TimeWindow(newOccStart, window.End);
+                        break;
+                    }
+                }
+            }
+        }
+
+        // 占用起点变了 ⇒ 后继索引的排序键失效，下次查询重建。
+        if (changed) successorLookup.Invalidate();
+    }
+
+    /// <summary>
+    /// 整只重建 Task 并替换 `SetupTime`（其余 28 个属性逐字拷贝）。
+    /// ⚠ 新增 `FinalTaskDraft` 字段时**必须**同步本方法，否则该字段在「邻居重算」路径上被静默清零
+    ///   （历史事故：`OperationSeq`、`EffectiveProcessMinutes`、`ExecutionBatchDraftKey` 均在此栽过）。
+    /// </summary>
+    private static FinalTaskDraft CloneTaskWithSetup(FinalTaskDraft task, decimal setupMinutes)
+        => new()
+        {
+            FinalDraftId = task.FinalDraftId,
+            SourceDraftId = task.SourceDraftId,
+            MaterialId = task.MaterialId,
+            FactoryId = task.FactoryId,
+            StageCode = task.StageCode,
+            OperationCode = task.OperationCode,
+            OperationSeq = task.OperationSeq,
+            TaskType = task.TaskType,
+            ResourceId = task.ResourceId,
+            ResourceCode = task.ResourceCode,
+            RouteCode = task.RouteCode,
+            PathId = task.PathId,
+            Quantity = task.Quantity,
+            PlannedProcessQty = task.PlannedProcessQty,
+            UOM = task.UOM,
+            PlannedStartTime = task.PlannedStartTime,
+            PlannedEndTime = task.PlannedEndTime,
+            SetupTime = setupMinutes,
+            EffectiveProcessMinutes = task.EffectiveProcessMinutes,
+            Duration = task.Duration,
+            SetupSource = task.SetupSource,
+            Priority = task.Priority,
+            IsVirtual = task.IsVirtual,
+            ExecutionBatchDraftKey = task.ExecutionBatchDraftKey,
+            ContinuationKey = task.ContinuationKey,
+            StageExecutionBatchDraftKey = task.StageExecutionBatchDraftKey,
+            StageExecutionBatchQty = task.StageExecutionBatchQty,
+            ExistingMESPlanReleaseId = task.ExistingMESPlanReleaseId,
+            ExecutionLockId = task.ExecutionLockId
+        };
 
     /// <summary>
     /// 获取物料最早可用时间
@@ -1452,7 +2018,23 @@ internal class PhaseFourLocalRepair
         var occupied = resourceOccupancy.TryGetValue(resourceId, out var occList) ? occList : null;
         if (occupied is not null && !IsAscendingByStart(occupied))
         {
-            occupied = occupied.OrderBy(w => w.Start).ToList();
+            // ── 2026-10-28：顺序**原地写回**（原实现把排好序的副本丢掉 ⇒ 每次调用都白排一遍）──
+            //   实测（PV190，42,501 需求）：Phase4 20/20 栈采样落在 `RepairUnscheduledDemands`，
+            //   其中 18/20 在 `SetupOptimizer.FindSlotWithDynamicSetup`→`TryResourceSwitch`→本方法，
+            //   **13/20（65% 的采样）直接停在本行的 `OrderBy().ToList()`**。
+            //   机制：占用表由 `BuildResourceOccupancy:1004` 按 **Task 列表顺序**追加 ⇒ 建出来就无序；
+            //   而这里每次调用都重排一遍、结果只赋给**局部变量** `occupied` 就扔 ⇒ 下次进来又发现无序、又重排。
+            //   一个资源几千个占用窗 × 几百万次调用 ⇒ 白白重排几百万遍。
+            //   ⚠ **不能换对象**：`PhaseFiveCompression.CompactGaps:974` 会先取走 `windows` 引用，
+            //     跨过本次调用之后才回填（`:984`/`:1011`）；若此处把字典项换成新列表，
+            //     那边就是往一个**已脱离字典**的列表里 `Add` ⇒ 占用表丢窗 ⇒ 后续 Task 被错误前拉压实。
+            //     故用 `Clear + AddRange` **原地重排，列表实例不变**。
+            //   等价性：`OrderBy` 是**稳定**排序；本方法原本就只在「非升序」时才排，排完写回后
+            //     后续调用走「已升序」跳过分支，而「已升序」序列与其稳定排序输出逐元素相同
+            //     ⇒ 与旧实现逐元素一致。
+            var sortedByStart = occupied.OrderBy(w => w.Start).ToList();
+            occupied.Clear();
+            occupied.AddRange(sortedByStart);
         }
 
         foreach (var calWindow in calendar)
@@ -1471,7 +2053,16 @@ internal class PhaseFourLocalRepair
             }
         }
 
-        return null;
+        // ── PV195 跨窗（2026-10-29）：上面的**单窗循环一行未动**，默认也**不加**跨窗 ──
+        //   只有 `RepairUnscheduledDemands` 对「常规修复一个 Task 都没排出」的执行批做**一次**重试时，
+        //   才临时把 `constraints.AllowCrossWindowSlot` 置 true 放行到这里
+        //   ⇒ 今天能排下的结果一个都不动，跨窗只救今天出来 0 个 Task 的那类需求。
+        //   闸门还有第二层（`CrossWindowSlotLocator` 内部）：「时长 > 该资源最长日历窗」才真跨。
+        //   返回窗是真实墙钟一段，`End − Start` 大于有效加工；本文件与 Phase5 的**有效加工**消费点
+        //   早已改走 `EffectiveProcessMinutes`（见 `:363` 注释），占用口径仍用原算式。
+        return constraints.AllowCrossWindowSlot
+            ? CrossWindowSlotLocator.Locate(calendar, earliestStart, duration, occupied)
+            : null;
     }
 
     /// <summary>
@@ -1495,6 +2086,9 @@ internal class PhaseFourLocalRepair
         //   ⇒ 从「第一个 `Start >= windowStart` 的二分位」**向前回溯到不再有 `End > windowStart`** 起扫，
         //      结果与整趟扫描逐位一致。
         //   `FindFirstAvailableSlot` 是 private，调用方只有本文件 `FindForwardSlot`。
+        // ── 2026-10-26 第十一刀：此处曾与 `PhaseTwoInitialScheduler` 同改「二分跳窗」，**实测反向优化，已回滚** ──
+        //   实测与理由见 `PhaseTwoInitialScheduler.FindFirstAvailableSlot` 处的注释：
+        //   顺序前扫（预取命中）优于随机二分的 cache miss；不建索引则「跳过连续窗」省不下内存访问。
         int lo = 0, hi = occupied.Count;
         while (lo < hi)
         {
@@ -1721,7 +2315,8 @@ internal class PhaseFourLocalRepair
                         }
 
                         var resolved = SetupOptimizer.ResolveSetupCore(
-                            operation.OperationCode, resourceId, fromMaterial, demand.MaterialId,
+                            operation.OperationCode, operation.ProductionDepartmentId, operation.StageCode,
+                            resourceId, fromMaterial, demand.MaterialId,
                             constraints.SetupExactRules, constraints.SetupDefaultRules);
                         if (resolved.SetupMinutes == setupMinutes)
                         {

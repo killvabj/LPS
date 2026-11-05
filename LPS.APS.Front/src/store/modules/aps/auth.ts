@@ -230,7 +230,9 @@ const MOCK_ROLE_PRESETS: Record<
       'aps.auth.role.edit',
       'aps.auth.permission.assign',
       'aps.auth.scope.assign',
-      'aps.audit.view'
+      'aps.audit.view',
+      // 排程域维护独立码（3号位 2026-10-25 方案甲：授权矩阵 = 仅 aps.admin.system）
+      'aps.domain.edit'
     ],
     ...toBackendScope(MOCK_ROLE_SCOPE_PRESETS['aps.admin.system'])
   },

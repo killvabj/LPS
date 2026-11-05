@@ -2,6 +2,7 @@ using System.Security.Claims;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using LPS.APS.Core.Authorization;
+using LPS.APS.Core.Exceptions;
 using LPS.APS.Core.Interfaces;
 using LPS.APS.Core.Entities.APS;
 using LPS.APS.Core.Entities.Auth;
@@ -232,6 +233,9 @@ public class GovernanceController : ControllerBase
     /// </summary>
     /// <remarks>开发者：3号位</remarks>
     [Authorize(Policy = PermissionCodes.ParameterEdit)]
+    // 参数集主表删除（DELETE /parameter-set/{id}）：无任何 PUBLISHED（已发布）版本才可删（纯新建未发布族）；
+    // 含 PUBLISHED 仍只可停用。0号位（用户）2026-10-26 已按 R1 口径放行落码；2026-10-30 依用户选定「路 A」恢复主表级删除
+    // （版本级 rule-set/version/{id} 保持不开放），删除须经 FK 反查与前置审计，不新增权限码。
     [HttpDelete("parameter-set/{id}")]
     public async Task<IActionResult> DeleteParameterSet(long id, CancellationToken ct)
     {
@@ -254,6 +258,9 @@ public class GovernanceController : ControllerBase
     /// </summary>
     /// <remarks>开发者：3号位</remarks>
     [Authorize(Policy = PermissionCodes.StrategyEdit)]
+    // 策略包主表删除（DELETE /strategy-profile/{id}）：无任何 PUBLISHED（已发布）版本才可删（纯新建未发布族）；
+    // 含 PUBLISHED 仍只可停用。0号位（用户）2026-10-26 已按 R1 口径放行落码；2026-10-30 依用户选定「路 A」恢复主表级删除
+    // （版本级 rule-set/version/{id} 保持不开放），删除须经 FK 反查与前置审计，不新增权限码。
     [HttpDelete("strategy-profile/{id}")]
     public async Task<IActionResult> DeleteStrategyProfile(long id, CancellationToken ct)
     {
@@ -275,6 +282,9 @@ public class GovernanceController : ControllerBase
     /// </summary>
     /// <remarks>开发者：3号位</remarks>
     [Authorize(Policy = PermissionCodes.RuleMaintain)]
+    // 规则集主表删除（DELETE /rule-set/{id}）：无任何 PUBLISHED（已发布）版本才可删（纯新建未发布族）；
+    // 含 PUBLISHED 仍只可停用。0号位（用户）2026-10-26 已按 R1 口径放行落码；2026-10-30 依用户选定「路 A」恢复主表级删除
+    // （版本级 rule-set/version/{id} 保持不开放），删除须经 FK 反查与前置审计，不新增权限码。
     [HttpDelete("rule-set/{id}")]
     public async Task<IActionResult> DeleteRuleSet(long id, CancellationToken ct)
     {
@@ -296,7 +306,9 @@ public class GovernanceController : ControllerBase
     /// </summary>
     /// <remarks>开发者：3号位</remarks>
     [Authorize(Policy = PermissionCodes.RuleMaintain)]
-    [HttpDelete("rule-set/version/{versionId}")]
+    // FC-V1-007 未获批准，同上：摘除路由属性并标记 [NonAction]，恢复对外前须另行取得 FC-V1-007 批准。
+    // [HttpDelete("rule-set/version/{versionId}")]
+    [NonAction]
     public async Task<IActionResult> DeleteRuleSetVersion(long versionId, CancellationToken ct)
     {
         try
@@ -344,6 +356,15 @@ public class GovernanceController : ControllerBase
     [HttpPost("rule-set/version")]
     public async Task<IActionResult> CreateRuleSetVersion([FromBody] RuleSetVersion version, CancellationToken ct)
     {
+        // D-1（2026-10-29 实测修复）：空体/缺必填此前直落数据库被约束拒绝，异常逃逸成 500。
+        // 边界校验在此拦成 400，与 UpdateRuleSetVersion 的 400 口径一致。
+        var invalid = ValidateVersionCreate(version.RuleSetId, nameof(version.RuleSetId), version.VersionCode);
+        if (invalid is not null)
+        {
+            _logger.LogWarning("规则集版本创建入参非法：{Reason}", invalid);
+            return BadRequest(ApiResponse.Fail(400, invalid));
+        }
+
         var created = await _governanceService.CreateRuleSetVersionAsync(version, GetCurrentUserCode(), GetCurrentUserId(), ct);
         return CreatedAtAction(nameof(GetRuleSetVersion), new { versionId = created.Id }, ApiResponse<RuleSetVersion>.Success(created));
     }
@@ -403,6 +424,14 @@ public class GovernanceController : ControllerBase
     [HttpPost("parameter-set/version")]
     public async Task<IActionResult> CreateParameterSetVersion([FromBody] ParameterSetVersion version, CancellationToken ct)
     {
+        // D-1（2026-10-29 实测修复）：空体/缺必填此前直落数据库被约束拒绝，异常逃逸成 500。
+        var invalid = ValidateVersionCreate(version.ParameterSetId, nameof(version.ParameterSetId), version.VersionCode);
+        if (invalid is not null)
+        {
+            _logger.LogWarning("参数集版本创建入参非法：{Reason}", invalid);
+            return BadRequest(ApiResponse.Fail(400, invalid));
+        }
+
         var created = await _governanceService.CreateParameterSetVersionAsync(version, GetCurrentUserCode(), GetCurrentUserId(), ct);
         return CreatedAtAction(nameof(GetParameterSetVersion), new { versionId = created.Id }, ApiResponse<ParameterSetVersion>.Success(created));
     }
@@ -425,6 +454,43 @@ public class GovernanceController : ControllerBase
         }
     }
 
+    /// <summary>
+    /// 写入参数集版本 Stage 固定交接等待规则（R05 治理写面补全，2026-11-02；仅 DRAFT/SUBMITTED/APPROVED 可改）。
+    /// 请求体为规则 JSON 数组；写前校验 + P1-04 审计；空数组 = 删除该键（C9：本版不用该块）。
+    /// </summary>
+    /// <remarks>开发者：3号位</remarks>
+    [Authorize(Policy = PermissionCodes.ParameterEdit)]
+    [HttpPut("parameter-set/version/{versionId}/stage-handoff-wait-rules")]
+    public async Task<IActionResult> SaveStageHandoffWaitRules(long versionId, [FromBody] System.Text.Json.JsonElement body, CancellationToken ct)
+    {
+        // 兼容两种请求体：裸规则数组 [ ... ] 或包装 { rules: [...] }。以原始 JSON 文本交给服务侧，
+        // 由服务内本块专用选项（含枚举字符串转换器）反序列化——不依赖全局无枚举转换器的 Web JSON 选项，
+        // 避免 TimeBasis:"ELAPSED" 绑枚举失败。
+        string? rulesJson = body.ValueKind switch
+        {
+            System.Text.Json.JsonValueKind.Array => body.GetRawText(),
+            System.Text.Json.JsonValueKind.Object when body.TryGetProperty("rules", out var rulesNode) => rulesNode.GetRawText(),
+            _ => null,
+        };
+
+        if (string.IsNullOrEmpty(rulesJson))
+        {
+            return BadRequest(ApiResponse.Fail(400, "请求体须为规则数组或 { rules: [...] }"));
+        }
+
+        try
+        {
+            await _governanceService.SaveStageHandoffWaitRulesAsync(versionId, rulesJson, GetCurrentUserCode(), GetCurrentUserId(), ct);
+            _logger.LogInformation("参数集版本 StageHandoffWaitRules 已写入：{VersionId}", versionId);
+            return Ok(ApiResponse.Ok($"参数集版本 {versionId} StageHandoffWaitRules 已保存"));
+        }
+        catch (InvalidOperationException ex)
+        {
+            _logger.LogWarning(ex, "参数集版本 StageHandoffWaitRules 写入失败：{VersionId}", versionId);
+            return BadRequest(ApiResponse.Fail(400, ex.Message));
+        }
+    }
+
     #endregion
 
     #region 发布端点（R01/R02 验收）
@@ -443,6 +509,13 @@ public class GovernanceController : ControllerBase
             await _governanceService.PublishRuleSetVersionAsync(versionId, GetCurrentUserCode(), GetCurrentUserId(), ct, changeReason: request?.ChangeReason);
             _logger.LogInformation("规则集版本已发布：{VersionId}，发布人：{PublishedBy}", versionId, GetCurrentUserCode());
             return Ok(ApiResponse.Ok($"规则集版本 {versionId} 已发布"));
+        }
+        catch (LPS.APS.Core.Exceptions.SetupRuleDataRedLineException ex)
+        {
+            // P0-B（2026-10-27 核证收口）：Setup 同键冲突为数据红线，统一发布路径映射 422（与 SetupRuleController 发布语义
+            // `UnprocessableEntity(Fail(422, message))` 同轨，不落入下方通用 400 —— 消除两条发布路径错误分叉）。
+            _logger.LogWarning(ex, "规则集版本发布失败（Setup 冲突）：{VersionId}", versionId);
+            return UnprocessableEntity(ApiResponse.Fail(422, ex.Message));
         }
         catch (InvalidOperationException ex)
         {
@@ -725,6 +798,35 @@ public class GovernanceController : ControllerBase
         }
     }
 
+    /// <summary>策略包版本富对比（S12：06 §6.4.1「版本富对比（H1）」；a＝对比方、b＝基准方）</summary>
+    /// <remarks>
+    /// 开发者：3号位。06 该行只冻结「路径／a、b 为 VersionId／治理读／403」，**字段清单属契约空白**，
+    /// 最小 DTO 已登记为 S-14。参数方向与 <c>plan-version/{a}/compare-with/{b}</c> 同序。
+    /// </remarks>
+    [Authorize(Policy = PermissionCodes.StrategyView)]
+    [HttpGet("strategy-profile/version/{compareVersionId}/compare-with/{baseVersionId}")]
+    public async Task<IActionResult> CompareStrategyProfileVersionWith(
+        long compareVersionId,
+        long baseVersionId,
+        CancellationToken ct = default)
+    {
+        try
+        {
+            var result = await _governanceService.CompareStrategyProfileVersionRichAsync(baseVersionId, compareVersionId, ct);
+            return Ok(ApiResponse<StrategyProfileVersionComparisonDto>.Success(result));
+        }
+        catch (KeyNotFoundException ex)
+        {
+            _logger.LogWarning(ex, "策略包版本富对比失败：版本不存在");
+            return NotFound(ApiResponse<StrategyProfileVersionComparisonDto>.Fail(404, ex.Message));
+        }
+        catch (InvalidOperationException ex)
+        {
+            _logger.LogWarning(ex, "策略包版本富对比失败：{Message}", ex.Message);
+            return BadRequest(ApiResponse<StrategyProfileVersionComparisonDto>.Fail(400, ex.Message));
+        }
+    }
+
     #endregion
 
     #region 发布前校验（A-5）
@@ -784,8 +886,36 @@ public class GovernanceController : ControllerBase
     [HttpPost("strategy-profile/version")]
     public async Task<IActionResult> CreateStrategyProfileVersion([FromBody] StrategyProfileVersion version, CancellationToken ct)
     {
+        // D-1（2026-10-29 实测修复）：空体/缺必填此前直落数据库被约束拒绝，异常逃逸成 500。
+        // 策略包是组合载体，除父载体与版本编码外，两个绑定 Id 缺失同样会在写库时炸，一并拦成 400。
+        var invalid = ValidateVersionCreate(version.StrategyProfileId, nameof(version.StrategyProfileId), version.VersionCode)
+            ?? (version.RuleSetVersionId <= 0 ? "RuleSetVersionId 必须为正整数" : null)
+            ?? (version.ParameterSetVersionId <= 0 ? "ParameterSetVersionId 必须为正整数" : null);
+        if (invalid is not null)
+        {
+            _logger.LogWarning("策略包版本创建入参非法：{Reason}", invalid);
+            return BadRequest(ApiResponse.Fail(400, invalid));
+        }
+
         var created = await _governanceService.CreateStrategyProfileVersionAsync(version, GetCurrentUserCode(), GetCurrentUserId(), ct);
         return CreatedAtAction(nameof(GetStrategyProfileVersion), new { versionId = created.Id }, ApiResponse<StrategyProfileVersion>.Success(created));
+    }
+
+    /// <summary>
+    /// 建版入参边界校验（D-1）：空体或缺必填在入口拦成 400，
+    /// 避免空实体直落数据库被约束拒绝、异常逃逸成 500。
+    /// </summary>
+    /// <param name="parentId">父载体 Id（规则集 / 参数集 / 策略包）</param>
+    /// <param name="parentField">父载体字段名，用于错误提示</param>
+    /// <param name="versionCode">版本编码</param>
+    /// <returns>不合法时返回提示文本；合法返回 <c>null</c></returns>
+    private static string? ValidateVersionCreate(long parentId, string parentField, string? versionCode)
+    {
+        if (parentId <= 0)
+            return $"{parentField} 必须为正整数";
+        if (string.IsNullOrWhiteSpace(versionCode))
+            return "VersionCode 不能为空";
+        return null;
     }
 
     /// <summary>更新策略包版本（P0-02：状态机约束——已发布/失效/归档拒绝原地修改；Status/治理字段/引用字段冻结，禁止越权改状态）</summary>
@@ -839,6 +969,12 @@ public class GovernanceController : ControllerBase
     [HttpGet("strategy-profile/default")]
     public async Task<IActionResult> ResolveDefaultStrategyProfile([FromQuery] string? runType, [FromQuery] DateTime? asOf, CancellationToken ct)
     {
+        // AE-007：入参缺失属客户端错误 → 400；「同层多默认」属配置冲突 → 409（不再一律 400）
+        if (string.IsNullOrWhiteSpace(runType))
+        {
+            return BadRequest(ApiResponse.Fail(400, "解析默认策略包需要 runType 参数（对应 StrategyProfile.RunType）"));
+        }
+
         try
         {
             var version = await _governanceService.ResolveDefaultStrategyProfileVersionAsync(runType, asOf, ct);
@@ -850,7 +986,8 @@ public class GovernanceController : ControllerBase
         }
         catch (InvalidOperationException ex)
         {
-            return BadRequest(ApiResponse.Fail(400, ex.Message));
+            // AE-007 / 06 v1.41 §S5：精确优先、NULL 兜底、同层多默认 = 冲突 ⇒ HTTP 409
+            return Conflict(ApiResponse.Fail(409, ex.Message));
         }
     }
 
@@ -973,7 +1110,9 @@ public class GovernanceController : ControllerBase
     {
         try
         {
-            var newRunId = await _runLifecycleService.RecoverFailedRunAsync(failedScheduleRunId, GetCurrentUserId(), ct);
+            // 冻结主体：新 Run 的 TriggeredBy 写当前登录人工号（后端取身份，禁止信任请求体）
+            var newRunId = await _runLifecycleService.RecoverFailedRunAsync(
+                failedScheduleRunId, GetCurrentUserId(), GetCurrentUserCode(), ct);
             return Ok(ApiResponse<object>.Success(new { NewScheduleRunId = newRunId }, $"FAILED 运行 {failedScheduleRunId} 已恢复，新建运行 {newRunId}"));
         }
         catch (InvalidOperationException ex)
@@ -1002,6 +1141,11 @@ public class GovernanceController : ControllerBase
                 Actor = GetCurrentUserCode(),
             }, GetCurrentUserId(), ct);
             return Ok(ApiResponse<CandidateRunCreatedResult>.Success(result, $"白天候选运行创建成功：RunId={result.NewScheduleRunId}, CandidatePlanVersionId={result.NewPlanVersionId}"));
+        }
+        catch (ScopeViolationException ex)
+        {
+            _logger.LogWarning(ex, "白天候选运行业务范围越界：RunType={RunType}, Domain={Domain}", request?.RunType, request?.DomainKey);
+            return StatusCode(403, ApiResponse.Fail(403, ex.Message));
         }
         catch (InvalidOperationException ex)
         {
