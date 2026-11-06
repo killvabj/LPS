@@ -111,6 +111,28 @@ public static class SolverDiagnostics
         public long TaskTableAppended;
 
         /// <summary>
+        /// 2026-11-06 P2-A：外层批方案采纳命中**纯追加快路径**的次数
+        ///   （胜者表长度 ≥ 旧表，且旧表与胜者表前缀**逐引用同序**）。
+        ///   判据：`本次 ÷ (本次 + OuterAdoptFallback)` = 快路径覆盖率。纯观测，不参与任何判定。
+        /// </summary>
+        public long OuterAdoptPureAppend;
+
+        /// <summary>2026-11-06 P2-A：外层批方案采纳**回落到旧路径**（`Clear + AddRange`）的次数。纯观测。</summary>
+        public long OuterAdoptFallback;
+
+        /// <summary>2026-11-06 P2-A：快路径实际追加的 Task 条数累计。纯观测。</summary>
+        public long OuterAdoptAppendedTasks;
+
+        /// <summary>
+        /// 2026-11-06 P2-A：命中快路径时**旧表长度**的最小 / 最大值（0号位 v2.0 §三.5 要求记录）。
+        ///   最小初值 <see cref="long.MaxValue"/>，从未命中则保持初值（判读时先看计数是否为 0）。
+        /// </summary>
+        public long OuterAdoptOldCountMin = long.MaxValue;
+
+        /// <summary>2026-11-06 P2-A：命中快路径时**旧表长度**的最大值。纯观测。</summary>
+        public long OuterAdoptOldCountMax;
+
+        /// <summary>
         /// 2026-10-20 二十九次定位：批分组**整表重建**的触发原因计数（互斥，合计 = 重建次数）。
         ///   [0] 缓存标记失效 / [1] 任务表变短 / [2] 长度不短但前缀失配。纯观测。
         /// </summary>
@@ -570,7 +592,7 @@ public static class SolverDiagnostics
         /// <para>已被 <c>LPS.APS.Tests/Unit/SolverDiagnosticsSlotTests.cs</c> 钉死：
         /// 反射取最大槽号 + 1 必须等于本值，否则单测红。</para>
         /// </summary>
-        public const int HotspotCount = 77;
+        public const int HotspotCount = 78;
 
         // 2026-10-27 四十二刀：**并发安全**（候选并行前置条件）。
         //   原来用 `+=` / `++`，多线程同时写会丢更新 —— 而这两个数组正是判断「改快了没有」的唯一依据，
@@ -1031,6 +1053,14 @@ public static class SolverDiagnostics
         ///   （分子/资源集合/统计上界都可能不同，会改 `CAPACITY` 判定）。
         /// </summary>
         public const int Phase3UtilizationPerDemand = 76;
+
+        /// <summary>
+        /// 2026-11-06 P2-A：**外层批方案采纳段**的墙钟（前缀校验 + 索引对齐 + 追加/替换）。
+        ///   与 <see cref="BatchGroupAdoptReconcile"/>（嵌套在内，只覆盖索引对齐那一步）分开：
+        ///   本槽才是采纳总价，两者的差 ≈ 前缀校验 + 真正搬元素的时间。
+        ///   A/B 判据：本槽 ÷ `DemandSchedule` 或 Phase2Ms，看采纳占多少。
+        /// </summary>
+        public const int OuterAdopt = 77;
     }
 
     private static readonly AsyncLocal<Counters?> Current = new();
@@ -1636,6 +1666,20 @@ public static class SolverDiagnostics
                 + $"回滚键数 峰值={c.BatchGroupOverlayRestoreKeyMax:N0}, "
                 + $"表长−快照长 峰值={c.BatchGroupPrefixGapMax:N0}");
 
+            // ── 2026-11-06 P2-A：外层批方案采纳的「纯追加 / 回退」拆解 ──────────────
+            //   判据：快路径覆盖率 = 纯追加 ÷ (纯追加 + 回退)。覆盖率低说明本次优化基本打不中，
+            //   应回看 §三 的保守条件是否过严，而不是硬推。
+            var outerAppend = c.OuterAdoptPureAppend;
+            var outerFallback = c.OuterAdoptFallback;
+            var outerTotal = outerAppend + outerFallback;
+            Console.WriteLine(
+                $"[SHAPE] P2-A 外层采纳: 纯追加={outerAppend:N0} 次 / 回退={outerFallback:N0} 次"
+                + (outerTotal > 0 ? $" ⇒ 覆盖率 {outerAppend * 100d / outerTotal:F1}%" : " ⇒ 本 Run 未发生采纳")
+                + $", 追加 Task 累计={c.OuterAdoptAppendedTasks:N0} 条"
+                + $", 旧表长度 最小={(outerAppend > 0 ? c.OuterAdoptOldCountMin.ToString("N0") : "—")}"
+                + $"/最大={c.OuterAdoptOldCountMax:N0}"
+                + $", 采纳段墙钟={c.HotspotMs(Hotspot.OuterAdopt):N0}ms");
+
             // ── 全 68 槽分项（2026-10-27）──────────────────────────────────────
             //   【为什么必须打全】宿主夹具 `RealDomainFullRunTest.DumpSolverCounters` 只固定打印 14 个槽，
             //     导致 PV190 剖面里每次都有一大块「没名字」（run14 里 `BatchPlanTrial` 334.8 s 中
@@ -2021,6 +2065,30 @@ public static class SolverDiagnostics
     {
         if (Current.Value is not { } c) return;
         System.Threading.Interlocked.Increment(ref c.TaskTableAppended);
+    }
+
+    /// <summary>
+    /// 2026-11-06 P2-A：登记一次**外层批方案采纳**（纯追加快路径 / 回落旧路径）。
+    ///   <paramref name="oldCount"/> 只在快路径时参与最小/最大旧表长度统计（0号位 v2.0 §三.5）；
+    ///   <paramref name="appended"/> 为本次实际追加条数。纯观测，不参与任何判定。
+    ///   最小/最大的比较未加锁 —— 与既有的 `DiagnoseLockedTasksMax` 同款做法，
+    ///   多写者下最坏只是统计值偏一点，不影响任何业务判定。
+    /// </summary>
+    internal static void CountOuterAdopt(bool pureAppend, int oldCount, int appended)
+    {
+        if (Current.Value is not { } c) return;
+
+        if (pureAppend)
+        {
+            System.Threading.Interlocked.Increment(ref c.OuterAdoptPureAppend);
+            System.Threading.Interlocked.Add(ref c.OuterAdoptAppendedTasks, appended);
+            if (oldCount < c.OuterAdoptOldCountMin) c.OuterAdoptOldCountMin = oldCount;
+            if (oldCount > c.OuterAdoptOldCountMax) c.OuterAdoptOldCountMax = oldCount;
+        }
+        else
+        {
+            System.Threading.Interlocked.Increment(ref c.OuterAdoptFallback);
+        }
     }
 
     /// <summary>2026-10-20 十二次定位：`ComputeDetachPositions` 被调用次数。</summary>

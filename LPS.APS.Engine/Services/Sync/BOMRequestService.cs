@@ -86,8 +86,12 @@ public class BOMRequestService : IBOMRequestService
                 FROM Order_Canonical oc
                 WHERE oc.Status = N'OPEN'
                   AND (
+                      -- 2026-11-05 修复：原写法 SALES_ORDER 用 `BETWEEN 今天 AND 今天+90`，多了下界
+                      --   ⇒ 逾期销售订单整批不进 BOM 请求，与 sp_SyncOrdersToPartitionTable 同一个缺陷。
+                      --   业务口径「90 天以内所有订单」只卡上界；逾期单最需要排，必须纳入。
+                      --   同批修复同步覆盖：装载 SP 三处、本处 Message。
                       (oc.OrderType = 'SALES_ORDER'
-                       AND oc.DueDate BETWEEN CAST(GETDATE() AS DATE) AND DATEADD(DAY, 90, CAST(GETDATE() AS DATE)))
+                       AND oc.DueDate <= DATEADD(DAY, 90, CAST(GETDATE() AS DATE)))
                       OR
                       (oc.OrderType = 'PRODUCTION_INSTRUCTION')
                   )";

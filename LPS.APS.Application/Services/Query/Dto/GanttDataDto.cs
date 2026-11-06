@@ -78,22 +78,22 @@ public class GanttDataDto
 
     /// <summary>
     /// 游标回显：<c>hasMore=true</c> 时必给，原样回填 afterResourceId/afterStartAt/afterTaskId 即取下一页。
-    /// 排序键全序=<c>(ISNULL(ResourceId,-1), ISNULL(PlannedStartTime,'1753-01-01'), Id)</c>；
-    /// NULL 资源/NULL 起始时刻均已在此归一化回显（前端勿自拼原始行值）。
+    /// 排序键全序=<c>(ISNULL(PlannedStartTime,'1753-01-01'), Id)</c>（11-06 B 案时间序）；
+    /// 未排（NULL 起始）归一 1753-01-01 排最前；<c>resourceId</c> 仅信息回显、**不参与游标**（afterResourceId 被服务端忽略）。
     /// </summary>
     public GanttCursorDto? NextAfter { get; set; }
 }
 
-/// <summary>甘特分页游标（排序键三元组；10-29 契约）</summary>
+/// <summary>甘特分页游标（11-06 B 案：生效键=二元组 plannedStartTime+taskId；resourceId 仅信息回显不参与游标）</summary>
 public class GanttCursorDto
 {
-    /// <summary>排序键1：资源 Id；无资源任务归一为 -1</summary>
+    /// <summary>信息回显（11-06 起不参与游标；服务端忽略回传值；无资源=-1 归一）</summary>
     public int ResourceId { get; set; }
 
-    /// <summary>排序键2：计划开始时刻；未排（NULL）归一为 1753-01-01T00:00:00（SQL datetime 下限；0001 会参数溢出，勿改回）</summary>
+    /// <summary>游标键1：计划开始时刻；未排（NULL）归一为 1753-01-01T00:00:00（SQL datetime 下限；0001 会参数溢出，勿改回）</summary>
     public DateTime PlannedStartTime { get; set; }
 
-    /// <summary>排序键3：Task Id（唯一尾键，全序保证翻页不漏行不重行）</summary>
+    /// <summary>游标键2：Task Id（唯一尾键，全序保证翻页不漏行不重行）</summary>
     public long TaskId { get; set; }
 }
 
@@ -168,9 +168,11 @@ public class GanttTaskDto
     public decimal? DelayHours { get; set; }
 
     /// <summary>
-    /// 是否关键路径（Task.IsCriticalPath，冻结 07:3699 / DDL 08:4326）。
+    /// 是否关键路径。**11-05 B5 定稿：V1 恒缺键（未判定）**——落盘列 Task.IsCriticalPath 写侧恒 false
+    /// （PeggingOrchestrator 两处写死），false 并非"判过且非关键"而是"未算"；按 10-17 MesEligible 先例
+    /// 改 bool? 且查询层改投 CAST(NULL)（不让假 false 冒充判定）。真值归属 1号位（01:355），已标转办。
     /// </summary>
-    public bool IsCriticalPath { get; set; }
+    public bool? IsCriticalPath { get; set; }
 
     /// <summary>
     /// 计划工时，单位**小时**：取自库值 <c>Task.Duration</c>（DDL 08:4323，库值口径亦为**小时**）。
@@ -266,6 +268,54 @@ public class GanttTaskDto
     /// </summary>
     public string? UpstreamStageCode { get; set; }
 
+    // ─── 0号位 11-05「表里有的都反出来，部门显示名称」清单（Task 列直投；JSON 均 camelCase）───
+
+    /// <summary>生产部门 Id（Task.ProductionDepartmentId，实库 100% 有值）。JSON: productionDepartmentId</summary>
+    public int? ProductionDepartmentId { get; set; }
+
+    /// <summary>部门名称（JOIN ProductionDepartment.DeptName，如「CN机加_制造3-3课755HL」）。JSON: departmentName</summary>
+    public string? DepartmentName { get; set; }
+
+    // （工序名不设——Task 表无此列，Owner 11-05 裁「表里有的才吐」，衍生 JOIN 一并撤）
+
+    /// <summary>阶段码（Task.StageCode，100% 有值）。JSON: stageCode</summary>
+    public string? StageCode { get; set; }
+
+    /// <summary>任务类型（Task.TaskType，实库现全 PRODUCTION 单值域）。JSON: taskType</summary>
+    public string? TaskType { get; set; }
+
+    /// <summary>路线码（Task.RouteCode 原样；实库多为通用快照「DEFAULT」，与 RoutingDependency 对合时不可靠，如实回传）。JSON: routeCode</summary>
+    public string? RouteCode { get; set; }
+
+    /// <summary>路径 Id（Task.PathId，多 BOM 支号；配合 MaterialId+OperationCode 定位）。JSON: pathId</summary>
+    public int? PathId { get; set; }
+
+    /// <summary>人工槽 Id（Task.ManualSlotId，人工作业行才有值=资源侧与设备互斥身份）。JSON: manualSlotId</summary>
+    public int? ManualSlotId { get; set; }
+
+    /// <summary>生产指示号（Task.MTS_InstructionNo，A 桶关联 PI）。⚠ JSON 键=**`mtS_InstructionNo`**（同订单列表规律）。</summary>
+    public string? MTS_InstructionNo { get; set; }
+
+    /// <summary>执行批内部键（Task.StageExecutionBatchDraftKey，GUID 句柄，供追溯非展示）。JSON: stageExecutionBatchKey</summary>
+    public string? StageExecutionBatchKey { get; set; }
+
+    /// <summary>执行批量（Task.StageExecutionBatchQty，整批串行执行的数量载体）。JSON: stageExecutionBatchQty</summary>
+    public decimal? StageExecutionBatchQty { get; set; }
+
+    /// <summary>
+    /// MES 工单号（Task.MESWorkOrderNo，冻结 07:3687 可追溯执行身份；A/B 桶绑定原单、C 桶后建新单）。
+    /// 空/未建单 ⇒ null ⇒ **整键省略**（不显示空串）。
+    /// ⚠ JSON 键=**`mesWorkOrderNo`**（实测 11-05：连续大写段 MESW 后接小写 o，CamelCase 只折到 "MES" 全小写、W 保留；
+    /// 与 `MTS_`→`mtS_`（带下划线、整段折到倒数第二个）规则**不同**——本键无下划线。11-05 B2① 定稿。）
+    /// </summary>
+    public string? MESWorkOrderNo { get; set; }
+
+    /// <summary>
+    /// 下发状态（TaskDispatch.DispatchStatus——"是否已正式下发 MES"的权威载体，解 07:3721 状态0 的 PLANNED/RELEASED 歧义）。
+    /// 无下发记录 ⇒ 缺键=未下发；dev 现况 TaskDispatch 0 行、键整体缺省属真实终态。11-05 B2② 定稿。
+    /// </summary>
+    public string? DispatchStatus { get; set; }
+
     /// <summary>
     /// 换型/Setup 来源（R3 SetupSource 输出链；v1.5 §9/§10）
     /// 1号位 产出 → 2号位 原样落库 [Task].[SetupSource] → 本 DTO 透传。
@@ -314,4 +364,10 @@ public class GanttDelayReasonDto
     public string? Description { get; set; }
     public string? RelatedObjectRef { get; set; }
     public decimal? ImpactHours { get; set; }
+
+    /// <summary>
+    /// 事实层级（11-05 Q2 定稿）：'TASK'=任务级正式原因；'ORDER'=订单级事实顺挂本任务（2号位现况主体）。
+    /// 前端对 ORDER 级须标注"订单级原因"，不得冒充任务级；缺键=旧数据无层级（V1 不会出现）。JSON: objectType
+    /// </summary>
+    public string? ObjectType { get; set; }
 }

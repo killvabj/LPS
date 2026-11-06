@@ -109,8 +109,21 @@ public sealed class PrioritySegment
     /// </summary>
     public CompetitionRound? CompetitionRound { get; set; }
 
-    /// <summary>命中条件（AND 列表；全部满足才命中本 Segment）——强类型表达，不建 DSL（清单 17 红线）</summary>
+    /// <summary>
+    /// 命中条件平铺列表（所有条件 AND 才命中，存量快照语义）——保留以兼容已发布快照 RSV 477/478/1240。
+    /// 新配置优先走 <see cref="MatchConditionGroups"/>（路线甲 DNF，组内 AND／组间 OR）；
+    /// 两者并存时以条件组为准（组非空即取组），组为 null/空则回退本平铺列表（存量语义不变）。
+    /// 强类型表达，不建 DSL（清单 17 红线）。
+    /// </summary>
     public List<SegmentMatchCondition> MatchConditions { get; set; } = [];
+    /// <summary>
+    /// 条件组（路线甲 DNF：**组内 AND、组间 OR**；3号位实施包 v1.0 §一.4）。
+    /// 例「1 并 2 并(3 或 4)」＝组A{1,2,3}、组B{1,2,4}，命中＝任一 AND 组全成立。
+    /// 可选特性：<c>null</c> 或空列表＝回退 <see cref="MatchConditions"/>（存量行为不变，向后兼容）；
+    /// 匹配器先读此组、组空才回退平铺。运行侧（A系 DNF）须由 1号位 接线后才生效，
+    /// 在此之前发布投影/校验对非空条件组 fail-closed（实施包 §五 空转声明）。
+    /// </summary>
+    public List<SegmentConditionGroup>? MatchConditionGroups { get; set; }
     /// <summary>命中后本 Segment 内部排序字段（有序，依次生效）</summary>
     public List<SegmentSortField> SortFields { get; set; } = [];
 
@@ -135,6 +148,17 @@ public sealed class SegmentMatchCondition
     public object? Value { get; set; }                    // 标量；Operator=In 时为 List<object>
 }
 
+/// <summary>
+/// 一条 AND 条件组（路线甲 DNF 的「组」；组内所有 <see cref="Conditions"/> 同时满足，组间 OR）。
+/// 例「1 并 2 并(3 或 4)」＝组A{1,2,3}、组B{1,2,4}，命中＝任一 AND 组全成立。
+/// 用于命中条件与需求保护触发条件两处统一（3号位实施包 v1.0 §一.4 / §二.3）。
+/// </summary>
+public sealed class SegmentConditionGroup
+{
+    /// <summary>组内条件（AND 语义；一条条件用一条 <see cref="SegmentMatchCondition"/></summary>
+    public List<SegmentMatchCondition> Conditions { get; set; } = [];
+}
+
 public sealed class SegmentSortField
 {
     public DemandField Field { get; set; }
@@ -151,15 +175,34 @@ public enum DemandField
 {
     RemainingTimeHours,       // 与 NormalLT 的剩余时间
     DelayStatus,              // Delayed / OnTrack
-    CustomerTier,             // VIP / A / B / C
-    OrderType,                // SO / WO / Transfer ...
+    CustomerTier,             // 客户分级（值域 VIP / GENERAL；0号位《order主要字段》口径：来源=订单备注含 *VP*，含*VP*→VIP，否则 GENERAL——2026-11-06 2号位 来文核准，撤回既往"页面维护/与备注无关"定案）
+    OrderType,                // 订单类型（枚举：销售订单SALES_ORDER / 生产指示PRODUCTION_INSTRUCTION）
     IsPmcProtected,           // PMC 人工强保护
     PriorityLevel,            // 业务优先等级（若冻结允许）
     DueDate,                  // 统一交期（DATE/DATETIME2，客户要求交期）——P0-07
     IssueDate,                // 订单发行/下发日期（源事实字段，MTS 无值）——P0-07
+    // == V1.1 新增（0号位 需求优先级新增字段，3号位实施包 v1.0 §一.2）==
+    // ⚠ 新增值须先由 2号位 在 DemandPriorityExecutor.KnownFields（A系）落地比较分支、
+    //    并装入 UpstreamDemand 后方可用；在此之前切勿加入投影/校验白名单，
+    //    否则「进枚举过校验却运行侧空转」（实施包 §五 空转声明）。
+    //    枚举成员顺序不可重排（既有值按数值/名称序列化兼容）。
+    CustomerSegment,       // 客户区分（枚举：日本JAPAN/中国国内DOMESTIC/海外OVERSEAS/越南VIETNAM/工厂间INTER_FACTORY/其他OTHER）——命中条件
+    CustomerDueDate,       // 出荷指示入物流日（独立新增字段，与 DueDate 并列）——命中+段内排序
+    TransportMode,         // 运输方式（陆运LAND/海运SEA/空运AIR/快递COURIER）——段内排序
+    SalesOrderCategory,    // 销售类别（直接销售DIRECT_SALES/销售补货SALES_REPLENISHMENT）——命中+段内排序
+    DemandMaturityStatus,  // 需求成熟度（枚举：事前确认PRE_CONFIRMED / 预测（SHIKOMI）FORECAST）——需求保护触发
+    StockConsumeDay,       // 库存消耗日（离消耗天数，<=0 即需当天消耗；载体=APS合资格实物库存 ÷ ODS近90天日均消耗，CoverageDays 原值小数比较，0号位 v1.1 方案；DDL 待 0号位 批准后方由 2号位 接线装载，届时另行放行）——命中+段内排序
+    NonStockShipCategory,  // 非在库出荷区分（全额紫票FULL_PURPLE_SLIP/差额紫票DIFF_PURPLE_SLIP——2026-11-06 已核准：规则在 ERP 原始值 ZPQF（1=全额/2=差额/0=在库出荷→NULL），2号位 已装载接线，非"待 5号位/ODS 定源"）——段内排序
+    MaterialCode,          // 物料编码（模糊匹配 Contains，值如 FINAL*）——命中条件
+    Quantity,              // 订单数量——段内排序
 }
 
-public enum ConditionOperator { Equals, NotEquals, LessThan, LessOrEqual, GreaterThan, GreaterOrEqual, In }
+public enum ConditionOperator
+{
+    Equals, NotEquals, LessThan, LessOrEqual, GreaterThan, GreaterOrEqual, In,
+    /// <summary>包含（模糊匹配；供 MaterialCode 等字符串字段，实施包 v1.0 §二.2，忽略大小写，值如 FINAL*）</summary>
+    Contains,
+}
 public enum SortDirection { Asc, Desc }
 
 /// <summary>
@@ -211,11 +254,30 @@ public sealed class ProtectionTriggerParams
 {
     public bool UseRemainingTimeThreshold { get; set; }    // RemainingTime < NormalLT 触发
     public double RemainingTimeThresholdHours { get; set; }
-    public bool ProtectDelayed { get; set; }              // DelayStatus = DELAYED 触发
+    public bool ProtectDelayed { get; set; }              // 延迟状态触发（DelayStatus ∈ {FIRST_DELAY, REPEATED_DELAY}＝延迟，§一.3/§六-3，参数集字段）
     public bool ProtectVipTier { get; set; }              // CustomerTier = VIP 触发
     public string? VipTierValue { get; set; }
     public IReadOnlyList<string> ProtectedOrderTypes { get; set; } = [];  // 指定 OrderType 触发
+    /// <summary>
+    /// 需求成熟度触发（参数集字段 —— 2026-11-06 补加；需求成熟度 DemandMaturityStatus 归参数集需求保护，非规则集命中）。
+    /// 触发 = 成熟度命中 <see cref="MaturityStatusValues"/> 中任一值。Excel「事前确认**并**预测都需要」=
+    /// 值为 <c>PRE_CONFIRMED, FORECAST</c> 的 IN 集（§一.4）。
+    /// </summary>
+    public bool ProtectMaturityStatus { get; set; }
+    /// <summary>需求成熟度触发值集（默认含全部候选；由用户维护，值域 PRE_CONFIRMED / FORECAST）。</summary>
+    public IReadOnlyList<string> MaturityStatusValues { get; set; } = ["PRE_CONFIRMED", "FORECAST"];
     public bool AllowPmcManualProtection { get; set; }    // PMC 人工强保护入口
+
+    /// <summary>
+    /// 需求保护触发**条件组（路线甲 DNF：组内 AND、组间 OR）**（§一.4 / §二.3，2026-11-06 统一到 DNF）。
+    /// 触发 = 任一 AND 组全成立。复用 <see cref="SegmentConditionGroup"/>（与规则集命中同一套强类型条件）。
+    ///
+    /// **向后兼容（不替换旧布尔簇）**：本组为可选新增。组非空 ⇒ 以条件组 DNF 判定触发；
+    /// 组 null/空 ⇒ 回退旧的 <see cref="ProtectDelayed"/> / <see cref="ProtectVipTier"/> /
+    /// <see cref="ProtectMaturityStatus"/> / <see cref="ProtectedOrderTypes"/> 布尔簇（存量已发布版本契约不破坏）。
+    /// 覆盖 Excel 例：段「延迟/VIP/成熟度任一即保护」＝三组 OR；「事前确认并预测都需要」＝组内含成熟度 IN。
+    /// </summary>
+    public List<SegmentConditionGroup>? TriggerConditionGroups { get; set; }
 }
 
 public sealed class StickyProtectionParams

@@ -1,3 +1,4 @@
+using System.Globalization;
 using LPS.APS.Core.Dto;
 using LPS.APS.Core.Interfaces;
 using Microsoft.Extensions.Logging;
@@ -30,7 +31,12 @@ public sealed class DemandPriorityExecutor : IDemandPriorityExecutor
     private static readonly HashSet<string> KnownFields = new(StringComparer.OrdinalIgnoreCase)
     {
         "ORDERTYPE", "DELAYSTATUS", "CUSTOMERTIER", "DUEDATE",
-        "ISSUEDATE", "PROTECTIONSTATUS", "DEMANDKEY"
+        "ISSUEDATE", "PROTECTIONSTATUS", "DEMANDKEY",
+        // 2026-11-06 V1.1 新增（3号位 实施包 v1.0 §四.1）。**只接订单源确有值的 7 个**：
+        //   `STOCKCONSUMEDAY`（库存消耗日）/`NONSTOCKSHIPCATEGORY`（非在库出荷区分）是页面维护字段、
+        //   当前无存储载体 ⇒ 未接入。接了只会拿到 null，正是实施包 §五 点名的「配置了也空转」。
+        "CUSTOMERSEGMENT", "CUSTOMERDUEDATE", "TRANSPORTMODE", "SALESORDERCATEGORY",
+        "DEMANDMATURITYSTATUS", "NONSTOCKSHIPCATEGORY", "MATERIALCODE", "QUANTITY"
     };
 
     private readonly ILogger<DemandPriorityExecutor> _logger;
@@ -209,12 +215,24 @@ public sealed class DemandPriorityExecutor : IDemandPriorityExecutor
 
         return condition.Operator.ToUpperInvariant() switch
         {
-            "EQ" => string.Equals(fieldValue, condition.Value, StringComparison.OrdinalIgnoreCase),
-            "IN" => condition.Value.Split(',').Any(v => string.Equals(v.Trim(), fieldValue, StringComparison.OrdinalIgnoreCase)),
+            // OrderType 的 SO/WO 旧词等价归一（3号位 实施包 §二B），两侧同时施加
+            "EQ" => string.Equals(NormalizeFieldValue(condition.FieldName, fieldValue),
+                                  NormalizeFieldValue(condition.FieldName, condition.Value),
+                                  StringComparison.OrdinalIgnoreCase),
+            "IN" => condition.Value.Split(',').Any(v => string.Equals(
+                                  NormalizeFieldValue(condition.FieldName, v.Trim()),
+                                  NormalizeFieldValue(condition.FieldName, fieldValue),
+                                  StringComparison.OrdinalIgnoreCase)),
             "LT" => CompareNumericOrDate(fieldValue, condition.Value) < 0,
             "LTE" => CompareNumericOrDate(fieldValue, condition.Value) <= 0,
             "GT" => CompareNumericOrDate(fieldValue, condition.Value) > 0,
             "GTE" => CompareNumericOrDate(fieldValue, condition.Value) >= 0,
+            // 2026-11-06 实施包 v1.0 §二.2「包含」算子；**语义已由 3号位 裁定为「前缀匹配」**
+            //   （其回执 v1.0 §二-1：`FINAL*` 只匹配以 `FINAL` 开头的值，要求改 StartsWith）。
+            //   实现：忽略大小写；比较前剥结尾 `*`（`*` 只是书写习惯，`FINAL*` 与 `FINAL` 等价）。
+            //   ⚠ 首版按字面实现成子串 `Contains`，于同日按其裁决策改为 `StartsWith`。
+            "CONTAINS" => (fieldValue ?? string.Empty)
+                .StartsWith((condition.Value ?? string.Empty).TrimEnd('*'), StringComparison.OrdinalIgnoreCase),
             _ => throw new NotSupportedException($"Unsupported operator: {condition.Operator}")
         };
     }
@@ -273,6 +291,28 @@ public sealed class DemandPriorityExecutor : IDemandPriorityExecutor
         return finalOrdered.ToList();
     }
 
+    /// <summary>
+    /// 字段取值别名归一（2026-11-06，3号位 实施包 v1.0 §二B）。
+    ///
+    /// `OrderType` 的存量快照写的是旧词 `SO` / `WO`，而库内实际值是
+    /// `SALES_ORDER` / `PRODUCTION_INSTRUCTION`。3号位 在发布校验侧把四值并列为合法
+    /// （「SO=存量旧词等价 SALES_ORDER、WO 等价 PRODUCTION_INSTRUCTION，防空转不牺牲存量快照」），
+    /// 因此**运行侧必须做等价归一**，否则 EQ 严格比较下 `SO` 永远不命中 —— 配置了也空转。
+    /// 归一在**两侧同时**施加（字段实际值与配置值），保证对称；其它字段原样返回。
+    /// </summary>
+    private static string NormalizeFieldValue(string fieldName, string? value)
+    {
+        if (string.IsNullOrEmpty(value)) return value ?? string.Empty;
+        if (!string.Equals(fieldName, "ORDERTYPE", StringComparison.OrdinalIgnoreCase)) return value;
+
+        return value.Trim().ToUpperInvariant() switch
+        {
+            "SO" => "SALES_ORDER",
+            "WO" => "PRODUCTION_INSTRUCTION",
+            _ => value
+        };
+    }
+
     private string GetFieldValue(UpstreamDemand demand, string fieldName)
     {
         return fieldName.ToUpperInvariant() switch
@@ -283,11 +323,23 @@ public sealed class DemandPriorityExecutor : IDemandPriorityExecutor
             "DUEDATE" => demand.DueDate?.ToString("O") ?? string.Empty,
             "ISSUEDATE" => demand.IssueDate?.ToString("O") ?? string.Empty,
             "PROTECTIONSTATUS" => demand.ProtectionStatus ?? string.Empty,
+            // 2026-11-06 V1.1 新增（3号位 实施包 v1.0 §四.1）
+            "CUSTOMERSEGMENT"      => demand.CustomerSegment ?? string.Empty,
+            "CUSTOMERDUEDATE"      => demand.CustomerDueDate?.ToString("O") ?? string.Empty,
+            "TRANSPORTMODE"        => demand.TransportMode ?? string.Empty,
+            "SALESORDERCATEGORY"   => demand.SalesOrderCategory ?? string.Empty,
+            "DEMANDMATURITYSTATUS" => demand.DemandMaturityStatus ?? string.Empty,
+            "NONSTOCKSHIPCATEGORY" => demand.NonStockShipmentType ?? string.Empty,
+            "MATERIALCODE"         => demand.MaterialCode ?? string.Empty,
+            "QUANTITY"             => demand.Quantity?.ToString(CultureInfo.InvariantCulture) ?? string.Empty,
             "DEMANDKEY" => demand.DemandKey,
             _ => throw UnknownFieldError(fieldName)
         };
     }
 
+    /// <summary>
+    /// 段内排序取值：日期/数值必须给**强类型**，否则字符串序会把 "10" 排在 "9" 之前。
+    /// </summary>
     private IComparable GetComparableValue(UpstreamDemand demand, string fieldName)
     {
         return fieldName.ToUpperInvariant() switch
@@ -299,11 +351,20 @@ public sealed class DemandPriorityExecutor : IDemandPriorityExecutor
             "DELAYSTATUS" => demand.DelayStatus ?? string.Empty,
             "CUSTOMERTIER" => demand.CustomerTier ?? string.Empty,
             "PROTECTIONSTATUS" => demand.ProtectionStatus ?? string.Empty,
+            // 2026-11-06 V1.1 新增（3号位 实施包 v1.0 §四.1）
+            "CUSTOMERDUEDATE"      => demand.CustomerDueDate ?? DateTime.MaxValue,
+            "QUANTITY"             => demand.Quantity ?? decimal.MaxValue,
+            "CUSTOMERSEGMENT"      => demand.CustomerSegment ?? string.Empty,
+            "TRANSPORTMODE"        => demand.TransportMode ?? string.Empty,
+            "SALESORDERCATEGORY"   => demand.SalesOrderCategory ?? string.Empty,
+            "DEMANDMATURITYSTATUS" => demand.DemandMaturityStatus ?? string.Empty,
+            "NONSTOCKSHIPCATEGORY" => demand.NonStockShipmentType ?? string.Empty,
+            "MATERIALCODE"         => demand.MaterialCode ?? string.Empty,
             _ => throw UnknownFieldError(fieldName)
         };
     }
 
-    private static InvalidOperationException UnknownFieldError(string fieldName)
+        private static InvalidOperationException UnknownFieldError(string fieldName)
         => new($"DemandPriority 配置错误：未知字段名 '{fieldName}'");
 
     private int CompareNumericOrDate(string value1, string value2)

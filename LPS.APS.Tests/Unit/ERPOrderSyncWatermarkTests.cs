@@ -62,7 +62,8 @@ public class ERPOrderSyncWatermarkTests
             return Task.FromResult(orders);
         }
 
-        protected override Task BulkWriteToStagingAsync(List<ERPOrderDto> orders)
+        // 2026-11-05：基类签名增加 `syncStamp`（孤儿收口要复用同一枚本轮戳），此处跟随。
+        protected override Task BulkWriteToStagingAsync(List<ERPOrderDto> orders, DateTime? syncStamp)
         {
             BulkWriteCalls++;
             return Task.CompletedTask;

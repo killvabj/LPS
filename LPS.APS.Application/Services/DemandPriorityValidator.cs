@@ -33,7 +33,64 @@ public sealed class DemandPriorityValidator
         DemandField.OrderType,
         DemandField.DueDate,     // P0-07
         DemandField.IssueDate,   // P0-07
+        // 2026-11-06 2号位 来文核准：截 8 字段已在 `DemandPriorityExecutor.KnownFields` 真实接线（匹配+排序分支落地），放行。
+        DemandField.CustomerSegment,        // 客户区分
+        DemandField.CustomerDueDate,        // 出荷指示入物流日
+        DemandField.TransportMode,          // 运输方式
+        DemandField.SalesOrderCategory,     // 销售类别
+        DemandField.DemandMaturityStatus,   // 需求成熟度
+        DemandField.NonStockShipCategory,   // 非在库出荷区分
+        DemandField.MaterialCode,           // 物料编码
+        DemandField.Quantity,               // 数量
+        // 刻意未放行：DemandField.StockConsumeDay（库存消耗日）——载体（ODS近90天日均消耗）待 0号位 DDL 批准并 2号位 接线后才放行（防空转，非空转语义下勿放）。
     ];
+
+    /// <summary>
+    /// **值域白名单注册表**（命中条件字段 → 合法值集，2026-11-06）。
+    /// 与 <see cref="SupportedDemandFields"/>（字段名白名单）分层：
+    /// - 字段名白名单：该字段能否被使用（Source 运行侧已接线才放行）
+    /// - 值域白名单：字段可用时，其命中**值**必须落在合法枚举内
+    ///
+    /// 这里统一登记各命中字段的维护枚举值，拦截拼写错误（如 "销售"、"SALESORDER"、"一般"）在发布期
+    /// 即拒绝，避免运行期与实库/维护值比对时空匹配或误匹配。
+    ///
+    /// 注意：**新字段的字段名白名单仍须 1号位 在 A系 <c>KnownFields</c> 接线后**才由
+    /// <see cref="SupportedDemandFields"/> 放行；值域白名单可先行登记（纯登记、不改变可用性），
+    /// 待字段可用时即作为第二道闸自动生效（实施包 §五 空转声明）。
+    /// </summary>
+    private static readonly Dictionary<DemandField, IReadOnlySet<string>> SupportedFieldValues = new()
+    {
+        [DemandField.OrderType] = new HashSet<string>
+        {
+            // 注意：存量运行侧 OrderType 用 `SO`/`WO` 旧词（快照478、In["SO","WO"] 即此），
+            // Excel 新规则词为 SALES_ORDER/PRODUCTION_INSTRUCTION。二者是**同义别名**，须并存，
+            // 否则值域校验会误拦存量快照、致重新发布原地失败（防空转不得牺牲存量兼容）。
+            // 别名映射：SO = SALES_ORDER（销售订单）、WO = PRODUCTION_INSTRUCTION（生产指示）。
+            "SALES_ORDER",            // 销售订单（Excel 新词）
+            "PRODUCTION_INSTRUCTION", // 生产指示（Excel 新词）
+            "SO",                     // 存量旧词（等价 SALES_ORDER）
+            "WO",                     // 存量旧词（等价 PRODUCTION_INSTRUCTION）
+        },
+        // == V1.1 新增字段值域（备登记；字段名白名单待 1号位 A系 接线后放行）==
+        [DemandField.CustomerSegment] = new HashSet<string>
+        {
+            "JAPAN", "DOMESTIC", "OVERSEAS", "VIETNAM", "INTER_FACTORY", "OTHER",
+        },
+        [DemandField.SalesOrderCategory] = new HashSet<string>
+        {
+            "DIRECT_SALES", "SALES_REPLENISHMENT",
+        },
+        [DemandField.TransportMode] = new HashSet<string>
+        {
+            "LAND", "SEA", "AIR", "COURIER",
+        },
+        // 注：DemandMaturityStatus（需求成熟度）不在此册——归属参数集（需求保护，非规则集命中），
+        //     其值域 PRE_CONFIRMED/FORECAST 由参数集保护条件（§一.4 IN 集）承载。
+        [DemandField.NonStockShipCategory] = new HashSet<string>
+        {
+            "FULL_PURPLE_SLIP", "DIFF_PURPLE_SLIP",
+        },
+    };
 
     /// <summary>
     /// 运行侧支持的操作符白名单（执行器只有 EQ/IN/LT/LTE/GT/GTE，**无 NE**）。
@@ -165,6 +222,22 @@ public sealed class DemandPriorityValidator
         {
             errors.Add($"Segment {segmentOrder}: IN 操作符的值必须是列表类型");
         }
+
+        // 值域白名单：命中字段若登记了合法值集，校验其值（Equals 单值 / In 列表）是否落在值域内
+        //（2026-11-06）。OrderType 及 V1.1 命中字段已登记，拦截拼写错在发布期。
+        if (SupportedFieldValues.TryGetValue(condition.Field, out var allowed)
+            && condition.Operator is ConditionOperator.Equals or ConditionOperator.In)
+        {
+            foreach (var v in EnumerateConditionValues(condition.Value))
+            {
+                if (!allowed.Contains(v, StringComparer.Ordinal))
+                {
+                    errors.Add(
+                        $"Segment {segmentOrder}: {condition.Field} 命中值 {v} 不在合法值域内"
+                        + $"（支持 {string.Join(" / ", allowed)}）");
+                }
+            }
+        }
     }
 
     /// <summary>IN 的值必须是列表。JSON 数组经 System.Text.Json 反序列化为 <see cref="JsonElement"/>（非 List&lt;object&gt;），
@@ -177,6 +250,37 @@ public sealed class DemandPriorityValidator
         System.Collections.IEnumerable => true,
         _ => false
     };
+
+    /// <summary>
+    /// 提取命中值清单（兼容 Equals 的 string 与 In 的 JsonElement 数组两种形态）。
+    /// 只在 <see cref="ValidateMatchCondition"/> 对 Equals/In 操作符调用；null 返回空集。
+    /// </summary>
+    private static IEnumerable<string> EnumerateConditionValues(object? value)
+    {
+        if (value is null)
+        {
+            return [];
+        }
+
+        if (value is JsonElement { ValueKind: JsonValueKind.Array } array)
+        {
+            return array.EnumerateArray()
+                .Select(e => e.ValueKind == JsonValueKind.String ? e.GetString() : null)
+                .OfType<string>();
+        }
+
+        if (value is JsonElement { ValueKind: JsonValueKind.String } str)
+        {
+            return [str.GetString() ?? string.Empty];
+        }
+
+        if (value is System.Collections.IEnumerable sequence and not string)
+        {
+            return sequence.Cast<object?>().Select(v => v?.ToString()).OfType<string>();
+        }
+
+        return [value.ToString() ?? string.Empty];
+    }
 
     /// <summary>
     /// 校验 Segment 引用的所有 DemandField 均在 Matcher 支持白名单内（P0-07）。

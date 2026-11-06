@@ -36,15 +36,15 @@ public interface IScheduleQueryService
     /// 冻结 05:1013 要求「Gantt按时间窗/资源加载」，故支持可选时间窗与资源过滤。
     /// ⚠ 10-29 分页契约（4号位 三步走·第 1 步）：<b>任务条单次上限恒存在</b>——
     /// 不传 limit 亦按默认 8,000 截断返回（hasMore/totalTasks 显式声明），「不传=全量」旧语义终结；
-    /// 全量导出不属于本端点职责。翻页=游标三元组回填（排序键全序，不漏不重）。
+    /// 全量导出不属于本端点职责。翻页=游标二元组(归一起始时刻,TaskId)回填（11-06 时间序全序，不漏不重）。
     /// </summary>
     /// <param name="from">时间窗起（含）。按任务区间相交过滤：PlannedEndTime ≥ from；无计划时间的任务始终保留。</param>
     /// <param name="to">时间窗止（含）。PlannedStartTime ≤ to；无计划时间的任务始终保留。</param>
     /// <param name="resourceIds">资源过滤（可选）。空/ null = 不过滤。</param>
     /// <param name="limit">单次任务条上限；null=8,000（缺省），钳制 1..20,000。</param>
-    /// <param name="afterResourceId">游标·排序键1（上页 nextAfter.resourceId）；三参须成套传，缺一即视为首页。</param>
-    /// <param name="afterStartAt">游标·排序键2（归一后时刻，NULL 起排传 1753-01-01）。</param>
-    /// <param name="afterTaskId">游标·排序键3（Task Id）。</param>
+    /// <param name="afterResourceId">**已忽略**（11-06 排序改时间序；保留入参纯为软兼容旧前端回传，不要求成套）。</param>
+    /// <param name="afterStartAt">游标·排序键1（归一后时刻，NULL 起排传 1753-01-01）。</param>
+    /// <param name="afterTaskId">游标·排序键2（Task Id）；有值即翻页。</param>
     Task<GanttDataDto> GetGanttAsync(
         int userId,
         int planVersionId,

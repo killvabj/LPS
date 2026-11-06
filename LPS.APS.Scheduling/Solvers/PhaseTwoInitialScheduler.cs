@@ -1402,13 +1402,47 @@ internal class PhaseTwoInitialScheduler
                 //   ⇒ 之后每一次试排副本的「前缀 + 尾巴」校验全部落空 ⇒ 每次都独立建（实测 17,774 次 × 937 µs）。
                 // 2026-10-27 四十七刀「共享底表」分支**已撤销**（当日 A/B：吞吐 −18%~−27%，见池上方结论）
                 //   ⇒ 这里恢复为唯一的整表替换路径。
+                // ── 2026-11-06 P2-A（0号位《Phase2源码级性能优化明确实施指令 v2.0》§三）──
+                //   原写法：无论胜出方案是否只是「原 Task 不变 + 本需求新增若干」，都对全部历史 Task
+                //     做 `Clear() + AddRange()` 整表替换 —— 表越长越贵，而内容上往往只是纯追加。
+                //   新写法：先做一次保守判定（不满足就走旧路径）——
+                //     ① 胜者表长度 ≥ 旧表长度；② 旧表与胜者表的**前缀逐引用同序**（`SameReferences` 向量化比对）。
+                //     两条都成立 ⇒ 只把 `winner[oldCount..]` 追加到**原 List 对象**上。
+                //   等价性：前缀逐引用相同 ⇒ 追加后的内容与 `Clear+AddRange` 的**逐位相同**（元素身份、次序一致）；
+                //     唯一差别是不换 List 对象、不做整表搬运。任务对象本身是否被就地改过都不影响结论 ——
+                //     前缀是同一批对象引用，改没改两边看到的内容都一样。
+                //   索引：`TryReconcileBatchGroupsBeforeReplace` 已有「新表 = 快照 + 尾巴」快路径，
+                //     会在下面这次调用里把新尾巴加进桶与快照；它**不改归属表**（`_batchGroupsSnapshotOwner`
+                //     仍指向这个真表）⇒ 追加后索引与真表仍一致。
+                //   不满足上面两条 ⇒ 原封不动走旧路径（`Clear + AddRange`），行为与改前逐字一致。
+                //   ⚠ 仅 Task 表走快路径；份额表 / 资源占用 / ProductTimeline / TraceNotes / 选路 /
+                //     数量与时间链全部照旧在下面按原逻辑采纳（0号位 §三.4 明确要求）。
+                var oldTaskCount = result.ScheduledTasks.Count;
+                var winnerTasks = pickedBatchPlan.Tasks;
+                var pureAppend = IsOuterAdoptPureAppend(result.ScheduledTasks, winnerTasks);
+
+                long swOuterAdopt = SolverDiagnostics.HotspotStart();
+
                 long swAdoptReconcile = SolverDiagnostics.HotspotStart();
                 var adoptAligned = TryReconcileBatchGroupsBeforeReplace(
-                    result.ScheduledTasks, pickedBatchPlan.Tasks);
+                    result.ScheduledTasks, winnerTasks);
                 SolverDiagnostics.HotspotEnd(swAdoptReconcile, SolverDiagnostics.Hotspot.BatchGroupAdoptReconcile);
 
-                result.ScheduledTasks.Clear();
-                result.ScheduledTasks.AddRange(pickedBatchPlan.Tasks);
+                if (pureAppend)
+                {
+                    for (int i = oldTaskCount; i < winnerTasks.Count; i++)
+                    {
+                        result.ScheduledTasks.Add(winnerTasks[i]);
+                    }
+                }
+                else
+                {
+                    result.ScheduledTasks.Clear();
+                    result.ScheduledTasks.AddRange(winnerTasks);
+                }
+
+                SolverDiagnostics.HotspotEnd(swOuterAdopt, SolverDiagnostics.Hotspot.OuterAdopt);
+                SolverDiagnostics.CountOuterAdopt(pureAppend, oldTaskCount, winnerTasks.Count - oldTaskCount);
 
                 // 对齐失败 ⇒ 在**真表已换好之后**重建成「镜像真表」的那份（与改前同价，且把归属绑回真表）。
                 //   重建本身走的是同一套前缀校验：恰好能增量就走增量，不能就整表重建。
@@ -8791,6 +8825,50 @@ internal class PhaseTwoInitialScheduler
     /// 【为什么快】`Span&lt;nint&gt;.SequenceEqual` 走 `SpanHelpers` 的向量化路径（一次比 16/32 字节），
     ///   而 `Span&lt;引用类型&gt;` 的 `SequenceEqual` / 手写 `ReferenceEquals` 循环**不能**向量化。
     /// </summary>
+    /// <summary>
+    /// 2026-11-06 P2-A：判断「外层批方案采纳」能否走**纯追加快路径**
+    ///   （0号位《Phase2源码级性能优化明确实施指令 v2.0》§三）。
+    ///
+    /// <para>【条件】① 胜者表长度 ≥ 旧表长度；② 旧表与胜者表的**前缀逐引用同序**。</para>
+    ///
+    /// <para>【为什么这两条够】前缀逐引用相同 ⇒ 把胜者的尾巴追加到旧表之后，内容与
+    ///   `Clear + AddRange(胜者表)` **逐位相同**（元素身份、次序一致）。任务对象是否被就地改过
+    ///   都不影响结论：前缀是同一批对象引用，两边看到的内容一致。</para>
+    ///
+    /// <para>【不满足时】返回 false，调用方必须走旧的整表替换路径 —— 含「胜者表更短」（真实合批摘除、
+    ///   Stage 合批后重排）、「前缀失配」（中间插入/替换）两类。宁可回落，不猜。</para>
+    ///
+    /// <para>【可见性】`private` → **`internal`**，仅供 `LPS.APS.Tests` 直接断言判定本身；业务语义未变。</para>
+    /// </summary>
+    internal static bool IsOuterAdoptPureAppend(
+        List<FinalTaskDraft> current,
+        List<FinalTaskDraft> winner)
+    {
+        if (!OuterAdoptAppendEnabled) return false;
+        if (winner.Count < current.Count) return false;
+        return SameReferences(
+            CollectionsMarshal.AsSpan(current),
+            CollectionsMarshal.AsSpan(winner).Slice(0, current.Count));
+    }
+
+    /// <summary>
+    /// 2026-11-06 P2-A **回退开关**：环境变量 `APS_P2_OUTER_APPEND=0`（或 `false`）⇒ 关闭纯追加快路径，
+    ///   回到整改前的 `Clear + AddRange` 整表替换。默认**开启**。进程内只读一次。
+    ///
+    /// <para>【为什么要有】0号位 v2.0 §八.5 要求每项优化交付「可回退开关」；
+    ///   同一二进制靠开关跑 A/B 也避免了两份 DLL 交叉污染读数。开关判否时走的是与改前**逐字相同**的旧路径
+    ///   （含索引对齐调用顺序不变），因此关掉即等于回到 r14057 的行为。</para>
+    /// </summary>
+    internal static bool OuterAdoptAppendEnabled { get; } = ReadOuterAdoptAppendSwitch();
+
+    private static bool ReadOuterAdoptAppendSwitch()
+    {
+        var raw = Environment.GetEnvironmentVariable("APS_P2_OUTER_APPEND");
+        if (string.IsNullOrWhiteSpace(raw)) return true;
+        return !(raw.Trim() == "0"
+                 || string.Equals(raw.Trim(), "false", StringComparison.OrdinalIgnoreCase));
+    }
+
     private static bool SameReferences(Span<FinalTaskDraft> left, Span<FinalTaskDraft> right)
     {
         if (left.Length != right.Length) return false;

@@ -87,7 +87,7 @@ public class FrozenStrategySnapshotProviderTests
                 },
                 new SupplyBlock
                 {
-                    Inventory = new InventoryAvailabilityRule { IsEnabled = true, WarehousePriority = new List<string> { "WH01" } }
+                    Inventory = new LPS.APS.Core.Dto.InventoryAvailabilityRule { IsEnabled = true, WarehousePriority = new List<string> { "WH01" } }
                 },
                 new ProcurementBlock
                 {
@@ -200,7 +200,7 @@ public class FrozenStrategySnapshotProviderTests
 
         var supplyJson = JsonSerializer.Serialize(new SupplyBlock
         {
-            Inventory = new InventoryAvailabilityRule
+            Inventory = new LPS.APS.Core.Dto.InventoryAvailabilityRule
             {
                 IsEnabled = true,
                 WarehousePriority = new List<string> { "WH01", "WH02" }

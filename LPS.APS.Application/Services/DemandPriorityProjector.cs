@@ -97,17 +97,30 @@ internal static class DemandPriorityProjector
         };
     }
 
-    private static PrioritySegmentConfig ProjectSegment(PrioritySegment segment, int competitionRound) => new()
+    private static PrioritySegmentConfig ProjectSegment(PrioritySegment segment, int competitionRound)
     {
-        CompetitionRound = competitionRound,
-        SegmentOrder = segment.SegmentOrder,
-        IsEnabled = segment.IsEnabled,
-        MatchConditions = segment.MatchConditions.Select(ProjectCondition).ToList(),
-        SortFields = segment.SortFields.Select(ProjectSortField).ToList(),
-        // Tie-break 已是强类型枚举，成员名即执行器词表词 ⇒ 只做 ToString()，
-        // 不再有别名换算（历史别名已在 TieBreakFieldJsonConverter 的反序列化处归一化）。
-        StableTieBreakFields = segment.StableTieBreakFields.Select(t => t.ToString()).ToList(),
-    };
+        // 路线甲 DNF 条件组：运行侧（A系）尚未接线，投影层不支持。若不拦而只投平铺 MatchConditions，
+        // 会静默丢掉条件组、导致命中判定错误——比报错危险得多，故 fail-closed（实施包 §五 空转声明）。
+        if (segment.MatchConditionGroups is { Count: > 0 })
+        {
+            throw new NotSupportedException(
+                $"DemandPriority 快照 Segment {segment.SegmentOrder}({segment.SegmentName}) 使用了"
+                + " 条件组 MatchConditionGroups（路线甲 DNF），但 2号位 执行器/1号位 A系 DNF 尚未接线，"
+                + " 投影暂不支持；请先 1↔3 契约对齐接线后再启用，不得静默丢弃。");
+        }
+
+        return new PrioritySegmentConfig
+        {
+            CompetitionRound = competitionRound,
+            SegmentOrder = segment.SegmentOrder,
+            IsEnabled = segment.IsEnabled,
+            MatchConditions = segment.MatchConditions.Select(ProjectCondition).ToList(),
+            SortFields = segment.SortFields.Select(ProjectSortField).ToList(),
+            // Tie-break 已是强类型枚举，成员名即执行器词表词 ⇒ 只做 ToString()，
+            // 不再有别名换算（历史别名已在 TieBreakFieldJsonConverter 的反序列化处归一化）。
+            StableTieBreakFields = segment.StableTieBreakFields.Select(t => t.ToString()).ToList(),
+        };
+    }
 
     private static MatchCondition ProjectCondition(SegmentMatchCondition condition) => new()
     {
@@ -140,6 +153,16 @@ internal static class DemandPriorityProjector
         DemandField.OrderType => "ORDERTYPE",
         DemandField.DueDate => "DUEDATE",
         DemandField.IssueDate => "ISSUEDATE",
+        // 2026-11-06 V1.1（3号位 实施包 v1.0 §一.2）。**只映射执行器已接线的 7 个**；
+        //   StockConsumeDay / NonStockShipCategory 是页面维护字段、当前无载体 ⇒ 仍 fail-closed。
+        DemandField.CustomerSegment      => "CUSTOMERSEGMENT",
+        DemandField.CustomerDueDate      => "CUSTOMERDUEDATE",
+        DemandField.TransportMode        => "TRANSPORTMODE",
+        DemandField.SalesOrderCategory   => "SALESORDERCATEGORY",
+        DemandField.DemandMaturityStatus => "DEMANDMATURITYSTATUS",
+        DemandField.NonStockShipCategory  => "NONSTOCKSHIPCATEGORY",
+        DemandField.MaterialCode         => "MATERIALCODE",
+        DemandField.Quantity             => "QUANTITY",
         // RemainingTimeHours / IsPmcProtected / PriorityLevel：快照枚举里有，但执行器白名单无对应字段。
         // 不猜配（例如把 IsPmcProtected 猜成 PROTECTIONSTATUS）——静默错排比报错危险得多。
         _ => throw new NotSupportedException(
@@ -157,6 +180,8 @@ internal static class DemandPriorityProjector
         ConditionOperator.GreaterThan => "GT",
         ConditionOperator.GreaterOrEqual => "GTE",
         ConditionOperator.In => "IN",
+        // 2026-11-06：实施包 v1.0 §二.2 新增「包含」算子（供 MaterialCode 模糊匹配）
+        ConditionOperator.Contains => "CONTAINS",
         _ => throw new NotSupportedException(
             $"DemandPriority 快照操作符 {op} 不受 2号位 执行器支持（支持 EQ/IN/LT/LTE/GT/GTE）")
     };

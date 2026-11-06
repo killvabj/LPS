@@ -256,7 +256,7 @@ public class FrozenStrategySnapshotProviderIntegrationTests : IDisposable
 
         var supplyJson = JsonSerializer.Serialize(new SupplyBlock
         {
-            Inventory = new InventoryAvailabilityRule
+            Inventory = new LPS.APS.Core.Dto.InventoryAvailabilityRule
             {
                 IsEnabled = true,
                 WarehousePriority = new List<string> { "WH-TEST-01", "WH-TEST-02" },

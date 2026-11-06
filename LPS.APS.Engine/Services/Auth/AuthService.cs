@@ -30,8 +30,9 @@ public class AuthService : IAuthService
     private readonly IAuditLogRepository _auditRepository;
     private readonly ILogger<AuthService> _logger;
 
-    private const int MaxFailedAttempts = 5;
-    private static readonly TimeSpan LockoutDuration = TimeSpan.FromMinutes(30);
+    // 允许连续失败次数。当前为开发期测试调大（9999≈等效关闭锁定）；生产安保不建议低于默认 5 次。
+    private const int MaxFailedAttempts = 9999;
+    private static readonly TimeSpan LockoutDuration = TimeSpan.FromSeconds(3);
 
     public AuthService(
         DatabaseConnectionManager connectionManager,

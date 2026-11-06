@@ -32,6 +32,16 @@ public class ERPOrderDto
     public string? JPOrderNo { get; set; }
     public string? SalesOrderCategory { get; set; }
     public string? DemandMaturityStatus { get; set; }
+    /// <summary>2026-11-06 新增：合同号，需求成熟度 SHIKOMI 判据（有值且<>'准备订单' ⇒ FORECAST）。</summary>
+    public string? ContractNo { get; set; }
+
+    /// <summary>
+    /// 2026-11-06 新增：ERP 原始型号（冻结 07 v5.1.16 §3494 / §3652、08 DDL :4162 要求
+    /// `Order_Canonical.SourceModel` 与 `[Order].SourceModel` 逐级透传）。
+    /// <para>⚠ 与 `MaterialCode` **同值但不是替代关系**：视图里 `MaterialCode = Cast(Model AS NVARCHAR(100))`，
+    /// 两者当前相等；`SourceModel` 只作 ERP 原始型号追溯，不参与主料号判定。</para>
+    /// </summary>
+    public string? SourceModel { get; set; }
 
     public DateTime CreatedAt { get; set; }
     public DateTime UpdatedAt { get; set; }

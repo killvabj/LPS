@@ -32,7 +32,31 @@ public sealed class DemandPriorityMatcher
             return false;
         }
 
-        // AND 语义：所有条件必须满足
+        // 路线甲 DNF（3号位实施包 v1.0 §一.4）：条件组优先——组内 AND，组间 OR；任一 AND 组全成立即命中。
+        if (segment.MatchConditionGroups is { Count: > 0 })
+        {
+            foreach (var group in segment.MatchConditionGroups)
+            {
+                var groupMatched = true;
+                foreach (var condition in group.Conditions)
+                {
+                    if (!EvaluateCondition(demand, condition))
+                    {
+                        groupMatched = false;
+                        break;
+                    }
+                }
+
+                if (groupMatched)
+                {
+                    return true; // 任一 AND 组全成立 ⇒ 命中
+                }
+            }
+
+            return false; // 所有 AND 组均未全成立
+        }
+
+        // 存量平铺语义：组 null/空时回退 MatchConditions（所有条件 AND 满足才命中）——向后兼容
         foreach (var condition in segment.MatchConditions)
         {
             if (!EvaluateCondition(demand, condition))
@@ -190,6 +214,34 @@ public sealed class DemandPriorityMatcher
             DemandField.IssueDate => direction == SortDirection.Asc
                 ? group.OrderBy(d => d.IssueDate)
                 : group.OrderByDescending(d => d.IssueDate),
+            // == V1.1 新增排序字段（3号位实施包 v1.0 §二；CSharpSortKey 复用字符串比较稳定序）==
+            DemandField.CustomerSegment => direction == SortDirection.Asc
+                ? group.OrderBy(d => d.CustomerSegment, StringComparer.Ordinal)
+                : group.OrderByDescending(d => d.CustomerSegment, StringComparer.Ordinal),
+            DemandField.CustomerDueDate => direction == SortDirection.Asc
+                ? group.OrderBy(d => d.CustomerDueDate)
+                : group.OrderByDescending(d => d.CustomerDueDate),
+            DemandField.TransportMode => direction == SortDirection.Asc
+                ? group.OrderBy(d => d.TransportMode, StringComparer.Ordinal)
+                : group.OrderByDescending(d => d.TransportMode, StringComparer.Ordinal),
+            DemandField.SalesOrderCategory => direction == SortDirection.Asc
+                ? group.OrderBy(d => d.SalesOrderCategory, StringComparer.Ordinal)
+                : group.OrderByDescending(d => d.SalesOrderCategory, StringComparer.Ordinal),
+            DemandField.DemandMaturityStatus => direction == SortDirection.Asc
+                ? group.OrderBy(d => d.DemandMaturityStatus, StringComparer.Ordinal)
+                : group.OrderByDescending(d => d.DemandMaturityStatus, StringComparer.Ordinal),
+            DemandField.StockConsumeDay => direction == SortDirection.Asc
+                ? group.OrderBy(d => d.StockConsumeDay)
+                : group.OrderByDescending(d => d.StockConsumeDay),
+            DemandField.NonStockShipCategory => direction == SortDirection.Asc
+                ? group.OrderBy(d => d.NonStockShipCategory, StringComparer.Ordinal)
+                : group.OrderByDescending(d => d.NonStockShipCategory, StringComparer.Ordinal),
+            DemandField.MaterialCode => direction == SortDirection.Asc
+                ? group.OrderBy(d => d.MaterialCode, StringComparer.Ordinal)
+                : group.OrderByDescending(d => d.MaterialCode, StringComparer.Ordinal),
+            DemandField.Quantity => direction == SortDirection.Asc
+                ? group.OrderBy(d => d.Quantity)
+                : group.OrderByDescending(d => d.Quantity),
             _ => throw new NotSupportedException($"不支持的排序字段：{field}")
         };
     }
@@ -229,6 +281,34 @@ public sealed class DemandPriorityMatcher
             DemandField.IssueDate => direction == SortDirection.Asc
                 ? query.ThenBy(d => d.IssueDate)
                 : query.ThenByDescending(d => d.IssueDate),
+            // == V1.1 新增排序字段（3号位实施包 v1.0 §二；与 ApplySort 同规则）==
+            DemandField.CustomerSegment => direction == SortDirection.Asc
+                ? query.ThenBy(d => d.CustomerSegment, StringComparer.Ordinal)
+                : query.ThenByDescending(d => d.CustomerSegment, StringComparer.Ordinal),
+            DemandField.CustomerDueDate => direction == SortDirection.Asc
+                ? query.ThenBy(d => d.CustomerDueDate)
+                : query.ThenByDescending(d => d.CustomerDueDate),
+            DemandField.TransportMode => direction == SortDirection.Asc
+                ? query.ThenBy(d => d.TransportMode, StringComparer.Ordinal)
+                : query.ThenByDescending(d => d.TransportMode, StringComparer.Ordinal),
+            DemandField.SalesOrderCategory => direction == SortDirection.Asc
+                ? query.ThenBy(d => d.SalesOrderCategory, StringComparer.Ordinal)
+                : query.ThenByDescending(d => d.SalesOrderCategory, StringComparer.Ordinal),
+            DemandField.DemandMaturityStatus => direction == SortDirection.Asc
+                ? query.ThenBy(d => d.DemandMaturityStatus, StringComparer.Ordinal)
+                : query.ThenByDescending(d => d.DemandMaturityStatus, StringComparer.Ordinal),
+            DemandField.StockConsumeDay => direction == SortDirection.Asc
+                ? query.ThenBy(d => d.StockConsumeDay)
+                : query.ThenByDescending(d => d.StockConsumeDay),
+            DemandField.NonStockShipCategory => direction == SortDirection.Asc
+                ? query.ThenBy(d => d.NonStockShipCategory, StringComparer.Ordinal)
+                : query.ThenByDescending(d => d.NonStockShipCategory, StringComparer.Ordinal),
+            DemandField.MaterialCode => direction == SortDirection.Asc
+                ? query.ThenBy(d => d.MaterialCode, StringComparer.Ordinal)
+                : query.ThenByDescending(d => d.MaterialCode, StringComparer.Ordinal),
+            DemandField.Quantity => direction == SortDirection.Asc
+                ? query.ThenBy(d => d.Quantity)
+                : query.ThenByDescending(d => d.Quantity),
             _ => throw new NotSupportedException($"不支持的排序字段：{field}")
         };
     }
@@ -250,6 +330,7 @@ public sealed class DemandPriorityMatcher
             ConditionOperator.GreaterThan => CompareValues(fieldValue, targetValue) > 0,
             ConditionOperator.GreaterOrEqual => CompareValues(fieldValue, targetValue) >= 0,
             ConditionOperator.In => IsInList(fieldValue, targetValue),
+            ConditionOperator.Contains => ContainsValue(fieldValue, targetValue),
             _ => throw new NotSupportedException($"不支持的操作符：{condition.Operator}")
         };
     }
@@ -293,6 +374,16 @@ public sealed class DemandPriorityMatcher
             // P0-07：日期字段（配合 CompareValues 的 IComparable 日期比较，支持 LessThan/GreaterThan 等匹配）
             DemandField.DueDate => demand.DueDate,
             DemandField.IssueDate => demand.IssueDate,
+            // == V1.1 新增（3号位实施包 v1.0 §二，B系参考实现——A系接线前经此可测）==
+            DemandField.CustomerSegment => demand.CustomerSegment,
+            DemandField.CustomerDueDate => demand.CustomerDueDate,
+            DemandField.TransportMode => demand.TransportMode,
+            DemandField.SalesOrderCategory => demand.SalesOrderCategory,
+            DemandField.DemandMaturityStatus => demand.DemandMaturityStatus,
+            DemandField.StockConsumeDay => demand.StockConsumeDay,
+            DemandField.NonStockShipCategory => demand.NonStockShipCategory,
+            DemandField.MaterialCode => demand.MaterialCode,
+            DemandField.Quantity => demand.Quantity,
             _ => throw new NotSupportedException($"不支持的字段：{field}")
         };
     }
@@ -352,6 +443,27 @@ public sealed class DemandPriorityMatcher
     }
 
     /// <summary>
+    /// 包含匹配（Contains 操作符；供 MaterialCode 等字符串模糊匹配，忽略大小写，值如 FINAL*）。
+    /// 字段值为 null 或目标为 null 时返回 false（fail-closed，不视为包含）。
+    /// </summary>
+    private static bool ContainsValue(object? fieldValue, object? targetValue)
+    {
+        if (fieldValue is null || targetValue is null)
+        {
+            return false;
+        }
+
+        var source = fieldValue.ToString()!;
+        var keyword = targetValue.ToString()!.TrimEnd('*'); // 容忍末位 * 通配记号，去掉后按子串包含
+        if (keyword.Length == 0)
+        {
+            return true; // 裸 * 视为匹配任意非空值
+        }
+
+        return source.Contains(keyword, StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
     /// 字段值比较器（处理 nullable 值类型装箱问题）
     /// </summary>
     private class FieldValueComparer : IComparer<object?>
@@ -393,4 +505,15 @@ public sealed class DemandRecord
     public DateTime? DueDate { get; init; }
     /// <summary>订单发行日期（P0-07：DemandField.IssueDate 排序/匹配；MTS 订单无值可为 null）</summary>
     public DateTime? IssueDate { get; init; }
+
+    // == V1.1 新增（3号位实施包 v1.0 §二，B系参考实现字段；A系接线前经此可测，2号位装入 UpstreamDemand 后对接）==
+    public string? CustomerSegment { get; init; }        // 客户区分
+    public DateTime? CustomerDueDate { get; init; }      // 出荷指示入物流日（独立字段，与 DueDate 并列）
+    public string? TransportMode { get; init; }          // 运输方式
+    public string? SalesOrderCategory { get; init; }     // 销售类别
+    public string? DemandMaturityStatus { get; init; }   // 需求成熟度
+    public int? StockConsumeDay { get; init; }           // 库存消耗日（离消耗天数，<=0 即当天消耗；源待 5号位/ODS 定源）
+    public string? NonStockShipCategory { get; init; }   // 非在库出荷区分（紫票；源待 5号位/ODS 定源）
+    public string? MaterialCode { get; init; }           // 物料编码（模糊匹配 Contains）
+    public decimal? Quantity { get; init; }              // 订单数量
 }

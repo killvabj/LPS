@@ -78,8 +78,12 @@ public class ERPOrderSyncService : IERPOrderSyncService
                 return;
             }
 
-            await BulkWriteToStagingAsync(orders);
+            // 2026-11-05：本轮同步戳。既用于写 staging 的 SyncedAt，也用于收口判定
+            //   「本轮是否出现」，两处必须是同一个值。
+            var roundStart = DateTime.Now;
+            await BulkWriteToStagingAsync(orders, roundStart);
             var (promoted, failed) = await _promotionService.ValidateAndPromoteAsync(cancellationToken);
+            await ReconcileOrderLifecycleAsync(roundStart, cancellationToken);
             var newBOMNOs = await DetectNewBOMNOsAsync();
 
             stopwatch.Stop();
@@ -97,6 +101,147 @@ public class ERPOrderSyncService : IERPOrderSyncService
         {
             _logger.LogError(ex, "全量同步失败");
             throw;
+        }
+    }
+
+    /// <summary>
+    /// 订单生命周期收口（2026-11-05，用户裁定）。**只在全量同步后执行**——增量只拉变更单，
+    /// 「本轮未出现」在增量语义下没有意义。
+    ///
+    /// 解决两个既有缺陷：
+    /// <list type="number">
+    ///   <item><b>验证失败行不更新状态</b>：staging 行只要 `SyncStatus='FAILED'`（如 `ORDER_TYPE_UNKNOWN`）
+    ///     就不会进入 promote，`Order_Canonical` 的状态因此永不更新。实测 **2,402 单**在 ERP 已
+    ///     `CLOSED`/`CANCELLED`，Canonical 仍停在 `Open`。<br/>
+    ///     ⇒ 本步只更新 `Status` 一列（`SalesOrderCategory` 含「取消」⇒ `CANCELLED`，否则取 `stg.Status`），
+    ///     **不做任何字段覆盖、不绕过校验**。校验失败说的是"这行数据不能用"，不等于"这单的状态不用更新"。</item>
+    ///   <item><b>源头消失不闭单</b>：ODS 视图 `v_APS_SalesOrder` 的关闭窗口只有 7 天
+    ///     （`InstrCancelDate/Completion >= GETDATE()-7`）。同步一旦停摆超过 7 天，关闭事件永久丢失
+    ///     ⇒ 订单永远停在最后一次看到的 `Open`。实测孤儿 **105,760** 单，其中仍为 `Open` 的 **36,468** 单。<br/>
+    ///     ⇒ 连续 **2 轮**未出现才置 `CLOSED`（单轮可能只是视图抖动）；中途重新出现则候选自动移除。</item>
+    /// </list>
+    ///
+    /// ⚠️ 本步只改 `Order_Canonical`，**不触碰 `[Order]`**：已装载的 PlanVersion 快照不受影响，
+    ///    因此可安全地在求解进行中执行。
+    /// </summary>
+    private async Task ReconcileOrderLifecycleAsync(DateTime roundStart, CancellationToken cancellationToken)
+    {
+        try
+        {
+            // ── ⓪ 先把「本轮戳」对齐到库里实际落盘的值 ──────────────────────
+            //   `ERP_Order_Staging.SyncedAt` 是 `datetime2(7)`，而 C# 传入的参数在 Dapper 下
+            //   默认按 `datetime` 精度（约 3.33ms）四舍五入 ⇒ 直接拿它做 `>=` 可能比落盘值**偏大**，
+            //   导致「本轮出现的单」被算成 0 行（2026-11-05 试算已复现：0 命中，全部 OPEN 被误登记为候选）。
+            //   ⇒ 写入后回读该轮次的真实时间戳，后续一律用它。取 10 分钟下限是为了吸收上述精度偏差。
+            var effectiveRoundStart = await _connectionManager.QueryFirstOrDefaultAsync<DateTime?>(
+                @"SELECT MAX(SyncedAt) FROM dbo.ERP_Order_Staging
+                   WHERE SyncedAt >= DATEADD(MINUTE, -10, @RoundStart);",
+                new { RoundStart = roundStart }, db: DatabaseId.APS);
+
+            if (effectiveRoundStart == null)
+            {
+                _logger.LogWarning("订单生命周期收口跳过：本轮未在 ERP_Order_Staging 写入任何行（RoundStart={RoundStart:O}）", roundStart);
+                return;
+            }
+
+            var stamp = effectiveRoundStart.Value;
+
+            // ⚠️ 必须显式声明 `DbType.DateTime2`：Dapper 对 `DateTime` 默认按 `datetime`（约 3.33ms）传，
+            //    会把 `datetime2(7)` 的戳**向上取整** ⇒ `SyncedAt >= @Stamp` 命中 0 行。
+            //    2026-11-05 15:35 首次实跑已复现：MAX=…45.8421065 → 传参变 …45.8433333 → 0 命中
+            //    ⇒ 232,129 个 Open 单全部被误登记为候选（若再跑一轮就全被关单）。参数必须钉死精度。
+            var stampParams = new DynamicParameters();
+            stampParams.Add("@Stamp", stamp, DbType.DateTime2);
+
+            // ── ① 验证失败行：只同步 Status ────────────────────────────────
+            var statusSynced = await _connectionManager.ExecuteAsync(
+                @"UPDATE oc
+                     SET oc.Status    = CASE WHEN s.SalesOrderCategory LIKE N'%取消%' THEN N'CANCELLED'
+                                             ELSE s.Status END,
+                         oc.UpdatedAt = GETDATE()
+                    FROM dbo.Order_Canonical oc
+                    JOIN dbo.ERP_Order_Staging s ON s.OrderNo = oc.OrderNo
+                   WHERE s.SyncStatus = N'FAILED'
+                     AND s.SyncedAt  >= @Stamp
+                     AND ISNULL(oc.Status, N'') <> (CASE WHEN s.SalesOrderCategory LIKE N'%取消%' THEN N'CANCELLED'
+                                                         ELSE s.Status END);",
+                stampParams, db: DatabaseId.APS);
+
+            // ── ② 候选表维护：本轮出现过的一律移除（recovered）────────────
+            await _connectionManager.ExecuteAsync(
+                @"DELETE c
+                    FROM dbo.OrderStaleCandidate c
+                   WHERE EXISTS (SELECT 1 FROM dbo.ERP_Order_Staging s
+                                  WHERE s.OrderNo = c.OrderNo AND s.SyncedAt >= @Stamp);",
+                stampParams, db: DatabaseId.APS);
+
+            // ── ③ 本轮未出现且仍为 Open 的 → MissCount + 1 ────────────────
+            await _connectionManager.ExecuteAsync(
+                @"MERGE dbo.OrderStaleCandidate AS t
+                  USING (
+                        SELECT oc.OrderNo
+                          FROM dbo.Order_Canonical oc
+                         WHERE oc.Status = N'Open'
+                           AND NOT EXISTS (SELECT 1 FROM dbo.ERP_Order_Staging s
+                                            WHERE s.OrderNo = oc.OrderNo AND s.SyncedAt >= @Stamp)
+                  ) AS src ON t.OrderNo = src.OrderNo
+                  WHEN MATCHED THEN
+                       UPDATE SET t.MissCount = t.MissCount + 1, t.LastCheckedAt = GETDATE()
+                  WHEN NOT MATCHED BY TARGET THEN
+                       INSERT (OrderNo, MissCount, FirstMissedAt, LastCheckedAt)
+                       VALUES (src.OrderNo, 1, GETDATE(), GETDATE());",
+                stampParams, db: DatabaseId.APS);
+
+            // ── ④ 连续两轮未出现 → 置 CLOSED ─────────────────────────────
+            var closed = await _connectionManager.ExecuteAsync(
+                @"UPDATE oc
+                     SET oc.Status = N'CLOSED', oc.UpdatedAt = GETDATE()
+                    FROM dbo.Order_Canonical oc
+                    JOIN dbo.OrderStaleCandidate c ON c.OrderNo = oc.OrderNo
+                   WHERE c.MissCount >= 2
+                     AND oc.Status = N'Open';",
+                db: DatabaseId.APS);
+
+            await _connectionManager.ExecuteAsync(
+                @"DELETE FROM dbo.OrderStaleCandidate WHERE MissCount >= 2;",
+                db: DatabaseId.APS);
+
+            // ── ⑤ 对账：四列必须闭合，落日志可回看 ───────────────────────
+            var logParams = new DynamicParameters();
+            logParams.Add("@Stamp", stamp, DbType.DateTime2);
+            logParams.Add("@StatusSynced", statusSynced, DbType.Int32);
+            logParams.Add("@Closed", closed, DbType.Int32);
+
+            await _connectionManager.ExecuteAsync(
+                @"INSERT INTO dbo.APS_ETL_Log (BatchNo, Step, Message, Status, CreatedAt)
+                  SELECT CONVERT(NVARCHAR(50), @Stamp, 121), N'OrderLifecycle.Reconcile',
+                         CONCAT(N'staging=', (SELECT COUNT(*) FROM dbo.ERP_Order_Staging),
+                                N'；canonical=', (SELECT COUNT(*) FROM dbo.Order_Canonical),
+                                N'；本轮状态同步(FAILED行)=', @StatusSynced,
+                                N'；本轮关单=', @Closed,
+                                N'；候选未关=', (SELECT COUNT(*) FROM dbo.OrderStaleCandidate),
+                                -- 对账口径：只比「本轮出现过」的行。历史 staging 行不再被源端返回，
+                                --   其状态是最后一次见到的快照，拿来比会产生永远消不掉的假差额
+                                --   （2026-11-05 实测：不一致 2,402 = 本轮 1,106 + 历史残留 1,296）。
+                                N'；本轮状态不一致=', (SELECT COUNT(*) FROM dbo.Order_Canonical oc
+                                                      JOIN dbo.ERP_Order_Staging s ON s.OrderNo = oc.OrderNo
+                                                     WHERE s.SyncedAt >= @Stamp
+                                                       AND ISNULL(oc.Status,N'') <> ISNULL(s.Status,N''))),
+                         N'INFO', GETDATE();",
+                logParams,
+                db: DatabaseId.APS);
+
+            if (statusSynced > 0 || closed > 0)
+            {
+                _logger.LogWarning(
+                    "订单生命周期收口：FAILED行状态同步 {StatusSynced} 单；连续两轮未出现→关单 {Closed} 单",
+                    statusSynced, closed);
+            }
+        }
+        catch (Exception ex)
+        {
+            // 不阻断主同步（收口是补强，不是主链）；但必须响亮留痕，否则会静默失效。
+            _logger.LogError(ex, "订单生命周期收口失败（不阻断全量同步）：{Message}", ex.Message);
         }
     }
 
@@ -190,6 +335,7 @@ public class ERPOrderSyncService : IERPOrderSyncService
                 OrderNo,
                 OrderType,
                 MaterialCode,
+                SourceModel,
                 BOMNO,
                 FactoryCode,
                 SourceWarehouseProcessCode,
@@ -209,6 +355,7 @@ public class ERPOrderSyncService : IERPOrderSyncService
                 JPOrderNo,
                 SalesOrderCategory,
                 DemandMaturityStatus,
+                ContractNo,
                 CreatedAt,
                 UpdatedAt
             FROM v_APS_SalesOrder
@@ -267,7 +414,7 @@ public class ERPOrderSyncService : IERPOrderSyncService
     ///   · 收敛失败时最坏结果是「同单号两条 PENDING」⇒ 下次提升 8672 ⇒ 下轮再收敛，属**可自愈**，
     ///     不再出现「事实丢失且不可恢复」。
     /// </summary>
-    protected virtual async Task BulkWriteToStagingAsync(List<ERPOrderDto> orders)
+    protected virtual async Task BulkWriteToStagingAsync(List<ERPOrderDto> orders, DateTime? syncStamp = null)
     {
         // 按 OrderNo 去重（OrderNo 是 APS 业务主键），保留 UpdatedAt 最新的记录
         var distinctOrders = orders
@@ -289,6 +436,8 @@ public class ERPOrderSyncService : IERPOrderSyncService
         dataTable.Columns.Add("OrderNo", typeof(string));
         dataTable.Columns.Add("OrderType", typeof(string));
         dataTable.Columns.Add("MaterialCode", typeof(string));
+        // 2026-11-06：ERP 原始型号（冻结 07 §3494/§3652、08 DDL:4162 要求逐级透传至 Order_Canonical.SourceModel / [Order].SourceModel）
+        dataTable.Columns.Add("Model", typeof(string));
         dataTable.Columns.Add("FactoryCode", typeof(string));
         dataTable.Columns.Add("SourceWarehouseProcessCode", typeof(string));
         dataTable.Columns.Add("Quantity", typeof(decimal));
@@ -312,11 +461,15 @@ public class ERPOrderSyncService : IERPOrderSyncService
         dataTable.Columns.Add("JPOrderNo", typeof(string));
         dataTable.Columns.Add("SalesOrderCategory", typeof(string));
         dataTable.Columns.Add("DemandMaturityStatus", typeof(string));
+        dataTable.Columns.Add("ContractNo", typeof(string));
         dataTable.Columns.Add("RawData", typeof(string));
         dataTable.Columns.Add("SyncStatus", typeof(string));
         dataTable.Columns.Add("SyncedAt", typeof(DateTime));
 
-        var now = DateTime.Now;
+        // 2026-11-05：`SyncedAt` 支持由调用方传入「本轮戳」。孤儿收口要以
+        //   「本轮是否出现」为判据，必须与调用方手里的同一枚时间戳逐位一致（同一时钟来源），
+        //   不在这里各自取 Now（应用机与库机是两个进程，可能漂移）。
+        var now = syncStamp ?? DateTime.Now;
         foreach (var order in distinctOrders)  // 使用去重后的数据
         {
             dataTable.Rows.Add(
@@ -326,6 +479,7 @@ public class ERPOrderSyncService : IERPOrderSyncService
                 order.OrderNo,
                 order.OrderType,
                 order.MaterialCode,
+                (object?)order.SourceModel ?? DBNull.Value,
                 order.FactoryCode,
                 order.SourceWarehouseProcessCode,
                 order.Quantity,
@@ -346,6 +500,7 @@ public class ERPOrderSyncService : IERPOrderSyncService
                 (object?)order.JPOrderNo ?? DBNull.Value,
                 (object?)order.SalesOrderCategory ?? DBNull.Value,
                 (object?)order.DemandMaturityStatus ?? DBNull.Value,
+                (object?)order.ContractNo ?? DBNull.Value,
                 JsonSerializer.Serialize(order),
                 "PENDING",
                 now

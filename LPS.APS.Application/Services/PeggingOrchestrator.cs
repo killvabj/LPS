@@ -593,6 +593,69 @@ public class PeggingOrchestrator : IPeggingOrchestrator
             await LoadMaterialStageDeptContextAsync(demandMaterialIds, cancellationToken);
         MarkBuild($"7 部门上下文(物料={demandMaterialIds.Count})");
 
+        // ── 部门一致性闸门（2026-11-05，用户裁定「乙」）──────────────────────────────
+        //   **部门权威 = MaterialStageDeptContext（MSDC）**，依据冻结口径「StageCode 不能直接决定
+        //   生产部门，必须通过 MaterialStageDeptContext 确定」「Stage 必须经过 Master 裁决」。
+        //   工艺数据（MES）若把同一 (物料, Stage) 的工序挂在**另一个部门**下，该部门不是本物料的
+        //   合法生产部门 ⇒ 这些工序不得进入求解（此前会带着 MSDC 部门进求解器，PhaseOne 按
+        //   (物料, 部门) 找不到工序 ⇒ Phase2 出口 `P2_NO_ROUTING` ⇒ 整笔需求未排，且没有任何提示）。
+        //
+        //   剔除后的效果（这就是「乙」）：该 (物料, Stage) 在 `LoadStageLeadTimesAsync` 的缺口判定
+        //   （`opsByMatStage`）里变成「无工序」⇒ 自动进入既有的 Stage 提前期通道
+        //   ⇒ 1号位 只推进时间、不产 Task。**不新增第二套兜底逻辑，只让既有通道能被命中。**
+        //
+        //   为什么由我方判定而不是 1号位：部门事实（MSDC）与工序事实（本方法装载）都在我方，
+        //   1号位 拿到的已是过滤后的工序集，没有第二个信息源可判；且业务事实裁决不得下放到求解器。
+        //
+        //   ⚠️ 只影响「同一 Stage 下部门不一致」的键（实测全库 2,031 个 / 涉及本 Run 348 单）；
+        //      跨 Stage 的多部门工艺不受影响（过滤按 (物料, Stage) 逐阶段做）。
+        var deptByMatStage = materialStageDeptContexts
+            .Where(c => c.ProductionDepartmentId > 0)
+            .GroupBy(c => (c.MaterialId, c.StageCode))
+            .ToDictionary(g => g.Key, g => g.First().ProductionDepartmentId);
+
+        var mismatchedOps = routingOperations
+            .Where(o => !string.IsNullOrEmpty(o.StageCode)
+                        && deptByMatStage.TryGetValue((o.MaterialId, o.StageCode), out var d)
+                        && o.ProductionDepartmentId != d)
+            .ToList();
+        var droppedOps = mismatchedOps.Count;
+
+        routingOperations.RemoveAll(o =>
+            !string.IsNullOrEmpty(o.StageCode)
+            && deptByMatStage.TryGetValue((o.MaterialId, o.StageCode), out var authoritativeDept)
+            && o.ProductionDepartmentId != authoritativeDept);
+
+        if (droppedOps > 0)
+        {
+            // 依赖与资质按与既有裁剪**同一口径**再收一次：工序键含部门；依赖只按 (物料, 工序码) 判存活
+            // （依赖边不带部门维度，带部门会误删跨部门/跨 Stage 边——见 LoadRoutingContextAsync 内注释）；
+            // 资质键含部门。
+            var opKeys = routingOperations
+                .Select(o => (o.MaterialId, o.ProductionDepartmentId, o.OperationCode))
+                .ToHashSet();
+            var opCodeKeys = routingOperations
+                .Select(o => (o.MaterialId, o.OperationCode))
+                .ToHashSet();
+
+            routingDependencies.RemoveAll(d =>
+                !opCodeKeys.Contains((d.MaterialId, d.FromOperationCode))
+                || !opCodeKeys.Contains((d.MaterialId, d.ToOperationCode)));
+            operationResourceEligibility.RemoveAll(e =>
+                !opKeys.Contains((e.MaterialId, e.ProductionDepartmentId, e.OperationCode)));
+
+            var affectedKeys = mismatchedOps
+                .Select(o => (o.MaterialId, o.StageCode))
+                .Distinct()
+                .Count();
+
+            _logger.LogWarning(
+                "[Pegging] 部门一致性闸门：剔除 {DroppedOps} 条「部门与 MSDC 不一致」的工序" +
+                "（受影响 (物料,Stage) 键 {Keys} 个）⇒ 这些 Stage 转为 Stage 提前期通道（时间照走、不产 Task）。" +
+                "口径：部门以 MaterialStageDeptContext 为准，工艺不得反向决定部门。PlanVersionId={PlanVersionId}",
+                droppedOps, affectedKeys, request.PlanVersionId);
+        }
+
         // ── 时点 A：部门维度业务范围闸门（队列3，3号位 治理域；2026-10-29 接线）──────────────────
         //   判据＝本域**真实 D**（`MaterialStageDepartmentContexts` 的 `ProductionDepartmentId` 去重）
         //   与用户已授权部门集的交集；装载侧零判定逻辑、零新查询，只做一行投影 + 一次调用，
@@ -1584,6 +1647,35 @@ public class PeggingOrchestrator : IPeggingOrchestrator
                     .GroupBy(d => d.LogicalDemandKey, StringComparer.Ordinal)
                     .ToDictionary(g => g.Key, g => g.First().ProductionInstructionNo!);
 
+                // ── 2026-11-06：`[Task].OrderId` 必须是**该需求真实订单**，不再是本域第一个订单 ──────
+                // 【原缺陷】两处 `OrderId = voucher.OrderId`，而 `voucher.OrderId = request.OrderIds.FirstOrDefault()`
+                //   ⇒ 同一 PlanVersion 内**所有 Task 共用一个 OrderId**。实测 PV999428：346,397 行只有 **1** 个
+                //   OrderId，却跨越 3,509 个物料、10,955 个 PI；该 OrderId 指向的制品本身反而 0 条任务。
+                //   `Task.RouteCode/PathId` 之外，这一列是唯一能"看起来关联上"的订单入口，写错等于全面误导
+                //   （前端展示、按订单统计、下发对账全部会挂到不相关的单上）。
+                // 【改法】`FinalTaskDraft.SourceDraftId` = 源 `LogicalProductionDemand.LogicalDemandKey`
+                //   （`PhaseTwoInitialScheduler` 的 `SourceDraftId = demand.LogicalDemandKey`），每个 Task 由**一条**需求
+                //   派生 ⇒ 取该需求自己的 `OrderId` 即可，一对一、无歧义（实测多份额同 Task 仅 131/106,224 = 0.12%，
+                //   且那是份额层的一对多，不影响任务的主订单归属）。
+                // 【与 AllocationTaskShare 的关系】份额表 `RootOrderId` 已是真值（`:2211` 从 DemandKey 反解），
+                //   仍是"权威数量归属"；本列是**主展示/统计入口**，两者不冲突，覆盖率 100% vs 30.7%
+                //   （顶层独立需求按 07 §4.4 不虚构 Allocation，故没有份额行）。
+                var orderIdByDemandKey = voucher.LogicalProductionDemands
+                    .Where(d => d.OrderId.HasValue && d.OrderId.Value > 0)
+                    .GroupBy(d => d.LogicalDemandKey, StringComparer.Ordinal)
+                    .ToDictionary(g => g.Key, g => g.First().OrderId!.Value);
+
+                // 未命中计数：正常应为 0（每条 Task 都由一条需求派生）。>0 时响亮告警，不静默写 0。
+                var orderIdUnresolved = 0;
+
+                // 取该 Task 的**真实主订单**；未命中则计 0（`Task.OrderId` 是非空 long，0 = 无归属），并累计告警。
+                long ResolveTaskOrderId(string sourceDraftId)
+                {
+                    if (orderIdByDemandKey.TryGetValue(sourceDraftId, out var oid)) return oid;
+                    orderIdUnresolved++;
+                    return 0L;
+                }
+
                 // G4：反查「旧 TaskNo ↔ MESWorkOrderNo」映射（TaskNo 继承，冻结 §12.10.1 / T10）。
                 // 映射落点 = 下发中间表 [TaskDispatch]，不是 [Task]（MES 侧工单身份不进核心 Task 模型，0号位 2026-09-17 P2/P3/P4 裁决）。
                 // 只对连续份额有 MES 工单号；显式剔除当前 SourcePlanVersionId，命中均为历史版本的 TaskDispatch 下发绑定。
@@ -1766,7 +1858,7 @@ public class PeggingOrchestrator : IPeggingOrchestrator
                     {
                             PlanVersionId    = planVersionId,
                             TaskNo           = taskNo,
-                            OrderId          = voucher.OrderId,
+                            OrderId          = ResolveTaskOrderId(final.SourceDraftId),
                             MaterialId       = final.MaterialId,
                             OperationSeq     = final.OperationSeq,
                             OperationCode    = final.OperationCode,
@@ -1886,7 +1978,7 @@ public class PeggingOrchestrator : IPeggingOrchestrator
                         Id               = 0,
                         PlanVersionId    = planVersionId,
                         TaskNo           = taskNo,
-                        OrderId          = voucher.OrderId,
+                        OrderId          = ResolveTaskOrderId(final.SourceDraftId),
                         MaterialId       = final.MaterialId,
                         OperationSeq     = final.OperationSeq,
                         OperationCode    = final.OperationCode,
@@ -1936,6 +2028,17 @@ public class PeggingOrchestrator : IPeggingOrchestrator
                 _logger.LogInformation(
                     "[PeggingPersist] Task 落库完成：{Rows} 条，用时 {Elapsed:F1}s（批量：暂存表 + MERGE 回传 Id）",
                     taskPersistRows.Count, taskSw.Elapsed.TotalSeconds);
+
+                // 2026-11-06：`[Task].OrderId` 改填「该需求真实订单」后，未命中数应恒为 0。
+                //   非 0 说明有 Task 的 SourceDraftId 反查不到需求（或需求无 OrderId）⇒ 该行 OrderId=0（无归属），
+                //   按订单统计会漏掉它。响亮告警，不静默。
+                if (orderIdUnresolved > 0)
+                {
+                    _logger.LogWarning(
+                        "[PeggingPersist] {Count}/{Total} 条 Task 的 OrderId 未能从需求解析（落 0 = 无归属），" +
+                        "按订单统计会漏计；PlanVersionId={PlanVersionId}",
+                        orderIdUnresolved, taskPersistRows.Count, planVersionId);
+                }
 
                 // ── A/B 桶下发绑定登记 ──────────────────────────────────────────────
                 //   为什么必须写：`ResolveTaskNo` 的 A 桶分支靠 `SELECT … FROM TaskDispatch WHERE SourcePlanVersionId <> 当前PV`
@@ -7200,7 +7303,11 @@ public class PeggingOrchestrator : IPeggingOrchestrator
                 @"SELECT MaterialId, ProductionDepartmentId, RouteCode, PathId, OperationCode, OperationName, StageCode
                   FROM RoutingOperation ro
                   INNER HASH JOIN OPENJSON(@Json) j ON j.value = ro.MaterialId
-                  WHERE ro.IsActive = 1",
+                  WHERE ro.IsActive = 1
+                  -- 2026-11-05：确定性行序（与 1d-5c 求解输入那三条同口径）。本方法输出是 5号位 DAG 拓扑前沿算法的
+                  --   事实源，行序会影响其并列项的选择 ⇒ 无 ORDER BY 时同一输入可能给出不同前沿。
+                  --   排序键覆盖唯一索引 UQ_RoutingOperation ⇒ 全序、无并列。
+                  ORDER BY ro.MaterialId, ro.ProductionDepartmentId, ro.RouteCode, ro.PathId, ro.OperationCode",
                 new { Json = json },
                 db: DatabaseId.APS),
             chunkSize: JsonInSinglePassChunkSize,
@@ -7213,7 +7320,9 @@ public class PeggingOrchestrator : IPeggingOrchestrator
                          FromOperationCode, ToOperationCode, DependencyType
                   FROM RoutingDependency rd
                   INNER HASH JOIN OPENJSON(@Json) j ON j.value = rd.MaterialId
-                  WHERE rd.IsActive = 1",
+                  WHERE rd.IsActive = 1
+                  -- 2026-11-05：确定性行序（同上）。键覆盖唯一索引 UQ_RoutingDep ⇒ 全序。
+                  ORDER BY rd.MaterialId, rd.ProductionDepartmentId, rd.RouteCode, rd.PathId, rd.FromOperationCode, rd.ToOperationCode",
                 new { Json = json },
                 db: DatabaseId.APS),
             chunkSize: JsonInSinglePassChunkSize,
@@ -11900,6 +12009,15 @@ public class PeggingOrchestrator : IPeggingOrchestrator
         public string   FactoryCode      { get; set; } = string.Empty;
         public string?  OrderType        { get; set; }
         public string?  CustomerTier     { get; set; }
+        // 2026-11-06 V1.1：需求优先级新增字段的订单侧来源（3号位 实施包 v1.0 §四.2）
+        public string?  CustomerSegment       { get; set; }
+        public string?  TransportMode         { get; set; }
+        public string?  SalesOrderCategory    { get; set; }
+        public string?  DemandMaturityStatus  { get; set; }
+        /// <summary>非在库出荷区分（`[Order].NonStockShipmentType`；1=全额紫票 2=差额紫票 0=在库出荷→NULL）。</summary>
+        public string?  NonStockShipmentType  { get; set; }
+        /// <summary>订单原始数量（`[Order].Quantity`）；与 PI 扣减后的 <see cref="DemandQty"/> 区分。</summary>
+        public decimal  OrderQuantity         { get; set; }
         public DateTime? IssueDate       { get; set; }
         /// <summary>
         /// 延迟状态（<c>[Order].DelayStatus</c>）：<c>ON_TIME</c> / <c>FIRST_DELAY</c> / <c>REPEATED_DELAY</c>。
@@ -11982,6 +12100,12 @@ public class PeggingOrchestrator : IPeggingOrchestrator
                          o.CustomerTier,
                          o.IssueDate,
                          o.DelayStatus,
+                         o.CustomerSegment,
+                         o.TransportMode,
+                         o.SalesOrderCategory,
+                         o.DemandMaturityStatus,
+                         o.NonStockShipmentType,
+                         o.Quantity        AS OrderQuantity,
                          -- ── 需求根（用户 2026-10-10 定盘）：按「有没有生产指示」分两类 ──
                          -- 判别「有 PI」**只看 `MTS_InstructionNo`**（与供给侧 `LoadPiRemainingFactsAsync` 同一条判据）：
                          --   不看 `OrderType` / ZPQF、不看 OrderNo 前缀 —— `OrderType` 就是 `ZPQF` 的映射
@@ -12703,6 +12827,20 @@ public class PeggingOrchestrator : IPeggingOrchestrator
                 CustomerTier = o.CustomerTier,
                 DueDate      = o.DueDate,
                 IssueDate    = o.IssueDate,
+                // 2026-11-06 V1.1 新增字段（3号位 实施包 §四.1/§四.2）
+                CustomerSegment      = o.CustomerSegment,
+                // 出荷指示入物流日（会随返信/延迟变化）= `v_APS_SalesOrder.DueDate` ← `V_AllSalesInstr.ReceiveDate`
+                // ⇒ `[Order].CustomerDueDate`，本处即 `o.DueDate`。
+                // （`[Order].OriginalDueDate` 是**原始订单入物流日**= Requisition.ReceiveDate，永不变化；
+                //   3号位 实施包 §一.1 已将它剔除、不进排序，故本 DTO 不承载。）
+                // 用户 2026-11-06 两次确认该链路。
+                CustomerDueDate      = o.DueDate,
+                TransportMode        = o.TransportMode,
+                SalesOrderCategory   = o.SalesOrderCategory,
+                DemandMaturityStatus = o.DemandMaturityStatus,
+                NonStockShipmentType = o.NonStockShipmentType,
+                MaterialCode         = o.MaterialCode,
+                Quantity             = o.OrderQuantity,
                 DelayStatus  = o.DelayStatus,   // 01 v1.13 :536 / Pegging v1.6 :257 需求排序可用条件
                 // ProtectionStatus：全库无该列（sys.columns 查无），保持 null（不造假）。
                 SourceDemand = o

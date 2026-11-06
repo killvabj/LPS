@@ -26,4 +26,13 @@ public class PlanVersionSummaryDto
     /// 推算逻辑：同 DomainKey、Status=ARCHIVED 且 ActivatedAt ≤ 当前版本 CreatedAt 的最新一条
     /// </summary>
     public int? BasePlanVersionId { get; set; }
+
+    /// <summary>数据截止时刻（冻结 01 §77A 第6项；源=来源 ScheduleRun.DataCutoffTime；无来源 Run ⇒ null 缺键）。JSON: dataCutoffTime</summary>
+    public DateTime? DataCutoffTime { get; set; }
+
+    /// <summary>触发方式·批型（FULL_SCHEDULE / MANUAL_RESCHEDULE / …，来源 Run.RunType）。JSON: runType</summary>
+    public string? RunType { get; set; }
+
+    /// <summary>触发注记（ScheduleRun.TriggeredBy，如 "夜间调度"/"2号位-落库性能对照测量"）。JSON: triggeredBy</summary>
+    public string? TriggeredBy { get; set; }
 }

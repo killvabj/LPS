@@ -20,6 +20,47 @@ public sealed class UpstreamDemand
     public DateTime? IssueDate { get; init; }
     public string? ProtectionStatus { get; init; }
 
+    // ── 2026-11-06 V1.1 新增（3号位 需求优先级新增字段四段贯通实施包 v1.0 §四.1）──────────
+    //   ⚠ 只装「订单源确实有值」的 7 个。`StockConsumeDay`（库存消耗日）与
+    //     `NonStockShipCategory`（非在库出荷区分）是**页面维护字段**、当前无存储载体，
+    //     未装入 ⇒ 也未接进执行器白名单（接了只会拿到 null，属于实施包 §五 点名的「空转」）。
+    //     待 4号位 前端维护入口 + 载体落库后再补。
+
+    /// <summary>客户区分（JAPAN/DOMESTIC/OVERSEAS/VIETNAM/INTER_FACTORY/OTHER）。源：`[Order].CustomerSegment`。</summary>
+    public string? CustomerSegment { get; init; }
+
+    /// <summary>
+    /// 出荷指示入物流日（3号位 定义为「独立新增字段，与 <see cref="DueDate"/> 并列」）。
+    /// ⚠ 当前装载源与 <see cref="DueDate"/> 同值（`[Order].CustomerDueDate`，订单表无第二个「入物流日」列）；
+    ///   待 PM 的 `TODAY+20`/OffsetDays 口径落地后，二者才会真正分叉。
+    /// </summary>
+    public DateTime? CustomerDueDate { get; init; }
+
+    /// <summary>运输方式（LAND/SEA/AIR/COURIER）。源：`[Order].TransportMode`。</summary>
+    public string? TransportMode { get; init; }
+
+    /// <summary>销售类别（DIRECT_SALES/SALES_REPLENISHMENT）。源：`[Order].SalesOrderCategory`。</summary>
+    public string? SalesOrderCategory { get; init; }
+
+    /// <summary>需求成熟度（PRE_CONFIRMED/FORECAST）。源：`[Order].DemandMaturityStatus`（2026-11-06 起由备注/合同号推导）。</summary>
+    public string? DemandMaturityStatus { get; init; }
+
+    /// <summary>
+    /// 非在库出荷区分（`FULL_PURPLE_SLIP` 全额紫票 / `DIFF_PURPLE_SLIP` 差额紫票 / NULL 在库出荷）。
+    /// 源：`[Order].NonStockShipmentType` ← `ZPQF`（1=全额 / 2=差额 / 0=在库出荷不产生产需求，装载即被拒）。
+    /// 2026-11-06 用户确认：该字段不再是"页面维护、无载体"，规则就在 ZPQF 上。
+    /// </summary>
+    public string? NonStockShipmentType { get; init; }
+
+    /// <summary>物料编码（供 `Contains` 模糊匹配，值如 `FINAL*`）。源：`[Order].MaterialCode`。</summary>
+    public string? MaterialCode { get; init; }
+
+    /// <summary>
+    /// 订单数量（**原始订单量**，非 PI 扣减后的 `DemandQty`）。源：`[Order].Quantity`。
+    /// 3号位 定义该字段参与【段内排序】，故取订单量而非剩余量。
+    /// </summary>
+    public decimal? Quantity { get; init; }
+
     /// <summary>
     /// 订单规范 Id（EXPEDITE 前置竞争层身份键 = ScopeJsonV2.OrderTargets.OrderCanonicalId，S5/PM 0923）。
     /// 普通 FULL 排程可空；EXPEDITE 触发时用于识别「提前」需求。

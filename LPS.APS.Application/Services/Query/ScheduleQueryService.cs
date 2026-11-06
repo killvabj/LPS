@@ -1,4 +1,5 @@
 using Dapper;
+using System.Data;
 using LPS.APS.Application.Services.Query.Dto;
 using LPS.APS.Core.Authorization;
 using LPS.APS.Core.Interfaces;
@@ -49,6 +50,7 @@ public class ScheduleQueryService : IScheduleQueryService
                 pv.Status, pv.ComputedAt,
                 pv.TotalTasks, pv.CreatedAt,
                 pv.SourceScheduleRunId, pv.ActivatedAt,
+                r.DataCutoffTime, r.RunType, r.TriggeredBy,
                 CASE WHEN pv.VersionCategory = 'CANDIDATE' OR pv.Status = 'ARCHIVED'
                      THEN (
                          SELECT TOP 1 b.Id
@@ -61,6 +63,7 @@ public class ScheduleQueryService : IScheduleQueryService
                      ELSE NULL
                 END AS BasePlanVersionId
               FROM PlanVersion pv
+              LEFT JOIN ScheduleRun r ON r.Id = pv.SourceScheduleRunId   -- B10(11-05)：§77A第6项 DataCutoffTime/触发方式
               WHERE pv.ArchivedAt IS NULL";
 
         object parameters;
@@ -115,8 +118,10 @@ public class ScheduleQueryService : IScheduleQueryService
         var allowed = await ResolveAllowedDomainKeysAsync(userId, cancellationToken);
         var departmentCodes = await ResolveAllowedDepartmentCodesAsync(userId, cancellationToken);
         var hasResources = resourceIds is { Count: > 0 };
-        // 游标三参成套才算翻页（缺一律按首页处理，防半套游标错跳行）
-        var hasCursor = afterTaskId.HasValue && afterResourceId.HasValue && afterStartAt.HasValue;
+        // 11-06 排序改时间序（B 案裁决）：游标=二元组(归一start, taskId)。
+        // afterResourceId **保留入参但被忽略**——旧前端原样回传三参不报错（软兼容，不要求前后端同批上线）；
+        // 有 afterTaskId 即视为翻页（afterStartAt 缺省按 1753 归一下界）。
+        var hasCursor = afterTaskId.HasValue;
 
         // 1. 版本信息（含 DomainKey 做范围校验；同时取 Status / BasePlanVersionId 供前端区分版本类型）
         var version = await _connectionManager.QueryFirstOrDefaultAsync<(int Id, string VersionCode, string DomainKey, DateTime PlanHorizonStart, DateTime PlanHorizonEnd, string Status, int? BasePlanVersionId)>(
@@ -228,7 +233,18 @@ public class ScheduleQueryService : IScheduleQueryService
                 t.PlannedEndTime,
                 t.Status,
                 t.SetupSource                 AS SetupSource,
-                t.IsCriticalPath              AS IsCriticalPath,
+                t.MESWorkOrderNo              AS MESWorkOrderNo,   -- B2①(11-05) 07:3687 透传；JSON 键=mESWorkOrderNo
+                t.ProductionDepartmentId      AS ProductionDepartmentId,
+                pdn.DeptName                  AS DepartmentName,
+                t.StageCode                   AS StageCode,
+                t.TaskType                    AS TaskType,
+                t.RouteCode                   AS RouteCode,
+                t.PathId                      AS PathId,
+                t.ManualSlotId                AS ManualSlotId,
+                t.MTS_InstructionNo           AS MTS_InstructionNo,
+                t.StageExecutionBatchDraftKey AS StageExecutionBatchKey,
+                t.StageExecutionBatchQty      AS StageExecutionBatchQty,
+                CAST(NULL AS BIT)             AS IsCriticalPath,   -- B5(11-05) 未判定：列恒写死false，不拿假false冒充判定（真值归1号位，已标转办）
                 -- Duration 库值单位=小时，与冻结 07 字段说明 `:3696`「单位：小时」一致（v5.1.16 `:3703` 同位同文）。
                 --   落库口径（2号位 PeggingOrchestrator，`Duration-2` 2026-10-26 起）：
                 --   命中＝`(EffectiveProcessMinutes + SetupTime) / 60`（工时，不含跨日历中断）；
@@ -262,15 +278,18 @@ public class ScheduleQueryService : IScheduleQueryService
               FROM [Task] t
               LEFT JOIN [Order] o ON o.Id = t.OrderId
               LEFT JOIN Material m ON m.Id = t.MaterialId
+              LEFT JOIN ProductionDepartment pdn ON pdn.Id = t.ProductionDepartmentId
               LEFT JOIN PlanVersion pv ON pv.Id = @Id
               WHERE t.PlanVersionId = @Id{GanttWindowPredicate}{DepartmentPredicate("t")}
-                -- 游标谓词与排序键同式（ISNULL 归一：无资源=-1、未排=1753-01-01），全序三元组翻页不漏不重
+                -- 11-06 B 案：全序键=（归一计划开始时刻, TaskId）——人工/设备按时间穿插，首屏即见双视图
+                -- （实测 44,702 无资源任务全部=人工槽、真未分配=0，「垫底/置顶 -1 桶」任一固定法都会把一边埋没）；
+                -- 未排(NULL 开始)归一 1753-01-01 排最前，同 buckets 未排桶行口径；游标谓词与排序键同式。
+                -- ⚠ 游标时刻必须 CONVERT(datetime2(7),字符串)：Dapper 把 DateTime 参数绑成 SQL datetime
+                -- （百纳秒被毫秒舍入），等值比较会失配、页边界重复/漏行（11-06 E2E 抓到并修复）
                 AND (@HasCursor = 0
-                     OR ISNULL(t.ResourceId, -1) > @CurRes
-                     OR (ISNULL(t.ResourceId, -1) = @CurRes AND ISNULL(t.PlannedStartTime, '17530101') > @CurStart)
-                     OR (ISNULL(t.ResourceId, -1) = @CurRes AND ISNULL(t.PlannedStartTime, '17530101') = @CurStart
-                         AND t.Id > @CurTask))
-              ORDER BY ISNULL(t.ResourceId, -1), ISNULL(t.PlannedStartTime, '17530101'), t.Id",
+                     OR ISNULL(t.PlannedStartTime, '17530101') > CONVERT(datetime2(7), @CurStartS, 121)
+                     OR (ISNULL(t.PlannedStartTime, '17530101') = CONVERT(datetime2(7), @CurStartS, 121) AND t.Id > @CurTask))
+              ORDER BY ISNULL(t.PlannedStartTime, '17530101'), t.Id",
             WithDepartmentScope(new
             {
                 Id = planVersionId,
@@ -280,8 +299,7 @@ public class ScheduleQueryService : IScheduleQueryService
                 ResourceIds = resourceIds,
                 Fetch = effectiveLimit + 1,          // 多取1行判溢出：hasMore 零额外查询、永不撒谎
                 HasCursor = hasCursor,
-                CurRes = afterResourceId ?? -1,
-                CurStart = afterStartAt ?? sqlDateFloor,   // Dapper 将 DateTime 默认绑定为 SQL datetime（下限1753），MinValue 会 SqlTypeException 溢出
+                CurStartS = (afterStartAt ?? sqlDateFloor).ToString("yyyy-MM-dd HH:mm:ss.fffffff"),   // Dapper 将 DateTime 默认绑定为 SQL datetime（下限1753），MinValue 会 SqlTypeException 溢出
                 CurTask = afterTaskId ?? 0L
             }, departmentCodes),
             db: DatabaseId.APS);
@@ -311,6 +329,16 @@ public class ScheduleQueryService : IScheduleQueryService
                     OPTION (HASH JOIN)",
                 new { Ids = pageIds }, db: DatabaseId.APS);
 
+            var dispatchRows = await _connectionManager.QueryAsync<TaskDispatchRow>(
+                @"SELECT d.SourceTaskId, d.DispatchStatus
+                    FROM (SELECT CAST(value AS bigint) AS TaskId FROM STRING_SPLIT(@Ids, ',')) v
+                    JOIN TaskDispatch d ON d.SourceTaskId = v.TaskId
+                    OPTION (RECOMPILE)",
+                new { Ids = pageIds },
+                CommandType.Text, DatabaseId.APS, commandTimeout: 30);
+            var dispatchById = dispatchRows
+                .GroupBy(d => d.SourceTaskId).ToDictionary(g => g.Key, g => g.Last().DispatchStatus);
+
             var sharesByTask = shareRows
                 .GroupBy(s => s.TaskId)
                 .ToDictionary(g => g.Key, g =>
@@ -328,10 +356,14 @@ public class ScheduleQueryService : IScheduleQueryService
                 });
 
             var reasonRows = await _connectionManager.QueryAsync<GanttReasonRow>(
-                @"SELECT f.TaskId, f.ReasonCode, f.Severity, f.ImpactHours
+                @"SELECT f.TaskId, f.ReasonCode, f.Severity, f.ImpactHours, f.ObjectType
                     FROM (SELECT CAST(value AS bigint) AS TaskId FROM STRING_SPLIT(@Ids, ',')) v
                     JOIN ScheduleExplanationFact f ON f.TaskId = v.TaskId
-                    WHERE f.ObjectType = 'TASK'
+                    -- 11-05 Q2-a 裁定：放宽为「挂在 Task 上的事实」= TASK 级 ∪ ORDER 级带 TaskId
+                    -- （2号位现况把任务号顺挂在 ORDER 级事实：ORDER 589 行含 11 行 TaskId）。
+                    -- 这不是新造第二套事实——同表同行原样透传，仅把行级事实层级 objectType 如实带给前端标注；
+                    -- F1(01:1927) 的「主要原因」本就是订单语义口径，订单级原因挂任务位不越义。DOMAIN 级无 TaskId 天然不入。
+                    WHERE f.ObjectType IN ('TASK', 'ORDER')
                     ORDER BY f.TaskId, f.Severity, f.ReasonCode
                     OPTION (HASH JOIN)",
                 new { Ids = pageIds }, db: DatabaseId.APS);
@@ -344,17 +376,53 @@ public class ScheduleQueryService : IScheduleQueryService
                 {
                     ReasonCode = x.ReasonCode,
                     Severity = x.Severity,
-                    ImpactHours = x.ImpactHours
+                    ImpactHours = x.ImpactHours,
+                    ObjectType = x.ObjectType   // 11-05 Q2：'TASK'/'ORDER'，前端据此标注层级
                 }).ToList());
 
             foreach (var task in taskList)
             {
                 if (sharesByTask.TryGetValue(task.TaskId, out var shares)) task.TaskShare = shares;
                 if (reasonsByTask.TryGetValue(task.TaskId, out var reasons)) task.DelayReasons = reasons;
+                if (dispatchById.TryGetValue(task.TaskId, out var ds)) task.DispatchStatus = ds;
             }
         }
 
         var resourceList = resources.ToList();
+
+        // B1(11-05)：资源不可用窗口——口径与总览 R6 完全同源（本级 ResourceCalendarSlot AvailableFlag=0，
+            // 不含部门/工厂继承 OFF；10-16 已裁口径 b 未采用，两页保持一套，合并口径若需另提）。
+            // 窗口取请求 [from,to]（缺省回落版本 PlanHorizon 由资源查询同源，这里用请求值/为空则全版本）。
+            var resIds = resourceList.Where(r => r.ResourceId > 0).Select(r => r.ResourceId).ToList();
+            if (resIds.Count > 0)
+            {
+                var offRows = (await _connectionManager.QueryAsync<ResourceOffWindowRow>(
+                    @"SELECT rc.ResourceId, rc.StartTime AS [From], rc.EndTime AS [To], rc.Remark AS Reason
+                        FROM ResourceCalendarSlot rc
+                       WHERE rc.AvailableFlag = 0
+                         AND rc.ResourceId IN @ResIds
+                         AND (@From IS NULL OR rc.EndTime > @From)
+                         AND (@To IS NULL OR rc.StartTime < @To)
+                       ORDER BY rc.ResourceId, rc.StartTime",
+                    new { ResIds = resIds, From = from, To = to },
+                    CommandType.Text, DatabaseId.APS, commandTimeout: 30)).ToList();
+                var offByRes = offRows.GroupBy(w => w.ResourceId).ToDictionary(g => g.Key, g => g.ToList());
+                foreach (var res in resourceList)
+                {
+                    if (!offByRes.TryGetValue(res.ResourceId, out var wins) || wins.Count == 0) continue;
+                    res.UnavailableWindows = wins.Select(w => new GanttUnavailableWindowDto
+                    {
+                        From = w.From, To = w.To, Reason = w.Reason,
+                        ImpactedTaskIds = taskList
+                            .Where(x => x.ResourceId == res.ResourceId
+                                     && x.PlannedStartTime is not null
+                                     && x.PlannedStartTime < w.To
+                                     && (x.PlannedEndTime ?? x.PlannedStartTime) > w.From)
+                            .Select(x => x.TaskId).ToList()
+                    }).ToList();
+                }
+            }
+
 
         return new GanttDataDto
         {
@@ -993,6 +1061,22 @@ public class ScheduleQueryService : IScheduleQueryService
     private async Task<int> CountScalarAsync(string sql, object parameters)
         => await _connectionManager.QueryFirstOrDefaultAsync<int?>(sql, parameters, db: DatabaseId.APS) ?? 0;
 
+    /// <summary>TaskDispatch 页内富化行（B2② 下发状态；非契约 DTO）</summary>
+    private sealed class TaskDispatchRow
+    {
+        public long SourceTaskId { get; set; }
+        public string DispatchStatus { get; set; } = string.Empty;
+    }
+
+    /// <summary>ResourceCalendarSlot 本级 OFF 窗口行（B1；与 Overview 同型；非契约 DTO）</summary>
+    private sealed class ResourceOffWindowRow
+    {
+        public int ResourceId { get; set; }
+        public DateTime From { get; set; }
+        public DateTime To { get; set; }
+        public string? Reason { get; set; }
+    }
+
     /// <summary>AllocationTaskShare 页内富化行（Dapper 映射用；非契约 DTO）</summary>
     private sealed class GanttShareRow
     {
@@ -1009,5 +1093,6 @@ public class ScheduleQueryService : IScheduleQueryService
         public string ReasonCode { get; set; } = string.Empty;
         public string? Severity { get; set; }
         public decimal? ImpactHours { get; set; }
+        public string ObjectType { get; set; } = string.Empty;
     }
 }
