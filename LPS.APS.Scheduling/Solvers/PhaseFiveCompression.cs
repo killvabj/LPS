@@ -452,10 +452,16 @@ internal class PhaseFiveCompression
 
         // P1-03修复：Phase4 可能改变 Resource/Start/End，Phase3 的旧诊断结果已过时。
         // 在最终任务集合上重跑 Phase3 诊断，保证 ExplanationFacts 与最终修复结果一致。
+        // 2026-11-06 顾问复核（纯观测）：这一段此前**完全没有计时**，是 Phase5 残差的主嫌。
+        //   Run 999401：JS 残差 30 分 36 秒 vs 首次 Phase3 30 分 33 秒（差 0.15%）、
+        //   QT 残差 15 分 38 秒 vs 15 分 37 秒（差 0.10%）—— 几乎同长，但此前只是推断。
+        //   本槽 = 二次诊断本身的墙钟；外层 `Phase3DiagnoseTotal` 会再累加一次 ⇒ 其**次数**直接证实「调了两次」。
+        var swP5FinalDiagnose = SolverDiagnostics.HotspotStart();
         var finalDiagnostics = new PhaseThreeDiagnostics().Diagnose(
             request,
             new InitialScheduleResult { ScheduledTasks = allScheduledTasks },
             constraints);
+        SolverDiagnostics.HotspotEnd(swP5FinalDiagnose, SolverDiagnostics.Hotspot.Phase5FinalDiagnose);
 
         // ── 2026-11-02｜**确定性指纹**（纯观测）：同一输入多轮跑出不同 `FinalTask` 条数 ─────────
         //   实测：同一份 PV 999329 输入、同一份代码连跑三轮，`FinalTask = 1,084,606 / 1,084,326 /
@@ -473,7 +479,12 @@ internal class PhaseFiveCompression
             var determinismNote = BuildDeterminismDigestNote(allScheduledTasks);
             if (determinismNote is not null) constraints.TraceNotes.Add(determinismNote);
         }
-        return new DomainSolveResult
+        // 2026-11-06 顾问复核（纯观测）：二次诊断之后到返回之间的**结果对象组装**（含 StageTiming 构建、
+        //   确定性指纹、四个列表的投影）。CYL 是唯一反例 —— Phase5 残差 6 分 56 秒，而首次 Phase3 只有 5 秒
+        //   ⇒ CYL 的残差不是二次诊断，446 万条 Task 的对象构造才是主嫌。本槽用来证实/否证。
+        //   注意：只把 `return new …` 改成「先赋本地再返回」，**求值次序与内容一字未改**。
+        var swP5ResultAsm = SolverDiagnostics.HotspotStart();
+        var finalResult = new DomainSolveResult
         {
             Success = !technicalFailure,
             ErrorMessage = composedErrorMessage,
@@ -488,7 +499,7 @@ internal class PhaseFiveCompression
             // ④⑤⑨（0号位 2026-09-29 裁决 §十四第 4/5/9 项）：末端/整条无 Routing Stage 的纯内存时间节点。
             // 载体在 Core（2号位 落），值由 1号位 填 —— 见 StageTimingNodeBuilder 类注释。
             // ⚠ 这些节点**不进 FinalTasks**：结构上就没有 Task 载体，不生成 TaskNo/MES工单。
-            DemandCompletions = StageTimingNodeBuilder.Build(request, constraints, allScheduledTasks),
+            DemandCompletions = TimedStageTimingBuild(request, constraints, allScheduledTasks),
             Summary = new SolveSummary
             {
                 TotalDrafts = allScheduledTasks.Count + unscheduledTasks.Count,
@@ -499,6 +510,33 @@ internal class PhaseFiveCompression
                 UsedRoughCut = false
             }
         };
+
+        SolverDiagnostics.HotspotEnd(swP5ResultAsm, SolverDiagnostics.Hotspot.Phase5ResultAssembly);
+        return finalResult;
+    }
+
+    /// <summary>
+    /// 2026-11-06 顾问复核：`StageTimingNodeBuilder.Build` 的**计时包装**。
+    ///   为什么不在调用点前后直接计时：该调用位于 `DomainSolveResult` 的**对象初始化器**里，
+    ///   成员求值次序是语义的一部分 —— `SolveTraceNotes = constraints.TraceNotes` 写在它**之前**，
+    ///   若把 `Build` 提到 `return` 之前求值，`Build` 追加的追溯会**改变** `SolveTraceNotes` 的内容。
+    ///   故用包装保持原位求值，秩序与内容逐位不变。
+    ///   纯观测；未开 scope 时 `HotspotStart()` 返回 0 ⇒ 零开销。
+    /// </summary>
+    private static List<DemandCompletionFact> TimedStageTimingBuild(
+        DomainSolveRequest request,
+        ConstraintContext constraints,
+        IReadOnlyList<FinalTaskDraft> allScheduledTasks)
+    {
+        var sw = SolverDiagnostics.HotspotStart();
+        try
+        {
+            return StageTimingNodeBuilder.Build(request, constraints, allScheduledTasks);
+        }
+        finally
+        {
+            SolverDiagnostics.HotspotEnd(sw, SolverDiagnostics.Hotspot.Phase5StageTimingBuild);
+        }
     }
 
     /// <summary>

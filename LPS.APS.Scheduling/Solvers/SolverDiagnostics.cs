@@ -260,6 +260,27 @@ public static class SolverDiagnostics
         public long BatchGroupPrefixGapMax;
 
         /// <summary>
+        /// 2026-11-06 顾问复核：每次 `PhaseThreeDiagnostics.Diagnose` 入口的 `constraints.LockedTasks.Count`
+        ///   累计值与峰值。判据用途：`DiagnoseDelayReason` 对**每条延期需求**做一次
+        ///   `LockedTasks.Values.FirstOrDefault(...)` 线性扫描 ⇒ 总工作量 = 延期需求数 × 本值。
+        ///   纯观测，不参与任何业务判定。
+        /// </summary>
+        public long DiagnoseLockedTasksSum;
+        public long DiagnoseLockedTasksMax;
+
+        /// <summary>
+        /// 2026-11-06 顾问复核：**外部/上游 ResourceBlock 条数**的累计值与峰值。
+        ///   ⚠ 口径已随第2步整改变更：原先在每条延期需求的 `HasResourceBlockOverlap` 里各登记一次
+        ///   （Sum = 延期需求数 × 块数）；整改后改为每次 `Diagnose()` 建索引时登记一次，
+        ///   ⇒ Sum = 各次 Diagnose 的块数之和，除以 `Phase3Diagnose` 调用次数即每次平均块数。
+        ///   峰值仍为单次最大值，可直接当「本域块规模」读。纯观测。
+        /// </summary>
+        public long DiagnoseExternalBlockSum;
+        public long DiagnoseExternalBlockMax;
+        public long DiagnoseUpstreamBlockSum;
+        public long DiagnoseUpstreamBlockMax;
+
+        /// <summary>
         /// 2026-10-27 诊断：候选并行的**执行形状**。
         ///   【为什么必须量】run24（候选并行 ON）的 `p2_done` @600s 只比 run23（OFF）高 17%，
         ///     而几乎所有热点「单次耗时」齐刷刷掉 18~19% —— 这是「这台机器这一次跑快了」的形状，
@@ -538,8 +559,18 @@ public static class SolverDiagnostics
         /// </summary>
         private readonly long[] _hotspotCalls = new long[HotspotCount];
 
-        /// <summary>热点数量（= <c>SolverDiagnostics.Hotspot</c> 枚举项数）。</summary>
-        public const int HotspotCount = 68;
+        /// <summary>
+        /// 热点数量（= <c>SolverDiagnostics.Hotspot</c> 里**常量编号的最大值 + 1**）。
+        ///
+        /// <para>⚠ **加新槽必须同步加这个数**。2026-11-06 实测踩过：槽位已编到 76，这里还停在 68，
+        /// 结果 <see cref="AddHotspotTicks"/> 的 `&lt; HotspotCount` 护栏把 68~76 这 9 个槽
+        /// **静默丢弃**（不报错、不计数、恒为 0），而 <see cref="HotspotMs"/> 无护栏直接越界抛异常。
+        /// 表现就是「埋点写了、编译过了、读数全 0」，极难察觉。</para>
+        ///
+        /// <para>已被 <c>LPS.APS.Tests/Unit/SolverDiagnosticsSlotTests.cs</c> 钉死：
+        /// 反射取最大槽号 + 1 必须等于本值，否则单测红。</para>
+        /// </summary>
+        public const int HotspotCount = 77;
 
         // 2026-10-27 四十二刀：**并发安全**（候选并行前置条件）。
         //   原来用 `+=` / `++`，多线程同时写会丢更新 —— 而这两个数组正是判断「改快了没有」的唯一依据，
@@ -555,9 +586,15 @@ public static class SolverDiagnostics
             }
         }
 
-        /// <summary>取热点累计耗时（ms）。</summary>
+        /// <summary>
+        /// 取热点累计耗时（ms）。越界返回 0（与 <see cref="HotspotCallCount"/> 同口径）——
+        /// 原先这里无护栏，槽号超过 <see cref="HotspotCount"/> 会让打印探针抛
+        /// <c>IndexOutOfRangeException</c> 并连带吞掉后面所有分项读数。
+        /// </summary>
         public double HotspotMs(int hotspot)
-            => _hotspotTicks[hotspot] * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+            => (uint)hotspot < HotspotCount
+                ? _hotspotTicks[hotspot] * 1000.0 / System.Diagnostics.Stopwatch.Frequency
+                : 0d;
 
         /// <summary>2026-10-19 性能定位：取热点**调用次数**（配合 <see cref="HotspotMs"/> 算每次耗时）。</summary>
         public long HotspotCallCount(int hotspot)
@@ -922,6 +959,78 @@ public static class SolverDiagnostics
         ///   不必再猜是哪一半。纯观测：不改任何判定、不参与业务。
         /// </summary>
         public const int BatchGroupOverlayRestore = 67;
+
+        // ── 2026-11-06 性能顾问复核：Phase3/Phase5 诊断链此前**只有 Phase 级墙钟**，没有方法级槽。
+        //    Run 999401 实测：JS 的 Phase5 扣掉已测槽后残差 30 分 36 秒，首次 Phase3 30 分 33 秒；
+        //    QT 残差 15 分 38 秒，首次 Phase3 15 分 37 秒 —— 两次诊断几乎同长。
+        //    `PhaseFiveCompression.cs:460` 确有第二次 `new PhaseThreeDiagnostics().Diagnose(...)`，
+        //    但外层**无任何计时**。以下七槽即为把这一次（以及 Phase3 内的三处扫描）拆开。
+        //    **纯观测**：不改任何判定、不改出口、不参与业务。未开 scope 时 `HotspotStart()` 返回 0 ⇒ 零开销。──
+
+        /// <summary>
+        /// `PhaseThreeDiagnostics.Diagnose` **整个方法**（Phase3 首诊与 Phase5 末诊**都会累加**，
+        ///   故本槽次数 = 诊断调用次数，用于直接证实「是不是调了两次」）。
+        ///   要分开看各自耗时：Phase5 那一次另计在 <see cref="Phase5FinalDiagnose"/>（嵌套于本槽）。
+        /// </summary>
+        public const int Phase3DiagnoseTotal = 68;
+
+        /// <summary>
+        /// Phase5 末端 `finalDiagnostics = new PhaseThreeDiagnostics().Diagnose(...)` 的墙钟。
+        ///   判据：本槽 vs 首次 `Phase3Ms` 是否同量级 ⇒ 二次诊断是否被重复付费。
+        ///   **业务上不许删**（Phase4/5 会改 Task 资源与时间，旧解释事实已过时）。
+        /// </summary>
+        public const int Phase5FinalDiagnose = 69;
+
+        /// <summary>
+        /// Phase5 在二次诊断**之后**、返回之前的**结果对象组装**（`FinalTaskDraft` / `AllocationTaskShare` /
+        ///   `PhysicalPeggingDraft` / `ExplanationFact` 投影）。
+        ///   为什么量它：CYL Phase5 残差 6 分 56 秒，而 CYL 首次 Phase3 只有 5 秒 ⇒ CYL 的残差**不是**二次诊断，
+        ///     446 万条 Task 的对象构造才是主嫌。本槽即用来证实/否证这一点。
+        /// </summary>
+        public const int Phase5ResultAssembly = 70;
+
+        /// <summary>Phase3 `Diagnose` 内：**延期需求**循环（每轮含一次 `DiagnoseDelayReason`）。次数 = 延期需求数。</summary>
+        public const int Phase3DelayedLoop = 71;
+
+        /// <summary>
+        /// `DiagnoseDelayReason` 第 1 步的**锁命中判定**。
+        ///   整改前 = `constraints.LockedTasks.Values.FirstOrDefault(...)` 全表线性扫
+        ///   （总量 = 延期需求数 × 锁定表长）；2026-11-06 第1步整改后 = `HashSet.Contains` O(1)。
+        ///   整改后本槽应≈0，若仍占量则说明索引没被复用。次数同 <see cref="Phase3DelayedLoop"/>。
+        /// </summary>
+        public const int Phase3LockScan = 72;
+
+        /// <summary>
+        /// `DiagnoseDelayReason` 第 2 步的**资源阻挡块检索**。
+        ///   整改前 = 每次调用重建外部+上游 ResourceBlock 列表再 Task×Block 嵌套扫（无条件付费）；
+        ///   2026-11-06 第2步整改后 = 只查自己 `ResourceId` 的桶，重建移到 `Diagnose()` 入口一次。
+        ///   整改后本槽应≈0；若仍占量先查索引是否真的传进来了。次数同 <see cref="Phase3DelayedLoop"/>。
+        /// </summary>
+        public const int Phase3BlockOverlap = 73;
+
+        /// <summary>
+        /// `Diagnose()` 里**全域**那一次 <c>CalculateResourceUtilization</c>（每个诊断调用一次）。
+        ///   底层 <c>foreach (var window in calendar)</c> **无二分**，遍历整本资源日历。
+        ///   2026-11-06 第3步：原先本槽与「每需求那一次」混在一起累加，无法拆分；
+        ///   现已拆开，逐需求那次单列在 <see cref="Phase3UtilizationPerDemand"/>。
+        ///   顾问 §四.3 指出「逐需求利用率」与「全域利用率」不是同一业务口径，口径问题另议，本槽只量耗时。
+        /// </summary>
+        public const int Phase3Utilization = 74;
+
+        /// <summary>
+        /// Phase5 结果组装里的 `StageTimingNodeBuilder.Build`（`DemandCompletions` 末端/纯内存时间节点）。
+        ///   顾问 §三点五 点名要求单列：它此前落在 Phase5 未计时的尾部里。
+        ///   **不改求值次序** —— 由同文件私有包装 `TimedStageTimingBuild` 在原位置调用（对象初始化器成员求值次序不变）。
+        /// </summary>
+        public const int Phase5StageTimingBuild = 75;
+
+        /// <summary>
+        /// `DiagnoseDelayReason` 里**逐延期需求**那一次 `CalculateResourceUtilization`（0号位 指令第3步的测量对象）。
+        ///   次数 = 延期需求数。判据：本槽 ÷ <see cref="Phase3Utilization"/> ⇒ 逐需求利用率到底值不值得缓存。
+        ///   **先测后改**：本槽读数出来之前不许动这段逻辑，更不许拿全域利用率顶替逐需求
+        ///   （分子/资源集合/统计上界都可能不同，会改 `CAPACITY` 判定）。
+        /// </summary>
+        public const int Phase3UtilizationPerDemand = 76;
     }
 
     private static readonly AsyncLocal<Counters?> Current = new();
@@ -1540,6 +1649,16 @@ public static class SolverDiagnostics
                 .Select(f => (Name: f.Name, Slot: (int)f.GetRawConstantValue()!))
                 .ToList();
 
+            // 2026-11-06：槽号 ≥ HotspotCount 的会**静默丢弃**（AddHotspotTicks 有护栏）。
+            //   这种情况下面所有读数都是 0，看起来像「没耗时」而不是「没记上」，必须吼出来。
+            var maxSlot = slots.Count == 0 ? -1 : slots.Max(s => s.Slot);
+            if (maxSlot >= Counters.HotspotCount)
+            {
+                Console.WriteLine(
+                    $"[SHAPE] ⚠ 槽号越界：最大槽={maxSlot}，但 Counters.HotspotCount={Counters.HotspotCount} "
+                    + "⇒ 这些槽**一个数都没记上**，下方读数为 0 不代表没耗时。先改 HotspotCount。");
+            }
+
             var totalNamed = slots.Sum(s => c.HotspotMs(s.Slot));
             Console.WriteLine($"[SHAPE] 全槽分项（共 {slots.Count} 槽, 累计 {totalNamed:N0}ms, 含嵌套）:");
             foreach (var (name, slot) in slots
@@ -1553,6 +1672,36 @@ public static class SolverDiagnostics
                 var perCall = calls > 0 ? ms * 1000d / calls : 0d;
                 Console.WriteLine($"[SHAPE]   {name,-26} {ms,12:N0}ms / {calls,12:N0} 次 = {perCall,10:N1}µs/次");
             }
+
+            // ── 2026-11-06 顾问复核：Phase3/Phase5 诊断链的输入规模 ──────────────
+            //   【为什么单列】上面那七槽只给「花了多久」，不给「每次扫多大」。
+            //     顾问 §四 的判据是「延期需求数 × 全阻挡块数」「延期需求数 × 锁定表长」，
+            //     所以两个乘数必须各自有数，否则无法区分「调用太少但每次巨大」和「调用太多」。
+            //   纯观测；只在 `APS_CLONE_SHAPE=1` 时执行，且一处 Run 只跑一次。
+            var diagCalls = c.HotspotCallCount(Hotspot.Phase3DiagnoseTotal);
+            var delayedCalls = c.HotspotCallCount(Hotspot.Phase3DelayedLoop);
+            var blockCalls = c.HotspotCallCount(Hotspot.Phase3BlockOverlap);
+            Console.WriteLine(
+                $"[SHAPE] 诊断链输入: Diagnose调用={diagCalls:N0} 次"
+                + $", 延期需求={delayedCalls:N0} 条"
+                + $", LockedTasks 累计={c.DiagnoseLockedTasksSum:N0}/峰值={c.DiagnoseLockedTasksMax:N0}"
+                + $" ⇒ 整改前锁扫描总量≈{c.DiagnoseLockedTasksSum * delayedCalls / Math.Max(diagCalls, 1):N0}"
+                + "（整改后实际=0，仅在耗时上体现）");
+            Console.WriteLine(
+                $"[SHAPE] 阻挡块输入: 外部块 累计={c.DiagnoseExternalBlockSum:N0}/峰值={c.DiagnoseExternalBlockMax:N0}"
+                + $", 上游块 累计={c.DiagnoseUpstreamBlockSum:N0}/峰值={c.DiagnoseUpstreamBlockMax:N0}"
+                + $" ⇒ 整改前块扫描总量≈{(c.DiagnoseExternalBlockSum + c.DiagnoseUpstreamBlockSum) * delayedCalls / Math.Max(diagCalls, 1):N0}"
+                + "（整改后实际=0，仅在耗时上体现）"
+                + $" ｜ 定向检索次数={blockCalls:N0}");
+            // 第3步测量：全域利用率 vs 逐需求利用率，两者同一槽号混算过 ⇒ 现已拆开，此处给出占比。
+            var utilDomainMs = c.HotspotMs(Hotspot.Phase3Utilization);
+            var utilPerDemandMs = c.HotspotMs(Hotspot.Phase3UtilizationPerDemand);
+            var utilTotal = utilDomainMs + utilPerDemandMs;
+            Console.WriteLine(
+                $"[SHAPE] 利用率: 全域={utilDomainMs:N0}ms / {c.HotspotCallCount(Hotspot.Phase3Utilization):N0} 次"
+                + $", 逐需求={utilPerDemandMs:N0}ms / {c.HotspotCallCount(Hotspot.Phase3UtilizationPerDemand):N0} 次"
+                + (utilTotal > 0 ? $" ⇒ 逐需求占利用率 {utilPerDemandMs * 100d / utilTotal:F1}%" : string.Empty)
+                + (c.Phase3Ms > 0 ? $"、占首次 Phase3 {utilTotal * 100d / c.Phase3Ms:F1}%" : string.Empty));
         }
         catch (Exception ex)
         {
@@ -1658,6 +1807,31 @@ public static class SolverDiagnostics
     {
         if (Current.Value is not { } c) return;
         if (taskCount > c.CloneTaskListLenMax) c.CloneTaskListLenMax = taskCount;
+    }
+
+    /// <summary>
+    /// 2026-11-06 顾问复核：登记一次 `PhaseThreeDiagnostics.Diagnose` 入口的 `LockedTasks.Count`。
+    ///   与 <see cref="Hotspot.Phase3DelayedLoop"/> 的次数相乘 = 锁定全表扫描的总条数。
+    ///   纯观测，不改任何判定。
+    /// </summary>
+    internal static void CountDiagnoseLockedTasks(int lockedTasks)
+    {
+        if (Current.Value is not { } c) return;
+        System.Threading.Interlocked.Add(ref c.DiagnoseLockedTasksSum, lockedTasks);
+        if (lockedTasks > c.DiagnoseLockedTasksMax) c.DiagnoseLockedTasksMax = lockedTasks;
+    }
+
+    /// <summary>
+    /// 2026-11-06 顾问复核：登记一次 `HasResourceBlockOverlap` 入口的外部/上游 ResourceBlock 条数。
+    ///   与该方法调用次数相乘 = 块列表重建 + 嵌套扫描的总规模。纯观测，不改任何判定。
+    /// </summary>
+    internal static void CountDiagnoseResourceBlocks(int externalBlocks, int upstreamBlocks)
+    {
+        if (Current.Value is not { } c) return;
+        System.Threading.Interlocked.Add(ref c.DiagnoseExternalBlockSum, externalBlocks);
+        System.Threading.Interlocked.Add(ref c.DiagnoseUpstreamBlockSum, upstreamBlocks);
+        if (externalBlocks > c.DiagnoseExternalBlockMax) c.DiagnoseExternalBlockMax = externalBlocks;
+        if (upstreamBlocks > c.DiagnoseUpstreamBlockMax) c.DiagnoseUpstreamBlockMax = upstreamBlocks;
     }
 
     /// <summary>

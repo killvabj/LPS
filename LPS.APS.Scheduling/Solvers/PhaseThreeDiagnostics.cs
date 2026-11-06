@@ -41,6 +41,24 @@ internal class PhaseThreeDiagnostics
     {
         var result = new DiagnosticsResult();
 
+        // ── 2026-11-06 顾问复核（纯观测）：Diagnose 整体墙钟 + 入口 LockedTasks 规模 ────────────
+        //   为什么加：`PhaseFiveCompression.cs:455` 会**再调一次本方法**，而外层无任何计时。
+        //   Run 999401 实测 JS 的 Phase5 残差 30 分 36 秒 ≈ 首次 Phase3 30 分 33 秒、QT 15 分 38 秒 ≈ 15 分 37 秒，
+        //   几乎同长但**没有直接证据**。本槽次数会直接说明「被调了几次」，墙钟说明每次多贵。
+        //   未开 scope 时 HotspotStart 返回 0 ⇒ 生产路径零开销、零分配。
+        var swDiagnose = SolverDiagnostics.HotspotStart();
+        SolverDiagnostics.CountDiagnoseLockedTasks(constraints.LockedTasks.Count);
+
+        // ── 2026-11-06 Phase3 首批整改 第1步：锁定表一次性建索引 ────────────────────────
+        //   原实现：`DiagnoseDelayReason` 里**每条延期需求**都 `LockedTasks.Values.FirstOrDefault(...)` 扫全表
+        //   ⇒ 总工作量 = 延期需求数 × 锁定表条数。改为本次调用建一次索引，逐需求 O(1) 命中。
+        var lockedDraftIds = BuildLockedDraftIdIndex(constraints);
+
+        // ── 2026-11-06 Phase3 首批整改 第2步：资源阻挡块一次性建索引 ────────────────────
+        //   原实现：每条延期需求都把外部块+上游块重新展开成一个 List，再 Task×全部Block 嵌套扫
+        //   ⇒ 总工作量 = 延期需求数 × 块总数。改为本次调用建一次 `ResourceId → Blocks`，定向取桶。
+        var resourceBlockIndex = BuildResourceBlockIndex(request);
+
         // P0-12修复：构建已排程任务的索引，使用ToLookup支持多工序（一个Demand生成多个Task）
         var scheduledTasksLookup = scheduleResult.ScheduledTasks
             .ToLookup(t => t.SourceDraftId);
@@ -73,6 +91,10 @@ internal class PhaseThreeDiagnostics
 
             if (delay > TimeSpan.Zero)
             {
+                // 2026-11-06 顾问复核（纯观测）：本槽次数 = **延期需求数**，墙钟 = 每条延期需求的诊断总价。
+                //   顾问 §四 的判据是「延期需求数 × 全阻挡块数」，两个乘数必须各自有数。
+                var swDelayed = SolverDiagnostics.HotspotStart();
+
                 // 延期
                 result.DelayedTaskIds.Add(lastTask.FinalDraftId);
 
@@ -83,6 +105,8 @@ internal class PhaseThreeDiagnostics
                     demandTasks,
                     constraints,
                     request,
+                    lockedDraftIds,
+                    resourceBlockIndex,
                     out var evidenceType,
                     out var extraDetails);
 
@@ -113,6 +137,8 @@ internal class PhaseThreeDiagnostics
                         $"\"summary\":\"需求 {demand.LogicalDemandKey} 延期 {delay.TotalHours:F2}h（{reasonCode}）\"," +
                         $"\"details\":{{\"RequiredTime\":\"{effectiveDue:O}\",\"ActualTime\":\"{lastTask.PlannedEndTime:O}\"{extraDetails}}}}}"
                 });
+
+                SolverDiagnostics.HotspotEnd(swDelayed, SolverDiagnostics.Hotspot.Phase3DelayedLoop);
             }
         }
 
@@ -122,11 +148,14 @@ internal class PhaseThreeDiagnostics
         // P1-02（BottleneckMode 四模式）：Auto 按利用率阈值自动识别；ForceAnchor 强制锚点必入；
         // PreferAnchor 锚点有负荷时优先入（无负荷/编码无效回退 Auto）；NotAnchor 锚点即使超阈值也排除。
         var solverStrategy = request.StrategySnapshot.SolverStrategy;
+        // 2026-11-06 顾问复核（纯观测）：全域利用率（本处一次）与逐需求利用率（下方第 5 步每延期需求一次）。
+        var swUtilAll = SolverDiagnostics.HotspotStart();
         var resourceUtilization = CalculateResourceUtilization(
             scheduleResult.ScheduledTasks,
             constraints,
             request.PlanningStart,
             request.PlanningEnd);
+        SolverDiagnostics.HotspotEnd(swUtilAll, SolverDiagnostics.Hotspot.Phase3Utilization);
 
         // Auto 基线：利用率超阈值者入瓶颈集。
         var bottleneckIds = resourceUtilization
@@ -196,6 +225,7 @@ internal class PhaseThreeDiagnostics
             });
         }
 
+        SolverDiagnostics.HotspotEnd(swDiagnose, SolverDiagnostics.Hotspot.Phase3DiagnoseTotal);
         return result;
     }
 
@@ -234,11 +264,40 @@ internal class PhaseThreeDiagnostics
     ///   中不存在「版本不一致」类输入（无 `CurrentActivePlanVersions` / `NewPlanVersions`），
     ///   1号位 无从判定版本风险；该码的真实生产者 = 2号位（跨域发布/版本链比对侧）。
     /// </summary>
+    /// <summary>
+    /// 2026-11-06 Phase3 首批整改 第1步：把「每条延期需求扫一遍全表锁定」改成**每次 Diagnose 建一次索引**。
+    ///
+    /// <para>【为什么是 HashSet 而不是「保留首条映射」】原逻辑
+    /// `constraints.LockedTasks.Values.FirstOrDefault(t =&gt; t.DraftId == demand.LogicalDemandKey)`
+    /// 的返回值**只用于判空**，调用方从未读取它的任何字段 ⇒ 真正需要的只是
+    /// 「锁定表里是否存在该 DraftId」。因此按下标建集合与原语义**严格等价**，
+    /// 同一 DraftId 出现多次（不同 StageCode/OperationCode）也与原「取首条」结果一致。</para>
+    ///
+    /// <para>【比较语义】原表达式用的是 <c>string ==</c>（序数比较），此处显式指定
+    /// <see cref="StringComparer.Ordinal"/> 对齐，不引入区域文化差异。</para>
+    ///
+    /// <para>【生命周期】局部变量，只覆盖本次 <c>Diagnose</c> 调用。Phase5 的第二次诊断会
+    /// **另建一份**，不跨两个时点复用与 Task 状态相关的过期结果（0号位 指令第4步要求）。</para>
+    /// <para>【可见性】`private` → **`internal`**（2026-11-06），仅供 `LPS.APS.Tests`
+    /// 对本索引与「锁定集合 0/1/多条、同 DraftId 重复」做直接断言。业务语义未变。</para>
+    /// </summary>
+    internal static HashSet<string> BuildLockedDraftIdIndex(ConstraintContext constraints)
+    {
+        var index = new HashSet<string>(constraints.LockedTasks.Count, StringComparer.Ordinal);
+        foreach (var locked in constraints.LockedTasks.Values)
+        {
+            index.Add(locked.DraftId);
+        }
+        return index;
+    }
+
     private string DiagnoseDelayReason(
         LogicalProductionDemand demand,
         List<FinalTaskDraft> demandTasks,
         ConstraintContext constraints,
         DomainSolveRequest request,
+        HashSet<string> lockedDraftIds,
+        Dictionary<int, List<(ResourceBlock Block, bool Cross)>> resourceBlockIndex,
         out string evidenceType,
         out string extraDetails)
     {
@@ -249,9 +308,13 @@ internal class PhaseThreeDiagnostics
 
         // 1. 锁定约束：冻结区（FIRM/FROZEN）锁定 vs 其它执行锁
         //    P1-07：复合键 (DraftId, OperationCode)，按 DraftId 匹配该需求任一锁定锚点。
-        var locked = constraints.LockedTasks.Values
-            .FirstOrDefault(t => t.DraftId == demand.LogicalDemandKey);
-        if (locked != null)
+        // 2026-11-06 Phase3 首批整改 第1步：全表线性扫描 → 本次 Diagnose 建一次索引后 O(1) 命中。
+        //   等价性依据：原 `FirstOrDefault` 的返回值**只用于判空**（从未读 locked 的任何字段），
+        //   ⇒ 需要的只是「存在该 DraftId」，HashSet 与原语义严格一致（重复 DraftId 也一致）。
+        var swLock = SolverDiagnostics.HotspotStart();
+        var hasLocked = lockedDraftIds.Contains(demand.LogicalDemandKey);
+        SolverDiagnostics.HotspotEnd(swLock, SolverDiagnostics.Hotspot.Phase3LockScan);
+        if (hasLocked)
         {
             // 15 码对齐：15 码中唯一的锁码 = FROZEN_ZONE_LOCK（冻结区锁）。
             // 原按 ConstraintType 分投 FIRM_FROZEN_CONSTRAINT / LOCK_CONSTRAINT 两码，二者均非 15 码；
@@ -267,7 +330,12 @@ internal class PhaseThreeDiagnostics
         //    1号位 的 DomainSolveRequest 中无任何版本不一致类输入 ⇒ 1号位 **不产** 该码（真实生产者 = 2号位）。
         //    细分由 EvidenceJson.evidenceType 承载（CROSS_DOMAIN_RESOURCE_BLOCK / SHARED_RESOURCE），
         //    details 携 SourceDomainKey / SourcePlanVersionId / ResourceId。
-        if (HasResourceBlockOverlap(demandTasks, request, out var matchedBlock, out var crossDomain))
+        // 2026-11-06 Phase3 首批整改 第2步：块索引在 `Diagnose()` 入口建一次，此处只做定向取桶。
+        var swBlocks = SolverDiagnostics.HotspotStart();
+        var hasBlockOverlap = HasResourceBlockOverlap(demandTasks, resourceBlockIndex, out var matchedBlock, out var crossDomain);
+        SolverDiagnostics.HotspotEnd(swBlocks, SolverDiagnostics.Hotspot.Phase3BlockOverlap);
+
+        if (hasBlockOverlap)
         {
             evidenceType = crossDomain ? "CROSS_DOMAIN_RESOURCE_BLOCK" : "SHARED_RESOURCE";
             if (matchedBlock != null)
@@ -317,11 +385,15 @@ internal class PhaseThreeDiagnostics
                 resourceIds.Add(rid);
             }
         }
+        // 2026-11-06 顾问复核（纯观测）：**逐需求**重算利用率。底层 `foreach (var window in calendar)` 无二分，
+        //   遍历整本资源日历 ⇒ 总工作量 = 延期需求数 × 该需求触及资源的日历窗数。
+        var swUtilDemand = SolverDiagnostics.HotspotStart();
         var resourceUtilization = CalculateResourceUtilization(
             demandTasks,
             constraints,
             request.PlanningStart,
             request.PlanningEnd);
+        SolverDiagnostics.HotspotEnd(swUtilDemand, SolverDiagnostics.Hotspot.Phase3UtilizationPerDemand);
 
         if (resourceIds.Any(rid => resourceUtilization.ContainsKey(rid) && resourceUtilization[rid] > request.StrategySnapshot.SolverStrategy.CapacityShortageUtilizationThreshold))
         {
@@ -452,22 +524,51 @@ internal class PhaseThreeDiagnostics
     /// <paramref name="matchedBlock"/> 出参回传命中的原始 <see cref="ResourceBlock"/>，
     /// 供调用方在 EvidenceJson.details 中携带 SourceDomainKey / SourcePlanVersionId / ResourceId。
     /// </summary>
-    private static bool HasResourceBlockOverlap(
-        List<FinalTaskDraft> demandTasks,
-        DomainSolveRequest request,
-        out ResourceBlock? matchedBlock,
-        out bool crossDomain)
+    /// <summary>
+    /// 2026-11-06 Phase3 首批整改 第2步：把两类 ResourceBlock 一次性建成 `ResourceId → Blocks` 索引。
+    ///
+    /// <para>【建法】外部块在前、上游块在后（与原实现拼接成同一个 List 的顺序**完全一致**）；
+    /// 同 ResourceId 的块按上述顺序进同一个桶，桶内相对次序 = 原始遍历次序。</para>
+    ///
+    /// <para>【等价性】原判定的命中条件是 <c>block.ResourceId == taskResourceId</c> 且区间重叠，
+    /// 前半句即「按资源过滤」。取桶查找只是把这条过滤换成了字典定位，**桶内仍按原次序线性扫**，
+    /// ⇒ (Task 外层顺序, Block 原始优先顺序) 的字典序首个命中与原实现逐位相同；
+    /// 同资源多个/重叠/重复 Block 也走同一桶同一顺序，选中的证据（含 SourceDomainKey /
+    /// SourcePlanVersionId / ResourceId）必然一致。命中即返回，不改变后续 Task 的遍历。</para>
+    ///
+    /// <para>【生命周期】局部变量，只覆盖本次 <c>Diagnose</c> 调用。Phase5 的第二次诊断按当时的
+    /// 请求另建一份，不跨两个时点复用（0号位 指令第4步要求）。</para>
+    ///
+    /// <para>【可见性】`private` → **`internal`**（2026-11-06），仅供 `LPS.APS.Tests` 做
+    /// 「新旧算法逐例差分对账」直接调用。业务语义未变。</para>
+    /// </summary>
+    internal static Dictionary<int, List<(ResourceBlock Block, bool Cross)>> BuildResourceBlockIndex(
+        DomainSolveRequest request)
     {
-        matchedBlock = null;
-        crossDomain = false;
+        // 2026-11-06 顾问复核（纯观测）：登记两类块来源的条数。改为每次 `Diagnose()` 登记一次
+        //   （原先在每条延期需求的 HasResourceBlockOverlap 里各登记一次），语义由「×需求数累计」
+        //   变为「本域本时点的块规模」，Sum 除以 Diagnose 次数即每次的平均块数。
+        SolverDiagnostics.CountDiagnoseResourceBlocks(
+            request.CandidateContext?.ExternalDomainResourceBlocks?.Count ?? 0,
+            request.UpstreamDomainResourceBlocks?.Count ?? 0);
 
-        var blocks = new List<(ResourceBlock Block, bool Cross)>();
+        var index = new Dictionary<int, List<(ResourceBlock Block, bool Cross)>>();
+
+        void Add(ResourceBlock b)
+        {
+            if (!index.TryGetValue(b.ResourceId, out var bucket))
+            {
+                bucket = new List<(ResourceBlock Block, bool Cross)>();
+                index[b.ResourceId] = bucket;
+            }
+            bucket.Add((b, !string.IsNullOrEmpty(b.SourceDomainKey)));
+        }
 
         if (request.CandidateContext?.ExternalDomainResourceBlocks != null)
         {
             foreach (var b in request.CandidateContext.ExternalDomainResourceBlocks)
             {
-                blocks.Add((b, !string.IsNullOrEmpty(b.SourceDomainKey)));
+                Add(b);
             }
         }
 
@@ -475,19 +576,40 @@ internal class PhaseThreeDiagnostics
         {
             foreach (var b in request.UpstreamDomainResourceBlocks)
             {
-                blocks.Add((b, !string.IsNullOrEmpty(b.SourceDomainKey)));
+                Add(b);
             }
         }
+
+        return index;
+    }
+
+    /// <summary>
+    /// P1-03修复：判断需求任务是否与「共享资源/跨域」不可移动阻挡块重叠。
+    /// 2026-11-06 第2步：块来源改为入口建好的 <paramref name="resourceBlockIndex"/>，
+    /// 本方法只做「Task 外层顺序 → 自己 ResourceId 桶内原顺序」的定向检索。
+    ///
+    /// <para>【可见性】`private` → **`internal`**（2026-11-06），仅供 `LPS.APS.Tests` 做
+    /// 「新旧算法逐例差分对账」直接调用。业务语义未变。</para>
+    /// </summary>
+    internal static bool HasResourceBlockOverlap(
+        List<FinalTaskDraft> demandTasks,
+        Dictionary<int, List<(ResourceBlock Block, bool Cross)>> resourceBlockIndex,
+        out ResourceBlock? matchedBlock,
+        out bool crossDomain)
+    {
+        matchedBlock = null;
+        crossDomain = false;
 
         foreach (var task in demandTasks)
         {
             // 非资源 Task 跳过：ResourceId 为 null 不占资源，不可能与任何资源阻挡块重叠
             if (task.ResourceId is not int taskResourceId) continue;
 
-            foreach (var (block, cross) in blocks)
+            if (!resourceBlockIndex.TryGetValue(taskResourceId, out var bucket)) continue;
+
+            foreach (var (block, cross) in bucket)
             {
-                if (block.ResourceId == taskResourceId &&
-                    Overlaps(task.PlannedStartTime, task.PlannedEndTime, block.StartTime, block.EndTime))
+                if (Overlaps(task.PlannedStartTime, task.PlannedEndTime, block.StartTime, block.EndTime))
                 {
                     matchedBlock = block;
                     crossDomain = cross;
