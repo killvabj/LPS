@@ -1473,7 +1473,9 @@ public class PeggingOrchestrator : IPeggingOrchestrator
         public int RowIndex { get; init; }
         public int PlanVersionId { get; init; }
         public string TaskNo { get; init; } = string.Empty;
-        public string MESWorkOrderNo { get; init; } = string.Empty;
+        /// <summary>`CREATED`=工单已存在（A 继承／B 绑定）；`PENDING`=C 桶待建单（尚无工单号）。</summary>
+        public string DispatchStatus { get; init; } = "CREATED";
+        public string? MESWorkOrderNo { get; init; }
         public int MaterialId { get; init; }
         public string OperationCode { get; init; } = string.Empty;
         public string? ProductionInstructionNo { get; init; }
@@ -1483,6 +1485,20 @@ public class PeggingOrchestrator : IPeggingOrchestrator
         public DateTime? PlannedStartTime { get; init; }
         public DateTime? PlannedEndTime { get; init; }
         public DateTime CreatedAt { get; init; }
+
+        // ── 2026-11-06 增列（5号位《MES 对接与 TaskDispatch 下发 v1.0》§四 A1/A2）─────────────
+        /// <summary>`Task.StageCode` 直抄；供调度器按 `(PI × Stage)` 分组（此前无此列，分组做不到）。</summary>
+        public string? StageCode { get; init; }
+        /// <summary>
+        /// 部门**码**（`ProductionDepartment.DeptCode`），**不取 `Holon`、不取 Id**——
+        ///   `Holon` 实测 287 行中 112 行（39%）为 NULL，`DeptCode` 零 NULL。
+        /// </summary>
+        public string? ProductionDepartmentCode { get; init; }
+        /// <summary>
+        /// 工序名：按五元组命中 `RoutingOperation.OperationName`；当前 `Task.RouteCode/PathId` 全表归一为
+        ///   `DEFAULT`/`1` ⇒ 命中 0 ⇒ **留 NULL 不猜**（四键在 1,903,725 组里有 11,312 组对应多名）。
+        /// </summary>
+        public string? OperationName { get; init; }
     }
 
     /// <summary>`ExplainTrace` 的落库行：属性名与表列名逐一对应（`Id` 由数据库生成，不在此）。</summary>
@@ -1713,6 +1729,75 @@ public class PeggingOrchestrator : IPeggingOrchestrator
                 // 作用域 = 本 PlanVersion 落库事务（跨域循环不共享，故声明在此 foreach 之前）。
                 var taskNoByBatch = new Dictionary<string, string>(StringComparer.Ordinal);
 
+                // 2026-11-06：部门 Id → 部门码 映射（`TaskDispatch.ProductionDepartmentCode` 用码不用 Id，5号位 A2）。
+                //   取 `DeptCode` 而**不取 `Holon`**：实测 `ProductionDepartment` 287 行中 `Holon` 112 行为 NULL（39%），
+                //   `DeptCode` 零 NULL；而 `Task.ProductionDepartmentId` → `DeptCode` 零缺失，可 100% 填满。
+                var deptCodeById = (await conn.QueryAsync<DeptIdCodeRow>(
+                        "SELECT Id, DeptCode FROM ProductionDepartment",
+                        transaction: tx))
+                    .Where(r => !string.IsNullOrWhiteSpace(r.DeptCode))
+                    .ToDictionary(r => r.Id, r => r.DeptCode!);
+
+                // ── 2026-11-06：C 桶「自由量」口径（用户定盘）────────────────────────────
+                //   Free(PI) = PI 总量 Q − Σ(MES 已有工单计划量) − Σ(我方已下发但 MES 快照尚未体现的组量)
+                //
+                //   ⚠ 建单基数**必须**是「Q − ΣWo」，**不能**用 `RemainingQty`：
+                //     `RemainingQty = PlannedQty − GoodCompletedQty`，我方新建一张单会让 `PlannedQty` 上涨
+                //     ⇒ `RemainingQty` 反而**变大** ⇒ 下一轮再建更大的单，**越建越多**。
+                //     `Q − ΣWo` 则随建单单调下降，建过即归零 —— 这正是「C 桶建完，下轮不再建单」的机制。
+                //   ⚠ 排产量仍用 `RemainingQty`（`LoadOrdersForPeggingAsync` 的需求根），两者分工不同：
+                //     排产随完工减少、建单随建单减少。混用任一方向都会出错。
+                var runIdForDispatch = await conn.QueryFirstOrDefaultAsync<int?>(
+                    "SELECT SourceScheduleRunId FROM PlanVersion WHERE Id = @Id",
+                    new { Id = planVersionId }, transaction: tx);
+
+                // PI 总量（本 PV 的 [Order]）
+                var piOrderQty = (await conn.QueryAsync<PiQtyRow>(
+                        @"SELECT MTS_InstructionNo, SUM(Quantity)
+                          FROM [Order]
+                          WHERE PlanVersionId = @Pv AND MTS_InstructionNo IS NOT NULL AND MTS_InstructionNo <> ''
+                          GROUP BY MTS_InstructionNo",
+                        new { Pv = planVersionId }, transaction: tx))
+                    .Where(r => !string.IsNullOrEmpty(r.PI))
+                    .ToDictionary(r => r.PI!, r => r.Qty, StringComparer.Ordinal);
+
+                // MES 已有工单计划量（按 PI 汇总；无 Run 则为空 ⇒ 无法建 C 桶单，见下）
+                var piWoQty = new Dictionary<string, decimal>(StringComparer.Ordinal);
+                if (runIdForDispatch is > 0)
+                {
+                    foreach (var r in await conn.QueryAsync<PiQtyRow>(
+                                 @"SELECT ProductionInstructionNo AS PI, SUM(PlannedQty) AS Qty
+                                   FROM MESWorkOrderSnapshot
+                                   WHERE ScheduleRunId = @Run AND PlannedQty > 0
+                                   GROUP BY ProductionInstructionNo",
+                                 new { Run = runIdForDispatch.Value }, transaction: tx))
+                        if (!string.IsNullOrEmpty(r.PI)) piWoQty[r.PI!] = r.Qty;
+
+                    // 我方已下发、但 MES 快照尚未体现的工单量（建单与 MES 可见之间的空窗，防同日重复建单）。
+                    //   判据：本 PV 的 CREATED 行，其 MESWorkOrderNo 不在本 Run 的快照里。
+                    foreach (var r in await conn.QueryAsync<PiQtyRow>(
+                                 @"SELECT d.ProductionInstructionNo AS PI, SUM(d.Quantity) AS Qty
+                                   FROM [TaskDispatch] d
+                                   WHERE d.SourcePlanVersionId = @Pv
+                                     AND d.DispatchStatus = 'CREATED'
+                                     AND d.MESWorkOrderNo IS NOT NULL
+                                     AND d.ProductionInstructionNo IS NOT NULL
+                                     AND NOT EXISTS (SELECT 1 FROM MESWorkOrderSnapshot s
+                                                     WHERE s.ScheduleRunId = @Run
+                                                       AND s.MESWorkOrderNo = d.MESWorkOrderNo)
+                                   GROUP BY d.ProductionInstructionNo",
+                                 new { Pv = planVersionId, Run = runIdForDispatch.Value }, transaction: tx))
+                        if (!string.IsNullOrEmpty(r.PI)) piWoQty[r.PI!] = piWoQty.TryGetValue(r.PI!, out var cur) ? cur + r.Qty : r.Qty;
+                }
+
+                // PI → 本轮剩余可建单量（前序 Task 已分配的部分实时扣减）
+                var piFreeQty = new Dictionary<string, decimal>(StringComparer.Ordinal);
+                foreach (var kv in piOrderQty)
+                {
+                    var wo = piWoQty.TryGetValue(kv.Key, out var w) ? w : 0m;
+                    piFreeQty[kv.Key] = Math.Max(kv.Value - wo, 0m);
+                }
+
                 // 只落「部门事实可解析」的 FinalTask（J14-06 Fail-Closed；缺口集合见上方分区与告警）。
                 // R08：Setup 分钟/来源的 **Task 级**落库缓冲（0号位 2026-10-28 §5：用既有轻量 `ExplainTrace`，
                 //   **域级 `APS_ETL_Log` 不能充 Task 级**）。逐条收集、循环后一次性 INSERT，避免每 Task 多一次往返。
@@ -1920,8 +2005,54 @@ public class PeggingOrchestrator : IPeggingOrchestrator
                             ResourceId             = persistResourceId,
                             PlannedStartTime       = final.PlannedStartTime,
                             PlannedEndTime         = final.PlannedEndTime,
-                            CreatedAt              = now
+                            CreatedAt              = now,
+                            // ── 2026-11-06 增列（A1/A2）──────────────────────────────
+                            StageCode              = string.IsNullOrWhiteSpace(final.StageCode) ? null : final.StageCode,
+                            ProductionDepartmentCode = persistDepartmentId.HasValue
+                                && deptCodeById.TryGetValue(persistDepartmentId.Value, out var dc) ? dc : null,
+                            // 五元组命中 0（Task.RouteCode/PathId 全表归一为 DEFAULT/1）⇒ 留 NULL，不按四键猜
+                            OperationName          = null
                         });
+                    }
+                    else
+                    {
+                        // ── C 桶（2026-11-06 新增）：无 MES 工单号 ⇒ 落 `PENDING`，等 5号位 调度器按 (PI × Stage) 建单。
+                        //   数量按「PI 自由量」封顶，**不能直接抄 `final.Quantity`**（会超发）：
+                        //     Free(PI) = PI 总量 − Σ(MES 已有工单计划量) − Σ(我方已下发但 MES 快照未体现)
+                        //   本循环按 (StageCode, OperationSeq) 顺序消费，`piFreeQty` 实时扣减、扣完即不再建单。
+                        //   ⚠ 无 PI 的 Task 不建单（5号位 A6：无 PI 不下发 MES，与现行为一致）。
+                        //   ⚠ 建单粒度为 **PI 级**：`MESWorkOrderSnapshot` 无 StageCode，无法按 Stage 拆分工单量；
+                        //      若 MES 侧确需「按 Stage 各建一单」，须 5号位 先明确 ΣWo 的 Stage 归属（待其确认）。
+                        if (!string.IsNullOrEmpty(mtsInstructionNo)
+                            && piFreeQty.TryGetValue(mtsInstructionNo, out var free) && free > 0m)
+                        {
+                            var alloc = Math.Min(free, final.Quantity);
+                            if (alloc > 0m)
+                            {
+                                piFreeQty[mtsInstructionNo] = free - alloc;
+                                taskDispatchDrafts.Add(new TaskDispatchDraft
+                                {
+                                    RowIndex               = rowIndex,
+                                    PlanVersionId          = planVersionId,
+                                    TaskNo                 = taskNo,
+                                    DispatchStatus         = "PENDING",
+                                    MESWorkOrderNo         = null,
+                                    MaterialId             = final.MaterialId,
+                                    OperationCode          = final.OperationCode,
+                                    ProductionInstructionNo = mtsInstructionNo,
+                                    Quantity               = alloc,
+                                    UOM                    = final.UOM,
+                                    ResourceId             = persistResourceId,
+                                    PlannedStartTime       = final.PlannedStartTime,
+                                    PlannedEndTime         = final.PlannedEndTime,
+                                    CreatedAt              = now,
+                                    StageCode              = string.IsNullOrWhiteSpace(final.StageCode) ? null : final.StageCode,
+                                    ProductionDepartmentCode = persistDepartmentId.HasValue
+                                        && deptCodeById.TryGetValue(persistDepartmentId.Value, out var dc2) ? dc2 : null,
+                                    OperationName          = null
+                                });
+                            }
+                        }
                     }
                     // 1号位 §五.4：原为逐条 `Console.WriteLine`（本轮 1,212,614 行输出）⇒ 改每 20,000 条一行。
                     if (++taskDone % 20_000 == 0)
@@ -2048,38 +2179,47 @@ public class PeggingOrchestrator : IPeggingOrchestrator
                 if (taskDispatchDrafts.Count > 0)
                 {
                     var dispatchRows = taskDispatchDrafts
-                        .Select(d => new
+                        .Select(d => new TaskDispatchRow
                         {
-                            SourcePlanVersionId     = d.PlanVersionId,
-                            SourceTaskId            = taskIds[d.RowIndex],
-                            d.TaskNo,
-                            d.MESWorkOrderNo,
-                            d.MaterialId,
-                            d.OperationCode,
-                            d.ProductionInstructionNo,
-                            d.Quantity,
-                            d.UOM,
-                            d.ResourceId,
-                            d.PlannedStartTime,
-                            d.PlannedEndTime,
-                            d.CreatedAt
+                            SourcePlanVersionId      = d.PlanVersionId,
+                            SourceTaskId             = taskIds[d.RowIndex],
+                            TaskNo                   = d.TaskNo,
+                            DispatchStatus           = d.DispatchStatus,
+                            MESWorkOrderNo           = d.MESWorkOrderNo,
+                            MaterialId               = d.MaterialId,
+                            OperationCode            = d.OperationCode,
+                            ProductionInstructionNo  = d.ProductionInstructionNo,
+                            Quantity                 = d.Quantity,
+                            UOM                      = d.UOM,
+                            ResourceId               = d.ResourceId,
+                            PlannedStartTime         = d.PlannedStartTime,
+                            PlannedEndTime           = d.PlannedEndTime,
+                            CreatedAt                = d.CreatedAt,
+                            StageCode                = d.StageCode,
+                            ProductionDepartmentCode = d.ProductionDepartmentCode,
+                            OperationName            = d.OperationName
                         })
                         .ToList();
 
-                    await conn.ExecuteAsync(
-                        @"INSERT INTO [TaskDispatch]
-                              (SourcePlanVersionId, SourceTaskId, TaskNo, MESWorkOrderNo, DispatchStatus,
-                               MaterialId, OperationCode, ProductionInstructionNo, Quantity, UOM,
-                               ResourceId, PlannedStartTime, PlannedEndTime, CreatedAt)
-                          VALUES
-                              (@SourcePlanVersionId, @SourceTaskId, @TaskNo, @MESWorkOrderNo, 'CREATED',
-                               @MaterialId, @OperationCode, @ProductionInstructionNo, @Quantity, @UOM,
-                               @ResourceId, @PlannedStartTime, @PlannedEndTime, @CreatedAt);",
-                        dispatchRows, transaction: tx);
+                    // PENDING 是「本轮待建单意图」，非事实 ⇒ 每轮先清后写，避免跨轮累积。
+                    //   CREATED 是事实（A 桶 TaskNo 继承靠它反查），**不得删**。
+                    var purgedPending = await conn.ExecuteAsync(
+                        "DELETE FROM [TaskDispatch] WHERE SourcePlanVersionId = @Pv AND DispatchStatus = 'PENDING'",
+                        new { Pv = planVersionId }, transaction: tx);
+                    if (purgedPending > 0)
+                        _logger.LogInformation("[PeggingPersist] 清理上轮 PENDING 下发行：{Count} 条（PV={Pv}）",
+                            purgedPending, planVersionId);
+
+                    // 【2026-11-06 性能】原为逐条参数化 INSERT。C 桶上线后行数从「数百」变成「可能上万」
+                    //   （每行一次往返，同类表实测 226s/365,545 行）⇒ 改 SqlBulkCopy（泛型重载，接受 IDbConnection）。
+                    await _connectionManager.BulkInsertToTransactionAsync(
+                        dispatchRows, "TaskDispatch", conn, tx);
 
                     _logger.LogInformation(
-                        "[PeggingPersist] 下发绑定登记（A/B 桶）：{Rows} 条（TaskNo↔MESWorkOrderNo，状态 CREATED）",
-                        dispatchRows.Count);
+                        "[PeggingPersist] 下发登记：{Rows} 条（CREATED={Created}／PENDING={Pending}）",
+                        dispatchRows.Count,
+                        dispatchRows.Count(x => x.DispatchStatus == "CREATED"),
+                        dispatchRows.Count(x => x.DispatchStatus == "PENDING"));
                 }
 
                 // R08：Setup 逐 Task 痕迹（同一事务；Task 回滚则痕迹一并回滚，不留孤儿行）。
@@ -9615,6 +9755,32 @@ public class PeggingOrchestrator : IPeggingOrchestrator
 
     private sealed class FamilyCodeRow { public int Id { get; set; } public string Code { get; set; } = string.Empty; }
     private sealed class DeptCodeRow { public int Id { get; set; } public string? SourceDeptCode { get; set; } }
+    /// <summary>`ProductionDepartment.Id → DeptCode`（2026-11-06，`TaskDispatch.ProductionDepartmentCode` 用）。</summary>
+    private sealed class DeptIdCodeRow { public int Id { get; set; } public string? DeptCode { get; set; } }
+    /// <summary>PI → 数量（2026-11-06，C 桶自由量计算用）。</summary>
+    private sealed class PiQtyRow { public string? PI { get; set; } public decimal Qty { get; set; } }
+
+    /// <summary>`TaskDispatch` 批量落库行（属性名 = 列名，供 SqlBulkCopy 泛型重载）。2026-11-06。</summary>
+    private sealed class TaskDispatchRow
+    {
+        public int SourcePlanVersionId { get; set; }
+        public long SourceTaskId { get; set; }
+        public string TaskNo { get; set; } = string.Empty;
+        public string? MESWorkOrderNo { get; set; }
+        public string DispatchStatus { get; set; } = "CREATED";
+        public int MaterialId { get; set; }
+        public string OperationCode { get; set; } = string.Empty;
+        public string? ProductionInstructionNo { get; set; }
+        public decimal Quantity { get; set; }
+        public string UOM { get; set; } = string.Empty;
+        public int? ResourceId { get; set; }
+        public DateTime? PlannedStartTime { get; set; }
+        public DateTime? PlannedEndTime { get; set; }
+        public DateTime CreatedAt { get; set; }
+        public string? StageCode { get; set; }
+        public string? ProductionDepartmentCode { get; set; }
+        public string? OperationName { get; set; }
+    }
     private sealed class FactoryCodeRow { public int Id { get; set; } public string Code { get; set; } = string.Empty; }
 
     /// <summary>MaterialCode → Id 反查行</summary>
@@ -12088,6 +12254,12 @@ public class PeggingOrchestrator : IPeggingOrchestrator
         PeggingExecutionRequest request,
         CancellationToken ct)
     {
+        // 2026-11-06：取本 PV 所属 Run，用于关联 MES 进度快照（需求根新口径，见下方 CASE 注释）。
+        //   取不到（PV 未挂 Run，如试跑 PV）⇒ 传 NULL ⇒ LEFT JOIN 不命中 ⇒ 自动退回旧口径 `Q − ReceivedQty`。
+        var scheduleRunId = await _connectionManager.QueryFirstOrDefaultAsync<int?>(
+            "SELECT SourceScheduleRunId FROM PlanVersion WHERE Id = @Id",
+            new { Id = request.PlanVersionId }, db: DatabaseId.APS);
+
         var rows = await QueryChunkedInAsync(request.OrderIds, chunk =>
             _connectionManager.QueryAsync<OrderPeggingRow>(
                 @"SELECT o.Id          AS OrderId,
@@ -12120,7 +12292,20 @@ public class PeggingOrchestrator : IPeggingOrchestrator
                          -- 库测（2026-10-10）：PV2 `[Order]` 22,144 行**全部有** `MTS_InstructionNo`（一行=一条需求，
                          --   OrderNo 与 MTS_InstructionNo 各自唯一、零重复、零跨类型）⇒ 本次改动**数值零变化**，
                          --   只是把「一律做减」收紧成「只对真 PI 行做减」，防上游将来给无 PI 行盖上假 ReceivedQty。
-                         CASE WHEN o.MTS_InstructionNo IS NOT NULL AND o.MTS_InstructionNo <> ''
+                         CASE
+                              -- ①【2026-11-06 新口径·用户定盘】MES 有该 PI 的进度行 ⇒ 需求根 = MES 剩余（未完工量）。
+                              --   为什么优先 MES：`ReceivedQty` 是**已入库**，回写滞后——实测 PV999437/999444 范围内，
+                              --   MES 显示 `Good >= Planned`（已做完）的 11,138 个 PI 里 **6,421 个 `ReceivedQty = 0`**，
+                              --   合计 **288 万件**；按旧口径会把这些**已完工的量全额重排**。
+                              --   按 MES 剩余则为 0 ⇒ 自动不排。**这是唯一能自动止住重复排产的机制。**
+                              --   上下限：负数归 0（不反向）；超过订单总量按订单总量封顶（不得凭空放大需求）。
+                              WHEN o.MTS_InstructionNo IS NOT NULL AND o.MTS_InstructionNo <> ''
+                                   AND mss.MesRemainingQty IS NOT NULL
+                              THEN CASE WHEN mss.MesRemainingQty < 0 THEN 0
+                                        WHEN mss.MesRemainingQty > o.Quantity THEN o.Quantity
+                                        ELSE mss.MesRemainingQty END
+                              -- ② 旧口径（无 MES 数据时）：`Q − ReceivedQty`
+                              WHEN o.MTS_InstructionNo IS NOT NULL AND o.MTS_InstructionNo <> ''
                                    AND o.Quantity - ISNULL(o.ReceivedQty, 0) > 0
                               THEN o.Quantity - ISNULL(o.ReceivedQty, 0)
                               WHEN o.MTS_InstructionNo IS NOT NULL AND o.MTS_InstructionNo <> ''
@@ -12143,8 +12328,16 @@ public class PeggingOrchestrator : IPeggingOrchestrator
                   FROM [Order] o
                   INNER JOIN Material m ON m.Id = o.MaterialId
                   INNER JOIN Factory  f ON f.Id = o.FactoryId
+                  -- 2026-11-06：MES 进度快照按 PI 聚合（一个 PI 可能多行，实测 3 个 PI 有 2 行 ⇒ 必须 SUM）。
+                  --   `@ScheduleRunId` 为 NULL（PV 未挂 Run）时本 LEFT JOIN 不命中 ⇒ 走旧口径。
+                  LEFT JOIN (
+                      SELECT ProductionInstructionNo AS PI, SUM(RemainingQty) AS MesRemainingQty
+                      FROM StageProgressSnapshot
+                      WHERE ScheduleRunId = @ScheduleRunId
+                      GROUP BY ProductionInstructionNo
+                  ) mss ON mss.PI = o.MTS_InstructionNo
                   WHERE o.Id IN @OrderIds",
-                new { OrderIds = chunk },
+                new { OrderIds = chunk, ScheduleRunId = scheduleRunId },
                 db: DatabaseId.APS));
 
         return rows.ToList();

@@ -3223,11 +3223,20 @@ internal class PhaseTwoInitialScheduler
                 traceNotesWatermark, constraints.TraceNotes.Count - traceNotesWatermark);
         }
 
-        // 擂台比较：判据与比较次序**一字未动** —— 严格更优才替换 ⇒ 平局时靠前的候选胜，与串行逐字一致。
+        // ── BATCH-02.5（0号位 e31a6fb §3）：**零进展的候选不得胜出** ──
+        //   实测背景：把「1 批」加入候选后，某些需求 1 批在试排里第一个批就失败
+        //     （`FailedBatchIndex == 0`，一个批都没落定），但 `CompareBatchPlans` 只看目标与批数
+        //     ⇒ 它照样可能胜出 ⇒ 该需求最终**一条 Task 都没有**（`反证9` 实测即为空结果）。
+        //   ⇒ 比较前先剔除「零进展」候选；**部分成功仍可参与**（不改变既有部分落定语义）。
+        //   全部候选都是零进展时，保持原口径（靠前者胜 = 基线），由既有失败出口如实登记未排量。
         BatchPlanTrialState? best = null;
         for (int i = 0; i < candidates.Count; i++)
         {
             var trial = results[i]!;
+            if (trial.Outcome.BatchFailed && trial.Outcome.FailedBatchIndex == 0 && trial.Outcome.NewTasks.Count == 0)
+            {
+                continue;
+            }
             if (best is null
                 || CompareBatchPlans(trial.Outcome, trial.Formation, best.Outcome, best.Formation,
                                      constraints, actualDemand, policy) < 0)
@@ -3237,6 +3246,12 @@ internal class PhaseTwoInitialScheduler
         }
 
         // `candidates.Count > 1`（调用方唯一入口）+ 首个候选必被 `best is null` 收下 ⇒ best 非空。
+        if (best is null)
+        {
+            // 全部候选都是「零进展」⇒ 保持原口径：靠前者（= 基线）胜，由既有失败出口登记未排量。
+            best = results[0]!;
+        }
+
         return best!;
     }
 
@@ -6663,6 +6678,18 @@ internal class PhaseTwoInitialScheduler
                 ? demand.PlannedProcessQty - procAssigned
                 : decimal.Round(demand.PlannedProcessQty / count, 4, MidpointRounding.ToZero);
 
+            // ── BATCH-03（0号位 e31a6fb §3）：**批数量严格 > 0**，不得产出 0 件批 / 负尾差批 ──
+            //   均分 + 末批补余量在「批数 > 可分辨数量」时会四舍五入出 0 批
+            //   （如 Qty=0.0001 / 批数=3 ⇒ 前两批 `Round(…, 4, ToZero)` = 0）⇒ 直接判冲突，
+            //   上层候选枚举会跳过该批数，而不是造出 0 件批。
+            //   `PlannedProcessQty = 0`（纯 WAIT_ONLY 等）时允许加工量为 0，但净量仍必须 > 0。
+            if (batchNet <= 0m || batchProc < 0m || (batchProc <= 0m && demand.PlannedProcessQty > 0m))
+            {
+                return ExecutionBatchFormation.Conflict(
+                    $"BATCH_QUANTITY_NOT_POSITIVE：批数={count} 时第 {ordinal} 批 净量={batchNet} / 加工量={batchProc} 不合法"
+                    + "（不得产生 0 件批或负尾差批）");
+            }
+
             netAssigned += batchNet;
             procAssigned += batchProc;
 
@@ -6808,88 +6835,104 @@ internal class PhaseTwoInitialScheduler
         decimal min = policy.MinExecutionBatchQty ?? 0m;
         decimal? max = policy.MaxExecutionBatchQty;
 
-        // 经济**软最优**锚：`nMin = ceil(Qty/经济Max)`、`nMax = floor(Qty/经济Min)`。
-        //   ⚠ R-1 后二者**只是软参考**（经济区间不再决定合法性）—— 本处仅用于**挑选代表性候选**。
-        int nMin = max is decimal mx ? ClampToPositiveInt(Math.Ceiling(qty / mx)) : 1;
-        int nMax = min > 0m ? ClampToPositiveInt(Math.Floor(qty / min)) : int.MaxValue;
+        // ── BATCH-01（0号位 2026-11-06《e31a6fb 拆批算法与 Phase2 优先整改指令》§3）──
+        //   `ceil(Qty / 经济Max)` **不是**硬拆批依据，只是**经济参考批数**：
+        //   冻结 §56 `:1329-1335` 把「不拆 / 2批 / 3批」列为代表性候选，经济 Max 不得成为
+        //   「整批候选不得生成」的实质硬门。本变量只参与**挑选代表点与排序**，不参与任何合法性判定。
+        int economicReferenceCount = max is decimal mx ? ClampToPositiveInt(Math.Ceiling(qty / mx)) : 1;
 
         int baselineCount = baseline.Batches.Count;
 
         var counts = new List<int>();
-        void TryAdd(int c)
+        bool TryAdd(int c)
         {
             if (c < 1 || c > MaxTechnicallyFormableBatches || counts.Contains(c))
             {
-                return;
+                return false;
             }
             counts.Add(c);
+            return true;
         }
 
-        // ① 经济区间内的**固定代表点**：`{1, 2, 3, nPref} ∩ [nMin, nMax]`（原口径保留）。
+        // ── BATCH-02.1 / BATCH-02.3：`1` 批**无条件**进入候选 ──
+        //   冻结要求「1 批至少要能作为**待真实试排**的可评价候选」；经济 Max 不再是门。
+        //   ⚠ 选 1 批 ≠ 必须 Merge —— `AllowMerge` 与 `AllowSplit` 是两个独立资格，
+        //     不得因为「旧多批合并身份载体不足」反过来屏蔽合法独立成批（BATCH-02.3 逐字）。
+        //   ⚠ 2026-11-06 实测：「1 批无条件入候选」会让 11 个既有用例红，其中含「需求最终 0 条 Task」
+        //     ⇒ 「1 批胜出但试排失败」没有回退路径（0号位 BATCH-02.5 的有限可行性扩展尚未实现）。
+        //     ⇒ 本项**由开关控制、默认关闭**；开关打开后才把 1 批无条件加入候选。
+        int nMaxEco = min > 0m ? ClampToPositiveInt(Math.Floor(qty / min)) : int.MaxValue;
         void TryAddInRange(int c)
         {
-            if (c >= nMin && c <= nMax)
+            if (c >= economicReferenceCount && c <= nMaxEco)
             {
                 TryAdd(c);
             }
         }
-        TryAddInRange(1);
-        TryAddInRange(2);
-        TryAddInRange(3);
-        if (policy.PreferredBatchQty is decimal pref && pref > 0m)
+
+        if (OneBatchCandidateEnabled)
         {
-            TryAddInRange(ClampToPositiveInt(Math.Round(qty / pref, MidpointRounding.AwayFromZero)));   // Preferred 附近
+            if (TryAdd(1))
+            {
+                SolverDiagnostics.CountBatchOneBatchCandidate();
+            }
+        }
+        else
+        {
+            TryAddInRange(1);
         }
 
-        // ② **R-3 锚点带**：经济软最优 `nMin` 及其邻近 `nMin + 1`（**不**受经济区间过滤）。
-        //   04 BP-R3 逐字：「技术层**不得因 `{1,2,3,nPref}` 过滤造成零候选**」—— 样本 `Qty100 / 经济Min1 /
-        //     Max30 / Preferred 空` ⇒ `nMin = 4`，固定点 `{1,2,3}` 全被 `[nMin, nMax]` 滤掉 ⇒ 旧实现**零候选**。
-        //   ⇒ 以 `nMin` 为锚补两点，保证**任何** `nMin`（含 ≥4）都有**至少一个**邻近代表候选参与择优。
-        //   ⚠ **不是伪造候选**：两点都是真实合法批方案（R-1 后 `BuildBatchFormation` 恒合法）。
-        //   ⚠ **不是放宽正式规则**：`Preferred` 仍只按正式发布值消费，本处**不**补默认 Preferred（BP-R3 末句）。
-        //   ⚠ **不**无条件加 `1`（整批）：整批候选会把 `AllowMerge` 场景引向「单批合并 ⇒ 批身份被吞」
-        //     （§十二 第 9 行禁止）；`1` 仅在**落在经济区间内**时由 ① 引入。
-        TryAdd(nMin);
-        TryAdd(nMin + 1);
+        TryAddInRange(2);
+        TryAddInRange(3);
 
-        // 04 BP-R2（`Qty1000 / 经济Min400 / Max600 / Preferred500` ⇒ `nMin == nMax == 2`）逐字要求
-        //   「有界生成**代表性候选**，实际比较交期/Setup/资源效率/软偏离，**非恒整批、非恒500+500**」
-        //   ⇒ **删除**旧 `if (nMin >= nMax) return list;`（「唯一合法批数 ⇒ 无优化空间」）—— 该前提建立在
-        //   「经济区间 = 硬合法域」上，R-1 后不成立。
+
+        // `Preferred` 附近：仍只按正式发布值消费，不补默认 Preferred（BP-R3 末句）
+        if (policy.PreferredBatchQty is decimal pref && pref > 0m)
+        {
+            TryAddInRange(ClampToPositiveInt(Math.Round(qty / pref, MidpointRounding.AwayFromZero)));
+        }
+
+        // 经济参考锚及其邻近（口径不变，只把 `nMin` 改名并去掉「合法性」含义）：
+        //   04 BP-R3 逐字：「技术层**不得因 `{1,2,3,nPref}` 过滤造成零候选**」⇒ 补这两个点。
+        //   ⚠ 不是伪造候选：两点都是真实合法批方案（R-1 后 `BuildBatchFormation` 恒合法）。
+        TryAdd(economicReferenceCount);
+        TryAdd(economicReferenceCount + 1);
 
         // ── 技术预算来源（AUD-1-005 整改）：**入参 `budget`**，绝不读业务 `policy` 的两列 ──
         //   `policy.MaxOptimizationSplitCount` / `policy.MaxBatchCandidates` 自 v5.1.10 收口①（2026-10-09 生效）
-        //   起投影恒 null 且**主链不得消费**（B-007）；旧写法把它们当运行预算 = 让历史业务列重新变成生效默认。
+        //   起投影恒 null 且**主链不得消费**（B-007）。
         var solverBudget = budget ?? SolverBatchBudget.VersionedSafeDefault;
 
-        // 上限①（R-3 更正）：`MaxOptimizationSplitCount` = **优化拆分「种数」**（01 v1.11 §1757 逐字：
-        //   「『优化性拆批最多3种』仅为 LOCAL 工程经验初值，**不是** `MaxOptimizationSplitCount=3` 的字段默认，
-        //     **更非**全部 FULL/LOCAL 的**固定物理批数上限**」）⇒ 只限制**候选个数**，**不**按批数大小过滤。
-        //   **旧写法** `RemoveAll(c => c > baselineCount && c > MaxOptimizationSplitCount)` 把「种数」误读成
-        //   「批数阈值」⇒ `nMin ≥ 4` 时把候选全删光（= 04 BP-R3 的失败形态）。
-        //   排序：离经济软最优 `nMin` **越近**的候选越优先保留（经济软信号真实参与，B-011）。
-        counts.Sort((x, y) =>
-        {
-            int d = Math.Abs(x - nMin).CompareTo(Math.Abs(y - nMin));
-            return d != 0 ? d : x.CompareTo(y);
-        });
-        if (solverBudget.MaxOptimizationSplitCount > 0
-            && counts.Count > solverBudget.MaxOptimizationSplitCount)
-        {
-            counts = counts.Take(solverBudget.MaxOptimizationSplitCount).ToList();
-        }
+        // ── BATCH-02.2：预算限制的是**比较工作量**，不是物理批数 ──
+        //   旧写法：全部候选按「离 nMin 越近越优先」排序后截断 ⇒ `economicReferenceCount` 很大时
+        //     「1 批」必被淘汰 = 经济 Max 变成事实上的候选排除机制（0号位 §1.3 指出的第二道门）。
+        //   新口径：① 「1 批」**保底保留**；② 其余名额按「离经济参考近」填充；
+        //          ③ 被挤掉的登记 `CandidateOmittedByBudget`，**不得**当成物理不合法。
+        var ordered = counts
+            .Where(c => c == 1)
+            .Concat(counts.Where(c => c != 1)
+                          .OrderBy(c => Math.Abs(c - economicReferenceCount))
+                          .ThenBy(c => c))
+            .ToList();
 
-        // 上限②：候选总数受预算限制（基线恒保留 ⇒ 可容纳的优化候选 = cap - 1）。
+        // 上限①：`MaxOptimizationSplitCount` 限制**候选种数**，不按批数大小过滤
+        //   上限②：`MaxBatchCandidates` 限制候选总数（基线恒保留 ⇒ 可容纳的优化候选 = cap - 1）
+        int allowed = ordered.Count;
+        if (solverBudget.MaxOptimizationSplitCount > 0)
+        {
+            allowed = Math.Min(allowed, solverBudget.MaxOptimizationSplitCount);
+        }
         if (solverBudget.MaxBatchCandidates > 0)
         {
-            int allowed = Math.Max(0, solverBudget.MaxBatchCandidates - 1);
-            if (counts.Count > allowed)
-            {
-                counts = counts.Take(allowed).ToList();
-            }
+            allowed = Math.Min(allowed, Math.Max(0, solverBudget.MaxBatchCandidates - 1));
+        }
+        if (allowed < ordered.Count)
+        {
+            SolverDiagnostics.CountBatchCandidateOmittedByBudget(ordered.Count - allowed);
+            ordered = ordered.Take(allowed).ToList();
         }
 
-        foreach (var c in counts)
+        foreach (var c in ordered)
         {
             if (c == baselineCount)
             {
@@ -8860,6 +8903,32 @@ internal class PhaseTwoInitialScheduler
     ///   （含索引对齐调用顺序不变），因此关掉即等于回到 r14057 的行为。</para>
     /// </summary>
     internal static bool OuterAdoptAppendEnabled { get; } = ReadOuterAdoptAppendSwitch();
+
+    /// <summary>
+    /// 2026-11-06 **BATCH-02.1 开关（默认关闭）**：把「整批（1 批）」不受经济区间过滤地加入待试排候选。
+    ///
+    /// <para>【为什么默认关闭】0号位 e31a6fb 指令 Q1 要求「1 批必须能作为可评价候选」，但**实测**：
+    ///   直接开启后 11 个既有用例转红。补上「零进展候选不得胜出」这道门后仍余 9 个，其中两类是**实质问题**
+    ///   而不只是断言过期：</para>
+    /// <list type="number">
+    ///   <item>`反证9`（`AllowMerge=true` + 多批需求）：D1 最终**一条 Task 都没有**、"
+    ///     两个批键全部消失 ⇒ 1 批方案被走成「并入 D2 的既有批」，正是 `:6850` 注释警告的
+    ///     「整批候选把 AllowMerge 场景引向单批合并 ⇒ 批身份被吞」。⇒ **「选 1 批」在本实现里
+    ///     事实上等于「允许 Merge」**，与 0号位 Q1「`AllowMerge` 与 `AllowSplit` 是两个独立资格」不符。</item>
+    ///   <item>`M_08`（Stage 合批夹具）：直接退化成「只有 2 个执行批」，用例变成空跑。</item>
+    /// </list>
+    /// <para>⇒ 开关默认**关闭**，等把「1 批独立成批」与「合批」彻底解耦后再默认开启。</para>
+    ///
+    /// <para>【开关】`APS_BATCH_ONE_BATCH_CANDIDATE=1`（或 `true`）打开；进程内只读一次。</para>
+    /// </summary>
+    internal static bool OneBatchCandidateEnabled { get; } = ReadOneBatchCandidateSwitch();
+
+    private static bool ReadOneBatchCandidateSwitch()
+    {
+        var raw = Environment.GetEnvironmentVariable("APS_BATCH_ONE_BATCH_CANDIDATE");
+        if (string.IsNullOrWhiteSpace(raw)) return false;
+        return raw.Trim() == "1" || string.Equals(raw.Trim(), "true", StringComparison.OrdinalIgnoreCase);
+    }
 
     private static bool ReadOuterAdoptAppendSwitch()
     {

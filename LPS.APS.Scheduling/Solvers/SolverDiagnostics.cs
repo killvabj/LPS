@@ -133,6 +133,19 @@ public static class SolverDiagnostics
         public long OuterAdoptOldCountMax;
 
         /// <summary>
+        /// 2026-11-06 BATCH-02（0号位 e31a6fb 指令）：**「1 批」作为待试排候选被纳入**的次数。
+        ///   判据：本值应 ≈ `AllowSplit=true` 的需求数；若长期远小于它，说明整批仍被某处排除。
+        ///   纯观测，不参与任何判定。
+        /// </summary>
+        public long BatchOneBatchCandidate;
+
+        /// <summary>
+        /// 2026-11-06 BATCH-02.2：**被技术预算挤掉**的候选种数累计。
+        ///   ⚠ 语义边界：被挤掉 ≠ 物理不合法。它只说明「这一轮没去试排」，不得当作排不下的原因。
+        /// </summary>
+        public long BatchCandidateOmittedByBudget;
+
+        /// <summary>
         /// 2026-10-20 二十九次定位：批分组**整表重建**的触发原因计数（互斥，合计 = 重建次数）。
         ///   [0] 缓存标记失效 / [1] 任务表变短 / [2] 长度不短但前缀失配。纯观测。
         /// </summary>
@@ -2065,6 +2078,26 @@ public static class SolverDiagnostics
     {
         if (Current.Value is not { } c) return;
         System.Threading.Interlocked.Increment(ref c.TaskTableAppended);
+    }
+
+    /// <summary>
+    /// 2026-11-06 BATCH-02：登记一次「1 批作为候选被纳入」。纯观测，不参与判定。
+    /// </summary>
+    internal static void CountBatchOneBatchCandidate()
+    {
+        if (Current.Value is not { } c) return;
+        System.Threading.Interlocked.Increment(ref c.BatchOneBatchCandidate);
+    }
+
+    /// <summary>
+    /// 2026-11-06 BATCH-02.2：登记**被技术预算挤掉**的候选种数。
+    ///   ⚠ 这不是「物理不合法」的计数 —— 只表示这一轮没去试排。纯观测。
+    /// </summary>
+    internal static void CountBatchCandidateOmittedByBudget(int omitted)
+    {
+        if (Current.Value is not { } c) return;
+        if (omitted <= 0) return;
+        System.Threading.Interlocked.Add(ref c.BatchCandidateOmittedByBudget, omitted);
     }
 
     /// <summary>
