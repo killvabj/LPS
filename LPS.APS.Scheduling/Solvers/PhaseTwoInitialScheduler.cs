@@ -3492,13 +3492,29 @@ internal class PhaseTwoInitialScheduler
         // 第4轮Merge修复：检测是否可以合并到已有Task
         if (allowMerge)
         {
-            return TryMergeOrSchedule(
+            // 2026-11-07 W1 候选级诊断（0号位 v3.0 §3.2 伪绿规则①）：
+            //   只看到「最终是独立 Task」无法区分「从未尝试合批」与「尝试后失败/落败」。
+            //   这里登记尝试 → 命中/未命中，让测试能证明 Merge **真的进过候选**。纯观测，不改判定。
+            SolverDiagnostics.CountMergeAttempt();
+            var mergedResult = TryMergeOrSchedule(
                 demand, operations, routingGraph, direction, constraints,
                 resourceOccupancy, scheduledTasks, allocationTaskShare, demandByKey,
                 planningStart, planningEnd, dynamicMaterialFloor, stageOverlap,
                 out mergedIntoTask, out replacedTaskTable, batchDraftKey,
                 requireIdentityPreservingMerge, occupancyPristine, request, batchGroupsIndex,
                 cancellationToken);
+            // ⚠ 命中判据**只能**是 `mergedIntoTask`：`TryMergeOrSchedule` 在未命中时会**回落正常排程**
+            //   并返回非空 Task 列表 ⇒ 用 `mergedResult.Count > 0` 会把「没合并」误记成「命中」
+            //   （实测踩过：MergeHits=2，而最终 C 明明有自己的 Task）。
+            if (mergedIntoTask is not null)
+            {
+                SolverDiagnostics.CountMergeHit();
+            }
+            else
+            {
+                SolverDiagnostics.CountMergeMiss();
+            }
+            return mergedResult;
         }
 
         mergedIntoTask = null;   // 未走 Merge 路径 ⇒ 构造上不可能合并
@@ -7259,6 +7275,28 @@ internal class PhaseTwoInitialScheduler
             //   这是常态路径：多工序 C 需求在开 Merge 时不因此多跑一次排程。
             if (stageBatches.Count == 0)
             {
+                // ── 2026-11-07 W2（0号位 v3.0 §2.2）：区分两种「零锚点」 ──
+                //   `NOT_ELIGIBLE`             = 业务上压根没有可合的另一个完整 Stage 批；
+                //   `IDENTITY_UNREPRESENTABLE` = 锚点存在，但全部被**执行批身份守卫**挡掉
+                //                                （单值 `ExecutionBatchDraftKey` 表达不出双身份 ⇒ 归 2号位）。
+                //   两者对代码的结论完全不同，不得都写成「没有合法合批机会」。
+                //   ⚠ 只有**开了诊断 scope** 才多做这一次重扫；生产路径（未开 scope）零额外开销。
+                if (SolverDiagnostics.Active is not null)
+                {
+                    if (requireIdentityPreservingMerge)
+                    {
+                        var unscoped = FindMergeableStageBatches(
+                            demand, operations, scheduledTasks, constraints, demandByKey,
+                            batchGroupsIndex, requireIdentityPreserving: false);
+                        if (unscoped.Count > 0) SolverDiagnostics.CountMergeIdentityUnrepresentable();
+                        else SolverDiagnostics.CountMergeNotEligible();
+                    }
+                    else
+                    {
+                        SolverDiagnostics.CountMergeNotEligible();
+                    }
+                }
+
                 mergedIntoTask = null;
                 return ScheduleDemandOperations(
                     demand, operations, routingGraph, direction, constraints,

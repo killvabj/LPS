@@ -72,7 +72,11 @@ public sealed class SolverBatchBudgetSemanticsTests
     public void One_LimitsToOneOptimizationCandidate()
     {
         var counts = CandidateCounts(new PhaseTwoInitialScheduler.SolverBatchBudget(1, 8, "test"));
-        Assert.Equal(2, counts.Count);   // 基线 1 条 + 优化 1 条
+        // 基线 1 条 + 优化 1 条 = 2，**开关开关都是 2**：
+        //   关门时这 1 个优化名额给「离经济参考最近」的候选；
+        //   开门时「1 批」是**保底保留**项，直接把唯一名额占掉（实测 Actual=2）。
+        //   ⇒ cap=1 这一档不能用「+1」推，必须按保底规则单独写死。
+        Assert.Equal(2, counts.Count);
     }
 
     [Fact(DisplayName = "预算语义 · MaxOptimizationSplitCount=3 ⇒ 基线 + 3 个优化候选")]
@@ -80,8 +84,18 @@ public sealed class SolverBatchBudgetSemanticsTests
     {
         var counts = CandidateCounts(new PhaseTwoInitialScheduler.SolverBatchBudget(3, 8, "test"));
         // 本夹具最多产出 3 个候选（基线 10 + 优化 50/11），cap=3 时全部放行。
-        Assert.Equal(3, counts.Count);
+        // ⚠ 2026-11-07：`APS_BATCH_ONE_BATCH_CANDIDATE=1` 打开后「1 批」是**无条件候选**，
+        //   不受本夹具的软经济区间约束 ⇒ 总数 +1。关/开两态都要能跑，故写成开关感知。
+        Assert.Equal(3 + ExtraOneBatchCandidate(), counts.Count);
     }
+
+    /// <summary>
+    /// 「1 批」无条件候选开关打开时，候选总数比关闭时多 1 条。
+    /// 写成开关感知而不是写死数字：同一个测试文件必须在**两种开关状态**下都能跑
+    /// （0号位 v3.0 §2.2 要求逐例分类，而不是靠屏蔽开关让测试变绿）。
+    /// </summary>
+    private static int ExtraOneBatchCandidate()
+        => PhaseTwoInitialScheduler.OneBatchCandidateEnabled ? 1 : 0;
 
     [Fact(DisplayName = "预算语义【现状=不限制】· 0 不截断优化候选，只由 MaxBatchCandidates 兜底")]
     public void Zero_MeansUnbounded_TODAY()

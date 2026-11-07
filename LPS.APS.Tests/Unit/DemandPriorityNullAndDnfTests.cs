@@ -278,6 +278,47 @@ public class DemandPriorityNullAndDnfTests
         _executor.ExecutePrioritySort(demands, config).Single().DemandSequence.Should().Be(1);
     }
 
+    /// <summary>段2 组B 变体：仅把 `ISSUEDATE` 算子参数化（LT=设计意图 / GT=现网 478 现状），供反证用例区分配置。</summary>
+    private static PriorityConditionGroup GroupBWithOperator(string issueDateOperator) => new()
+    {
+        Conditions =
+        [
+            new MatchCondition { FieldName = "ORDERTYPE", Operator = "EQ", Value = "PRODUCTION_INSTRUCTION" },
+            new MatchCondition { FieldName = "MATERIALCODE", Operator = "CONTAINS", Value = "FINAL*" },
+            new MatchCondition { FieldName = "ISSUEDATE", Operator = issueDateOperator, Value = "2026-10-08" },
+        ]
+    };
+
+    [Fact(DisplayName = "B 反证（Operator:4 反例）：同一需求早于阈值，配 GT 不命中、配 LT 命中 —— oracle 可区分配置")]
+    public void B_反证GT不命中LT命中_可区分配置()
+    {
+        // 目标需求 B1：不满足组A（库存>0），仅靠组B 决定 —— IssueDate 早于阈值 2026-10-08。
+        // 契约意图是 `IssueDate<TODAY-30`（LT）；现网 478 段2 却落成 GT（Operator:4）。
+        // 若 oracle 只会念设计意图、区分配置，则 GT/LT 下 B1 的段位应相同；反之 GT 时它应落兜底。
+        var demands = new List<UpstreamDemand>
+        {
+            new() { DemandKey = "A1", OrderType = "PRODUCTION_INSTRUCTION", MaterialCode = "FINAL-X", StockConsumeDay = 0m, IssueDate = new DateTime(2026, 11, 10), Quantity = 1m },
+            new() { DemandKey = "B1", OrderType = "PRODUCTION_INSTRUCTION", MaterialCode = "FINAL-X", StockConsumeDay = 30m, IssueDate = new DateTime(2026, 9, 1), Quantity = 9m },
+        };
+
+        // ── GT 变体（现网 478 段2 现状）⇒ B1 组B 不命中、组A 也不命中 ⇒ 落兜底（保持输入序，B1 在 A1 之后）
+        var gtConfig = Config(Segment(1,
+            groups: [GroupA(), GroupBWithOperator("GT")],
+            sorts: [new SortField { FieldName = "QUANTITY", Direction = "DESC" }]));
+        var gtSorted = _executor.ExecutePrioritySort(demands, gtConfig);
+        // 若 B1 误命中段1，会按数量降序被提到最前（seq 1）；应为 seq 2（落兜底）
+        gtSorted.Single(d => d.DemandKey == "B1").DemandSequence.Should().Be(2,
+            because: "组B 配 GT（现网现状）：发行日早于阈值的需求不命中段1，落兜底，而非被数量排序前置");
+
+        // ── LT 变体（设计意图 `IssueDate<TODAY-30`）⇒ 同一 B1 组B 命中 ⇒ 进段1，按数量降序前置（seq 1）
+        var ltConfig = Config(Segment(1,
+            groups: [GroupA(), GroupBWithOperator("LT")],
+            sorts: [new SortField { FieldName = "QUANTITY", Direction = "DESC" }]));
+        var ltSorted = _executor.ExecutePrioritySort(demands, ltConfig);
+        ltSorted.Single(d => d.DemandKey == "B1").DemandSequence.Should().Be(1,
+            because: "组B 改配 LT（设计意图）：同一需求即命中段1，按数量降序前置 ⇒ oracle 能区分 GT/LT 配置");
+    }
+
     [Fact(DisplayName = "B 两组均不成立 ⇒ 不命中，落兜底段（用段内排序键区分命中集合与兜底集合）")]
     public void B_两组均不成立则不命中()
     {

@@ -133,6 +133,34 @@ public static class SolverDiagnostics
         public long OuterAdoptOldCountMax;
 
         /// <summary>
+        /// 2026-11-07 W1 候选级诊断（0号位 v3.0 §3.2「伪绿规则①」）：`RunDemandSchedule` 进入
+        /// **合批路径**（`allowMerge=true`）的次数。判据：本值 &gt; 0 才说明 Merge **真的被尝试过**；
+        /// 只看最终结果是独立 Task 就宣称「Merge 失败后回退」属于伪绿。纯观测，不参与判定。
+        /// </summary>
+        public long MergeAttempts;
+
+        /// <summary>合批路径**命中**（并入既有 Task / 改由合并链承接）的次数。</summary>
+        public long MergeHits;
+
+        /// <summary>合批路径**未命中**（返回空/未产生合并）的次数。与 <see cref="MergeAttempts"/> 之差即命中数。</summary>
+        public long MergeMisses;
+
+        /// <summary>
+        /// 2026-11-07 W2（0号位 v3.0 §2.2「拒绝/省略原因至少内部可辨」）：多工序需求走到合批分支，
+        /// **一个合法锚点都没有**（`FindMergeableStageBatches` 返回空，且去掉身份守卫后仍为空）
+        /// 的次数 ⇒ 标签 `NOT_ELIGIBLE`。纯观测。
+        /// </summary>
+        public long MergeNotEligible;
+
+        /// <summary>
+        /// 2026-11-07 W2：**有锚点，但全部被执行批身份守卫挡掉**的次数 ⇒ 标签 `IDENTITY_UNREPRESENTABLE`。
+        /// 判据：同一输入下把 `requireIdentityPreserving` 关掉重扫，锚点数 &gt; 0。
+        /// ⇒ 这与 `NOT_ELIGIBLE` 是**完全不同**的结论：前者是载体表达力问题（归 2号位），后者是业务不成立。
+        /// 纯观测。
+        /// </summary>
+        public long MergeIdentityUnrepresentable;
+
+        /// <summary>
         /// 2026-11-06 BATCH-02（0号位 e31a6fb 指令）：**「1 批」作为待试排候选被纳入**的次数。
         ///   判据：本值应 ≈ `AllowSplit=true` 的需求数；若长期远小于它，说明整批仍被某处排除。
         ///   纯观测，不参与任何判定。
@@ -2078,6 +2106,36 @@ public static class SolverDiagnostics
     {
         if (Current.Value is not { } c) return;
         System.Threading.Interlocked.Increment(ref c.TaskTableAppended);
+    }
+
+    /// <summary>2026-11-07 W1：登记一次合批**尝试**。纯观测。</summary>
+    internal static void CountMergeAttempt()
+    {
+        if (Current.Value is { } c) System.Threading.Interlocked.Increment(ref c.MergeAttempts);
+    }
+
+    /// <summary>2026-11-07 W1：登记一次合批**命中**。纯观测。</summary>
+    internal static void CountMergeHit()
+    {
+        if (Current.Value is { } c) System.Threading.Interlocked.Increment(ref c.MergeHits);
+    }
+
+    /// <summary>2026-11-07 W1：登记一次合批**未命中**。纯观测。</summary>
+    internal static void CountMergeMiss()
+    {
+        if (Current.Value is { } c) System.Threading.Interlocked.Increment(ref c.MergeMisses);
+    }
+
+    /// <summary>2026-11-07 W2：登记一次「一个合法锚点都没有」（`NOT_ELIGIBLE`）。纯观测。</summary>
+    internal static void CountMergeNotEligible()
+    {
+        if (Current.Value is { } c) System.Threading.Interlocked.Increment(ref c.MergeNotEligible);
+    }
+
+    /// <summary>2026-11-07 W2：登记一次「有锚点但被身份守卫全部挡掉」（`IDENTITY_UNREPRESENTABLE`）。纯观测。</summary>
+    internal static void CountMergeIdentityUnrepresentable()
+    {
+        if (Current.Value is { } c) System.Threading.Interlocked.Increment(ref c.MergeIdentityUnrepresentable);
     }
 
     /// <summary>

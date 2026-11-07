@@ -769,15 +769,23 @@ public class StageBatchMergeTests
                 new DemandSpec("A", 1, 30m, Day.AddDays(200)),
                 new DemandSpec("B", 2, 20m, Day.AddDays(200))
             },
+            // ⚠ 2026-11-07：R1 切成三个 20 分钟小窗，让「整批 30 件」物理装不下。
+            //   原宽窗夹具靠**软 Max=15** 才拆批；`APS_BATCH_ONE_BATCH_CANDIDATE=1` 打开后
+            //   「1 批」是无条件候选、软 Max 拦不住 ⇒ 1 批胜出、多批前提消失（实测只剩 2 个批键）。
+            //   改成物理不可行后，开关开/关都为多批 ⇒ 本用例在两种状态下都真的测到多批路径。
             calendar: new[]
             {
-                (1, Day.AddDays(120), Day.AddDays(125)),
+                (1, Day.AddDays(120), Day.AddDays(120).AddMinutes(20)),
+                (1, Day.AddDays(120).AddMinutes(25), Day.AddDays(120).AddMinutes(45)),
+                (1, Day.AddDays(120).AddMinutes(50), Day.AddDays(120).AddMinutes(70)),
                 (2, Day.AddDays(120), Day.AddDays(125)),
                 (3, Day.AddDays(120), Day.AddDays(125))
             },
             allowMerge: allowMerge,
             allowSplit: true,
-            setupRules: SameProductSetup(60m, 1, 2, 3),
+            // ⚠ 同步去掉 60min 换型规则：换型装不进 20min 的窗（实测 A/B 双双未排）。
+            //   本用例的判据是「多批需求下合批目标全部已归批 ⇒ 开/关逐位相同」，
+            //   不依赖合批在目标层占优，故不需要换型。
             batchPolicies: Policies(allowMerge));
 
         var baseline = await _solver.SolveAsync(BuildRequest(allowMerge: false));
@@ -2580,9 +2588,11 @@ public class StageBatchMergeTests
     }
 
     // ══════════════════════════════════════════════════════════════════
-    //  C2-03（0号位 2026-11-07《未命名的Markdown文件(10)》§三 第二件）
-    //    「先确认合法 Merge 是否真实可达，再验证候选失败后仍可选择合法独立排程。
-    //      必须区分『Merge 不可达』和『Merge 尝试后失败』，不能把二者混成一个成功回退案例。」
+    //  C2-03a（范围已按 0号位 v3.0 §2.1 收窄）
+    //    ⚠ **本用例 allowSplit=false ⇒ 单批场景**，只能证明「单批需求在 Merge 未命中时独立排程成功、
+    //      净量闭合」，**不能**证明「多批 Merge 可达性」。原用例名已按 v3.0 批评更正。
+    //    v3.0 §2.1 要求的三组辨别性测试（合法Merge被采用 / 合批真实失败后独立成功 / 真正多批）
+    //    仍需候选级诊断（尝试数、命中数、拒因），未完成 —— 见任务登记。
     //
     //  【本用例的做法】不预设 Merge 一定命中，而是**实测并如实记录**：
     //    · 命中 ⇒ C 的需求量并入 A 的既有 Task（C 自己不产 Task，A 的 Task 数量 = A+C）
@@ -2590,8 +2600,10 @@ public class StageBatchMergeTests
     //  两种情况下都必须满足：**净量闭合**（Σ = A + C，不丢不增）、**C 不被判未排**。
     //  这既给出命中率事实，也不会用「人工删批身份」制造假的合并成功。
     // ══════════════════════════════════════════════════════════════════
-    [Fact(DisplayName = "C2-03 · 多批Merge真实入口：先测可达性，再验失败后独立排程与净量闭合")]
-    public async Task C2_03_MergeReachability_And_IndependentFallback()
+    // ⚠ 0号位 v3.0 §2.1 批评：原用例名「多批Merge可达性」与该用例 **allowSplit=false** 不符 ——
+    //   它只能证明「单批/独立排程结果」，不能证明多批 Merge 可达性。已改名为如实的 03a。
+    [Fact(DisplayName = "C2-03a · 单批场景（allowSplit=false）：Merge 未命中时独立排程与净量闭合")]
+    public async Task C2_03a_SingleBatch_IndependentFallback_And_QtyClosure()
     {
         var paths = new[]
         {
@@ -2608,9 +2620,22 @@ public class StageBatchMergeTests
         };
 
         var request = Build(paths, demands, calendar, allowMerge: true, allowSplit: false);
+
+        // 0号位 v3.0 §3.2「伪绿规则①」：只看到独立 Task 不能证明「Merge 尝试后回退」——
+        //   必须证明合批路径**真的被进过**。开诊断 scope 采计数。
+        using var diag = SolverDiagnostics.BeginScope();
         var result = await new FiniteCapacitySolver().SolveAsync(request);
+        var counters = diag.Counters;
 
         Assert.True(result.Success, result.ErrorMessage);
+
+        // ── ① 尝试事实：Merge 必须真的被尝试过（否则「回退」无从谈起）──
+        Assert.True(counters.MergeAttempts > 0,
+            $"合批路径从未被进入（MergeAttempts=0）⇒ 本用例不能宣称「Merge 尝试后回退」，只能算未进入候选");
+
+        // ── ② 本场景实测：0 命中（与下面「C 独立成 Task」互相印证）──
+        Assert.Equal(0L, counters.MergeHits);
+        Assert.Equal(counters.MergeAttempts, counters.MergeMisses);
 
         var aTasks = result.FinalTasks.Where(t => t.SourceDraftId == "A").ToList();
         var cTasks = result.FinalTasks.Where(t => t.SourceDraftId == "C").ToList();
@@ -2643,6 +2668,505 @@ public class StageBatchMergeTests
         // ── 需求不得因 Merge 逻辑被判未排 ──
         //    `UnscheduledTaskResult.DraftId` 的值域是 **LogicalDemandKey**（见 DomainSolveResult.cs:218 注释）
         Assert.DoesNotContain(result.UnscheduledTasks, u => u.DraftId == "C");
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    //  v3.0 §2.1 要求的三组辨别性测试（C2-03b / 03c / 03d）
+    //
+    //  为什么要三组：只看「最终有独立 Task」无法区分
+    //    ① Merge 根本没被尝试（进入不了候选）
+    //    ② Merge 被尝试、被评价、但判负（软层择优落给独立方案）
+    //    ③ Merge 被尝试、物理不合法（日历装不下）而失败
+    //  三者对代码的结论完全不同，混成一个「成功回退」案例就是伪绿。
+    //
+    //  判据来自候选级诊断（`SolverDiagnostics.MergeAttempts/Hits/Misses`，
+    //  纯观测、不参与判定，见 SolverDiagnostics.cs:140-146）：
+    //    · Attempts > 0           ⇒ 合批路径**真的被进过**
+    //    · Hits > 0               ⇒ 合并**真的落定**（不是只在结果上「看起来少了几条 Task」）
+    //    · Attempts == Misses     ⇒ 一次都没落定
+    //  ⚠ 命中判据只能看 `mergedIntoTask != null`：`TryMergeOrSchedule` 未命中会**回落正常排程**
+    //    并返回非空 Task 列表，用「返回非空」当命中有过实测误判（MergeHits 假 2）。
+    // ══════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// **C2-03b · 合法 Merge 可达并被采用**（v3.0 §2.1 第 1 组）。
+    ///
+    /// 夹具 = M-01 逐字（同产品 A30/B20、三工序、同产品换型 60min）——合批在冻结目标的
+    /// 第 ③（更早完成）与第 ④（Setup 更小）两层同时占优 ⇒ 是**合法的更优候选**。
+    ///
+    /// 本用例与 M-01 的区别：M-01 只断言**结果**（3 条 Task、1 个批键、50 件）；
+    /// 本用例额外要求**候选级证据**——合并必须真的被尝试（Attempts&gt;0）并真的落定（Hits&gt;0），
+    /// 才算「可达且被采用」，堵住「碰巧看起来像合批」。
+    /// </summary>
+    [Fact(DisplayName = "C2-03b · 合法 Merge 可达并被采用（候选级：Attempts>0 且 Hits>0）")]
+    public async Task C2_03b_LegalMerge_Reachable_And_Adopted()
+    {
+        var request = Build(
+            paths: new[] { ThreeOpPath("RT", 1, 1, 2, 3, 1m) },
+            demands: new[]
+            {
+                new DemandSpec("A", 1, 30m, Day.AddDays(200)),
+                new DemandSpec("B", 2, 20m, Day.AddDays(200))
+            },
+            calendar: new[]
+            {
+                (1, Day.AddDays(120), Day.AddDays(125)),
+                (2, Day.AddDays(120), Day.AddDays(125)),
+                (3, Day.AddDays(120), Day.AddDays(125))
+            },
+            allowMerge: true,
+            allowSplit: false,
+            setupRules: SameProductSetup(60m, 1, 2, 3));
+
+        using var diag = SolverDiagnostics.BeginScope();
+        var result = await _solver.SolveAsync(request);
+        var c = diag.Counters;
+
+        Assert.True(result.Success, result.ErrorMessage);
+        Assert.Empty(result.UnscheduledTasks);
+
+        // ── ① 候选被尝试 ──
+        Assert.True(c.MergeAttempts > 0,
+            $"合批路径从未被进入（MergeAttempts={c.MergeAttempts}）⇒ 本夹具**不能**证明「合法 Merge 可达」");
+
+        // ── ② 候选胜出并落定（候选级证据，M-01 没有这一条）──
+        Assert.True(c.MergeHits > 0,
+            $"Merge 一次都没落定（Attempts={c.MergeAttempts} / Hits={c.MergeHits} / Misses={c.MergeMisses}）"
+            + $"⇒ 结果上的「3 条 Task、50 件」只是独立排程的巧合，**不是**合批被采用");
+
+        // ── ③ 落定后的业务形态：一个执行批、三道工序、50 件、份额 A30+B20 ──
+        Assert.Equal(3, result.FinalTasks.Count);
+        var batchKey = Assert.Single(
+            result.FinalTasks.Select(t => t.ExecutionBatchDraftKey).Distinct().ToList());
+        Assert.False(string.IsNullOrEmpty(batchKey));
+        Assert.All(result.FinalTasks, t => Assert.Equal(50m, t.PlannedProcessQty));
+
+        Assert.Equal(30m, result.AllocationShares
+            .Where(s => s.AllocationSequence == 1).Sum(s => s.ComponentQty));
+        Assert.Equal(20m, result.AllocationShares
+            .Where(s => s.AllocationSequence == 2).Sum(s => s.ComponentQty));
+        Assert.Equal(50m, result.AllocationShares.Sum(s => s.ComponentQty));
+
+        // ── ④ 落定判据自洽：Attempts = Hits + Misses（诊断本身不得漏记）──
+        Assert.Equal(c.MergeAttempts, c.MergeHits + c.MergeMisses);
+    }
+
+    /// <summary>
+    /// **C2-03c · 合批尝试真实失败、独立排程成功**（v3.0 §2.1 第 2 组）。
+    ///
+    /// ⚠ **本用例前两版都是伪的，记录在此（2026-11-07 实测）**：
+    ///   · 版①：三工序 + 无换型，宽窗反证探测下 `MergeHits` **仍是 0** ⇒ 合批失败不是日历造成的，
+    ///     只是合批在该夹具下本就不占优（③ 更早完成这一层就判负）。把「择优判负」写成
+    ///     「并后整批不合法」= 编因果。
+    ///   · 版②：三工序 + 换型 60min（合批确实占优），但换型令**独立批比合并批更长**
+    ///     （B 独立 OP30 = 60 换型 + 10 = 70min vs 合并 OP30 = 40min）⇒ 装得下独立批的窗必然装得下
+    ///     合并批 ⇒ **结构上做不出「合并更不合法」**，实测窄窗臂 B 直接排不下。
+    ///
+    /// 版③（本版）：**单工序路径**。此时独立批与合并批**总工时相同**（都是 40min），
+    ///   唯一差别只剩「是否需要一段**连续**占用」——这才是能用日历把两者分开的唯一杠杆。
+    ///   · 臂① 宽窗 `[+0,+5d]`：合批因经济软参数占优且合法 ⇒ `MergeHits &gt; 0`、1 条 Task、40 件；
+    ///   · 臂② 窄窗 `[+0,+30]` ＋ `[+40,+50]`：
+    ///       A30 落 `[+0,+30]`、B10 落 `[+40,+50]` ⇒ **独立方案合法**；
+    ///       合并批 40 件需连续 40min，两个窗分别只有 30 / 10 分钟 ⇒ **并后整批不合法**。
+    ///   ⇒ 两臂一翻转，「失败原因是装不下」才被证明；否则就是择优判负。
+    /// </summary>
+    [Fact(DisplayName = "C2-03c · 两臂对照：宽窗合批被采用 / 窄窗合批装不下而独立排程成功")]
+    public async Task C2_03c_MergeAttemptFails_ButIndependentSchedulingSucceeds()
+    {
+        var t0 = Day.AddDays(120);
+
+        // 单工序路径：产能只与数量成正比（1min/件）⇒ 独立 30+10 与合并 40 总工时相同，
+        //   差别只剩「连续 vs 分段」。
+        PathSpec SingleOpPath() => new(
+            "RT", 1,
+            new[] { new OpSpec("STAGE1", "OP10", 1, 1m) },
+            Array.Empty<(string From, string To)>());
+
+        // 经济软 Preferred = 40（= 合并后批量）⇒ 合批在 ④.5 层占优；
+        //   ⚠ 显式政策会覆盖 `Build(allowMerge:)` 的登记，AllowMerge 必须写进政策里。
+        IReadOnlyList<BatchPolicyRuleSnapshot> Policies() => new[]
+        {
+            new BatchPolicyRuleSnapshot
+            {
+                MaterialId = MaterialId,
+                ProductionDepartmentId = DeptId,
+                MinExecutionBatchQty = null,
+                MaxExecutionBatchQty = null,
+                PreferredBatchQty = 40m,
+                AllowMerge = true,
+                AllowSplit = false
+            }
+        };
+
+        // 臂①（对照）：宽窗
+        var wideCal = new[] { (ResourceId: 1, Start: t0, End: t0.AddDays(5)) };
+        // 臂②（判别）：两段小窗 —— 独立批各占一段，合并批（连续 40min）两边都装不下
+        var tightCal = new[]
+        {
+            (ResourceId: 1, Start: t0, End: t0.AddMinutes(30)),
+            (ResourceId: 1, Start: t0.AddMinutes(40), End: t0.AddMinutes(50)),
+        };
+
+        DomainSolveRequest BuildRequest(IReadOnlyList<(int ResourceId, DateTime Start, DateTime End)> cal)
+            => Build(
+                paths: new[] { SingleOpPath() },
+                demands: new[]
+                {
+                    new DemandSpec("A", 1, 30m, Day.AddDays(200)),
+                    new DemandSpec("B", 2, 10m, Day.AddDays(200))
+                },
+                calendar: cal,
+                allowMerge: true,
+                allowSplit: false,
+                batchPolicies: Policies());
+
+        // ══ 臂①：宽窗 —— 先证明「合批本来会被采用」 ══
+        DomainSolveResult wide;
+        SolverDiagnostics.Counters wideCounters;
+        using (var diag = SolverDiagnostics.BeginScope())
+        {
+            wide = await _solver.SolveAsync(BuildRequest(wideCal));
+            wideCounters = diag.Counters;
+        }
+
+        Assert.True(wide.Success, wide.ErrorMessage);
+        Assert.Empty(wide.UnscheduledTasks);
+        Assert.True(wideCounters.MergeAttempts > 0,
+            $"宽窗臂合批路径从未被进入（MergeAttempts={wideCounters.MergeAttempts}）⇒ 用例前提不成立");
+        Assert.True(wideCounters.MergeHits > 0,
+            $"宽窗臂合批也没被采用（Attempts={wideCounters.MergeAttempts} / Hits={wideCounters.MergeHits}"
+            + $" / Misses={wideCounters.MergeMisses}）⇒ 合批在本夹具下本就不占优，"
+            + $"窄窗臂的 0 命中**不能**归因于日历");
+
+        // ══ 臂②：窄窗 —— 同夹具同输入，只把日历切成两段 ══
+        DomainSolveResult tight;
+        SolverDiagnostics.Counters tightCounters;
+        using (var diag = SolverDiagnostics.BeginScope())
+        {
+            tight = await _solver.SolveAsync(BuildRequest(tightCal));
+            tightCounters = diag.Counters;
+        }
+
+        Assert.True(tight.Success, tight.ErrorMessage);
+        Assert.Empty(tight.UnscheduledTasks);
+
+        // ── ① 合批**真的被尝试过**（不是没进候选）──
+        Assert.True(tightCounters.MergeAttempts > 0,
+            $"窄窗臂合批路径从未被进入（MergeAttempts={tightCounters.MergeAttempts}）⇒ 不能宣称「合批尝试后失败」");
+        Assert.Equal(tightCounters.MergeAttempts,
+            tightCounters.MergeHits + tightCounters.MergeMisses);
+
+        // ── ② 合批**一次都没落定**（与臂①形成翻转）──
+        Assert.Equal(0L, tightCounters.MergeHits);
+        Assert.Equal(tightCounters.MergeAttempts, tightCounters.MergeMisses);
+
+        // ── ③ 独立方案**合法且成功**：A、B 各一条 Task，净量闭合 40 ──
+        var aTask = Assert.Single(tight.FinalTasks.Where(t => t.SourceDraftId == "A"));
+        var bTask = Assert.Single(tight.FinalTasks.Where(t => t.SourceDraftId == "B"));
+        Assert.Equal(30m, aTask.PlannedProcessQty);
+        Assert.Equal(10m, bTask.PlannedProcessQty);
+        Assert.Equal(40m, aTask.PlannedProcessQty + bTask.PlannedProcessQty);
+
+        // ── ④ 独立方案确实**落在窄窗里**（合法性由日历本身背书，不是我说它合法）──
+        var windows = tightCal.Select(c => (Start: c.Start, End: c.End)).ToList();
+        Assert.All(tight.FinalTasks, t =>
+            Assert.Contains(windows, w =>
+                t.PlannedStartTime >= w.Start && t.PlannedEndTime <= w.End));
+
+        // ── ⑤ 合并批（40 件 = 40min）在此日历下**必然不合法** ──
+        //    写成断言防夹具漂移：若有人把窗放大，本用例先在这里红，而不是变成「失败原因不明」。
+        const int mergedQty = 40;
+        Assert.All(windows, w => Assert.True(
+            (w.End - w.Start).TotalMinutes < mergedQty,
+            $"存在 {w.End - w.Start} 分钟的窗，足以容纳 {mergedQty} 件合并批 ⇒ "
+            + $"「并后整批不合法」的前提不再成立，本用例失去判别力"));
+    }
+
+    /// <summary>
+    /// **C2-03d · 真正多批需求**（v3.0 §2.1 第 3 组）。
+    ///
+    /// 与 C2-03a 的根本区别：`AllowSplit=true` 且**实际形成 ≥2 个 Execution Batch**
+    /// （批域 `MaxExecutionBatchQty = 15` ⇒ A30 拆 2 批、B20 拆 2 批，共 ≥3 个批键）。
+    ///
+    /// 本用例**不要求** Merge 命中「多批目标」——按 v3.0 §2.1 第 3 组的口径：
+    /// <c>若守卫使 Merge 不能表达，登记明确反证和最小跨号位合同影响，而非删去真实批键使测试变绿。</c>
+    /// 因此这里做的是：先把「多批确实成立」钉死，再把 Merge 的尝试/命中/未命中**如实记录**成断言，
+    /// 并核验**行为不退化**（对齐 M-08：多批需求下 AllowMerge 关/开逐位相同）。
+    /// </summary>
+    [Fact(DisplayName = "C2-03d · 真正多批需求（AllowSplit=true 形成 ≥2 个执行批）下的 Merge 事实登记")]
+    public async Task C2_03d_MultiBatchDemand_RegistersMergeFacts()
+    {
+        // ⚠ 显式政策会覆盖 `Build(allowMerge:)` 的登记 ⇒ AllowMerge 必须跟着一起翻。
+        IReadOnlyList<BatchPolicyRuleSnapshot> Policies(bool allowMerge) => new[]
+        {
+            new BatchPolicyRuleSnapshot
+            {
+                MaterialId = MaterialId,
+                ProductionDepartmentId = DeptId,
+                MinExecutionBatchQty = null,
+                MaxExecutionBatchQty = 15m,   // A30 ⇒ 2 批、B20 ⇒ 2 批
+                PreferredBatchQty = null,
+                AllowMerge = allowMerge,
+                AllowSplit = true
+            }
+        };
+
+        DomainSolveRequest BuildRequest(bool allowMerge) => Build(
+            paths: new[] { ThreeOpPath("RT", 1, 1, 2, 3, 1m) },
+            demands: new[]
+            {
+                new DemandSpec("A", 1, 30m, Day.AddDays(200)),
+                new DemandSpec("B", 2, 20m, Day.AddDays(200))
+            },
+            // ⚠ 2026-11-07：R1 故意切成**三个 20 分钟的小窗**，让「整批 30 件」物理上装不下。
+            //   理由：`APS_BATCH_ONE_BATCH_CANDIDATE=1` 打开后「1 批」是**无条件候选**，
+            //   软 Max=15 拦不住它 ⇒ 宽窗夹具下 1 批直接胜出、多批前提消失
+            //   （实测：开关打开后 A/B 各只剩 1 个批键）。改用**物理不可行**固定多批前提：
+            //   30 件需 30 分钟连续占用，任一窗只有 20 分钟 ⇒ 整批必然无槽、只能拆；
+            //   15 件一窗即装 ⇒ 2 批合法。
+            //   ⇒ 这也正是 v3.0 §2.2「整批无槽而 2 批合法」那条必备反例。
+            calendar: new[]
+            {
+                (1, Day.AddDays(120), Day.AddDays(120).AddMinutes(20)),
+                (1, Day.AddDays(120).AddMinutes(25), Day.AddDays(120).AddMinutes(45)),
+                (1, Day.AddDays(120).AddMinutes(50), Day.AddDays(120).AddMinutes(70)),
+                (2, Day.AddDays(120), Day.AddDays(125)),
+                (3, Day.AddDays(120), Day.AddDays(125))
+            },
+            allowMerge: allowMerge,
+            allowSplit: true,
+            // ⚠ 刻意**不给换型规则**：60min 换型装不进 20min 的窗（实测会 A/B 双双未排）。
+            //   本用例只需要「多批事实」，不需要合批在目标层占优。
+            batchPolicies: Policies(allowMerge));
+
+        // 基线（Merge 关）：只用来钉死「夹具确实是多批」，不参与 Merge 事实判定。
+        var baseline = await _solver.SolveAsync(BuildRequest(allowMerge: false));
+        Assert.True(baseline.Success, baseline.ErrorMessage);
+        Assert.Empty(baseline.UnscheduledTasks);
+
+        var baselineKeys = baseline.FinalTasks
+            .Select(t => t.ExecutionBatchDraftKey).Distinct().ToList();
+        Assert.True(baselineKeys.Count >= 3,
+            $"夹具没有形成多批（只有 {baselineKeys.Count} 个执行批：[{string.Join(",", baselineKeys)}]）"
+            + $"⇒ 本用例退化成单批场景，测不到 v3.0 §2.1 第 3 组要求的东西");
+
+        // 单需求侧也要 ≥2 批：A30 / Max15 ⇒ 2 批。只数总量可能是 A1+B2 蒙混过关。
+        var aBatches = baseline.FinalTasks.Where(t => t.SourceDraftId == "A")
+            .Select(t => t.ExecutionBatchDraftKey).Distinct().Count();
+        Assert.True(aBatches >= 2,
+            $"需求 A 只形成 {aBatches} 个执行批 ⇒ 不是「真正多批需求」，本用例前提不成立");
+
+        // ── Merge 开：记录真实事实 ──
+        using var diag = SolverDiagnostics.BeginScope();
+        var withMerge = await _solver.SolveAsync(BuildRequest(allowMerge: true));
+        var c = diag.Counters;
+
+        Assert.True(withMerge.Success, withMerge.ErrorMessage);
+        Assert.Empty(withMerge.UnscheduledTasks);
+
+        // ① 合批路径真的被进过（多批需求下，目标候选同样是真实存在的）
+        Assert.True(c.MergeAttempts > 0,
+            $"多批需求下合批路径从未被进入（MergeAttempts=0）⇒ 只能登记「未进入候选」，"
+            + $"**不得**宣称「已尝试后回退」");
+
+        // ② 诊断自洽
+        Assert.Equal(c.MergeAttempts, c.MergeHits + c.MergeMisses);
+
+        // ③ 多批事实在 Merge 开时**依然成立**（不得为了合批把人造批键删掉）
+        var mergeKeys = withMerge.FinalTasks
+            .Select(t => t.ExecutionBatchDraftKey).Distinct().Count();
+        Assert.True(mergeKeys >= 2,
+            $"AllowMerge=true 后只剩 {mergeKeys} 个执行批 ⇒ 真实批键被合批抹掉，违反 v3.0 §2.1「不得删去真实批键」");
+
+        // ④ 不退化：多批需求下 AllowMerge 开/关逐位相同（与 M-08 同口径）
+        static string Sig(IEnumerable<FinalTaskDraft> tasks) => string.Join("\n", tasks
+            .Select(t => $"{t.ExecutionBatchDraftKey}|{t.OperationCode}|{t.Quantity}|{t.PlannedProcessQty}")
+            .OrderBy(x => x, StringComparer.Ordinal));
+        Assert.Equal(Sig(baseline.FinalTasks), Sig(withMerge.FinalTasks));
+
+        // ⑤ **反证登记**（v3.0 §2.1 第 3 组）：本场景命中数如实记录成断言。
+        //    若将来命中数变化 ⇒ 说明多批 Merge 的表达能力变了 ⇒ 应当复查的**信号**，不是回归。
+        Assert.Equal(0L, c.MergeHits);
+    }
+
+    /// <summary>
+    /// **W2 · 零锚点两态可辨**（v3.0 §2.2 逐字：
+    /// 「从『没有合并的最终结果』不能直接推断『没有合法合批机会』」，
+    /// 且拒绝原因至少内部可辨 `NOT_ELIGIBLE` / `IDENTITY_UNREPRESENTABLE`）。
+    ///
+    /// 两臂的**唯一区别是「有没有另一个需求的完整 Stage 批」**：
+    ///   · 臂① 只有一条需求 ⇒ 压根没有可合对象 ⇒ `NOT_ELIGIBLE`；
+    ///   · 臂② 两条多批需求 ⇒ A 的完整 Stage 批是真实锚点，但已被执行批身份占住
+    ///     ⇒ 身份守卫全挡 ⇒ `IDENTITY_UNREPRESENTABLE`。
+    /// 若两者混成一个「0 个合法合批机会」，就把「载体表达力不足（归 2号位）」误读成「业务不成立」。
+    /// </summary>
+    [Fact(DisplayName = "W2 · 零锚点两态可辨：NOT_ELIGIBLE 与 IDENTITY_UNREPRESENTABLE 不得混为一谈")]
+    public async Task W2_ZeroAnchor_Distinguishes_NotEligible_From_IdentityBlocked()
+    {
+        // ══ 臂①：单需求 ⇒ 没有可合对象 ══
+        var singleRequest = Build(
+            paths: new[] { ThreeOpPath("RT", 1, 1, 2, 3, 1m) },
+            demands: new[] { new DemandSpec("A", 1, 30m, Day.AddDays(200)) },
+            calendar: new[]
+            {
+                (1, Day.AddDays(120), Day.AddDays(125)),
+                (2, Day.AddDays(120), Day.AddDays(125)),
+                (3, Day.AddDays(120), Day.AddDays(125))
+            },
+            allowMerge: true,
+            allowSplit: false);
+
+        SolverDiagnostics.Counters c1;
+        using (var diag = SolverDiagnostics.BeginScope())
+        {
+            var r1 = await _solver.SolveAsync(singleRequest);
+            Assert.True(r1.Success, r1.ErrorMessage);
+            c1 = diag.Counters;
+        }
+
+        Assert.True(c1.MergeNotEligible > 0,
+            $"单需求场景应记 `NOT_ELIGIBLE`，实际 NotEligible={c1.MergeNotEligible}"
+            + $" / IdentityUnrepresentable={c1.MergeIdentityUnrepresentable}");
+        Assert.Equal(0L, c1.MergeIdentityUnrepresentable);
+
+        // ══ 臂②：两条多批需求 ⇒ A 的完整 Stage 批是真实锚点，但已被身份占住 ══
+        IReadOnlyList<BatchPolicyRuleSnapshot> Policies() => new[]
+        {
+            new BatchPolicyRuleSnapshot
+            {
+                MaterialId = MaterialId,
+                ProductionDepartmentId = DeptId,
+                MinExecutionBatchQty = null,
+                MaxExecutionBatchQty = 15m,
+                PreferredBatchQty = null,
+                AllowMerge = true,
+                AllowSplit = true
+            }
+        };
+
+        var multiRequest = Build(
+            paths: new[] { ThreeOpPath("RT", 1, 1, 2, 3, 1m) },
+            demands: new[]
+            {
+                new DemandSpec("A", 1, 30m, Day.AddDays(200)),
+                new DemandSpec("B", 2, 20m, Day.AddDays(200))
+            },
+            // 同 C2-03d：R1 切成 20 分钟小窗 ⇒ 整批装不下、必然多批（开关关/开都成立）
+            calendar: new[]
+            {
+                (1, Day.AddDays(120), Day.AddDays(120).AddMinutes(20)),
+                (1, Day.AddDays(120).AddMinutes(25), Day.AddDays(120).AddMinutes(45)),
+                (1, Day.AddDays(120).AddMinutes(50), Day.AddDays(120).AddMinutes(70)),
+                (2, Day.AddDays(120), Day.AddDays(125)),
+                (3, Day.AddDays(120), Day.AddDays(125))
+            },
+            allowMerge: true,
+            allowSplit: true,
+            batchPolicies: Policies());
+
+        SolverDiagnostics.Counters c2;
+        using (var diag = SolverDiagnostics.BeginScope())
+        {
+            var r2 = await _solver.SolveAsync(multiRequest);
+            Assert.True(r2.Success, r2.ErrorMessage);
+            Assert.Empty(r2.UnscheduledTasks);
+            c2 = diag.Counters;
+        }
+
+        Assert.True(c2.MergeIdentityUnrepresentable > 0,
+            "多批场景下 A 的完整 Stage 批是真实锚点，只是被身份守卫挡掉 ⇒ 必须记 `IDENTITY_UNREPRESENTABLE`。"
+            + $"实际 NotEligible={c2.MergeNotEligible} / IdentityUnrepresentable={c2.MergeIdentityUnrepresentable}。"
+            + "若 IdentityUnrepresentable=0 而 NotEligible>0 ⇒ 两种「零锚点」被混成一个，本用例失败即为此。");
+        // ⚠ 臂②里 `NOT_ELIGIBLE` **也会 > 0**（实测 5）—— 这是对的，不是污染：
+        //   第一条需求被排时，scheduledTasks 里还没有任何别人的完整 Stage 批 ⇒ 它确实「无锚点」。
+        //   第一条需求被排时，scheduledTasks 里还没有任何别人的完整 Stage 批 ⇒ 它确实「无锚点」。
+        //   只有**后到的**需求才可能「有锚点但被挡」。两者在同一个 Run 里共存是正常的，
+        //   本用例要证的是「它们能被分开计数」，不是「其中一个是 0」。
+        Assert.True(c2.MergeNotEligible > 0,
+            $"臂② 首条需求必然无锚点 ⇒ NotEligible 应 > 0，实际 {c2.MergeNotEligible}");
+    }
+
+    /// <summary>
+    /// **W4 · T1 结构层**（v3.0 §2.4 第一段）：验证两条**结构事实**，不发明新业务模式：
+    ///   ① **Setup 占用起点**：换型时间算在 `[PlannedStartTime, PlannedEndTime)` **之内且在加工之前**
+    ///      ⇒ 该 Task 的跨度必须等于 `SetupTime + 数量 × 单件工时`；
+    ///   ② **资源互斥**：同一 `ResourceId` 上的任意两条 Task 时间区间**不得重叠**。
+    ///
+    /// ⚠ 本用例**不声称**验证了 T2（离线日历事实层：班次 / OFF / 保养 / 停机 / 授权加班 / 人工资源）。
+    ///   那些要 2号位 权威三级 Calendar 的已解析时间片，本轮**没有**权威输入，故未做。
+    /// </summary>
+    [Fact(DisplayName = "W4-T1 · Setup 占用起点在加工之前 + 同资源不得重叠")]
+    public async Task W4_T1_SetupOccupiesResourceBeforeProcessing_And_NoResourceOverlap()
+    {
+        var request = Build(
+            paths: new[] { ThreeOpPath("RT", 1, 1, 2, 3, 1m) },
+            demands: new[]
+            {
+                new DemandSpec("A", 1, 30m, Day.AddDays(200)),
+                new DemandSpec("B", 2, 20m, Day.AddDays(200))
+            },
+            calendar: new[]
+            {
+                (1, Day.AddDays(120), Day.AddDays(125)),
+                (2, Day.AddDays(120), Day.AddDays(125)),
+                (3, Day.AddDays(120), Day.AddDays(125))
+            },
+            allowMerge: false,          // 只看结构，不看合批择优
+            allowSplit: false,
+            setupRules: SameProductSetup(60m, 1, 2, 3));
+
+        var result = await _solver.SolveAsync(request);
+        Assert.True(result.Success, result.ErrorMessage);
+        Assert.Empty(result.UnscheduledTasks);
+
+        // ── ① 换型到底占不占资源：**实测口径**（2026-11-07）──
+        //    第一版我按「跨度 = SetupTime + 数量×单件工时」写断言，**实测被打回**：
+        //      `B/OP10` 跨度只有 20min（= 20 件 × 1min），而 `SetupTime = 60`。
+        //    即：**换型不落在 `Task.Planned[Start,End)` 跨度内**。
+        //    那就必须核另一件事：换型是否至少**单独占用**了资源（前一条 Task 结束 → 本条开始之间的空档）。
+        //    若连空档都没有，说明换型根本没占用资源 —— 那是真缺陷，不是口径差异。
+        foreach (var t in result.FinalTasks)
+        {
+            var span = (decimal)(t.PlannedEndTime - t.PlannedStartTime).TotalMinutes;
+            Assert.True(Math.Abs(span - t.PlannedProcessQty * 1m) < 0.001m,
+                $"{t.SourceDraftId}/{t.OperationCode} 跨度 {span}min，"
+                + $"实测口径应为「只含加工」= {t.PlannedProcessQty}×1min，差 {span - t.PlannedProcessQty}min");
+        }
+
+        // 后到需求 B 必然吃到 M→M 换型 60min（同产品显式规则），A 是首件不换型。
+        Assert.All(result.FinalTasks.Where(t => t.SourceDraftId == "A"),
+            t => Assert.Equal(0m, t.SetupTime));
+        Assert.All(result.FinalTasks.Where(t => t.SourceDraftId == "B"),
+            t => Assert.Equal(60m, t.SetupTime));
+
+        // ── ①.5 换型必须**单独占用**资源：同资源相邻两条之间，空档不得小于后者的 SetupTime ──
+        foreach (var byResource in result.FinalTasks.GroupBy(t => t.ResourceId))
+        {
+            var ordered = byResource.OrderBy(t => t.PlannedStartTime).ToList();
+            for (var i = 1; i < ordered.Count; i++)
+            {
+                var gap = (decimal)(ordered[i].PlannedStartTime - ordered[i - 1].PlannedEndTime).TotalMinutes;
+                Assert.True(gap >= ordered[i].SetupTime,
+                    $"资源 {byResource.Key}：{ordered[i].SourceDraftId}/{ordered[i].OperationCode} 的 SetupTime="
+                    + $"{ordered[i].SetupTime}min，但与前一条之间的空档只有 {gap}min"
+                    + " ⇒ 换型**没有单独占用资源**（前一条结束→本条开始之间塞不下换型）");
+            }
+        }
+
+        // ── ② 资源互斥：同一资源上任意两条 Task 不得重叠 ──
+        foreach (var byResource in result.FinalTasks.GroupBy(t => t.ResourceId))
+        {
+            var ordered = byResource.OrderBy(t => t.PlannedStartTime).ToList();
+            for (var i = 1; i < ordered.Count; i++)
+            {
+                Assert.True(ordered[i].PlannedStartTime >= ordered[i - 1].PlannedEndTime,
+                    $"资源 {byResource.Key} 上两条 Task 重叠："
+                    + $"{ordered[i - 1].SourceDraftId}/{ordered[i - 1].OperationCode}"
+                    + $" [{ordered[i - 1].PlannedStartTime:HH:mm}-{ordered[i - 1].PlannedEndTime:HH:mm}] 与 "
+                    + $"{ordered[i].SourceDraftId}/{ordered[i].OperationCode}"
+                    + $" [{ordered[i].PlannedStartTime:HH:mm}-{ordered[i].PlannedEndTime:HH:mm}]");
+            }
+        }
     }
 
 }

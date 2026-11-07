@@ -237,11 +237,13 @@ public sealed class BatchMergeCommitTests
     public void StageMerge_ThirdOperationFails_RestoresEverything()
     {
         var constraints = ThreeOpConstraints();
-        // **日历只够前两道**：每道 60 件 × 1min = 60min；总需 180min，只给 130min ⇒ 第三道必然无槽。
-        // 这是**真实资源约束**导致的失败（不是交期前置拒绝），才符合 0号位 §0.4 的「深度回滚」口径。
+        // ── 日历 165min（0号位 v3.0 §2.1 指定口径）──
+        //   **原批合法**：3 道 × 50min = 150min ≤ 165min ✓（原批 08:00~10:30 落在窗内）
+        //   **合并后不合法**：3 道 × 60min = 180min > 165min ✗ ⇒ 第三道必然无槽
+        //   ⚠ 用 130min 会让**原批本身也非法**，那样的「Before」是坏的、测试没有证明力（v3.0 点名）。
         constraints.ResourceCalendars[ResourceId] = new List<TimeWindow>
         {
-            new TimeWindow(T0, T0.AddMinutes(130)),
+            new TimeWindow(T0, T0.AddMinutes(165)),
         };
 
         var targetBatch = AnchorStageBatch();
@@ -267,7 +269,34 @@ public sealed class BatchMergeCommitTests
         var beforeShares = shares.ToDictionary(
             kv => kv.Key,
             kv => string.Join(";", kv.Value.Select(x => x.DemandKey + "=" + x.ShareQty)));
-        var timelineBefore = constraints.ProductTimeline;
+        // ── 初始 ProductTimeline 必须与既有 Task 一致（v3.0 §3.1-3）──
+        //   原来留空 ⇒ 「Before」是坏的，回滚前后必然不等，测不出真实还原。
+        constraints.ProductTimeline = ResourceProductTimeline.FromTasks(targetBatch);
+
+        // ── 0号位 v3.0 §3.1-3：**先断言夹具初始状态已经合法**，否则测试没有证明力 ──
+        //   原批 3 道共 150min，日历 165min ⇒ 每条 Task 都必须完整落在窗内、且首尾相接无重叠。
+        var cal = constraints.ResourceCalendars[ResourceId][0];
+        foreach (var t in targetBatch)
+        {
+            Assert.True(t.PlannedStartTime >= cal.Start && t.PlannedEndTime <= cal.End,
+                $"初始夹具非法：Task {t.FinalDraftId} [{t.PlannedStartTime:HH:mm}~{t.PlannedEndTime:HH:mm}] 不在日历窗内");
+        }
+        Assert.True(targetBatch[^1].PlannedEndTime <= cal.End, "初始夹具非法：原批整体超出日历窗");
+
+        // ── ProductTimeline 的可观察内容指纹（不用 Assert.NotNull 糊过去，见 v3.0 §2.1）──
+        //   探测点覆盖：原批起点前 / 每道 Task 结束点前后 / 原批终点后（同产品、不同产品边界都落在这些点上）
+        var probes = new[]
+        {
+            T0.AddMinutes(-1), T0, T0.AddMinutes(49), T0.AddMinutes(50), T0.AddMinutes(51),
+            T0.AddMinutes(99), T0.AddMinutes(100), T0.AddMinutes(101),
+            T0.AddMinutes(149), T0.AddMinutes(150), T0.AddMinutes(151), T0.AddMinutes(200),
+        };
+        string TimelineFingerprint()
+        {
+            var tl = constraints.ProductTimeline;
+            return string.Join("|", probes.Select(x => x.ToString("HH:mm") + "=>" + (tl.GetPrevMaterial(ResourceId, x)?.ToString() ?? "null")));
+        }
+        var timelineBefore = TimelineFingerprint();
 
         var merged = Scheduler.TryMergeDemandIntoStageBatch(
             Demand("C", 10m), ThreeOps(), ThreeOpGraph(), "FORWARD", targetBatch, constraints,
@@ -298,14 +327,10 @@ public sealed class BatchMergeCommitTests
             Assert.Equal(kv.Value, string.Join(";", now!.Select(x => x.DemandKey + "=" + x.ShareQty)));
         }
 
-        // ── ⑤ ProductTimeline 已恢复 ──
-        //   ⚠ **不能用 `Assert.Same`**：失败路径恢复的是**入口处 Clone 出来的那份**
-        //     （`PhaseTwoInitialScheduler.cs:9879` `var timelineBeforeRerun = constraints.ProductTimeline.Clone();`，
-        //      回滚点 `:9896`/`:9922`/`:9943` 都赋它）⇒ 实例必然不同、内容按设计等价。
-        //   `ResourceProductTimeline` 只公开 `FromTasks`/`Clone`，内容无法直接比对
-        //   ⇒ 这里只能断言「回滚后仍是一个非空的时间线」，并且在上面 ①~④ 四项内容级还原都通过的前提下成立。
-        _ = timelineBefore;
-        Assert.NotNull(constraints.ProductTimeline);
+        // ── ⑤ ProductTimeline：**可观察内容等价**（不是 Assert.NotNull，也不是 Assert.Same）──
+        //   实例不同是设计如此（`PhaseTwoInitialScheduler.cs:9879` 入口 `Clone()`、回滚赋它），
+        //   但**内容**必须一致 —— 用真实消费语义 `GetPrevMaterial(resourceId, time)` 在 12 个探测点上逐点比对。
+        Assert.Equal(timelineBefore, TimelineFingerprint());
     }
 
     [Fact(DisplayName = "C2-04 · 三 Operation Stage 合批：A30+B20 已批 + C10 并入 ⇒ 每道 60 件、业务总量 60")]
@@ -364,7 +389,19 @@ public sealed class BatchMergeCommitTests
         }
     }
 
-    [Fact(DisplayName = "C2 · 同目标重复合并：份额不得被追加第二条（数量闭合）")]
+    /// <summary>
+    /// **C2-02**：同 `DemandKey` 同目标再合并必须被拒（纵深防御）。
+    ///
+    /// v3.0 §2.1 C2-02 逐字要求：「断言 `null` 且**拒绝前后**任务值、所有份额、资源占用、
+    /// **ProductTimeline 查询**及 **TraceNotes** 一致，不只比较 D1 数量。」
+    ///
+    /// ⚠ 本用例第一版只比了「D1 份额条数 + 合计金额」，并把 `second is null || all == 5m`
+    ///   写成「两种情况都算过」——这正是 v3.0 §3.2 批的「伪绿」：
+    ///   只要金额没变，**即使第二次真的被接受**也判绿。已推翻重做：
+    ///   · 拒绝判据必须是 `second is null`（严格）；
+    ///   · 五项状态**逐项对拍**：Task 字段 / 全部份额 / 资源占用窗 / ProductTimeline 可观察查询 / TraceNotes。
+    /// </summary>
+    [Fact(DisplayName = "C2-02 · 同目标重复合并被拒：Task/份额/占用/ProductTimeline/TraceNotes 五项逐项不变")]
     public void DuplicateMergeIntoSameTarget_DoesNotDoubleCount()
     {
         var target = TargetTask();
@@ -372,27 +409,70 @@ public sealed class BatchMergeCommitTests
         var occupancy = new Dictionary<int, List<TimeWindow>>();
         var constraints = Constraints();
 
+        // ProductTimeline 必须有**真实初值**才能做内容对拍（空对象上比较等于没比较）。
+        constraints.ProductTimeline = ResourceProductTimeline.FromTasks(new[] { target });
+
         // 第一次合并：D1 的 5 件进目标 Task
         var first = Scheduler.TryMergeDemandIntoTask(
             Demand("D1", 5m), target, Graph(), constraints, occupancy, shares, T0.AddDays(30));
         Assert.NotNull(first);
 
+        // ── 拒绝前快照（五项）──
+        string TaskSig(FinalTaskDraft t) =>
+            $"{t.FinalDraftId}|{t.SourceDraftId}|{t.ResourceId}|{t.StageCode}|{t.OperationCode}"
+            + $"|{t.PlannedStartTime:O}|{t.PlannedEndTime:O}|{t.SetupTime}|{t.Quantity}"
+            + $"|{t.PlannedProcessQty}|{t.ExecutionBatchDraftKey}";
+
+        string ShareSig() => string.Join(";", shares
+            .OrderBy(kv => kv.Key, StringComparer.Ordinal)
+            .Select(kv => kv.Key + "=" + string.Join(",", kv.Value
+                .Select(s => $"{s.DemandKey}:{s.ShareQty}"))));
+
+        string OccupancySig() => string.Join(";", occupancy
+            .OrderBy(kv => kv.Key)
+            .Select(kv => kv.Key + "=[" + string.Join(",", kv.Value
+                .Select(w => $"{w.Start:O}-{w.End:O}")) + "]"));
+
+        // ProductTimeline：用**真实消费语义**做内容指纹（`GetPrevMaterial`），覆盖目标 Task 起止点前后。
+        //   ⚠ 不能用 Assert.NotNull 代替内容比较，也不要求实例相同（回滚会 Clone）。
+        var probes = new[]
+        {
+            target.PlannedStartTime.AddMinutes(-1), target.PlannedStartTime,
+            target.PlannedStartTime.AddMinutes(30), target.PlannedEndTime,
+            target.PlannedEndTime.AddMinutes(1),
+        };
+        string TimelineSig() => string.Join("|", probes.Select(x =>
+            x.ToString("HH:mm") + "=>" + (constraints.ProductTimeline.GetPrevMaterial(ResourceId, x)?.ToString() ?? "null")));
+
+        string TraceSig() => string.Join(";", constraints.TraceNotes
+            .Select(n => $"{n.Key}|{n.ReasonCode}|{n.Level}|{n.Message}"));
+
+        var taskBefore = TaskSig(first!);
+        var shareBefore = ShareSig();
+        var occBefore = OccupancySig();
+        var tlBefore = TimelineSig();
+        var traceBefore = TraceSig();
+
         // 第二次：同一需求再合并一次（模拟「同需求的两批先后命中同一目标」）
         var second = Scheduler.TryMergeDemandIntoTask(
             Demand("D1", 5m), first!, Graph(), constraints, occupancy, shares, T0.AddDays(30));
 
-        // C2-02：拒绝后必须与拒绝前**逐项相同**（份额条数、金额都不许变）
-        var totalQtyAfter = shares.Values.SelectMany(v => v).Sum(v => v.ShareQty);
-        var d1CountAfter = shares.Values.SelectMany(v => v).Count(v => v.DemandKey == "D1");
+        // ── ① 严格拒绝（不允许「接受但没加钱」蒙混）──
+        Assert.True(second is null,
+            "同一需求再次合并进同一目标**未被拒绝** ⇒ 纵深防御失效"
+            + $"（份额现状：{ShareSig()}）");
 
-        var all = shares.Values.SelectMany(v => v).Where(s => s.DemandKey == "D1").Sum(s => s.ShareQty);
+        // ── ② 五项状态逐项对拍 ──
+        Assert.Equal(taskBefore, TaskSig(first!));
+        Assert.Equal(shareBefore, ShareSig());
+        Assert.Equal(occBefore, OccupancySig());
+        Assert.Equal(tlBefore, TimelineSig());
+        Assert.Equal(traceBefore, TraceSig());
 
-        // 要么第二次被拒（second == null），要么份额仍是 5；**两者都不许出现「D1 份额合计 10」**
-        Assert.Equal(1, d1CountAfter);
-        Assert.Equal(5m, totalQtyAfter);
-
-        Assert.True(second is null || all == 5m,
-            $"同一需求被重复合并进同一目标：D1 份额合计={all}（应为 5）。"
-            + $" 第二次合并返回={(second is null ? "null（已拒绝）" : "非 null（接受）")}");
+        // ── ③ 数量闭合（原先唯一断言，保留）──
+        var d1 = shares.Values.SelectMany(v => v).Where(s => s.DemandKey == "D1").ToList();
+        Assert.Single(d1);
+        Assert.Equal(5m, d1.Sum(s => s.ShareQty));
+        Assert.Equal(5m, shares.Values.SelectMany(v => v).Sum(s => s.ShareQty));
     }
 }

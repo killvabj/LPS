@@ -142,6 +142,64 @@ public class FrozenStrategySnapshotProviderIntegrationTests : IDisposable
             .WithMessage($"策略包版本不存在：{nonExistentVersionId}");
     }
 
+    /// <summary>
+    /// 需求优先级 §四-A 配置契约回归闸（2号位 2026-11-07 回执 §三）：
+    /// **直读现网已发布 `RuleSetVersion.Id = 478` 快照**，断言段2 组B 第三条
+    /// `{Field=7(ISSUEDATE), Operator=2(LessThan), Value="-30"}` 保持设计意图
+    /// （`IssueDate &lt; 冻结日-30`，发行超30天命中）。
+    ///
+    /// 与 §四-B（证明「执行器能区分配置」）互补——本闸证明「**库里的那份配置没被人改回去**」。
+    /// 478 这行今天已在 PUBLISHED 原位整份替换、`UpdatedAt=NULL`、`APS_Auth.AuditLog` 零痕迹
+    /// （2号位 §三：今日至少 4 例同形），发布校验不查相对日方向语义、运行期也不报错 ⇒
+    /// 「把 Operator 从 2 改回 4」是现实会发生且静默错排的回归路径，须靠本闸红。
+    ///
+    /// 红判据（照 2号位 §三 原文）：Operator 变 4，或该条件被删/被移出组B，或 478 行缺失。
+    /// </summary>
+    [SkippableFact(DisplayName = "回归闸：现网 478 段2 组B ISSUEDATE 算子须保持 LessThan(Operator==2)—— 配置被改回即红")]
+    public async System.Threading.Tasks.Task RuleSetVersion478_段2组B_ISSUEDATE算子须为LessThan_配置契约回归闸()
+    {
+        Skip.If(!TestEnvironment.HasContentSnapshotJsonColumn(), "测试库缺 ContentSnapshotJson 列（方案 A 未迁移），需 2号位 v5.1.2 迁移后转绿");
+
+        var json = await _connectionManager.QueryFirstOrDefaultAsync<string>(
+            "SELECT ContentSnapshotJson FROM [dbo].[RuleSetVersion] WHERE Id = 478",
+            new { },
+            db: DatabaseId.APS);
+
+        json.Should().NotBeNull("回归闸：现网 RuleSetVersion 不存在 Id=478（配置被删，或测试库缺该活配置行），无法核验需求优先级段2 组B 算子");
+
+        using var parsed = JsonDocument.Parse(json!);
+        var root = parsed.RootElement;
+
+        var hasSeg1 = root.TryGetProperty("DemandPriority", out var dp)
+                      && dp.TryGetProperty("Segments", out var segs)
+                      && segs.GetArrayLength() > 1;
+        if (!hasSeg1)
+        {
+            throw new InvalidOperationException("回归闸红：478 DemandPriority.Segments[1]（段2）缺失或被移出 —— 配置被改动");
+        }
+
+        var seg1 = dp.GetProperty("Segments")[1];
+        var hasGroups = seg1.TryGetProperty("MatchConditionGroups", out var groups)
+                        && groups.GetArrayLength() > 1;
+        if (!hasGroups)
+        {
+            throw new InvalidOperationException("回归闸红：478 段2 缺 MatchConditionGroups 双组（组B 丢失）—— 配置被改动");
+        }
+
+        var hasCond = groups[1].TryGetProperty("Conditions", out var conds)
+                      && conds.GetArrayLength() > 2;
+        if (!hasCond)
+        {
+            throw new InvalidOperationException("回归闸红：478 段2 组B 第3 条（ISSUEDATE）缺失或被移出 —— 配置被改动");
+        }
+
+        var cond = conds[2];
+        cond.GetProperty("Field").GetInt32().Should().Be(7, "组B 第3 条须为 ISSUEDATE（Field=7）");
+        cond.GetProperty("Value").GetString().Should().Be("-30", "组B 第3 条阈值保持整数偏移 -30（换算为 冻结日-30）");
+        cond.GetProperty("Operator").GetInt32().Should().Be(2,
+            "组B 第3 条算子须为 LessThan(2)；若被改回 GreaterThan(4)，段2 DNF 组B 语意即翻转（发行超30天误命中）");
+    }
+
     private async System.Threading.Tasks.Task SetupTestDataAsync()
     {
         var now = DateTime.Now;
