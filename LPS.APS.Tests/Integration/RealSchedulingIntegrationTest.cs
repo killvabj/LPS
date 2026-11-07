@@ -57,6 +57,10 @@ public class RealSchedulingIntegrationTest
     private int _actualPlanVersionId; // 运行时动态获取
     // 定点回收：只有当本测试**真的补造**了工艺路线时才非空，回收按 Id 删、绝不按 MaterialId 盲删真实工艺数据
     private long? _syntheticRoutingOperationId;
+    // O36（2026-11-07）：本测试**自己创建**的 Run 壳 / PV 壳 Id；0＝本测试没建（复用了别人的 PV）⇒ 收尾不删。
+    //   缺陷背景：原实现只删业务行、不删壳 ⇒ 每跑一次就永久留一个 RUNNING Run + 一张 BUILDING PV。
+    private long _createdScheduleRunId;
+    private int  _createdPlanVersionId;
 
     public RealSchedulingIntegrationTest()
     {
@@ -150,6 +154,44 @@ public class RealSchedulingIntegrationTest
             Console.WriteLine($"堆栈: {ex.StackTrace}");
             Console.WriteLine("=".PadRight(80, '='));
             throw;
+        }
+        finally
+        {
+            // O36（2026-11-07）：**成败都收尾**。
+            //   原先无论成功失败都留一个 RUNNING 的 ScheduleRun + BUILDING 的 PlanVersion 永久不散，
+            //   ⇒ 「现在有几个 Run 在跑」「这张 PV 是不是还在算」全部失真。
+            //   收尾只删本测试自己创建的 Id（复用的 PV 不删）；排障信息以 Console 输出为准，不靠残行。
+            await CleanupRunShellsAsync();
+        }
+    }
+
+    /// <summary>
+    /// O36：删掉本测试自己造的 `ScheduleRun` / `PlanVersion` 壳（连同其依赖行）。
+    /// 只按本测试记录的 Id 定点删；回收失败只告警、不掩盖测试结果。
+    /// </summary>
+    private async Task CleanupRunShellsAsync()
+    {
+        try
+        {
+            // 先删 PV（含其全部依赖行），再删 Run：Run 是 PV 的父壳，顺序上不会造成悬空引用。
+            if (_createdPlanVersionId > 0)
+            {
+                var pvDeleted = await TestRunArtifactCleaner.PurgePlanVersionAsync(_connectionManager, _createdPlanVersionId);
+                Console.WriteLine($"  - 已回收本测试自建 PlanVersion: Id={_createdPlanVersionId}（删除 {pvDeleted} 行，含依赖）");
+                _createdPlanVersionId = 0;
+            }
+
+            if (_createdScheduleRunId > 0)
+            {
+                var runDeleted = await TestRunArtifactCleaner.PurgeScheduleRunAsync(_connectionManager, _createdScheduleRunId);
+                Console.WriteLine($"  - 已回收本测试自建 ScheduleRun: Id={_createdScheduleRunId}（删除 {runDeleted} 行）");
+                _createdScheduleRunId = 0;
+            }
+        }
+        catch (Exception cleanupEx)
+        {
+            // 不用 ex.Message 之外的堆栈干扰测试结论；但要响亮 —— 收尾失败＝下一次读数还会有残壳。
+            Console.WriteLine($"  ⚠ Run 壳回收失败（残留 PlanVersionId={_createdPlanVersionId}／ScheduleRunId={_createdScheduleRunId}）：{cleanupEx.Message}");
         }
     }
 
@@ -261,6 +303,9 @@ public class RealSchedulingIntegrationTest
             },
             db: DatabaseId.APS);
 
+        // O36：记下本测试自建的 Run 壳，收尾时按此 Id 定点删除（绝不按状态批量删）
+        _createdScheduleRunId = scheduleRunId;
+
         Console.WriteLine($"  - 创建ScheduleRun: {scheduleRunId}");
 
         // 2. 准备Material基础数据（LoadOrdersForPeggingAsync需要JOIN Material表）
@@ -359,11 +404,14 @@ public class RealSchedulingIntegrationTest
                 },
                 db: DatabaseId.APS);
 
+            // O36：只删本测试自建的 PV 壳；复用别人的 PV 时保持 0（不删不属于自己的东西）
+            _createdPlanVersionId = _actualPlanVersionId;
+
             Console.WriteLine($"  - 创建测试计划版本: {_actualPlanVersionId}，关联ScheduleRun: {scheduleRunId}");
         }
         else
         {
-            Console.WriteLine($"  - 使用现有计划版本: {_actualPlanVersionId}");
+            Console.WriteLine($"  - 使用现有计划版本: {_actualPlanVersionId}（非本测试创建 ⇒ 收尾不删）");
         }
 
         // 3.1 PV 维度的幂等重置：必须等 _actualPlanVersionId 解析完再删（CleanupTestDataAsync 早于本方法，那时它是 0）。

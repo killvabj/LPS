@@ -1447,6 +1447,11 @@ public class PeggingOrchestrator : IPeggingOrchestrator
         public int? ProductionDepartmentId { get; init; }
         public string? RouteCode { get; init; }
         public int? PathId { get; init; }
+        /// <summary>
+        /// 工序名：按 `(MaterialId, ProductionDepartmentId, OperationCode)` **三元唯一命中** `RoutingOperation.OperationName`（O34，2026-11-07）；
+        ///   多值/未命中一律 NULL，不猜。三元键的判别力与命中率见 <see cref="LoadUniqueOperationNamesAsync"/> 注释。
+        /// </summary>
+        public string? OperationName { get; init; }
         public string? StageExecutionBatchDraftKey { get; init; }
         public decimal? StageExecutionBatchQty { get; init; }
         public DateTime CreatedAt { get; init; }
@@ -1500,8 +1505,10 @@ public class PeggingOrchestrator : IPeggingOrchestrator
         /// </summary>
         public string? ProductionDepartmentCode { get; init; }
         /// <summary>
-        /// 工序名：按五元组命中 `RoutingOperation.OperationName`；当前 `Task.RouteCode/PathId` 全表归一为
-        ///   `DEFAULT`/`1` ⇒ 命中 0 ⇒ **留 NULL 不猜**（四键在 1,903,725 组里有 11,312 组对应多名）。
+        /// 工序名：按 `(MaterialId, ProductionDepartmentId, OperationCode)` **三元唯一命中** `RoutingOperation.OperationName`（O34，2026-11-07）。
+        ///   历史口径（作废）：曾按「五元组含 `RouteCode`/`PathId`」查，而 `Task.RouteCode/PathId` 全表归一为 `DEFAULT`/`1`
+        ///   ⇒ 命中恒 0 ⇒ 落库 100% NULL。改为三元键后实测唯一命中 99.39%（PV 999447 为 100%），
+        ///   0.61% 对应多名 ⇒ **留 NULL 不猜**（同 `[Task].OperationName` 口径，5号位 裁定两表同规则）。
         /// </summary>
         public string? OperationName { get; init; }
     }
@@ -1518,6 +1525,89 @@ public class PeggingOrchestrator : IPeggingOrchestrator
         public DateTime CreatedAt { get; init; }
     }
 
+    /// <summary>`RoutingOperation` 工序名装载行（O34，2026-11-07）。</summary>
+    private sealed class RoutingOperationNameRow
+    {
+        public int MaterialId { get; set; }
+        public int ProductionDepartmentId { get; set; }
+        public string OperationCode { get; set; } = string.Empty;
+        public string OperationName { get; set; } = string.Empty;
+        public int NameCount { get; set; }
+    }
+
+    /// <summary>
+    /// O34（2026-11-07）：装载 `(MaterialId, ProductionDepartmentId, OperationCode) → OperationName` 的**唯一命中**字典，
+    ///   供 `[Task].OperationName` 与 `TaskDispatch.OperationName` **同规则**回填。
+    /// </summary>
+    /// <remarks>
+    /// 【为什么是三元键】历史实现按「五元组」连 `RouteCode`/`PathId` 一起查，而 `[Task].RouteCode/PathId` 全表归一为
+    ///   `DEFAULT`/`1` ⇒ 命中恒 0 ⇒ 两表该列写入时恒为 NULL。三元键去掉了这两个恒常量化字段。
+    /// 【为什么必须带部门】188 个 `OperationCode` 里有 141 个在不同部门下对应不同工序名 ⇒ 少了部门就会把 A 部门
+    ///   的工序名写到 B 部门的行上（静默张冠李戴，比留 NULL 更糟）。
+    /// 【为什么多名就放弃】实读 2026-11-07 12:38：三元组 1,903,726 个，其中 11,312 个对应多名（0.594%）
+    ///   ⇒ 只有 `COUNT(DISTINCT OperationName) = 1` 才入字典，其余留 NULL。**不按 `MIN()` 猜**。
+    /// 【量级】近三个 PV 的 `[Task]` 每轮只涉及 950–1,364 个物料 ⇒ 一次分块查询即可，不构成负担。
+    /// 【事务边界】在落库事务**外**装载（纯只读参考数据，不占锁）。
+    /// </remarks>
+    private async Task<Dictionary<(int MaterialId, int ProductionDepartmentId, string OperationCode), string>>
+        LoadUniqueOperationNamesAsync(IReadOnlyList<int> materialIds)
+    {
+        var map = new Dictionary<(int, int, string), string>();
+        if (materialIds.Count == 0) return map;
+
+        List<RoutingOperationNameRow> rows;
+        try
+        {
+            rows = await QueryJsonInAsync(materialIds, json =>
+                    _connectionManager.QueryAsync<RoutingOperationNameRow>(
+                        @"SELECT ro.MaterialId, ro.ProductionDepartmentId, ro.OperationCode,
+                                 MIN(ro.OperationName) AS OperationName,
+                                 COUNT(DISTINCT ro.OperationName) AS NameCount
+                          FROM OPENJSON(@Json) WITH (value int '$') j
+                          INNER JOIN RoutingOperation ro ON ro.MaterialId = j.value
+                          WHERE ro.IsActive = 1
+                            AND LTRIM(RTRIM(ro.OperationName)) <> ''
+                          GROUP BY ro.MaterialId, ro.ProductionDepartmentId, ro.OperationCode",
+                        new { Json = json },
+                        db: DatabaseId.APS),
+                tag: $"O34 工序名(物料={materialIds.Count})");
+        }
+        catch (Exception ex)
+        {
+            // 降级而非失败：工序名是**诊断信息**，取不到就回到旧行为（留 NULL），
+            //   不能因为一次参考数据查询失败而丢掉整轮生产落库。
+            // ⚠ 必须响亮：这条日志是「本 Run 两表 OperationName 全 NULL」的唯一解释，别让它变静默。
+            _logger.LogWarning(ex,
+                "[Pegging] O34 工序名装载失败（物料={Count} 个）⇒ 本轮 `[Task].OperationName` 与 " +
+                "`TaskDispatch.OperationName` 一律留 NULL（旧行为），排程结果不受影响",
+                materialIds.Count);
+            return map;
+        }
+
+        foreach (var row in rows)
+        {
+            // 多名 ⇒ 不进字典（查不到即 NULL）；单名才入
+            if (row.NameCount == 1)
+                map[(row.MaterialId, row.ProductionDepartmentId, row.OperationCode)] = row.OperationName;
+        }
+
+        if (rows.Count > 0)
+            _logger.LogInformation(
+                "[Pegging] O34 工序名：三元组 {Total} 个，唯一命中 {Unique} 个（{Ratio:P2}），余 {Multi} 个多名/缺名 ⇒ 留 NULL",
+                rows.Count, map.Count, map.Count / (double)rows.Count, rows.Count - map.Count);
+
+        return map;
+    }
+
+    /// <summary>O34：三元唯一命中取工序名；无部门 / 空工序码 / 未命中 / 多名 ⇒ NULL（不猜）。</summary>
+    private static string? ResolveOperationNameOrNull(
+        IReadOnlyDictionary<(int MaterialId, int ProductionDepartmentId, string OperationCode), string> map,
+        int materialId, int? departmentId, string? operationCode)
+    {
+        if (departmentId is null || string.IsNullOrWhiteSpace(operationCode)) return null;
+        return map.TryGetValue((materialId, departmentId.Value, operationCode), out var name) ? name : null;
+    }
+
     private async System.Threading.Tasks.Task<(List<ApsTask> tasks, int peggingCount, int supplyAllocationCount)>
         PersistDomainAndPeggingInTransactionAsync(
             int planVersionId,
@@ -1531,6 +1621,12 @@ public class PeggingOrchestrator : IPeggingOrchestrator
             string? setupInitialStateEvidence = null,
             IReadOnlyList<PiStageQuantityBaseline>? stageBaselines = null)
     {
+        // ── O34（2026-11-07）：工序名唯一命名字典 ────────────────────────────────
+        //   事务外装载（只读参考数据，不占锁）；键 = (MaterialId, ProductionDepartmentId, OperationCode)。
+        //   `[Task]` 与 `TaskDispatch` 两表同一条规则，见 LoadUniqueOperationNamesAsync 注释。
+        var operationNameByKey = await LoadUniqueOperationNamesAsync(
+            solveResult.FinalTasks.Select(t => t.MaterialId).Distinct().ToList());
+
         return await _connectionManager.ExecuteInTransactionAsync<(List<ApsTask>, int, int)>(
             async (conn, tx) =>
             {
@@ -2069,6 +2165,9 @@ public class PeggingOrchestrator : IPeggingOrchestrator
                             // 空串落 NULL（与 StageCode 同口径）；**不得**把 DEFAULT 当占位真值写进去
                             RouteCode        = string.IsNullOrWhiteSpace(final.RouteCode) ? null : final.RouteCode,
                             PathId           = persistPathId,
+                            // O34（2026-11-07）：工序名三元唯一命中；未命中/多名/无部门 ⇒ NULL（不猜）
+                            OperationName    = ResolveOperationNameOrNull(
+                                operationNameByKey, final.MaterialId, persistDepartmentId, final.OperationCode),
                             // C 桶由 1号位 给 Stage 执行批键（A/B 桶留空，见 09-29 加列脚本口径）；当前 1号位 尚未产出 ⇒ 恒 NULL
                             StageExecutionBatchDraftKey = string.IsNullOrWhiteSpace(final.StageExecutionBatchDraftKey) ? null : final.StageExecutionBatchDraftKey,
                             StageExecutionBatchQty      = final.StageExecutionBatchQty,
@@ -2102,8 +2201,9 @@ public class PeggingOrchestrator : IPeggingOrchestrator
                             StageCode              = string.IsNullOrWhiteSpace(final.StageCode) ? null : final.StageCode,
                             ProductionDepartmentCode = persistDepartmentId.HasValue
                                 && deptCodeById.TryGetValue(persistDepartmentId.Value, out var dc) ? dc : null,
-                            // 五元组命中 0（Task.RouteCode/PathId 全表归一为 DEFAULT/1）⇒ 留 NULL，不按四键猜
-                            OperationName          = null
+                            // O34（2026-11-07）：工序名三元唯一命中；未命中/多名/无部门 ⇒ NULL（不猜）
+                            OperationName          = ResolveOperationNameOrNull(
+                                operationNameByKey, final.MaterialId, persistDepartmentId, final.OperationCode)
                         });
                     }
                     else
@@ -2165,7 +2265,9 @@ public class PeggingOrchestrator : IPeggingOrchestrator
                                     StageCode              = string.IsNullOrWhiteSpace(final.StageCode) ? null : final.StageCode,
                                     ProductionDepartmentCode = persistDepartmentId.HasValue
                                         && deptCodeById.TryGetValue(persistDepartmentId.Value, out var dc2) ? dc2 : null,
-                                    OperationName          = null
+                                    // O34（2026-11-07）：工序名三元唯一命中；未命中/多名/无部门 ⇒ NULL（不猜）
+                                    OperationName          = ResolveOperationNameOrNull(
+                                        operationNameByKey, final.MaterialId, persistDepartmentId, final.OperationCode)
                                 });
                             }
                         }

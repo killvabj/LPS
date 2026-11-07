@@ -264,6 +264,20 @@ public class DemandPriorityNullAndDnfTests
         _executor.ExecutePrioritySort(demands, config).Single().DemandSequence.Should().Be(1);
     }
 
+    [Fact(DisplayName = "B 组A 与 组B 皆成立 ⇒ 整段命中（组间 OR：任一 AND 组全成立即命中）")]
+    public void B_两组皆成立则命中()
+    {
+        var config = Config(Segment(1, groups: [GroupA(), GroupB()]));
+
+        // 同时满足组A（StockConsumeDay≤0）与组B（IssueDate 早于 2026-10-08）⇒ 两组皆成立，整段命中
+        var demands = new List<UpstreamDemand>
+        {
+            new() { DemandKey = "AB", OrderType = "PRODUCTION_INSTRUCTION", MaterialCode = "FINAL-X", StockConsumeDay = 0m, IssueDate = new DateTime(2026, 9, 1) },
+        };
+
+        _executor.ExecutePrioritySort(demands, config).Single().DemandSequence.Should().Be(1);
+    }
+
     [Fact(DisplayName = "B 两组均不成立 ⇒ 不命中，落兜底段（用段内排序键区分命中集合与兜底集合）")]
     public void B_两组均不成立则不命中()
     {

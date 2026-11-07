@@ -508,6 +508,125 @@ public class SchedulingOrchestrator : ISchedulingOrchestrator
         }
     }
 
+    /// <summary>O38 判据谓词（聚合与抽样两条查询共用，避免谓词各写一遍后漂移）。</summary>
+    private const string StaleCreatedDispatchPredicate = @"
+              FROM [TaskDispatch] d
+              WHERE d.DispatchStatus = 'CREATED'
+                AND d.MESWorkOrderNo IS NOT NULL
+                AND d.CreatedAt < @PrevSnapshotAt
+                AND NOT EXISTS (SELECT 1 FROM MESWorkOrderSnapshot s
+                                WHERE s.ScheduleRunId = @Run AND s.MESWorkOrderNo = d.MESWorkOrderNo)
+                AND NOT EXISTS (SELECT 1 FROM MESWorkOrderSnapshot p
+                                WHERE p.ScheduleRunId = @PrevRun AND p.MESWorkOrderNo = d.MESWorkOrderNo)";
+
+    /// <summary>O38：上一份可比 MES 快照所属的 Run 及其落库时刻。</summary>
+    private sealed class PrevSnapshotRunRow
+    {
+        public int PrevRun { get; set; }
+        public DateTime? PrevSnapshotAt { get; set; }
+    }
+
+    /// <summary>O38 聚合读数。</summary>
+    private sealed class StaleCreatedDispatchStat
+    {
+        public int RowCount { get; set; }
+        public int WorkOrderCount { get; set; }
+        public decimal Qty { get; set; }
+    }
+
+    /// <summary>O38 抽样行。</summary>
+    private sealed class StaleCreatedDispatchSample
+    {
+        public string? MESWorkOrderNo { get; set; }
+        public string? ProductionInstructionNo { get; set; }
+        public int MaterialId { get; set; }
+        public string? StageCode { get; set; }
+        public decimal Quantity { get; set; }
+        public DateTime CreatedAt { get; set; }
+    }
+
+    /// <summary>
+    /// O38（2026-11-07，5号位《五项答复》§六.2）：`CREATED` 下发行的「连续 2 个 Run 快照缺席」出口。
+    /// </summary>
+    /// <remarks>
+    /// 【要解决什么】Stage 闸第三项会把这些 `CREATED` 行的量**永久扣减**（当作"我方已建、MES 证据未到"的欠账）。
+    ///   若某张工单其实已被 MES 静默丢弃（取消了却没同步、或建单失败但号已落库），它**永不进快照** ⇒
+    ///   那部分量被扣到天荒地老，PI 永远建不出新单。**5号位 明确不自动放**（放掉即双建风险）⇒
+    ///   本方只能**出声**，交人工在 MES 侧确认后再走 A5（词表扩 `SNAPSHOT_MISSING` → `FAILED` → 重发）。
+    /// 【为什么是「连续 2 个 Run」】单轮缺席是**正常**的——建单与快照之间本就有空窗（见第三项注释）。
+    ///   只有「上一个快照里没有、这个快照里仍然没有」才足以说明不是时滞。
+    /// 【凭什么是「2 个 Run」而不是「2 次同步」】快照按 `ScheduleRunId` 分区，一个 Run 一份快照 ⇒
+    ///   缺席两个连续 Run＝缺席两份独立的快照，这正好也是 Stage 闸扣减发生两次的证据。
+    /// 【为什么加 `CreatedAt &lt; @PrevSnapshotAt`】把「本轮/上轮才建、本来就还没轮到快照」的行排除掉；
+    ///   不排除的话，今天新建的行当天就会因"两个快照都没有"被误报（它那时还不存在）。
+    /// 【为什么只 WARN 不改状态】自动置 `FAILED` 会让 W5 重发 —— 若 MES 侧其实有这张单，就是**双建**。
+    ///   本方法**只读不写**，任何状态变更都必须由人工在 MES 侧确认后发起。
+    /// </remarks>
+    private async Task WarnStaleCreatedDispatchRowsAsync(int scheduleRunId, CancellationToken cancellationToken)
+    {
+        if (scheduleRunId <= 0)
+        {
+            return;   // 手动单 PV 入口无 Run 上下文 ⇒ 无"连续两轮"可比
+        }
+
+        // 上一个**有快照的** Run：取快照表里比本 Run 小的最大 RunId，顺带取出它那份快照的落库时刻。
+        var prev = await _connectionManager.QueryFirstOrDefaultAsync<PrevSnapshotRunRow>(
+            @"SELECT TOP 1 ScheduleRunId AS PrevRun, MIN(CreatedAt) AS PrevSnapshotAt
+              FROM MESWorkOrderSnapshot
+              WHERE ScheduleRunId < @Run
+              GROUP BY ScheduleRunId
+              ORDER BY ScheduleRunId DESC",
+            new { Run = scheduleRunId },
+            db: DatabaseId.APS);
+
+        if (prev?.PrevSnapshotAt == null)
+        {
+            _logger.LogInformation(
+                "[O38] Run={Run} 没有可比的上一份 MES 快照（首轮或快照缺失）⇒ 本轮不做「连续两轮缺席」判定",
+                scheduleRunId);
+            return;
+        }
+
+        var prevRun = prev.PrevRun;
+        var prevSnapshotAt = prev.PrevSnapshotAt.Value;
+
+        var stat = await _connectionManager.QueryFirstOrDefaultAsync<StaleCreatedDispatchStat>(
+            @"SELECT COUNT(*) AS RowCount,
+                     COUNT(DISTINCT d.MESWorkOrderNo) AS WorkOrderCount,
+                     ISNULL(SUM(d.Quantity), 0) AS Qty"
+            + StaleCreatedDispatchPredicate,
+            new { Run = scheduleRunId, PrevRun = prevRun, PrevSnapshotAt = prevSnapshotAt },
+            db: DatabaseId.APS);
+
+        if (stat == null || stat.RowCount == 0)
+        {
+            return;
+        }
+
+        var samples = (await _connectionManager.QueryAsync<StaleCreatedDispatchSample>(
+            @"SELECT TOP 5 d.MESWorkOrderNo, d.ProductionInstructionNo, d.MaterialId,
+                     d.StageCode, d.Quantity, d.CreatedAt"
+            + StaleCreatedDispatchPredicate
+            + @"
+              ORDER BY d.CreatedAt",
+            new { Run = scheduleRunId, PrevRun = prevRun, PrevSnapshotAt = prevSnapshotAt },
+            db: DatabaseId.APS)).ToList();
+
+        _logger.LogWarning(
+            "[O38] CREATED 过期出口：{Rows} 行／{Wos} 张工单（ΣQty={Qty}）连续两个 Run 未出现在 MES 快照" +
+            "（Run={Run} / 上一份快照 Run={PrevRun}），**已按第三项持续扣减**。" +
+            "⇒ 请人工到 MES 侧确认这些工单是否确实不存在；确认不存在后走 A5（`SNAPSHOT_MISSING` → FAILED → 重发）。" +
+            "**本方不自动释放，避免与 MES 双建。** 样本：{Sample}",
+            stat.RowCount,
+            stat.WorkOrderCount,
+            stat.Qty,
+            scheduleRunId,
+            prevRun,
+            string.Join("；", samples.Select(x =>
+                $"WO={x.MESWorkOrderNo}/PI={x.ProductionInstructionNo}/物料={x.MaterialId}/Stage={x.StageCode}" +
+                $"/Qty={x.Quantity}/建于 {x.CreatedAt:yyyy-MM-dd HH:mm:ss}")));
+    }
+
     /// <summary>
     /// ScheduleRun 终态收口（三态各一次）：全成功 COMPLETED / 部分成功 PARTIAL_SUCCESS / 全失败 FAILED。
     /// 抽为私有方法，供「正常执行完」与「重入全终态跳过」两条路径共用 —— 收口语义必须单点，
@@ -526,6 +645,11 @@ public class SchedulingOrchestrator : ISchedulingOrchestrator
         int durationSeconds,
         CancellationToken cancellationToken)
     {
+        // O38（2026-11-07）：收口前先出「CREATED 连续两轮快照缺席」的告警。
+        //   放在收口点＝本 Run 的全部 TaskDispatch 已落库之后、且**每 Run 只跑一次**（不在各域重复算）。
+        //   只读不写：过期判定交人工，本方不自动释放（5号位 §六.2：放掉即双建风险）。
+        await WarnStaleCreatedDispatchRowsAsync(scheduleRunId, cancellationToken);
+
         if (succeededCount == totalDomainCount)
         {
             await _scheduleRunService.CompleteAsync(scheduleRunId, durationSeconds, cancellationToken);

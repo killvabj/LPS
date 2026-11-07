@@ -51,6 +51,12 @@ public class SyntheticSchedulingIntegrationTest
     private readonly DatabaseConnectionManager _connectionManager;
     private readonly SchedulingOrchestrator _schedulingOrchestrator;
 
+    // O36（2026-11-07）：本测试在 SeedAsync 里**自己创建**的 Run 壳 / PV 壳 Id，收尾按此定点删。
+    //   缺陷背景：原实现只删夹具业务键（Material/Order/Routing…），从不删壳 ⇒
+    //   每跑一次就永久留一个 RUNNING 的 ScheduleRun 和一张 BUILDING 的 PlanVersion。
+    private long _createdScheduleRunId;
+    private int  _createdPlanVersionId;
+
     public SyntheticSchedulingIntegrationTest()
     {
         var services = new ServiceCollection();
@@ -86,49 +92,87 @@ public class SyntheticSchedulingIntegrationTest
         // 0. 幂等清理：删掉上次运行残留的合成夹具行（真实数据不动）。
         await CleanupAsync();
 
-        // 1. 装配全自洽合成夹具（订单 + 无 BOM + 1 工序 + 资质 + 资源 + 部门上下文，同一部门闭环）。
-        var planVersionId = await SeedAsync();
-
-        // 2. 跑完整排程链（装载 → Pegging → 1号位 Solver → Task 落库）。
-        var result = await _schedulingOrchestrator.RunSchedulingAsync(
-            planVersionId, STRATEGY_VERSION, CancellationToken.None);
-
-        Assert.True(result.IsSuccess, $"合成排程失败: {result.ErrorMessage}");
-
-        // 3. 断言：Task 已落库且被真实排定（PlannedStartTime/PlannedEndTime 非空 = 非 Unscheduled）。
-        var tasks = (await _connectionManager.QueryAsync<dynamic>(
-            @"SELECT Id, PlanVersionId, MaterialId, Quantity, PlannedStartTime, PlannedEndTime
-              FROM [Task]
-              WHERE PlanVersionId = @PlanVersionId",
-            new { PlanVersionId = planVersionId },
-            db: DatabaseId.APS)).ToList();
-
-        if (tasks.Count == 0)
+        try
         {
-            throw new InvalidOperationException("Task 表无数据：合成夹具未产出任务（代码链断裂）");
-        }
+            // 1. 装配全自洽合成夹具（订单 + 无 BOM + 1 工序 + 资质 + 资源 + 部门上下文，同一部门闭环）。
+            var planVersionId = await SeedAsync();
 
-        var foundMaterial = false;
-        var anyScheduled = false;
-        foreach (var task in tasks)
-        {
-            if ((int)task.MaterialId == TEST_MATERIAL_ID)
+            // 2. 跑完整排程链（装载 → Pegging → 1号位 Solver → Task 落库）。
+            var result = await _schedulingOrchestrator.RunSchedulingAsync(
+                planVersionId, STRATEGY_VERSION, CancellationToken.None);
+
+            Assert.True(result.IsSuccess, $"合成排程失败: {result.ErrorMessage}");
+
+            // 3. 断言：Task 已落库且被真实排定（PlannedStartTime/PlannedEndTime 非空 = 非 Unscheduled）。
+            var tasks = (await _connectionManager.QueryAsync<dynamic>(
+                @"SELECT Id, PlanVersionId, MaterialId, Quantity, PlannedStartTime, PlannedEndTime
+                  FROM [Task]
+                  WHERE PlanVersionId = @PlanVersionId",
+                new { PlanVersionId = planVersionId },
+                db: DatabaseId.APS)).ToList();
+
+            if (tasks.Count == 0)
             {
-                foundMaterial = true;
+                throw new InvalidOperationException("Task 表无数据：合成夹具未产出任务（代码链断裂）");
             }
 
-            if (task.PlannedStartTime != null && task.PlannedEndTime != null)
+            var foundMaterial = false;
+            var anyScheduled = false;
+            foreach (var task in tasks)
             {
-                anyScheduled = true;
-                if ((decimal)task.Quantity <= 0)
+                if ((int)task.MaterialId == TEST_MATERIAL_ID)
                 {
-                    throw new InvalidOperationException($"Task.Quantity 无效: {task.Quantity}");
+                    foundMaterial = true;
+                }
+
+                if (task.PlannedStartTime != null && task.PlannedEndTime != null)
+                {
+                    anyScheduled = true;
+                    if ((decimal)task.Quantity <= 0)
+                    {
+                        throw new InvalidOperationException($"Task.Quantity 无效: {task.Quantity}");
+                    }
                 }
             }
-        }
 
-        Assert.True(foundMaterial, "Task 中未找到合成物料，物料链未贯通");
-        Assert.True(anyScheduled, "所有 Task 均为 Unscheduled（PlannedStart/End 为空），求解未排定");
+            Assert.True(foundMaterial, "Task 中未找到合成物料，物料链未贯通");
+            Assert.True(anyScheduled, "所有 Task 均为 Unscheduled（PlannedStart/End 为空），求解未排定");
+        }
+        finally
+        {
+            // O36（2026-11-07）：**成败都收尾**删掉本测试自建的 Run/PV 壳。
+            //   原先收尾只按业务键删夹具行，`ScheduleRun` / `PlanVersion` 永久不散 ⇒
+            //   「现在有几个 Run 在跑」的读数被合成残壳污染（且它 Status 恒 RUNNING）。
+            await CleanupRunShellsAsync();
+        }
+    }
+
+    /// <summary>
+    /// O36：删掉本测试自己造的 `ScheduleRun` / `PlanVersion` 壳（连同其依赖行）。
+    /// 只按本测试记录的 Id 定点删；回收失败只告警、不掩盖测试结果。
+    /// </summary>
+    private async Task CleanupRunShellsAsync()
+    {
+        try
+        {
+            if (_createdPlanVersionId > 0)
+            {
+                var pvDeleted = await TestRunArtifactCleaner.PurgePlanVersionAsync(_connectionManager, _createdPlanVersionId);
+                Console.WriteLine($"  - 已回收本测试自建 PlanVersion: Id={_createdPlanVersionId}（删除 {pvDeleted} 行，含依赖）");
+                _createdPlanVersionId = 0;
+            }
+
+            if (_createdScheduleRunId > 0)
+            {
+                var runDeleted = await TestRunArtifactCleaner.PurgeScheduleRunAsync(_connectionManager, _createdScheduleRunId);
+                Console.WriteLine($"  - 已回收本测试自建 ScheduleRun: Id={_createdScheduleRunId}（删除 {runDeleted} 行）");
+                _createdScheduleRunId = 0;
+            }
+        }
+        catch (Exception cleanupEx)
+        {
+            Console.WriteLine($"  ⚠ Run 壳回收失败（残留 PlanVersionId={_createdPlanVersionId}／ScheduleRunId={_createdScheduleRunId}）：{cleanupEx.Message}");
+        }
     }
 
     /// <summary>
@@ -301,6 +345,9 @@ public class SyntheticSchedulingIntegrationTest
               VALUES ('FULL_SCHEDULE', 'RUNNING', GETDATE(), 'TEST_SYN', GETDATE(), GETDATE())",
             db: DatabaseId.APS);
 
+        // O36：记下本测试自建的 Run 壳，收尾按此 Id 定点删除（绝不按状态批量删）
+        _createdScheduleRunId = scheduleRunId;
+
         var versionCode = "SYN-PLAN-" + DateTime.Now.ToString("yyyyMMddHHmmss");
         var planVersionId = await _connectionManager.QueryFirstOrDefaultAsync<int>(
             @"INSERT INTO PlanVersion
@@ -310,6 +357,9 @@ public class SyntheticSchedulingIntegrationTest
                 (@VersionCode, 'TEST', @BatchNo, @SourceScheduleRunId, 'SYN-DOMAIN', GETDATE(), DATEADD(DAY, 30, GETDATE()), 'SIMULATION', 'BUILDING', 'TEST_SYN', GETDATE())",
             new { VersionCode = versionCode, BatchNo = TEST_BATCH_NO, SourceScheduleRunId = scheduleRunId },
             db: DatabaseId.APS);
+
+        // O36：本测试自建的 PV 壳，收尾定点删除
+        _createdPlanVersionId = planVersionId;
 
         // ── 三类 MES 快照的 **Run 级成功证据**（2026-10-12 必需，PM `回复1010.md` §四/§五.2 fail-closed）──
         //   合成 PlanVersion **无 Base** ⇒ `SnapshotRunResolver.ResolveCoreAsync` 走「无 Base」分支，

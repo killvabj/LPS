@@ -151,102 +151,216 @@ public sealed class BatchMergeCommitTests
 
     // ══════════════════════════════════════════════════════════════════
     //  C2-04：三 Operation Stage 合批 —— 实物总量只算一份
+    //  按 0号位 2026-11-07 答复 §Q1 的完整清单构造：
+    //   ① targetBatch 必须是**整批 3 道 Operation**（不是逐道调 3 次）
+    //   ② 必须同时填 OperationResourceEligibility（GetEligibleResources 读它）
+    //      与 ResourceCapacityFactors（效率系数），两者资源 ID 要对上
+    //   ③ resourceOccupancy 必须有该 ResourceId 的键且与既有 Task 时间一致
+    //   ④ Graph 要有 OP10→OP20→OP30 依赖
     // ══════════════════════════════════════════════════════════════════
 
+    private static readonly string[] StageOps = { "OP10", "OP20", "OP30" };
+
     private static List<OperationNode> ThreeOps()
-        => new()
+        => StageOps.Select(op => new OperationNode
         {
-            new OperationNode { OperationCode = "OP10", StageCode = Stage, StandardDuration = 1m, RouteCode = "DEFAULT", PathId = 1, ProductionDepartmentId = 1 },
-            new OperationNode { OperationCode = "OP20", StageCode = Stage, StandardDuration = 1m, RouteCode = "DEFAULT", PathId = 1, ProductionDepartmentId = 1 },
-            new OperationNode { OperationCode = "OP30", StageCode = Stage, StandardDuration = 1m, RouteCode = "DEFAULT", PathId = 1, ProductionDepartmentId = 1 },
-        };
+            OperationCode = op,
+            StageCode = Stage,
+            StandardDuration = 1m,          // **分钟/件**（Solver 输入口径），不是秒
+            OperationPlanningMode = "FINITE_RESOURCE",
+            RouteCode = "DEFAULT",
+            PathId = 1,
+            ProductionDepartmentId = 1,
+        }).ToList();
 
     private static RoutingGraph ThreeOpGraph()
     {
         var g = new RoutingGraph();
         foreach (var op in ThreeOps()) g.Operations[OperationNodeKey.Of(Stage, op.OperationCode)] = op;
+
+        // DAG：OP20 依赖 OP10，OP30 依赖 OP20（Dependencies 是「To → 前驱列表」）
+        g.Dependencies[OperationNodeKey.Of(Stage, "OP20")] = new List<DependencyEdge>
+        {
+            new DependencyEdge { From = OperationNodeKey.Of(Stage, "OP10"), To = OperationNodeKey.Of(Stage, "OP20") },
+        };
+        g.Dependencies[OperationNodeKey.Of(Stage, "OP30")] = new List<DependencyEdge>
+        {
+            new DependencyEdge { From = OperationNodeKey.Of(Stage, "OP20"), To = OperationNodeKey.Of(Stage, "OP30") },
+        };
+        g.RootOperations.Add(OperationNodeKey.Of(Stage, "OP10"));
         return g;
     }
 
+    /// <summary>资格表与效率系数**两张都填**（0号位 §Q1 点名：只填 CapacityFactors 会拿到空资格）。</summary>
     private static ConstraintContext ThreeOpConstraints()
     {
         var c = new ConstraintContext();
-        foreach (var op in ThreeOps())
+        foreach (var op in StageOps)
         {
-            c.ResourceCapacityFactors[new EligibilityLookupKey(MaterialId, 1, "DEFAULT", 1, op.OperationCode)]
-                = new Dictionary<int, decimal> { [ResourceId] = 1m };
+            var key = new EligibilityLookupKey(MaterialId, 1, "DEFAULT", 1, op);
+            c.OperationResourceEligibility[key] = new List<int> { ResourceId };   // 资格
+            c.ResourceCapacityFactors[key] = new Dictionary<int, decimal> { [ResourceId] = 1m };  // 效率系数
         }
         c.ResourceCalendars[ResourceId] = new List<TimeWindow> { new TimeWindow(T0, T0.AddHours(48)) };
         return c;
     }
 
-    /// <summary>锚点需求 A 的三道工序既有 Task（同一执行批键）。</summary>
-    private static List<FinalTaskDraft> AnchorBatch(string opCode, decimal qty) => new()
+    /// <summary>既有 Stage 执行批：**三道工序各一条 Task、各 50 件（A30+B20）、共用同一批键**，
+    /// 时间首尾相接（1min/件 × 50 = 50min）。</summary>
+    private static List<FinalTaskDraft> AnchorStageBatch()
     {
-        new FinalTaskDraft
+        var list = new List<FinalTaskDraft>();
+        var cursor = T0;
+        foreach (var op in StageOps)
         {
-            FinalDraftId = "T-A-" + opCode,
-            SourceDraftId = "A",
-            MaterialId = MaterialId,
-            ResourceId = ResourceId,
-            StageCode = Stage,
-            OperationCode = opCode,
-            PlannedStartTime = T0,
-            PlannedEndTime = T0.AddHours(1),
-            Quantity = qty,
-            PlannedProcessQty = qty,
-            ExecutionBatchDraftKey = "EB|A|001",
-        },
-    };
+            list.Add(new FinalTaskDraft
+            {
+                FinalDraftId = "T-A-" + op,
+                SourceDraftId = "A",
+                MaterialId = MaterialId,
+                ResourceId = ResourceId,
+                StageCode = Stage,
+                OperationCode = op,
+                PlannedStartTime = cursor,
+                PlannedEndTime = cursor.AddMinutes(50),
+                SetupTime = 0m,
+                Quantity = 50m,
+                PlannedProcessQty = 50m,
+                ExecutionBatchDraftKey = "EB|A|001",
+            });
+            cursor = cursor.AddMinutes(50);
+        }
+        return list;
+    }
 
-    [Fact(Skip = "夹具未跑通：TryMergeDemandIntoStageBatch 仍返回 null。已排除：targetBatch 空/无批键/缺锚点/detach 缺任务/"
-               + "缺 StartStageCode。下一步：给 ScheduleDemandOperations 加临时探针，看是哪一步零产出（工序依赖链/eligibility 键/日历窗）。",
-          DisplayName = "C2-04 · 三 Operation Stage 合批：每道构成 [A30,B20,C10]，实物总量 60 不是 180")]
-    public void StageMerge_ThreeOperations_CountsPhysicalOnce()
+    [Fact(DisplayName = "C2-04深度回滚 · 前两道试排成功、第三道因日历无槽失败 ⇒ 全状态逐项还原")]
+    public void StageMerge_ThirdOperationFails_RestoresEverything()
     {
         var constraints = ThreeOpConstraints();
-        var occupancy = new Dictionary<int, List<TimeWindow>>();
-        var scheduled = new List<FinalTaskDraft>();
+        // **日历只够前两道**：每道 60 件 × 1min = 60min；总需 180min，只给 130min ⇒ 第三道必然无槽。
+        // 这是**真实资源约束**导致的失败（不是交期前置拒绝），才符合 0号位 §0.4 的「深度回滚」口径。
+        constraints.ResourceCalendars[ResourceId] = new List<TimeWindow>
+        {
+            new TimeWindow(T0, T0.AddMinutes(130)),
+        };
+
+        var targetBatch = AnchorStageBatch();
+        var occupancy = new Dictionary<int, List<TimeWindow>>
+        {
+            [ResourceId] = targetBatch.Select(t => new TimeWindow(t.PlannedStartTime, t.PlannedEndTime)).ToList(),
+        };
+        var scheduled = new List<FinalTaskDraft>(targetBatch);
         var shares = new Dictionary<string, List<(string DemandKey, decimal ShareQty)>>(StringComparer.Ordinal);
+        foreach (var t in targetBatch)
+        {
+            shares[t.FinalDraftId] = new List<(string, decimal)> { ("A", 30m), ("B", 20m) };
+        }
         var demandByKey = new Dictionary<string, LogicalProductionDemand>(StringComparer.Ordinal)
         {
             ["A"] = Demand("A", 30m),
         };
-        var c = Demand("C", 10m);
 
-        // 逐道工序调用：先把 A30 的既有批当作目标批，让 C10 并进去
-        var results = new List<FinalTaskDraft>();
-        foreach (var opCode in new[] { "OP10", "OP20", "OP30" })
+        // ── 进入前完整快照 ──
+        var beforeTaskIds = scheduled.Select(t => t.FinalDraftId).OrderBy(x => x, StringComparer.Ordinal).ToList();
+        var beforeTaskQty = scheduled.ToDictionary(t => t.FinalDraftId, t => t.PlannedProcessQty);
+        var beforeOcc = occupancy[ResourceId].Select(w => (w.Start, w.End)).ToList();
+        var beforeShares = shares.ToDictionary(
+            kv => kv.Key,
+            kv => string.Join(";", kv.Value.Select(x => x.DemandKey + "=" + x.ShareQty)));
+        var timelineBefore = constraints.ProductTimeline;
+
+        var merged = Scheduler.TryMergeDemandIntoStageBatch(
+            Demand("C", 10m), ThreeOps(), ThreeOpGraph(), "FORWARD", targetBatch, constraints,
+            occupancy, scheduled, shares, demandByKey,
+            T0, T0.AddDays(30), T0, new StageOverlapParams(), null,
+            out var combinedTasks);
+
+        // ── ① 失败：返回 null 且零产出 ──
+        Assert.Null(merged);
+        Assert.Empty(combinedTasks);
+
+        // ── ② 任务集合逐项还原 ──
+        Assert.Equal(beforeTaskIds,
+            scheduled.Select(t => t.FinalDraftId).OrderBy(x => x, StringComparer.Ordinal).ToList());
+        foreach (var t in scheduled)
         {
-            var targetBatch = AnchorBatch(opCode, 30m);
-            // detachTaskList 默认 true ⇒ 目标批必须**真的在** scheduledTasks 里，否则摘除失败直接回 null
-            scheduled.AddRange(targetBatch);
-            // 目标批上已有 A30 的份额（B20 略去，先验证「跨 Operation 不重复累加」这条主线）
-            shares[targetBatch[0].FinalDraftId] =
-                new List<(string, decimal)> { ("A", 30m) };
-
-            var merged = Scheduler.TryMergeDemandIntoStageBatch(
-                c, ThreeOps(), ThreeOpGraph(), "FORWARD", targetBatch, constraints,
-                occupancy, scheduled, shares, demandByKey,
-                T0, T0.AddDays(30), T0, new StageOverlapParams(), null,
-                out var combinedTasks);
-
-            Assert.NotNull(merged);
-            results.Add(merged!);
-            Assert.Equal(3, combinedTasks.Count);   // 三道工序各一条
-            _ = opCode;
+            Assert.Equal(beforeTaskQty[t.FinalDraftId], t.PlannedProcessQty);
         }
 
-        // 核心断言：**每道 Operation 的实物量都是 40（A30+C10），不是把三道加起来当 120**
-        Assert.All(results, t => Assert.Equal(40m, t.PlannedProcessQty));
-        Assert.Equal(40m, results.Sum(t => t.PlannedProcessQty) / results.Count);   // 平均仍是 40
+        // ── ③ 占用窗逐项还原 ──
+        Assert.Equal(beforeOcc, occupancy[ResourceId].Select(w => (w.Start, w.End)).ToList());
 
-        // 份额按需求独立闭合：每个 Task 上 Σ份额 ≤ 该 Task 实物量
-        foreach (var t in results)
+        // ── ④ 份额逐项还原（A30+B20 原样，未留 C10 残迹）──
+        Assert.Equal(beforeShares.Count, shares.Count);
+        foreach (var kv in beforeShares)
         {
-            if (!shares.TryGetValue(t.FinalDraftId, out var list)) continue;
-            Assert.True(list.Sum(x => x.ShareQty) <= t.PlannedProcessQty,
-                $"Task {t.FinalDraftId} 份额合计 {list.Sum(x => x.ShareQty)} 超过实物量 {t.PlannedProcessQty}");
+            Assert.True(shares.TryGetValue(kv.Key, out var now), $"份额键 {kv.Key} 丢失");
+            Assert.Equal(kv.Value, string.Join(";", now!.Select(x => x.DemandKey + "=" + x.ShareQty)));
+        }
+
+        // ── ⑤ ProductTimeline 已恢复 ──
+        //   ⚠ **不能用 `Assert.Same`**：失败路径恢复的是**入口处 Clone 出来的那份**
+        //     （`PhaseTwoInitialScheduler.cs:9879` `var timelineBeforeRerun = constraints.ProductTimeline.Clone();`，
+        //      回滚点 `:9896`/`:9922`/`:9943` 都赋它）⇒ 实例必然不同、内容按设计等价。
+        //   `ResourceProductTimeline` 只公开 `FromTasks`/`Clone`，内容无法直接比对
+        //   ⇒ 这里只能断言「回滚后仍是一个非空的时间线」，并且在上面 ①~④ 四项内容级还原都通过的前提下成立。
+        _ = timelineBefore;
+        Assert.NotNull(constraints.ProductTimeline);
+    }
+
+    [Fact(DisplayName = "C2-04 · 三 Operation Stage 合批：A30+B20 已批 + C10 并入 ⇒ 每道 60 件、业务总量 60")]
+    public void StageMerge_ThreeOperations_CountsPhysicalOnce()
+    {
+        var constraints = ThreeOpConstraints();
+        var targetBatch = AnchorStageBatch();
+
+        // 占用窗与既有 Task 一一对应（0号位 §Q1：不能只给 scheduledTasks 而占用账全空）
+        var occupancy = new Dictionary<int, List<TimeWindow>>
+        {
+            [ResourceId] = targetBatch.Select(t => new TimeWindow(t.PlannedStartTime, t.PlannedEndTime)).ToList(),
+        };
+        var scheduled = new List<FinalTaskDraft>(targetBatch);
+
+        // 既有批的规范需求构成：每道 Task 上 A30 + B20
+        var shares = new Dictionary<string, List<(string DemandKey, decimal ShareQty)>>(StringComparer.Ordinal);
+        foreach (var t in targetBatch)
+        {
+            shares[t.FinalDraftId] = new List<(string, decimal)> { ("A", 30m), ("B", 20m) };
+        }
+
+        var demandByKey = new Dictionary<string, LogicalProductionDemand>(StringComparer.Ordinal)
+        {
+            ["A"] = Demand("A", 30m),   // 锚点需求（可被 CloneDemandWithBatchQty 克隆）
+        };
+
+        // **一次调用**把 C10 并入整批（不是逐道调三次）
+        var merged = Scheduler.TryMergeDemandIntoStageBatch(
+            Demand("C", 10m), ThreeOps(), ThreeOpGraph(), "FORWARD", targetBatch, constraints,
+            occupancy, scheduled, shares, demandByKey,
+            T0, T0.AddDays(30), T0, new StageOverlapParams(), null,
+            out var combinedTasks);
+
+        Assert.NotNull(merged);
+        Assert.Equal(3, combinedTasks.Count);   // 三道工序各一条
+
+        // ① 每道 Operation 的**实物量都是 60**（A30+B20+C10），不是把三道相加当 180
+        Assert.All(combinedTasks, t => Assert.Equal(60m, t.PlannedProcessQty));
+
+        // ② 业务总量只算一份：三道的 PlannedProcessQty 之和 ÷ 工序数 = 60，而不是 180
+        //    ⚠ 这里不是「算平均值冒充闭合」—— 因为三道时必须**逐道等于 60** 已由 ① 钉死，
+        //      本行只是把「170/180 这种重复累加」显式挡住。
+        Assert.Equal(3 * 60m, combinedTasks.Sum(t => t.PlannedProcessQty));
+
+        // ③ 按 DemandKey × Operation 逐项验构成（0号位 §3 要求，不用平均值代替）
+        foreach (var t in combinedTasks)
+        {
+            Assert.True(shares.TryGetValue(t.FinalDraftId, out var list), $"Task {t.FinalDraftId} 缺份额构成");
+            var byKey = list!.GroupBy(x => x.DemandKey).ToDictionary(g => g.Key, g => g.Sum(x => x.ShareQty));
+            Assert.Equal(30m, byKey["A"]);
+            Assert.Equal(20m, byKey["B"]);
+            Assert.Equal(10m, byKey["C"]);
+            Assert.Equal(60m, byKey.Values.Sum());          // 构成之和 = 该道实物量
+            Assert.Equal(t.PlannedProcessQty, byKey.Values.Sum());   // 两者必须相等，不得超出
         }
     }
 

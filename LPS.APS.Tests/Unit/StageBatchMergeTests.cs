@@ -2578,4 +2578,71 @@ public class StageBatchMergeTests
         Assert.Contains("含人工槽 140", note.Message);
         Assert.Contains("含人工槽 110", note.Message);
     }
+
+    // ══════════════════════════════════════════════════════════════════
+    //  C2-03（0号位 2026-11-07《未命名的Markdown文件(10)》§三 第二件）
+    //    「先确认合法 Merge 是否真实可达，再验证候选失败后仍可选择合法独立排程。
+    //      必须区分『Merge 不可达』和『Merge 尝试后失败』，不能把二者混成一个成功回退案例。」
+    //
+    //  【本用例的做法】不预设 Merge 一定命中，而是**实测并如实记录**：
+    //    · 命中 ⇒ C 的需求量并入 A 的既有 Task（C 自己不产 Task，A 的 Task 数量 = A+C）
+    //    · 未命中 ⇒ C 走独立排程（C 有自己的 Task）
+    //  两种情况下都必须满足：**净量闭合**（Σ = A + C，不丢不增）、**C 不被判未排**。
+    //  这既给出命中率事实，也不会用「人工删批身份」制造假的合并成功。
+    // ══════════════════════════════════════════════════════════════════
+    [Fact(DisplayName = "C2-03 · 多批Merge真实入口：先测可达性，再验失败后独立排程与净量闭合")]
+    public async Task C2_03_MergeReachability_And_IndependentFallback()
+    {
+        var paths = new[]
+        {
+            ThreeOpPath("R1", 1, r1: 1, r2: 1, r3: 1, minutesPerUnit: 1m),
+        };
+        var demands = new[]
+        {
+            new DemandSpec("A", 1, 30m, null),
+            new DemandSpec("C", 2, 10m, null),
+        };
+        var calendar = new[]
+        {
+            (ResourceId: 1, Start: new DateTime(2026, 11, 10, 8, 0, 0), End: new DateTime(2026, 11, 20, 20, 0, 0)),
+        };
+
+        var request = Build(paths, demands, calendar, allowMerge: true, allowSplit: false);
+        var result = await new FiniteCapacitySolver().SolveAsync(request);
+
+        Assert.True(result.Success, result.ErrorMessage);
+
+        var aTasks = result.FinalTasks.Where(t => t.SourceDraftId == "A").ToList();
+        var cTasks = result.FinalTasks.Where(t => t.SourceDraftId == "C").ToList();
+
+        // ── 净量闭合：**按实物算，不按工序件次**（0号位 §3 原话）──
+        //   三工序路径 ⇒ 每个执行批在每道工序各一条 Task，数量相同。
+        //   `Sum(PlannedProcessQty)` 会把同一批加 3 遍（30+10 会变成 120 件次），**不能当实物量**。
+        //   ⇒ 先按「各道工序数量应一致」钉死，再取其一作为该需求的实物量。
+        static decimal PhysicalQty(List<FinalTaskDraft> tasks)
+        {
+            if (tasks.Count == 0) return 0m;
+            var distinct = tasks.Select(t => t.PlannedProcessQty).Distinct().ToList();
+            Assert.Single(distinct);   // 三道工序数量必须一致，否则「实物只算一份」的前提不成立
+            return distinct[0];
+        }
+
+        var aQty = PhysicalQty(aTasks);
+        var cQty = PhysicalQty(cTasks);
+        Assert.Equal(40m, aQty + cQty);
+
+        // ── 实测分支（2026-11-07 最小场景）：**Merge 0 命中**，C 走独立排程 ──
+        //   探针读数：`A任务=3 量=30/30/30 | C任务=3 量=10/10/10 | 未排=空`
+        //   这与 0号位 §Q3 的预判一致：现行单值 `ExecutionBatchDraftKey` 下多批/合批
+        //   存在结构性不可达。**本用例只登记事实，不制造空批键去凑合并成功。**
+        //   ⚠ 若将来 Merge 变为可达，下面三条会红 —— 那是**应当复查**的信号，不是回归。
+        Assert.Equal(3, cTasks.Count);   // C 三道工序各一条独立 Task
+        Assert.Equal(30m, aQty);
+        Assert.Equal(10m, cQty);
+
+        // ── 需求不得因 Merge 逻辑被判未排 ──
+        //    `UnscheduledTaskResult.DraftId` 的值域是 **LogicalDemandKey**（见 DomainSolveResult.cs:218 注释）
+        Assert.DoesNotContain(result.UnscheduledTasks, u => u.DraftId == "C");
+    }
+
 }
