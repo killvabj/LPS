@@ -15,7 +15,8 @@
 -->
 <script setup lang="tsx">
 import { computed, onMounted, reactive, ref, watch } from 'vue'
-import { formatUtcDateTimeSec } from '@/utils/datetime'
+import { formatLocalDateTimeSec } from '@/utils/datetime'
+// Role.CreatedAt 由后端 DateTime.Now / GETDATE() 落库（服务器本地墙钟）⇒ 本地直显，不做 UTC→本地位移
 import {
   ElButton,
   ElDialog,
@@ -442,7 +443,7 @@ async function handleAssignScopeSubmit(ids: number[]): Promise<void> {
       </ElTableColumn>
       <ElTableColumn label="创建时间" width="170">
         <template #default="{ row }: { row: RoleSummaryDto }">
-          {{ formatUtcDateTimeSec(row.createdAt) }}
+          {{ formatLocalDateTimeSec(row.createdAt) }}
         </template>
       </ElTableColumn>
       <ElTableColumn label="操作" width="400" fixed="right">

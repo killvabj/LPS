@@ -59,3 +59,8 @@ export function formatLocalDateTimeSec(s: string | null | undefined): string {
 export function formatLocalDate(s: string | null | undefined): string {
   return s ? dayjs(s).format('YYYY-MM-DD') : '—'
 }
+
+/** 治理域月日时分（窄位展示，如批次下拉） */
+export function formatLocalMonthDayHM(s: string | null | undefined): string {
+  return s ? dayjs(s).format('MM-DD HH:mm') : '—'
+}

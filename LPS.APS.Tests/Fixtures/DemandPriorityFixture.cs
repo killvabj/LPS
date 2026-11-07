@@ -10,8 +10,15 @@ namespace LPS.APS.Tests.Fixtures;
 public static class DemandPriorityFixture
 {
     /// <summary>
-    /// 标准三层优先级策略：紧急延迟 > VIP客户 > 标准订单
+    /// 标准三层优先级策略：销售订单 > VIP客户 > 生产指示（示例）
     /// </summary>
+    /// <remarks>
+    /// 2026-11-07 0号位 裁决：DelayStatus / DemandMaturityStatus 归【参数集】（需求保护），不入规则集。
+    /// 原夹具段1「紧急延迟订单」以 DelayStatus 命中 —— 现已归 `ProtectDelayed`，规则集不再承载（投影器
+    /// fail-closed）。此处改段1 用规则集合法字段 OrderType=SALES_ORDER 命中，保留「可发布示例」语义：
+    /// 本夹具必须过得过 <c>DemandPriorityValidator</c>，否则集成测试验的是一份永远发不出去的配置。
+    /// 排序字段均用 <c>DueDate</c>（`RemainingTimeHours` 已于 2026-10-20 剔除白名单，运行侧不认）。
+    /// </remarks>
     public static FrozenStrategySnapshot GetStandardPrioritySnapshot()
     {
         return new FrozenStrategySnapshot
@@ -27,15 +34,15 @@ public static class DemandPriorityFixture
                     new PrioritySegment
                     {
                         SegmentOrder = 1,
-                        SegmentName = "紧急延迟订单",
+                        SegmentName = "销售订单",
                         IsEnabled = true,
                         MatchConditions = new List<SegmentMatchCondition>
                         {
-                            new SegmentMatchCondition { Field = DemandField.DelayStatus, Operator = ConditionOperator.Equals, Value = "DELAYED" }
+                            new SegmentMatchCondition { Field = DemandField.OrderType, Operator = ConditionOperator.Equals, Value = "SALES_ORDER" }
                         },
                         SortFields = new List<SegmentSortField>
                         {
-                            new SegmentSortField { Field = DemandField.RemainingTimeHours, Direction = SortDirection.Asc }
+                            new SegmentSortField { Field = DemandField.DueDate, Direction = SortDirection.Asc }
                         },
                         StableTieBreakFields = new List<TieBreakField> { TieBreakField.DEMANDKEY }
                     },
@@ -50,7 +57,7 @@ public static class DemandPriorityFixture
                         },
                         SortFields = new List<SegmentSortField>
                         {
-                            new SegmentSortField { Field = DemandField.RemainingTimeHours, Direction = SortDirection.Asc }
+                            new SegmentSortField { Field = DemandField.DueDate, Direction = SortDirection.Asc }
                         }
                     }
                 }

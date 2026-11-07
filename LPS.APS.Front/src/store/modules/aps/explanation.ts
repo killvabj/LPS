@@ -28,7 +28,9 @@ import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
 import {
   ApiError,
+  EXPLANATION_FACT_LOAD_MAX,
   EXPLANATION_OBJECT_TYPES,
+  EXPLANATION_FACT_PAGE_SIZE,
   explanationApi,
   type BusinessFactIssue,
   type ExplanationObjectType,
@@ -57,6 +59,8 @@ export const useExplanationStore = defineStore('aps.explanation', () => {
   const businessFactIssuesPageSize = ref<number>(20)
   /** 业务事实问题加载态（与 loading 分离，独立 spinner） */
   const businessFactIssuesLoading = ref<boolean>(false)
+  /** 排程解释事实「继续加载」进行中（2026-11-05） */
+  const factsLoading = ref<boolean>(false)
   /** 缓存标记：false = 首次或已 invalidate → load() 触发首查；true = 命中缓存 → 不重查 */
   const businessFactIssuesCached = ref<boolean>(false)
 
@@ -75,8 +79,25 @@ export const useExplanationStore = defineStore('aps.explanation', () => {
     }
   })
 
-  /** 排程解释事实总数（来自 data.scheduleExplanationFacts.length） */
-  const totalFacts = computed(() => data.value?.scheduleExplanationFacts?.length ?? 0)
+  /**
+   * 排程解释事实**权威总数**（后端 Summary 端点 `totalCount`）。
+   *
+   * 2026-11-05 修：此前这里取 `scheduleExplanationFacts.length`（**已加载条数**），
+   *   而页面 KPI 百分比用它当分母、分子却是 Summary 的全量计数 ⇒ dev 上出现
+   *   「错误 538% / 警告 516%」（分母 50 条已加载，分子 269/258）。
+   * 现在分母改用后端总数（`totalCount`），已加载条数另由 `loadedFactsCount` 提供。
+   */
+  const totalFacts = computed(() => data.value?.totalCount ?? 0)
+
+  /** 已加载到本地的排程解释事实条数（可能小于 `totalFacts`，大版本会被上限截住） */
+  const loadedFactsCount = computed(() => data.value?.scheduleExplanationFacts?.length ?? 0)
+
+  /** 还有没有更多可加载（未取满总数，且未达累计加载上限） */
+  const factsHasMore = computed(
+    () =>
+      loadedFactsCount.value < totalFacts.value &&
+      loadedFactsCount.value < EXPLANATION_FACT_LOAD_MAX
+  )
 
   /**
    * 按根因 objectType 分组的解释事实（5 码：v5.1.10 :4858）
@@ -198,6 +219,32 @@ export const useExplanationStore = defineStore('aps.explanation', () => {
   }
 
   /**
+   * 继续加载排程解释事实（2026-11-05）
+   *  - 后端列表端点单页上限 500 ⇒ 每次追加一页（skip = 已加载条数）
+   *  - 累计上限 `EXPLANATION_FACT_LOAD_MAX`：dev 最大版本有 37 万条，不能无限加
+   *  - 追加的是**同一批数据的下一页**（后端 ORDER BY severity/impactHours/Id 稳定 ⇒ 分页不重不漏）
+   */
+  async function loadMoreFacts(): Promise<void> {
+    if (factsLoading.value) return
+    if (!factsHasMore.value) return
+    factsLoading.value = true
+    try {
+      const batch = await explanationApi.listFactsPage(
+        planVersionId.value,
+        loadedFactsCount.value,
+        EXPLANATION_FACT_PAGE_SIZE
+      )
+      if (batch.length && data.value) {
+        data.value.scheduleExplanationFacts = [...data.value.scheduleExplanationFacts, ...batch]
+      }
+    } catch (err) {
+      handleError(err)
+    } finally {
+      factsLoading.value = false
+    }
+  }
+
+  /**
    * 显式刷新（用户点顶部"刷新"按钮）
    *  - 重置到第一页；保持当前 pageSize 不变
    *  - 失败时缓存标记回退到 false（下一次 load 会重拉）
@@ -260,6 +307,9 @@ export const useExplanationStore = defineStore('aps.explanation', () => {
     error,
     severityCounts,
     totalFacts,
+    loadedFactsCount,
+    factsHasMore,
+    factsLoading,
     factsByObjectType,
     unrecognizedObjectTypeFacts,
     unrecognizedRawObjectTypes,
@@ -271,6 +321,7 @@ export const useExplanationStore = defineStore('aps.explanation', () => {
     businessFactIssuesCached,
     sortedBusinessFactIssues,
     load,
+    loadMoreFacts,
     fetchBizPage,
     refreshBizIssues,
     changeBizPageSize,

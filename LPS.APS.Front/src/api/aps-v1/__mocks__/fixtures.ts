@@ -38,8 +38,8 @@ const hourOffset = (hours: number) => {
 const RESOURCES: GanttResourceDto[] = [
   {
     resourceId: 1,
-    resourceCode: 'MC01',
-    resourceName: '注塑机-01',
+    resourceCode: 'M-000',
+    resourceName: '设备_0',
     domainKey: 'FAMILY_INJECTION',
     factoryId: 1,
     factoryName: '苏州厂',
@@ -58,8 +58,8 @@ const RESOURCES: GanttResourceDto[] = [
   },
   {
     resourceId: 2,
-    resourceCode: 'MC02',
-    resourceName: '注塑机-02',
+    resourceCode: 'M-001',
+    resourceName: '设备_1',
     domainKey: 'FAMILY_INJECTION',
     factoryId: 1,
     factoryName: '苏州厂',
@@ -69,8 +69,8 @@ const RESOURCES: GanttResourceDto[] = [
   },
   {
     resourceId: 3,
-    resourceCode: 'ASM01',
-    resourceName: '装配线-01',
+    resourceCode: 'M-002',
+    resourceName: '设备_2',
     domainKey: 'FAMILY_ASSEMBLY',
     factoryId: 1,
     factoryName: '苏州厂',
@@ -80,8 +80,8 @@ const RESOURCES: GanttResourceDto[] = [
   },
   {
     resourceId: 4,
-    resourceCode: 'ASM02',
-    resourceName: '装配线-02',
+    resourceCode: 'M-003',
+    resourceName: '设备_3',
     domainKey: 'FAMILY_ASSEMBLY',
     factoryId: 1,
     factoryName: '苏州厂',
@@ -91,8 +91,8 @@ const RESOURCES: GanttResourceDto[] = [
   },
   {
     resourceId: 5,
-    resourceCode: 'TST01',
-    resourceName: '测试台-01',
+    resourceCode: 'M-004',
+    resourceName: '设备_4',
     domainKey: 'FAMILY_TEST',
     factoryId: 1,
     factoryName: '苏州厂',
@@ -102,8 +102,8 @@ const RESOURCES: GanttResourceDto[] = [
   },
   {
     resourceId: 6,
-    resourceCode: 'MC03',
-    resourceName: '注塑机-03',
+    resourceCode: 'M-005',
+    resourceName: '设备_5',
     domainKey: 'FAMILY_INJECTION',
     factoryId: 2,
     factoryName: '成都厂',
@@ -113,8 +113,8 @@ const RESOURCES: GanttResourceDto[] = [
   },
   {
     resourceId: 7,
-    resourceCode: 'ASM03',
-    resourceName: '装配线-03',
+    resourceCode: 'M-006',
+    resourceName: '设备_6',
     domainKey: 'FAMILY_ASSEMBLY',
     factoryId: 2,
     factoryName: '成都厂',
@@ -124,8 +124,8 @@ const RESOURCES: GanttResourceDto[] = [
   },
   {
     resourceId: 8,
-    resourceCode: 'TST02',
-    resourceName: '测试台-02',
+    resourceCode: 'M-007',
+    resourceName: '设备_7',
     domainKey: 'FAMILY_TEST',
     factoryId: 1,
     factoryName: '苏州厂',
@@ -140,45 +140,28 @@ const pickStatus = (seed: number): TaskStatus => TASK_STATUSES[seed % TASK_STATU
 
 const TASKS: GanttTaskDto[] = (() => {
   const list: GanttTaskDto[] = []
+  // 物料列短名（对齐主流排产系统左表：物料只放一个短名，长描述进 materialName 走悬浮）
   const orders = [
-    {
-      orderNo: 'ORD-2026-0001',
-      material: '电机壳体-A / 铝合金ADC12 / 6.5kg / 静电喷涂黑',
-      orderId: 101
-    },
-    {
-      orderNo: 'ORD-2026-0002',
-      material: '机柜上盖-B / 镀锌钢板1.2mm / 600×400mm / 折弯成型',
-      orderId: 102
-    },
-    {
-      orderNo: 'ORD-2026-0003',
-      material: '控制箱-C / 钢结构壳体 / 0.8mm冷板 / 喷塑RAL7035',
-      orderId: 103
-    },
-    {
-      orderNo: 'ORD-2026-0004',
-      material: '标准泵-D / 铸铁HT200 / DN80 / 法兰连接',
-      orderId: 104
-    },
-    {
-      orderNo: 'ORD-2026-0005',
-      material: '包装套件-E / 蜂窝纸板+PE膜 / 850×600×400 / VCI防锈',
-      orderId: 105
-    },
-    {
-      orderNo: 'ORD-2026-0006',
-      material: '机架焊接件-F / Q235B型材 / 1200×800×1800 / 二保焊',
-      orderId: 106
-    }
+    { orderNo: 'SO240301-021', materialCode: '包装套件', material: '包装套件', orderId: 101 },
+    { orderNo: 'SO240302-007', materialCode: '塑料齿轮', material: '塑料齿轮', orderId: 102 },
+    { orderNo: 'SO240302-008', materialCode: '金属支架', material: '金属支架', orderId: 103 },
+    { orderNo: 'SO240302-012', materialCode: '机架焊接件', material: '机架焊接件', orderId: 104 },
+    { orderNo: 'SO240303-013', materialCode: '电机壳体', material: '电机壳体', orderId: 105 },
+    { orderNo: 'SO240301-009', materialCode: '机柜上盖', material: '机柜上盖', orderId: 106 },
+    { orderNo: 'SO240303-014', materialCode: '控制箱', material: '控制箱', orderId: 107 },
+    { orderNo: 'SO240303-015', materialCode: '标准泵', material: '标准泵', orderId: 108 }
   ]
+  // 工序：接口只有 operationCode（无名称字段）⇒ mock 直接把中文工序名当代码，
+  //   这样甘特条/左表「工序 | 订单号」读起来就是 焊接 | SO240301-021。
   const operations = [
-    { code: 'OP10', seq: 10, name: '切割下料' },
-    { code: 'OP20', seq: 20, name: '焊接成型' },
-    { code: 'OP30', seq: 30, name: '表面处理' },
-    { code: 'OP40', seq: 40, name: '总装调试' },
-    { code: 'OP50', seq: 50, name: '出厂测试' }
+    { code: '切割', seq: 10, name: '切割' },
+    { code: '焊接', seq: 20, name: '焊接' },
+    { code: '喷涂', seq: 30, name: '喷涂' },
+    { code: '总装', seq: 40, name: '总装' },
+    { code: '测试', seq: 50, name: '测试' }
   ]
+  // 批次码（截图里形如 LOT-G6 / LOT-U20；i ≥ 批次数量时补 A/B 后缀保证任务号唯一）
+  const lotCodes = ['G6', 'U20', 'M12', 'N13', 'L14', 'J11', 'T15', 'K10', 'H8', 'V21']
   let taskId = 1000
   for (let i = 0; i < 60; i++) {
     const order = orders[i % orders.length]
@@ -191,24 +174,22 @@ const TASKS: GanttTaskDto[] = (() => {
     //    7 天视图看着很空；铺开到 6~22 点后条形能填满各天列。
     const startHour = 6 + (i % 9) * 2
     const plannedStart = dayOffset(startDays, startHour)
-    // 时长多样化：8h ~ 36h，按 i 分段（OP10 切割 8-12h / OP20 焊接 12-24h / OP30 喷涂 8-16h
-    //   / OP40 总装 12-22h / OP50 测试 8-12h；少量跨日 28-36h）
-    //  - 2026-10-27 演示调整：下限由 4h 提到 8h。7 天视图中一天列宽 152px，
-    //    4h 的条只有 25px（几乎点不到），8h 起条宽 51px 起，条形才读得出来。
+    // 时长 44~72h（约 2~3 天）：mock 是演示数据，条太短时「工序 | 订单号」写不全、
+    //   视觉上也散 —— 2026-11-05 用户两次要求加长，按当前 7 天窗口取 2~3 天。
     const opDurations: Record<string, number[]> = {
-      OP10: [8, 10, 12, 8, 10],
-      OP20: [12, 16, 20, 24, 12],
-      OP30: [8, 12, 14, 16, 10],
-      OP40: [14, 18, 22, 16, 12],
-      OP50: [8, 10, 12, 10, 8]
+      切割: [44, 48, 56, 44, 64],
+      焊接: [56, 72, 48, 64, 72],
+      喷涂: [44, 56, 48, 64, 48],
+      总装: [64, 56, 72, 64, 60],
+      测试: [44, 48, 56, 44, 64]
     }
-    const opDur = opDurations[op.code] ?? [8, 10, 12]
-    let durationH = opDur[i % opDur.length]
-    // 偶发跨日长 Task（i%11===2 → 28-36h，跨 2-3 天；让甘特条更长更好看）
-    if (i % 11 === 2) durationH = 28 + (i % 3) * 4 // 28/32/36
+    const opDur = opDurations[op.code] ?? [20, 28, 36]
+    const durationH = opDur[i % opDur.length]
     const plannedEndHours = startHour + durationH
     const plannedEnd = dayOffset(startDays + Math.floor(plannedEndHours / 24), plannedEndHours % 24)
-    const isDelayed = i % 7 === 0 // 与下方根因类型选择器 i % 5 解耦，确保 5 类根因都能展开
+    // 已完成的任务不标延期（一根条上同时出现「✓ 和 +Nh」会自相矛盾）
+    const isDelayed = status !== 'COMPLETED' && i % 7 === 0 // 与下方根因类型选择器 i % 5 解耦，确保 5 类根因都能展开
+    const delayHours = isDelayed ? 1 + (i % 5) : undefined
 
     // U05：净需求 + 计划加工（含良率补偿）
     const netQty = 50 + i * 3
@@ -236,77 +217,20 @@ const TASKS: GanttTaskDto[] = (() => {
       ]
     }
 
-    // U14：每 13 条任务中挑 1 条做跨 Domain 阻挡（资源被外 Domain 占用）
-    const crossDomainBlocked = i % 13 === 5
-    const crossDomainBlockReason = crossDomainBlocked
-      ? `外 Domain 共享设备 ${resource.resourceCode} 被 ${resource.domainKey === 'FAMILY_TEST' ? 'FAMILY_INJECTION' : 'FAMILY_TEST'} 域占用至 ${dayOffset(startDays + 2, 18).slice(0, 10)}`
-      : undefined
-
-    // U06：每 17 条任务中挑 1 条做数量-时间拆分（产能不足导致）
-    let taskSegments: GanttTaskDto['taskSegments']
-    if (i % 17 === 4) {
-      const seg1Qty = Math.ceil(plannedProcessQty * 0.6)
-      const seg2Qty = plannedProcessQty - seg1Qty
-      const seg1Start = plannedStart
-      // 段 1 占用 60% 时长（向上取整），段 2 补剩余 40%
-      const seg1Hours = Math.ceil(durationH * 0.6)
-      const seg1End = dayOffset(
-        startDays + Math.floor((startHour + seg1Hours) / 24),
-        (startHour + seg1Hours) % 24
-      )
-      const seg2Start = seg1End
-      const seg2End = plannedEnd
-      taskSegments = [
-        {
-          segmentSeq: 1,
-          startTime: seg1Start,
-          endTime: seg1End,
-          qty: seg1Qty,
-          qtyRatio: seg1Qty / plannedProcessQty,
-          reason: 'MC01 主产能段'
-        },
-        {
-          segmentSeq: 2,
-          startTime: seg2Start,
-          endTime: seg2End,
-          qty: seg2Qty,
-          qtyRatio: seg2Qty / plannedProcessQty,
-          reason: '次日加班段补齐'
-        }
-      ]
-    }
-
-    // Section 二.2：FactType（默认 RESULT；部分任务带其它 4 类）
-    let factType: GanttTaskDto['factType']
-    if (crossDomainBlocked) {
-      factType = 'FACT' // 资源被外 Domain 占用是当下事实
-    } else if (i % 19 === 7) {
-      factType = 'ESTIMATED' // 占位未承诺供应
-    } else if (i % 23 === 11 && isDelayed) {
-      factType = 'RECOMMENDATION' // 建议发起重排
-    } else {
-      factType = 'RESULT'
-    }
+    // 注：U06「数量-时间拆分」、Section 二.2「FactType」、Section 十一「上游 Stage 阻挡」、
+    //   U14「跨 Domain 共享设备阻挡」四处 mock 造数已随展示位一并撤除
+    //   （5号位 2026-11-05 B6/B7/B8「不做、撤」+ B4「不做」）——
+    //   mock 必须与真实契约同形（这四项真实后端永久缺键），否则离线 mock 会造出线上不存在的数据。
 
     // Section 十一：根因（4号位文档第 11 节硬约束：必须优先展示根因，不能只丢 DUE_DATE_RISK）
     // 文档第 11 节原文示例：采购料9月3日才可用、MC01无产能、上游Stage完成晚、Firm任务占关键窗口
     const delayReasons: NonNullable<GanttTaskDto['delayReasons']> = []
-    let upstreamStageBlocked: boolean | undefined
-    let upstreamStageCode: string | undefined
-    if (crossDomainBlocked) {
-      delayReasons.push({
-        reasonCode: 'CROSS_DOMAIN_VERSION_MISMATCH_RISK',
-        issueCategory: 'SCHEDULING_ISSUE',
-        severity: 'ERROR',
-        description: '外 Domain 共享设备占用，本 Domain 任务无法按时开工',
-        relatedObjectRef: resource.resourceCode,
-        impactHours: 8
-      })
-    }
     if (isDelayed) {
       if (i % 5 === 0) {
         delayReasons.push({
           reasonCode: 'RESOURCE_CAPACITY_WAIT',
+          // mock 与真契约同形：这码在 dev 上就是订单级（5号位 11-05 Q2-a 放宽后实测 4/4 条 objectType=ORDER）
+          objectType: 'ORDER',
           issueCategory: 'SCHEDULING_ISSUE',
           severity: 'WARN',
           description: `设备 ${resource.resourceCode} 产能不足，无法在本时段内完工`,
@@ -316,6 +240,7 @@ const TASKS: GanttTaskDto[] = (() => {
       } else if (i % 5 === 1) {
         delayReasons.push({
           reasonCode: 'MATERIAL_SHORTAGE',
+          objectType: 'TASK',
           issueCategory: 'DATA_ISSUE',
           severity: 'WARN',
           description: `PO-${String(1000 + i).padStart(4, '0')} 物料预计 ${dayOffset(
@@ -328,19 +253,19 @@ const TASKS: GanttTaskDto[] = (() => {
           impactHours: 24
         })
       } else if (i % 5 === 2) {
-        upstreamStageBlocked = true
-        upstreamStageCode = 'STG-AS'
         delayReasons.push({
           reasonCode: 'PRECEDENCE_WAIT',
+          objectType: 'TASK',
           issueCategory: 'SCHEDULING_ISSUE',
           severity: 'WARN',
-          description: `上游 ${upstreamStageCode} 完成晚，预计延误 6h 后才能开始本工序`,
-          relatedObjectRef: upstreamStageCode,
+          description: `上游 STG-AS 完成晚，预计延误 6h 后才能开始本工序`,
+          relatedObjectRef: 'STG-AS',
           impactHours: 6
         })
       } else if (i % 5 === 3) {
         delayReasons.push({
           reasonCode: 'FROZEN_ZONE_LOCK',
+          objectType: 'TASK',
           issueCategory: 'SCHEDULING_ISSUE',
           severity: 'INFO',
           description: '关键窗口已被 Firm/FROZEN 任务占用，本任务只能后置',
@@ -350,6 +275,7 @@ const TASKS: GanttTaskDto[] = (() => {
       } else {
         delayReasons.push({
           reasonCode: 'EQUIPMENT_BREAKDOWN_RISK',
+          objectType: 'TASK',
           issueCategory: 'DATA_ISSUE',
           severity: 'ERROR',
           description: `${resource.resourceCode} 在本时段发生设备故障，预计 ${dayOffset(
@@ -375,10 +301,7 @@ const TASKS: GanttTaskDto[] = (() => {
     } else if (status === 'PLANNED') {
       mesEligible = 'UNKNOWN'
       mesIneligibleReasons.push('未达下发窗口，等待释放判定')
-    } else if (crossDomainBlocked) {
-      mesEligible = 'INELIGIBLE'
-      mesIneligibleReasons.push('外 Domain 共享设备阻挡，未开始加工（U14）')
-    } else if (factType === 'ESTIMATED') {
+    } else if (i % 19 === 7) {
       mesEligible = 'INELIGIBLE'
       mesIneligibleReasons.push('依赖 PLANNING_PURCHASE_PLACEHOLDER，无正式承诺（U18）')
     } else if (i % 9 === 4) {
@@ -391,18 +314,35 @@ const TASKS: GanttTaskDto[] = (() => {
       mesEligible = 'ELIGIBLE'
     }
 
+    // 批次后缀：i 超过批次码数量后补 A/B…，保证 60 条任务号互不重复
+    const lot =
+      lotCodes[i % lotCodes.length] +
+      (i >= lotCodes.length ? String.fromCharCode(65 + Math.floor(i / lotCodes.length)) : '')
+
     list.push({
       taskId: taskId++,
-      taskNo: `T${taskId}`,
+      taskNo: `${op.name}-LOT-${lot}`,
       orderId: order.orderId,
       orderNo: order.orderNo,
       domainKey: resource.domainKey,
       materialId: 200 + (i % orders.length),
-      materialCode: `M-${(i % 9) + 1}`,
+      materialCode: order.materialCode,
       materialName: order.material,
       resourceId: resource.resourceId,
       operationCode: op.code,
       operationSeq: op.seq,
+      // 任务清单信息补全（5号位 2026-11-05 r14043/14044）：部门/阶段取该任务资源的部门，
+      // 生产指示号少数缺键（真实覆盖 2904/2910），人工槽在设备任务上恒缺键（真实 0/2910）。
+      productionDepartmentId: resource.productionDepartmentId,
+      departmentName: resource.productionDepartmentName,
+      stageCode: resource.stage,
+      taskType: 'PRODUCTION',
+      routeCode: 'DEFAULT',
+      pathId: 1,
+      manualSlotId: undefined,
+      mtS_InstructionNo: i % 50 === 0 ? undefined : `PI-${String(240000 + i)}`,
+      stageExecutionBatchKey: `SEB-${String(240000 + i)}`,
+      stageExecutionBatchQty: plannedProcessQty,
       netQty,
       plannedProcessQty,
       quantity: plannedProcessQty,
@@ -411,17 +351,16 @@ const TASKS: GanttTaskDto[] = (() => {
       plannedEndTime: plannedEnd,
       status,
       isDelayed,
+      delayHours,
       lockMarker: i % 7 === 0 ? 'EXECUTION' : i % 11 === 0 ? 'FIRM' : undefined,
       taskShare,
-      crossDomainBlocked: crossDomainBlocked || undefined,
-      crossDomainBlockReason,
-      taskSegments,
-      factType,
+      // MES 工单号 / 下发状态（5号位 2026-11-05 B2①/B2② 契约）：
+      //   已建单且已下发的任务带这两个键；其余任务缺键（=未建单 / 未下发），与真实后端同形。
+      mesWorkOrderNo: i % 5 === 0 ? `WO-${String(700000 + i)}` : undefined,
+      dispatchStatus: i % 5 === 0 ? 'DISPATCHED' : undefined,
       mesEligible,
       mesIneligibleReasons: mesIneligibleReasons.length > 0 ? mesIneligibleReasons : undefined,
-      delayReasons: delayReasons.length > 0 ? delayReasons : undefined,
-      upstreamStageBlocked,
-      upstreamStageCode
+      delayReasons: delayReasons.length > 0 ? delayReasons : undefined
     })
   }
   return list
@@ -436,6 +375,10 @@ export const mockVersions: PlanVersionSummaryDto[] = [
     planHorizonEnd: dayOffset(83),
     status: 'ACTIVE',
     computedAt: hourOffset(-2),
+    // 数据截止 / 触发方式 / 触发来源（5号位 2026-11-05 B10 契约）：无来源 Run 的版本这三项缺键
+    dataCutoffTime: hourOffset(-3),
+    runType: 'FULL_SCHEDULE',
+    triggeredBy: 'mock',
     totalTasks: TASKS.length,
     createdAt: hourOffset(-2)
   },
@@ -447,6 +390,9 @@ export const mockVersions: PlanVersionSummaryDto[] = [
     planHorizonEnd: dayOffset(83),
     status: 'ARCHIVED',
     computedAt: hourOffset(-26),
+    dataCutoffTime: hourOffset(-27),
+    runType: 'FULL_SCHEDULE',
+    triggeredBy: 'mock',
     totalTasks: 58,
     createdAt: hourOffset(-26)
   },
@@ -458,6 +404,9 @@ export const mockVersions: PlanVersionSummaryDto[] = [
     planHorizonEnd: dayOffset(83),
     status: 'CANDIDATE',
     computedAt: hourOffset(-1),
+    dataCutoffTime: hourOffset(-2),
+    runType: 'MANUAL_RESCHEDULE',
+    triggeredBy: 'mock',
     totalTasks: 62,
     createdAt: hourOffset(-1)
   }

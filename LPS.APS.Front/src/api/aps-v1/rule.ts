@@ -37,7 +37,7 @@ import type {
   PublishGovernanceInput,
   ForkDraftResult
 } from './types'
-import { normalizeRuleStatus, pickCurrentPublished } from './types/common'
+import { normalizeRuleStatus, pickLatestPublished } from './types/common'
 import { parsePrioritySegments } from './prioritySegment'
 import type { PublishValidationResultDto } from './types/strategyProfile'
 
@@ -186,8 +186,8 @@ export const ruleApi = {
       // 不外露内部 ID —— 用户看到的应该是「这个规则集没有可用版本」
       throw new Error('该规则集没有可用版本')
     }
-    // 多条 PUBLISHED 并存时取**最新生效**的一条（`find` 会命中已到期的旧版）
-    const published = pickCurrentPublished(versions)
+    // 多条 PUBLISHED 并存时取**最新已发布**的一条（`find` 会命中已到期的旧版）
+    const published = pickLatestPublished(versions)
     const draft = versions.find((v) => normalizeRuleStatus(v.status) === 'DRAFT')
     const history: RuleVersionHistoryDto[] = versions.map((v) => ({
       ruleSetId,
@@ -197,8 +197,9 @@ export const ruleApi = {
       changeReason: v.remarks ?? '',
       publishedAt: v.publishedAt ?? undefined,
       publishedBy: v.publishedBy ?? '',
-      // 「当前生效」只认**唯一一条** PUBLISHED（后端允许多条 PUBLISHED 并存 ⇒ 不能按状态一刀切）
-      isCurrent: !!published && v.id === published.id,
+      // 「最新已发布」只认 Id 最大的那一条 PUBLISHED（后端允许多条 PUBLISHED 并存 ⇒ 不能按状态一刀切）。
+      // ⚠️ 术语：这是「最新已发布」不是「当前有效」（后者按生效期窗口，由 published-version 端点判定）
+      isLatestPublished: !!published && v.id === published.id,
       effectiveFrom: v.effectiveFrom ?? undefined,
       effectiveTo: v.effectiveTo ?? undefined
     }))
@@ -303,26 +304,6 @@ export const ruleApi = {
   },
 
   /**
-   * 删除规则集（DELETE /api/governance/rule-set/{id}）
-   *
-   * ⚠️ 2026-10-25 3号位 R1：端点已落码，**dev 已实测生效**
-   *   （`DELETE /api/governance/rule-set/999999` → 400「规则集不存在：999999」，路由已注册）。
-   *   R1 是冻结口径 Q5「不给删除、一律停用」的例外翻案；0号位 2026-10-26 明示「3-P6 Q5 直接开放」，
-   *   三族删除入口已正式放行上线（3号位《删除端点Q5放行开通_增补回执_v1.1_20261026》）。
-   *
-   * 后端拒绝条件（`RuleSetGovernanceService.DeleteRuleSetAsync:106-132`）：
-   *  - 该族存在任何 PUBLISHED 版本 ⇒ 400「该规则集已发布过，不能删除（请先停用版本）」
-   *  - 任一版本被策略包引用 ⇒ 400「该规则集存在被策略包引用的版本，不能删除」
-   * 成功 ⇒ 200 + `ApiResponse<bool>`（事务内连带删全部 DRAFT 版本 + 主表行，并写审计 Delete）
-   * 权限 aps.rule.edit
-   */
-  async deleteRuleSet(ruleSetId: number): Promise<void> {
-    await apsHttp.delete<boolean>({
-      url: `/api/governance/rule-set/${ruleSetId}`
-    })
-  },
-
-  /**
    * 编辑规则集主表（PUT /api/governance/rule-set/{id}）
    *
    *  - RuleSetCode **必须原样回传**（大小写差异也会被后端判 400「一经创建不可变更」）
@@ -340,6 +321,19 @@ export const ruleApi = {
         isActive: input.isActive
       }
     })
+  },
+
+  /**
+   * 物理删除规则集整族（DELETE /api/governance/rule-set/{id}）
+   *
+   * 最窄口径（2026-10-30 0号位 选路 A 后 3号位 恢复）：**无任何 PUBLISHED 版本**才可删，
+   * 连带删其 DRAFT。含 PUBLISHED ⇒ 400「该规则集已发布过，不能删除（请先停用版本）」；
+   * 被策略包版本引用 ⇒ 400。后端硬删（单事务）并前置写审计，非软删。
+   * **版本级删除 `DELETE /rule-set/version/{id}` 仍不开放**（[NonAction]，dev 实测 405）。
+   * 权限 aps.rule.edit
+   */
+  async deleteRuleSet(ruleSetId: number): Promise<void> {
+    await apsHttp.delete<boolean>({ url: `/api/governance/rule-set/${ruleSetId}` })
   },
 
   /** 新建 RuleSet DRAFT（POST /api/governance/rule-set/version）

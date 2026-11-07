@@ -42,6 +42,9 @@ public sealed class DemandPriorityConfigProvider : IDemandPriorityConfigProvider
         var snapshot = await _frozenStrategySnapshotProvider
             .GetFrozenStrategySnapshotAsync(strategyProfileVersionId, cancellationToken);
 
-        return DemandPriorityProjector.Project(snapshot.DemandPriority);
+        // 传 `FrozenAt`：`CustomerDueDate` 的相对日阈值（配置存整数偏移，如 `20`）在此换算成具体日期。
+        //   依据 3号位 2026-11-06 回执 §三：Run 冻结日 = `FrozenStrategySnapshot.FrozenAt` 的日期部分。
+        //   不传 ⇒ 投影层遇到相对日阈值会显式抛错（fail-closed，不静默退化成字符串比较）。
+        return DemandPriorityProjector.Project(snapshot.DemandPriority, snapshot.FrozenAt);
     }
 }

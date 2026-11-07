@@ -28,24 +28,52 @@ public class DemandPriorityProjectorTests
 
     /// <summary>
     /// 生产默认策略包 StrategyProfileVersion 811 (SP-DEMO-V3.0, IsDefault=1) 冻结的 DemandPriority 子块，
-    /// 实读自 APS_Production 的 RuleSetVersion Id=478 (RS-DEMO-V2) 的 ContentSnapshotJson。
-    /// 注意枚举以**数值**序列化（Field:1=DelayStatus, 3=OrderType, 2=CustomerTier, 6=DueDate, 7=IssueDate；
-    /// Operator:0=Equals；Direction:0=Asc / 1=Desc）。
+    /// 即 RuleSetVersion 478 的 ContentSnapshotJson —— 0号位 20261107 裁决整份替换（6 段 / 3 轮），用户已在 SSMS 执行。
+    /// 段1-6 全不含 DelayStatus / DemandMaturityStatus（归参数集需求保护），OriginalDueDate 已删，
+    /// CustomerSegment ≠INTER_FACTORY 改 IN 补集，CompetitionRound 1/1/1/1/2/3 显式声明。
+    /// 注意枚举仍以**数值**序列化（Field:3=OrderType, 8=CustomerSegment, 9=CustomerDueDate, 10=TransportMode,
+    /// 15=MaterialCode, 13=StockConsumeDay, 7=IssueDate；Operator:0=Equals,6=In,7=Contains,3=LessOrEqual；
+    /// Direction:0=Asc）。
+    ///
+    /// ⚠ 段1 `CUSTOMERDUEDATE` 已升为整数偏移 `20`（换算链已接通：Provider 传 FrozenAt + Projector 换算
+    /// `FrozenAt.Date+20`）。故本组 `Project()` 一律传 <see cref="TestFrozenAt"/>，否则整数偏移遇 null 冻结点
+    /// 会 fail-closed 抛错。构造需求时**避开依赖换算阈值**：段1 命中用 CustomerDueDate=null
+    /// （空串 LTE 换算后日期成立）、段2 用 MaterialCode FINAL* 作主路由，保证路由确定。
     /// </summary>
+    private static readonly DateTime TestFrozenAt = new(2026, 11, 1, 15, 30, 0);
     private const string RealSnapshot811Json = """
     {"Segments":[
-      {"SegmentOrder":1,"SegmentName":"延迟订单","IsEnabled":true,
-       "MatchConditions":[{"Field":1,"Operator":0,"Value":"Delayed"},{"Field":3,"Operator":0,"Value":"SO"}],
-       "SortFields":[{"Field":6,"Direction":0},{"Field":2,"Direction":1},{"Field":7,"Direction":0}],
-       "StableTieBreakFields":["OrderId"]},
-      {"SegmentOrder":2,"SegmentName":"VIP","IsEnabled":true,
-       "MatchConditions":[{"Field":2,"Operator":0,"Value":"VIP"}],
-       "SortFields":[{"Field":6,"Direction":0}],
-       "StableTieBreakFields":["OrderId"]},
-      {"SegmentOrder":3,"SegmentName":"其余","IsEnabled":true,
-       "MatchConditions":[],
-       "SortFields":[{"Field":6,"Direction":0}],
-       "StableTieBreakFields":["OrderId"]}
+      {"SegmentOrder":1,"SegmentName":"顶层-销售订单(需求内)","IsEnabled":true,
+       "MatchConditions":[{"Field":3,"Operator":0,"Value":"SALES_ORDER"},
+                          {"Field":8,"Operator":6,"Value":["JAPAN","DOMESTIC","OVERSEAS","VIETNAM","OTHER"]},
+                          {"Field":9,"Operator":3,"Value":"20"}],
+       "SortFields":[{"Field":9,"Direction":0},{"Field":10,"Direction":0}],
+       "StableTieBreakFields":["DEMANDKEY"],"CompetitionRound":1},
+      {"SegmentOrder":2,"SegmentName":"顶层-生产指示(库存消耗<=0)","IsEnabled":true,
+       "MatchConditions":[{"Field":3,"Operator":0,"Value":"PRODUCTION_INSTRUCTION"},
+                          {"Field":15,"Operator":7,"Value":"FINAL*"},
+                          {"Field":13,"Operator":3,"Value":"0"}],
+       "SortFields":[{"Field":13,"Direction":0},{"Field":7,"Direction":0}],
+       "StableTieBreakFields":["DEMANDKEY"],"CompetitionRound":1},
+      {"SegmentOrder":3,"SegmentName":"顶层-销售订单(需求外,正常)","IsEnabled":true,
+       "MatchConditions":[{"Field":3,"Operator":0,"Value":"SALES_ORDER"},
+                          {"Field":8,"Operator":6,"Value":["JAPAN","DOMESTIC","OVERSEAS","VIETNAM","OTHER"]}],
+       "SortFields":[{"Field":9,"Direction":0},{"Field":10,"Direction":0}],
+       "StableTieBreakFields":["DEMANDKEY"],"CompetitionRound":1},
+      {"SegmentOrder":4,"SegmentName":"顶层-生产指示(FINAL*)","IsEnabled":true,
+       "MatchConditions":[{"Field":3,"Operator":0,"Value":"PRODUCTION_INSTRUCTION"},
+                          {"Field":15,"Operator":7,"Value":"FINAL*"}],
+       "SortFields":[{"Field":13,"Direction":0},{"Field":7,"Direction":0}],
+       "StableTieBreakFields":["DEMANDKEY"],"CompetitionRound":1},
+      {"SegmentOrder":5,"SegmentName":"SH履约-工厂自用销售订单","IsEnabled":true,
+       "MatchConditions":[{"Field":3,"Operator":0,"Value":"SALES_ORDER"},
+                          {"Field":8,"Operator":0,"Value":"INTER_FACTORY"}],
+       "SortFields":[{"Field":9,"Direction":0}],
+       "StableTieBreakFields":["DEMANDKEY"],"CompetitionRound":2},
+      {"SegmentOrder":6,"SegmentName":"第3轮-孤儿与下阶生产指示","IsEnabled":true,
+       "MatchConditions":[{"Field":3,"Operator":0,"Value":"PRODUCTION_INSTRUCTION"}],
+       "SortFields":[{"Field":13,"Direction":0},{"Field":7,"Direction":0}],
+       "StableTieBreakFields":["DEMANDKEY"],"CompetitionRound":3}
     ]}
     """;
 
@@ -55,91 +83,83 @@ public class DemandPriorityProjectorTests
     // ── 真实快照端到端：投影 → 真执行器验收 ──
 
     [Fact]
-    public void 真实811快照_投影后执行器接受_并按段序输出连续DemandSequence()
+    public void 真实478快照_投影后执行器接受_并按段序输出连续DemandSequence()
     {
-        var config = DemandPriorityProjector.Project(ParseRealBlock());
+        var config = DemandPriorityProjector.Project(ParseRealBlock(), TestFrozenAt);
 
         var demands = new List<UpstreamDemand>
         {
-            // 延迟的 SO → 段1
-            new() { DemandKey = "3", DelayStatus = "Delayed", OrderType = "SO", CustomerTier = "C", DueDate = new DateTime(2026, 9, 20) },
-            // VIP → 段2
-            new() { DemandKey = "1", DelayStatus = "OnTrack", OrderType = "SO", CustomerTier = "VIP", DueDate = new DateTime(2026, 9, 15) },
-            // 其余 → 段3
-            new() { DemandKey = "2", DelayStatus = "OnTrack", OrderType = "WO", CustomerTier = "B", DueDate = new DateTime(2026, 9, 10) },
+            // 段1（round1）：销售订单·厂外客户区分·CustomerDueDate=null ⇒ 段1 的 CUSTOMERDUEDATE LTE 占位对空串成立
+            new() { DemandKey = "A", OrderType = "SALES_ORDER", CustomerSegment = "JAPAN", CustomerDueDate = null },
+            // 段2（round1）：生产指示·MaterialCode FINAL*·库存消耗<=0
+            new() { DemandKey = "B", OrderType = "PRODUCTION_INSTRUCTION", MaterialCode = "FINAL-PART-1", StockConsumeDay = 0 },
+            // 段6（round3）：生产指示·非FINAL ⇒ 只落段6
+            new() { DemandKey = "C", OrderType = "PRODUCTION_INSTRUCTION", MaterialCode = "NONFINAL", StockConsumeDay = 5 },
         };
 
         var act = () => _executor.ExecutePrioritySort(demands, config);
-        act.Should().NotThrow("投影结果必须能通过执行器白名单校验（Tie-break 名漂移会在这里炸）");
+        act.Should().NotThrow("投影结果必须能通过执行器白名单校验（新增 V1.1 字段名漂移会在这里炸）");
 
         var sorted = _executor.ExecutePrioritySort(demands, config);
-        sorted.Select(d => d.DemandKey).Should().Equal(new[] { "3", "1", "2" }, because: "段序优先：段1 → 段2 → 段3");
+        sorted.Select(d => d.DemandKey).Should().Equal(new[] { "A", "B", "C" }, because: "段序优先：段1 → 段2 → 段6");
         sorted.Select(d => d.DemandSequence).Should().Equal(1, 2, 3);
     }
 
     [Fact]
-    public void 真实811快照_未声明轮次_每段轮次恒为1_防静默退化()
+    public void 真实478快照_六段三轮_轮次逐段透传_防静默退化()
     {
-        var config = DemandPriorityProjector.Project(ParseRealBlock());
+        var config = DemandPriorityProjector.Project(ParseRealBlock(), TestFrozenAt);
 
         config.Segments.Should().NotBeEmpty();
-        config.Segments.Should().OnlyContain(s => s.CompetitionRound == DemandPriorityProjector.DefaultCompetitionRound,
-            "投影成 0 会让 PeggingOrchestrator 按轮次取段时取到空集，"
-            + "全体 Demand 静默退化为 DemandKey ASC 兜底 —— 冻结策略形同未生效，且没有任何报错");
+        config.Segments.Select(s => s.CompetitionRound).Should().Equal(new[] { 1, 1, 1, 1, 2, 3 },
+            "478 整份替换后六段显式声明轮次（情形三），投影须逐段透传；若被压平回第 1 轮，"
+            + "第 2/3 轮段会在 PeggingOrchestrator 按轮次取段时被取错，排序错而无声（防空转防静默退化）");
     }
 
     [Fact]
-    public void 真实811快照_TieBreak_OrderId换算为DEMANDKEY()
+    public void 真实478快照_各段TieBreak恒为DEMANDKEY()
     {
-        var config = DemandPriorityProjector.Project(ParseRealBlock());
+        var config = DemandPriorityProjector.Project(ParseRealBlock(), TestFrozenAt);
 
         config.Segments.Should().OnlyContain(s =>
-            s.StableTieBreakFields.Count == 1 && s.StableTieBreakFields[0] == "DEMANDKEY");
+            s.StableTieBreakFields.Count == 1 && s.StableTieBreakFields[0] == "DEMANDKEY",
+            "478 整份替换后 Tie-break 已是强类型成员名 DEMANDKEY（反序列化即归一）；投影后必须是执行器白名单词 DEMANDKEY");
     }
 
     [Fact]
-    public void 真实811快照_字段与方向逐值映射正确()
+    public void 真实478快照_新增V1_1字段与方向逐值映射正确()
     {
-        var config = DemandPriorityProjector.Project(ParseRealBlock());
+        var config = DemandPriorityProjector.Project(ParseRealBlock(), TestFrozenAt);
 
-        var seg1 = config.Segments.Single(s => s.SegmentOrder == 1);
-        seg1.MatchConditions.Should().HaveCount(2);
-        seg1.MatchConditions[0].FieldName.Should().Be("DELAYSTATUS");
-        seg1.MatchConditions[0].Operator.Should().Be("EQ");
-        seg1.MatchConditions[0].Value.Should().Be("Delayed");
-        seg1.MatchConditions[1].FieldName.Should().Be("ORDERTYPE");
-        seg1.MatchConditions[1].Value.Should().Be("SO");
+        // 段5：OrderType + CustomerSegment(INTER_FACTORY) 命中，CustomerDueDate ASC 排序
+        var seg5 = config.Segments.Single(s => s.SegmentOrder == 5);
+        seg5.MatchConditions.Should().HaveCount(2);
+        seg5.MatchConditions[0].FieldName.Should().Be("ORDERTYPE");
+        seg5.MatchConditions[0].Value.Should().Be("SALES_ORDER");
+        seg5.MatchConditions[1].FieldName.Should().Be("CUSTOMERSEGMENT");
+        seg5.MatchConditions[1].Operator.Should().Be("EQ");
+        seg5.MatchConditions[1].Value.Should().Be("INTER_FACTORY");
+        seg5.SortFields.Select(f => (f.FieldName, f.Direction))
+            .Should().Equal(("CUSTOMERDUEDATE", "ASC"));
 
-        seg1.SortFields.Select(f => (f.FieldName, f.Direction))
-            .Should().Equal(("DUEDATE", "ASC"), ("CUSTOMERTIER", "DESC"), ("ISSUEDATE", "ASC"));
+        // 段2：生产指示 + MaterialCode CONTAINS + StockConsumeDay LTE；Sort StockConsumeDay/IssueDate ASC
+        var seg2 = config.Segments.Single(s => s.SegmentOrder == 2);
+        seg2.MatchConditions.Should().HaveCount(3);
+        seg2.MatchConditions[0].FieldName.Should().Be("ORDERTYPE");
+        seg2.MatchConditions[1].FieldName.Should().Be("MATERIALCODE");
+        seg2.MatchConditions[1].Operator.Should().Be("CONTAINS");
+        seg2.MatchConditions[2].FieldName.Should().Be("STOCKCONSUMEDAY");
+        seg2.SortFields.Select(f => (f.FieldName, f.Direction))
+            .Should().Equal(("STOCKCONSUMEDAY", "ASC"), ("ISSUEDATE", "ASC"));
 
-        // 空 MatchConditions = 无条件命中（兜底段）
-        config.Segments.Single(s => s.SegmentOrder == 3).MatchConditions.Should().BeEmpty();
+        // 防空转锚：0号位 裁决 DelayStatus/DemandMaturityStatus 归参数集 ⇒ 整块投影后不得再出现这两字段
+        var allFields = config.Segments
+            .SelectMany(s => s.MatchConditions.Select(m => m.FieldName).Concat(s.SortFields.Select(f => f.FieldName)));
+        allFields.Should().NotContain("DELAYSTATUS", "0号位 裁决：规则集不得再承载 DelayStatus（归参数集需求保护）");
+        allFields.Should().NotContain("DEMANDMATURITYSTATUS");
     }
 
-    // ── 生产数据事实：段1 空转（不是投影的错，是事实源缺列）──
-
-    [Fact]
-    public void 生产口径DelayStatus恒null_Segment1永不命中_冻结意图空转()
-    {
-        var config = DemandPriorityProjector.Project(ParseRealBlock());
-
-        // BuildDemandSequenceMapAsync 逐字注释：「DelayStatus / ProtectionStatus：Order 表暂无对应列，保持 null（不造假），
-        // 待5号位事实标准化后接入」⇒ 生产跑批时 DelayStatus 恒为 null。
-        var demands = new List<UpstreamDemand>
-        {
-            new() { DemandKey = "late", DelayStatus = null, OrderType = "SO", CustomerTier = "C", DueDate = new DateTime(2026, 9, 20) },
-            new() { DemandKey = "early", DelayStatus = null, OrderType = "SO", CustomerTier = "C", DueDate = new DateTime(2026, 9, 10) },
-        };
-
-        var sorted = _executor.ExecutePrioritySort(demands, config);
-
-        // 段1 条件含 DelayStatus='Delayed'，恒 null ⇒ 永不命中；两条都落到段3，纯按 DueDate ASC
-        sorted.Select(d => d.DemandKey).Should().Equal(new[] { "early", "late" },
-            because: "段1「延迟订单优先」在当前事实源下是空转的 —— 需 5号位 补 DelayStatus 事实后才生效（非投影缺陷）");
-    }
-
-    // ── 显式失败纪律（不静默、不猜配）──
+    // ── 显示失败纪律（不静默、不猜配）──
 
     [Fact]
     public void 快照子块为空_显式抛错_禁止静默当空策略执行()
@@ -314,5 +334,88 @@ public class DemandPriorityProjectorTests
         var act = () => DemandPriorityProjector.Project(block);
 
         act.Should().Throw<InvalidOperationException>().WithMessage("*必须 >= 1*");
+    }
+
+    // ── `CustomerDueDate` 相对日阈值（`TODAY+20`）──────────────────────────────
+    // 3号位 2026-11-06 回执 §三：Run 冻结日 = `FrozenStrategySnapshot.FrozenAt.Date`；
+    // 配置 `Value` 存整数偏移，由**我方在装载/匹配期**换算成具体日期再比较。
+    //
+    // 这一组断言的目的**不是**「字符串变了个样子」，而是「不换算就会静默错判」这件事不再可能发生：
+    // 执行器 `CompareNumericOrDate` 对「日期串 vs "20"」会落到字符串比较 ⇒ LTE 恒 false、GTE 恒 true。
+    // 所以第 2 条走真执行器，直接验命中结果随冻结日不同而不同。
+
+    private static DemandPriorityBlock CustomerDueDateThresholdBlock(
+        ConditionOperator op, object? value) => new()
+    {
+        Segments =
+        [
+            new PrioritySegment
+            {
+                SegmentOrder = 1,
+                SegmentName = "客户交期阈值段",
+                IsEnabled = true,
+                MatchConditions = [new SegmentMatchCondition { Field = DemandField.CustomerDueDate, Operator = op, Value = value }],
+                SortFields = [new SegmentSortField { Field = DemandField.DueDate, Direction = SortDirection.Asc }],
+                StableTieBreakFields = [TieBreakField.DEMANDKEY],
+            }
+        ]
+    };
+
+    [Fact]
+    public void 客户交期整数阈值_按冻结日换算为具体日期_不同冻结日得不同阈值()
+    {
+        var block = CustomerDueDateThresholdBlock(ConditionOperator.LessOrEqual, 20);
+
+        var early = DemandPriorityProjector.Project(block, new DateTime(2026, 11, 1, 15, 30, 0));
+        var late = DemandPriorityProjector.Project(block, new DateTime(2026, 12, 1, 8, 0, 0));
+
+        early.Segments[0].MatchConditions[0].Value.Should().Be("2026-11-21");
+        late.Segments[0].MatchConditions[0].Value.Should().Be("2026-12-21",
+            "阈值必须随 Run 冻结日移动；若两条相等，说明换算没接上、仍在比原始整数");
+    }
+
+    [Fact]
+    public void 客户交期整数阈值_真执行器按换算后日期命中_同一需求在不同冻结日结果不同()
+    {
+        // 需求客户交期 2026-12-10：
+        //   冻结日 11-01 ⇒ 阈值 11-21 ⇒ 不命中（落到未命中兜底，排在命中之后）
+        //   冻结日 12-01 ⇒ 阈值 12-21 ⇒ 命中
+        var block = CustomerDueDateThresholdBlock(ConditionOperator.LessOrEqual, 20);
+        var demands = new List<UpstreamDemand>
+        {
+            new() { DemandKey = "D1", CustomerDueDate = new DateTime(2026, 12, 10) },
+            new() { DemandKey = "D2", CustomerDueDate = new DateTime(2026, 11, 5) },
+        };
+
+        var earlySorted = _executor.ExecutePrioritySort(
+            demands, DemandPriorityProjector.Project(block, new DateTime(2026, 11, 1)));
+        var lateSorted = _executor.ExecutePrioritySort(
+            demands, DemandPriorityProjector.Project(block, new DateTime(2026, 12, 1)));
+
+        // 11-01 冻结：只有 D2 命中段，D1 未命中落兜底
+        earlySorted.Select(d => d.DemandKey).Should().Equal(new[] { "D2", "D1" });
+        // 12-01 冻结：两条都命中段，按 DueDate 升序（两条 DueDate 皆 null ⇒ 稳定退出到 DEMANDKEY）
+        lateSorted.Select(d => d.DemandKey).Should().Equal(new[] { "D1", "D2" });
+    }
+
+    [Fact]
+    public void 客户交期整数阈值_未传冻结时点_显式抛错_不静默退化为字符串比较()
+    {
+        var block = CustomerDueDateThresholdBlock(ConditionOperator.LessOrEqual, 20);
+
+        var act = () => DemandPriorityProjector.Project(block);
+
+        act.Should().Throw<InvalidOperationException>().WithMessage("*冻结时点*");
+    }
+
+    [Fact]
+    public void 客户交期显式日期阈值_原样保留_不做偏移换算()
+    {
+        // 配置直接写具体日期是合法写法，不能被当成「整数偏移」再算一次。
+        var block = CustomerDueDateThresholdBlock(ConditionOperator.LessOrEqual, "2026-11-20");
+
+        var config = DemandPriorityProjector.Project(block, new DateTime(2026, 11, 1));
+
+        config.Segments[0].MatchConditions[0].Value.Should().Be("2026-11-20");
     }
 }

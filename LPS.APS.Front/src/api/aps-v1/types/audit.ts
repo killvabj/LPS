@@ -90,13 +90,14 @@ export interface AuditLogQuery {
 /* ==================== 枚举与中文映射 ==================== */
 
 /**
- * 实际 actionCode 枚举（2026-09-20 后端代码走读去重，共 15 个）：
+ * 实际 actionCode 枚举（2026-09-20 后端代码走读去重；10-29 追加 Activate，共 16 个）：
  *  - AuthService：Login / Logout（09-20 二次提交落地，Module="Auth"，U42 脱敏）
  *  - GovernanceVersionService：Publish / Disable
  *  - RunLifecycleService：ConfirmCandidate / CreateCandidateRun / ActivateCandidate / RecoverFailedRun
  *  - DomainDefinitionGovernanceService：Create / Update / Enable / Disable
  *  - SetupTransitionRuleService：Create / Update / Delete
  *  - RbacManagementService：Create / Update / Delete / AssignRoles / AssignPermissions / AssignScopes / Disable
+ *  - TaskSplitRuleConfig / StageLeadTimeParam：Create / Update / Deactivate / Activate（停用后恢复启用）
  */
 export const AUDIT_ACTION_CODES = [
   'Login',
@@ -106,6 +107,8 @@ export const AUDIT_ACTION_CODES = [
   'Delete',
   'Enable',
   'Disable',
+  'Deactivate',
+  'Activate',
   'Publish',
   'AssignRoles',
   'AssignPermissions',
@@ -126,6 +129,8 @@ export const AUDIT_ACTION_LABELS: Record<string, string> = {
   Delete: '删除',
   Enable: '启用',
   Disable: '停用/退役',
+  Deactivate: '停用',
+  Activate: '启用',
   Publish: '发布',
   AssignRoles: '分配角色',
   AssignPermissions: '分配权限',

@@ -10,7 +10,8 @@
 -->
 <script setup lang="tsx">
 import { computed, onMounted, reactive, ref, watch } from 'vue'
-import { formatUtcDateTimeSec } from '@/utils/datetime'
+import { formatLocalDateTimeSec } from '@/utils/datetime'
+// DataScopePolicy.CreatedAt 由后端 DateTime.Now / GETDATE() 落库（服务器本地墙钟）⇒ 本地直显，不做 UTC→本地位移
 import {
   ElButton,
   ElDialog,
@@ -270,7 +271,7 @@ const SCOPE_TAG_TYPE: Record<ScopeType, 'primary' | 'success' | 'warning' | 'inf
       </ElTableColumn>
       <ElTableColumn label="创建时间" width="170">
         <template #default="{ row }: { row: DataScopePolicyDto }">
-          {{ formatUtcDateTimeSec(row.createdAt) }}
+          {{ formatLocalDateTimeSec(row.createdAt) }}
         </template>
       </ElTableColumn>
       <ElTableColumn label="操作" width="180" fixed="right">

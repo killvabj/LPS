@@ -335,21 +335,15 @@ export const strategyProfileApi = {
     })
   },
 
-  /* ===== 1'''. 删除策略包主表（DELETE /api/governance/strategy-profile/{id}） =====
+  /* ===== 1'''. 物理删除策略包整族（DELETE /api/governance/strategy-profile/{id}） =====
    *
-   * 3号位 2026-10-26 已落码并上 dev（实测 `DELETE /api/governance/strategy-profile/999999`
-   * → 400「策略包不存在：999999」）。口径同规则集删除（R1）：
-   *  - 该族存在任何 PUBLISHED 版本 ⇒ 400「该策略包已发布过，不能删除（请先停用版本）」
-   *  - 版本被 ScheduleRun 引用 ⇒ 400「该策略包存在已被运行引用的版本，不能删除」
-   * 成功 ⇒ 200 + `ApiResponse<bool>`（单事务连带删 DRAFT 版本 + 主表行，并写审计 Delete）
-   *
-   * 权限 aps.strategy.edit。**硬删 ≠ 停用**（updateProfile 的 isActive=false 是停用，不级联、留历史）。
+   * 最窄口径（2026-10-30 恢复）：无任何 PUBLISHED 版本才可删，连带删 DRAFT。
+   * 含 PUBLISHED ⇒ 400；被 ScheduleRun（排产运行）引用 ⇒ 400「存在已被运行引用的版本，不能删除」。
+   * 硬删（单事务）+ 审计前置。权限 aps.strategy.edit
    */
-  async deleteStrategyProfile(id: number): Promise<void> {
-    if (APS_USE_MOCK) return rejectMockWrite('deleteStrategyProfile')
-    await apsHttp.delete<boolean>({
-      url: `/api/governance/strategy-profile/${id}`
-    })
+  async deleteProfile(id: number): Promise<void> {
+    if (APS_USE_MOCK) return rejectMockWrite('deleteProfile')
+    await apsHttp.delete<boolean>({ url: `/api/governance/strategy-profile/${id}` })
   },
 
   /* ===== 2. 单 Profile 版本列表 ===== */

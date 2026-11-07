@@ -72,19 +72,25 @@ public class DemandPriorityIntegrationTests : IDisposable
         var ruleSetVersion = await _ruleSetRepo.GetByIdAsync(_testRuleSetVersionId);
         var priorityBlock = LoadDemandPriorityBlock(ruleSetVersion!.ContentSnapshotJson!);
 
+        // 夹具（DemandPriorityFixture，2026-11-07 适配 0号位 裁决后）为两段：
+        //   段1 OrderType EQ "SALES_ORDER"（DueDate ASC）、段2 CustomerTier EQ "VIP"（DueDate ASC）；
+        // 排序字段是 DueDate，这里必须给真交期。DelayStatus 已归参数集、不承载于规则集，故不再用于路由。
+        var today = DateTime.Now.Date;
         var demands = new List<DemandRecord>
         {
-            new DemandRecord { DemandId = "D001", OrderId = "O001", CreatedAt = DateTime.Now, DelayStatus = "DELAYED", CustomerTier = "A", RemainingTimeHours = 5 },
-            new DemandRecord { DemandId = "D002", OrderId = "O002", CreatedAt = DateTime.Now, DelayStatus = "ONTRACK", CustomerTier = "VIP", RemainingTimeHours = 20 },
-            new DemandRecord { DemandId = "D003", OrderId = "O003", CreatedAt = DateTime.Now, DelayStatus = "DELAYED", CustomerTier = "VIP", RemainingTimeHours = 2 }
+            // 段1：销售订单（非 VIP），交期越早越前
+            new DemandRecord { DemandId = "D001", OrderId = "O001", CreatedAt = DateTime.Now, OrderType = "SALES_ORDER", CustomerTier = "A", DueDate = today.AddDays(5) },
+            new DemandRecord { DemandId = "D002", OrderId = "O002", CreatedAt = DateTime.Now, OrderType = "SALES_ORDER", CustomerTier = "B", DueDate = today.AddDays(20) },
+            // 段2：非销售订单但 VIP 客户 ⇒ 落第二段
+            new DemandRecord { DemandId = "D003", OrderId = "O003", CreatedAt = DateTime.Now, OrderType = "WO", CustomerTier = "VIP", DueDate = today.AddDays(2) }
         };
 
         var sorted = _matcher.SortDemands(demands, priorityBlock!);
 
         sorted.Should().HaveCount(3);
-        sorted[0].OrderId.Should().Be("O003", "DELAYED订单中Hours最小(2)应排第一");
-        sorted[1].OrderId.Should().Be("O001", "DELAYED订单中Hours第二小(5)");
-        sorted[2].OrderId.Should().Be("O002", "ONTRACK订单排最后");
+        sorted[0].OrderId.Should().Be("O001", "段1 销售订单内交期最早(+5d)应排第一");
+        sorted[1].OrderId.Should().Be("O002", "段1 销售订单内交期次早(+20d)排第二（段内 DueDate ASC）");
+        sorted[2].OrderId.Should().Be("O003", "非销售订单的 VIP 客户落第二段排最后（段序优先）");
     }
 
     [SkippableFact]
@@ -98,7 +104,9 @@ public class DemandPriorityIntegrationTests : IDisposable
         var priorityBlock = LoadDemandPriorityBlock(ruleSetVersion!.ContentSnapshotJson!);
 
         var validationResult = _validator.Validate(priorityBlock!);
-        validationResult.IsValid.Should().BeTrue();
+        // 断言带上 Errors：只报 IsValid=False 时看不出是哪条规则拒的（本用例 2026-11-07 就这么卡过一次）。
+        validationResult.IsValid.Should().BeTrue(
+            "标准快照必须能通过发布校验；实际错误：" + string.Join(" | ", validationResult.Errors));
     }
 
     private async System.Threading.Tasks.Task SetupTestDataAsync()

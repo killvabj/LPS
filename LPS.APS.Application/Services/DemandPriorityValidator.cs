@@ -24,11 +24,16 @@ public sealed class DemandPriorityValidator
     /// （`RemainingTimeHours` / `IsPmcProtected` / `PriorityLevel`），只有旧 <c>DemandPriorityMatcher</c> 认它们，
     /// 运行时 <c>DemandPriorityExecutor</c> 一律抛 `NotSupportedException`
     /// ⇒ 发布放行、运行期炸。旧 Matcher 只被测试消费，不能作为白名单依据。
-    /// 新增 <see cref="DemandField"/> 值时**必须先让 1号位 在执行器落地比较分支**，再来这里登记。
+    /// 新增 <see cref="DemandField"/> 值时**必须先让 2号位 在执行器落地比较分支**，再来这里登记。
     /// </summary>
     private static readonly HashSet<DemandField> SupportedDemandFields =
     [
-        DemandField.DelayStatus,
+        // 2026-11-07 0号位 裁决：延迟状态 `DelayStatus`、需求成熟度 `DemandMaturityStatus`
+        // **归属参数集**（需求保护：`ProtectDelayed` / `ProtectMaturityStatus`），【本就不该存放在规则集】，
+        // 故不在本白名单（规则集命中/排序字段）内。「延迟」与「成熟度」是保护触发条件，不是优先级分段条件。
+        // ⚠ 防空转一致：478 已完成整份替换为整理稿 6 段（不含这两个字段）；此白名单同步剔除——
+        //   规则集配置若再引用 DelayStatus/DemandMaturityStatus 作命中/排序，发布期即拦截。
+        //   A系 `DemandPriorityExecutor` 仍读这两个字段作参数集保护比较，规则集侧不再承载。
         DemandField.CustomerTier,
         DemandField.OrderType,
         DemandField.DueDate,     // P0-07
@@ -38,11 +43,10 @@ public sealed class DemandPriorityValidator
         DemandField.CustomerDueDate,        // 出荷指示入物流日
         DemandField.TransportMode,          // 运输方式
         DemandField.SalesOrderCategory,     // 销售类别
-        DemandField.DemandMaturityStatus,   // 需求成熟度
         DemandField.NonStockShipCategory,   // 非在库出荷区分
         DemandField.MaterialCode,           // 物料编码
         DemandField.Quantity,               // 数量
-        // 刻意未放行：DemandField.StockConsumeDay（库存消耗日）——载体（ODS近90天日均消耗）待 0号位 DDL 批准并 2号位 接线后才放行（防空转，非空转语义下勿放）。
+        DemandField.StockConsumeDay,        // 库存消耗日（2026-11-06 放行：载体 `IAD.AverageDailyConsumption` 已落库、执行器/投影器已接线＝防空转满足；取值=小数 CoverageDays）
     ];
 
     /// <summary>
@@ -54,7 +58,7 @@ public sealed class DemandPriorityValidator
     /// 这里统一登记各命中字段的维护枚举值，拦截拼写错误（如 "销售"、"SALESORDER"、"一般"）在发布期
     /// 即拒绝，避免运行期与实库/维护值比对时空匹配或误匹配。
     ///
-    /// 注意：**新字段的字段名白名单仍须 1号位 在 A系 <c>KnownFields</c> 接线后**才由
+    /// 注意：**新字段的字段名白名单仍须 2号位 在 A系 <c>KnownFields</c> 接线后**才由
     /// <see cref="SupportedDemandFields"/> 放行；值域白名单可先行登记（纯登记、不改变可用性），
     /// 待字段可用时即作为第二道闸自动生效（实施包 §五 空转声明）。
     /// </summary>
@@ -71,7 +75,7 @@ public sealed class DemandPriorityValidator
             "SO",                     // 存量旧词（等价 SALES_ORDER）
             "WO",                     // 存量旧词（等价 PRODUCTION_INSTRUCTION）
         },
-        // == V1.1 新增字段值域（备登记；字段名白名单待 1号位 A系 接线后放行）==
+        // == V1.1 新增字段值域（备登记；字段名白名单待 2号位 A系 接线后放行）==
         [DemandField.CustomerSegment] = new HashSet<string>
         {
             "JAPAN", "DOMESTIC", "OVERSEAS", "VIETNAM", "INTER_FACTORY", "OTHER",
@@ -93,8 +97,10 @@ public sealed class DemandPriorityValidator
     };
 
     /// <summary>
-    /// 运行侧支持的操作符白名单（执行器只有 EQ/IN/LT/LTE/GT/GTE，**无 NE**）。
+    /// 运行侧支持的操作符白名单（执行器支持 EQ/IN/LT/LTE/GT/GTE/CONTAINS，**无 NE**）。
     /// `NotEquals` 在发布期即拦截，不留到运行期（B3 v1.2 §3.2）。
+    /// 2026-11-06：`Contains` 放行——真运行侧 <c>DemandPriorityExecutor</c> 的 CONTAINS 已落地**前缀匹配**
+    /// （`:234-235` `.StartsWith(...TrimEnd('*'))`），非空转，可发布（防空转：只放行真能跑的算子）。
     /// </summary>
     private static readonly HashSet<ConditionOperator> SupportedOperators =
     [
@@ -104,6 +110,7 @@ public sealed class DemandPriorityValidator
         ConditionOperator.GreaterThan,
         ConditionOperator.GreaterOrEqual,
         ConditionOperator.In,
+        ConditionOperator.Contains,
     ];
 
     /// <summary>

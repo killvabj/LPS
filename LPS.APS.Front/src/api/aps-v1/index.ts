@@ -17,7 +17,12 @@ export { overviewApi } from './overview'
 export { orderApi } from './order'
 export { ctpApi } from './ctp'
 export { candidateApi } from './candidate'
-export { explanationApi } from './explanation'
+export {
+  explanationApi,
+  EXPLANATION_FACT_PAGE_SIZE,
+  EXPLANATION_FACT_INITIAL_MAX,
+  EXPLANATION_FACT_LOAD_MAX
+} from './explanation'
 export { piApi } from './pi'
 export { peggingTraceApi } from './peggingTrace'
 export { ruleApi, mockActor, buildForkContentSnapshot } from './rule'

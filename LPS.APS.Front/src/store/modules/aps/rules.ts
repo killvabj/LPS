@@ -56,6 +56,14 @@ export const useRulesStore = defineStore('aps.rules', () => {
   const diffTargetVersionId = ref<number | null>(null)
   const lastValidation = ref<PublishValidationResultDto | null>(null)
   const statusFilter = ref<RuleStatus | typeof NO_VERSION | 'ALL'>('ALL')
+  /**
+   * 是否在列表里显示「主表停用」的行（默认不显示）。
+   *
+   * 治理三族已无删除入口（FC-V1-007 未获批，后端 DELETE 路由摘除），建错的主表只能靠
+   * 「停用」退出使用 ⇒ 停用行会永久堆在列表里。这里默认折叠，但**必须保留开关**：
+   * 停用行是唯一的「重新启用」入口，藏死了用户就找不回来。
+   */
+  const showInactive = ref(false)
   const loading = ref(false)
   const listLoading = ref(false)
   const actionRunning = ref(false)
@@ -79,6 +87,7 @@ export const useRulesStore = defineStore('aps.rules', () => {
    */
   const filteredRuleSets = computed(() => {
     let arr = ruleSets.value
+    if (!showInactive.value) arr = arr.filter((r) => r.isActive !== false)
     if (statusFilter.value === NO_VERSION) {
       arr = arr.filter((r) => !r.hasVersion)
     } else if (statusFilter.value !== 'ALL') {
@@ -114,6 +123,9 @@ export const useRulesStore = defineStore('aps.rules', () => {
    */
   const noVersionCount = computed(() => ruleSets.value.filter((r) => !r.hasVersion).length)
 
+  /** 主表停用的行数（「显示已停用」开关的计数标签；与 6 态版本状态正交） */
+  const inactiveCount = computed(() => ruleSets.value.filter((r) => r.isActive === false).length)
+
   /** 当前选中 RuleSet 的 status */
   const currentStatus = computed(() => currentDetail.value?.summary.status ?? null)
 
@@ -145,19 +157,6 @@ export const useRulesStore = defineStore('aps.rules', () => {
     const s = currentStatus.value
     if (!s) return { allowed: false, reason: '未选中 RuleSet' }
     return canCreateDraftForStatus(s)
-  })
-
-  /**
-   * 当前选中 RuleSet 是否**可删**（3号位 R1 口径）
-   *
-   * 判据 = 历史版本里**没有 PUBLISHED**（已发布过的只能停用，历史不可变守恒）。
-   * 与后端 `DeleteRuleSetAsync:113-117` 同源；后端另有一条前端看不到的
-   * 拒删条件（被策略包引用）⇒ 真被拒时由后端 message 如实回显。
-   */
-  const currentDeletable = computed(() => {
-    const d = currentDetail.value
-    if (!d) return false
-    return !(d.history ?? []).some((h) => h.status === 'PUBLISHED')
   })
 
   // ===== actions =====
@@ -213,7 +212,9 @@ export const useRulesStore = defineStore('aps.rules', () => {
 
       // 默认对比：已发布版本 ↔ 草稿版本（两者都存在才有意义）
       const history = detail.history
-      const baseVer = history.find((h) => h.status === 'PUBLISHED' && h.isCurrent)?.versionId
+      const baseVer = history.find(
+        (h) => h.status === 'PUBLISHED' && h.isLatestPublished
+      )?.versionId
       const targetVer = history.find((h) => h.status === 'DRAFT')?.versionId
       if (baseVer && targetVer && baseVer !== targetVer) {
         await loadDiff(baseVer, targetVer)
@@ -367,6 +368,45 @@ export const useRulesStore = defineStore('aps.rules', () => {
   }
 
   /**
+   * 物理删除规则集整族（DELETE /rule-set/{id}，权限 aps.rule.edit）
+   *
+   *  最窄口径：**没有任何已发布版本**的规则集才可硬删（连带删草稿）；含 PUBLISHED 后端 400。
+   *  前端只做「明显不可删就提前拦」的提示，**不预判被引用**（拿不到引用关系），
+   *  失败一律回显后端原文。
+   *
+   *  ⚠️ 写接口报错 ≠ 没写成：请求失败后**必须回列表核对真值** —— 行已不在即按已删除继续，
+   *  不能把一次 500/超时直接抛给用户当成「删除失败」。
+   */
+  async function removeRuleSet(ruleSetId: number): Promise<boolean> {
+    if (!canWrite.value) {
+      error.value = '当前操作者无删除权限（需权限码 aps.rule.edit）'
+      return false
+    }
+    actionRunning.value = true
+    error.value = null
+    let failedMsg: string | null = null
+    try {
+      await ruleApi.deleteRuleSet(ruleSetId)
+    } catch (err) {
+      failedMsg = (err as Error)?.message ?? '删除请求失败'
+    }
+    try {
+      await loadList()
+    } catch {
+      /* loadList 内部已 handleError */
+    }
+    const stillThere = ruleSets.value.some((r) => r.ruleSetId === ruleSetId)
+    actionRunning.value = false
+    if (stillThere) {
+      if (failedMsg) handleError(new Error(failedMsg))
+      return false
+    }
+    // 行已不在：无论请求返回什么，事实是删掉了
+    if (currentDetail.value?.summary.ruleSetId === ruleSetId) reset()
+    return true
+  }
+
+  /**
    * 新建草稿（fork）
    *
    *  ⚠️ 只 fork **规则集**。原先此处还顺带 POST 了一条参数集版本（自造的 1:1 模型），
@@ -497,65 +537,6 @@ export const useRulesStore = defineStore('aps.rules', () => {
     return ruleSetId
   }
 
-  /**
-   * 删除规则集（DELETE /api/governance/rule-set/{id}，3号位 R1）
-   *
-   * 口径与后端 `RuleSetGovernanceService.DeleteRuleSetAsync:113-125` 逐字一致：
-   *  - 该族**存在任何 PUBLISHED 版本** ⇒ 拒删（"历史不可变守恒"），只能停用
-   *  - 任一版本**被策略包引用** ⇒ 拒删（FK 无级联，硬删会违约）
-   *  - 否则事务内连带删全部 DRAFT 版本 + 主表行
-   *
-   * ⚠️ 破坏性操作：调用方必须先弹二次确认。
-   * ⚠️ 写接口报错≠没写成 ⇒ 失败后回列表核对：行已不在 ⇒ 按已删除处理。
-   */
-  async function removeRuleSet(ruleSetId: number): Promise<boolean> {
-    if (!canWrite.value) {
-      error.value = '当前操作者无删除权限（需权限码 aps.rule.edit）'
-      return false
-    }
-    const detail = currentDetail.value
-    const row = ruleSets.value.find((r) => r.ruleSetId === ruleSetId)
-    // 「未配版本」的规则集没有详情（loadDetail 加载不出内容）⇒ 用列表行兜底
-    if (!row && (!detail || detail.summary.ruleSetId !== ruleSetId)) {
-      error.value = '规则集未选中'
-      return false
-    }
-    const hasPublished = detail
-      ? (detail.history ?? []).some((h) => h.status === 'PUBLISHED')
-      : row?.status === 'PUBLISHED'
-    if (hasPublished) {
-      error.value = '该规则集已发布过，不能删除（请先停用版本）'
-      return false
-    }
-    actionRunning.value = true
-    error.value = null
-    try {
-      await ruleApi.deleteRuleSet(ruleSetId)
-      currentDetail.value = null
-      clearDiff()
-      await loadList()
-      return true
-    } catch (err) {
-      /**
-       * 删除失败有两种可能：真没删掉；或**已经删掉了但响应阶段出错**。
-       * 后者若直接报错，用户会看到"删除失败"却发现列表里那条真的没了 ⇒ 困惑。
-       * ⇒ 回列表核对：行已不在 ⇒ 按已删除继续。
-       */
-      await loadList()
-      const stillThere = ruleSets.value.some((r) => r.ruleSetId === ruleSetId)
-      if (!stillThere) {
-        console.warn('[规则集] 删除接口报错，但回列表发现该规则集已不存在，按已删除继续', err)
-        currentDetail.value = null
-        clearDiff()
-        return true
-      }
-      handleError(err)
-      return false
-    } finally {
-      actionRunning.value = false
-    }
-  }
-
   /** 编辑规则集主表（改名 / 改说明 / 启停；编码不可改） */
   async function updateRuleSet(input: UpdateRuleSetInput): Promise<boolean> {
     if (!canWrite.value) {
@@ -680,6 +661,7 @@ export const useRulesStore = defineStore('aps.rules', () => {
     diffTargetVersionId,
     lastValidation,
     statusFilter,
+    showInactive,
     loading,
     listLoading,
     actionRunning,
@@ -692,12 +674,12 @@ export const useRulesStore = defineStore('aps.rules', () => {
     filteredRuleSets,
     statusCounts,
     noVersionCount,
+    inactiveCount,
     currentStatus,
     canWrite,
     canPublishAction,
     actions,
     forkPermission,
-    currentDeletable,
     // actions
     loadList,
     loadDetail,
@@ -706,10 +688,10 @@ export const useRulesStore = defineStore('aps.rules', () => {
     saveDraftSegments,
     publish,
     disable,
+    removeRuleSet,
     forkDraft,
     createRuleSet,
     updateRuleSet,
-    removeRuleSet,
     setStatusFilter,
     reset,
     handleError

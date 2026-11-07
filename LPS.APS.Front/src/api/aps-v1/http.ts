@@ -77,14 +77,29 @@ export interface RequestOptions {
   timeout?: number
   /** 关闭全局错误 toast，由调用方自行呈现。用于后端 message 含内部术语、需改写为大白话的端点 */
   silent?: boolean
+  /**
+   * 出错时**不整页跳 /500**，改为把错误抛给调用方在页内呈现。
+   *
+   * 何时用：页面自己已经有错误位（如订单列表的 `listError` → ElAlert「加载失败：…」），
+   * 而请求失败时用户**已经填好的筛选、勾选、页码不该丢**。
+   * 全局默认行为是 `window.location.replace('/500')`（系统级兜底）——
+   * 对「列表查不动」这种局部失败代价太大（用户回到起点）。
+   * 5号位 2026-10-31 回执 §六-2 明确支持前端这么改（与性能修复无关，是错误处理本身的问题）。
+   */
+  noErrorRedirect?: boolean
+  /** 取消信号（切版本/切时间窗/离开页面时中止上一次请求，避免"前端放弃、后端白算"） */
+  signal?: AbortSignal
 }
 
 /** 随 axios config 透传的标记（axios 的 config 类型无索引签名，需自行声明） */
-type SilentRequest = { silent?: boolean }
+type RequestFlags = { silent?: boolean; noErrorRedirect?: boolean }
 
-/** 只在显式 silent 时下发标记，避免每个 config 都多一个无用字段 */
-function silentConfig(opts: RequestOptions): SilentRequest {
-  return opts.silent ? { silent: true } : {}
+/** 只在显式开启时下发标记，避免每个 config 都多一个无用字段 */
+function requestFlags(opts: RequestOptions): RequestFlags {
+  return {
+    ...(opts.silent ? { silent: true as const } : {}),
+    ...(opts.noErrorRedirect ? { noErrorRedirect: true as const } : {})
+  }
 }
 
 /** 标记是否正在 refresh（防止多个 401 同时触发 refresh 风暴） */
@@ -114,12 +129,23 @@ function createInstance(): AxiosInstance {
     async (error: AxiosError<ApiResponse<unknown>>) => {
       const original = error.config as InternalAxiosRequestConfig & {
         _retried?: boolean
-      } & SilentRequest
+      } & RequestFlags
       const silent = original?.silent === true
+      const noErrorRedirect = original?.noErrorRedirect === true
       const status = error.response?.status
       const respData = error.response?.data as ApiResponse<unknown> | undefined
       const isAuthEndpoint =
         original?.url?.includes('/api/auth/login') || original?.url?.includes('/api/auth/refresh')
+
+      // 调用方主动取消（AbortSignal）：不是错误，不 refresh、不 toast、**不跳 500 页**
+      // （取消的请求没有 response ⇒ 会落进下面「网络层错误 → redirectToError(500)」分支）
+      // 注：isCancel 的入参先转 unknown，否则类型守卫会把下面的 error.narrow 成 never
+      if (
+        axios.isCancel(error as unknown) ||
+        (error as AxiosError & { code?: string }).code === 'ERR_CANCELED'
+      ) {
+        return Promise.reject(error)
+      }
 
       // 业务码 401 / HTTP 401 → refresh 后重放（login/refresh 端点不重试避免死循环）
       if ((status === 401 || respData?.code === 401) && !original._retried && !isAuthEndpoint) {
@@ -162,14 +188,23 @@ function createInstance(): AxiosInstance {
         return Promise.reject(apiErr)
       }
 
-      // 后端 5xx → 跳 500 页（不弹 toast，避免淹没上下文）
+      // 后端 5xx → 默认跳 500 页（不弹 toast，避免淹没上下文）
+      // noErrorRedirect（页内自己有错误位）→ 不跳，把大白话错误抛给页面渲染
       if (status && status >= 500) {
+        if (noErrorRedirect) {
+          const plain = plainErrorMessage(error, status)
+          return Promise.reject(new ApiError(plain.message, plain.code))
+        }
         redirectToError(500)
         return Promise.reject(error)
       }
 
-      // 网络层错误（断网 / 超时 / DNS）→ 跳 500 页（500 页通用兜底）
+      // 网络层错误（断网 / 超时 / DNS）→ 同上
       if (!status) {
+        if (noErrorRedirect) {
+          const plain = plainErrorMessage(error)
+          return Promise.reject(new ApiError(plain.message, plain.code))
+        }
         redirectToError(500)
         return Promise.reject(error)
       }
@@ -190,6 +225,21 @@ function redirectToLogin(): void {
     const returnUrl = encodeURIComponent(window.location.pathname + window.location.search)
     window.location.href = `/login?redirect=${returnUrl}`
   }
+}
+
+/** 出错时给用户看的大白话（不把 axios 英文原文 / 状态码摆到页面上）
+ *  - 超时（axios code = ECONNABORTED）⇒「请求超时」；断网/DNS ⇒「网络连接失败」
+ *  - 5xx ⇒「服务暂时不可用」
+ *  - code 0 = 不是 HTTP 状态（网络层）⇒ 页面上不显示 "[0]" 这种没人看得懂的编号 */
+function plainErrorMessage(err: AxiosError, status?: number): { message: string; code: number } {
+  const axiosCode = (err as AxiosError & { code?: string }).code
+  if (status && status >= 500) {
+    return { message: '服务暂时不可用，请稍后重试', code: status }
+  }
+  if (axiosCode === 'ECONNABORTED' || /timeout/i.test(err.message ?? '')) {
+    return { message: '请求超时，请稍后重试', code: 408 }
+  }
+  return { message: '网络连接失败，请检查网络后重试', code: 0 }
 }
 
 /** 跳错误页（避免在 router 未就绪时拿不到 push，用 window.location） */
@@ -254,7 +304,8 @@ export const apsHttp = {
       headers: opts.headers,
       responseType: opts.responseType,
       timeout: opts.timeout,
-      ...silentConfig(opts)
+      signal: opts.signal,
+      ...requestFlags(opts)
     })
     return unwrap<T>(res)
   },
@@ -263,7 +314,8 @@ export const apsHttp = {
       params: opts.params,
       headers: opts.headers,
       timeout: opts.timeout,
-      ...silentConfig(opts)
+      signal: opts.signal,
+      ...requestFlags(opts)
     })
     return unwrap<T>(res)
   },
@@ -272,7 +324,8 @@ export const apsHttp = {
       params: opts.params,
       headers: opts.headers,
       timeout: opts.timeout,
-      ...silentConfig(opts)
+      signal: opts.signal,
+      ...requestFlags(opts)
     })
     return unwrap<T>(res)
   },
@@ -283,7 +336,8 @@ export const apsHttp = {
       data: opts.data,
       responseType: opts.responseType,
       timeout: opts.timeout,
-      ...silentConfig(opts)
+      signal: opts.signal,
+      ...requestFlags(opts)
     })
     return unwrap<T>(res)
   }

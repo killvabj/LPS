@@ -2,7 +2,7 @@
 /**
  * APS V1 4号位 — Domain 字典接口不可用徽标
  *
- * 用法：在 domainFilter 下拉旁放置
+ * 用法：放在依赖排程域字典的位置（如甘特页版本下拉旁）
  *   <DomainUnavailableBadge />
  *
  * 行为：

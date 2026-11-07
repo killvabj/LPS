@@ -22,7 +22,9 @@
 
 import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { storeToRefs } from 'pinia'
-import { formatUtcDateTime } from '@/utils/datetime'
+import { formatLocalDateTime } from '@/utils/datetime'
+// DomainDefinition.CreatedAt/UpdatedAt = DateTime.Now、Domain_Dependency.ScannedAt 默认 GETDATE()
+// （服务器本地墙钟，冻结 DDL v5.1.8.7）⇒ 本地直显，不做 UTC→本地位移
 import { useDomainStore } from '@/store/modules/aps/domain'
 import { useApsAuthStore } from '@/store/modules/aps/auth'
 import {
@@ -583,7 +585,7 @@ onMounted(async () => {
       </template>
       <div class="empty-state-content">
         <p v-if="emptyReason === 'no-config'" class="hint-text">
-          系统中尚未创建任何排程域定义。排程域是排程边界，CTP / Candidate / Run
+          系统中尚未创建任何排程域定义。排程域是排程边界，CTP / 候选版本 / 排程运行
           等下游功能均依赖排程域选域；未配置时下游页面将无可选项。
         </p>
         <p v-else class="hint-text">
@@ -831,13 +833,13 @@ onMounted(async () => {
               currentDetail.createdBy ?? '—'
             }}</ElDescriptionsItem>
             <ElDescriptionsItem label="创建时间">{{
-              formatUtcDateTime(currentDetail.createdAt)
+              formatLocalDateTime(currentDetail.createdAt)
             }}</ElDescriptionsItem>
             <ElDescriptionsItem label="更新人">{{
               currentDetail.updatedBy ?? '—'
             }}</ElDescriptionsItem>
             <ElDescriptionsItem label="更新时间">{{
-              formatUtcDateTime(currentDetail.updatedAt)
+              formatLocalDateTime(currentDetail.updatedAt)
             }}</ElDescriptionsItem>
           </ElDescriptions>
 
@@ -922,7 +924,7 @@ onMounted(async () => {
           </template>
         </ElTableColumn>
         <ElTableColumn label="扫描时间" min-width="160">
-          <template #default="{ row }">{{ formatUtcDateTime(row.scannedAt) }}</template>
+          <template #default="{ row }">{{ formatLocalDateTime(row.scannedAt) }}</template>
         </ElTableColumn>
       </ElTable>
     </ElCard>

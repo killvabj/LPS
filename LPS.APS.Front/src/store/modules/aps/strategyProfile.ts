@@ -65,11 +65,21 @@ export const useStrategyProfileStore = defineStore('aps.strategyProfile', () => 
   const actionRunning = ref(false)
   const validating = ref(false)
   const error = ref<string | null>(null)
+  /** 是否显示「停用」的策略包（默认不显示；停用行是唯一的重新启用入口，故必须留开关） */
+  const showInactive = ref(false)
 
   // ===== auth =====
   const apsAuth = useApsAuthStore()
 
   // ===== getters =====
+
+  /** 列表可见的 Profile（默认滤掉停用行；「显示已停用」开关打开才全量） */
+  const visibleProfiles = computed<StrategyProfileDto[]>(() =>
+    showInactive.value ? profiles.value : profiles.value.filter((p) => p.isActive !== false)
+  )
+
+  /** 停用的策略包数量（开关上的计数标签） */
+  const inactiveCount = computed(() => profiles.value.filter((p) => p.isActive === false).length)
 
   /** 当前选中的 Profile（null = 列表页） */
   const currentProfile = computed<StrategyProfileDto | null>(() => {
@@ -281,52 +291,43 @@ export const useStrategyProfileStore = defineStore('aps.strategyProfile', () => 
   }
 
   /**
-   * 删除策略包主表（DELETE /strategy-profile/{id}，3号位 2026-10-26 同 R1 口径）
+   * 物理删除策略包整族（DELETE /strategy-profile/{id}，权限 aps.strategy.edit）
    *
-   *  - 权限码沿用主表写端点码 `aps.strategy.edit`（3号位：不新增权限码）
-   *  - 前端先拦「已发布过不可删」：后端必拒，前端先拦是为了让用户看到原因而不是撞 400
-   *  - 后端还有一条前端拿不到的前置条件（版本被 ScheduleRun 引用 ⇒ 400），
-   *    页面不预判，失败时如实回显后端原文
-   *  - 写接口报错≠没写成 ⇒ 失败后回列表核对：行已不在 ⇒ 按已删除继续
+   * 最窄口径：无任何已发布版本才可硬删（连带删草稿）；含 PUBLISHED、或被排产运行
+   * （ScheduleRun）引用，后端 400 并给原文 —— 引用关系前端拿不到，不预判、不翻译。
+   *
+   * ⚠️ 写接口报错 ≠ 没写成：失败后回列表核对，行已不在即按已删除继续。
    */
-  async function removeStrategyProfile(profileId: number): Promise<boolean> {
+  async function removeProfile(id: number): Promise<boolean> {
     if (!canWrite.value) {
       error.value = '当前操作者无删除权限（需权限码 aps.strategy.edit）'
       return false
     }
-    const row = profiles.value.find((p) => p.id === profileId)
-    if (!row) {
-      error.value = '策略包未选中'
-      return false
-    }
-    // versions 只装当前选中策略包的版本 ⇒ 带上 profileId 判定，避免删 A 时用上 B 的状态
-    const hasPublished = versions.value.some(
-      (v) => v.strategyProfileId === profileId && v.status === 'PUBLISHED'
-    )
-    if (hasPublished) {
-      error.value = '该策略包已发布过，不能删除（请先停用版本）'
-      return false
-    }
     actionRunning.value = true
     error.value = null
+    let failedMsg: string | null = null
     try {
-      await strategyProfileApi.deleteStrategyProfile(profileId)
-      selectProfile(null)
-      await loadProfiles()
-      return true
+      await strategyProfileApi.deleteProfile(id)
     } catch (err) {
-      await loadProfiles()
-      const stillThere = profiles.value.some((p) => p.id === profileId)
-      if (!stillThere) {
-        console.warn('[策略包] 删除接口报错，但回列表发现该策略包已不存在，按已删除继续', err)
-        selectProfile(null)
-        return true
-      }
-      handleError(err)
-      return false
-    } finally {
-      actionRunning.value = false
+      failedMsg = (err as Error)?.message ?? '删除请求失败'
     }
+    try {
+      await loadProfiles()
+    } catch {
+      /* loadProfiles 内部已 handleError */
+    }
+    const stillThere = profiles.value.some((p) => p.id === id)
+    actionRunning.value = false
+    if (stillThere) {
+      if (failedMsg) handleError(new Error(failedMsg))
+      return false
+    }
+    if (selectedProfileId.value === id) {
+      selectedProfileId.value = null
+      versions.value = []
+      selectedVersionId.value = null
+    }
+    return true
   }
 
   async function loadVersions(profileId: number): Promise<void> {
@@ -562,7 +563,10 @@ export const useStrategyProfileStore = defineStore('aps.strategyProfile', () => 
     actionRunning,
     validating,
     error,
+    showInactive,
     // getters
+    visibleProfiles,
+    inactiveCount,
     currentProfile,
     currentVersion,
     currentStatus,
@@ -579,7 +583,7 @@ export const useStrategyProfileStore = defineStore('aps.strategyProfile', () => 
     loadProfiles,
     createProfile,
     updateProfile,
-    removeStrategyProfile,
+    removeProfile,
     loadVersions,
     loadDiff,
     validateDraft,

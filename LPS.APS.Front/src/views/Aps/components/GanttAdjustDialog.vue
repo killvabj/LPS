@@ -11,7 +11,7 @@
   Dialog 只收集载荷；父组件持 loading 并调 triggerBusinessEntry。
 -->
 <script setup lang="ts">
-import { nextTick, ref, watch } from 'vue'
+import { computed, nextTick, ref, watch } from 'vue'
 import {
   ElAlert,
   ElButton,
@@ -21,6 +21,7 @@ import {
   ElFormItem,
   ElMessage,
   ElOption,
+  ElPagination,
   ElSelect,
   ElTable,
   ElTableColumn,
@@ -69,22 +70,47 @@ const rows = ref<Row[]>([])
 const selected = ref<Row[]>([])
 const errors = ref<string[]>([])
 const tableRef = ref<InstanceType<typeof ElTable> | null>(null)
+const page = ref(1)
+const pageSize = ref(50)
+
+/**
+ * 表格只渲染当前页。
+ *
+ * ⚠️ 为什么必须分页：任务源是**甘特页当前时间窗内的全部任务**（dev 实测单域 5953 条），
+ *   而 ElTable（非虚拟化）会一次性渲染所有行、每行还挂一个 ElDatePicker ⇒
+ *   打开弹窗即主线程卡死（headless 实测：点「甘特图调整」后 CDP 无响应 > 100s）。
+ *   分页后每页 50 行，跨页多选靠 selection 列的 reserve-selection 保留。
+ */
+const pagedRows = computed(() =>
+  rows.value.slice((page.value - 1) * pageSize.value, page.value * pageSize.value)
+)
 
 async function rebuildRows(preIds: number[] = []): Promise<void> {
-  rows.value = props.tasks.filter((t) => t.domainKey === domainKey.value).map((t) => ({ ...t }))
+  const pre = new Set(preIds)
+  rows.value = props.tasks
+    .filter((t) => t.domainKey === domainKey.value)
+    .map((t) => ({
+      ...t,
+      // 软目标时间默认取该任务当前计划开始时间（后端 naive UTC 原值，与「当前计划」列同一口径）；
+      // 拖拽入口的 preselectTargetTime 优先（那是用户拖到的新时间）。
+      // 不预填的话，工具栏入口选完任务直接提交会被「软目标时间不能为空」拦死。
+      targetTime:
+        pre.has(t.taskId) && props.preselectTargetTime
+          ? props.preselectTargetTime
+          : t.plannedStartTime || ''
+    }))
   selected.value = []
+  page.value = 1
+  // 切域/重开时清掉上一批保留选择（reserve-selection 会按 rowKey 记住旧行）
+  tableRef.value?.clearSelection()
+  await nextTick()
+  // 预填任务可能不在第 1 页 ⇒ 跳到它所在页，否则 toggleRowSelection 找不到行
+  const idx = rows.value.findIndex((r) => pre.has(r.taskId))
+  if (idx >= 0) page.value = Math.floor(idx / pageSize.value) + 1
   await nextTick()
   if (!tableRef.value) return
-  const pre = new Set(preIds)
-  rows.value.forEach((r) => {
-    // 软目标时间默认取该任务当前计划开始时间（后端 naive UTC 原值，与「当前计划」列同一口径）；
-    // 拖拽入口的 preselectTargetTime 优先（那是用户拖到的新时间）。
-    // 不预填的话，工具栏入口选完任务直接提交会被「软目标时间不能为空」拦死。
-    r.targetTime = r.targetTime || r.plannedStartTime || ''
-    if (pre.has(r.taskId)) {
-      if (props.preselectTargetTime) r.targetTime = props.preselectTargetTime
-      tableRef.value?.toggleRowSelection(r, true)
-    }
+  pagedRows.value.forEach((r) => {
+    if (pre.has(r.taskId)) tableRef.value?.toggleRowSelection(r, true)
   })
 }
 
@@ -99,7 +125,8 @@ watch(
     errors.value = []
     const preIds = props.preselectedTaskIds ?? []
     const preTask = props.tasks.find((t) => t.taskId === preIds[0])
-    domainKey.value = props.defaultDomainKey ?? preTask?.domainKey ?? props.domainOptions[0]
+    // 预填任务自身的域最精确（Drawer 单条入口可能来自别的域）→ 其次页面当前域 → 最后退到首个选项
+    domainKey.value = preTask?.domainKey ?? props.defaultDomainKey ?? props.domainOptions[0]
     await rebuildRows(preIds)
   },
   { immediate: true }
@@ -164,7 +191,7 @@ function onSubmit(): void {
       <ElFormItem label="任务目标" required>
         <ElTable
           ref="tableRef"
-          :data="rows"
+          :data="pagedRows"
           size="small"
           border
           max-height="340"
@@ -172,7 +199,7 @@ function onSubmit(): void {
           style="width: 100%"
           @selection-change="onSelectionChange"
         >
-          <ElTableColumn type="selection" width="44" />
+          <ElTableColumn type="selection" width="44" reserve-selection />
           <ElTableColumn prop="taskNo" label="任务号" width="110" />
           <ElTableColumn prop="orderNo" label="订单号" width="130">
             <template #default="{ row }">
@@ -217,8 +244,20 @@ function onSubmit(): void {
           </ElTableColumn>
         </ElTable>
 
+        <ElPagination
+          v-model:current-page="page"
+          v-model:page-size="pageSize"
+          :total="rows.length"
+          :page-sizes="[20, 50, 100]"
+          layout="total, sizes, prev, pager, next, jumper"
+          size="small"
+          background
+          class="d-pager"
+        />
+
         <div class="field-hint">
-          已选 <strong>{{ selected.length }}</strong> / {{ rows.length }} 个任务（当前排程域）
+          已选 <strong>{{ selected.length }}</strong> /
+          {{ rows.length }} 个任务（当前排程域；表格分页显示，勾选可跨页保留）
         </div>
       </ElFormItem>
 
@@ -266,5 +305,9 @@ function onSubmit(): void {
 }
 .muted-text {
   color: var(--el-text-color-secondary);
+}
+.d-pager {
+  margin-top: 8px;
+  justify-content: flex-end;
 }
 </style>

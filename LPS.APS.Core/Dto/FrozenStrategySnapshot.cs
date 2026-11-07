@@ -120,7 +120,7 @@ public sealed class PrioritySegment
     /// 条件组（路线甲 DNF：**组内 AND、组间 OR**；3号位实施包 v1.0 §一.4）。
     /// 例「1 并 2 并(3 或 4)」＝组A{1,2,3}、组B{1,2,4}，命中＝任一 AND 组全成立。
     /// 可选特性：<c>null</c> 或空列表＝回退 <see cref="MatchConditions"/>（存量行为不变，向后兼容）；
-    /// 匹配器先读此组、组空才回退平铺。运行侧（A系 DNF）须由 1号位 接线后才生效，
+    /// 匹配器先读此组、组空才回退平铺。运行侧（A系 DNF）须由 2号位 接线后才生效，
     /// 在此之前发布投影/校验对非空条件组 fail-closed（实施包 §五 空转声明）。
     /// </summary>
     public List<SegmentConditionGroup>? MatchConditionGroups { get; set; }

@@ -31,7 +31,7 @@
  * 所以前端拿到的是 `undefined` 而不是 `null`，判空一律用 `== null`。
  */
 
-import type { IsoDateTime } from './common'
+import type { IsoDateTime, OrderRiskLevel } from './common'
 
 /**
  * 订单列表一行（= 后端 `OrderListItemDto`，`OrderQueryDtos.cs:6-35`）
@@ -75,8 +75,33 @@ export interface OrderListItemDto {
    * 故此处用 `string` 而非窄联合：前端按冻结词表渲染、遇未知值原样降级，绝不做枚举校验（否则整表渲染空标签）。
    */
   status: string
-  /** 延迟状态；冻结 `07:2666` 值域 `ON_TIME / FIRST_DELAY / REPEATED_DELAY`，V1 简化超期均记 FIRST_DELAY */
+  /**
+   * 延迟状态（`Order.DelayStatus`）—— **ERP/ODS 独立维度**，冻结 `07:2688` / `07:2666`，
+   * 值域 `ON_TIME / FIRST_DELAY / REPEATED_DELAY`（V1 简化超期均记 FIRST_DELAY）。
+   *
+   * ⚠️ **不得当「本版本是否延期」的标签用**：冻结 `01 §64` 红线明文禁止用 `Order.DelayStatus`
+   *   替代当前 PlanVersion 的交付结果。页面上的交付判定一律读 `riskLevel`。
+   *   本字段保留在 DTO 里（后端仍返、筛选仍可按它筛），但前端不再据此渲染状态标签。
+   */
   delayStatus?: string
+  /**
+   * 交付风险等级 —— **计划派生**判定（5号位 2026-11-02 答复函 §一 Q1 选甲新增）。
+   *
+   * 判定 = 冻结 `01 §64` 唯一判定：`本版本有 Task 且 MAX(PlannedEndTime) > CustomerDueDate`
+   * ⇒ `DELAYED`；有 Task 且未超交期 ⇒ `ON_TRACK`（按期与提前同归此值）。
+   *
+   * **缺键语义（关键）**：本版本**无 Task（未排产）或无交期** ⇒ 后端整键省略
+   *   （`WhenWritingNull`）⇒ 前端渲染「未排产」，**绝不能落进「按期」**。
+   *
+   * dev 实测（2026-11-02，r14009 已部署）：v999333 共 310 单 —— `DELAYED` 1 单
+   *   （O20630651，同时 `delayStatus=ON_TIME`，正是原「未延迟 + 超期 15.4 天」打架那一单）、
+   *   其余 309 单缺键（未排产）；v999334 共 53 单 —— `ON_TRACK` 1 单、其余 52 单缺键。
+   *
+   * ⚠️ **只有列表端点带这个字段**：详情端点 `GET /api/order-query/{id}` 的 `order` 是另一条
+   *   SQL，**不返 `riskLevel` / `delayHours` / `plannedCompletionTime`**（dev 实测）⇒
+   *   抽屉要显示计划派生结论，只能取**打开抽屉的那一行列表数据**，不能对详情响应判空。
+   */
+  riskLevel?: OrderRiskLevel
   /**
    * 需求成熟度 —— **V1 冻结严格 NULL**（`07:244`「禁止从任何字段临时推断」），
    * 不是「还没填」而是「V1 不会有值」⇒ 前端不渲染，也不做任何推断。
@@ -158,16 +183,28 @@ export interface OrderDetailDto {
 /**
  * 订单状态聚合（`OrderSummaryDto.cs:6-25`）
  *
- * `riskCount` / `unscheduledCount` 的口径见各字段注释 —— 前端**不渲染**这两项，
- * 理由见文件内说明与 5号位 2026-10-17 回执 §2.3。
+ * ⚠️ **2026-11-02 口径全换（5号位 r14009 答复函 §二）**：三桶（`onTimeCount` /
+ * `delayedCount` / `unscheduledCount`）**全部改为计划派生** —— 判据与列表 `riskLevel` 同源
+ * （冻结 `01 §64`：`本版本有 Task 且 MAX(PlannedEndTime) > CustomerDueDate` 即为延期）。
+ * 原口径（按 `o.DelayStatus` 聚合 = ERP 维度）已废除：那是「两个世界」，
+ * 会让 KPI 与格子各说各话（v999333 曾出现「格子未延迟 / KPI 延迟 0」）。
+ *
+ * **恒等式**：`onTimeCount + delayedCount + unscheduledCount === totalCount`（三桶互斥且穷尽）
+ * ⇒ 可直接作探针断言。dev 实测：v999333 `310 = 0 + 1 + 309`、v999334 `53 = 1 + 0 + 52`。
+ *
+ * `riskCount` 仍是另一张表（`OrderScheduleSummary`，dev 0 行、当前无写入方）⇒ 前端**不渲染**。
  */
 export interface OrderSummaryDto {
   planVersionId: number
   /** 该版本订单总数（`COUNT(*)`，与列表 `total` 同 WHERE 口径） */
   totalCount: number
-  /** `DelayStatus = 'ON_TIME'`；**NULL 不计入**（5号位 10-17 修正，NULL = 未计算 ≠ 按期） */
+  /**
+   * 按期单数（**计划派生**）：本版本**有 Task** 且未超交期。
+   *
+   * ⚠️ 不含「无交期」与「未排产」—— 那两类归 `unscheduledCount`（缺键 ⇒ 未排产/不可判定）。
+   */
   onTimeCount: number
-  /** `DelayStatus IN ('FIRST_DELAY','REPEATED_DELAY')` */
+  /** 延期单数（**计划派生**）：本版本有 Task 且超交期（`MAX(PlannedEndTime) > CustomerDueDate`） */
   delayedCount: number
   /**
    * `OrderScheduleSummary.RiskLevel IN ('AT_RISK','DELAYED')`（冻结 `07:4965` RiskLevel 值域）。
@@ -178,10 +215,11 @@ export interface OrderSummaryDto {
    */
   riskCount: number
   /**
-   * ⚠️ 前端**不渲染**：后端 SQL 写死 `CAST(0 AS INT)`（`OrderQueryRepository.cs:271`）——
-   * 恒 0 是后端的字面量，不是查出来的数。原口径 `Status='UNSCHEDULED'` 不在冻结
-   * `07:3474` 的 `OPEN/CLOSED/CANCELLED` 里；「未排」目前无权威字段可查
-   * （冻结 `07 §6.6a` 规划采购占位仅内存不建表），2号位口径未定前显示这个数就是编数据。
+   * 未排产 / 不可判定单数（**计划派生**，2026-11-02 起为**实值**，不再是 `CAST(0 AS INT)` 字面量）：
+   * 本版本**无 Task 行**（未排产）**或无交期**的订单数。
+   *
+   * 与 `onTimeCount + delayedCount` 互斥且穷尽 ⇒ 三桶之和恒等于 `totalCount`。
+   * dev 实测：v999333 = 309、v999334 = 52（这两个真实小版本「绝大多数未排产」是正常形态，勿当异常）。
    */
   unscheduledCount: number
 }

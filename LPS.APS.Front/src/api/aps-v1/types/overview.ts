@@ -33,7 +33,20 @@ export interface ActiveVersionPanel {
   activatedAt?: IsoDateTime | null
   sourceScheduleRunId?: number | null
   /** 以下为后端附加字段（可选消费） */
+  /**
+   * 计划任务数（PlanVersion 表冗余列，`OverviewQueryRepository.cs:135` `ISNULL(TotalTasks,0)`）。
+   * 页面在「当前生效版本」卡里展示此值。
+   */
   totalTasks?: number
+  /**
+   * 计划订单数（PlanVersion 表冗余列）。
+   *
+   * ⚠️ **与实时计数不一致，页面暂不渲染**：dev 实测 planVersionId=999334
+   *   本列 = 53，而 `/api/order-query/summary` 的 `TotalCount`
+   *   （`OrderQueryRepository.cs:307+` = `COUNT(*) FROM [Order] WHERE PlanVersionId=@Id`）= 55。
+   *   同页两个数字打架 ⇒ 页面不展示这一列（展示实时值即可），差额已出函请 5号位 核对
+   *   （冗余列是登记时的快照，还是实时维护？）。**不要**在页面把两个数并排显示。
+   */
   totalOrders?: number
   createdAt?: IsoDateTime
 }
@@ -60,13 +73,26 @@ export interface OverviewResourceBottleneck {
    *
    * ⚠️ 后端当前是 `NULL AS UtilizationRate` **占位字面量**（`OverviewQueryRepository.cs:91`），
    *   可用工时来自三级日历，尚未接入 ⇒ 恒缺键/恒 null。前端显示 `-`，不拿它算百分比。
+   *
+   * 📌 **口径已锁、落地时点 = V1.1**（5号位 2026-11-02 复函 §二；冻结 `01 §77A.1` 负荷率后移 V1.1，
+   *   前移申请已终止，不再提）：
+   *   - 分子 = **工时口径**（任务工时按桶重叠**切分**后求和；V1.1 拟名 `loadHoursInBucket`）；
+   *     ⛔ **墙钟 `occupiedHours` 方案已撤回** —— 跨天任务 119 条，夜间时段不是产能占用，
+   *        按墙钟算会把正常排产天天标成超载（假负荷信号）。
+   *   - 分母 = `availableHours`（三级合并窗口 ∩ 桶；授权加班计入；未登记 = 缺键 ≠ 0）—— 这半边未被证伪，V1.1 沿用。
+   *   - 分母缺键 ⇒ 不判。⛔ `loadHours`（整条任务工时计入**起点桶**）仍**禁止**直接作分子
+   *      （日桶宽下必然虚高：40 h 任务起点周一 ⇒ 周一格 444%）；修法 = 按桶**切分工时**，不是切墙钟。
+   *   - ⛔ **超载判定不随本轮落地**：将来若做，判据同为工时口径（Σ工时In桶 > 可用窗口分钟），
+   *      且需 0号位 定「回归仪表 vs 告警」定位。
    */
   utilizationRate?: number | null
   /**
    * ⚠️ 当前**恒 false 且是字面量**（`OverviewQueryRepository.cs:93` `0 AS IsBottleneck`），
    *   同块注释自陈「Bottleneck判定应由 2号位 正式Query提供，5号位 不做二次计算」。
    * ⇒ `false` 区分不了「判定为非瓶颈」与「未判定」，**前端不得据此渲染「正常」**。
-   *   待 5号位 落地 2026-09-21 R1 契约（删 `isBottleneck`，改 `availableHours/plannedHours/loadRate`）后重写。
+   *
+   * 📌 **不要等 2026-09-21 R1 契约**：那一版（C2/C3 段）已于 **2026-09-22 作废**，
+   *   `availableHours / plannedHours / loadRate` **不会再来**。现行口径见上（工时分子 / `availableHours`）。
    */
   isBottleneck: boolean
   /** 资源级「明确停机」窗口（ResourceCalendarSlot.AvailableFlag = 0），

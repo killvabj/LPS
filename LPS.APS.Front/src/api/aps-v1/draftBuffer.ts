@@ -24,7 +24,12 @@ import {
   lookupParameterLimits,
   type ParameterEnumOption
 } from './parameterSetEnums'
-import { findBlockField, isInertBlockField } from './parameterBlockFields'
+import {
+  findBlockField,
+  isInertBlockField,
+  isHiddenBlockField,
+  isReadonlyBlockField
+} from './parameterBlockFields'
 
 /* ===== 类型 ===== */
 
@@ -55,6 +60,10 @@ export interface ParameterRow {
   step?: number
   /** 运行期无消费者（3号位 2026-10-26 核证口径）⇒ 行上标「暂未生效」 */
   inert?: boolean
+  /** 维护面隐藏（C/E/F/H 类）⇒ 页面不渲染；**值仍在快照里，保存原样回写** */
+  hidden?: boolean
+  /** D 类 V1 固定 ⇒ 只读展示（editable 同时为 false） */
+  fixed?: boolean
   /** 启发式推断是否敏感 */
   sensitive: boolean
   /** 启发式推断是否可编辑 */
@@ -78,6 +87,9 @@ export function flattenBlocks(blocks: ParameterSetBlocks): ParameterRow[] {
     walkObject(obj, [], (path, value) => {
       const keyPath = path.join('.')
       const def = findBlockField(block, keyPath)
+      // 维护责任分类只影响维护面：隐藏行不渲染，D 类只读；载荷始终原样回写。
+      const hidden = isHiddenBlockField(block, keyPath)
+      const fixed = isReadonlyBlockField(block, keyPath)
       // 数组：只有字段目录声明为「文本清单」且确是字符串数组时才可编辑，
       //   其余数组（对象数组等）保持只读一行 JSON —— 通用单值控件表达不了。
       if (Array.isArray(value)) {
@@ -89,8 +101,10 @@ export function flattenBlocks(blocks: ParameterSetBlocks): ParameterRow[] {
           type: isTextList ? 'TEXT_LIST' : 'STRING',
           label: def?.label,
           inert: isInertBlockField(block, keyPath),
+          hidden,
+          fixed,
           sensitive: isSensitive(keyPath),
-          editable: isTextList ? isEditable(keyPath) : false
+          editable: !hidden && !fixed && isTextList && isEditable(keyPath)
         })
         return
       }
@@ -107,8 +121,10 @@ export function flattenBlocks(blocks: ParameterSetBlocks): ParameterRow[] {
         max: limits.max,
         step: def?.step,
         inert: isInertBlockField(block, keyPath),
+        hidden,
+        fixed,
         sensitive: isSensitive(keyPath),
-        editable: isEditable(keyPath)
+        editable: !hidden && !fixed && isEditable(keyPath)
       })
     })
   }

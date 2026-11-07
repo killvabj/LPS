@@ -249,7 +249,12 @@ public class PeggingOrchestrator : IPeggingOrchestrator
                     // R08（0号位 2026-10-28 R07/R08 更正回复 §5）：把「无前产品」的**成因**随 Task 级
                     //   ExplainTrace 落库 —— 1号位 载荷上「可信确无前产品」与「执行/基础计划事实缺失」
                     //   同形（都是 fromMaterialId=null），此处用本域可证事实把它变成可查的一行。
-                    DescribeSetupInitialStateEvidence(request, solveRequest.ExecutionConstraints?.Count ?? 0));
+                    DescribeSetupInitialStateEvidence(request, solveRequest.ExecutionConstraints?.Count ?? 0),
+                    // Stage 闸（5号位 2026-11-07 §一.3）：`Baselines − E` 只在这里存在（内存、不落库），
+                    //   而第三项 `UnreportedOwnCreated` 只能在落库事务内取到（要读本事务内的 `TaskDispatch`）。
+                    //   ⇒ 两数必须在落库段会合。传的是 **1号位 求解器本轮真用的那一份**（同一个对象），
+                    //     不重算 —— 重算会与求解器的封顶值分叉，两处门禁对不上。
+                    solveRequest.PiStageQuantityBaselines);
             persistSw.Stop();
             _logger.LogInformation(
                 "[Pegging] 统一事务落库: Task={Tasks}, Pegging={Pegging}, SupplyAllocation={Alloc}",
@@ -1523,7 +1528,8 @@ public class PeggingOrchestrator : IPeggingOrchestrator
             IReadOnlyList<MaterialStageDepartmentContextDto>? deptContexts = null,
             IReadOnlySet<(int MaterialId, string StageCode, string RouteCode, long PathId, string OperationCode)>? nonResourceOperations = null,
             SupplyPool? supplyPool = null,
-            string? setupInitialStateEvidence = null)
+            string? setupInitialStateEvidence = null,
+            IReadOnlyList<PiStageQuantityBaseline>? stageBaselines = null)
     {
         return await _connectionManager.ExecuteInTransactionAsync<(List<ApsTask>, int, int)>(
             async (conn, tx) =>
@@ -1762,6 +1768,16 @@ public class PeggingOrchestrator : IPeggingOrchestrator
                     .ToDictionary(r => r.PI!, r => r.Qty, StringComparer.Ordinal);
 
                 // MES 已有工单计划量（按 PI 汇总；无 Run 则为空 ⇒ 无法建 C 桶单，见下）
+                //
+                // ── `O31`：**只剔 `DELETED`，别的状态一个都不许剔**（5号位 2026-11-07 §一 认此项）──
+                //   ▸ `DELETED` = **取消释放**：工单已取消，其计划量不该再占 `Q`。剔它是在纠正实现偏差
+                //     （原注释写「在册工单」，可执行语句却把全状态都算了）。
+                //   ▸ `CLOSED` **必须保留**，这是本项唯一容易连坐的地方：总量闸的 `Q` 是**订单毛量**（不减 `Received`），
+                //     已完工 `CLOSED` 工单的计划量正是「已生产占用」在这本账上的**唯一记法**。
+                //     **把 `CLOSED` 剔掉 ＝ 已完工量会被再建一遍单。**
+                //   ▸ `RELEASED` / `IN_PROGRESS` 同样保留（在制占用）。⇒ 判据是「**取消才放、完工不放**」，不是「只要不是进行中就放」。
+                //   ▸ 用 `ISNULL(...,'')` 包一层：`<> 'DELETED'` 遇 NULL 求值为 UNKNOWN ⇒ 状态为 NULL 的工单会被**静默剔掉**，
+                //     那是把「状态未知」当成「已取消」，方向错了。
                 var piWoQty = new Dictionary<string, decimal>(StringComparer.Ordinal);
                 if (runIdForDispatch is > 0)
                 {
@@ -1769,6 +1785,7 @@ public class PeggingOrchestrator : IPeggingOrchestrator
                                  @"SELECT ProductionInstructionNo AS PI, SUM(PlannedQty) AS Qty
                                    FROM MESWorkOrderSnapshot
                                    WHERE ScheduleRunId = @Run AND PlannedQty > 0
+                                     AND ISNULL(WorkOrderStatus, '') <> 'DELETED'
                                    GROUP BY ProductionInstructionNo",
                                  new { Run = runIdForDispatch.Value }, transaction: tx))
                         if (!string.IsNullOrEmpty(r.PI)) piWoQty[r.PI!] = r.Qty;
@@ -1797,6 +1814,81 @@ public class PeggingOrchestrator : IPeggingOrchestrator
                     var wo = piWoQty.TryGetValue(kv.Key, out var w) ? w : 0m;
                     piFreeQty[kv.Key] = Math.Max(kv.Value - wo, 0m);
                 }
+
+                // ── Stage 闸（5号位 2026-11-07《pending 认①…》§一.3；四项确认全认）──────────────
+                //   free(PI,M,S) = Max( Baselines − E − 第三项(UnreportedOwnCreated), 0 )
+                //
+                //   ⚠ 第三项**减在封顶上、不减在提案上**：
+                //     1号位 求解器已把 `final.Quantity` 封在 `StageFreeEligibleQty − AlreadyCommittedQty`
+                //     以内（`PhaseTwoInitialScheduler`：`stageFree = StageFreeEligibleQty - AlreadyCommittedQty`，
+                //     另按 V1_4 NEW-04 把本 Run 已成批折进已占）⇒ 若再对 `final.Quantity` 减第三项，
+                //     提案本就低于封顶时会被**双重扣减**。
+                //     故先算封顶 `Baselines − E`，再令 `alloc = min(总量闸, 封顶 − 第三项, 提案)`。
+                //     ⇒ 第三项为 0 时（今日 `TaskDispatch.StageCode` 全 NULL）本段与前**完全等价**。
+                //
+                //   ⚠ 基线缺失 ⇒ **不施 Stage 闸**，只走总量闸，并逐键留痕（5号位 确认 #4：
+                //     「未知 ≠ 零」，与其 `FailureCode`「结果未知不判失败」同向）。
+                //   纯算式在 `StageFreeQuantityGate`（可单测）；此处只负责取数与调用。
+                var stageCap = StageFreeQuantityGate.BuildCap(stageBaselines);
+
+                var stageThirdTerm = new Dictionary<StageFreeQuantityGate.Key, decimal>();
+                var stageThirdNullWorkOrder = 0;
+                if (runIdForDispatch is > 0 && stageCap.Count > 0)
+                {
+                    // 第三项谓词（5号位 原样，不做 PV 收敛 —— 该量是「我方已建、MES 证据未到」的跨轮欠账）：
+                    //   DispatchStatus='CREATED' AND StageCode IS NOT NULL AND
+                    //   ( 工单号 ∉ 当期 Run 快照 OR (工单号 ∈ 快照 AND WorkOrderStatus='RELEASED') )
+                    // 规模上界 = 全部 CREATED 行（今日 65,964），分组后行数小；且**必须在事务内读**，
+                    //   否则看不见本事务刚写的 A/B 行。**不加 `IN (...)` 大列表**（2,100 参数上限）。
+                    foreach (var r in await conn.QueryAsync<PiStageQtyRow>(
+                                 @"SELECT d.ProductionInstructionNo AS PI, d.MaterialId, d.StageCode, SUM(d.Quantity) AS Qty
+                                   FROM [TaskDispatch] d
+                                   WHERE d.DispatchStatus = 'CREATED'
+                                     AND d.StageCode IS NOT NULL AND d.StageCode <> ''
+                                     AND d.ProductionInstructionNo IS NOT NULL
+                                     AND d.MESWorkOrderNo IS NOT NULL
+                                     AND ( NOT EXISTS (SELECT 1 FROM MESWorkOrderSnapshot s
+                                                       WHERE s.ScheduleRunId = @Run AND s.MESWorkOrderNo = d.MESWorkOrderNo)
+                                        OR EXISTS (SELECT 1 FROM MESWorkOrderSnapshot s
+                                                   WHERE s.ScheduleRunId = @Run AND s.MESWorkOrderNo = d.MESWorkOrderNo
+                                                     AND s.WorkOrderStatus = 'RELEASED') )
+                                   GROUP BY d.ProductionInstructionNo, d.MaterialId, d.StageCode",
+                                 new { Run = runIdForDispatch.Value }, transaction: tx))
+                    {
+                        if (r.PI is null || r.StageCode is null) continue;
+                        stageThirdTerm[new StageFreeQuantityGate.Key(r.PI, r.MaterialId, r.StageCode)] = r.Qty;
+                    }
+
+                    // `CREATED` 语义即「工单已存在」⇒ 无工单号是脏行。不计入第三项（不多减），但必须响亮。
+                    stageThirdNullWorkOrder = await conn.ExecuteScalarAsync<int>(
+                        @"SELECT COUNT(*) FROM [TaskDispatch]
+                          WHERE DispatchStatus = 'CREATED' AND MESWorkOrderNo IS NULL
+                            AND StageCode IS NOT NULL AND StageCode <> ''",
+                        transaction: tx);
+                }
+
+                // 封顶 − 第三项；第三项有、基线无 ⇒ 无从扣（该键本就没有 Stage 闸），单独计数。
+                var stageFreeQty = new Dictionary<StageFreeQuantityGate.Key, decimal>(stageCap);
+                var thirdApply = StageFreeQuantityGate.ApplyThirdTerm(stageFreeQty, stageThirdTerm);
+                var stageThirdWithoutBaseline = thirdApply.WithoutBaselineGroups;
+
+                if (stageThirdTerm.Count > 0 || stageThirdNullWorkOrder > 0 || stageThirdWithoutBaseline > 0)
+                {
+                    _logger.LogInformation(
+                        "[PeggingPersist] Stage 闸第三项快照：Run={Run}／基线键 {BaselineKeys} 个／" +
+                        "第三项 {ThirdKeys} 组 Σ={ThirdSum}／无基线可扣 {NoBaseline} 组／" +
+                        "CREATED 缺工单号 {NullWo} 行（未计入）",
+                        runIdForDispatch, stageCap.Count, stageThirdTerm.Count,
+                        stageThirdTerm.Values.Sum(), stageThirdWithoutBaseline, stageThirdNullWorkOrder);
+                    if (stageThirdNullWorkOrder > 0)
+                        _logger.LogWarning(
+                            "[PeggingPersist] 有 {Count} 行 `CREATED` 却无 `MESWorkOrderNo`（StageCode 非空）——" +
+                            "`CREATED` 的语义是「工单已存在」，这些行违义，第三项**不**计入它们；请查下发回写。",
+                            stageThirdNullWorkOrder);
+                }
+                // C 桶「无投影键」留痕（5号位 确认 #4：仅总量闸 + 日志须带 (PI,M,S) 与原因）。
+                var stageGateNoBaselineCount = 0;
+                var stageGateNoBaselineSample = new List<string>(6);
 
                 // 只落「部门事实可解析」的 FinalTask（J14-06 Fail-Closed；缺口集合见上方分区与告警）。
                 // R08：Setup 分钟/来源的 **Task 级**落库缓冲（0号位 2026-10-28 §5：用既有轻量 `ExplainTrace`，
@@ -2027,9 +2119,33 @@ public class PeggingOrchestrator : IPeggingOrchestrator
                             && piFreeQty.TryGetValue(mtsInstructionNo, out var free) && free > 0m)
                         {
                             var alloc = Math.Min(free, final.Quantity);
+
+                            // ── Stage 闸：再封顶到 `Baselines − E − 第三项`（见本方法上部说明）──
+                            //   无 StageCode / 无投影键 ⇒ 不施此闸（5号位 确认 #4「未知 ≠ 零」），留痕后交给总量闸。
+                            var stageCodeKey = string.IsNullOrWhiteSpace(final.StageCode)
+                                ? string.Empty : final.StageCode!.Trim();
+                            var stageKey = new StageFreeQuantityGate.Key(mtsInstructionNo, final.MaterialId, stageCodeKey);
+                            var stageFree = 0m;
+                            var hasStageBaseline = stageCodeKey.Length > 0
+                                && stageFreeQty.TryGetValue(stageKey, out stageFree);
+                            if (hasStageBaseline)
+                            {
+                                alloc = Math.Min(alloc, stageFree);
+                            }
+                            else
+                            {
+                                stageGateNoBaselineCount++;
+                                if (stageGateNoBaselineSample.Count < 5)
+                                    stageGateNoBaselineSample.Add(
+                                        $"{mtsInstructionNo}/{final.MaterialId}/" +
+                                        (stageCodeKey.Length == 0 ? "<空StageCode>" : stageCodeKey));
+                            }
+
                             if (alloc > 0m)
                             {
                                 piFreeQty[mtsInstructionNo] = free - alloc;
+                                if (hasStageBaseline)
+                                    stageFreeQty[stageKey] = Math.Max(stageFreeQty[stageKey] - alloc, 0m);
                                 taskDispatchDrafts.Add(new TaskDispatchDraft
                                 {
                                     RowIndex               = rowIndex,
@@ -2171,11 +2287,73 @@ public class PeggingOrchestrator : IPeggingOrchestrator
                         orderIdUnresolved, taskPersistRows.Count, planVersionId);
                 }
 
+                // C 桶「无投影键」留痕（5号位 确认 #4：仅总量闸 + 日志须带 (PI,M,S) 与原因）。
+                if (stageGateNoBaselineCount > 0)
+                {
+                    _logger.LogWarning(
+                        "[PeggingPersist] Stage 闸：{Count} 条 C 桶候选无投影键（`(PI,物料,Stage)` 不在 " +
+                        "`PiStageQuantityBaselines` 内）⇒ 仅按总量闸封顶，**未施 Stage 闸**。样本：{Sample}",
+                        stageGateNoBaselineCount, string.Join("；", stageGateNoBaselineSample));
+                }
+
                 // ── A/B 桶下发绑定登记 ──────────────────────────────────────────────
                 //   为什么必须写：`ResolveTaskNo` 的 A 桶分支靠 `SELECT … FROM TaskDispatch WHERE SourcePlanVersionId <> 当前PV`
                 //   反查旧 TaskNo；该表此前**无任何写入方**（0 行）⇒ 每轮都查不到 ⇒ 每轮都是 B 桶、每轮造新号，
                 //   跨版本连续性**一次都没生效过**。写入后，从下一轮起 A 桶即可命中。
                 //   数量级：A/B 桶实测仅数百条（PV999329 为 283 条），逐条参数化 INSERT 足够，不必上批量。
+                //
+                //   【2026-11-07 轮清移出条件分支】原先把 `DELETE … PENDING` 放在
+                //   `if (taskDispatchDrafts.Count > 0)` 内 ⇒ **本轮零草案时一条都不清**，上轮 PENDING 留存。
+                //   5号位 2026-11-07 §二.1 认①：PENDING 不承载任何跨轮事实 ⇒ **每轮无条件轮清**，与有无草案无关。
+                //   ── `O33` 范围修正（5号位 2026-11-07 §三 已裁）──────────────────────────────
+                //   原缺陷：条件是 `SourcePlanVersionId = @Pv`，而上一轮的 PENDING 是**旧 PV** 写的
+                //     ⇒ 那条永远删不到，僵尸「建单意图」可能在下轮被当成合法意图建成一张过期单。
+                //   口径（逐字认其裁决）：
+                //     ① `@RunStartedAt` 必须是 **Run 级起点**（全 Run 各域共享），**不是**各域轮次开始时刻 ——
+                //        否则 A 域先落库写的 PENDING 会被 B 域轮清判成「早于起点」而删掉（跨域误伤）。
+                //     ② 补口：同域在本 Run 内出过第二个 PV 时，其上一 PV 的 PENDING 创建时刻**晚于** Run 起点、
+                //        时间分支删不到 ⇒ 再加「本域本 Run 的 PV 集合」一支。**时间戳不能代替域界。**
+                //     ③ 原则：**清 = 清自己，别借时间戳越界** ⇒ 时间分支必须与「本域」条件 AND，不能单选时间。
+                //
+                //   ── `O35` 租约回收（`PROCESSING` 僵尸）────────────────────────────────────
+                //   `UpdatedAt` 全 NULL 且该列无 DEFAULT（我方落库不写它）⇒ **不能裸判**，否则谓词永不成立。
+                //   5号位 已确认：W5 抢占时写 `UpdatedAt`、回写时也写，一律本地时间 ⇒ `COALESCE` 兜住历史行成立。
+                //   回收动作 = **回置 `PENDING`**，由本轮重建单；MES 按参考号幂等返原单，不会出双单。
+                //   阈值 30 分钟（≥ 2× MES 调用超时），5号位 已认可。
+                var runStartedAt = (runIdForDispatch is > 0
+                        ? await conn.ExecuteScalarAsync<DateTime?>(
+                            "SELECT StartedAt FROM ScheduleRun WHERE Id = @Run",
+                            new { Run = runIdForDispatch.Value }, transaction: tx)
+                        : null)
+                    ?? now;   // Run 无 StartedAt ⇒ 取本事务时刻：时间分支只会少删、不会多删（保守方向）
+
+                var reclaimedLease = await conn.ExecuteAsync(
+                    @"UPDATE [TaskDispatch]
+                      SET DispatchStatus = 'PENDING', UpdatedAt = @Now
+                      WHERE DispatchStatus = 'PROCESSING'
+                        AND COALESCE(UpdatedAt, CreatedAt) < DATEADD(MINUTE, -30, @Now)
+                        AND SourcePlanVersionId IN (SELECT Id FROM PlanVersion WHERE DomainKey = @Domain)",
+                    new { Now = now, Domain = voucher.DomainKey }, transaction: tx);
+                if (reclaimedLease > 0)
+                    _logger.LogWarning(
+                        "[PeggingPersist] 租约回收：{Count} 条 `PROCESSING` 超 30 分钟未回写，已回置 `PENDING`（Domain={Domain}）。" +
+                        "若持续出现，说明 W5 侧 MES 调用卡住或回写失败。",
+                        reclaimedLease, voucher.DomainKey);
+
+                var purgedPending = await conn.ExecuteAsync(
+                    @"DELETE FROM [TaskDispatch]
+                      WHERE DispatchStatus = 'PENDING'
+                        AND SourcePlanVersionId IN (SELECT Id FROM PlanVersion WHERE DomainKey = @Domain)
+                        AND ( SourcePlanVersionId = @Pv
+                              OR CreatedAt < @RunStartedAt
+                              OR SourcePlanVersionId IN (SELECT Id FROM PlanVersion
+                                                         WHERE DomainKey = @Domain AND SourceScheduleRunId = @Run) )",
+                    new { Pv = planVersionId, Run = runIdForDispatch ?? 0, RunStartedAt = runStartedAt }, transaction: tx);
+                if (purgedPending > 0)
+                    _logger.LogInformation(
+                        "[PeggingPersist] 清理上轮 PENDING 下发行：{Count} 条（PV={Pv}／Domain={Domain}／RunStart={RunStart:yyyy-MM-dd HH:mm:ss}）",
+                        purgedPending, planVersionId, voucher.DomainKey, runStartedAt);
+
                 if (taskDispatchDrafts.Count > 0)
                 {
                     var dispatchRows = taskDispatchDrafts
@@ -2201,14 +2379,7 @@ public class PeggingOrchestrator : IPeggingOrchestrator
                         })
                         .ToList();
 
-                    // PENDING 是「本轮待建单意图」，非事实 ⇒ 每轮先清后写，避免跨轮累积。
-                    //   CREATED 是事实（A 桶 TaskNo 继承靠它反查），**不得删**。
-                    var purgedPending = await conn.ExecuteAsync(
-                        "DELETE FROM [TaskDispatch] WHERE SourcePlanVersionId = @Pv AND DispatchStatus = 'PENDING'",
-                        new { Pv = planVersionId }, transaction: tx);
-                    if (purgedPending > 0)
-                        _logger.LogInformation("[PeggingPersist] 清理上轮 PENDING 下发行：{Count} 条（PV={Pv}）",
-                            purgedPending, planVersionId);
+                    // 轮清已上移到本分支**之外**（2026-11-07，见上方注释）：零草案轮次也必须清。
 
                     // 【2026-11-06 性能】原为逐条参数化 INSERT。C 桶上线后行数从「数百」变成「可能上万」
                     //   （每行一次往返，同类表实测 226s/365,545 行）⇒ 改 SqlBulkCopy（泛型重载，接受 IDbConnection）。
@@ -4469,14 +4640,22 @@ public class PeggingOrchestrator : IPeggingOrchestrator
     }
 
     /// <summary>Lock类型（§8）</summary>
+    /// <summary>
+    /// 硬锁类型 —— **只承载「供需之间的人为绑定关系」**（B4 §5.4）。
+    ///
+    /// 【为什么没有 EXECUTION】「供给已被不可逆消耗（已投料/已发货）」是**执行事实**，
+    /// 由 <c>ExecutionConstraintProjector</c> 经 <c>ExecutionConstraints</c> 通道承载，
+    /// 不经 <c>DemandSupplyHardLock</c>。历史上这里曾有 <c>EXECUTION</c> 一支，
+    /// 但锁装载侧的映射（<c>LoadActiveLockDataAsync</c>）从不产出该值 ⇒ 消费侧判定恒为假、
+    /// 从不生效，属「看着有防护、实际没有」的死分支，2026-11-07 按 B4 §5.4 删除。
+    /// 若将来真要让执行事实参与分配，请接 <c>ExecutionConstraints</c>，不要在此复活该分支。
+    /// </summary>
     private enum LockType
     {
         /// <summary>严格绑定：1对1强绑定，其他需求完全不可用</summary>
         STRICT_BINDING,
         /// <summary>需求保护：1对N保护，保护组内需求可用，组外不可用</summary>
-        DEMAND_PROTECTION,
-        /// <summary>执行锁：不可逆事实（已投料、已发货），不得再分配</summary>
-        EXECUTION
+        DEMAND_PROTECTION
     }
 
     /// <summary>Allocation记录（用于Supply侧追溯）</summary>
@@ -6198,6 +6377,9 @@ public class PeggingOrchestrator : IPeggingOrchestrator
             {
                 foreach (var dbLock in locks)
                 {
+                    // 只映射「供需绑定关系」两类。`EXECUTION` 刻意**不**映射（B4 §5.4）：
+                    // 执行不可逆事实走 ExecutionConstraintProjector，若此处接上会让
+                    // 「表里写了 EXECUTION 锁」变成「整条供给对分配不可用」，与执行事实的真实语义不符。
                     var lockType = dbLock.LockType switch
                     {
                         "STRICT_BINDING" => LockType.STRICT_BINDING,
@@ -9768,6 +9950,15 @@ public class PeggingOrchestrator : IPeggingOrchestrator
     /// <summary>PI → 数量（2026-11-06，C 桶自由量计算用）。</summary>
     private sealed class PiQtyRow { public string? PI { get; set; } public decimal Qty { get; set; } }
 
+    /// <summary>Stage 闸第三项的分组行：`(PI, 物料ID, StageCode) → 量`（5号位 2026-11-07 §一.3）。</summary>
+    private sealed class PiStageQtyRow
+    {
+        public string? PI { get; set; }
+        public int MaterialId { get; set; }
+        public string? StageCode { get; set; }
+        public decimal Qty { get; set; }
+    }
+
     /// <summary>`TaskDispatch` 批量落库行（属性名 = 列名，供 SqlBulkCopy 泛型重载）。2026-11-06。</summary>
     private sealed class TaskDispatchRow
     {
@@ -13079,6 +13270,17 @@ public class PeggingOrchestrator : IPeggingOrchestrator
 
         var config = await _demandPriorityConfigProvider.GetPriorityConfigAsync(strategyProfileVersionId.Value, ct);
 
+        // ── 需求保护资格派生（B4 §三；`$.Lock` 的**唯一消费点**）─────────────────────────
+        //   时点必须在「分轮排序之前」——B4 §1.5：保护资格要先成为需求的真实属性，排序才能用它。
+        //   基准时点 = 本 Run 的 DataCutoffTime（`request.SnapshotAt`，与 `SupplyPool.DataCutoffTime` 同源）；
+        //   **不是** `FrozenStrategySnapshot.FrozenAt`（治理快照装载时刻，不作业务时钟）——
+        //   3号位 2026-10-20《B4 四项口径确认回执》#4 逐字裁决。
+        //   快照按 StrategyProfileVersionId 缓存，这里再取一次不额外读库。
+        var lockBlock = (await _frozenStrategySnapshotProvider
+            .GetFrozenStrategySnapshotAsync(strategyProfileVersionId.Value, ct)).Lock;
+        var protectionBasisTime = request.SnapshotAt == default ? DateTime.Now : request.SnapshotAt;
+        var protectionStatusByOrder = DeriveDemandProtectionStatus(lockBlock, orders, protectionBasisTime);
+
         // S5（PM 0923）：EXPEDITE 身份 = ScopeJsonV2.OrderTargets.OrderCanonicalId，仅 PriorityMode=EXPEDITE 时生效；
         // 作为「可调整 Demand 排序前置竞争层」传给 Executor（V1 全量重排：expedite 需求整体前置，层内仍按冻结策略竞争）。
         var expediteOrderCanonicalIds = await LoadExpediteOrderCanonicalIdsAsync(request, ct);
@@ -13136,7 +13338,12 @@ public class PeggingOrchestrator : IPeggingOrchestrator
                 // 库存消耗日（天，小数，越小越紧急）；null = 无可信日均 ⇒ 排序置末
                 StockConsumeDay      = stockConsumeDayByMaterial.TryGetValue(o.MaterialCode, out var scd) ? scd : null,
                 DelayStatus  = o.DelayStatus,   // 01 v1.13 :536 / Pegging v1.6 :257 需求排序可用条件
-                // ProtectionStatus：全库无该列（sys.columns 查无），保持 null（不造假）。
+                // 需求保护资格（B4 §3.1）：`PROTECTED` / `UNPROTECTED`，由冻结快照 `$.Lock.Trigger` 派生。
+                // 2026-11-07 起不再是 null —— 之前 `$.Lock` 装进快照零消费，导致执行器 `KnownFields`
+                // 里的 `PROTECTIONSTATUS` 恒 `null`、排序静默落 `DemandKey ASC` 兜底（B4 §二 #16）。
+                ProtectionStatus = protectionStatusByOrder.TryGetValue(o.OrderId, out var protectionStatus)
+                    ? protectionStatus
+                    : DemandProtectionTriggerEvaluator.UnprotectedStatus,
                 SourceDemand = o
             }).ToList();
 
@@ -13173,6 +13380,146 @@ public class PeggingOrchestrator : IPeggingOrchestrator
         }
 
         return map;
+    }
+
+    /// <summary>
+    /// 按冻结快照 `$.Lock.Trigger` 派生每条需求根的保护资格（B4 §三）。
+    ///
+    /// 【为什么单独一个方法】本方法只做「取事实 → 判 → 汇总诊断」，判定本身在
+    /// <see cref="DemandProtectionTriggerEvaluator"/>（纯函数、可单测）。这里负责三件汇总活：
+    /// <list type="number">
+    ///   <item>逐单判定，产出 <c>OrderId → PROTECTED/UNPROTECTED</c>；</item>
+    ///   <item><b>§3.4 不可评价必须显性</b>：某触发**已配置**、本 Run 却**一条都没命中** ⇒ 出
+    ///     <c>PROTECTION_TRIGGER_UNEVALUABLE</c> WARN，附「字段名／配置值／实测去重值」。
+    ///     挡住「配置为真、实际保护 0 条、日志无痕」。</item>
+    ///   <item><b>§3.5 人工保护为预留位</b>：`AllowPmcManualProtection` 为真时记一次 WARN。
+    ///     该位 A 层零依据、且 `DemandSupplyHardLock.SupplyKey NOT NULL` 使「尚未选供给的需求保护」
+    ///     无法表达 ⇒ **为真也不执行**（3号位 2026-10-20 回执 #3 已认此处理）。</item>
+    /// </list>
+    ///
+    /// 【为什么不抛错就不判了】单条需求缺事实（如 `CustomerDueDate` 为空）只让**该条**不保护并留痕，
+    /// 不连坐整批——B4 §3.1「无法判定的触发条件 ⇒ 不保护＋显性诊断」。
+    /// </summary>
+    private Dictionary<long, string> DeriveDemandProtectionStatus(
+        LockBlock? lockBlock,
+        IReadOnlyList<OrderPeggingRow> orders,
+        DateTime basisTime)
+    {
+        var statusByOrder = new Dictionary<long, string>(orders.Count);
+        var trigger = lockBlock?.Trigger;
+
+        if (trigger is null || orders.Count == 0)
+        {
+            foreach (var order in orders)
+                statusByOrder[order.OrderId] = DemandProtectionTriggerEvaluator.UnprotectedStatus;
+            return statusByOrder;
+        }
+
+        if (trigger.AllowPmcManualProtection)
+        {
+            // 预留位、当前 V1 不执行。每次 Run 一条，不按需求刷屏。
+            _logger.LogWarning(
+                "[Pegging][需求保护] $.Lock.Trigger.AllowPmcManualProtection=true，但 PMC 人工强制保护为**预留位**、"
+                + "当前 V1 不执行（B4 §3.5：A 层零依据 ＋ DemandSupplyHardLock.SupplyKey NOT NULL 使"
+                + "「尚未选供给的需求保护」无法表达）。该配置不会产生任何保护动作，配置改正后本告警自然消失。");
+        }
+
+        var hitsByTrigger = new Dictionary<DemandProtectionTriggerEvaluator.ProtectionTrigger, int>();
+        var gapCounts = new Dictionary<string, int>(StringComparer.Ordinal);
+        var protectedCount = 0;
+
+        foreach (var order in orders)
+        {
+            var facts = new DemandProtectionTriggerEvaluator.DemandFacts(
+                CustomerDueDate: order.DueDate,
+                DelayStatus: order.DelayStatus,
+                CustomerTier: order.CustomerTier,
+                OrderType: order.OrderType,
+                DemandMaturityStatus: order.DemandMaturityStatus);
+
+            var verdict = DemandProtectionTriggerEvaluator.Evaluate(lockBlock, facts, basisTime);
+            statusByOrder[order.OrderId] = verdict.Status;
+
+            if (verdict.IsProtected)
+            {
+                protectedCount++;
+                if (verdict.MatchedTrigger is { } matched)
+                    hitsByTrigger[matched] = hitsByTrigger.GetValueOrDefault(matched) + 1;
+            }
+
+            if (verdict.Gap is { Length: > 0 } gap)
+                gapCounts[gap] = gapCounts.GetValueOrDefault(gap) + 1;
+        }
+
+        // ── §3.4：已配置但零命中 ⇒ 显性诊断 ─────────────────────────────────────────
+        //   典型场景就是今日配置现状：ProtectedOrderTypes=["SO"] 而运行词表是
+        //   SALES_ORDER/PRODUCTION_INSTRUCTION ⇒ 该触发**永远**不命中，此前完全无痕。
+        foreach (var kind in Enum.GetValues<DemandProtectionTriggerEvaluator.ProtectionTrigger>())
+        {
+            if (!DemandProtectionTriggerEvaluator.IsConfigured(trigger, kind)) continue;
+            if (hitsByTrigger.ContainsKey(kind)) continue;
+
+            var field = DemandProtectionTriggerEvaluator.FactFieldOf(kind);
+            var observed = DescribeDistinctFacts(orders, kind);
+            _logger.LogWarning(
+                "[Pegging][需求保护] {Code}: {ConfigField} 已配置，但本 Run {OrderCount} 条需求**无一命中**该触发"
+                + "（判据字段 {Field}，实测去重值：{Observed}）⇒ 该触发本轮不产生任何保护，请核对配置值与运行词表是否一致。",
+                DemandProtectionTriggerEvaluator.UnevaluableDiagnosticCode,
+                DemandProtectionTriggerEvaluator.Describe(kind),
+                orders.Count,
+                field,
+                observed);
+        }
+
+        foreach (var (gap, count) in gapCounts.OrderByDescending(kv => kv.Value))
+        {
+            _logger.LogWarning(
+                "[Pegging][需求保护] 无法判定 {Count} 条需求（不保护、按未受保护处理）：{Gap}",
+                count, gap);
+        }
+
+        _logger.LogInformation(
+            "[Pegging][需求保护] 资格派生完成：需求 {Total} 条，受保护 {Protected} 条（{Detail}），基准时点 {Basis:yyyy-MM-dd HH:mm:ss}",
+            orders.Count, protectedCount,
+            string.Join("、", hitsByTrigger.Select(kv => $"{kv.Key}={kv.Value}")),
+            basisTime);
+
+        return statusByOrder;
+    }
+
+    /// <summary>
+    /// §3.4 诊断用：某触发判据字段在本 Run 需求里的**实测去重值**（截断到 8 个，避免刷屏）。
+    /// </summary>
+    private static string DescribeDistinctFacts(
+        IReadOnlyList<OrderPeggingRow> orders,
+        DemandProtectionTriggerEvaluator.ProtectionTrigger kind)
+    {
+        var values = kind switch
+        {
+            DemandProtectionTriggerEvaluator.ProtectionTrigger.RemainingTimeThreshold
+                => orders.Select(o => o.DueDate.ToString("yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture)),
+            DemandProtectionTriggerEvaluator.ProtectionTrigger.Delayed
+                => orders.Select(o => o.DelayStatus),
+            DemandProtectionTriggerEvaluator.ProtectionTrigger.VipTier
+                => orders.Select(o => o.CustomerTier),
+            DemandProtectionTriggerEvaluator.ProtectionTrigger.OrderTypes
+                => orders.Select(o => o.OrderType),
+            DemandProtectionTriggerEvaluator.ProtectionTrigger.MaturityStatus
+                => orders.Select(o => o.DemandMaturityStatus),
+            _ => Enumerable.Empty<string?>(),
+        };
+
+        var distinct = values
+            .Select(v => string.IsNullOrWhiteSpace(v) ? "<空>" : v!)
+            .Distinct(StringComparer.Ordinal)
+            .OrderBy(v => v, StringComparer.Ordinal)
+            .ToList();
+
+        if (distinct.Count == 0)
+            return "<无>";
+
+        var shown = string.Join(" | ", distinct.Take(8));
+        return distinct.Count > 8 ? $"{shown} …（共 {distinct.Count} 个去重值）" : shown;
     }
 
     /// <summary>
@@ -13235,11 +13582,13 @@ public class PeggingOrchestrator : IPeggingOrchestrator
     /// 3. 校验资格（Eligibility，当前版本暂不实现，待5号位规则引擎接入）
     /// 4. 校验Strict Binding
     /// 5. 校验Demand Protection
-    /// 6. 校验Execution不可逆事实
-    /// 7. 扣DemandBalance
-    /// 8. 扣SupplyBalance
-    /// 9. 此时生成AllocationSequence
-    /// 10. 生成逻辑Allocation/LedgerEntry
+    /// 6. 扣DemandBalance
+    /// 7. 扣SupplyBalance
+    /// 8. 此时生成AllocationSequence
+    /// 9. 生成逻辑Allocation/LedgerEntry
+    ///
+    /// （原第 6 步「校验 Execution 不可逆事实」恒为假、从未生效，2026-11-07 按 B4 §5.4 删除；
+    ///   执行事实走 ExecutionConstraintProjector / ExecutionConstraints，不经本方法。）
     ///
     /// 任何一步失败：Demand/Supply余额均不得部分修改（通过在所有校验通过后才执行扣减实现原子性）
     /// </summary>
@@ -13291,26 +13640,27 @@ public class PeggingOrchestrator : IPeggingOrchestrator
         if (protectionCap < allocQty)
             allocQty = protectionCap;
 
-        // Step 6: 校验Execution不可逆事实（Execution Lock）
-        // Execution Lock表示供给已被不可逆地消耗（如已投料、已发货），不得再分配
-        var executionLock = supply.Locks.FirstOrDefault(l => l.LockType == LockType.EXECUTION);
-        if (executionLock != null)
-            return AllocationResult.Failed($"Execution Lock violation: Supply {supply.SupplyKey} has been irreversibly consumed");
+        // 原 Step 6「校验 Execution 不可逆事实」已删除（2026-11-07，B4 §5.4）。
+        //   它读的是 `supply.Locks` 里 `LockType.EXECUTION` 的记录，而锁装载侧
+        //   （`LoadActiveLockDataAsync` 的 `dbLock.LockType` 映射）只会产出 STRICT_BINDING /
+        //   DEMAND_PROTECTION，其它类型落 `null` 并告警跳过 ⇒ 该判定**恒为假、从未生效**。
+        //   留着的害处是让人以为「已投料/已发货的供给会被挡住」，而实际挡不住。
+        //   执行不可逆事实的正规通道是 ExecutionConstraintProjector / ExecutionConstraints。
 
         // ══════════════════════════════════════════════════════════════════════
         // 第二阶段：原子扣减（所有校验通过，开始修改状态）
         // ══════════════════════════════════════════════════════════════════════
 
-        // Step 7: 扣DemandBalance（§5.2要求：使用DemandBalance对象维护需求余额）
+        // Step 6: 扣DemandBalance（§5.2要求：使用DemandBalance对象维护需求余额）
         demand.RemainingQty -= allocQty;
 
-        // Step 8: 扣SupplyBalance
+        // Step 7: 扣SupplyBalance
         supply.RemainingQty -= allocQty;
 
-        // Step 9: 生成AllocationSequence（在扣减成功时生成，符合§5.4要求）
+        // Step 8: 生成AllocationSequence（在扣减成功时生成，符合§5.4要求）
         var allocationSeq = voucher.NextAllocationSequence++;
 
-        // Step 10: 生成逻辑Allocation/LedgerEntry
+        // Step 9: 生成逻辑Allocation/LedgerEntry
         var allocationRecord = new AllocationRecord
         {
             AllocationSequence = allocationSeq,

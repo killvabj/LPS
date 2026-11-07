@@ -34,7 +34,11 @@ export const orderApi = {
   async list(query: OrderQuery): Promise<OrderListPageResult<OrderListItemDto>> {
     return apsHttp.get<OrderListPageResult<OrderListItemDto>>({
       url: '/api/order-query',
-      params: { ...query }
+      params: { ...query },
+      // 查不动时**留在页内**（页面已有「加载失败：…」错误条）——
+      // 整页跳 /500 会把用户已填的筛选、勾选、页码全丢掉。
+      // 5号位 2026-10-31 回执 §六-2 支持前端这么改。
+      noErrorRedirect: true
     })
   },
 
@@ -47,7 +51,9 @@ export const orderApi = {
     return apsHttp.get<OrderDetailDto>({
       url: `/api/order-query/${orderId}`,
       params: { planVersionId },
-      silent: true
+      silent: true,
+      // 详情失败在抽屉里显示（`detailError`），不整页跳 /500
+      noErrorRedirect: true
     })
   },
 
@@ -62,7 +68,9 @@ export const orderApi = {
     return apsHttp.get<OrderSummaryDto>({
       url: '/api/order-query/summary',
       params: { planVersionId },
-      silent: true
+      silent: true,
+      // 聚合失败只让 KPI 整块空态（store 侧处理），不整页跳 /500
+      noErrorRedirect: true
     })
   }
 }

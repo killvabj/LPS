@@ -44,6 +44,16 @@
  *    应查 linked server [mes] 与同义词 APS_Production.dbo.ext_MES_APS_BOM_Workset_Issues，
  *    而非 ODS 直连（命名沿用 ext_* 防腐层惯例）
  *  - 函件：frontNew/docs/5号位-2026-10-12-business-fact-issues回执更新-同义词落地2B可行性更正-给4号位.md
+ *
+ * 2026-11-05 修三处真缺陷（dev 实测 + 源码定位）：
+ *  ① KPI 百分比分母错：Summary 端点 `totalCount`（权威总数）前端没接，页面拿「已加载条数」
+ *     当分母 ⇒ dev 上出现「错误 538% / 警告 516%」。现 totalCount 进 DTO，作分母。
+ *  ② 列表静默截断：后端 `ExplanationQueryRepository.cs:113` 把 Summary.items 写死成
+ *     `QueryAsync(..., severity:"ERROR", take:50)` ⇒ 只看得见 50 条 ERROR，258 条 INFO 与
+ *     其它 ObjectType 分组全不可见且无任何提示。现改走列表端点 `/api/explanation` 分页加载。
+ *  ③ 事实 DTO 字段名对不上：后端返 `id`/`createdAt`/四个来源 Id，前端却按 `factId`/`occurredAt`/
+ *     `objectRef` 取 ⇒ 「对象」格恒空、时间恒 `Invalid Date`、`:key` 恒 undefined。
+ *     现统一经 `toScheduleExplanationFact()` 映射（objectRef 由需求号/域键/来源 Id 派生）。
  */
 
 import { apsHttp, APS_USE_MOCK } from './http'
@@ -51,8 +61,20 @@ import type {
   BusinessFactIssue,
   ExplanationViewDto,
   ReasonCodeCount,
+  ReasonCodeValue,
   ScheduleExplanationFact
 } from './types'
+
+/* ===== 排程解释事实：分页加载常量（2026-11-05） ===== */
+/**
+ * 后端列表端点单页上限：`ExplanationQueryService.cs:38` — `if (take > 500) take = 500;`
+ * ⇒ 前端每页最多拿 500 条，多了会被后端夹住（且不报错，静默截断 ⇒ 必须自己分页）。
+ */
+export const EXPLANATION_FACT_PAGE_SIZE = 500
+/** 首屏最多加载条数（dev 最大版本 190 有 37.4 万条 ⇒ 不能一次全拉） */
+export const EXPLANATION_FACT_INITIAL_MAX = 1000
+/** 累计加载上限（点「继续加载」最多加到这里，防把浏览器拖死） */
+export const EXPLANATION_FACT_LOAD_MAX = 5000
 
 /* ===== Mock 构造器（与 5号位 Summary 端点 DTO 1:1 对齐） ===== */
 
@@ -186,6 +208,7 @@ const mockBusinessIssues = (): BusinessFactIssue[] => [
 /**
  * mock ExplanationViewDto（与 lps/LPS.APS.Core/Dto/ExplanationDtos.cs :48 ExplanationSummaryDto 字段对齐）
  *  - scheduleExplanationFacts = items
+ *  - totalCount = 权威总数（= errorCount + warnCount + infoCount；2026-11-05 补，KPI 分母靠它）
  *  - errorCount / warnCount / infoCount = Summary 端点权威数
  *  - reasonCodeCounts = Summary 端点按 15 码分布
  *  - businessFactIssues = mockBusinessIssues（mock 模式独立填充）
@@ -212,6 +235,7 @@ const mockExplanation = (planVersionId: number): ExplanationViewDto => {
 
   return {
     planVersionId,
+    totalCount: errorCount + warnCount + infoCount,
     scheduleExplanationFacts: facts,
     businessFactIssues: mockBusinessIssues(),
     businessFactIssuesTotal: mockBusinessIssues().length,
@@ -280,6 +304,102 @@ function toBusinessFactIssue(r: BusinessFactIssueRawDto): BusinessFactIssue {
   }
 }
 
+/* ===== 排程解释事实：后端原始 DTO → 前端视图模型（2026-11-05） ===== */
+/**
+ * 后端 `ExplanationDto` 原始字段（@see lps/LPS.APS.Core/Dto/ExplanationDtos.cs :9-43）。
+ *
+ * ⚠️ 字段名与前端视图模型**不同**：后端是 `id` / `createdAt`，前端要 `factId` / `occurredAt`，
+ * 且 `objectRef` 后端**根本没有**（要前端派生）。此前前端直接把后端 JSON 当视图模型用，
+ *   ⇒ 页面「对象」格恒空、时间恒显示 `Invalid Date`。现统一经 `toScheduleExplanationFact()` 映射。
+ */
+interface ScheduleExplanationFactRawDto {
+  id: number
+  planVersionId: number
+  scheduleRunId?: number
+  objectType: string
+  orderId?: number
+  taskId?: number
+  resourceId?: number
+  stageCode?: string
+  reasonCode?: string
+  severity: string
+  impactHours?: number
+  evidenceJson?: string
+  createdAt: string
+}
+
+/** 证据 JSON 解析（形状不统一，解析失败一律当空对象，不抛） */
+function parseEvidence(json?: string): Record<string, unknown> {
+  if (!json) return {}
+  try {
+    const o = JSON.parse(json)
+    return o && typeof o === 'object' ? (o as Record<string, unknown>) : {}
+  } catch {
+    return {}
+  }
+}
+
+/** 证据里取一个键（camelCase / PascalCase 都认 —— 实测两种写法都有） */
+function evidenceStr(evidence: Record<string, unknown>, key: string): string {
+  const lower = key.charAt(0).toLowerCase() + key.slice(1)
+  const upper = key.charAt(0).toUpperCase() + key.slice(1)
+  const v = evidence[lower] ?? evidence[upper]
+  return typeof v === 'string' && v.trim() ? v.trim() : ''
+}
+
+/**
+ * `objectRef` 派生（后端没这列，前端自己算一个**人能看懂**的标签）。
+ *
+ * 实测（dev 版本 999333，527 行）：
+ *  - 514 行证据是 `{LogicalDemandKey, MaterialId, DomainKey, ...}` ⇒ 有**需求号**（如 `999333_35`）
+ *  - 11 行证据是 `{evidenceType, summary, details}` ⇒ 无需求号，退到 `orderId`
+ *  - 2 行 DOMAIN 证据是 `{EvidenceType, DomainKey, ...}` ⇒ 有**域键**（如 `FAMILY_QT`）
+ */
+function deriveObjectRef(
+  raw: ScheduleExplanationFactRawDto,
+  evidence: Record<string, unknown>
+): string {
+  const demandKey = evidenceStr(evidence, 'LogicalDemandKey')
+  const domainKey = evidenceStr(evidence, 'DomainKey')
+  switch (raw.objectType) {
+    case 'ORDER':
+      return demandKey ? `需求 ${demandKey}` : raw.orderId ? `需求 ${raw.orderId}` : '订单'
+    case 'TASK':
+      return raw.taskId ? `任务 ${raw.taskId}` : '任务'
+    case 'RESOURCE':
+      return raw.resourceId ? `资源 ${raw.resourceId}` : '资源'
+    case 'STAGE':
+      return raw.stageCode || '工段'
+    case 'DOMAIN':
+      return domainKey ? `分域 ${domainKey}` : '分域'
+    default:
+      return raw.objectType
+  }
+}
+
+/** 后端原始 DTO → 前端视图模型 */
+function toScheduleExplanationFact(r: ScheduleExplanationFactRawDto): ScheduleExplanationFact {
+  const evidence = parseEvidence(r.evidenceJson)
+  const summary = evidenceStr(evidence, 'summary')
+  return {
+    factId: r.id,
+    planVersionId: r.planVersionId,
+    scheduleRunId: r.scheduleRunId,
+    objectType: r.objectType as ScheduleExplanationFact['objectType'],
+    objectRef: deriveObjectRef(r, evidence),
+    reasonCode: (r.reasonCode ?? '') as ReasonCodeValue,
+    severity: r.severity as ScheduleExplanationFact['severity'],
+    impactHours: r.impactHours ?? undefined,
+    evidenceJson: r.evidenceJson,
+    evidenceSummary: summary || undefined,
+    occurredAt: r.createdAt,
+    orderId: r.orderId,
+    taskId: r.taskId,
+    resourceId: r.resourceId,
+    stageCode: r.stageCode
+  }
+}
+
 export const explanationApi = {
   /**
    * 异常与原因解释（页面 6）
@@ -294,20 +414,31 @@ export const explanationApi = {
    *  - 数据按设计跨版本（@see BusinessFactIssueController.cs:60-67 无 planVersionId 参数）
    *  - 后端建议改 PageResult<T> 包装（@see ./types/common.ts:62-67，TaskSplitRuleConfig 已用同模式）
    *  - 后端落地前 fallback：仍按 List<RawDto> 解析，total = items.length（保证前端 E23 绿）
+   *
+   * 2026-11-05 修两处真缺陷：
+   *  ① **列表不再用 Summary.items**：后端 `ExplanationQueryRepository.cs:113` 把 items 写死成
+   *     `QueryAsync(planVersionId, severity:"ERROR", take:50)` ⇒ 页面只看得见 50 条 **ERROR**，
+   *     258 条 INFO 与其它 ObjectType 分组**全部不可见**，且**没有任何提示**（静默截断）。
+   *     改为走列表端点 `/api/explanation`（skip/take，单页上限 500）**分页加载全部严重度**。
+   *  ② **KPI 百分比分母**：Summary 端点的 `totalCount`（权威总数）此前没被前端接收，
+   *     页面拿「已加载条数」当分母 ⇒ dev 上出现「错误 538% / 警告 516%」。现由 totalCount 承担。
    */
   async getByPlanVersion(planVersionId: number): Promise<ExplanationViewDto> {
     if (APS_USE_MOCK) return mockExplanation(planVersionId)
     const summary = await apsHttp.get<{
       planVersionId: number
+      totalCount: number
       errorCount: number
       warnCount: number
       infoCount: number
       reasonCodeCounts: ReasonCodeCount[]
-      items: ScheduleExplanationFact[]
+      items: ScheduleExplanationFactRawDto[]
     }>({
       url: '/api/explanation/summary',
       params: { planVersionId }
     })
+    // 排程解释事实：走**列表端点**分页加载（Summary.items 只有 50 条 ERROR，不再使用）
+    const facts = await explanationApi.listFactsUpTo(planVersionId, summary.totalCount ?? 0)
     // 业务事实问题首查（pageIndex=1, pageSize=20；5号位 10-10 落地 PageResult{page} 包装）
     // 注：PageResult<T> 通用类型字段名是 pageIndex（@see types/common.ts:62-67），但
     //   后端 business-fact-issues 实际返字段是 page（5号位 落地回执明确告知，与 RBAC/TaskSplitRuleConfig/ManualETA 同源）
@@ -319,7 +450,8 @@ export const explanationApi = {
 
     return {
       planVersionId: summary.planVersionId,
-      scheduleExplanationFacts: summary.items ?? [],
+      totalCount: summary.totalCount ?? 0,
+      scheduleExplanationFacts: facts,
       businessFactIssues: bizPage.items.map(toBusinessFactIssue),
       businessFactIssuesTotal: bizPage.total,
       businessFactIssuesPage: bizPage.page,
@@ -329,6 +461,52 @@ export const explanationApi = {
       infoCount: summary.infoCount ?? 0,
       reasonCodeCounts: summary.reasonCodeCounts ?? []
     }
+  },
+
+  /**
+   * 排程解释事实：分页加载，直到拿满 `min(total, limit)` 条
+   *  - 后端列表端点单页上限 500（`ExplanationQueryService.cs:38`），故按 500 一页一页取
+   *  - `total` 传 0（后端没给总数）时至少取第一页，避免明明有数据却显示空
+   */
+  async listFactsUpTo(
+    planVersionId: number,
+    total: number,
+    limit: number = EXPLANATION_FACT_INITIAL_MAX
+  ): Promise<ScheduleExplanationFact[]> {
+    const target = total > 0 ? Math.min(total, limit) : EXPLANATION_FACT_PAGE_SIZE
+    const out: ScheduleExplanationFact[] = []
+    while (out.length < target) {
+      const batch = await explanationApi.listFactsPage(
+        planVersionId,
+        out.length,
+        EXPLANATION_FACT_PAGE_SIZE
+      )
+      if (!batch.length) break
+      out.push(...batch)
+      if (batch.length < EXPLANATION_FACT_PAGE_SIZE) break
+    }
+    return out
+  },
+
+  /**
+   * 排程解释事实：列表端点单页（skip/take；后端 take 上限 500）
+   *  - 端点：`GET /api/explanation?planVersionId=&skip=&take=`（+ 可选 objectType/reasonCode/severity 过滤）
+   *  - 返回已映射成前端视图模型的数组（不是后端原始 JSON）
+   */
+  async listFactsPage(
+    planVersionId: number,
+    skip: number,
+    take: number = EXPLANATION_FACT_PAGE_SIZE
+  ): Promise<ScheduleExplanationFact[]> {
+    if (APS_USE_MOCK) {
+      const all = mockExplanation(planVersionId).scheduleExplanationFacts
+      return all.slice(skip, skip + take)
+    }
+    const raw = await apsHttp.get<ScheduleExplanationFactRawDto[]>({
+      url: '/api/explanation',
+      params: { planVersionId, skip, take: Math.min(take, EXPLANATION_FACT_PAGE_SIZE) }
+    })
+    return (raw ?? []).map(toScheduleExplanationFact)
   },
 
   /**
@@ -365,7 +543,7 @@ export const explanationApi = {
 
   /**
    * 排程解释事实列表（5号位 list 端点，含 filter）
-   *  - 备查端点：本页未直接消费；保留供深钻或 store 后续扩展
+   *  - 深钻 / 备查用；页面主路径走 `listFactsPage` / `listFactsUpTo`
    *  - 5号位 `GET /api/explanation?planVersionId=&objectType=&reasonCode=&severity=&skip=&take=`
    */
   async listFacts(opts: {
@@ -384,9 +562,10 @@ export const explanationApi = {
         .filter((f) => (opts.severity ? f.severity === opts.severity : true))
         .slice(opts.skip ?? 0, (opts.skip ?? 0) + (opts.take ?? 100))
     }
-    return apsHttp.get<ScheduleExplanationFact[]>({
+    const raw = await apsHttp.get<ScheduleExplanationFactRawDto[]>({
       url: '/api/explanation',
       params: { ...opts }
     })
+    return (raw ?? []).map(toScheduleExplanationFact)
   }
 }

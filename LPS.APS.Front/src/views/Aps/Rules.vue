@@ -91,12 +91,14 @@ const {
   filteredRuleSets,
   statusCounts,
   noVersionCount,
+  inactiveCount,
   currentDetail,
   currentDiff,
   diffBaseVersionId,
   diffTargetVersionId,
   lastValidation,
   statusFilter,
+  showInactive,
   loading,
   listLoading,
   actionRunning,
@@ -765,49 +767,41 @@ async function onDisable(): Promise<void> {
   if (ok) disableDialog.value = false
 }
 
-/* ===== 删除规则集 Dialog（DELETE /rule-set/{id}，3号位 R1）===== */
-const deleteRuleSetDialog = ref(false)
+/* ===== 物理删除（最窄口径：无任何已发布版本才可删，连带删草稿） ===== */
+/** 详情版本历史里是否存在 PUBLISHED —— 有则前端提前拦住，不把必然 400 的请求发出去 */
+const detailHasPublished = computed<boolean>(() =>
+  (detailNN.value?.history ?? []).some((h: RuleVersionHistoryDto) => h.status === 'PUBLISHED')
+)
 
-/** 删除目标：详情区选中项优先；「未配版本」的空态走列表行 */
-const deleteTarget = computed<{ ruleSetId: number; code: string; name: string } | null>(() => {
-  const d = detailNN.value
-  if (d) {
-    return {
-      ruleSetId: d.summary.ruleSetId,
-      code: d.summary.ruleSetCode,
-      name: d.summary.ruleSetName
-    }
+/**
+ * 删除规则集整族（硬删）。
+ * - 主表行 + 全部草稿一起删；含 PUBLISHED 版本后端 400，stub 里提前禁用（提示以后端原文为准）
+ * - 被策略包/排产运行引用时后端也 400 —— 引用关系前端拿不到，不预判、不翻译
+ */
+async function onDeleteRuleSet(ruleSetId: number, ruleSetName: string): Promise<void> {
+  let confirmed = false
+  try {
+    await ElMessageBox.confirm(
+      `即将永久删除规则集「${ruleSetName}」及其全部未发布草稿版本，删除后无法恢复。已发布过版本或仍被策略包引用的规则集不能删除。是否继续？`,
+      '删除规则集',
+      {
+        type: 'warning',
+        confirmButtonText: '确认删除',
+        cancelButtonText: '取消',
+        confirmButtonClass: 'el-button--danger'
+      }
+    )
+    confirmed = true
+  } catch {
+    confirmed = false
   }
-  const n = noVersionPicked.value
-  if (n) return { ruleSetId: n.ruleSetId, code: n.ruleSetCode, name: n.ruleSetName }
-  return null
-})
-
-/** 删除按钮的禁用原因（破坏性操作：先说清为什么不让删） */
-const deleteDisabledReason = computed(() => {
-  if (!rulesStore.canWrite) return '当前账号无删除权限'
-  if (detailNN.value && !rulesStore.currentDeletable) {
-    return '该规则集已发布过，不能删除（请先停用版本）'
-  }
-  return ''
-})
-
-function openDeleteRuleSetDialog(): void {
-  if (deleteDisabledReason.value) {
-    rulesStore.handleError(new Error(deleteDisabledReason.value))
-    return
-  }
-  deleteRuleSetDialog.value = true
-}
-
-async function onDeleteRuleSet(): Promise<void> {
-  const target = deleteTarget.value
-  if (!target) return
-  const ok = await rulesStore.removeRuleSet(target.ruleSetId)
-  if (ok) {
-    deleteRuleSetDialog.value = false
-    noVersionPicked.value = null
+  if (!confirmed) return
+  if ((await rulesStore.removeRuleSet(ruleSetId)) === true) {
     ElMessage.success('规则集已删除')
+    noVersionPicked.value = null
+  } else if (rulesStore.error) {
+    // 后端原文由 store 的 handleError 落进 error（含 400 原因：已发布/被引用）
+    ElMessage.error(rulesStore.error)
   }
 }
 
@@ -939,6 +933,12 @@ onActivated(() => {
         </ElRadioButton>
         <ElRadioButton :label="NO_VERSION">{{ NO_VERSION_LABEL }}</ElRadioButton>
       </ElRadioGroup>
+      <ElTooltip content="停用的规则集默认不显示；勾选后才能看到并重新启用它们" placement="top">
+        <label class="show-inactive-toggle">
+          <ElSwitch v-model="showInactive" size="small" />
+          <span>显示已停用（{{ inactiveCount }}）</span>
+        </label>
+      </ElTooltip>
     </div>
 
     <div class="content-row">
@@ -982,7 +982,7 @@ onActivated(() => {
             </div>
             <div class="rs-name">{{ r.ruleSetName }}</div>
             <div class="rs-meta">
-              <span class="meta-key">当前版本</span>
+              <span class="meta-key">最新已发布版本</span>
               <span class="meta-val">{{ r.currentVersionCode || '—' }}</span>
               <span v-if="r.draftVersionCode" class="meta-draft">
                 / 草稿 {{ r.draftVersionCode }}
@@ -1004,11 +1004,11 @@ onActivated(() => {
             <ElButton
               v-if="canWrite"
               type="danger"
-              plain
               size="small"
-              @click="openDeleteRuleSetDialog"
+              plain
+              @click="onDeleteRuleSet(noVersionPicked.ruleSetId, noVersionPicked.ruleSetName)"
             >
-              <Icon icon="vi-mdi:delete-outline" /> 删除这个规则集
+              <Icon icon="vi-mdi:trash-can-outline" /> 删除规则集
             </ElButton>
           </ElEmpty>
         </template>
@@ -1063,20 +1063,26 @@ onActivated(() => {
               >
                 <Icon icon="vi-mdi:archive" /> 停用
               </ElButton>
-              <!-- [删除]：破坏性操作，破坏性前先说清后果（3号位 R1） -->
               <ElTooltip
                 v-if="canWrite"
-                :content="deleteDisabledReason || '删除该规则集（会连带删除它的草稿版本）'"
-                placement="bottom"
+                :disabled="!detailHasPublished"
+                content="该规则集已有已发布版本，不能物理删除；如不再使用请「停用」已发布版本"
+                placement="top"
               >
-                <ElButton
-                  type="danger"
-                  size="small"
-                  :disabled="!!deleteDisabledReason"
-                  @click="openDeleteRuleSetDialog"
-                >
-                  <Icon icon="vi-mdi:delete-outline" /> 删除
-                </ElButton>
+                <span>
+                  <ElButton
+                    type="danger"
+                    size="small"
+                    plain
+                    :disabled="detailHasPublished"
+                    :loading="actionRunning"
+                    @click="
+                      onDeleteRuleSet(detailNN.summary.ruleSetId, detailNN.summary.ruleSetName)
+                    "
+                  >
+                    <Icon icon="vi-mdi:trash-can-outline" /> 删除
+                  </ElButton>
+                </span>
               </ElTooltip>
             </div>
           </div>
@@ -1102,7 +1108,7 @@ onActivated(() => {
               </ElTag>
               <span v-else class="muted">—</span>
             </ElDescriptionsItem>
-            <ElDescriptionsItem label="当前已发布版本">
+            <ElDescriptionsItem label="最新已发布版本">
               {{ detailNN.summary.currentVersionCode || '—' }}
             </ElDescriptionsItem>
             <ElDescriptionsItem label="草稿版本">
@@ -1551,7 +1557,9 @@ onActivated(() => {
               <ElTable :data="detailNN.history" size="small" border>
                 <ElTableColumn label="版本码" min-width="150">
                   <template #default="{ row }">
-                    <span :class="{ 'history-current': row.isCurrent }">{{ row.versionCode }}</span>
+                    <span :class="{ 'history-current': row.isLatestPublished }">{{
+                      row.versionCode
+                    }}</span>
                   </template>
                 </ElTableColumn>
                 <ElTableColumn label="状态" width="110" align="center">
@@ -1582,9 +1590,19 @@ onActivated(() => {
                     {{ formatLocalDateTime(row.effectiveTo) }}
                   </template>
                 </ElTableColumn>
-                <ElTableColumn label="当前生效" width="100" align="center">
+                <ElTableColumn width="120" align="center">
+                  <template #header>
+                    <ElTooltip
+                      content="标的是最近一次发布的那一版。「当前有效」另按生效期窗口判定，见「生效起 / 生效止」两列。"
+                      placement="top"
+                    >
+                      <span class="th-hint">最新已发布</span>
+                    </ElTooltip>
+                  </template>
                   <template #default="{ row }">
-                    <ElTag v-if="row.isCurrent" size="small" type="success" effect="dark">是</ElTag>
+                    <ElTag v-if="row.isLatestPublished" size="small" type="success" effect="dark"
+                      >是</ElTag
+                    >
                     <span v-else class="muted">否</span>
                   </template>
                 </ElTableColumn>
@@ -1717,34 +1735,6 @@ onActivated(() => {
           @click="onDisable"
         >
           确认停用
-        </ElButton>
-      </template>
-    </ElDialog>
-
-    <!-- ===== [删除规则集] Dialog（DELETE /rule-set/{id}，3号位 R1）===== -->
-    <ElDialog
-      v-model="deleteRuleSetDialog"
-      title="删除规则集"
-      width="480px"
-      :close-on-click-modal="false"
-    >
-      <ElForm label-width="100px" size="default">
-        <ElFormItem label="规则集">
-          <span class="d-val">{{ deleteTarget?.code }}</span>
-        </ElFormItem>
-        <ElFormItem label="名称">
-          <span class="d-val">{{ deleteTarget?.name }}</span>
-        </ElFormItem>
-        <ElAlert type="error" :closable="false" show-icon class="d-alert">
-          <template #title>删除后不可恢复</template>
-          这条规则集和它的草稿版本会一起被删掉，删了就找不回来了。已发布过的规则集不能删（只能停用）；
-          如果这个规则集已经被策略包引用，也删不掉。
-        </ElAlert>
-      </ElForm>
-      <template #footer>
-        <ElButton @click="deleteRuleSetDialog = false">取消</ElButton>
-        <ElButton type="danger" :loading="actionRunning" @click="onDeleteRuleSet">
-          确认删除
         </ElButton>
       </template>
     </ElDialog>
@@ -2061,6 +2051,21 @@ onActivated(() => {
   background: #fff;
   border: 1px solid #e2e8f0;
   border-radius: 6px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.show-inactive-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  color: #4b5563;
+  cursor: pointer;
+  user-select: none;
 }
 
 /* 主内容 */

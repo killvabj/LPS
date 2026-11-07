@@ -10,7 +10,8 @@
 -->
 <script setup lang="tsx">
 import { computed, onMounted, reactive, ref, watch } from 'vue'
-import { formatUtcDateTimeSec } from '@/utils/datetime'
+import { formatLocalDateTimeSec } from '@/utils/datetime'
+// Permission.CreatedAt 由后端 DateTime.Now / GETDATE() 落库（服务器本地墙钟）⇒ 本地直显，不做 UTC→本地位移
 import {
   ElAlert,
   ElButton,
@@ -275,7 +276,7 @@ const ACTION_TAG_TYPE = (action: string): 'success' | 'warning' | 'danger' | 'in
       </ElTableColumn>
       <ElTableColumn label="创建时间" width="170">
         <template #default="{ row }: { row: PermissionSummaryDto }">
-          {{ formatUtcDateTimeSec(row.createdAt) }}
+          {{ formatLocalDateTimeSec(row.createdAt) }}
         </template>
       </ElTableColumn>
     </ElTable>

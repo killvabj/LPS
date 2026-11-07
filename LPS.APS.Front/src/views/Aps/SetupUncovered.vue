@@ -26,6 +26,10 @@
      而本统计给不出前产品 ⇒ 只能跳「默认换型规则」页。
 
   权限：aps.setup.view（只读页面，无写操作）
+
+  10-29 服务端分页（3号位 方案 A 落码后）：
+   - 列表改走后端分页：请求带 pageIndex/pageSize，返回分页对象；total 用后端给的总行数
+   - CSV 导出仍要全量 ⇒ 导出时另发一次不带分页参数的请求重拉全量（否则只导当前页）
 -->
 
 <script setup lang="ts">
@@ -37,15 +41,13 @@ import {
   ElAlert,
   ElButton,
   ElCard,
-  ElCol,
   ElEmpty,
   ElForm,
   ElFormItem,
   ElInput,
-  ElInputNumber,
   ElMessage,
   ElOption,
-  ElRow,
+  ElPagination,
   ElSelect,
   ElTable,
   ElTableColumn,
@@ -54,8 +56,10 @@ import {
 } from 'element-plus'
 import { useSetupUncoveredStore } from '@/store/modules/aps/setupUncovered'
 import { useApsAuthStore } from '@/store/modules/aps/auth'
-import type { SetupUncoveredQuery } from '@/api/aps-v1'
-import { roleLabelOf, setupApi, SETUP_SOURCES, SETUP_SOURCE_META } from '@/api/aps-v1'
+import { RUN_STATUS_LABEL } from '@/store/modules/aps/run'
+import type { ScheduleRunGovDto, SetupUncoveredQuery } from '@/api/aps-v1'
+import { roleLabelOf, runApi, setupApi } from '@/api/aps-v1'
+import { formatLocalMonthDayHM } from '@/utils/datetime'
 import {
   filterLookupOptions,
   useSetupMasterData,
@@ -69,19 +73,88 @@ const uncoveredStore = useSetupUncoveredStore()
 const apsAuth = useApsAuthStore()
 const masterData = useSetupMasterData()
 
-const { stats, listLoading, error, statCount } = storeToRefs(uncoveredStore)
+const { stats, total, listLoading, error } = storeToRefs(uncoveredStore)
+
+// ===== 分页（服务端分页）=====
+// 10-29：3号位 方案 A 落码 —— 端点传 pageIndex/pageSize 即返回分页对象
+// （SetupRuleController.cs:381）；不传则仍返回全量数组（CSV 导出走这条）。
+// stats = 当前页行，total = 后端给的过滤后总行数（分页器用，不是 stats.length）。
+const page = ref(1)
+const pageSize = ref(20)
+/** 序号跨页连续（每页从 1 重新开始会让用户误以为换了批数据） */
+function rowIndex(index: number): number {
+  return (page.value - 1) * pageSize.value + index + 1
+}
+/** 拉当前页（服务端分页） */
+async function fetchPage(): Promise<void> {
+  await uncoveredStore.loadStats({ ...queryForm }, page.value, pageSize.value)
+}
+/** 翻页：保持筛选条件，只换页码 */
+async function onPageChange(nextPage: number): Promise<void> {
+  page.value = nextPage
+  await fetchPage()
+}
+/** 切每页条数：回第 1 页（避免新 pageSize × 旧 pageIndex 越界） */
+async function onSizeChange(nextSize: number): Promise<void> {
+  pageSize.value = nextSize
+  page.value = 1
+  await fetchPage()
+}
 
 // ===== 查询表单 =====
 // 10-27：筛参全部改后端真实形参。departmentId / resourceId / materialId 走内部主键 Id
 // （下拉选项的 opt.id 即 lookup 的 masterId，与后端 JOIN 的 Id 同源），
 // operationCode 后端没有工序 lookup ⇒ 自由文本输入。
+// 10-29（用户口径）：排产批次改「下拉选最近 50 次 + 进页默认最近一次」——
+// 此前是手填数字且写死 1，用户记不住批次号，dev 数据一迁就打开空表。
+// runId=0 表示「尚未选」，未选中前不发请求（避免拿一个假的批次号去查）。
 const queryForm = reactive<SetupUncoveredQuery>({
-  runId: 1, // 默认 RunId=1（dev 演示用）
+  runId: 0,
   departmentId: undefined,
   operationCode: undefined,
   resourceId: undefined,
   materialId: undefined
 })
+
+// ===== 排产批次下拉 =====
+// 数据源：GET /api/governance/runs?take=N（aps.plan.view，与 aps.setup.view 同人群持）。
+// 后端**没有**按 Id 搜索 / offset / total（已发函 5号位）⇒ 只能列最近 N 次，
+// 更老的批次当前选不到（不是前端限制，是端点能力限制）。
+// 后端顺序不保证「最近优先」（10-29 实测 Id 倒序有 1 处倒挂）⇒ 前端按 startedAt 降序。
+const RUN_OPTION_TAKE = 50
+const runOptions = ref<ScheduleRunGovDto[]>([])
+const runLoading = ref(false)
+
+async function loadRuns(): Promise<void> {
+  runLoading.value = true
+  try {
+    const rows = await runApi.listRuns(RUN_OPTION_TAKE)
+    runOptions.value = [...rows].sort(
+      (a, b) => new Date(b.startedAt).getTime() - new Date(a.startedAt).getTime()
+    )
+  } catch {
+    // 取不到批次列表就保持空下拉（不编造选项），用户可看到下方错误条重试
+    runOptions.value = []
+  } finally {
+    runLoading.value = false
+  }
+}
+
+/** 批次展示：开始时间 · 状态 · 批次号（Run 无业务编码，批次号是唯一可对齐的标识） */
+function runOptionLabel(r: ScheduleRunGovDto): string {
+  // Run.startedAt 是治理域 DateTime.Now 本地墙钟 ⇒ 走 formatLocal*（不做 UTC 位移）
+  return `${formatLocalMonthDayHM(r.startedAt)} · ${RUN_STATUS_LABEL[r.status] ?? r.status} · #${r.id}`
+}
+
+/** 默认批次 = 最近一次**跑完**的批次。
+ *  本页读的是批次跑完后落库的统计行：运行中的批次还没算完（10-29 dev 实测 #999310 运行中 → total=0），
+ *  拿它当默认会一进页就空表。50 条内没有跑完的批次才回退到最近一次（不编造）。 */
+function pickDefaultRun(): ScheduleRunGovDto | undefined {
+  return (
+    runOptions.value.find((r) => r.status === 'COMPLETED' || r.status === 'PARTIAL_SUCCESS') ??
+    runOptions.value[0]
+  )
+}
 
 // ===== 下拉源（后端主数据 lookup） =====
 // 10-15 4号位：下拉改远程搜索。后端 lookups/{departments,resources,materials} 的 SQL 都是
@@ -197,17 +270,32 @@ function ruleSetVersionLabel(versionId?: number | null): string {
 // ===== 加载 =====
 async function loadStats() {
   if (!queryForm.runId) {
-    ElMessage.warning('请填写 RunId（必填）')
+    ElMessage.warning('请选择排产批次（必填）')
     return
   }
-  await uncoveredStore.loadStats({ ...queryForm })
+  // 筛选条件变 → 回到第 1 页（避免停留在新结果里不存在的页码上）
+  page.value = 1
+  await fetchPage()
 }
 
-onMounted(() => {
+/** 重置：清空查询结果，页码同步归位 */
+function handleReset(): void {
+  page.value = 1
+  uncoveredStore.reset()
+}
+
+onMounted(async () => {
   void masterData.loadAll()
   void loadRuleSetVersionLabels()
-  // 默认加载一次（dev 演示用）
-  void loadStats()
+  await loadRuns()
+  // 默认选最近一次跑完的批次（用户 2026-10-29 口径：不再写死 Run=1）
+  const def = pickDefaultRun()
+  if (!queryForm.runId && def) {
+    queryForm.runId = def.id
+  }
+  if (queryForm.runId) {
+    void loadStats()
+  }
 })
 
 // ===== 出口操作 =====
@@ -252,16 +340,25 @@ function goToDefault(row: (typeof stats.value)[number]) {
   void router.push({ path: '/aps/rules', query })
 }
 
-/** 导出 CSV */
-function handleExportCsv() {
-  const csv = uncoveredStore.exportCsv()
-  const blob = new Blob(['﻿' + csv], { type: 'text/csv;charset=utf-8;' })
-  const link = document.createElement('a')
-  link.href = URL.createObjectURL(blob)
-  link.download = `setup-uncovered-${dayjs().format('YYYYMMDD-HHmmss')}.csv`
-  link.click()
-  URL.revokeObjectURL(link.href)
-  ElMessage.success(`已导出 ${statCount.value} 条记录`)
+/** 导出 CSV（服务端分页后另发一次全量请求，避免只导当前页） */
+const exporting = ref(false)
+async function handleExportCsv(): Promise<void> {
+  if (exporting.value) return
+  exporting.value = true
+  try {
+    const { csv, count } = await uncoveredStore.exportCsv()
+    const blob = new Blob(['﻿' + csv], { type: 'text/csv;charset=utf-8;' })
+    const link = document.createElement('a')
+    link.href = URL.createObjectURL(blob)
+    link.download = `setup-uncovered-${dayjs().format('YYYYMMDD-HHmmss')}.csv`
+    link.click()
+    URL.revokeObjectURL(link.href)
+    ElMessage.success(`已导出 ${count} 条记录`)
+  } catch (err) {
+    ElMessage.error((err as Error)?.message ?? '导出失败')
+  } finally {
+    exporting.value = false
+  }
 }
 </script>
 
@@ -296,13 +393,20 @@ function handleExportCsv() {
     <ElCard class="query-card" shadow="never">
       <ElForm :model="queryForm" inline>
         <ElFormItem label="排产批次" required>
-          <ElInputNumber
+          <ElSelect
             v-model="queryForm.runId"
-            :min="1"
-            :step="1"
-            controls-position="right"
-            style="width: 120px"
-          />
+            placeholder="选择批次（最近 50 次）"
+            filterable
+            :loading="runLoading"
+            style="width: 260px"
+          >
+            <ElOption
+              v-for="r in runOptions"
+              :key="r.id"
+              :label="runOptionLabel(r)"
+              :value="r.id"
+            />
+          </ElSelect>
         </ElFormItem>
         <ElFormItem label="部门">
           <ElSelect
@@ -374,61 +478,10 @@ function handleExportCsv() {
             <Icon icon="vi-ep:search" class="mr-4" />
             查询
           </ElButton>
-          <ElButton @click="uncoveredStore.reset()">重置</ElButton>
+          <ElButton @click="handleReset">重置</ElButton>
         </ElFormItem>
       </ElForm>
     </ElCard>
-
-    <!-- KPI 条 -->
-    <ElRow :gutter="16" class="kpi-row">
-      <ElCol :span="6">
-        <ElCard shadow="never" class="kpi-card">
-          <div class="kpi-value">{{ statCount }}</div>
-          <div class="kpi-label">未覆盖转换对</div>
-        </ElCard>
-      </ElCol>
-      <ElCol :span="6">
-        <ElCard shadow="never" class="kpi-card">
-          <div class="kpi-value">{{ Object.keys(uncoveredStore.statsByDepartment).length }}</div>
-          <div class="kpi-label">涉及部门</div>
-        </ElCard>
-      </ElCol>
-      <ElCol :span="6">
-        <ElCard shadow="never" class="kpi-card">
-          <div class="kpi-value">{{ Object.keys(uncoveredStore.statsByStage).length }}</div>
-          <div class="kpi-label">涉及大工艺</div>
-        </ElCard>
-      </ElCol>
-      <ElCol :span="6">
-        <ElCard shadow="never" class="kpi-card">
-          <div class="kpi-value danger">0 分钟</div>
-          <div class="kpi-label">兜底换型时间</div>
-        </ElCard>
-      </ElCol>
-    </ElRow>
-
-    <!-- 换型来源 4 态说明（标签取自 SETUP_SOURCE_META，与 Gantt.vue Drawer 同一份） -->
-    <ElAlert type="info" :closable="false" show-icon class="legend-alert">
-      <template #title>
-        换型来源四态说明（本页统计仅含「无规则兜底」：有前后产品但无规则 → 0 分钟兜底；
-        「初始设备状态」：班头首单 / 冷启动，属正常生产事实，<strong>不进</strong>未覆盖统计）
-      </template>
-      <div class="legend-row">
-        <ElTag
-          v-for="s in SETUP_SOURCES"
-          :key="s"
-          size="small"
-          :type="SETUP_SOURCE_META[s].tag"
-          effect="dark"
-        >
-          {{ SETUP_SOURCE_META[s].label }}
-        </ElTag>
-      </div>
-      <div class="legend-hint">
-        本统计不记录前产品，所以行内只能跳「默认换型规则」页补规则；
-        要补明确产品转换，请到「明确产品转换」页手工新增。
-      </div>
-    </ElAlert>
 
     <!-- 统计列表 -->
     <ElCard class="table-card" shadow="never">
@@ -438,7 +491,8 @@ function handleExportCsv() {
           <ElButton
             type="success"
             size="small"
-            :disabled="statCount === 0"
+            :disabled="total === 0"
+            :loading="exporting"
             @click="handleExportCsv"
           >
             <Icon icon="vi-ep:download" class="mr-4" />
@@ -454,7 +508,7 @@ function handleExportCsv() {
         stripe
         empty-text="无未覆盖的产品转换对（所有转换均已命中明确产品转换规则或默认换型规则）"
       >
-        <ElTableColumn type="index" label="#" width="50" />
+        <ElTableColumn type="index" label="#" width="50" :index="rowIndex" />
         <ElTableColumn prop="departmentCode" label="部门" width="120" />
         <ElTableColumn prop="stageCode" label="大工艺" width="120">
           <template #default="{ row }">
@@ -498,7 +552,20 @@ function handleExportCsv() {
         </ElTableColumn>
       </ElTable>
 
-      <ElEmpty v-if="!listLoading && statCount === 0" description="无未覆盖的产品转换对" />
+      <ElPagination
+        v-if="total > 0"
+        :current-page="page"
+        :page-size="pageSize"
+        :total="total"
+        :page-sizes="[10, 20, 50, 100, 200]"
+        layout="total, sizes, prev, pager, next, jumper"
+        background
+        class="unc-pagination"
+        @current-change="onPageChange"
+        @size-change="onSizeChange"
+      />
+
+      <ElEmpty v-if="!listLoading && total === 0" description="无未覆盖的产品转换对" />
     </ElCard>
   </div>
 </template>
@@ -536,14 +603,6 @@ function handleExportCsv() {
   margin-bottom: 16px;
 }
 
-.kpi-row {
-  margin-bottom: 16px;
-}
-
-.kpi-card {
-  text-align: center;
-}
-
 .th-hint {
   border-bottom: 1px dashed var(--el-text-color-placeholder);
   cursor: help;
@@ -551,22 +610,6 @@ function handleExportCsv() {
 
 .cell-muted {
   color: var(--el-text-color-placeholder);
-}
-
-.kpi-value {
-  font-size: 28px;
-  font-weight: 700;
-  color: var(--el-color-primary);
-  margin-bottom: 4px;
-}
-
-.kpi-value.danger {
-  color: var(--el-color-danger);
-}
-
-.kpi-label {
-  font-size: 13px;
-  color: var(--el-text-color-secondary);
 }
 
 .table-card {
@@ -579,10 +622,9 @@ function handleExportCsv() {
   align-items: center;
 }
 
-.legend-hint {
-  margin-top: 6px;
-  font-size: 13px;
-  color: var(--el-text-color-regular);
+.unc-pagination {
+  margin-top: 12px;
+  justify-content: flex-end;
 }
 
 .mr-4 {

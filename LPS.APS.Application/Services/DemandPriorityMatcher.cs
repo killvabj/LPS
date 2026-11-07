@@ -330,7 +330,7 @@ public sealed class DemandPriorityMatcher
             ConditionOperator.GreaterThan => CompareValues(fieldValue, targetValue) > 0,
             ConditionOperator.GreaterOrEqual => CompareValues(fieldValue, targetValue) >= 0,
             ConditionOperator.In => IsInList(fieldValue, targetValue),
-            ConditionOperator.Contains => ContainsValue(fieldValue, targetValue),
+            ConditionOperator.Contains => MatchContains(fieldValue, targetValue),
             _ => throw new NotSupportedException($"不支持的操作符：{condition.Operator}")
         };
     }
@@ -443,10 +443,11 @@ public sealed class DemandPriorityMatcher
     }
 
     /// <summary>
-    /// 包含匹配（Contains 操作符；供 MaterialCode 等字符串模糊匹配，忽略大小写，值如 FINAL*）。
-    /// 字段值为 null 或目标为 null 时返回 false（fail-closed，不视为包含）。
+    /// 前缀匹配（Contains 操作符；供 MaterialCode 等字符串模糊匹配，忽略大小写，值如 FINAL*）。
+    /// 与真运行侧 <c>DemandPriorityExecutor</c> 的 CONTAINS 前缀口径一致（防空转：测试 oracle 不得与真执行相左）。
+    /// 字段值为 null 或目标为 null 时返回 false（fail-closed，不视为前缀匹配）。
     /// </summary>
-    private static bool ContainsValue(object? fieldValue, object? targetValue)
+    private static bool MatchContains(object? fieldValue, object? targetValue)
     {
         if (fieldValue is null || targetValue is null)
         {
@@ -454,13 +455,13 @@ public sealed class DemandPriorityMatcher
         }
 
         var source = fieldValue.ToString()!;
-        var keyword = targetValue.ToString()!.TrimEnd('*'); // 容忍末位 * 通配记号，去掉后按子串包含
+        var keyword = targetValue.ToString()!.TrimEnd('*'); // 容忍末位 * 通配记号，去掉后按前缀匹配
         if (keyword.Length == 0)
         {
             return true; // 裸 * 视为匹配任意非空值
         }
 
-        return source.Contains(keyword, StringComparison.OrdinalIgnoreCase);
+        return source.StartsWith(keyword, StringComparison.OrdinalIgnoreCase);
     }
 
     /// <summary>
@@ -512,7 +513,7 @@ public sealed class DemandRecord
     public string? TransportMode { get; init; }          // 运输方式
     public string? SalesOrderCategory { get; init; }     // 销售类别
     public string? DemandMaturityStatus { get; init; }   // 需求成熟度
-    public int? StockConsumeDay { get; init; }           // 库存消耗日（离消耗天数，<=0 即当天消耗；源待 5号位/ODS 定源）
+    public decimal? StockConsumeDay { get; init; }       // 库存消耗日（CoverageDays 小数，<=0 即当天消耗；与 A系 UpstreamDemand.decimal?/PeggingOrchestrator.LoadStockConsumeDayByMaterialAsync 对齐——防空转：测试 oracle 不得与真执行类型有别）
     public string? NonStockShipCategory { get; init; }   // 非在库出荷区分（紫票；源待 5号位/ODS 定源）
     public string? MaterialCode { get; init; }           // 物料编码（模糊匹配 Contains）
     public decimal? Quantity { get; init; }              // 订单数量

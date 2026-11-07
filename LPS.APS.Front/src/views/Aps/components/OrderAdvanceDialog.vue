@@ -42,6 +42,8 @@ interface OrderAdvanceCandidate {
   orderNo: string
   /** 订单规范化 Id（5号位 B4 已落地；自动带入可空由 Dialog watch 处理） */
   orderCanonicalId?: number
+  /** 排程域（列表项自带）：候选集按域收敛，跨域订单不进本弹窗 */
+  domainKey?: string
   materialCode?: string
   customerName?: string
   customerDueDate?: string
@@ -85,29 +87,56 @@ function onSelectionChange(sel: Row[]): void {
   selected.value = sel
 }
 
-watch(
-  () => props.visible,
-  async (vis) => {
-    if (!vis) return
-    rows.value = props.orders.map((o) => ({
+/** 订单上的域必须落在弹窗授权域列表内，否则视为不可提交 */
+function toDomainKey(v: string | undefined): DomainKey | undefined {
+  return props.domainOptions.includes(v as DomainKey) ? (v as DomainKey) : undefined
+}
+
+/** 候选集按排程域收敛：一次只处理一个域，跨域订单不进本弹窗 */
+function buildRows(dk: DomainKey | undefined): Row[] {
+  return props.orders
+    .filter((o) => o.domainKey === dk)
+    .map((o) => ({
       ...o,
       // 自动带入（B4 已落地）：orderCanonicalId 存在则带入 canonicalId（保留手填兜底作兼容回退）
       canonicalId: o.orderCanonicalId
     }))
-    selected.value = []
+}
+
+/** 勾选预选订单（只勾当前域内的行；预选订单不在当前域 ⇒ 不勾） */
+function applyPreselection(): void {
+  const pre = new Set(props.preselectedOrderIds ?? [])
+  if (pre.size === 0 || !tableRef.value) return
+  rows.value.forEach((r) => {
+    if (pre.has(r.orderId)) tableRef.value?.toggleRowSelection(r, true)
+  })
+}
+
+watch(
+  () => props.visible,
+  async (vis) => {
+    if (!vis) return
     errors.value = []
+    // 预选订单自身的域最精确（用户在列表里勾的就是这些订单）→ 其次页面当前域 → 最后退到首个选项
+    const preOrder = props.orders.find((o) => o.orderId === (props.preselectedOrderIds ?? [])[0])
+    domainKey.value =
+      toDomainKey(preOrder?.domainKey) ?? props.defaultDomainKey ?? props.domainOptions[0]
+    rows.value = buildRows(domainKey.value)
+    selected.value = []
     priorityMode.value = 'NORMAL'
-    domainKey.value = props.defaultDomainKey ?? props.domainOptions[0]
     await nextTick()
-    const pre = new Set(props.preselectedOrderIds ?? [])
-    if (pre.size > 0 && tableRef.value) {
-      rows.value.forEach((r) => {
-        if (pre.has(r.orderId)) tableRef.value?.toggleRowSelection(r, true)
-      })
-    }
+    applyPreselection()
   },
   { immediate: true }
 )
+
+watch(domainKey, async (next, prev) => {
+  if (!props.visible || next === prev) return
+  rows.value = buildRows(next)
+  selected.value = []
+  await nextTick()
+  applyPreselection()
+})
 
 function close(): void {
   emit('update:visible', false)
@@ -224,7 +253,12 @@ function onSubmit(): void {
         </ElTable>
 
         <div class="field-hint">
-          已选 <strong>{{ selected.length }}</strong> / {{ rows.length }} 个订单
+          已选 <strong>{{ selected.length }}</strong> / {{ rows.length }} 个订单（仅显示排程域
+          {{ domainKey ?? '未选择' }} 的订单）
+        </div>
+        <div v-if="rows.length === 0" class="field-hint">
+          当前页没有排程域
+          {{ domainKey ?? '未选择' }} 的订单：请切换排程域，或回到列表勾选该域的订单。
         </div>
       </ElFormItem>
 

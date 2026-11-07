@@ -1283,7 +1283,8 @@
             故下方显式拦截，避免调用方误以为过滤生效（4号位 10-17 §3.2）。</para>
             <para>10-29 分页契约（4号位 三步走·第 1 步，5号位 复函定稿）：
             <c>limit</c> 缺省 8,000、硬上限 20,000——<b>不传亦按默认截断，"裸调=全量"旧语义终结</b>；
-            翻页=把响应 <c>nextAfter</c> 三元组原样回填 <c>afterResourceId/afterStartAt/afterTaskId</c>（缺一按首页）。
+            翻页=把响应 <c>nextAfter</c> 的 <c>afterStartAt/afterTaskId</c> 回填（11-06 时间序二元组；
+            <c>afterResourceId</c> 仍可收到、被忽略——旧前端不需要同批改）。
             响应新增 <c>limit/totalTasks/hasMore/nextAfter</c>；<c>totalTasks</c>=当前过滤口径数（非版本总数）。</para>
             </summary>
         </member>

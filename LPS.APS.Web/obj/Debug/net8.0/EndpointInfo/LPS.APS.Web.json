@@ -6816,7 +6816,7 @@
         "tags": [
           "Schedule"
         ],
-        "summary": "获取指定计划版本的甘特图数据（资源行 + 任务条；越权返回空且 ScopeDenied=true）。\r\n冻结 05:1013「Gantt按时间窗/资源加载」：支持可选 from / to / resourceIds。\r\n<br>⚠️ `resourceIds` 只认<b>重复键</b>写法：`?resourceIds=1&resourceIds=2`。\r\n逗号形式（`1,2`）会被模型绑定拒绝（422）；`resourceIds[]=1` 形式会被静默忽略而返回全量，\r\n故下方显式拦截，避免调用方误以为过滤生效（4号位 10-17 §3.2）。<br>10-29 分页契约（4号位 三步走·第 1 步，5号位 复函定稿）：\r\n`limit` 缺省 8,000、硬上限 20,000——<b>不传亦按默认截断，\"裸调=全量\"旧语义终结</b>；\r\n翻页=把响应 `nextAfter` 三元组原样回填 `afterResourceId/afterStartAt/afterTaskId`（缺一按首页）。\r\n响应新增 `limit/totalTasks/hasMore/nextAfter`；`totalTasks`=当前过滤口径数（非版本总数）。",
+        "summary": "获取指定计划版本的甘特图数据（资源行 + 任务条；越权返回空且 ScopeDenied=true）。\r\n冻结 05:1013「Gantt按时间窗/资源加载」：支持可选 from / to / resourceIds。\r\n<br>⚠️ `resourceIds` 只认<b>重复键</b>写法：`?resourceIds=1&resourceIds=2`。\r\n逗号形式（`1,2`）会被模型绑定拒绝（422）；`resourceIds[]=1` 形式会被静默忽略而返回全量，\r\n故下方显式拦截，避免调用方误以为过滤生效（4号位 10-17 §3.2）。<br>10-29 分页契约（4号位 三步走·第 1 步，5号位 复函定稿）：\r\n`limit` 缺省 8,000、硬上限 20,000——<b>不传亦按默认截断，\"裸调=全量\"旧语义终结</b>；\r\n翻页=把响应 `nextAfter` 的 `afterStartAt/afterTaskId` 回填（11-06 时间序二元组；\r\n`afterResourceId` 仍可收到、被忽略——旧前端不需要同批改）。\r\n响应新增 `limit/totalTasks/hasMore/nextAfter`；`totalTasks`=当前过滤口径数（非版本总数）。",
         "parameters": [
           {
             "name": "planVersionId",
@@ -9747,6 +9747,10 @@
             "type": "number",
             "format": "double",
             "nullable": true
+          },
+          "objectType": {
+            "type": "string",
+            "nullable": true
           }
         },
         "additionalProperties": false
@@ -9882,7 +9886,8 @@
             "nullable": true
           },
           "isCriticalPath": {
-            "type": "boolean"
+            "type": "boolean",
+            "nullable": true
           },
           "duration": {
             "type": "number",
@@ -9956,6 +9961,58 @@
             "nullable": true
           },
           "upstreamStageCode": {
+            "type": "string",
+            "nullable": true
+          },
+          "productionDepartmentId": {
+            "type": "integer",
+            "format": "int32",
+            "nullable": true
+          },
+          "departmentName": {
+            "type": "string",
+            "nullable": true
+          },
+          "stageCode": {
+            "type": "string",
+            "nullable": true
+          },
+          "taskType": {
+            "type": "string",
+            "nullable": true
+          },
+          "routeCode": {
+            "type": "string",
+            "nullable": true
+          },
+          "pathId": {
+            "type": "integer",
+            "format": "int32",
+            "nullable": true
+          },
+          "manualSlotId": {
+            "type": "integer",
+            "format": "int32",
+            "nullable": true
+          },
+          "mtS_InstructionNo": {
+            "type": "string",
+            "nullable": true
+          },
+          "stageExecutionBatchKey": {
+            "type": "string",
+            "nullable": true
+          },
+          "stageExecutionBatchQty": {
+            "type": "number",
+            "format": "double",
+            "nullable": true
+          },
+          "mesWorkOrderNo": {
+            "type": "string",
+            "nullable": true
+          },
+          "dispatchStatus": {
             "type": "string",
             "nullable": true
           },
@@ -11895,6 +11952,19 @@
           "basePlanVersionId": {
             "type": "integer",
             "format": "int32",
+            "nullable": true
+          },
+          "dataCutoffTime": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          },
+          "runType": {
+            "type": "string",
+            "nullable": true
+          },
+          "triggeredBy": {
+            "type": "string",
             "nullable": true
           }
         },
@@ -14096,7 +14166,8 @@
             "$ref": "#/components/schemas/TimeSpan"
           },
           "allowLowerOverride": {
-            "type": "boolean"
+            "type": "boolean",
+            "nullable": true
           }
         },
         "additionalProperties": false
@@ -14170,10 +14241,12 @@
             "$ref": "#/components/schemas/TimeSpan"
           },
           "allowLowerOverride": {
-            "type": "boolean"
+            "type": "boolean",
+            "nullable": true
           },
           "isAuthorizedOverride": {
-            "type": "boolean"
+            "type": "boolean",
+            "nullable": true
           },
           "sourceSystem": {
             "type": "string",

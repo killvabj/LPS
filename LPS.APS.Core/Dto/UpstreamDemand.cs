@@ -21,10 +21,10 @@ public sealed class UpstreamDemand
     public string? ProtectionStatus { get; init; }
 
     // ── 2026-11-06 V1.1 新增（3号位 需求优先级新增字段四段贯通实施包 v1.0 §四.1）──────────
-    //   ⚠ 只装「订单源确实有值」的 7 个。`StockConsumeDay`（库存消耗日）与
-    //     `NonStockShipCategory`（非在库出荷区分）是**页面维护字段**、当前无存储载体，
-    //     未装入 ⇒ 也未接进执行器白名单（接了只会拿到 null，属于实施包 §五 点名的「空转」）。
-    //     待 4号位 前端维护入口 + 载体落库后再补。
+    //   9 个新增字段现已全部装入并接线执行器白名单（防空转满足，2026-11-06/07 已放行）。
+    //   `StockConsumeDay`（库存消耗日）＝ `IAD.AverageDailyConsumption` 派生的 CoverageDays **小数天**（非日期、非页面维护）；
+    //   `NonStockShipCategory`（非在库出荷区分）＝ `[Order].ZPQF`（1/2/0）装载（非页面维护）。
+    //   ⚠ 2026-11-07 更正早期暂态表述：二者均**非**「页面维护、无载体待 4号位 前端入口补录」，勿据此造页面录入。
 
     /// <summary>客户区分（JAPAN/DOMESTIC/OVERSEAS/VIETNAM/INTER_FACTORY/OTHER）。源：`[Order].CustomerSegment`。</summary>
     public string? CustomerSegment { get; init; }

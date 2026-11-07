@@ -12,7 +12,8 @@
 -->
 <script setup lang="tsx">
 import { computed, onMounted, reactive, ref, watch } from 'vue'
-import { formatUtcDateTimeSec } from '@/utils/datetime'
+import { formatLocalDateTimeSec } from '@/utils/datetime'
+// User.CreatedAt / LastLoginAt 由后端 DateTime.Now / GETDATE() 落库（服务器本地墙钟）⇒ 本地直显，不做 UTC→本地位移
 import {
   ElButton,
   ElDialog,
@@ -503,12 +504,12 @@ const statusTagType = (s: UserStatus): 'success' | 'warning' | 'info' => {
       </ElTableColumn>
       <ElTableColumn label="最后登录" width="170">
         <template #default="{ row }: { row: UserSummaryDto }">
-          {{ formatUtcDateTimeSec(row.lastLoginTime) }}
+          {{ formatLocalDateTimeSec(row.lastLoginTime) }}
         </template>
       </ElTableColumn>
       <ElTableColumn label="创建时间" width="170">
         <template #default="{ row }: { row: UserSummaryDto }">
-          {{ formatUtcDateTimeSec(row.createdAt) }}
+          {{ formatLocalDateTimeSec(row.createdAt) }}
         </template>
       </ElTableColumn>
       <ElTableColumn label="操作" width="400" fixed="right">

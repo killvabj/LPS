@@ -8,6 +8,9 @@
  *
  * 服务端分页：列表 / 合计都取 `/api/order-query` 的 `PageResult{items,total,page,pageSize}`，
  * `listTotal` 用服务端 `total`，不用 `items.length`。
+ *
+ * summary 三桶（按期 / 延迟 / 未排产）为**计划派生**（5号位 2026-11-02 r14009 落码），
+ * 与列表 `riskLevel` 同源（冻结 `01 §64`）⇒ 恒等式 `onTime+delayed+unscheduled = total`。
  */
 
 import { defineStore } from 'pinia'
@@ -61,18 +64,6 @@ export const useOrderStore = defineStore('aps.order', () => {
   const planVersionIdReady = computed<boolean>(
     () => planVersionId.value !== null && planVersionId.value > 0
   )
-
-  /**
-   * 未计算订单数 = 总数 − 已算出的（未延迟 + 延迟）。
-   *
-   * 冻结 `07:2666` 值域里没有 NULL，但 `DelayStatus` 列可空；NULL = **未计算**，不是「按期」。
-   * v24 实测 13,577 + 7,941 = 21,518 = 总数，即该版本无未计算行；其它版本未必。
-   */
-  const uncalculatedCount = computed<number>(() => {
-    const s = summary.value
-    if (!s) return 0
-    return Math.max(0, s.totalCount - s.onTimeCount - s.delayedCount)
-  })
 
   // ===== actions =====
   async function loadVersions(): Promise<void> {
@@ -199,8 +190,9 @@ export const useOrderStore = defineStore('aps.order', () => {
 
   function handleError(target: typeof listError, err: unknown): void {
     if (err instanceof ApiError) {
-      target.value =
-        `[${err.code}] ${err.message}` + (err.traceId ? ` (traceId=${err.traceId})` : '')
+      // code 0 = 网络层错误（断网 / 超时），不是 HTTP 状态 ⇒ 不显示 "[0]" 这种没人看得懂的编号
+      const prefix = err.code > 0 ? `[${err.code}] ` : ''
+      target.value = prefix + err.message + (err.traceId ? ` (traceId=${err.traceId})` : '')
     } else {
       target.value = (err as Error)?.message ?? '未知错误'
     }
@@ -215,7 +207,6 @@ export const useOrderStore = defineStore('aps.order', () => {
     listError,
     summary,
     summaryLoading,
-    uncalculatedCount,
     currentDetail,
     detailLoading,
     detailError,

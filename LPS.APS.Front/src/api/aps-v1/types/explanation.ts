@@ -69,6 +69,38 @@ export const REASON_CODE_LABELS: Record<ReasonCode, string> = {
   EQUIPMENT_BREAKDOWN_RISK: '设备故障风险'
 }
 
+/* ===== 原因码 → 展示标签（全站唯一口径，2026-10-31 收口） ===== */
+/**
+ * 后端原因码字段的实库取值类型：**空串**（写方未填）+ 冻结 15 码。
+ *
+ * 后端两处均为 `public string ... = string.Empty`：
+ *  - `lps/LPS.APS.Core/Dto/ExplanationDtos.cs` → `ScheduleExplanationFact.ReasonCode`
+ *  - `lps/LPS.APS.Application/Services/Query/Dto/GanttDataDto.cs:310` → `GanttDelayReasonDto.ReasonCode`
+ *
+ * 5号位 2026-10-31 回执实查：ORDER 级 465,481 条事实中 **442,408 条（95%）ReasonCode 为空串**；
+ * dev `GET /api/explanation/summary?planVersionId=999333` 实测 `reasonCodeCounts` 含
+ * `{"reasonCode":"","count":516}`、`items` 50 条中 39 条为空串。
+ * ⇒ **空串是常态，不是异常**：前端必须按「写方未填原因码」中性展示，不能留空白标签。
+ */
+export type ReasonCodeValue = ReasonCode | ''
+
+/**
+ * 原因码 → 展示标签。**全站唯一口径**（甘特页 / 排程解释页 / CTP 页共用，禁止各页自写查表）。
+ *
+ * 三档：
+ *  - 空串 / null / undefined → 「未标注原因码」（中性；**不留空白标签**）
+ *  - 冻结 15 码命中 → 冻结中文标签
+ *  - 字典未命中（15 码之外的受控扩展值）→ 「待核对·<码值>」（原样露出码值，不臆造中文名）
+ *
+ * ⚠️ 查表**必须**走本函数：裸索引 `REASON_CODE_LABELS[code]` 在空串 / 未命中时得到 `undefined`
+ *    ⇒ ElTag 渲染成**空白标签**（Ctp.vue 历史注释已记「甘特 GT02/GT10 踩过」）。
+ */
+export function reasonLabelOf(code?: string | null): string {
+  const raw = (code ?? '').trim()
+  if (!raw) return '未标注原因码'
+  return (REASON_CODE_LABELS as Record<string, string>)[raw] ?? `待核对·${raw}`
+}
+
 /* ===== ObjectType 值域（v5.1.10 :4858 5 码） ===== */
 export const EXPLANATION_OBJECT_TYPES = ['ORDER', 'TASK', 'RESOURCE', 'STAGE', 'DOMAIN'] as const
 export type ExplanationObjectType = (typeof EXPLANATION_OBJECT_TYPES)[number]
@@ -101,22 +133,61 @@ export const EXPLANATION_SEVERITY_TAG: Record<ExplanationSeverity, 'info' | 'war
     ERROR: 'danger'
   }
 
-/* ===== 排程解释事实（ScheduleExplanationFact，对齐 5号位 lps/LPS.APS.Core/Dto/ExplanationDtos.cs :9-43） ===== */
+/* ===== 排程解释事实（ScheduleExplanationFact —— 前端视图模型） ===== */
+/**
+ * ⚠️ **本类型是前端视图模型，不是后端 DTO 的原样拷贝**（2026-11-05 修）。
+ *
+ * 后端 `ExplanationDto`（lps/LPS.APS.Core/Dto/ExplanationDtos.cs :9-43）返的字段名是
+ *   `id` / `createdAt` / `orderId` / `taskId` / `resourceId` / `stageCode`，
+ * **没有** `factId` / `occurredAt` / `objectRef`。
+ * 前端此前直接把它当本类型用 ⇒ 页面「对象」格恒为空、时间恒显示 `Invalid Date`、
+ * `:key="f.factId"` 恒为 undefined。
+ *
+ * 现统一由 `api/aps-v1/explanation.ts` 的 `toScheduleExplanationFact()` 做一次映射：
+ *   `id → factId`、`createdAt → occurredAt`、`objectRef` 由来源 Id / 证据 JSON 派生。
+ */
 export interface ScheduleExplanationFact {
   factId: number
   planVersionId: number
   scheduleRunId?: number
   objectType: ExplanationObjectType
-  /** 聚合展示用：基于 OrderId / TaskId / ResourceId / StageCode 派生（store 层聚合） */
+  /**
+   * 聚合展示用：**由来源 Id / 证据 JSON 派生**（不是后端字段）。
+   * 派生优先级（见 api 层 `deriveObjectRef`）：
+   *   ORDER → 证据里的 `LogicalDemandKey`（需求号，如 `999333_35`）→ 退到 `orderId`
+   *   TASK → `taskId`；RESOURCE → `resourceId`；STAGE → `stageCode`；DOMAIN → 证据里的 `DomainKey`
+   */
   objectRef: string
-  /** 权威枚举（v5.1.10 :4863 15 码全集） */
-  reasonCode: ReasonCode
+  /**
+   * 原因码 —— 冻结权威枚举（v5.1.10 :4863 15 码全集）**或空串**。
+   *
+   * 2026-10-31：实库 **95% 为空串**（写方未填，见 `ReasonCodeValue` 注释）⇒ 类型必须能表达空串，
+   * 否则前端按 15 码联合理解值，会把「写方未填」误判为「未知码」。
+   */
+  reasonCode: ReasonCodeValue
   severity: ExplanationSeverity
   /** 影响小时数（v5.1.10 :4865；可为 0） */
   impactHours?: number
   /** 证据 JSON（外壳 evidenceType/summary/details；v5.1.10 :4866；细分走 evidenceType） */
   evidenceJson?: string
+  /**
+   * 证据里的大白话摘要（写方给了才有；没有则不显示这一行）。
+   * 实测形状不统一：ORDER 排产延误行是 `{evidenceType, summary, details}`（有 summary），
+   * 需求分配行是 `{LogicalDemandKey, MaterialId, DomainKey, ...}`（无 summary），
+   * 域级行是 PascalCase 的 `{EvidenceType, DomainKey, ...}` ⇒ 取值时大小写都认。
+   */
+  evidenceSummary?: string
+  /** 发生时间（= 后端 `createdAt`） */
   occurredAt: IsoDateTime
+  /* ---- 以下为后端原始列，保留以便派生 / 深钻 ---- */
+  /** 订单 Id（ORDER 级事实；实库 525/527 行有值） */
+  orderId?: number
+  /** 任务 Id（TASK 级事实） */
+  taskId?: number
+  /** 资源 Id（RESOURCE 级事实） */
+  resourceId?: number
+  /** 工段代码（STAGE 级事实；实库多为 CN_ASSY / BJ_CAST / BJ_SURF） */
+  stageCode?: string
 }
 
 /* ===== 业务事实问题（BusinessFactIssue，对齐 5号位 lps/LPS.APS.Core/Dto/BusinessFactIssueDto.cs :9-80）
@@ -164,7 +235,11 @@ export interface BusinessFactIssue {
 
 /* ===== 按 ReasonCode 分组统计（对齐 5号位 lps/LPS.APS.Core/Dto/ExplanationDtos.cs :71-76 ReasonCodeCountDto） ===== */
 export interface ReasonCodeCount {
-  reasonCode: ReasonCode
+  /**
+   * 原因码 —— 冻结 15 码**或空串**（实库 95% 空串，见 `ReasonCodeValue`）。
+   * 空串会作为一个独立分组出现在 `reasonCodeCounts` 里（dev 实测 `{"reasonCode":"","count":516}`）。
+   */
+  reasonCode: ReasonCodeValue
   count: number
   totalImpactHours?: number
 }
@@ -175,12 +250,20 @@ export interface ReasonCodeCount {
  *  改用 Summary 端点的 `errorCount / warnCount / infoCount` 三计数。
  *
  *  说明：本 DTO 是 4号位 视图聚合层（与 5号位 lps/LPS.APS.Core/Dto/ExplanationDtos.cs :48 ExplanationSummaryDto 字段对齐 + 增 4号位 业务字段）：
- *  - top 3 KPI 来自 `errorCount / warnCount / infoCount`（Summary 端点权威数）
- *  - 排程解释事实卡片来自 `scheduleExplanationFacts[]`（Summary.items）
+ *  - top 3 KPI 来自 `errorCount / warnCount / infoCount`（Summary 端点权威数），**百分比分母用 `totalCount`**
+ *  - 排程解释事实卡片来自 `scheduleExplanationFacts[]`（**列表端点 `/api/explanation` 分页加载**，不是 Summary.items）
  *  - reasonCodeCounts 来自 Summary 端点直接透传
  */
 export interface ExplanationViewDto {
   planVersionId: number
+  /**
+   * **后端权威总数**（Summary 端点 `TotalCount`，= errorCount + warnCount + infoCount）。
+   *
+   * 2026-11-05 修：此前页面拿「已加载条数」当分母算 KPI 百分比
+   *   ⇒ dev 上出现「错误 538% / 警告 516%」（分母 50 条已加载，分子 269/258 全量计数）。
+   * 百分比分母必须用这个字段（总数），不能用 `scheduleExplanationFacts.length`（已加载数）。
+   */
+  totalCount: number
   scheduleExplanationFacts: ScheduleExplanationFact[]
   businessFactIssues: BusinessFactIssue[]
   /** 业务事实问题总数（来自后端 PageResult.total；前端视图层"共 M 条"展示） */

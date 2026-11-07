@@ -228,6 +228,37 @@ export const ORDER_DELAY_STATUS_LABELS: Record<OrderDelayStatus, string> = {
   REPEATED_DELAY: '重复延迟'
 }
 
+/**
+ * 交付风险等级（`OrderListItemDto.riskLevel`）—— **计划派生**判定
+ *
+ * 5号位 2026-11-02 答复函 §一 Q1 选「甲」新增的字段：词表取冻结 `07 §八.2`
+ * （`OrderScheduleSummary.RiskLevel`）的 `ON_TRACK / AT_RISK / DELAYED`。
+ *
+ * ⚠️ 与上面那套 `Order.DelayStatus`（ERP/ODS 独立维度）**不是一回事**：
+ *   - `DelayStatus` = 订单进 APS 之前 ERP 侧记的延期属性，与排产无关；
+ *   - `riskLevel` = **本 PlanVersion 的交付判定**（冻结 `01 §64`：
+ *     `APS预计完成时间 > CustomerDueDate` 即为延期）。
+ *   冻结 `01 §64` 红线明文：**不得用 `Order.DelayStatus` 替代当前 PlanVersion 的交付结果**。
+ *
+ * **缺键 ≠ 按期**：本版本无 Task（未排产）或无交期时后端整键省略 ⇒ 一律渲染「未排产」，
+ * 绝不能落进「按期」里（那会把没排产的订单说成按时）。
+ *
+ * `AT_RISK` 属 `OrderScheduleSummary` 实体（dev 实测该表 0 行、当前无写入方）⇒ V1 不出该值，
+ * 词表留着只为将来有数据时能渲染，不造假。
+ */
+export const ORDER_RISK_LEVELS = ['ON_TRACK', 'AT_RISK', 'DELAYED'] as const
+export type OrderRiskLevel = (typeof ORDER_RISK_LEVELS)[number]
+
+/** UI 层用：交付风险等级中文标签（未知值原样降级显示） */
+export const ORDER_RISK_LEVEL_LABELS: Record<OrderRiskLevel, string> = {
+  ON_TRACK: '按期',
+  AT_RISK: '有风险',
+  DELAYED: '延迟'
+}
+
+/** `riskLevel` 缺键时的文案（本版本无 Task / 无交期 ⇒ 不可判定） */
+export const ORDER_RISK_MISSING_LABEL = '未排产'
+
 /** 4号位文档第 13 节：Supply 来源类型 */
 export const SUPPLY_TYPES = [
   'INVENTORY',
@@ -243,16 +274,14 @@ export const SUPPLY_TYPES = [
 
 export type SupplyType = (typeof SUPPLY_TYPES)[number]
 
-/** 4号位文档第 2.2 节：页面必须区分四类信息标签 */
+/**
+ * Task「事实类型」四值
+ *
+ * ⚠️ **V1 永久缺键**（5号位 2026-11-05 B7 裁决「不做、撤」）：全部冻结文档无 Task 事实类型定义
+ *   （07 的 ESTIMATED 属 Supply CommitmentStatus）。类型位保留以对齐后端 DTO 预留位，
+ *   前端已撤展示位与中文映射（原先的 `FACT_TYPE_LABELS` 已随之删除，避免留下无出口的死码表）。
+ */
 export type FactType = 'FACT' | 'RESULT' | 'ESTIMATED' | 'RECOMMENDATION'
-
-/** UI 层用：四类信息标签中文映射 */
-export const FACT_TYPE_LABELS: Record<FactType, string> = {
-  FACT: '事实',
-  RESULT: '计算结果',
-  ESTIMATED: '估算',
-  RECOMMENDATION: '建议'
-}
 
 /**
  * PI 位置类型（PositionType）
@@ -365,19 +394,25 @@ export const normalizeRuleStatus = (raw: string | null | undefined): RuleStatus 
 }
 
 /**
- * 从版本列表里挑出「当前生效的已发布版本」
+ * 从版本列表里挑出「**最新已发布**」的那一版（口径 = Id 最大）
  *
  * ⚠️ 后端允许**多条 PUBLISHED 并存**（旧版本不会自动降级），所以不能
  *   `find(status === 'PUBLISHED')` —— 那会命中**最旧**的一版。dev 实测：
  *   RS_DEMO 的 RS-DEMO-V1（2026-07-04 生效 ~ 08-03 到期）与 RS-DEMO-V2
- *   （08-03 生效 ~ 一直）**都是** PUBLISHED，`find` 拿到 V1，
- *   页面就把已到期的旧版标成「当前生效」，而列表摘要明明写着 V2。
+ *   （08-03 生效 ~ 一直）**都是** PUBLISHED，`find` 拿到 V1。
  *
  * 选取口径 = **Id 最大**，与后端列表 `OUTER APPLY (... ORDER BY [Id] DESC)`
  * （`RuleSetRepository.cs:95-102` / `ParameterSetRepository.cs:93-100`）完全一致
- * ⇒ 列表里的「当前版本」和详情页标「当前生效」的那一条不会打架。
+ * ⇒ 列表摘要与详情页标的那一条不会打架。
+ *
+ * ⚠️ **术语：这里取的是「最新已发布」，不是「当前有效」**（0号位 2026-10-16 裁决 /
+ *   3号位 2026-11-02 承接回执 §3.1 Q2）：两个是**不同概念**，不一致不是缺陷。
+ *   - 「当前有效」= **生效期窗口**语义 ⇒ 权威读路是 `published-version` 端点
+ *     （状态 + 生效期窗口内恰一才返；多条同时命中 ⇒ 400 报歧义）。
+ *   - 「最新已发布」= 列表投影 **Id 最大** ⇒ 就是本函数。
+ *   ⇒ 前端文案一律叫「最新已发布」，**不许叫「当前生效」**（否则与窗口口径的权威答案打架）。
  */
-export function pickCurrentPublished<T extends { id: number; status?: string | null }>(
+export function pickLatestPublished<T extends { id: number; status?: string | null }>(
   versions: readonly T[]
 ): T | undefined {
   const published = versions.filter((v) => normalizeRuleStatus(v.status) === 'PUBLISHED')

@@ -295,6 +295,41 @@ export interface SetupUncoveredStatDto {
   sampleTaskId?: number | null
 }
 
+/**
+ * 0 分钟兜底统计 **服务端分页** 查询参数
+ *
+ * 与 `SetupUncoveredQuery`（5 个筛选）分开定义：后者保持纯筛选，
+ * 「不带分页 = 全量数组」这条后端契约（SetupRuleController.cs:381）不被前端类型污染。
+ */
+export interface SetupUncoveredPageQuery extends SetupUncoveredQuery {
+  /** 页码（1 基） */
+  pageIndex?: number
+  /** 每页条数 */
+  pageSize?: number
+}
+
+/**
+ * 0 分钟兜底统计 **服务端分页** 响应
+ *
+ * 对齐后端 `SetupUncoveredStatsPage`（SetupUncoveredStatDtos.cs:65-84）。
+ * 与全量数组响应（`SetupUncoveredStatDto[]`）是**同一端点的两种响应形态**，
+ * 由「是否传 pageIndex / pageSize」决定（方案 A，3号位 2026-10-28 落码）。
+ */
+export interface SetupUncoveredStatsPage {
+  /** 当前页聚合行 */
+  items: SetupUncoveredStatDto[]
+  /** 过滤后的全量聚合行数（前端分页器 total） */
+  total: number
+  /** 当前页码（1 基） */
+  page: number
+  /** 每页条数 */
+  pageSize: number
+  /** 涉及部门数（后端 KPI；前端当前不展示，仅保留字段） */
+  departmentCount: number
+  /** 涉及大工艺数（后端 KPI；前端当前不展示，仅保留字段） */
+  stageCount: number
+}
+
 /* ==================== 共同合法设备推荐 ==================== */
 
 /**

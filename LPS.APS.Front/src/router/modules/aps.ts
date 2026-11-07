@@ -574,7 +574,7 @@ export const apsV1Routes: AppRouteRecordRaw[] = [
         name: 'ApsSetupDiff',
         meta: {
           title: '规则版本对比',
-          icon: 'vi-mdi:file-compare-outline',
+          icon: 'vi-mdi:file-compare',
           hidden: true,
           noCache: true,
           stage: 'C',

@@ -22,6 +22,12 @@
  *  - 「去补明确产品转换」出口撤除：EXACT 入参必须同时给前/后产品主键
  *    （SetupRuleExactInput.FromMaterialId/ToMaterialId，缺任一即 422），
  *    而 [Task] 无 FromMaterial ⇒ 统计行永远补不出明确转换。3号位 Q4 已裁定降级为只补 DEFAULT。
+ *
+ * 10-29 变更（3号位 方案 A 服务端分页落码后）：
+ *  - stats = **当前页**行；total = 后端返回的过滤后总行数（分页器用，不是 stats.length）
+ *  - 后端分页对象另带 2 个 KPI 计数，本页按用户口径**只取 total**，其余不展示也不落 state
+ *  - 列表走后端分页端点（传 pageIndex/pageSize）；CSV 导出改走全量端点重新拉一次，
+ *    否则只会导出当前页（静默漏导）
  */
 
 import { defineStore } from 'pinia'
@@ -34,9 +40,18 @@ import {
 } from '@/api/aps-v1'
 import { useApsAuthStore } from './auth'
 
+/** 导出结果：CSV 文本 + 实际导出行数（服务端分页后导出走全量重拉，行数 ≠ 当前页行数） */
+export interface SetupUncoveredCsvResult {
+  csv: string
+  count: number
+}
+
 export const useSetupUncoveredStore = defineStore('aps.setupUncovered', () => {
   // ===== state =====
+  /** 当前页的聚合行（服务端分页后不再是全量） */
   const stats = ref<SetupUncoveredStatDto[]>([])
+  /** 过滤后的总行数（后端返回，分页器 total 用；不是 stats.length） */
+  const total = ref<number>(0)
   const query = ref<SetupUncoveredQuery | null>(null)
 
   const listLoading = ref(false)
@@ -50,61 +65,49 @@ export const useSetupUncoveredStore = defineStore('aps.setupUncovered', () => {
   /** 查看权限 */
   const canView = computed<boolean>(() => apsAuth.has('aps.setup.view'))
 
-  /** 统计总数 */
-  const statCount = computed<number>(() => stats.value.length)
-
-  /** 按部门分组统计 */
-  const statsByDepartment = computed<Record<string, SetupUncoveredStatDto[]>>(() => {
-    const groups: Record<string, SetupUncoveredStatDto[]> = {}
-    stats.value.forEach((s) => {
-      if (!groups[s.departmentCode]) groups[s.departmentCode] = []
-      groups[s.departmentCode].push(s)
-    })
-    return groups
-  })
-
-  /**
-   * 按大工艺分组统计
-   *
-   * 10-27：原口径是 `${departmentCode}/${stageCode}` 复合键 —— 那是因为后端当时
-   * 不回带 stageCode，该列恒空，复合键让「涉及工艺」恒为 1。P1 落码后 stageCode
-   * 已有值（dev 实测 CN_ASSY 等），复合键会把「部门+大工艺」组合数当成工艺数，口径失真。
-   * 改为按大工艺单键分组；未回带的行归到「（未回带）」，不与真实大工艺混算。
-   */
-  const statsByStage = computed<Record<string, SetupUncoveredStatDto[]>>(() => {
-    const groups: Record<string, SetupUncoveredStatDto[]> = {}
-    stats.value.forEach((s) => {
-      const key = s.stageCode?.trim() || '（未回带）'
-      if (!groups[key]) groups[key] = []
-      groups[key].push(s)
-    })
-    return groups
-  })
-
   // ===== actions =====
 
   function setQuery(newQuery: SetupUncoveredQuery): void {
     query.value = newQuery
   }
 
-  async function loadStats(newQuery: SetupUncoveredQuery): Promise<void> {
+  /**
+   * 加载当前页（服务端分页，方案 A）
+   *  - 传了 pageIndex/pageSize ⇒ 后端返回分页对象（items/total/…）
+   *  - 失败清空 stats 且 total 归 0（不留半截状态）
+   */
+  async function loadStats(
+    newQuery: SetupUncoveredQuery,
+    pageIndex = 1,
+    pageSize = 20
+  ): Promise<void> {
     listLoading.value = true
     error.value = null
     query.value = newQuery
     try {
-      stats.value = await setupApi.getUncoveredStats(newQuery)
+      const page = await setupApi.getUncoveredStatsPage({ ...newQuery, pageIndex, pageSize })
+      stats.value = page.items
+      total.value = page.total
     } catch (err) {
       handleError(err)
       stats.value = []
+      total.value = 0
     } finally {
       listLoading.value = false
     }
   }
 
-  /** 导出 CSV（前端生成，不调后端）
+  /**
+   * 导出 CSV（前端拼装）
    *  10-27：列对齐后端实返字段（去掉不存在的 前产品/后产品/最近出现），并补 Id 列便于回溯
-   *  10-28：补 RuleSetVersionId（后端 P1 落码的归属维度） */
-  function exportCsv(): string {
+   *  10-28：补 RuleSetVersionId（后端 P1 落码的归属维度）
+   *  10-29：列表改服务端分页后，stats 只有当前页 ⇒ 导出**重新拉一次全量**（不带分页参），
+   *         避免只导出当前页静默漏导。返回 { csv, count }，count = 实际导出行数。
+   */
+  async function exportCsv(): Promise<SetupUncoveredCsvResult> {
+    const current = query.value
+    if (!current) return { csv: '', count: 0 }
+    const all = await setupApi.getUncoveredStats(current)
     const headers = [
       'ScheduleRunId',
       'RuleSetVersionId',
@@ -119,7 +122,7 @@ export const useSetupUncoveredStore = defineStore('aps.setupUncovered', () => {
       'Count',
       'SampleTaskId'
     ]
-    const rows = stats.value.map((s) => [
+    const rows = all.map((s) => [
       String(s.scheduleRunId ?? ''),
       String(s.ruleSetVersionId ?? ''),
       String(s.departmentId),
@@ -133,7 +136,10 @@ export const useSetupUncoveredStore = defineStore('aps.setupUncovered', () => {
       String(s.count),
       String(s.sampleTaskId ?? '')
     ])
-    return [headers.join(','), ...rows.map((r) => r.join(','))].join('\n')
+    return {
+      csv: [headers.join(','), ...rows.map((r) => r.join(','))].join('\n'),
+      count: all.length
+    }
   }
 
   function handleError(err: unknown): void {
@@ -147,6 +153,7 @@ export const useSetupUncoveredStore = defineStore('aps.setupUncovered', () => {
 
   function reset(): void {
     stats.value = []
+    total.value = 0
     query.value = null
     error.value = null
   }
@@ -154,14 +161,12 @@ export const useSetupUncoveredStore = defineStore('aps.setupUncovered', () => {
   return {
     // state
     stats,
+    total,
     query,
     listLoading,
     error,
     // getters
     canView,
-    statCount,
-    statsByDepartment,
-    statsByStage,
     // actions
     setQuery,
     loadStats,

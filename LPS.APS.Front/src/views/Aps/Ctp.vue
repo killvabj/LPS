@@ -27,7 +27,7 @@ import { materialLookupApi } from '@/api/aps-v1/materialLookup'
 import type { MaterialLookupItem } from '@/api/aps-v1/types'
 import {
   ESTIMATED_BADGE_TEXT,
-  REASON_CODE_LABELS,
+  reasonLabelOf,
   type CtpInput,
   type FactorySummaryDto
 } from '@/api/aps-v1/types'
@@ -119,11 +119,11 @@ const FACTORY_OPTIONS = ref<FactorySummaryDto[]>([])
 /* ===== 字典 =====
  * 根因码复用冻结 `07 v5.1.13 §八.1` 权威 15 码（与甘特 / Explanation 页同一份
  * `REASON_CODE_LABELS`，不再维护第二套自拟码表）。
- * ⚠️ 查表必须走下面的降级函数：后端将来若返回 15 码之外的受控扩展值，
- *    裸索引会得到 `undefined` ⇒ ElTag 渲染成**空白标签**（甘特 GT02/GT10 踩过）。
+ * ⚠️ 查表必须走 `reasonLabelOf`（全站唯一口径，types/explanation.ts）：
+ *    后端将来若返回 15 码之外的受控扩展值，裸索引会得到 `undefined`
+ *    ⇒ ElTag 渲染成**空白标签**（甘特 GT02/GT10 踩过）；
+ *    实库 95% 的 ReasonCode 是空串（写方未填），更不能裸索引。
  */
-const reasonLabelOf = (code: string): string =>
-  (REASON_CODE_LABELS as Record<string, string>)[code] ?? `待核对·${code}`
 /** 根因码 → 标签配色：只看语义大类，未知码给中性 info */
 const reasonTagTypeOf = (code: string): 'success' | 'warning' | 'danger' | 'info' => {
   if (code === 'EQUIPMENT_BREAKDOWN_RISK') return 'danger'

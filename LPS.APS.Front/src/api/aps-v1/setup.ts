@@ -17,6 +17,7 @@
  *   8.  DELETE /setup-rules/default/{id}                             删除 DEFAULT
  *   9.  GET    /operation-resource-eligibility?operationCode=...&materialId=...  共同合法设备推荐
  *   10. GET    /setup-rules/uncovered-stats?runId=...&...filters     0 分钟兜底统计
+ *               （方案 A 2026-10-28：**传 pageIndex/pageSize → 分页对象**；不传 → 全量数组）
  *   11. GET    /rule-set-versions                                    RuleSetVersion 列表（已有，复用）
  *   12. GET    /rule-set-versions/{id}/diff?otherVersionId=...       版本 Diff（需补 Setup 维度）
  *   13. POST   /rule-set-versions/{id}/publish                       整版发布 —— 前端**不封装**（越权端点，见文末）
@@ -35,6 +36,8 @@ import type {
   SetupRuleDefaultInput,
   SetupUncoveredQuery,
   SetupUncoveredStatDto,
+  SetupUncoveredPageQuery,
+  SetupUncoveredStatsPage,
   OperationResourceEligibilityQuery,
   OperationResourceEligibilityDto,
   SetupDiffDto,
@@ -227,6 +230,24 @@ const MOCK_UNCOVERED_STATS: SetupUncoveredStatDto[] = [
     sampleTaskId: 3
   }
 ]
+
+/** mock 模式下的 0 分钟兜底统计筛选（全量/分页两形态共用） */
+function filterMockUncoveredStats(query: SetupUncoveredQuery): SetupUncoveredStatDto[] {
+  let arr = MOCK_UNCOVERED_STATS
+  if (query.departmentId) {
+    arr = arr.filter((s) => s.departmentId === query.departmentId)
+  }
+  if (query.operationCode) {
+    arr = arr.filter((s) => s.operationCode === query.operationCode)
+  }
+  if (query.resourceId) {
+    arr = arr.filter((s) => s.resourceId === query.resourceId)
+  }
+  if (query.materialId) {
+    arr = arr.filter((s) => s.materialId === query.materialId)
+  }
+  return arr
+}
 
 /** mock 共同合法设备推荐（key = operationCode_fromMaterialId_toMaterialId，偏差 #5 后传 Id） */
 const MOCK_ELIGIBILITY: Record<string, OperationResourceEligibilityDto> = {
@@ -430,30 +451,41 @@ export const setupApi = {
     })
   },
 
-  /* ===== 10. 0 分钟兜底统计 ===== */
+  /* ===== 10. 0 分钟兜底统计（全量数组，供 CSV 导出） ===== */
   async getUncoveredStats(query: SetupUncoveredQuery): Promise<SetupUncoveredStatDto[]> {
     if (APS_USE_MOCK) {
-      let arr = MOCK_UNCOVERED_STATS
-      if (query.departmentId) {
-        arr = arr.filter((s) => s.departmentId === query.departmentId)
-      }
-      if (query.operationCode) {
-        arr = arr.filter((s) => s.operationCode === query.operationCode)
-      }
-      if (query.resourceId) {
-        arr = arr.filter((s) => s.resourceId === query.resourceId)
-      }
-      if (query.materialId) {
-        arr = arr.filter((s) => s.materialId === query.materialId)
-      }
-      return arr
+      return filterMockUncoveredStats(query)
     }
     return apsHttp.get<SetupUncoveredStatDto[]>({
       url: '/api/governance/setup-rules/uncovered-stats',
       // 形参名必须与后端一致（SetupRuleController.cs:366-372）：
       // runId / departmentId / operationCode / resourceId / materialId
       // 发 Code（departmentCode/resourceCode/stageCode）后端绑不上 ⇒ 筛选静默失效
+      // ⚠️ 本方法**绝不**传 pageIndex/pageSize ⇒ 后端走全量数组分支（SetupRuleController.cs:381）
       params: { ...query } as Record<string, unknown>
+    })
+  },
+
+  /* ===== 10b. 0 分钟兜底统计（服务端分页，方案 A） ===== */
+  async getUncoveredStatsPage(query: SetupUncoveredPageQuery): Promise<SetupUncoveredStatsPage> {
+    const pageIndex = query.pageIndex ?? 1
+    const pageSize = query.pageSize ?? 20
+    if (APS_USE_MOCK) {
+      const all = filterMockUncoveredStats(query)
+      const start = (pageIndex - 1) * pageSize
+      return {
+        items: all.slice(start, start + pageSize),
+        total: all.length,
+        page: pageIndex,
+        pageSize,
+        departmentCount: new Set(all.map((s) => s.departmentId)).size,
+        stageCount: new Set(all.map((s) => s.stageCode).filter((c): c is string => !!c)).size
+      }
+    }
+    return apsHttp.get<SetupUncoveredStatsPage>({
+      url: '/api/governance/setup-rules/uncovered-stats',
+      // 传了 pageIndex/pageSize ⇒ 后端返回 SetupUncoveredStatsPage（items/total/page/pageSize/...）
+      params: { ...query, pageIndex, pageSize } as Record<string, unknown>
     })
   },
 

@@ -38,6 +38,16 @@
  *  - ElPagination layout="total, sizes, prev, pager, next, jumper" 一次给齐
  *  - view ElCard header 移除 "显示 N 条 / 共 M 条" 双 tag（与 ElPagination 总数显示重复）
  *  - verify E23 静态锁标准 ElPagination 契约
+ *
+ * 2026-11-05 修三处真缺陷（dev 实测 + 后端源码定位）：
+ *  - KPI 百分比分母：改用后端权威总数 `totalFacts`（Summary.totalCount）
+ *    （此前拿「已加载条数」当分母 ⇒ dev 出现「错误 538% / 警告 516%」）
+ *  - 排程解释事实列表：改走列表端点 `/api/explanation` 分页加载
+ *    （后端 Summary.items 写死 `severity:"ERROR", take:50` ⇒ 只看得见 50 条 ERROR，
+ *      258 条 INFO 与其它 ObjectType 分组全部不可见且无任何提示 ⇒ 静默截断）
+ *  - 事实字段映射：后端 `id`/`createdAt` → 前端 `factId`/`occurredAt`；`objectRef` 前端派生
+ *    （此前「对象」格恒空、时间恒 `Invalid Date`）
+ *  - 面板加「共 N 条 · 已显示 M 条」计数行 + 「继续加载」（大版本不一次拉完）
  */
 
 import { computed, onMounted } from 'vue'
@@ -60,7 +70,7 @@ import {
   EXPLANATION_SEVERITY_LABELS,
   EXPLANATION_SEVERITY_TAG,
   OBJECT_TYPE_LABELS,
-  REASON_CODE_LABELS
+  reasonLabelOf
 } from '@/api/aps-v1/types/explanation'
 
 const explanationStore = useExplanationStore()
@@ -71,6 +81,9 @@ const {
   error,
   severityCounts,
   totalFacts,
+  loadedFactsCount,
+  factsHasMore,
+  factsLoading,
   factsByObjectType,
   unrecognizedObjectTypeFacts,
   unrecognizedRawObjectTypes,
@@ -83,18 +96,23 @@ const {
 } = storeToRefs(explanationStore)
 const { versions, currentVersionId, displayedVersions } = storeToRefs(scheduleStore)
 // actions 直接解构（Pinia 文档：storeToRefs 只包 state/getters；actions 直接解构）
-const { fetchBizPage, refreshBizIssues, changeBizPageSize } = explanationStore
+const { fetchBizPage, refreshBizIssues, changeBizPageSize, loadMoreFacts } = explanationStore
 
-/* ===== 顶部 KPI（3 码：ERROR / WARN / INFO） ===== */
+/* ===== 顶部 KPI（3 码：ERROR / WARN / INFO） =====
+ * 百分比分母 = `totalFacts`（**后端权威总数** Summary.totalCount），不是已加载条数。
+ * 2026-11-05 修：此前分母取「已加载条数」⇒ dev 上出现「错误 538% / 警告 516%」。 */
 const kpiItems = computed(() => [
   { key: 'ERROR', label: '错误', count: severityCounts.value.ERROR, color: '#ef4444' },
   { key: 'WARN', label: '警告', count: severityCounts.value.WARN, color: '#f59e0b' },
   { key: 'INFO', label: '提示', count: severityCounts.value.INFO, color: '#3b82f6' }
 ])
 
-/* ===== ReasonCode 字典兜底（15 码未命中时原样展示） ===== */
-const reasonLabel = (code: string): string =>
-  REASON_CODE_LABELS[code as keyof typeof REASON_CODE_LABELS] ?? code
+/* ===== ReasonCode 标签：走全站唯一口径 `reasonLabelOf`（types/explanation.ts） =====
+ * 2026-10-31：本页原先自写查表 `REASON_CODE_LABELS[code] ?? code` ——
+ *   ① 空串时 `?? code` 返回空串 ⇒ ElTag 渲染成**空白标签**（实库 95% 的事实 ReasonCode 为空串，
+ *      5号位 10-31 实查 442,408 / 465,481 条；dev 实测 reasonCodeCounts 含 {"reasonCode":"","count":516}）；
+ *   ② 未知码显示成裸码值，与甘特 / CTP 页的「待核对·<码>」口径不一致。
+ *   现统一走共享函数：空串 → 「未标注原因码」，未知码 → 「待核对·<码>」。 ===== */
 
 /* ===== BusinessFactIssue 类型中文映射（4号位 业务抽象，非冻结 15 码） =====
  *  - 与 ScheduleExplanationFact.ReasonCode 区分（后者 = v5.1.10 15 码权威枚举）
@@ -153,6 +171,11 @@ function selectVersion(id: number): void {
 /** 业务事实问题 pageSize 变更（10-10 增） */
 function onBizSizeChange(size: number): void {
   void changeBizPageSize(size)
+}
+
+/** 排程解释事实「继续加载」（2026-11-05）：追加下一页，不覆盖已有 */
+function onLoadMoreFacts(): void {
+  void loadMoreFacts()
 }
 
 /** 业务事实问题分页跳转（10-10 续改：标准 ElPagination）
@@ -221,7 +244,10 @@ onMounted(async () => {
       <div class="kpi-card total">
         <div class="kpi-label">解释事实合计</div>
         <div class="kpi-value">{{ totalFacts }}</div>
-        <div class="kpi-ratio">3 类汇总</div>
+        <div class="kpi-ratio">
+          错误 {{ severityCounts.ERROR }} · 警告 {{ severityCounts.WARN }} · 提示
+          {{ severityCounts.INFO }}
+        </div>
       </div>
     </div>
 
@@ -230,7 +256,21 @@ onMounted(async () => {
       <template #header>
         <div class="panel-header">
           <span> 排程解释事实 </span>
-          <span class="hint-text">按真实约束分组</span>
+          <!-- 计数行（2026-11-05）：把「一共多少条 / 展示了多少条」摆在明面上，
+               杜绝再出现「静默只显示 50 条」那种用户看不出被截断的情况 -->
+          <div class="fact-count">
+            <span class="hint-text">
+              共 {{ totalFacts }} 条 · 已显示 {{ loadedFactsCount }} 条
+            </span>
+            <ElButton
+              v-if="factsHasMore"
+              size="small"
+              :loading="factsLoading"
+              @click="onLoadMoreFacts"
+            >
+              继续加载
+            </ElButton>
+          </div>
         </div>
       </template>
       <div v-if="!data?.scheduleExplanationFacts?.length" class="panel-empty">
@@ -261,11 +301,15 @@ onMounted(async () => {
                 <span class="fact-ref">{{ f.objectRef }}</span>
                 <!-- 15 码 ReasonCode 徽章（v5.1.10 :4863 权威枚举） -->
                 <ElTag size="small" type="primary" effect="plain">
-                  {{ reasonLabel(f.reasonCode) }}
+                  {{ reasonLabelOf(f.reasonCode) }}
                 </ElTag>
                 <span v-if="f.impactHours && f.impactHours > 0" class="fact-impact">
                   {{ f.impactHours }}h
                 </span>
+              </div>
+              <!-- 证据里的大白话摘要（写方给了才有；悬停看全文） -->
+              <div v-if="f.evidenceSummary" class="fact-summary" :title="f.evidenceSummary">
+                {{ f.evidenceSummary }}
               </div>
               <div class="fact-time">
                 {{ dayjs(f.occurredAt).format('YYYY-MM-DD HH:mm') }}
@@ -303,11 +347,14 @@ onMounted(async () => {
               </ElTag>
               <span class="fact-ref">{{ f.objectRef }}</span>
               <ElTag size="small" type="primary" effect="plain">
-                {{ reasonLabel(f.reasonCode) }}
+                {{ reasonLabelOf(f.reasonCode) }}
               </ElTag>
               <span v-if="f.impactHours && f.impactHours > 0" class="fact-impact">
                 {{ f.impactHours }}h
               </span>
+            </div>
+            <div v-if="f.evidenceSummary" class="fact-summary" :title="f.evidenceSummary">
+              {{ f.evidenceSummary }}
             </div>
             <div class="fact-time">
               {{ dayjs(f.occurredAt).format('YYYY-MM-DD HH:mm') }}
@@ -392,7 +439,9 @@ onMounted(async () => {
       </template>
       <div class="code-distribution">
         <div v-for="c in data.reasonCodeCounts" :key="c.reasonCode" class="code-chip">
-          <ElTag type="primary" effect="plain" size="small">{{ reasonLabel(c.reasonCode) }}</ElTag>
+          <ElTag type="primary" effect="plain" size="small">{{
+            reasonLabelOf(c.reasonCode)
+          }}</ElTag>
           <span class="code-count">{{ c.count }} 项</span>
           <span v-if="c.totalImpactHours && c.totalImpactHours > 0" class="code-impact">
             / {{ c.totalImpactHours }}h
@@ -500,6 +549,8 @@ onMounted(async () => {
     font-size: 11px;
     color: #94a3b8;
     white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
 
   &.total {
@@ -551,6 +602,20 @@ onMounted(async () => {
   text-align: center;
 }
 
+/* ===== 排程解释事实面板头：计数行 + 继续加载（2026-11-05） ===== */
+.fact-count {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+
+  .hint-text {
+    font-size: 12px;
+    font-weight: 400;
+    color: #94a3b8;
+    white-space: nowrap;
+  }
+}
+
 .content-row {
   display: grid;
   grid-template-columns: 1fr;
@@ -599,6 +664,11 @@ onMounted(async () => {
   display: flex;
   flex-direction: column;
   gap: 8px;
+  /* 分组内独立滚动：一个版本的事实可能几百条（dev 实测 527 条），
+     不加滚动条会把整页撑到几万像素长 */
+  max-height: 420px;
+  overflow-y: auto;
+  padding-right: 4px;
 }
 
 .fact-item {
@@ -637,6 +707,17 @@ onMounted(async () => {
     margin-top: 6px;
     font-size: 11px;
     color: #94a3b8;
+  }
+
+  /* 证据里的大白话摘要（2026-11-05） */
+  .fact-summary {
+    margin-top: 6px;
+    font-size: 12px;
+    color: #475569;
+    line-height: 1.5;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 }
 

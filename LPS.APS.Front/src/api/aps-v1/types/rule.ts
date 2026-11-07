@@ -39,11 +39,13 @@ export interface RuleSetSummaryDto {
    */
   domainKey: DomainKey
   /**
-   * 当前已发布版本**版本码**（后端 `currentVersionCode`，字符串）
+   * 最新已发布版本**版本码**（后端 `currentVersionCode`，字符串，列表投影按 Id DESC 取）
    *
    * ⚠️ 2026-10-22 更正：原先本字段是 `currentVersion: number`，映射时恒填 0，
    * 页面上「当前版本」永远是「—」。后端给的就是版本**码**（如 `RS-DEMO-V2`），
    * 不是自增号，故改成字符串并直接用后端值。
+   *
+   * ⚠️ 术语：是「**最新已发布**」不是「当前有效」——后者按生效期窗口判定（published-version 端点）。
    */
   currentVersionCode?: string
   /** 待发布 DRAFT 版本码（后端 `draftVersionCode`；无草稿时 key 缺失） */
@@ -130,8 +132,9 @@ export interface RuleVersionHistoryDto {
   changeReason: string
   publishedAt?: IsoDateTime
   publishedBy: string
-  /** 是否为当前生效版本 */
-  isCurrent: boolean
+  /** 是否为「最新已发布」版本（Id 最大的那条 PUBLISHED）。
+   *  ⚠️ 不等于「当前有效」——后者按生效期窗口判定，由 published-version 端点给出。 */
+  isLatestPublished: boolean
   /** 生效起（后端 `effectiveFrom`） */
   effectiveFrom?: IsoDateTime
   /** 生效止（后端 `effectiveTo`；空 = 一直有效） */

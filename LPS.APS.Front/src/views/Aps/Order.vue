@@ -17,7 +17,15 @@
  *  - 硬编码的工厂 / 产品族 / 客户下拉（`F-SUZ-01`、`INJECTION`、`CUST-001` 等）全部删除 ——
  *    dev 实库是 `CN` / `CYL` / 中文客户名，与那份列表**零重合**，按它筛必然空
  *  - 「风险」卡下线（`riskCount` 查的是另一张表，实测恒 0，区分不了「无风险」与「无数据」）
- *  - 「未排」卡下线（后端 SQL 写死 `CAST(0 AS INT)`，是字面量不是查出来的数）
+ *
+ * 2026-11-02 按 5号位 答复函（r14009 已部署）接入**计划派生交付判定**：
+ *  - 交付状态改读后端算好的 `riskLevel`（`DELAYED` 红 / `ON_TRACK` 绿 / **缺键=未排产** 灰）；
+ *    `Order.DelayStatus` 是 ERP/ODS 独立维度，冻结 `01 §64` 红线禁止拿它当本版本交付结果
+ *    （实测 v999333 O20630651 就是 `delayStatus=ON_TIME` + 计划超期 15.4 天，两结论同屏打架）
+ *  - KPI 四卡 = 总数 / 按期 / 延迟 / 未排产，全部取 summary 的**计划派生三桶**
+ *    （恒等式：按期+延迟+未排产 = 总数）
+ *  - 「未排」卡重新上线：后端 `unscheduledCount` 已从 `CAST(0 AS INT)` 字面量改为**实值**
+ *    （本版本无 Task 行）；旧「未计算」卡（= 总数 − 按期 − 延迟）口径已废，删掉
  *
  * 写接口：本页查询部分只读；**唯一写入口 = §10A.1「已有订单提前」**
  * （EXISTING_ORDER_ADVANCE → POST /api/governance/run/candidate，Policy aps.plan.run）
@@ -39,14 +47,16 @@ import {
   ORDER_STATUS_LABELS,
   ORDER_DELAY_STATUSES,
   ORDER_DELAY_STATUS_LABELS,
+  ORDER_RISK_LEVEL_LABELS,
+  ORDER_RISK_MISSING_LABEL,
   ORDER_STATUS_FILTER_OPTIONS,
   PLAN_VERSION_STATUS_LABELS,
-  REASON_CODE_LABELS,
   normalizeOrderStatus,
+  reasonLabelOf,
   type DomainKey,
   type OrderDelayStatus,
+  type OrderRiskLevel,
   type OrderStatusDisplay,
-  type ReasonCode,
   type SupplyType
 } from '@/api/aps-v1/types'
 
@@ -77,7 +87,6 @@ const {
   listLoading,
   listError,
   summary,
-  uncalculatedCount,
   currentDetail,
   detailLoading,
   detailError,
@@ -88,28 +97,37 @@ const {
 
 const drawerVisible = ref(false)
 
-// ===== 延迟状态配色（冻结 07:2666 三值；未知值走 defaultColor 降级）=====
-const DELAY_COLORS: Record<OrderDelayStatus, string> = {
-  ON_TIME: '#059669',
-  FIRST_DELAY: '#ef4444',
-  REPEATED_DELAY: '#c2410c'
+// ===== 交付状态配色（计划派生 `riskLevel`；冻结 07 §八.2 三值 + 缺键态）=====
+//
+// ⚠️ 这里**不再**用 `Order.DelayStatus`（ERP/ODS 独立维度）渲染状态标签：
+//   冻结 `01 §64` 红线 —— 不得用 `Order.DelayStatus` 替代当前 PlanVersion 的交付结果；
+//   实测 v999333 的 O20630651 就是 `delayStatus=ON_TIME` + 计划超期 15.4 天，
+//   两个结论同屏打架。现在交付判定一律读后端算好的 `riskLevel`。
+const RISK_COLORS: Record<OrderRiskLevel, string> = {
+  ON_TRACK: '#059669',
+  AT_RISK: '#d97706',
+  DELAYED: '#ef4444'
 }
-const DELAY_TAG_TYPE: Record<OrderDelayStatus, 'success' | 'danger' | 'warning'> = {
-  ON_TIME: 'success',
-  FIRST_DELAY: 'danger',
-  REPEATED_DELAY: 'warning'
+const RISK_TAG_TYPE: Record<OrderRiskLevel, 'success' | 'danger' | 'warning'> = {
+  ON_TRACK: 'success',
+  AT_RISK: 'warning',
+  DELAYED: 'danger'
 }
+/** 缺键（未排产 / 无交期）的灰 —— 不用红色，避免把「没排」说成「出事」 */
+const RISK_MISSING_COLOR = '#94a3b8'
 
-/** 延迟状态未知值降级：原样显示、不做枚举校验（实库可能出现冻结词表外的值） */
-function delayLabel(raw: string | undefined): string {
-  if (!raw) return '—'
-  return ORDER_DELAY_STATUS_LABELS[raw as OrderDelayStatus] ?? raw
+/** 交付状态中文标签：缺键 ⇒「未排产」（**不得**落成「按期」/「未延迟」） */
+function riskLabel(raw: string | undefined): string {
+  if (!raw) return ORDER_RISK_MISSING_LABEL
+  return ORDER_RISK_LEVEL_LABELS[raw as OrderRiskLevel] ?? raw
 }
-function delayColor(raw: string | undefined): string {
-  return DELAY_COLORS[raw as OrderDelayStatus] ?? '#94a3b8'
+function riskColor(raw: string | undefined): string {
+  if (!raw) return RISK_MISSING_COLOR
+  return RISK_COLORS[raw as OrderRiskLevel] ?? RISK_MISSING_COLOR
 }
-function delayTagType(raw: string | undefined): 'success' | 'danger' | 'warning' | 'info' {
-  return DELAY_TAG_TYPE[raw as OrderDelayStatus] ?? 'info'
+function riskTagType(raw: string | undefined): 'success' | 'danger' | 'warning' | 'info' {
+  if (!raw) return 'info'
+  return RISK_TAG_TYPE[raw as OrderRiskLevel] ?? 'info'
 }
 
 /**
@@ -121,15 +139,25 @@ function delayTagType(raw: string | undefined): 'success' | 'danger' | 'warning'
  * 摆出原值是诚实，臆造中文名才是造假（该漂移已出函 5号位，前端不替它兜底成正式码）。
  */
 function delayReasonLabel(code: string | undefined): string {
+  // 无延期原因 ⇒ '—'（该字段是**可空可选**字段，键不出现即「没有延期原因」）；
+  // 有值 ⇒ 走全站唯一口径 `reasonLabelOf`（冻结 15 码 / 未入字典 →「待核对·<原值>」）。
+  // 2026-10-31：原为本地查表 `REASON_CODE_LABELS[code as ReasonCode] ?? 待核对·${code}`，
+  // 与甘特 / 排程解释 / CTP 页各写各的 ⇒ 收敛到共享函数，避免再次分叉。
   if (!code) return '—'
-  return REASON_CODE_LABELS[code as ReasonCode] ?? `待核对·${code}`
+  return reasonLabelOf(code)
 }
-/** 延期时长 → 天/小时两态（后端给的是自然小时小数；`!= null` 而非真值判断，0 与「无值」是两态） */
+/** 延期时长 → 天/小时两态（后端给的是自然小时小数；`!= null` 而非真值判断，0 与「无值」是两态）
+ *
+ *  口径（5号位 2026-11-02 答复函 §三 Q3 定稿）：**按期不给 `delayHours`**（缺键 = 诚实，
+ *  按期/提前无「延期时长」可言）。负值若出现属「提前」，按展示换算显示成「提前 N 天」——
+ *  取绝对值会把「提前 20 天」写成「超期 20 天」，方向就反了。
+ *  ⚠️ 提前与否的**判定**看 `plannedCompletionTime` 与交期之差，这里只做展示换算，不参与判定。 */
 function delayHoursText(hours: number | undefined): string {
   if (hours == null) return ''
   const abs = Math.abs(hours)
-  if (abs < 24) return `超期 ${abs.toFixed(1)} 小时`
-  return `超期 ${(abs / 24).toFixed(1)} 天`
+  const label = hours < 0 ? '提前' : '超期'
+  if (abs < 24) return `${label} ${abs.toFixed(1)} 小时`
+  return `${label} ${(abs / 24).toFixed(1)} 天`
 }
 
 /** 订单状态标签：按冻结 07:3611 六值词表渲染（实库 `Open` 归一回历史遗留 `OPEN`）；仍不认识则原样显示 */
@@ -277,26 +305,21 @@ const currentVersionLabel = computed(() => {
 })
 
 // ===== KPI（全部取 /api/order-query/summary 的服务端聚合）=====
+//
+// ⚠️ 2026-11-02 口径全换（5号位 r14009 答复函 §二）：三桶改为**计划派生**，
+//   与列表 `riskLevel` 同源（冻结 `01 §64`）⇒ 格子与 KPI 不再各说各话。
+//   三桶互斥且穷尽：按期 + 延迟 + 未排产 = 总数（可作探针断言）。
+//   旧「未延迟」卡文案已换「按期」（同一判定，但「按期」不与 ERP 维度混读）。
 const totalCount = computed(() => summary.value?.totalCount ?? null)
 const kpis = computed(() => {
   const s = summary.value
   if (!s) return []
-  const items = [
+  return [
     { key: 'total', label: '订单总数', value: s.totalCount, color: '#334155' },
-    { key: 'ontime', label: '未延迟', value: s.onTimeCount, color: DELAY_COLORS.ON_TIME },
-    { key: 'delayed', label: '延迟', value: s.delayedCount, color: DELAY_COLORS.FIRST_DELAY }
+    { key: 'ontime', label: '按期', value: s.onTimeCount, color: RISK_COLORS.ON_TRACK },
+    { key: 'delayed', label: '延迟', value: s.delayedCount, color: RISK_COLORS.DELAYED },
+    { key: 'unscheduled', label: '未排产', value: s.unscheduledCount, color: RISK_MISSING_COLOR }
   ]
-  // 「未计算」= DelayStatus 为 NULL 的行。2026-10-17 起全表已回填（NULL=0），
-  // 常驻一张 0 卡片只是噪音 ⇒ 只有真的存在未计算行时才显示（既暴露问题，也不天天摆 0）。
-  if (uncalculatedCount.value > 0) {
-    items.push({
-      key: 'unknown',
-      label: '未计算',
-      value: uncalculatedCount.value,
-      color: '#94a3b8'
-    })
-  }
-  return items
 })
 const kpiRatio = (v: number): number =>
   totalCount.value && totalCount.value > 0 ? Math.round((v / totalCount.value) * 100) : 0
@@ -312,16 +335,27 @@ function onSizeChange(s: number): void {
 }
 
 // ===== 行点击：打开抽屉 =====
-async function openDetail(orderId: number): Promise<void> {
+/**
+ * 抽屉里的「交付状态 / 延期时长 / APS 预计完成」取**打开抽屉的那一行列表数据**。
+ *
+ * ⚠️ 原因（dev 实测 2026-11-02）：详情端点 `GET /api/order-query/{id}` 的 `order` 是**另一条 SQL**，
+ *   **不返计划派生字段**（`riskLevel` / `delayHours` / `plannedCompletionTime` 三个键全缺）⇒
+ *   若拿详情响应判空，一条「已超期 15.4 天」的订单会被显示成「未排产」。
+ *   列表行是同一 PlanVersion 下的同一条数据（只有列表端点带富化字段），用它才是真的。
+ */
+const detailRow = ref<OrderListItemDto | null>(null)
+
+async function openDetail(row: OrderListItemDto): Promise<void> {
   drawerVisible.value = true
-  await orderStore.loadDetail(orderId)
+  detailRow.value = row
+  await orderStore.loadDetail(row.id)
 }
 function closeDetail(): void {
   drawerVisible.value = false
 }
 function onRowClick(row: OrderListItemDto, column?: { type?: string }): void {
   if (column?.type === 'selection') return
-  void openDetail(row.id)
+  void openDetail(row)
 }
 
 // ===== §10A.1 已有订单提前（EXISTING_ORDER_ADVANCE）=====
@@ -333,12 +367,14 @@ const advanceSubmitting = ref(false)
 const selectedOrders = ref<OrderListItemDto[]>([])
 const tableRef = ref<InstanceType<typeof ElTable> | null>(null)
 
-/** Dialog 候选行（仅取所需字段；orderCanonicalId 自动带入由 Dialog watch 处理） */
+/** Dialog 候选行（仅取所需字段；orderCanonicalId 自动带入由 Dialog watch 处理）
+ *  domainKey 一并带出：弹窗按排程域收敛候选集（一次只处理一个域） */
 const advanceCandidates = computed(() =>
   list.value.map((o) => ({
     orderId: o.id,
     orderNo: o.orderNo,
     orderCanonicalId: o.orderCanonicalId,
+    domainKey: o.domainKey,
     materialCode: o.materialCode,
     customerName: o.customerName,
     customerDueDate: o.customerDueDate
@@ -376,7 +412,7 @@ async function submitOrderAdvance(payload: BusinessEntrySubmission): Promise<voi
       actor: apsAuth.userInfo?.userCode ?? 'unknown'
     })
     ElMessage.success(
-      `已发起：Run#${result.newRunId}，Candidate PlanVersion#${result.candidatePlanVersionId}。跳转对比页…`
+      `已发起：排程运行 #${result.newRunId}，候选版本 #${result.candidatePlanVersionId}。跳转对比页…`
     )
     advanceVisible.value = false
     selectedOrders.value = []
@@ -501,7 +537,7 @@ onMounted(async () => {
         />
         <ElSelect
           :model-value="delayStatusInput"
-          placeholder="延迟状态"
+          placeholder="ERP 延期属性"
           clearable
           class="filter-select-sm"
           @change="onDelayStatusChange"
@@ -591,19 +627,19 @@ onMounted(async () => {
             }}</ElTag>
           </template>
         </ElTableColumn>
-        <ElTableColumn label="延迟状态" width="100" align="center">
+        <ElTableColumn label="交付状态" width="100" align="center">
           <template #default="{ row }">
             <ElTag
               size="small"
               effect="light"
-              :type="delayTagType(row.delayStatus)"
+              :type="riskTagType(row.riskLevel)"
               :style="{
-                background: delayColor(row.delayStatus),
+                background: riskColor(row.riskLevel),
                 color: '#fff',
-                borderColor: delayColor(row.delayStatus)
+                borderColor: riskColor(row.riskLevel)
               }"
             >
-              {{ delayLabel(row.delayStatus) }}
+              {{ riskLabel(row.riskLevel) }}
             </ElTag>
             <div v-if="delayHoursText(row.delayHours)" class="muted delay-hours">
               {{ delayHoursText(row.delayHours) }}
@@ -619,7 +655,7 @@ onMounted(async () => {
         </ElTableColumn>
         <ElTableColumn label="操作" width="70" align="center" fixed="right">
           <template #default="{ row }">
-            <a href="javascript:;" @click.stop="openDetail(row.id)">详情</a>
+            <a href="javascript:;" @click.stop="openDetail(row)">详情</a>
           </template>
         </ElTableColumn>
         <template #empty>
@@ -695,21 +731,29 @@ onMounted(async () => {
                 {{ statusLabel(detailOrder.status) }}
               </ElTag>
             </ElDescriptionsItem>
-            <ElDescriptionsItem label="延迟状态">
-              <ElTag size="small" :type="delayTagType(detailOrder.delayStatus)">
-                {{ delayLabel(detailOrder.delayStatus) }}
+            <ElDescriptionsItem label="交付状态">
+              <ElTag v-if="detailRow" size="small" :type="riskTagType(detailRow.riskLevel)">
+                {{ riskLabel(detailRow.riskLevel) }}
               </ElTag>
+              <span v-else>—</span>
             </ElDescriptionsItem>
             <ElDescriptionsItem label="APS 预计完成">
-              {{ formatUtcDateTime(detailOrder.plannedCompletionTime) }}
+              {{ formatUtcDateTime(detailRow?.plannedCompletionTime) }}
             </ElDescriptionsItem>
             <ElDescriptionsItem label="延期时长">
-              {{ delayHoursText(detailOrder.delayHours) || '—' }}
+              {{ delayHoursText(detailRow?.delayHours) || '—' }}
             </ElDescriptionsItem>
             <ElDescriptionsItem label="延期原因" :span="2">
-              <span :class="{ 'reason-unchecked': !!detailOrder.primaryReasonCode }">{{
-                delayReasonLabel(detailOrder.primaryReasonCode)
-              }}</span>
+              <span
+                :class="{
+                  'reason-unchecked': !!(
+                    detailRow?.primaryReasonCode ?? detailOrder.primaryReasonCode
+                  )
+                }"
+                >{{
+                  delayReasonLabel(detailRow?.primaryReasonCode ?? detailOrder.primaryReasonCode)
+                }}</span
+              >
             </ElDescriptionsItem>
             <ElDescriptionsItem label="订单类型">
               {{ detailOrder.orderType }}

@@ -71,6 +71,11 @@ const getIconName = computed(() => {
 }
 
 .iconify {
+  /* 离线图标是一层 div（靠 UnoCSS 生成的 mask 规则显形），必须有尺寸，否则 mask 是 0×0 看不见 */
+  display: inline-block;
+  width: 1em;
+  height: 1em;
+
   &:hover {
     // stylelint-disable-next-line
     color: v-bind(hoverColor) !important;

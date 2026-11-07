@@ -64,7 +64,9 @@ import StrategyDiffPanel from './components/StrategyDiffPanel.vue'
 
 const store = useStrategyProfileStore()
 const {
-  profiles,
+  visibleProfiles,
+  showInactive,
+  inactiveCount,
   selectedProfileId,
   versions,
   currentDiff,
@@ -90,9 +92,9 @@ const {
 
 async function loadAll(): Promise<void> {
   await store.loadProfiles()
-  // 默认选中第一个 Profile
-  if (selectedProfileId.value === null && profiles.value.length > 0) {
-    await selectProfile(profiles.value[0].id)
+  // 默认选中第一个可见 Profile（默认视图不含停用行，选中隐藏行会出现「左无行、右有内容」）
+  if (selectedProfileId.value === null && visibleProfiles.value.length > 0) {
+    await selectProfile(visibleProfiles.value[0].id)
   }
 }
 
@@ -319,6 +321,43 @@ async function onSetDefault(row: StrategyProfileVersionDto): Promise<void> {
   }
 }
 
+/* ==================== 物理删除（最窄口径） ====================
+ * DELETE /strategy-profile/{id}（权限 aps.strategy.edit）。
+ * 无任何已发布版本才可硬删（连带删草稿）；含 PUBLISHED、或被排产运行
+ * （ScheduleRun）引用时后端 400。引用关系前端拿不到，只回显后端原文。
+ */
+async function onDeleteProfile(): Promise<void> {
+  if (!canWrite.value) {
+    ElMessage.warning('当前操作者无删除权限，请联系系统管理员授予')
+    return
+  }
+  const p = currentProfile.value
+  if (!p) return
+  if (hasPublished.value) {
+    ElMessage.warning('该策略包已有已发布版本，不能物理删除；如不再使用请「停用」已发布版本')
+    return
+  }
+  try {
+    await ElMessageBox.confirm(
+      `即将永久删除策略包「${p.strategyProfileName}」（${p.strategyProfileCode}）及其全部未发布草稿版本，删除后无法恢复。已发布过版本或被排产运行引用的策略包不能删除。是否继续？`,
+      '删除策略包',
+      {
+        type: 'warning',
+        confirmButtonText: '确认删除',
+        cancelButtonText: '取消',
+        confirmButtonClass: 'el-button--danger'
+      }
+    )
+  } catch {
+    return
+  }
+  if (await store.removeProfile(p.id)) {
+    ElMessage.success('策略包已删除')
+  } else if (store.error) {
+    ElMessage.error(store.error)
+  }
+}
+
 /* ==================== Validate ==================== */
 
 async function onValidate(): Promise<void> {
@@ -429,40 +468,6 @@ async function onUpdateProfile(): Promise<void> {
   ElMessage.success('策略包已保存')
 }
 
-/* ==================== 删除策略包（主表 DELETE） ====================
- * 3号位 2026-10-26 落码并上 dev，口径同规则集删除（R1）：
- *  - 该族存在任何 PUBLISHED 版本 ⇒ 400「该策略包已发布过，不能删除（请先停用版本）」
- *  - 版本被 ScheduleRun 引用 ⇒ 400「该策略包存在已被运行引用的版本，不能删除」（前端拿不到，不预判）
- * 硬删 ≠ 停用：停用（编辑里的启用开关）保留历史、只关主表；删除是破坏性物理删。
- */
-
-const deleteProfileDialog = ref(false)
-
-/** 删除按钮的禁用原因（破坏性操作：先说清为什么不让删） */
-const deleteProfileDisabledReason = computed(() => {
-  if (!canWrite.value) return '当前账号无删除权限'
-  if (hasPublished.value) return '该策略包已发布过，不能删除（请先停用版本）'
-  return ''
-})
-
-function openDeleteProfileDialog(): void {
-  if (deleteProfileDisabledReason.value) {
-    store.handleError(new Error(deleteProfileDisabledReason.value))
-    return
-  }
-  deleteProfileDialog.value = true
-}
-
-async function onDeleteProfile(): Promise<void> {
-  const p = currentProfile.value
-  if (!p) return
-  const ok = await store.removeStrategyProfile(p.id)
-  if (ok) {
-    deleteProfileDialog.value = false
-    ElMessage.success('策略包已删除')
-  }
-}
-
 /**
  * KPI 只展示 V1 够得着的状态；万一库里真出现了预留状态（手工 SQL / 后端将来补齐审批流），
  * 仍按实际计数显示，不把真实数据藏起来。
@@ -522,22 +527,35 @@ const statusTagEffect = (s: StrategyVersionStatus): 'light' | 'dark' | 'plain' |
           <template #header>
             <div class="card-head-row">
               <span>策略包列表</span>
-              <ElTooltip
-                :content="canWrite ? '新建一个策略包（编码创建后不可修改）' : '当前账号无编辑权限'"
-                placement="bottom"
-              >
-                <ElButton size="small" :disabled="!canWrite" @click="openCreateProfileDialog">
-                  新建策略包
-                </ElButton>
-              </ElTooltip>
+              <div class="card-head-actions">
+                <ElTooltip
+                  content="停用的策略包默认不显示；勾选后才能看到并重新启用它们"
+                  placement="top"
+                >
+                  <label class="show-inactive-toggle">
+                    <ElSwitch v-model="showInactive" size="small" />
+                    <span>显示已停用（{{ inactiveCount }}）</span>
+                  </label>
+                </ElTooltip>
+                <ElTooltip
+                  :content="
+                    canWrite ? '新建一个策略包（编码创建后不可修改）' : '当前账号无编辑权限'
+                  "
+                  placement="bottom"
+                >
+                  <ElButton size="small" :disabled="!canWrite" @click="openCreateProfileDialog">
+                    新建策略包
+                  </ElButton>
+                </ElTooltip>
+              </div>
             </div>
           </template>
-          <template v-if="profiles.length === 0 && !listLoading">
+          <template v-if="visibleProfiles.length === 0 && !listLoading">
             <ElEmpty description="暂无策略包" :image-size="80" />
           </template>
           <div v-else class="profile-list">
             <div
-              v-for="p in profiles"
+              v-for="p in visibleProfiles"
               :key="p.id"
               :class="['profile-card', { active: selectedProfileId === p.id }]"
               @click="selectProfile(p.id)"
@@ -601,19 +619,25 @@ const statusTagEffect = (s: StrategyVersionStatus): 'light' | 'dark' | 'plain' |
                     新建草稿
                   </ElButton>
                 </ElTooltip>
-                <!-- [删除]：破坏性操作，破坏性前先说清后果（3号位 2026-10-26 同 R1 口径） -->
                 <ElTooltip
-                  :content="deleteProfileDisabledReason || '删除该策略包（会连带删除它的草稿版本）'"
+                  :content="
+                    hasPublished
+                      ? '该策略包已有已发布版本，不能物理删除；如不再使用请「停用」已发布版本'
+                      : '删除策略包及其全部未发布草稿版本（不可恢复）'
+                  "
                   placement="top"
                 >
-                  <ElButton
-                    type="danger"
-                    plain
-                    :disabled="!!deleteProfileDisabledReason"
-                    @click="openDeleteProfileDialog"
-                  >
-                    删除策略包
-                  </ElButton>
+                  <span>
+                    <ElButton
+                      type="danger"
+                      plain
+                      :disabled="!canWrite || hasPublished"
+                      :loading="actionRunning"
+                      @click="onDeleteProfile"
+                    >
+                      删除策略包
+                    </ElButton>
+                  </span>
                 </ElTooltip>
               </div>
             </div>
@@ -1062,34 +1086,6 @@ const statusTagEffect = (s: StrategyVersionStatus): 'light' | 'dark' | 'plain' |
       </template>
     </ElDialog>
 
-    <!-- 删除策略包 Dialog（主表；DELETE /strategy-profile/{id}，3号位 2026-10-26 同 R1 口径） -->
-    <ElDialog
-      v-model="deleteProfileDialog"
-      title="删除策略包"
-      width="480px"
-      :close-on-click-modal="false"
-    >
-      <ElForm label-width="100px" size="default">
-        <ElFormItem label="策略包">
-          <span class="d-val">{{ currentProfile?.strategyProfileCode }}</span>
-        </ElFormItem>
-        <ElFormItem label="名称">
-          <span class="d-val">{{ currentProfile?.strategyProfileName }}</span>
-        </ElFormItem>
-        <ElAlert type="error" :closable="false" show-icon>
-          <template #title>删除后不可恢复</template>
-          这个策略包和它的草稿版本会一起被删掉，删了就找不回来了。已发布过的策略包不能删（只能停用）；
-          如果它的版本已经被运行引用，也删不掉。
-        </ElAlert>
-      </ElForm>
-      <template #footer>
-        <ElButton @click="deleteProfileDialog = false">取消</ElButton>
-        <ElButton type="danger" :loading="actionRunning" @click="onDeleteProfile">
-          确认删除
-        </ElButton>
-      </template>
-    </ElDialog>
-
     <!-- Publish Dialog -->
     <ElDialog
       v-model="publishDialogVisible"
@@ -1370,6 +1366,22 @@ const statusTagEffect = (s: StrategyVersionStatus): 'light' | 'dark' | 'plain' |
   display: flex;
   align-items: center;
   justify-content: space-between;
+}
+
+.card-head-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.show-inactive-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  color: #4b5563;
+  cursor: pointer;
+  user-select: none;
 }
 
 .profile-head-actions {

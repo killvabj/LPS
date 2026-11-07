@@ -9399,7 +9399,8 @@ internal class PhaseTwoInitialScheduler
     /// 检查Resource能力是否允许、交期是否被破坏
     /// 返回合并后的新Task，失败时返回null
     /// </summary>
-    private FinalTaskDraft? TryMergeDemandIntoTask(
+    // 2026-11-07：`private` → `internal`，仅供 LPS.APS.Tests 直调，验证「同目标重复合并必须被拒 / 份额数量闭合」
+    internal FinalTaskDraft? TryMergeDemandIntoTask(
         LogicalProductionDemand demand,
         FinalTaskDraft targetTask,
         RoutingGraph routingGraph,
@@ -9615,6 +9616,19 @@ internal class PhaseTwoInitialScheduler
         var mergedShareNext = mergedSharePrev is null
             ? new List<(string, decimal)>(1)
             : new List<(string, decimal)>(mergedSharePrev);
+        // ── 2026-11-07 纵深防御：**同一需求不得在同一目标上重复计份额** ──
+        //   生产路径本来由 `requireIdentityPreserving = multiBatch` 挡住（多批需求的第二批
+        //   会因「目标已归批」被拒）；但本函数自身**没有任何去重**，直接连调两次就会把
+        //   同一 `DemandKey` 追加两条 ⇒ ∑Share 翻倍、数量闭合被破坏（已有单元反证）。
+        //   ⇒ 这里补一道与生产守卫**同向**的防御：目标上已存在该需求的份额就拒绝本次合并
+        //     （返回 null = 交回调用方走正常排程，不产出错误份额）。
+        //   ⚠ 语义边界：拒绝的是「**重复**合并」，不是「不允许合并」—— 首次合并不受影响。
+        if (mergedSharePrev is not null
+            && mergedSharePrev.Any(x => x.DemandKey == demand.LogicalDemandKey))
+        {
+            return null;
+        }
+
         // 追加当前Demand的份额（原Task的份额已在之前记录）
         mergedShareNext.Add((demand.LogicalDemandKey, demand.NetOutputQty));
         ShareSet(allocationTaskShare, mergedTask.FinalDraftId, mergedShareNext);

@@ -95,7 +95,11 @@ watch(
   async (vis) => {
     if (!vis) return
     errors.value = []
-    domainKey.value = props.defaultDomainKey ?? props.domainOptions[0]
+    // 预填资源自身的域最精确（Resource Drawer 单条入口）→ 其次页面当前域 → 最后退到首个选项
+    const preRes = props.resources.find(
+      (r) => r.resourceId === (props.preselectedResourceIds ?? [])[0]
+    )
+    domainKey.value = preRes?.domainKey ?? props.defaultDomainKey ?? props.domainOptions[0]
     rows.value = props.resources
       .filter((r) => r.domainKey === domainKey.value)
       .map((r) => ({ ...r }))

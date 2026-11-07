@@ -8,6 +8,7 @@ import type {
   DhxGanttDragRejectedPayload,
   DhxGanttDragStartContext,
   DhxGanttDropValidationPayload,
+  DhxGanttLoadBand,
   DhxGanttPayload,
   DhxGanttScaleUnit,
   DhxGanttTask
@@ -31,6 +32,10 @@ const props = withDefaults(
     scaleUnit?: DhxGanttScaleUnit
     dateFrom?: string
     dateTo?: string
+    /** 资源×时间桶负荷带（页面层算好，组件只负责画到底层泳道条上） */
+    loadBands?: DhxGanttLoadBand[]
+    /** 「数量」列的单位：任务单位一致时由页面传入（表头写「数量(PS)」，格子只留数字）；空串 = 表头只写「数量」 */
+    qtyUnit?: string
     beforeTaskDrag?: (context: DhxGanttDragStartContext) => boolean | string
     validateTaskDrop?: (payload: DhxGanttDropValidationPayload) => boolean | string
   }>(),
@@ -44,10 +49,12 @@ const props = withDefaults(
     readonly: false,
     allowResize: true,
     allowProgress: true,
-    rowHeight: 42,
+    rowHeight: 46,
     scaleUnit: 'day',
     dateFrom: undefined,
     dateTo: undefined,
+    loadBands: () => [],
+    qtyUnit: '',
     beforeTaskDrag: undefined,
     validateTaskDrop: undefined
   }
@@ -58,7 +65,14 @@ const emits = defineEmits<{
   taskDragEnd: [payload: DhxGanttDragPayload]
   taskDragRejected: [payload: DhxGanttDragRejectedPayload]
   taskContextMenu: [taskId: string | number, event: MouseEvent]
+  /** 纵向滚动接近底部（供无限加载触发；节流/去重由调用方负责） */
+  nearBottom: []
+  /** 时间轴刻度层级变化（小时/天/周/月），供页面显示当前缩放档位 */
+  zoomChange: [levelName: string]
 }>()
+
+/** 当前缩放层级下标（0 小时 … 3 月） */
+const zoomLevelIndex = ref(1)
 
 const rootRef = ref<HTMLDivElement | null>(null)
 let initialized = false
@@ -67,6 +81,8 @@ let compareLayerId: string | number | null = null
 let actualLayerId: string | number | null = null
 let laneOverlayLayerId: string | number | null = null
 let progressLayerId: string | number | null = null
+let loadBandLayerId: string | number | null = null
+let outerLabelLayerId: string | number | null = null
 let todayMarkerId: string | number | null = null
 const dragSnapshots = new Map<string | number, DhxGanttTask>()
 const formatDate = gantt.date.date_to_str('%Y-%m-%d %H:%i')
@@ -78,6 +94,57 @@ const dayScaleLabel = (date: Date) =>
   `${pad2(date.getMonth() + 1)}-${pad2(date.getDate())}周${WEEKDAY_CN[date.getDay()]}`
 const dayOfMonthScaleLabel = (date: Date) => `${date.getDate()}周${WEEKDAY_CN[date.getDay()]}`
 
+/**
+ * 缩放层级（知名排产系统的通用能力：时间轴能放大到小时、缩小到月）。
+ *
+ * ⚠️ dhtmlx `ext.zoom` 的 `_setLevel` 会把层级的 `scales` / `min_column_width`
+ *   **直接 mixin 进 `gantt.config`**（`mixin(target, source, true)` = 覆盖语义）
+ *   ⇒ **刻度配置的唯一所有者是缩放层级**：页面若再写 `gantt.config.scales`，会被层级覆盖。
+ *   所以本组件里页面只管「窗口」(start_date/end_date)，刻度一律由这里下发。
+ *
+ * 层级下标越小 = 越细（0 小时 … 3 月），与 `ext.zoom.zoomIn()`（index-1）方向一致。
+ */
+const ZOOM_LEVELS = [
+  {
+    name: '小时',
+    scales: [
+      { unit: 'day', step: 1, format: dayScaleLabel },
+      { unit: 'hour', step: 1, format: '%H:%i' }
+    ],
+    // 「00:00」实测文字宽 36~40px ⇒ 列宽低于 40 必然挤压（2026-11-05 实测 28px 挤成一团）。
+    // 44 是窄屏兜底：视口够宽时列会被拉得更宽（1 天 24 列 ⇒ 约 56px），不触发滚动。
+    min_column_width: 44
+  },
+  {
+    name: '天',
+    scales: [{ unit: 'day', step: 1, format: dayScaleLabel }],
+    min_column_width: 70
+  },
+  {
+    name: '周',
+    scales: [
+      { unit: 'week', step: 1, format: '第%W周' },
+      { unit: 'day', step: 1, format: dayScaleLabel }
+    ],
+    min_column_width: 70
+  },
+  {
+    name: '月',
+    scales: [
+      { unit: 'month', step: 1, format: '%Y-%m' },
+      { unit: 'day', step: 1, format: dayOfMonthScaleLabel }
+    ],
+    min_column_width: 70
+  }
+] as const
+
+const ZOOM_INDEX_BY_UNIT: Record<DhxGanttScaleUnit, number> = {
+  hour: 0,
+  day: 1,
+  week: 2,
+  month: 3
+}
+
 /** 左表单元格文本转义（单元格内容按 HTML 插入，防注入） */
 const escapeHtml = (value: unknown): string =>
   String(value ?? '')
@@ -85,6 +152,43 @@ const escapeHtml = (value: unknown): string =>
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;')
+
+/**
+ * 条宽 vs 标签宽：撑得下写条内，撑不下写在条右侧（外挂层）。
+ * 用 canvas 按实际字体测量（缓存文本宽度），避免按字数估算导致忽长忽短。
+ */
+const LABEL_MEASURE_FONT =
+  '11px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif'
+const BAR_LABEL_PADDING_X = 12
+/** 任务号与状态标记之间的水平间距（与 `.dhx-bar-mark { margin-left: 6px }` 同值） */
+const BAR_MARK_GAP = 6
+/** 与 CSS `:deep(.gantt_task_line) { min-width: 14px }` 同值：DOM 实际条宽 = max(位置宽, 14) */
+const BAR_MIN_WIDTH = 14
+const OUTER_LABEL_GAP = 6
+const barRenderWidth = (pos: any) => Math.max(Number(pos?.width) || 0, BAR_MIN_WIDTH)
+let labelMeasureCtx: CanvasRenderingContext2D | null = null
+const labelWidthCache = new Map<string, number>()
+const measureLabelWidth = (text: string): number => {
+  const cached = labelWidthCache.get(text)
+  if (cached !== undefined) return cached
+  if (labelMeasureCtx === null) {
+    labelMeasureCtx = document.createElement('canvas').getContext('2d')
+    if (labelMeasureCtx) labelMeasureCtx.font = LABEL_MEASURE_FONT
+  }
+  const width = labelMeasureCtx ? labelMeasureCtx.measureText(text).width : text.length * 7
+  labelWidthCache.set(text, width)
+  return width
+}
+const barLabelFits = (task: any): boolean => {
+  if (!task?.barLabel) return false
+  const pos = ganttApi.getTaskPosition(task, task.start_date, task.end_date)
+  // 2026-11-06：必须把状态标记（+Nh / ✓ / 延期 M）一起算进去。
+  // 只量任务号时，44px 的条判定「放得下 S102」，但再加 +392h 就装不下 ⇒
+  // flex 把任务号压成 0 宽，条上只剩被裁掉一半的红字（用户实测截图）。
+  let need = measureLabelWidth(String(task.barLabel))
+  if (task.barMarkText) need += measureLabelWidth(String(task.barMarkText)) + BAR_MARK_GAP
+  return barRenderWidth(pos) >= need + BAR_LABEL_PADDING_X
+}
 
 const cloneTask = (task: any): DhxGanttTask => JSON.parse(JSON.stringify(task)) as DhxGanttTask
 const compareTaskMap = () => new Map(props.compareTasks.map((item) => [String(item.taskId), item]))
@@ -127,55 +231,186 @@ const buildDragPayload = (id: string | number, mode: string): DhxGanttDragPayloa
   }
 }
 
-const applyScaleConfig = (scaleUnit: DhxGanttScaleUnit) => {
-  // 设置时间轴刻度（format 支持函数，dhtmlx 官方 d.ts 只声明了 string，故走 any）
-  if (scaleUnit === 'hour') {
-    ganttApi.config.scales = [
-      { unit: 'day', step: 1, format: dayScaleLabel },
-      { unit: 'hour', step: 1, format: '%H:%i' }
-    ]
-  } else if (scaleUnit === 'day') {
-    ganttApi.config.scales = [{ unit: 'day', step: 1, format: dayScaleLabel }]
-  } else if (scaleUnit === 'week') {
-    ganttApi.config.scales = [
-      { unit: 'week', step: 1, format: '第%W周' },
-      { unit: 'day', step: 1, format: dayScaleLabel }
-    ]
-  } else if (scaleUnit === 'month') {
-    ganttApi.config.scales = [
-      { unit: 'month', step: 1, format: '%Y-%m' },
-      { unit: 'day', step: 1, format: dayOfMonthScaleLabel }
-    ]
-  }
-
+/**
+ * 时间轴**窗口**（起止）。
+ * 刻度不在这里设 —— 刻度由缩放层级独占（见 ZOOM_LEVELS 注释），
+ * 这里若再写 `gantt.config.scales` 会被层级覆盖，等于白写。
+ */
+const applyWindowConfig = (scaleUnit: DhxGanttScaleUnit) => {
   // 设置日期范围：优先使用外部传入的值，否则根据 scaleUnit 设置默认值
   if (props.dateFrom && props.dateTo) {
     gantt.config.start_date = new Date(props.dateFrom)
     gantt.config.end_date = new Date(props.dateTo)
-  } else {
-    // 默认时间范围：今天开始
-    const now = new Date()
-    now.setHours(0, 0, 0, 0)
-    let rangeEnd = new Date(now)
-    rangeEnd.setDate(rangeEnd.getDate() + 7) // 默认7天
-
-    if (scaleUnit === 'hour') {
-      rangeEnd = new Date(now)
-      rangeEnd.setDate(rangeEnd.getDate() + 1) // 今日：1天
-    } else if (scaleUnit === 'day') {
-      rangeEnd = new Date(now)
-      rangeEnd.setDate(rangeEnd.getDate() + 7) // 7天
-    } else if (scaleUnit === 'week') {
-      rangeEnd = new Date(now)
-      rangeEnd.setDate(rangeEnd.getDate() + 30) // 30天
-    } else if (scaleUnit === 'month') {
-      rangeEnd = new Date(now)
-      rangeEnd.setMonth(rangeEnd.getMonth() + 3) // 3个月
-    }
-
-    gantt.config.start_date = now
-    gantt.config.end_date = rangeEnd
+    return
   }
+  // 默认时间范围：今天开始
+  const now = new Date()
+  now.setHours(0, 0, 0, 0)
+  let rangeEnd = new Date(now)
+  rangeEnd.setDate(rangeEnd.getDate() + 7) // 默认7天
+
+  if (scaleUnit === 'hour') {
+    rangeEnd = new Date(now)
+    rangeEnd.setDate(rangeEnd.getDate() + 1) // 今日：1天
+  } else if (scaleUnit === 'day') {
+    rangeEnd = new Date(now)
+    rangeEnd.setDate(rangeEnd.getDate() + 7) // 7天
+  } else if (scaleUnit === 'week') {
+    rangeEnd = new Date(now)
+    rangeEnd.setDate(rangeEnd.getDate() + 30) // 30天
+  } else if (scaleUnit === 'month') {
+    rangeEnd = new Date(now)
+    rangeEnd.setMonth(rangeEnd.getMonth() + 3) // 3个月
+  }
+
+  gantt.config.start_date = now
+  gantt.config.end_date = rangeEnd
+}
+
+/** 缩放层级是否已就绪（ext.zoom 必须在 gantt.init 之后才能 init） */
+let zoomReady = false
+
+const syncZoomState = () => {
+  const zoom = ganttApi.ext?.zoom
+  const idx =
+    zoom && typeof zoom.getCurrentLevel === 'function'
+      ? zoom.getCurrentLevel()
+      : zoomLevelIndex.value
+  zoomLevelIndex.value = idx
+  emits('zoomChange', ZOOM_LEVELS[idx]?.name ?? '天')
+}
+
+/**
+ * 当前视口里这些行的最早开始时刻。
+ *
+ * 虚拟渲染只渲染「纵向可见的行」⇒ DOM 里的 .gantt_row 就是用户正在看的那些行，
+ * 拿它们的开始时刻当锚点，换刻度后用户看到的仍是同一批任务的条子。
+ */
+const earliestVisibleRowStart = (): Date | null => {
+  const root = rootRef.value
+  if (!root) return null
+  let min: Date | null = null
+  for (const row of Array.from(root.querySelectorAll('.gantt_row'))) {
+    const id = row.getAttribute('task_id')
+    if (!id) continue
+    const task = ganttApi.getTask?.(id)
+    if (!task) continue
+    const start = parseShadowDate(task.start_date)
+    if (start && (!min || start < min)) min = start
+  }
+  return min
+}
+
+/** 全部任务里最早的开始时刻（视口里一行都没有时的兜底） */
+const earliestTaskStart = (): Date | null => {
+  let min: Date | null = null
+  // ⚠️ 本 dhtmlx 9.1.3 打包件**没有 getTasks()**，只有 eachTask(cb)
+  ganttApi.eachTask?.((task: any) => {
+    const start = parseShadowDate(task.start_date)
+    if (start && (!min || start < min)) min = start
+  })
+  return min
+}
+
+/**
+ * 对外暴露：用户**正在看**的那批任务的最早开始时刻。
+ * 页面层用它把「收窄后的窗口」锚在用户当前视野上（而不是跳回窗口左端）。
+ */
+const visibleRowStart = (): Date | null => earliestVisibleRowStart() ?? earliestTaskStart()
+
+/**
+ * 换刻度后把视口锚回「用户正在看的那几行」。
+ *
+ * dhtmlx `ext.zoom` 的 setLevel 会把视口**重新居中到「切换前的可视日期」**；
+ * 本页窗口固定 [今天, 今天+N]，切换前的可视中心多落在窗口中段，
+ * 而纵向可见的那些行的条子都在最近一两天 ⇒ 切到「小时」档后视口停在任务区间之外，
+ * 虚拟渲染把任务条整段裁掉 ⇒ 时间轴整屏空白（领导看到的「这甘特图用不了」）。
+ *
+ * 规则：换刻度后把时间轴左端对齐到「当前可见行的最早开始时刻」——
+ *       用户看的是哪几行，换刻度后还是哪几行，条子必然在屏幕里。
+ */
+const clampViewportToTaskRange = () => {
+  const target = earliestVisibleRowStart() ?? earliestTaskStart()
+  if (!target) return
+  ganttApi.showDate?.(target)
+}
+
+/** 换刻度档位后的统一收尾：同步页面显示的档位 + 把视口拉回有数据的区间 */
+const afterZoomLevelChanged = () => {
+  syncZoomState()
+  clampViewportToTaskRange()
+}
+
+const setZoomLevel = (index: number) => {
+  const zoom = ganttApi.ext?.zoom
+  if (!zoomReady || !zoom || typeof zoom.setLevel !== 'function') return
+  const idx = Math.max(0, Math.min(ZOOM_LEVELS.length - 1, index))
+  zoom.setLevel(idx)
+  afterZoomLevelChanged()
+}
+
+/** 按档位名设置刻度（小时 / 天 / 周 / 月）；dhtmlx 的 setLevel 支持按 name 匹配层级 */
+const setZoomLevelByName = (name: string) => {
+  const zoom = ganttApi.ext?.zoom
+  if (!zoomReady || !zoom || typeof zoom.setLevel !== 'function') return
+  zoom.setLevel(name)
+  afterZoomLevelChanged()
+}
+
+/** 启用缩放扩展：层级自带 scales + min_column_width，init 末尾会 setLevel 生效 */
+const initZoom = () => {
+  const zoom = ganttApi.ext?.zoom
+  if (!zoom || typeof zoom.init !== 'function') return
+  zoom.init({
+    levels: ZOOM_LEVELS as unknown as any[],
+    activeLevelIndex: ZOOM_INDEX_BY_UNIT[props.scaleUnit] ?? 1,
+    minColumnWidth: 28,
+    maxColumnWidth: 240,
+    // 不劫持滚轮：滚轮留给时间轴横向滚动（知名系统里滚轮缩放是常见做法，
+    // 但本组件的横向滚动也用滚轮，两者冲突时优先保证能看全时间轴）
+    trigger: null
+  })
+  zoomReady = true
+  syncZoomState()
+}
+
+/**
+ * 窗口 + 刻度层级。
+ * ⚠️ 层级**相同就不重设**：`ext.zoom.setLevel` 会重绘并把可视日期重新居中，
+ *   每次翻页/追加数据都触发会把用户的横向滚动位置冲掉。
+ */
+const applyScaleConfig = (scaleUnit: DhxGanttScaleUnit) => {
+  applyWindowConfig(scaleUnit)
+  const target = ZOOM_INDEX_BY_UNIT[scaleUnit] ?? 1
+  const zoom = ganttApi.ext?.zoom
+  const current = zoom && typeof zoom.getCurrentLevel === 'function' ? zoom.getCurrentLevel() : -1
+  if (zoomReady && current !== target) setZoomLevel(target)
+}
+
+/**
+ * 悬浮提示只挂在**右侧时间轴的任务条**上（左侧行名列不弹）。
+ *
+ * Why：tooltip 插件默认的选择器是 `[task_id]:not(.gantt_task_row)`，
+ *   它同时命中左侧网格行（`.gantt_row`，也带 task_id）⇒ 鼠标停在左边行名列上
+ *   也会弹出与右侧条子一模一样的黑框（内容重复、遮挡行名）。
+ *
+ * How：onGanttReady 时摘掉默认选择器，改挂 `.gantt_task_line`（只在右侧时间轴）。
+ *   必须在插件的 onGanttReady 之后注册本函数 ⇒ 事件监听按注册顺序触发，本函数最后跑。
+ */
+const applyTooltipScope = () => {
+  const tooltips = ganttApi.ext?.tooltips
+  if (!tooltips) return
+  const attr = ganttApi.config?.task_attribute || 'task_id'
+  tooltips.detach(`[${attr}]:not(.gantt_task_row)`)
+  tooltips.tooltipFor({
+    selector: '.gantt_task_line',
+    html: (e: MouseEvent) => {
+      const id = ganttApi.locate(e)
+      if (!ganttApi.isTaskExists(id)) return null
+      const task = ganttApi.getTask(id)
+      return ganttApi.templates.tooltip_text(task.start_date, task.end_date, task)
+    }
+  })
 }
 
 const applyConfig = () => {
@@ -194,8 +429,8 @@ const applyConfig = () => {
   // 留着这两个圆点只能拖出只在内存里的假连线，刷新即消失
   gantt.config.drag_links = false
   gantt.config.open_tree_initially = true
-  gantt.config.grid_width = 580
-  gantt.config.bar_height = 28
+  gantt.config.grid_width = 690
+  gantt.config.bar_height = 32
   gantt.config.grid_resize = true
   gantt.config.show_progress = false // 禁用内置进度条，使用自定义进度显示
   // 禁用原生右键菜单，使用自定义菜单
@@ -210,20 +445,46 @@ const applyConfig = () => {
   if ((gantt as any).showEvent) {
     ;(gantt as any).showEvent = function () {}
   }
+  // 列宽合计 = grid_width（690）：工序·指示号/物料 340 + 开始 130 + 结束 130 + 数量 90
+  // 2026-11-06 工厂口径：撤掉「时长」列（泳道行 75h 是占用跨度、子任务 1/2h 是加工工时，
+  //   同列不同义易被读成算错）⇒ 改为「开始 / 结束 / 数量」，工时看悬停
+  // 物料并入首列（「物料」独立列在窄屏下只剩半截编码，且拉低左表信息密度）
+  // 放不下时用原生 title 悬停显示完整文本（与「任务清单」页签的溢出提示同一套交互）
+  // dhtmlx 官方 d.ts 的 GanttColumn 未声明 template，运行时支持 ⇒ 走 any 通道
+  const titleTemplate = (field: string) => (task: any) =>
+    `<span title="${escapeHtml(task?.[field] ?? '')}">${escapeHtml(task?.[field] ?? '')}</span>`
   gantt.config.columns = [
     {
       name: 'text',
-      label: '任务 / 订单 / 物料',
+      label: '工序 / 指示号 / 物料',
       tree: true,
-      width: 360,
-      // 首列固定 360px，「任务号 | 订单号 | 物料」「资源编码 | 名称 | 工厂/部门」必然放不下，
-      // 用原生 title 让鼠标悬停显示完整文本（与「任务清单」页签的溢出提示同一套交互）
-      // dhtmlx 官方 d.ts 的 GanttColumn 未声明 template，运行时支持 ⇒ 走 any 通道
-      template: (task: any) =>
-        `<span title="${escapeHtml(task.text)}">${escapeHtml(task.text)}</span>`
+      width: 340,
+      template: titleTemplate('text')
     } as any,
-    { name: 'start_date', label: '开始', align: 'center', width: 140 },
-    { name: 'duration', label: '时长(h)', align: 'center', width: 80 }
+    {
+      // 用页面拼好的 startText 而不是 start_date：空泳道（该窗口内没任务）要显示空白，
+      // 不能让 dhtmlx 把兜底日期画成「开始时间」
+      name: 'startText',
+      label: '开始',
+      align: 'center',
+      width: 130,
+      template: titleTemplate('startText')
+    } as any,
+    {
+      name: 'endText',
+      label: '结束',
+      align: 'center',
+      width: 130,
+      template: titleTemplate('endText')
+    } as any,
+    {
+      name: 'qtyText',
+      // 单位一致时提到表头「数量(PS)」，格子里只剩数字；单位混合时页面传空串，保持「数量」+ 行内单位
+      label: props.qtyUnit ? `数量(${props.qtyUnit})` : '数量',
+      align: 'left',
+      width: 90,
+      template: titleTemplate('qtyText')
+    } as any
   ]
 
   applyScaleConfig(props.scaleUnit)
@@ -239,7 +500,12 @@ const applyConfig = () => {
 
   gantt.templates.task_class = (_, __, task) => {
     const classes: string[] = []
-    if (task.type === 'project') classes.push('dhx-task-lane')
+    if (task.type === 'project') {
+      classes.push('dhx-task-lane')
+      // 2026-11-06 A4：浅色泳道（资源/订单/物料，深色字）与彩色泳道（域/阶段/工厂/部门，白字）
+      // 分开着色 —— 此前统一刷浅绿，整屏 20 条泳道一片绿，看不出区分度。
+      classes.push(task.textColor === '#ffffff' ? 'dhx-lane-strong' : 'dhx-lane-light')
+    }
     // 泳道在该时间窗内没有任务时不画条（避免 1 小时兜底假条）
     if (task.type === 'project' && task.laneEmpty) classes.push('dhx-lane-empty')
     if (task.readonly) classes.push('dhx-task-readonly')
@@ -259,18 +525,43 @@ const applyConfig = () => {
     return classes.join(' ')
   }
 
-  // 条子上一律不写字：
-  //  - 任务条按真实工时绘制（4 小时 ≈ 1/6 个日列），放不下「任务号 | 订单号」，
-  //    且 .gantt_task_content 是 overflow:visible，文字会溢出盖到相邻条上；
-  //  - 泳道条的区间与左侧行名重复（左侧表格已展示），留空只做「占用区间」视觉。
-  // 信息走左侧表格列 + 悬浮 tooltip / 双击浮窗。
-  gantt.templates.task_text = () => ''
+  /**
+   * 条内标签：「工序 | 订单号」撑得下写在条上（省略号兜底），撑不下整条不写字、
+   * 交给右侧外挂标签层（见 renderOuterLabel），避免半截文字。
+   * 泳道摘要条（2026-11-06）：写「N 条」，有延期时右侧补红字「延期 M」。
+   */
+  gantt.templates.task_text = (_start: any, _end: any, task: any) => {
+    if (!task || !task.barLabel) return ''
+    if (!barLabelFits(task)) return ''
+    if (task.type === 'project') {
+      const count = `<span class="dhx-lane-count">${escapeHtml(task.barLabel)}</span>`
+      const delayMark = task.barMarkText
+        ? `<span class="dhx-lane-mark is-delay">${escapeHtml(task.barMarkText)}</span>`
+        : ''
+      return `<span class="dhx-lane-inner">${count}${delayMark}</span>`
+    }
+    const label = `<span class="dhx-bar-label">${escapeHtml(task.barLabel)}</span>`
+    const markClass = task.barMark === 'done' ? 'is-done' : 'is-delay'
+    const mark = task.barMarkText
+      ? `<span class="dhx-bar-mark ${markClass}">${escapeHtml(task.barMarkText)}</span>`
+      : ''
+    return `<span class="dhx-bar-inner">${label}${mark}</span>`
+  }
 
-  gantt.templates.tooltip_text = (_, __, task) => {
-    const lines = [`任务：${task.text || '-'}`]
-    const note = task.changeReason || task.details
+  /**
+   * 悬浮提示：页面层已按业务口径拼好行（任务号 / 订单 / 资源 / 工时 / 状态 / 延期…），
+   * 组件只负责渲染，不自己拼业务语义（术语口径统一在页面层）。
+   */
+  gantt.templates.tooltip_text = (_start: any, _end: any, task: any) => {
+    const lines: string[] = []
+    if (Array.isArray(task?.tooltipLines) && task.tooltipLines.length) {
+      lines.push(...task.tooltipLines)
+    } else {
+      lines.push(`任务：${task?.text || '-'}`)
+    }
+    const note = task?.changeReason || task?.details
     if (note) lines.push(`说明：${note}`)
-    return lines.join('<br/>')
+    return lines.map((line) => escapeHtml(line)).join('<br/>')
   }
 }
 
@@ -443,12 +734,115 @@ const renderLaneOverlay = (task: DhxGanttTask) => {
   wrappers.forEach((item) => container.appendChild(item))
   return container
 }
+/**
+ * 负荷带：资源×时间桶的负荷强度，画在泳道行底部。
+ *
+ * ⚠️ 桶起点可能**早于窗口 from**（周桶锚=周一，5号位 2026-10-30 复函 Q1-b 已书面确认
+ *   「前端不裁首桶是对的」）⇒ 这里直接按桶起点画，不按窗口裁剪。
+ * ⚠️ 强度口径 = 本桶任务数 / **全部泳道**内最大桶任务数 ⇒ 深浅跨泳道可比
+ *   （早期版本按行内归一，结果每条泳道看着都"很满"，横向比较是假的；
+ *     与「资源负荷」页签的热力图口径保持一致）。
+ */
+let loadBandCache: {
+  key: DhxGanttLoadBand[]
+  map: Map<string, DhxGanttLoadBand[]>
+  maxCount: number
+} | null = null
+const loadBandMap = (): {
+  map: Map<string, DhxGanttLoadBand[]>
+  maxCount: number
+} => {
+  const bands = props.loadBands ?? []
+  if (loadBandCache && loadBandCache.key === bands) return loadBandCache
+  const map = new Map<string, DhxGanttLoadBand[]>()
+  let maxCount = 0
+  for (const band of bands) {
+    if (band.taskCount > maxCount) maxCount = band.taskCount
+    const list = map.get(band.laneId)
+    if (list) list.push(band)
+    else map.set(band.laneId, [band])
+  }
+  loadBandCache = { key: bands, map, maxCount }
+  return loadBandCache
+}
+
+const renderLoadBand = (task: DhxGanttTask) => {
+  if (task.type !== 'project') return null
+  const { map, maxCount } = loadBandMap()
+  const bands = map.get(String(task.id))
+  if (!bands || !bands.length) return null
+  const row = ganttApi.getTaskPosition(
+    task as any,
+    task.start_date,
+    gantt.calculateEndDate(task.start_date, task.duration)
+  )
+  if (!row) return null
+  if (maxCount <= 0) return null
+  const container = document.createElement('div')
+  container.className = 'dhx-load-band'
+  for (const band of bands) {
+    const start = parseShadowDate(band.start)
+    const end = parseShadowDate(band.end)
+    if (!start || !end || end <= start) continue
+    const pos = ganttApi.getTaskPosition(task as any, start, end)
+    if (!pos || pos.width <= 0) continue
+    const cell = document.createElement('div')
+    cell.className = 'dhx-load-band-cell'
+    cell.style.left = `${pos.left}px`
+    // 贴着泳道行底边：条高 9px，比原来 7px 更容易看清深浅差
+    cell.style.top = `${row.top + Math.max(row.rowHeight - 9, 0)}px`
+    cell.style.width = `${pos.width}px`
+    cell.style.height = '9px'
+    cell.style.opacity = String(0.25 + (band.taskCount / maxCount) * 0.75)
+    cell.title = [
+      `桶：${band.start.slice(0, 10)} ~ ${band.end.slice(0, 10)}（右端不含）`,
+      `任务 ${band.taskCount} 条 · 工时 ${band.loadHours != null ? band.loadHours.toFixed(2) : '-'} h`
+    ].join('\n')
+    container.appendChild(cell)
+  }
+  return container.children.length ? container : null
+}
+
+/**
+ * 条外标签：只有条宽撑不下「工序 | 订单号」时才画，紧贴条的右缘。
+ * 返回 DOM 元素交给 dhtmlx 的任务图层，滚动/缩放时随条自动重排。
+ * 泳道摘要条同样适用（窄泳道条「N 条」+ 红字「延期 M」写条外）。
+ */
+const renderOuterLabel = (task: any) => {
+  if (!task) return null
+  if (!task.barLabel) return null
+  if (barLabelFits(task)) return null
+  const pos = ganttApi.getTaskPosition(task, task.start_date, task.end_date)
+  if (!pos) return null
+  const el = document.createElement('div')
+  el.className = task.type === 'project' ? 'dhx-bar-outer-label is-lane' : 'dhx-bar-outer-label'
+  // 2026-11-06：窄条条内写不下时，延期小时（+Nh）跟在标签后面用红字补上，
+  // 否则窄条既没有条内文字、也没有任何延期提示。
+  const labelText = String(task.barLabel)
+  const delayText = task.barMark === 'delay' && task.barMarkText ? String(task.barMarkText) : ''
+  const delayMark = delayText
+    ? `<span class="dhx-outer-mark is-delay">${escapeHtml(delayText)}</span>`
+    : ''
+  el.innerHTML = `<span class="dhx-outer-label-text">${escapeHtml(labelText)}</span>${delayMark}`
+  el.title = delayText ? `${labelText} ${delayText}` : labelText
+  el.style.left = `${Math.round(pos.left + barRenderWidth(pos) + OUTER_LABEL_GAP)}px`
+  // getTaskPosition().top 是行顶，条在行内垂直居中（dhtmlx: (rowHeight - barHeight) / 2）
+  const barHeight = Number(pos.height) || 0
+  const rowHeight = Number(pos.rowHeight) || gantt.config.row_height || barHeight
+  el.style.top = `${Math.round(pos.top + (rowHeight - barHeight) / 2)}px`
+  el.style.height = `${Math.round(barHeight)}px`
+  el.style.maxWidth = '220px'
+  return el
+}
+
 const syncLayers = () => {
   if (!initialized) return
   if (compareLayerId !== null) ganttApi.removeTaskLayer(compareLayerId as any)
+  if (outerLabelLayerId !== null) ganttApi.removeTaskLayer(outerLabelLayerId as any)
   if (actualLayerId !== null) ganttApi.removeTaskLayer(actualLayerId as any)
   if (laneOverlayLayerId !== null) ganttApi.removeTaskLayer(laneOverlayLayerId as any)
   if (progressLayerId !== null) ganttApi.removeTaskLayer(progressLayerId as any)
+  if (loadBandLayerId !== null) ganttApi.removeTaskLayer(loadBandLayerId as any)
   compareLayerId = ganttApi.addTaskLayer((task: DhxGanttTask) => renderCompareShadow(task)) as
     | string
     | number
@@ -459,6 +853,12 @@ const syncLayers = () => {
     | string
     | number
   progressLayerId = ganttApi.addTaskLayer((task: DhxGanttTask) => renderProgressBar(task)) as
+    | string
+    | number
+  loadBandLayerId = ganttApi.addTaskLayer((task: DhxGanttTask) => renderLoadBand(task)) as
+    | string
+    | number
+  outerLabelLayerId = ganttApi.addTaskLayer((task: DhxGanttTask) => renderOuterLabel(task)) as
     | string
     | number
 }
@@ -478,8 +878,17 @@ const ensureTodayMarker = (): void => {
   })
 }
 
+/** 纵向滚动容器（dhtmlx 的垂直滚动条元素） */
+const getVerticalScroller = (): HTMLElement | null =>
+  (rootRef.value?.querySelector('.gantt_ver_scroll') as HTMLElement | null) ?? null
+
+/** 上一次解析的任务条数：用于识别「追加一页」（只为这种场景保住纵向滚动位置） */
+let lastParsedCount = 0
+
 const parseData = async () => {
   if (!initialized || !rootRef.value) return
+  const isAppend = props.tasks.length > lastParsedCount
+  const prevScrollTop = getVerticalScroller()?.scrollTop ?? 0
   await nextTick()
   gantt.clearAll()
   dragSnapshots.clear()
@@ -493,6 +902,16 @@ const parseData = async () => {
   ensureTodayMarker()
   // 使用 ganttApi.render() 确保强制重绘
   ganttApi.render()
+  lastParsedCount = props.tasks.length
+  // 追加一页后整图重解析会把滚动条弹回顶部；恢复用户原先所在位置，否则无法连续下滑加载
+  if (isAppend && prevScrollTop > 0) {
+    const restore = () => {
+      const el = getVerticalScroller()
+      if (el) el.scrollTop = prevScrollTop
+    }
+    restore()
+    requestAnimationFrame(restore)
+  }
 }
 
 let nativeContextMenuHandler: ((e: MouseEvent) => void) | null = null
@@ -539,14 +958,19 @@ const showDate = (date: Date | string): void => {
   ganttApi.render?.()
 }
 
-defineExpose({ showDate })
+defineExpose({ showDate, setZoomLevelByName, visibleRowStart })
 
 onMounted(async () => {
   if (!rootRef.value) return
   applyConfig()
-  // addMarker/deleteMarker 由 marker 扩展提供，未 plugins 前这两个方法根本不存在
-  ganttApi.plugins({ marker: true })
+  // addMarker/deleteMarker 由 marker 扩展提供，未 plugins 前这两个方法根本不存在；
+  // tooltip 扩展负责悬浮提示（未 plugins 时悬停任务条没有任何内容）
+  ganttApi.plugins({ marker: true, tooltip: true })
+  // 插件的 onGanttReady 先注册 ⇒ 本函数后跑，才能摘掉它的默认监听范围
+  ganttApi.attachEvent('onGanttReady', () => applyTooltipScope())
   gantt.init(rootRef.value)
+  // 缩放扩展必须在 init 之后启用：它的 init 会 setLevel → 写 config.scales → 重绘
+  initZoom()
 
   // 原生 contextmenu 事件监听，确保右键菜单能触发
   nativeContextMenuHandler = (e: MouseEvent) => {
@@ -679,7 +1103,14 @@ onMounted(async () => {
       })
       return false
     }),
-    gantt.attachEvent('onAfterTaskDrag', () => true)
+    gantt.attachEvent('onAfterTaskDrag', () => true),
+    // 纵向滚动接近底部 → 通知页面追加下一页；真正加载由调用方的 hasMore + 在飞去重决定
+    gantt.attachEvent('onGanttScroll', () => {
+      const el = getVerticalScroller()
+      if (!el || el.scrollHeight <= el.clientHeight + 1) return
+      if (el.scrollHeight - el.scrollTop - el.clientHeight > 240) return
+      emits('nearBottom')
+    })
   ]
 
   initialized = true
@@ -721,6 +1152,16 @@ watch(
   }
 )
 
+// 监听负荷带变化：图层回调读的是 props，但 dhtmlx 需要一次重绘才会重新调用它
+watch(
+  () => props.loadBands,
+  () => {
+    // 缓存键是数组引用，父组件**原地改**同一数组时键不变 ⇒ 这里强制失效
+    loadBandCache = null
+    if (initialized) ganttApi.render?.()
+  }
+)
+
 // 监听 dateFrom/dateTo 变化，更新甘特图显示范围
 watch(
   () => [props.dateFrom, props.dateTo],
@@ -749,9 +1190,14 @@ onBeforeUnmount(() => {
   if (compareLayerId !== null) ganttApi.removeTaskLayer(compareLayerId as any)
   if (actualLayerId !== null) ganttApi.removeTaskLayer(actualLayerId as any)
   if (laneOverlayLayerId !== null) ganttApi.removeTaskLayer(laneOverlayLayerId as any)
+  if (loadBandLayerId !== null) ganttApi.removeTaskLayer(loadBandLayerId as any)
+  if (outerLabelLayerId !== null) ganttApi.removeTaskLayer(outerLabelLayerId as any)
   compareLayerId = null
   actualLayerId = null
   laneOverlayLayerId = null
+  loadBandLayerId = null
+  outerLabelLayerId = null
+  loadBandCache = null
   // clearAll 不清 marker 数据源，不主动删会随组件重挂载叠加
   if (todayMarkerId !== null) {
     ganttApi.deleteMarker?.(todayMarkerId)
@@ -760,6 +1206,7 @@ onBeforeUnmount(() => {
   if (initialized) {
     gantt.clearAll()
   }
+  lastParsedCount = 0
 })
 </script>
 
@@ -770,7 +1217,20 @@ onBeforeUnmount(() => {
 <style scoped lang="less">
 .dhx-gantt-root {
   width: 100%;
-  min-height: 680px;
+  height: 100%;
+  /**
+   * ⚠️ 这里**不能**设固定高度地板（如 min-height: 680px）。
+   *
+   * 根节点是 dhtmlx 的容器宿主，它的高度一旦被钉死：
+   *  ① 容器比可视区高 ⇒ 超出部分被父级 `.gantt-area` 的 overflow:hidden 裁掉，
+   *     **底部那条横向滚动条正好落在被裁掉的那一段里 ⇒ 用户看不到横向滚动条**；
+   *  ② dhtmlx 靠 iframe 监听「容器自身尺寸变化」来决定要不要重排，
+   *     尺寸被钉死 ⇒ 监听不到变化 ⇒ 内部布局也不跟着重排。
+   *
+   * 正确做法：高度 100% 跟随父容器（.gantt-area 高度由 flex 决定），
+   * 视口/工具栏行数一变，容器尺寸就变 ⇒ dhtmlx 自动重排 ⇒ 横向滚动条始终贴在可视区底边。
+   */
+  min-height: 0;
   contain: strict;
   overflow-anchor: none; // 禁用滚动锚点
 }
@@ -790,18 +1250,18 @@ onBeforeUnmount(() => {
   background-color: #f8fafc;
 }
 
-// 今天竖线
+// 今天竖线：灰色虚线 + 浅灰标签（实心红线过抢眼，只作参照线用）
 :deep(.gantt_marker.dhx-today-marker) {
-  width: 2px;
-  background-color: rgb(239 68 68 / 90%);
+  width: 1px;
+  background: repeating-linear-gradient(to bottom, #cbd5e1 0 4px, transparent 4px 8px);
 }
 
 :deep(.gantt_marker.dhx-today-marker .gantt_marker_content) {
   padding: 0 4px;
   font-size: 10px;
   line-height: 14px;
-  color: #fff;
-  background: #ef4444;
+  color: #64748b;
+  background: #f1f5f9;
   border-radius: 0 0 3px;
 }
 
@@ -914,11 +1374,100 @@ onBeforeUnmount(() => {
   border-left: 2px dashed rgb(15 23 42 / 70%);
 }
 
-:deep(.dhx-task-lane .gantt_task_content) {
+// 泳道占用带（2026-11-06 A4）：不再整片刷浅绿。
+//  - 浅色泳道（按资源/订单/物料）：中性淡灰蓝底 + 深色字；
+//  - 彩色泳道（按排程域/阶段/工厂/部门）：保留维度底色，只叠一层半透明白柔化。
+:deep(.dhx-task-lane.dhx-lane-light .gantt_task_content) {
+  font-weight: 600;
+  color: #334155 !important;
+  background: linear-gradient(180deg, #eef2f8 0%, #e6ecf5 100%) !important;
+  border: 1px solid #d8e1ee;
+}
+
+:deep(.dhx-task-lane.dhx-lane-strong .gantt_task_content) {
+  font-weight: 600;
+  color: #fff !important;
+  text-shadow: 0 1px 2px rgb(15 23 42 / 40%);
+  background: linear-gradient(
+    180deg,
+    rgb(255 255 255 / 16%) 0%,
+    rgb(255 255 255 / 4%) 100%
+  ) !important;
+  border: 1px solid rgb(255 255 255 / 45%);
+}
+
+// 泳道摘要条（2026-11-06）：条高由行级 bar_height=16 交给 dhtmlx 定位，
+// 这里只管造型 —— 比 32px 任务条矮一半、两端有收边，一眼可分「这是汇总不是任务」。
+:deep(.gantt_task_line.dhx-task-lane) {
+  border-radius: 5px;
+  box-shadow:
+    0 1px 2px rgb(15 23 42 / 10%),
+    inset 3px 0 0 rgb(148 163 184 / 30%),
+    inset -3px 0 0 rgb(148 163 184 / 30%);
+}
+
+:deep(.gantt_task_line.dhx-lane-strong) {
+  box-shadow:
+    0 1px 2px rgb(15 23 42 / 16%),
+    inset 3px 0 0 rgb(255 255 255 / 50%),
+    inset -3px 0 0 rgb(255 255 255 / 50%);
+}
+
+:deep(.gantt_task_line.dhx-task-lane .gantt_task_content) {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0 8px;
+  box-sizing: border-box;
+  border-radius: 5px;
+  font-size: 11px;
+  line-height: 1;
+}
+
+// 泳道条文字：左侧「N 条」、右侧红字「延期 M」
+:deep(.dhx-lane-inner) {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+}
+
+:deep(.dhx-lane-count) {
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+:deep(.dhx-lane-mark.is-delay) {
+  flex: none;
   font-weight: 700;
-  color: #24446b !important;
-  background: linear-gradient(135deg, #d7e8ff 0%, #c6dbfb 100%) !important;
-  border: 1px solid #aac8ef;
+  white-space: nowrap;
+}
+
+:deep(.dhx-lane-light .dhx-lane-mark.is-delay) {
+  color: #b91c1c;
+}
+
+:deep(.dhx-lane-strong .dhx-lane-mark.is-delay) {
+  color: #fee2e2;
+  text-shadow: 0 1px 2px rgb(15 23 42 / 45%);
+}
+
+// 条内状态标记（固定右侧）：已完成打勾（浅绿）/ 延期 +Nh（红）
+:deep(.dhx-bar-mark) {
+  flex: none;
+  margin-left: 6px;
+  font-weight: 700;
+}
+
+:deep(.dhx-bar-mark.is-done) {
+  color: #ecfdf5;
+}
+
+:deep(.dhx-bar-mark.is-delay) {
+  color: #b91c1c;
 }
 
 :deep(.dhx-task-readonly .gantt_task_content) {
@@ -939,10 +1488,8 @@ onBeforeUnmount(() => {
   box-shadow: inset 0 0 0 2px rgb(245 158 11 / 82%);
 }
 
-// 延期标记：红色左边缘（原先的白色虚线在 88% 任务都延期的图上毫无区分度）
-:deep(.dhx-task-warning .gantt_task_content) {
-  border-left: 3px solid #ef4444;
-}
+// 2026-11-06 用户指定：延期条不再画任何红色线条（原条底 2px 红刻度）。
+// 延期仍由条内红色 +Nh 文字表达。
 
 // 时间窗内无任务的泳道：不画兜底 1 小时假条
 :deep(.gantt_task_line.dhx-lane-empty) {
@@ -1017,25 +1564,98 @@ onBeforeUnmount(() => {
   background-color: #059669 !important;
 }
 
-// Completed 状态：添加绿色对勾标识
-:deep(.dhx-status-completed .gantt_task_content::after),
-:deep(.dhx-zone-completed .gantt_task_content::after) {
-  position: absolute;
-  top: 50%;
-  right: 4px;
-  z-index: 10;
-  font-size: 12px;
-  font-weight: 700;
-  color: #fff;
-  pointer-events: none;
-  content: '✓';
-  transform: translateY(-50%);
-}
-
-// 确保文字在所有背景色上都清晰可见
+// 条内文字一律裁在条内（任务号由 .dhx-bar-label 省略号截断）
 :deep(.gantt_task_content) {
   z-index: 1;
-  overflow: visible !important;
+  overflow: hidden !important;
+}
+
+/**
+ * 任务条最小心宽保底。
+ * 4 小时的条在「天」刻度下只有 ~12px（一个日列的 1/6），肉眼几乎看不见、也点不中 ——
+ * 这正是「这甘特图用户用不了」的直接原因。
+ * CSS 的 min-width 能盖过 dhtmlx 写在行内 style 上的 width（used width = max(width, min-width)）。
+ */
+:deep(.gantt_task_line) {
+  min-width: 14px;
+  // 2026-11-06 A1：圆角 + 极淡投影，条从「色块」变成可点的实体
+  border-radius: 6px;
+  box-shadow: 0 1px 2px rgb(15 23 42 / 14%);
+}
+
+// 状态色是画在 .gantt_task_content 上的（!important），圆角要同步，否则直角会露出来
+:deep(.gantt_task_line .gantt_task_content) {
+  border-radius: 6px;
+}
+
+// 条内任务号（始终渲染；条宽不足时由省略号截断，见 templates.task_text）
+:deep(.dhx-bar-label) {
+  display: block;
+  overflow: hidden;
+  font-size: 11px;
+  line-height: 26px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  // 2026-11-06 A3：中等深浅的条底色上纯白字发虚，加一层淡投影提升可读性
+  font-weight: 600;
+  text-shadow: 0 1px 2px rgb(15 23 42 / 45%);
+}
+
+// 条内布局：任务号占满剩余宽度，状态标记固定在右侧
+:deep(.dhx-bar-inner) {
+  display: flex;
+  align-items: center;
+  height: 100%;
+  padding: 0 6px;
+  box-sizing: border-box;
+}
+
+:deep(.dhx-bar-inner .dhx-bar-label) {
+  flex: 1 1 auto;
+  min-width: 0;
+  text-align: left;
+}
+
+// 条外标签：条宽撑不下「工序 | 订单号」时写在条右侧（淡底胶囊，压在周末底纹/今日线上也看得清）
+:deep(.dhx-bar-outer-label) {
+  position: absolute;
+  display: flex;
+  align-items: center;
+  font-size: 11px;
+  line-height: 1.2;
+  color: #334155;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  pointer-events: none;
+  z-index: 2;
+  // 2026-11-06 A3：淡底胶囊
+  padding: 0 5px;
+  background: rgb(255 255 255 / 88%);
+  border-radius: 4px;
+  box-shadow: 0 0 0 1px rgb(148 163 184 / 22%);
+}
+
+:deep(.dhx-outer-label-text) {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+// 窄条条外的延期小时：红字跟在任务号后（2026-11-06）
+:deep(.dhx-outer-mark.is-delay) {
+  flex: none;
+  margin-left: 4px;
+  font-weight: 700;
+  color: #dc2626;
+}
+
+// 窄泳道条条外摘要（2026-11-06）：「N 条 · 延期 M」也用淡底胶囊，字号略小避免抢任务条的视觉
+:deep(.dhx-bar-outer-label.is-lane) {
+  font-size: 10px;
+  font-weight: 600;
+  padding: 0 4px;
 }
 
 // 计划冻结-斜纹条纹（用于planFreezeFlag=true的任务）
@@ -1140,6 +1760,19 @@ onBeforeUnmount(() => {
   border-style: solid;
   border-width: 0 10px 10px 0;
   content: '';
+}
+
+// 资源负荷带（资源×时间桶；画在泳道行底部，深浅 = 该桶任务数）
+:deep(.dhx-load-band) {
+  position: absolute;
+  z-index: 2;
+  pointer-events: none;
+}
+
+:deep(.dhx-load-band-cell) {
+  position: absolute;
+  background: linear-gradient(180deg, rgb(37 99 235 / 85%) 0%, rgb(59 130 246 / 65%) 100%);
+  border-radius: 2px;
 }
 
 // 计划进度条（自定义，更清晰显示）

@@ -46,7 +46,7 @@ public class DemandPriorityValidatorTests
     /// 再在 Validator 与 Projector 两侧同时登记，然后才在这里加一行。
     /// </summary>
     [Theory]
-    [InlineData(DemandField.DelayStatus, true)]
+    [InlineData(DemandField.DelayStatus, false)]  // 2026-11-07 归参数集：投影器已 fail-closed
     [InlineData(DemandField.CustomerTier, true)]
     [InlineData(DemandField.OrderType, true)]
     [InlineData(DemandField.DueDate, true)]
@@ -91,7 +91,8 @@ public class DemandPriorityValidatorTests
                     SegmentOrder = 1, SegmentName = "延迟销售订单", IsEnabled = true,
                     MatchConditions =
                     [
-                        new SegmentMatchCondition { Field = DemandField.DelayStatus, Operator = ConditionOperator.Equals, Value = "DELAYED" },
+                        // 2026-11-07 0号位 裁决：DelayStatus/DemandMaturityStatus 归参数集，不入规则集。
+                        // 冻结示例本以 DelayStatus=DELAYED 作命中，现移参数集(ProtectDelayed)，此处改纯 OrderType 命中保留排序校验。
                         new SegmentMatchCondition { Field = DemandField.OrderType, Operator = ConditionOperator.Equals, Value = "SALES_ORDER" }
                     ],
                     SortFields =
@@ -152,27 +153,47 @@ public class DemandPriorityValidatorTests
 
     /// <summary>
     /// 现行线上快照 <c>RuleSetVersion 478</c>（实读 APS_Production 的 ContentSnapshotJson）必须能**重新发布**。
-    /// 这是改白名单/兜底段规则的验收口径：规则收紧后若把现行快照判成非法，
-    /// 后果是「线上配置原地不可再发布」，比原缺陷更难收拾。载荷与
-    /// <see cref="DemandPriorityProjectorTests"/> 里的真实快照一致（含 Tie-break 旧写法 "OrderId"）。
+    /// 2026-11-07 0号位 裁决：DelayStatus/DemandMaturityStatus 归参数集，478 已整份替换为整理稿 6 段 / 3 轮
+    /// （无 DelayStatus/DemandMaturity 命中/排序、OriginalDueDate 已删、≠INTER_FACTORY 改 IN 补集）。
+    /// 本载荷 = 用户 2026-11-07 在 SSMS 执行整份替换 SQL 后读回的真实 478 段集合（防空转：测试锚=真实现状，
+    /// 不沿用已作废的旧 3 段 DelayStatus 载荷）。
     /// </summary>
     [Fact]
     public void 现行线上快照478_重新发布校验通过()
     {
         const string real478Json = """
         {"Segments":[
-          {"SegmentOrder":1,"SegmentName":"延迟订单","IsEnabled":true,
-           "MatchConditions":[{"Field":1,"Operator":0,"Value":"Delayed"},{"Field":3,"Operator":0,"Value":"SO"}],
-           "SortFields":[{"Field":6,"Direction":0},{"Field":2,"Direction":1},{"Field":7,"Direction":0}],
-           "StableTieBreakFields":["OrderId"]},
-          {"SegmentOrder":2,"SegmentName":"VIP","IsEnabled":true,
-           "MatchConditions":[{"Field":2,"Operator":0,"Value":"VIP"}],
-           "SortFields":[{"Field":6,"Direction":0}],
-           "StableTieBreakFields":["OrderId"]},
-          {"SegmentOrder":3,"SegmentName":"其余","IsEnabled":true,
-           "MatchConditions":[],
-           "SortFields":[{"Field":6,"Direction":0}],
-           "StableTieBreakFields":["OrderId"]}
+          {"SegmentOrder":1,"SegmentName":"顶层-销售订单(需求内)","IsEnabled":true,
+           "MatchConditions":[{"Field":3,"Operator":0,"Value":"SALES_ORDER"},
+                              {"Field":8,"Operator":6,"Value":["JAPAN","DOMESTIC","OVERSEAS","VIETNAM","OTHER"]},
+                              {"Field":9,"Operator":3,"Value":"20"}],
+           "SortFields":[{"Field":9,"Direction":0},{"Field":10,"Direction":0}],
+           "StableTieBreakFields":["DEMANDKEY"],"CompetitionRound":1},
+          {"SegmentOrder":2,"SegmentName":"顶层-生产指示(库存消耗<=0)","IsEnabled":true,
+           "MatchConditions":[{"Field":3,"Operator":0,"Value":"PRODUCTION_INSTRUCTION"},
+                              {"Field":15,"Operator":7,"Value":"FINAL*"},
+                              {"Field":13,"Operator":3,"Value":"0"}],
+           "SortFields":[{"Field":13,"Direction":0},{"Field":7,"Direction":0}],
+           "StableTieBreakFields":["DEMANDKEY"],"CompetitionRound":1},
+          {"SegmentOrder":3,"SegmentName":"顶层-销售订单(需求外,正常)","IsEnabled":true,
+           "MatchConditions":[{"Field":3,"Operator":0,"Value":"SALES_ORDER"},
+                              {"Field":8,"Operator":6,"Value":["JAPAN","DOMESTIC","OVERSEAS","VIETNAM","OTHER"]}],
+           "SortFields":[{"Field":9,"Direction":0},{"Field":10,"Direction":0}],
+           "StableTieBreakFields":["DEMANDKEY"],"CompetitionRound":1},
+          {"SegmentOrder":4,"SegmentName":"顶层-生产指示(FINAL*)","IsEnabled":true,
+           "MatchConditions":[{"Field":3,"Operator":0,"Value":"PRODUCTION_INSTRUCTION"},
+                              {"Field":15,"Operator":7,"Value":"FINAL*"}],
+           "SortFields":[{"Field":13,"Direction":0},{"Field":7,"Direction":0}],
+           "StableTieBreakFields":["DEMANDKEY"],"CompetitionRound":1},
+          {"SegmentOrder":5,"SegmentName":"SH履约-工厂自用销售订单","IsEnabled":true,
+           "MatchConditions":[{"Field":3,"Operator":0,"Value":"SALES_ORDER"},
+                              {"Field":8,"Operator":0,"Value":"INTER_FACTORY"}],
+           "SortFields":[{"Field":9,"Direction":0}],
+           "StableTieBreakFields":["DEMANDKEY"],"CompetitionRound":2},
+          {"SegmentOrder":6,"SegmentName":"第3轮-孤儿与下阶生产指示","IsEnabled":true,
+           "MatchConditions":[{"Field":3,"Operator":0,"Value":"PRODUCTION_INSTRUCTION"}],
+           "SortFields":[{"Field":13,"Direction":0},{"Field":7,"Direction":0}],
+           "StableTieBreakFields":["DEMANDKEY"],"CompetitionRound":3}
         ]}
         """;
 
@@ -181,8 +202,8 @@ public class DemandPriorityValidatorTests
         var result = _validator.Validate(block);
 
         result.IsValid.Should().BeTrue(
-            "段 3 的空条件兜底是合法形态（执行器对空表返回 true），且它位于段序末，"
-            + "把现行快照判成非法会让重新发布原地失败：" + result.GetErrorMessage());
+            "478 已整份替换为 6 段（无 DelayStatus/Maturity 命中排序、无空条件兜底），"
+            + "此为新真源，必须能重新发布：" + result.GetErrorMessage());
         result.Errors.Should().BeEmpty();
     }
 
@@ -196,8 +217,8 @@ public class DemandPriorityValidatorTests
             [
                 new PrioritySegment
                 {
-                    SegmentOrder = 1, SegmentName = "延迟订单", IsEnabled = true,
-                    MatchConditions = [new SegmentMatchCondition { Field = DemandField.DelayStatus, Operator = ConditionOperator.Equals, Value = "Delayed" }],
+                    SegmentOrder = 1, SegmentName = "VIP订单", IsEnabled = true,
+                    MatchConditions = [new SegmentMatchCondition { Field = DemandField.CustomerTier, Operator = ConditionOperator.Equals, Value = "VIP" }],
                     SortFields = [new SegmentSortField { Field = DemandField.DueDate, Direction = SortDirection.Asc }]
                 },
                 new PrioritySegment
@@ -295,6 +316,32 @@ public class DemandPriorityValidatorTests
 
         result.IsValid.Should().BeFalse("执行器只有 EQ/IN/LT/LTE/GT/GTE，NotEquals 没有对应实现");
         result.Errors.Should().Contain(e => e.Contains("运行侧不支持"));
+    }
+
+    [Fact]
+    public void Contains操作符_发布期放行_与执行器CONTAINS分支对齐()
+    {
+        // 2026-11-07 O26：执行器 `EvaluateCondition` 自 r14060 起已有 "CONTAINS" 分支
+        //（语义＝前缀匹配：剥结尾 `*` + 忽略大小写，3号位 2026-11-06 裁决），
+        // 但发布期白名单一直没收 ⇒ 任何写了「包含」的策略包**发布时原地被拒**，运行侧却完全支持。
+        // 本用例钉住「白名单 ≥ 运行侧实现」，防止再次落后。
+        var block = new DemandPriorityBlock
+        {
+            Segments =
+            [
+                new PrioritySegment
+                {
+                    SegmentOrder = 1, SegmentName = "前缀命中", IsEnabled = true,
+                    MatchConditions = [new SegmentMatchCondition { Field = DemandField.MaterialCode, Operator = ConditionOperator.Contains, Value = "FINAL*" }],
+                    SortFields = [new SegmentSortField { Field = DemandField.DueDate, Direction = SortDirection.Asc }]
+                }
+            ]
+        };
+
+        var result = _validator.Validate(block);
+
+        result.IsValid.Should().BeTrue("执行器已有 CONTAINS 分支，发布期不得再拦");
+        result.Errors.Should().BeEmpty();
     }
 
     [Fact]

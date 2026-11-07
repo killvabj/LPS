@@ -6,7 +6,7 @@
  *  - /api/overview/active-plan             各 Domain 生效版本（→ store.planVersionId）
  *  - /api/order-query/summary?planVersionId= 订单摘要 4 类计数
  *  - /api/overview/resource-bottleneck?planVersionId= 资源负荷 + 不可用窗口
- *  - /api/overview/candidate-summary       待确认 Candidate 数
+ *  - /api/overview/candidate-summary       待确认候选版本数
  *  - /api/domain-status/{runId}            排程域状态（6 值）
  *
  * 保留的 4号位文档约束：
@@ -20,19 +20,53 @@
  * 10-16 版式精简：页面大标题 + 副标题 + 刷新按钮整块下线（标题由面包屑/标签页承担，页面只留数据）；
  *   「无生效版本」说明从顶部横幅改为写进「当前生效版本」卡片的空状态，订单摘要取不到时给整块空态
  *   而不是摆 5 张含 0 的 KPI 卡。
+ *
+ * 2026-11-04 逐功能测试后改动（口径写清 + 有数据不展示的列换掉）：
+ *  - KPI「订单合计」下方写明统计范围（哪个域的哪个版本）—— 三个数据面都按 active-plan 第一条取数，
+ *    不写清会被误读成「全部域合计」。
+ *  - 资源表：删「负荷率 / 状态」两列（后端 `NULL AS UtilizationRate` / `0 AS IsBottleneck` 是占位字面量
+ *    ⇒ 恒为 `-`），换成后端真有的「任务数 / 计划工时（小时）」；面板口径提示负荷率与超载暂无口径。
+ *  - 资源「编码 + 名称」合成一列，同名只留一段（与甘特页共用 `utils/apsResource` 同一套取值）。
+ *  - 排程域状态面板头写明「共 N 个排程域 · 来源排程运行 X」，让「8 项异常 / 12 个域」看得懂。
+ *  - 待确认候选版本的「去处理」由死文本改成真链接（无 `aps.candidate.confirm` 权限者不给入口）。
+ *
+ * 2026-11-04 任务数口径写明（用户反馈「两个页面任务数对不上」）：
+ *  - 版本卡「任务数」= `PlanVersion.TotalTasks` 冗余列 = **整个计划区间**（2026-10-30 ~ 2027-01-28）
+ *    内的任务总数（dev 实测 QT 版 13201）；故卡上写明「（整个计划区间内）」。
+ *  - 甘特页那个「任务」是**时间窗内**的数（dev 实测同一版本 11-04 ~ 11-10 窗内 3334 条）
+ *    —— 两个数不是同一口径，窗口版随日期滚、版本版不滚。
+ *  - 对账：7990(10-30~11-04) + 3334(11-04~11-11) + 1877(11-11~01-28) = 13201 ⇒ 两页能对上。
+ *
+ *  ⚠️ 2026-11-04 后端缺口（已出函，页面零妥协）：
+ *  - PlanVersion 冗余列 `totalOrders`（dev 实测 53）与 `/api/order-query/summary` 的实时 `totalCount`
+ *    （55）不一致 ⇒ **页面不展示 totalOrders**，避免同页两个数字打架（见 types/overview.ts 注释）。
+ *  - 负荷率（`utilizationRate`）与瓶颈判定（`isBottleneck`）后端仍是占位字面量 ⇒ 不展示、不臆断。
+ *
+ * 2026-11-04 加「查看版本切换」：
+ *  - 原先订单摘要 / 资源负荷 / 排程域状态死钉在 `active-plan` 第一条 ⇒ 页面上列了 3 张生效版本卡，
+ *    用户看得见另外两个版本、点不动也看不到（dev 实测 QT 版 951-3S 有 1857 个任务 / 116.91 小时，
+ *    恰恰是用户想看的那份数据）。
+ *  - 改成**点「当前生效版本」卡片切换**（不另加下拉控件 —— 同一路径只留一个入口）：
+ *    选中卡片标「查看中」；订单摘要按选中版本取、资源负荷按选中版本取、
+ *    域状态按选中版本的 sourceScheduleRunId 取（不同版本可能来自不同 Run）。
+ *  - 候选数与版本无关（全局），不随切换变。
  */
 
 import { computed, onMounted } from 'vue'
 import dayjs from 'dayjs'
 import { storeToRefs } from 'pinia'
+import { useRouter } from 'vue-router'
 import { useOverviewStore } from '@/store/modules/aps/overview'
 import { useDomainStore } from '@/store/modules/aps/domain'
+import { useApsAuthStore } from '@/store/modules/aps/auth'
+import { resourceCodeNameParts } from '@/utils/apsResource'
 import {
   RUN_DOMAIN_ISSUE_STATUSES,
   RUN_DOMAIN_STATUS_LABELS,
   RUN_DOMAIN_STATUS_TAG,
   planVersionStatusLabel,
   planVersionStatusTag,
+  type ActiveVersionPanel,
   type RunDomainStatus
 } from '@/api/aps-v1/types'
 
@@ -46,9 +80,11 @@ import {
   ElTag
 } from 'element-plus'
 
+const router = useRouter()
 const overviewStore = useOverviewStore()
 const { errors, activeVersions, orderSummary, resources, pendingCandidateCount, domainStatuses } =
   storeToRefs(overviewStore)
+const apsAuth = useApsAuthStore()
 
 const domainStore = useDomainStore()
 function humanLabel(domainKey: string | undefined | null): string {
@@ -60,33 +96,61 @@ function fmtTime(v: string | null | undefined, pattern = 'YYYY-MM-DD HH:mm'): st
   return v ? dayjs(v).format(pattern) : '-'
 }
 
-/* ===== 订单摘要（只展示查得出来的两类 + 未计算；理由见 types/order.ts OrderSummaryDto）=====
+/* ===== 订单摘要（计划派生三桶；理由见 types/order.ts OrderSummaryDto）=====
  *
- * 下线「风险」卡：`riskCount` 查的是 `OrderScheduleSummary`（冻结 07:4965 RiskLevel），
+ * 2026-11-02 口径全换（5号位 r14009 答复函 §二）：三桶改为**计划派生**，与订单页格子的
+ * `riskLevel` 同源（冻结 `01 §64`）⇒ 总览与订单页不再各说各话。
+ * 恒等式：按期 + 延迟 + 未排产 = 合计（v999333 实测 0 + 1 + 309 = 310）。
+ *
+ * 「风险」卡仍下线：`riskCount` 查的是 `OrderScheduleSummary`（冻结 07:4965 RiskLevel），
  *   dev 实测恒 0，**区分不了「无风险」与「该表无数据」** —— 显示它等于宣称零风险。
- * 下线「未排」卡：后端 SQL 写死 `CAST(0 AS INT)`（`OrderQueryRepository.cs:271`），
- *   恒 0 是字面量不是查出来的数；「未排」目前无权威字段可查。
- * 「未计算」= 总数 − 未延迟 − 延迟，是本前端由服务端计数做的差，不是独立查询结果。
+ * 「未排」卡重新上线：后端 `unscheduledCount` 已从 `CAST(0 AS INT)` 字面量改为**实值**
+ *   （本版本无 Task 行 ⇒ 未排产/不可判定）。旧「未计算」卡（= 总数 − 按期 − 延迟）
+ *   在新口径下算出来的其实是「未排产」，标签是错的 ⇒ 删掉，改用后端这一桶。
  */
 const orderKpis = computed(() => {
   const s = orderSummary.value
   if (!s) return []
-  const items = [
-    { key: 'ontime', label: '未延迟', count: s.onTimeCount, color: '#059669' },
-    { key: 'delayed', label: '延迟', count: s.delayedCount, color: '#ef4444' }
+  return [
+    { key: 'ontime', label: '按期', count: s.onTimeCount, color: '#059669' },
+    { key: 'delayed', label: '延迟', count: s.delayedCount, color: '#ef4444' },
+    { key: 'unscheduled', label: '未排产', count: s.unscheduledCount, color: '#94a3b8' }
   ]
-  // 「未计算」= DelayStatus 为 NULL 的行。全表已回填（NULL=0）⇒ 只在真有未计算行时才显示。
-  const uncalculated = Math.max(0, s.totalCount - s.onTimeCount - s.delayedCount)
-  if (uncalculated > 0) {
-    items.push({ key: 'uncalculated', label: '未计算', count: uncalculated, color: '#94a3b8' })
-  }
-  return items
 })
 
 const totalOrders = computed(() => orderSummary.value?.totalCount ?? null)
 
 const orderShare = (count: number): number =>
   totalOrders.value && totalOrders.value > 0 ? Math.round((count / totalOrders.value) * 100) : 0
+
+/* ===== 统计口径 =====
+ *
+ * 订单摘要 / 资源负荷 / 排程域状态三个数据面**都按「正在查看的版本」取数**
+ * （store 的 `selectedVersion`）⇒ 页面必须写清「这些数字属于哪个域的哪个版本」，
+ * 否则与下方 3 张生效版本卡对不上号（用户会以为 KPI 是全部域的合计）。
+ *
+ * 2026-11-04：原先死钉在 active-plan 第一条，用户看得见另外两个版本却点不动 ⇒
+ *   改成可点卡片切换（selectedVersion），下面三块随之切换。
+ */
+const selectedVersion = computed(() => overviewStore.selectedVersion)
+
+/** 正在查看的版本 id（用于卡片高亮） */
+const selectedVersionId = computed(() => selectedVersion.value?.planVersionId ?? null)
+
+/** 订单摘要的统计范围文案（域中文名 + 版本号） */
+const summaryScope = computed(() => {
+  const v = selectedVersion.value
+  if (!v) return '统计范围未知'
+  return `${humanLabel(v.domainKey)} · ${v.versionCode}`
+})
+
+/** 排程域状态来自哪个 Run（与 store 请求的入参同源 = 正在查看版本的 sourceScheduleRunId） */
+const statusRunId = computed(() => selectedVersion.value?.sourceScheduleRunId ?? null)
+
+/** 点版本卡 ⇒ 切到该版本（订单摘要 / 资源负荷 / 域状态三块随之重取） */
+function onSelectVersion(v: ActiveVersionPanel): void {
+  void overviewStore.selectVersion(v.planVersionId)
+}
 
 /* ===== 排程域状态 ===== */
 const issueStatuses = new Set<string>(RUN_DOMAIN_ISSUE_STATUSES)
@@ -101,10 +165,21 @@ const domainTag = (status: string) => RUN_DOMAIN_STATUS_TAG[status as RunDomainS
 /* ===== 资源 ===== */
 const bottleneckResources = computed(() => resources.value.filter((r) => r.isBottleneck))
 
-const utilPercent = (r: { utilizationRate?: number | null }): number | null =>
-  r.utilizationRate === null || r.utilizationRate === undefined
-    ? null
-    : Math.round(r.utilizationRate * 100)
+/** 资源显示名：编码 + 名称（同名只留一段，与甘特页同一套取值助手） */
+const resourceLabel = (r: { resourceCode?: string | null; resourceName?: string | null }): string =>
+  resourceCodeNameParts(r).join(' | ')
+
+/** 计划工时：后端给的是小时小数，页面保留 2 位（7.062 → 7.06） */
+const fmtHours = (v: number | null | undefined): string =>
+  v === null || v === undefined ? '-' : String(Number(v.toFixed(2)))
+
+/* ===== 待确认候选版本 ===== */
+/** 候选确认页需 `aps.candidate.confirm`（路由 RBAC）⇒ 无权者不给入口，避免点了跳 403 */
+const canConfirmCandidate = computed(() => apsAuth.has('aps.candidate.confirm'))
+
+function goCandidate(): void {
+  void router.push({ path: '/aps/candidate' })
+}
 
 function refresh() {
   overviewStore.load()
@@ -125,12 +200,12 @@ onMounted(refresh)
       :title="`${e.section}加载失败：${e.message}`"
     />
 
-    <!-- ===== 订单摘要：合计 + 未延迟/延迟/未计算。取不到时给整块空态，不摆 0 ===== -->
+    <!-- ===== 订单摘要：合计 + 按期/延迟/未排产（计划派生三桶）。取不到时给整块空态，不摆 0 ===== -->
     <div v-if="orderSummary" class="kpi-row">
       <div class="kpi-card total">
         <div class="kpi-label">订单合计</div>
         <div class="kpi-value">{{ totalOrders ?? '-' }}</div>
-        <div class="kpi-ratio">本版本全部订单</div>
+        <div class="kpi-ratio">统计范围：{{ summaryScope }}</div>
       </div>
       <div
         v-for="item in orderKpis"
@@ -160,7 +235,7 @@ onMounted(refresh)
           </div>
         </template>
         <div v-if="!activeVersions.length" class="panel-empty">
-          <ElEmpty description="当前没有排程域处于生效（ACTIVE）状态">
+          <ElEmpty description="当前没有排程域处于生效状态">
             <p class="empty-hint">
               订单摘要、资源负荷、排程域状态都以生效版本为入参。<br />
               需先完成一次排产运行并被正式采用。
@@ -168,12 +243,31 @@ onMounted(refresh)
           </ElEmpty>
         </div>
         <div v-else class="version-list">
-          <div v-for="v in activeVersions" :key="v.planVersionId" class="version-card">
+          <p v-if="activeVersions.length > 1" class="panel-hint">
+            点版本卡可切换下面各块看的版本（订单摘要 / 资源负荷 / 排程域状态）
+          </p>
+          <div
+            v-for="v in activeVersions"
+            :key="v.planVersionId"
+            class="version-card"
+            :class="{ selected: v.planVersionId === selectedVersionId }"
+            role="button"
+            tabindex="0"
+            title="点击查看该版本的数据"
+            @click="onSelectVersion(v)"
+            @keydown.enter="onSelectVersion(v)"
+            @keydown.space.prevent="onSelectVersion(v)"
+          >
             <div class="version-card-head">
               <div class="version-code">{{ v.versionCode }}</div>
-              <ElTag :type="planVersionStatusTag(v.status)" size="small">
-                {{ planVersionStatusLabel(v.status) }}
-              </ElTag>
+              <div class="version-card-tags">
+                <ElTag v-if="v.planVersionId === selectedVersionId" type="primary" size="small">
+                  查看中
+                </ElTag>
+                <ElTag :type="planVersionStatusTag(v.status)" size="small">
+                  {{ planVersionStatusLabel(v.status) }}
+                </ElTag>
+              </div>
             </div>
             <ElDescriptions :column="2" size="small" class="version-desc">
               <ElDescriptionsItem label="排程域">{{ humanLabel(v.domainKey) }}</ElDescriptionsItem>
@@ -185,8 +279,12 @@ onMounted(refresh)
                 ~
                 {{ fmtTime(v.planHorizonEnd, 'YYYY-MM-DD') }}
               </ElDescriptionsItem>
-              <ElDescriptionsItem label="来源 Run">
+              <ElDescriptionsItem label="来源排程运行">
                 {{ v.sourceScheduleRunId ?? '-' }}
+              </ElDescriptionsItem>
+              <ElDescriptionsItem label="任务数">
+                {{ v.totalTasks ?? '-' }}
+                <span class="field-scope">（整个计划区间内）</span>
               </ElDescriptionsItem>
             </ElDescriptions>
           </div>
@@ -198,7 +296,14 @@ onMounted(refresh)
         <template #header>
           <div class="panel-header">
             <span>排程域状态</span>
-            <ElTag v-if="issueCount" type="danger" size="small"> {{ issueCount }} 项异常 </ElTag>
+            <div class="panel-header-right">
+              <span class="hint-text">
+                共 {{ domainStatuses.length }} 个排程域<template v-if="statusRunId">
+                  · 来源排程运行 {{ statusRunId }}</template
+                >
+              </span>
+              <ElTag v-if="issueCount" type="danger" size="small"> {{ issueCount }} 项异常 </ElTag>
+            </div>
           </div>
         </template>
         <div v-if="!domainStatuses.length" class="panel-empty">
@@ -222,15 +327,18 @@ onMounted(refresh)
       </ElCard>
     </div>
 
-    <!-- ===== 资源利用率 ===== -->
+    <!-- ===== 资源负荷 ===== -->
     <ElCard class="panel">
       <template #header>
         <div class="panel-header">
-          <span>资源利用率</span>
-          <span v-if="bottleneckResources.length" class="hint-text">
-            <ElIcon><Icon icon="vi-mdi:alert" /></ElIcon>
-            <strong>{{ bottleneckResources.length }} 个瓶颈资源</strong>
-          </span>
+          <span>资源负荷</span>
+          <div class="panel-header-right">
+            <span v-if="bottleneckResources.length" class="hint-text">
+              <ElIcon><Icon icon="vi-mdi:alert" /></ElIcon>
+              <strong>{{ bottleneckResources.length }} 个瓶颈资源</strong>
+            </span>
+            <span class="hint-text">负荷率与超载判定暂无口径，暂不显示</span>
+          </div>
         </div>
       </template>
 
@@ -240,44 +348,17 @@ onMounted(refresh)
       <table v-else class="resource-table">
         <thead>
           <tr>
-            <th>资源编码</th>
-            <th>名称</th>
-            <th>负荷率</th>
-            <th>状态</th>
+            <th>资源</th>
+            <th>任务数</th>
+            <th>计划工时（小时）</th>
             <th>不可用窗口</th>
           </tr>
         </thead>
         <tbody>
           <tr v-for="r in resources" :key="r.resourceId" :class="{ bottleneck: r.isBottleneck }">
-            <td>{{ r.resourceCode }}</td>
-            <td>{{ r.resourceName }}</td>
-            <td>
-              <span v-if="utilPercent(r) === null" class="muted">-</span>
-              <div v-else class="util-bar">
-                <div
-                  class="util-fill"
-                  :style="{
-                    width: Math.min(utilPercent(r)!, 100) + '%',
-                    background:
-                      utilPercent(r)! >= 90
-                        ? '#ef4444'
-                        : utilPercent(r)! >= 70
-                          ? '#f59e0b'
-                          : '#10b981'
-                  }"
-                ></div>
-                <span class="util-text">{{ utilPercent(r) }}%</span>
-              </div>
-            </td>
-            <td>
-              <!-- 只在真为瓶颈时标红：`isBottleneck` 后端是 `0 AS IsBottleneck` 字面量
-                   （`OverviewQueryRepository.cs:93`，同块还有 `NULL AS UtilizationRate`），
-                   注释自陈「Bottleneck判定应由2号位正式Query提供，5号位不做二次计算」。
-                   ⇒ false 区分不了「判定为非瓶颈」与「未判定」，写「正常」是把未知说成正常。
-                   待 5号位 落地 2026-09-21 R1 契约（删 isBottleneck，改 availableHours/plannedHours/loadRate）后重写本列。 -->
-              <ElTag v-if="r.isBottleneck" type="danger" size="small">瓶颈</ElTag>
-              <span v-else class="muted">-</span>
-            </td>
+            <td>{{ resourceLabel(r) }}</td>
+            <td>{{ r.taskCount }}</td>
+            <td>{{ fmtHours(r.totalPlannedHours) }}</td>
             <td>
               <span v-if="!r.unavailableWindows.length" class="muted">无</span>
               <div v-else class="window-list">
@@ -295,9 +376,17 @@ onMounted(refresh)
     <!-- ===== 底部：待确认候选（整行窄条，不占半屏留白） ===== -->
     <div class="candidate-bar">
       <ElIcon class="candidate-icon"><Icon icon="vi-mdi:clock-alert-outline" /></ElIcon>
-      <span class="candidate-label">待确认 Candidate</span>
+      <span class="candidate-label">待确认候选版本</span>
       <span class="candidate-value">{{ pendingCandidateCount ?? '-' }}</span>
-      <span class="candidate-sub">去「候选版本确认」页处理</span>
+      <button
+        v-if="pendingCandidateCount && canConfirmCandidate"
+        type="button"
+        class="candidate-link"
+        @click="goCandidate"
+      >
+        去「候选版本确认」页处理 →
+      </button>
+      <span v-else-if="pendingCandidateCount === 0" class="candidate-sub">暂无待确认候选</span>
     </div>
   </div>
 </template>
@@ -388,6 +477,13 @@ onMounted(refresh)
   color: #1e293b;
 }
 
+.panel-header-right {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-weight: 400;
+}
+
 .panel-empty {
   padding: 20px 0;
 }
@@ -399,17 +495,43 @@ onMounted(refresh)
   gap: 12px;
 }
 
+.panel-hint {
+  margin: 0;
+  font-size: 12px;
+  color: #94a3b8;
+}
+
 .version-card {
   padding: 12px;
   background: #f8fafc;
   border: 1px solid #e2e8f0;
   border-radius: 6px;
+  cursor: pointer;
+  transition:
+    border-color 0.15s,
+    box-shadow 0.15s;
+
+  &:hover {
+    border-color: #93c5fd;
+  }
+
+  &.selected {
+    border-color: #409eff;
+    box-shadow: 0 0 0 1px #409eff inset;
+    background: #f0f7ff;
+  }
 
   &-head {
     display: flex;
     justify-content: space-between;
     align-items: center;
     margin-bottom: 8px;
+  }
+
+  &-tags {
+    display: flex;
+    gap: 6px;
+    align-items: center;
   }
 
   .version-code {
@@ -426,6 +548,12 @@ onMounted(refresh)
     :deep(.el-descriptions__content) {
       color: #475569;
     }
+  }
+
+  /* 口径标注（跟数值贴在一起，避免读者把它当成另一个字段名） */
+  .field-scope {
+    font-size: 12px;
+    color: #94a3b8;
   }
 }
 
@@ -500,35 +628,6 @@ onMounted(refresh)
   }
 }
 
-.util-bar {
-  position: relative;
-  width: 100%;
-  height: 18px;
-  overflow: hidden;
-  background: #f1f5f9;
-  border-radius: 9px;
-
-  .util-fill {
-    position: absolute;
-    top: 0;
-    left: 0;
-    height: 100%;
-    border-radius: 9px;
-    transition: width 0.3s;
-  }
-
-  .util-text {
-    position: absolute;
-    top: 50%;
-    left: 50%;
-    z-index: 1;
-    font-size: 11px;
-    font-weight: 500;
-    color: #1e293b;
-    transform: translate(-50%, -50%);
-  }
-}
-
 .window-list {
   display: flex;
   flex-direction: column;
@@ -579,6 +678,20 @@ onMounted(refresh)
     margin-left: auto;
     font-size: 12px;
     color: #94a3b8;
+  }
+
+  .candidate-link {
+    margin-left: auto;
+    padding: 0;
+    font-size: 12px;
+    color: #2563eb;
+    cursor: pointer;
+    background: none;
+    border: 0;
+
+    &:hover {
+      text-decoration: underline;
+    }
   }
 }
 </style>
