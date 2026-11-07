@@ -43,7 +43,6 @@ import {
   NO_VERSION,
   NO_VERSION_LABEL,
   RULE_STATUSES_UI,
-  roleLabelOf,
   setupApi,
   type FieldDiff,
   type RuleStatus,
@@ -105,8 +104,6 @@ const {
   validating,
   saving,
   error,
-  actor,
-  actorRoles,
   canWrite,
   canPublishAction,
   actions,
@@ -868,14 +865,6 @@ onActivated(() => {
     <!-- ===== 顶部（无大标题页头：页面名由菜单/面包屑给出） ===== -->
     <div class="page-header">
       <div class="header-actions">
-        <ElTooltip
-          :content="`当前操作者：${actor}（${actorRoles.map(roleLabelOf).join('、')}）`"
-          placement="bottom"
-        >
-          <ElTag effect="plain" type="primary">
-            <Icon icon="vi-mdi:account-circle" /> {{ actor }}
-          </ElTag>
-        </ElTooltip>
         <!-- [+ 新建规则集]：建主表壳并自动跟建一个空白 DRAFT（3号位 Q2 两步） -->
         <ElTooltip
           :content="canWrite ? '新建规则集（编码创建后不可修改）' : '当前账号无编辑权限'"

@@ -31,8 +31,7 @@ import {
   ElSelect,
   ElTable,
   ElTableColumn,
-  ElTag,
-  ElTooltip
+  ElTag
 } from 'element-plus'
 import { useSetupDiffStore } from '@/store/modules/aps/setupDiff'
 import { useApsAuthStore } from '@/store/modules/aps/auth'
@@ -40,7 +39,6 @@ import { formatRuleSetVersionLabel } from './composables/ruleSetVersionLabels'
 import {
   SETUP_RULE_STATUS_META,
   SETUP_VERSION_STATUS_META,
-  roleLabelOf,
   type SetupRuleChangeDto
 } from '@/api/aps-v1'
 import { formatUtcDateTimeSec } from '@/utils/datetime'
@@ -166,13 +164,6 @@ function formatRuleChange(change: SetupRuleChangeDto) {
       <div class="header-left">
         <h2>规则版本对比</h2>
         <p class="subtitle">对比两个规则版本的换型规则差异</p>
-      </div>
-      <div class="header-right">
-        <ElTooltip
-          :content="`当前操作者：${apsAuth.userInfo?.userCode ?? '—'}（${apsAuth.roles.map(roleLabelOf).join('、')}）`"
-        >
-          <ElTag type="info" size="small">{{ apsAuth.userInfo?.userCode ?? '—' }}</ElTag>
-        </ElTooltip>
       </div>
     </div>
 

@@ -38,11 +38,9 @@ import {
   ElTooltip
 } from 'element-plus'
 import { useSetupDefaultStore } from '@/store/modules/aps/setupDefault'
-import { useApsAuthStore } from '@/store/modules/aps/auth'
 import {
   SETUP_RULE_STATUS_META,
   SETUP_VERSION_STATUS_META,
-  roleLabelOf,
   type SetupDialogPrefill,
   type SetupRuleDto
 } from '@/api/aps-v1'
@@ -55,7 +53,6 @@ defineOptions({ name: 'ApsSetupDefault' })
 
 const route = useRoute()
 const defaultStore = useSetupDefaultStore()
-const apsAuth = useApsAuthStore()
 const masterData = useSetupMasterData()
 
 const {
@@ -267,13 +264,6 @@ const editDisabledReason = computed<string>(() => {
         <p class="subtitle"
           >无前后产品的兜底换型规则；命中优先级：明确产品转换规则 &gt; 默认换型规则 &gt; 0 分钟</p
         >
-      </div>
-      <div class="header-right">
-        <ElTooltip
-          :content="`当前操作者：${apsAuth.userInfo?.userCode ?? '—'}（${apsAuth.roles.map(roleLabelOf).join('、')}）`"
-        >
-          <ElTag type="info" size="small">{{ apsAuth.userInfo?.userCode ?? '—' }}</ElTag>
-        </ElTooltip>
       </div>
     </div>
 

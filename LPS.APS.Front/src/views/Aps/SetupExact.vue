@@ -40,11 +40,9 @@ import {
   ElTooltip
 } from 'element-plus'
 import { useSetupExactStore } from '@/store/modules/aps/setupExact'
-import { useApsAuthStore } from '@/store/modules/aps/auth'
 import {
   SETUP_RULE_STATUS_META,
   SETUP_VERSION_STATUS_META,
-  roleLabelOf,
   type SetupDialogPrefill,
   type SetupRuleDto
 } from '@/api/aps-v1'
@@ -57,7 +55,6 @@ defineOptions({ name: 'ApsSetupExact' })
 
 const route = useRoute()
 const exactStore = useSetupExactStore()
-const apsAuth = useApsAuthStore()
 const masterData = useSetupMasterData()
 
 const {
@@ -285,13 +282,6 @@ const editDisabledReason = computed<string>(() => {
           </ElTooltip>
         </h2>
         <p class="subtitle">填「什么产品换成什么产品、要多久」，排产时按这张表算设备换型时间</p>
-      </div>
-      <div class="header-right">
-        <ElTooltip
-          :content="`当前操作者：${apsAuth.userInfo?.userCode ?? '—'}（${apsAuth.roles.map(roleLabelOf).join('、')}）`"
-        >
-          <ElTag type="info" size="small">{{ apsAuth.userInfo?.userCode ?? '—' }}</ElTag>
-        </ElTooltip>
       </div>
     </div>
 

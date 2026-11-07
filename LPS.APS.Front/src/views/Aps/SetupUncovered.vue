@@ -58,7 +58,7 @@ import { useSetupUncoveredStore } from '@/store/modules/aps/setupUncovered'
 import { useApsAuthStore } from '@/store/modules/aps/auth'
 import { RUN_STATUS_LABEL } from '@/store/modules/aps/run'
 import type { ScheduleRunGovDto, SetupUncoveredQuery } from '@/api/aps-v1'
-import { roleLabelOf, runApi, setupApi } from '@/api/aps-v1'
+import { runApi, setupApi } from '@/api/aps-v1'
 import { formatLocalMonthDayHM } from '@/utils/datetime'
 import {
   filterLookupOptions,
@@ -369,13 +369,6 @@ async function handleExportCsv(): Promise<void> {
       <div class="header-left">
         <h2>缺失规则查询</h2>
         <p class="subtitle">查询未命中换型规则的产品转换（按 0 分钟兜底）</p>
-      </div>
-      <div class="header-right">
-        <ElTooltip
-          :content="`当前操作者：${apsAuth.userInfo?.userCode ?? '—'}（${apsAuth.roles.map(roleLabelOf).join('、')}）`"
-        >
-          <ElTag type="info" size="small">{{ apsAuth.userInfo?.userCode ?? '—' }}</ElTag>
-        </ElTooltip>
       </div>
     </div>
 

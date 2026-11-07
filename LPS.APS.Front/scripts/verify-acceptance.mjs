@@ -2712,9 +2712,14 @@ function runParameterSetUxStatic() {
   /* -------- P35-P38 运行期无消费者字段标「暂未生效」（2026-10-27）--------
    * 依据：3号位 2026-10-26《参数集无运行时消费者字段核证回执》（13 项一致 / 1 项纠正），
    *   页面口径 = B 字段级中性标记，**范围只到「本轮不接入」**：
-   *   - 要标 22 个字段（锁 12 / 供 3 / 采 1 / 求解 4 / 守门 2）
-   *     锁块 2026-11-06 新增成熟度两项（Trigger.ProtectMaturityStatus / MaturityStatusValues，
-   *     3号位 实施包 v1.0），运行侧仍读 DB 硬锁 ⇒ 一并标「暂未生效」
+   *   - 要标 12 个字段（锁 4 / 供 3 / 采 1 / 求解 4 / 守门 0）
+   *   - 2026-11-07 撤标 10 项（22 → 12）：后端已接线的字段必须移出清单，
+   *     否则页面会对**真生效**的字段说「配了没用」——那比不标更坏。
+   *     锁块 8 项 Trigger.*：`FrozenStrategySnapshotProvider.cs:177` 把参数集版本内容 `$.Lock`
+   *       装进 `snapshot.Lock` → `PeggingOrchestrator.cs:13279` 取块 →
+   *       `DemandProtectionTriggerEvaluator.cs:122-197` 判定 → `ProtectionStatus`（:13344）→ 影响需求排序
+   *     守门 2 项 ResourceTopN / WarnOnlyOnMaxImpacted：`PhaseFourLocalRepair.cs:1435` / `:184`
+   *   - 留存的 12 项逐条复核过：仅 DTO 声明 / 仅发布校验 / 预留位 ⇒ 运行期仍无消费者
    *   - 不标：逾期修正比例（真消费）、准时率目标 + 守门四项（待激活，接线即生效）
    * 四陷阱照旧：标签文案出现多处 ⇒ 每条判「该处的 v-if + 邻近文案」，不靠 includes 计数。 */
   const catalog = readSrc('api/aps-v1/parameterBlockFields.ts')
@@ -2722,15 +2727,7 @@ function runParameterSetUxStatic() {
   const inertSrc = inertBlock ? inertBlock[0] : ''
   const inertPaths = [...inertSrc.matchAll(/'([^']+)'/g)].map((m) => m[1])
   const expectedInert = [
-    'Trigger.UseRemainingTimeThreshold',
-    'Trigger.RemainingTimeThresholdHours',
-    'Trigger.ProtectDelayed',
-    'Trigger.ProtectVipTier',
-    'Trigger.VipTierValue',
-    'Trigger.ProtectedOrderTypes',
     'Trigger.AllowPmcManualProtection',
-    'Trigger.ProtectMaturityStatus',
-    'Trigger.MaturityStatusValues',
     'Sticky.RequireReleaseRecord',
     'Sticky.ProtectUntilCompletion',
     'Sticky.ProtectUntilSupplyInvalid',
@@ -2741,9 +2738,7 @@ function runParameterSetUxStatic() {
     'OnTimeTarget.IsPrimaryObjective',
     'Split.LimitMandatorySplit',
     'StageOverlap.ThresholdQty',
-    'StageOverlap.ThresholdPercent',
-    'ResourceTopN',
-    'WarnOnlyOnMaxImpacted'
+    'StageOverlap.ThresholdPercent'
   ].sort()
   const forbiddenInert = [
     'OverdueMargin.MarginPercent',
@@ -2751,7 +2746,18 @@ function runParameterSetUxStatic() {
     'NormalMs',
     'SoftMs',
     'LocalHardMs',
-    'MaxRepairAttempts'
+    'MaxRepairAttempts',
+    // 2026-11-07 已接线 ⇒ 不得再标「暂未生效」
+    'Trigger.UseRemainingTimeThreshold',
+    'Trigger.RemainingTimeThresholdHours',
+    'Trigger.ProtectDelayed',
+    'Trigger.ProtectVipTier',
+    'Trigger.VipTierValue',
+    'Trigger.ProtectedOrderTypes',
+    'Trigger.ProtectMaturityStatus',
+    'Trigger.MaturityStatusValues',
+    'ResourceTopN',
+    'WarnOnlyOnMaxImpacted'
   ]
   const p35List = JSON.stringify([...inertPaths].sort()) === JSON.stringify(expectedInert)
   const p35Excluded = forbiddenInert.every((p) => !inertPaths.includes(p))
@@ -2762,7 +2768,7 @@ function runParameterSetUxStatic() {
     (draft.match(/inert: isInertBlockField\(block, keyPath\)/g) ?? []).length === 2
   const p35Ok = p35List && p35Excluded && p35Helper && p35Wired
   assert(
-    'P35 静态：无消费者字段表恰好 22 项（锁 12/供 3/采 1/求解 4/守门 2），且不含已消费/待激活字段',
+    'P35 静态：无消费者字段表恰好 12 项（锁 4/供 3/采 1/求解 4/守门 0），且不含已消费/待激活字段',
     p35Ok,
     p35Ok
       ? '清单精确匹配 + 两条渲染路径都带 inert'
@@ -2790,7 +2796,7 @@ function runParameterSetUxStatic() {
   const p38Import = /isFullyInertBlock/.test(page)
   const p38Ok = p38Block && p38Import
   assert(
-    'P38 静态：整块无效（锁定策略）在块标题上标一次（空块时用户看不到任何行）',
+    'P38 静态：整块无效的块在块标题上标一次（空块时用户看不到任何行；2026-11-07 锁块已部分生效 ⇒ 机制保留但当前不触发）',
     p38Ok,
     p38Ok ? '块级标注' : `块级标注${p38Block ? '有' : '缺'} / 引用${p38Import ? '有' : '缺'}`
   )
@@ -2798,8 +2804,10 @@ function runParameterSetUxStatic() {
   /* -------- P39 用户操作教学文档的「不生效」标注与代码真源一致（2026-10-28）--------
    * 起因：教学文档 v1.1 曾对 11 处无消费者字段照常讲「配了就生效」，与页面「暂未生效」标签矛盾
    *   ⇒ 用户照文档配了却不生效。10-28 已逐字段加「← 不生效」标记并补 §十一 统一清单。
-   * 判据：① §十一「不生效」列 = INERT_FIELD_PATHS 22 项（不多不少）
-   *      ② 正文中每条「← 不生效」标记只标一个字段，且该字段必在 20 项内
+   * 2026-11-07 后端接线后撤标 10 项 ⇒ 清单由 22 项收窄到 12 项，文档与页面同步收窄
+   *   （文档若仍说「锁定策略整块都不生效」，用户会以为 8 项 Trigger 白配了）。
+   * 判据：① §十一「不生效」列 = INERT_FIELD_PATHS 12 项（不多不少）
+   *      ② 正文中每条「← 不生效」标记只标一个字段，且该字段必在 12 项内
    *      ③ 已消费/待激活字段不得被标「不生效」（否则把真生效的说成死的） */
   const guideSrc = readFileSync(
     join(__dirname, '..', 'docs', 'APS排产系统_规则集与参数集维护_用户操作教学_v1.1_20261022.md'),
@@ -2828,7 +2836,7 @@ function runParameterSetUxStatic() {
     'P39 静态：用户操作教学文档的「不生效」字段清单/标注与代码真源 INERT_FIELD_PATHS 一致',
     p39Ok,
     p39Ok
-      ? `§十一 恰好 22 项 + 正文 ${markedLines.length} 处标记均命中清单`
+      ? `§十一 恰好 12 项 + 正文 ${markedLines.length} 处标记均命中清单`
       : `§十一 清单${p39Cover ? '对' : `不符（实际 ${guideListed.length} 项）`} / 正文标记${p39MarkedOk ? '合规' : `越界或漏标（${markedLines.filter((f) => !expectedInert.includes(f)).join(',') || '无越界字段'}）`}`
   )
 
@@ -2927,6 +2935,103 @@ function runParameterSetUxStatic() {
     p42Ok
       ? 'diffParameterBlocks → paramDiffRows → 页面表 已接通'
       : `diff 函数${p42HasDiffFn ? '有' : '缺'} / flatten 展开${p42UsesFlatten ? '是' : '否'} / store 调用${p42StoreCallsDiff ? '有' : '无'} / store 暴露${p42StoreExposes ? '有' : '无'} / 页面表${p42PageTable ? '有' : '无'} / 原值新值列${p42PageCols ? '有' : '无'}`
+  )
+
+  /* -------- P43 撤标守门：后端已接线的字段不得再标「暂未生效」（2026-11-07）--------
+   * 起因：后端把需求保护消费链接上了 —— `FrozenStrategySnapshotProvider.cs:177` 把**参数集版本内容**
+   *   `$.Lock` 反序列化成 `snapshot.Lock`，`PeggingOrchestrator.cs:13279` 取该块 →
+   *   `DemandProtectionTriggerEvaluator.cs:122-197` 逐项判定 → 产出 `ProtectionStatus`（:13344）
+   *   → 影响需求排序；候选守门两项也早在 R11（10-29）由 `PhaseFourLocalRepair.cs` 接线。
+   *   前端却仍按 10-26 旧口径给这 10 项挂「暂未生效」⇒ **页面对着真生效的字段说「配了没用」**。
+   *
+   * 判据（三条独立，缺一即红）：
+   *   ① 10 项已接线字段**不得**出现在 INERT_FIELD_PATHS 里（撤标守门本体）
+   *   ② 后端接线证据仍在（快照取 `$.Lock` / 判定器读这 8 项 / 守门读那 2 项）
+   *   ③ 前端源码注释里记着接线出处（后人不得把这条依据悄悄删掉）
+   *
+   * - 反向破坏自证：把任一已接线字段塞回 INERT_FIELD_PATHS ⇒ P43 必转红
+   *   （见 scripts/selfverify-parameter-inert.mjs） */
+  const WIRED_FIELDS = [
+    'Trigger.UseRemainingTimeThreshold',
+    'Trigger.RemainingTimeThresholdHours',
+    'Trigger.ProtectDelayed',
+    'Trigger.ProtectVipTier',
+    'Trigger.VipTierValue',
+    'Trigger.ProtectedOrderTypes',
+    'Trigger.ProtectMaturityStatus',
+    'Trigger.MaturityStatusValues',
+    'ResourceTopN',
+    'WarnOnlyOnMaxImpacted'
+  ]
+  const p43NotLabeled = WIRED_FIELDS.every((p) => !inertPaths.includes(p))
+  const p43ReLabeled = WIRED_FIELDS.filter((p) => inertPaths.includes(p))
+
+  const readLps = (...parts) => {
+    try {
+      return readText(join(LPS_ROOT, ...parts))
+    } catch {
+      return ''
+    }
+  }
+  const lpsProvider = readLps(
+    'LPS.APS.Application',
+    'Services',
+    'FrozenStrategySnapshotProvider.cs'
+  )
+  const lpsEvaluator = readLps(
+    'LPS.APS.Application',
+    'Services',
+    'DemandProtectionTriggerEvaluator.cs'
+  )
+  const lpsPegging = readLps('LPS.APS.Application', 'Services', 'PeggingOrchestrator.cs')
+  const lpsPhase4 = readLps('LPS.APS.Scheduling', 'Solvers', 'PhaseFourLocalRepair.cs')
+
+  // ②a 快照里装的是**参数集版本内容**的 `$.Lock`（不是 DB 硬锁事实）
+  const p43SnapshotLock =
+    lpsProvider.length > 0 &&
+    /Lock\s*=\s*DeserializeParameterSetBlock<LockBlock>\(\s*parameterSetVersion\s*,\s*"Lock"/.test(
+      lpsProvider
+    )
+  // ②b 排产主链取该块并交给判定器
+  const p43PeggingTakesLock =
+    lpsPegging.length > 0 &&
+    /GetFrozenStrategySnapshotAsync\([\s\S]{0,160}\)\)\.Lock/.test(lpsPegging) &&
+    /DemandProtectionTriggerEvaluator\.Evaluate\(/.test(lpsPegging)
+  // ②c 判定器确实逐项读这 8 个触发条件
+  const p43EvaluatorReads =
+    lpsEvaluator.length > 0 &&
+    [
+      'UseRemainingTimeThreshold',
+      'RemainingTimeThresholdHours',
+      'ProtectDelayed',
+      'ProtectVipTier',
+      'VipTierValue',
+      'ProtectedOrderTypes',
+      'ProtectMaturityStatus',
+      'MaturityStatusValues'
+    ].every((f) => new RegExp(`trigger\\.${f}\\b`).test(lpsEvaluator))
+  // ②d 候选守门两项由 PhaseFourLocalRepair 消费
+  const p43GuardrailRead =
+    lpsPhase4.length > 0 &&
+    /CandidateGuardrail\.ResourceTopN/.test(lpsPhase4) &&
+    /CandidateGuardrail\.WarnOnlyOnMaxImpacted/.test(lpsPhase4)
+  // ③ 前端源码记着出处
+  const p43CommentKept =
+    /DemandProtectionTriggerEvaluator/.test(catalog) && /PhaseFourLocalRepair/.test(catalog)
+
+  const p43Ok =
+    p43NotLabeled &&
+    p43SnapshotLock &&
+    p43PeggingTakesLock &&
+    p43EvaluatorReads &&
+    p43GuardrailRead &&
+    p43CommentKept
+  assert(
+    'P43 静态：后端已接线的 10 项字段不得标「暂未生效」，且接线证据仍在（撤销 11-07 前的错标）',
+    p43Ok,
+    p43Ok
+      ? '10 项均已撤标 + 后端接线证据齐全'
+      : `撤标${p43NotLabeled ? '干净' : `被重新标上（${p43ReLabeled.join(',')}）`} / 快照装参数集$.Lock${p43SnapshotLock ? '有' : '缺'} / 主链取块并判定${p43PeggingTakesLock ? '有' : '缺'} / 判定器读 8 触发条件${p43EvaluatorReads ? '有' : '缺'} / 守门读 2 项${p43GuardrailRead ? '有' : '缺'} / 前端记出处${p43CommentKept ? '有' : '缺'}`
   )
 }
 
@@ -15961,10 +16066,10 @@ function verifyRulesSplit() {
   const editorOpVals = arrayValues('EDITOR_CONDITION_OPERATORS')
   const sameEditorSeq = (a, b) => JSON.stringify(a) === JSON.stringify(b)
 
-  assert('R27 静态：编辑器字段白名单 = 发布白名单内运行侧已接线的 13 个；不含 0/4/5（执行器无实现）与 12（需求成熟度口径待确认）',
-    sameEditorSeq(editorFieldVals, [1, 2, 3, 6, 7, 8, 9, 10, 11, 13, 14, 15, 16]) &&
-      ![0, 4, 5, 12].some((v) => editorFieldVals.includes(v)),
-    `实际=${JSON.stringify(editorFieldVals)}（0/4/5/12 选了必然发布失败或口径未定）`)
+  assert('R27 静态：编辑器字段白名单 = 发布白名单内运行侧已接线的 12 个；不含 0/4/5（执行器无实现）与 1（延期状态）/12（需求成熟度）（0号位 2026-11-07 裁决归参数集）',
+    sameEditorSeq(editorFieldVals, [2, 3, 6, 7, 8, 9, 10, 11, 13, 14, 15, 16]) &&
+      ![0, 1, 4, 5, 12].some((v) => editorFieldVals.includes(v)),
+    `实际=${JSON.stringify(editorFieldVals)}（0/1/4/5/12 选了必然发布失败或口径归参数集）`)
 
   assert('R28 静态：编辑器操作符白名单 = 执行器支持的 7 个（含 Contains/7），且不含 NotEquals(1)',
     sameEditorSeq(editorOpVals, [0, 6, 7, 2, 3, 4, 5]) && !editorOpVals.includes(1),
@@ -16383,7 +16488,10 @@ function verifyRulesSplit() {
       ? psegSrcRP19.slice(sugStartRP19, sugEndRP19)
       : ''
   const rp19 =
-    /1:\s*\[[\s\S]{0,200}?'ON_TIME'[\s\S]{0,200}?'FIRST_DELAY'[\s\S]{0,200}?'REPEATED_DELAY'/.test(sug19) &&
+    // 2026-11-07：延期状态(1) 归参数集、字段撤除 ⇒ 其候选值（ON_TIME 等）必须一并消失
+    !/'ON_TIME'/.test(sug19) &&
+    !/'FIRST_DELAY'/.test(sug19) &&
+    !/'REPEATED_DELAY'/.test(sug19) &&
     /2:\s*\[[\s\S]{0,200}?'VIP'[\s\S]{0,200}?'GENERAL'/.test(sug19) &&
     !/'KEY_ACCOUNT'/.test(sug19) &&
     !/'STANDARD'/.test(sug19) &&
@@ -16399,9 +16507,9 @@ function verifyRulesSplit() {
     /:label="v\.label"/.test(psegViewRP19) &&
     /no-data-text="没有预设值，直接输入后回车"/.test(psegViewRP19)
   assert(
-    'RP19 静态：段位文本字段候选值取自后端值域（延期状态/客户等级/订单类型/客户区分/运输方式/销售类别/非在库出荷区分），旧错值绝迹且允许手填',
+    'RP19 静态：段位文本字段候选值取自后端值域（客户等级/订单类型/客户区分/运输方式/销售类别/非在库出荷区分），延期状态候选已随字段撤除，旧错值绝迹且允许手填',
     rp19,
-    `字典切片=${sug19.length}字符 客户等级收敛=${/2:\s*\[[\s\S]{0,200}?'VIP'[\s\S]{0,200}?'GENERAL'/.test(sug19) && !/'KEY_ACCOUNT'/.test(sug19)} 新值域=${[8, 10, 11, 14].every((f) => sug19.includes(`${f}: [`))} 旧值残留=${/'(Delayed|OnTrack)'/.test(sug19)} 渲染=${/:value="v\.value"/.test(psegViewRP19) && /:label="v\.label"/.test(psegViewRP19)} 手填提示=${/no-data-text="没有预设值，直接输入后回车"/.test(psegViewRP19)}`
+    `字典切片=${sug19.length}字符 延期状态候选残留=${/'(ON_TIME|FIRST_DELAY|REPEATED_DELAY)'/.test(sug19)} 客户等级收敛=${/2:\s*\[[\s\S]{0,200}?'VIP'[\s\S]{0,200}?'GENERAL'/.test(sug19) && !/'KEY_ACCOUNT'/.test(sug19)} 新值域=${[8, 10, 11, 14].every((f) => sug19.includes(`${f}: [`))} 旧值残留=${/'(Delayed|OnTrack)'/.test(sug19)} 渲染=${/:value="v\.value"/.test(psegViewRP19) && /:label="v\.label"/.test(psegViewRP19)} 手填提示=${/no-data-text="没有预设值，直接输入后回车"/.test(psegViewRP19)}`
   )
 
   /* RP20-RP23（2026-11-07）：3号位 需求优先级新增字段实施包 v1.0 §三 前端维护落地。
@@ -16417,9 +16525,9 @@ function verifyRulesSplit() {
       displaySrcRP20.includes("label: '包含（前缀匹配）'"),
     `字段=${JSON.stringify(displayFieldVals)} 算子=${JSON.stringify(displayOpVals)}`)
 
-  assert('RP21 静态：编辑器开放 13 个已接线字段（8/9/10/11/13/14/15/16），12 需求成熟度与 0/4/5 保持关闭',
-    sameEditorSeq(editorFieldVals, [1, 2, 3, 6, 7, 8, 9, 10, 11, 13, 14, 15, 16]) &&
-      ![0, 4, 5, 12].some((v) => editorFieldVals.includes(v)),
+  assert('RP21 静态：编辑器开放 12 个已接线字段（2/3/6/7/8/9/10/11/13/14/15/16），延期状态(1)/需求成熟度(12) 与 0/4/5 保持关闭',
+    sameEditorSeq(editorFieldVals, [2, 3, 6, 7, 8, 9, 10, 11, 13, 14, 15, 16]) &&
+      ![0, 1, 4, 5, 12].some((v) => editorFieldVals.includes(v)),
     `实际=${JSON.stringify(editorFieldVals)}`)
 
   const rp22 =
@@ -16427,15 +16535,36 @@ function verifyRulesSplit() {
     /{ value: 15, label: '物料编码', kind: 'TEXT', allowContains: true }/.test(editorSrc) &&
     /{ value: 13, label: '库存消耗日（天）', kind: 'NUMBER' }/.test(editorSrc) &&
     /{ value: 16, label: '数量', kind: 'NUMBER' }/.test(editorSrc) &&
-    /{ value: 9, label: '出荷指示入物流日', kind: 'DATE' }/.test(editorSrc) &&
     /def\.kind === 'DATE' \|\| def\.kind === 'NUMBER'/.test(editorSrc) &&
     /def\.allowContains/.test(editorSrc) &&
     /ElInputNumber/.test(psegViewRP19) &&
     /fieldKindOf\(c\.field\) === 'NUMBER'/.test(psegViewRP19) &&
     /c\.operator === 7 \? '前缀匹配，如 FINAL\*'/.test(psegViewRP19)
-  assert('RP22 静态：「包含」只给物料编码且写明前缀匹配；库存消耗日/数量用数字框、出荷指示入物流日用日期框',
+  assert('RP22 静态：「包含」只给物料编码且写明前缀匹配；库存消耗日/数量用数字框（出荷指示入物流日的双模式另见 RP24）',
     rp22,
     `allowContains=${(editorSrc.match(/allowContains:\s*true/g) || []).length} 数字框=${/ElInputNumber/.test(psegViewRP19)} 前缀提示=${/前缀匹配/.test(psegViewRP19)}`)
+
+  /* RP24（2026-11-07 3号位 Q4 回执）：出荷指示入物流日（9，后端 CUSTOMERDUEDATE）的范围条件，
+   *   值可写「相对冻结日整数天数」（后端投影层 `ConvertRelativeDateThreshold` 换算成 FrozenAt.Date + N），
+   *   也可继续写具体日期（原样比较）。编辑器必须双模式且整数/日期都能通过本地拦截。 */
+  const rp24 =
+    /{ value: 9, label: '出荷指示入物流日', kind: 'DATE', allowRelativeOffset: true }/.test(editorSrc) &&
+    /export function supportsRelativeOffset\(field: number, operator: number\): boolean/.test(editorSrc) &&
+    /isRelativeOffsetField\(field\) && \[2, 3, 4, 5\]\.includes\(operator\)/.test(editorSrc) &&
+    /export function isOffsetDaysText\(text: string\): boolean/.test(editorSrc) &&
+    editorSrc.includes('的比较值应为整数天数（如 20 = 冻结日 +20 天）或具体日期 YYYY-MM-DD') &&
+    /supportsRelativeOffset\(c\.field, c\.operator\)/.test(psegViewRP19) &&
+    /onConditionMode\(seg, ci, \$event\)/.test(psegViewRP19) &&
+    // 必须锁到控件本身：页脚提示里也有「按天数偏移」四个字，只搜文本会被提示顶住（自证实测假绿）
+    /<ElRadioButton value="offset">按天数偏移<\/ElRadioButton>/.test(psegViewRP19) &&
+    /<ElRadioButton value="date">具体日期<\/ElRadioButton>/.test(psegViewRP19) &&
+    /offsetValueOf\(c\.value\)/.test(psegViewRP19) &&
+    /距冻结日天数，如 20/.test(psegViewRP19) &&
+    /20 = 冻结日 \+20 天（可填负数）/.test(psegViewRP19) &&
+    /conditionMode\(c\) === 'offset'/.test(psegViewRP19)
+  assert('RP24 静态：出荷指示入物流日范围条件支持相对天数（整数偏移）+ 具体日期双模式，值域与后端投影换算口径一致',
+    rp24,
+    `字段标记=${/allowRelativeOffset: true/.test(editorSrc)} 算子限制=${/isRelativeOffsetField\(field\) && \[2, 3, 4, 5\]/.test(editorSrc)} 整数判据=${/isOffsetDaysText/.test(editorSrc)} 双模式=${/按天数偏移/.test(psegViewRP19) && /具体日期/.test(psegViewRP19)} 天数框=${/offsetValueOf\(c\.value\)/.test(psegViewRP19)} 提示=${/20 = 冻结日 \+20 天/.test(psegViewRP19)}`)
 
   const blockFieldsSrcRP23 = stripComments(readSrc('api/aps-v1/parameterBlockFields.ts'))
   const lockStartRP23 = blockFieldsSrcRP23.indexOf('const LOCK_FIELDS')
