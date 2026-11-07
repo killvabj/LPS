@@ -153,8 +153,8 @@ internal static class DemandPriorityProjector
         DemandField.OrderType => "ORDERTYPE",
         DemandField.DueDate => "DUEDATE",
         DemandField.IssueDate => "ISSUEDATE",
-        // 2026-11-06 V1.1（3号位 实施包 v1.0 §一.2）。**只映射执行器已接线的 7 个**；
-        //   StockConsumeDay / NonStockShipCategory 是页面维护字段、当前无载体 ⇒ 仍 fail-closed。
+        // 2026-11-06 V1.1（3号位 实施包 v1.0 §一.2）。当日只映射执行器已接线的 7 个；
+        //   StockConsumeDay 当时无载体 ⇒ fail-closed。**当晚载体（`IAD.AverageDailyConsumption`）落库，已补映射（见本 switch 末项）。**
         DemandField.CustomerSegment      => "CUSTOMERSEGMENT",
         DemandField.CustomerDueDate      => "CUSTOMERDUEDATE",
         DemandField.TransportMode        => "TRANSPORTMODE",
@@ -163,6 +163,9 @@ internal static class DemandPriorityProjector
         DemandField.NonStockShipCategory  => "NONSTOCKSHIPCATEGORY",
         DemandField.MaterialCode         => "MATERIALCODE",
         DemandField.Quantity             => "QUANTITY",
+        // 2026-11-06 晚：库存消耗日载体已落库（`InventoryAvailableSupplyDetail.AverageDailyConsumption`），
+        //   执行器 `KnownFields` 已接线 ⇒ 解除 fail-closed。
+        DemandField.StockConsumeDay      => "STOCKCONSUMEDAY",
         // RemainingTimeHours / IsPmcProtected / PriorityLevel：快照枚举里有，但执行器白名单无对应字段。
         // 不猜配（例如把 IsPmcProtected 猜成 PROTECTIONSTATUS）——静默错排比报错危险得多。
         _ => throw new NotSupportedException(

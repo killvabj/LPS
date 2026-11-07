@@ -32,11 +32,15 @@ public sealed class DemandPriorityExecutor : IDemandPriorityExecutor
     {
         "ORDERTYPE", "DELAYSTATUS", "CUSTOMERTIER", "DUEDATE",
         "ISSUEDATE", "PROTECTIONSTATUS", "DEMANDKEY",
-        // 2026-11-06 V1.1 新增（3号位 实施包 v1.0 §四.1）。**只接订单源确有值的 7 个**：
-        //   `STOCKCONSUMEDAY`（库存消耗日）/`NONSTOCKSHIPCATEGORY`（非在库出荷区分）是页面维护字段、
-        //   当前无存储载体 ⇒ 未接入。接了只会拿到 null，正是实施包 §五 点名的「配置了也空转」。
+        // 2026-11-06 V1.1 新增（3号位 实施包 v1.0 §四.1）。当日先接**订单源确有值的 8 个**；
+        //   `STOCKCONSUMEDAY`（库存消耗日）当时无存储载体（`IAD.AverageDailyConsumption` 尚未落库），
+        //   接了只会拿到 null＝实施包 §五 点名的「配置了也空转」，故当日未接，当晚载体落库后补齐（见本集合末项）。
         "CUSTOMERSEGMENT", "CUSTOMERDUEDATE", "TRANSPORTMODE", "SALESORDERCATEGORY",
-        "DEMANDMATURITYSTATUS", "NONSTOCKSHIPCATEGORY", "MATERIALCODE", "QUANTITY"
+        "DEMANDMATURITYSTATUS", "NONSTOCKSHIPCATEGORY", "MATERIALCODE", "QUANTITY",
+        // 2026-11-06 晚：`STOCKCONSUMEDAY`（库存消耗日）接线完成（`IAD.AverageDailyConsumption` 已落库）。
+        //   语义＝原值小数天、**越小越紧急**；无可信日均时为 null ⇒ 排序置末（`decimal.MaxValue`），
+        //   不按 0 处理（0 是 `ZERO_STOCK`，真·最紧急，两者不能混）。依据 3号位 回执 §二-3。
+        "STOCKCONSUMEDAY"
     };
 
     private readonly ILogger<DemandPriorityExecutor> _logger;
@@ -332,6 +336,8 @@ public sealed class DemandPriorityExecutor : IDemandPriorityExecutor
             "NONSTOCKSHIPCATEGORY" => demand.NonStockShipmentType ?? string.Empty,
             "MATERIALCODE"         => demand.MaterialCode ?? string.Empty,
             "QUANTITY"             => demand.Quantity?.ToString(CultureInfo.InvariantCulture) ?? string.Empty,
+            // 2026-11-06：原值小数，InvariantCulture 保证不因区域设置把 "." 变成 ","
+            "STOCKCONSUMEDAY"      => demand.StockConsumeDay?.ToString(CultureInfo.InvariantCulture) ?? string.Empty,
             "DEMANDKEY" => demand.DemandKey,
             _ => throw UnknownFieldError(fieldName)
         };
@@ -354,6 +360,8 @@ public sealed class DemandPriorityExecutor : IDemandPriorityExecutor
             // 2026-11-06 V1.1 新增（3号位 实施包 v1.0 §四.1）
             "CUSTOMERDUEDATE"      => demand.CustomerDueDate ?? DateTime.MaxValue,
             "QUANTITY"             => demand.Quantity ?? decimal.MaxValue,
+            // null（无可信日均）置末；0（ZERO_STOCK）排最前 —— 两者语义不同，不能塌成一个
+            "STOCKCONSUMEDAY"      => demand.StockConsumeDay ?? decimal.MaxValue,
             "CUSTOMERSEGMENT"      => demand.CustomerSegment ?? string.Empty,
             "TRANSPORTMODE"        => demand.TransportMode ?? string.Empty,
             "SALESORDERCATEGORY"   => demand.SalesOrderCategory ?? string.Empty,

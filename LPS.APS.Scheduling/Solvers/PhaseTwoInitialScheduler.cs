@@ -2902,10 +2902,20 @@ internal class PhaseTwoInitialScheduler
             // 第5轮Merge修复：Merge成功时返回空List，但Demand已进入TaskShare，不应标记为Unscheduled
             if (batchTasks.Count == 0)
             {
-                // 检查该Demand是否已通过Merge进入TaskShare
-                bool isMerged = allocationTaskShare.Values.Any(shares =>
-                    shares.Any(s => s.DemandKey == actualDemand.DemandKey
-                                    || s.DemandKey == actualDemand.LogicalDemandKey));
+                // ── C2（0号位 2026-11-06《bc1e80c BATCH02裁定与Phase2精准整改指令》§3 C2）──
+                //   **按本批实际落定判成功，不得用「历史份额表里存在同一 Demand」冒充**。
+                //   旧写法 `allocationTaskShare.Values.Any(...)` 扫的是**整张历史份额表**：
+                //     更早的批（甚至别的执行批）留下的同一 `DemandKey` 份额，会把**本批失败**
+                //     误判成「Merge 成功」⇒ 本批既不产出 Task、也不登记失败 ⇒ 静默丢量。
+                //   新判据（两条都要满足）：
+                //     ① 内层试排确实产生了 Merge 目标 Task（`winnerState.MergedTask != null`）；
+                //     ② **该目标 Task 的份额表里确实登记了本需求**（本批写进去的那条）。
+                //   任一不满足 ⇒ 判本批失败并记 `failedBatchIndex`，由既有失败出口如实登记未排净量。
+                var mergedTarget = winnerState.MergedTask;
+                bool isMerged = mergedTarget is not null
+                    && allocationTaskShare.TryGetValue(mergedTarget.FinalDraftId, out var mergedShares)
+                    && mergedShares.Any(s => s.DemandKey == actualDemand.DemandKey
+                                          || s.DemandKey == actualDemand.LogicalDemandKey);
 
                 if (!isMerged)
                 {
@@ -2915,10 +2925,17 @@ internal class PhaseTwoInitialScheduler
                 }
 
                 // 2026-10-28：记下被合并后的目标 Task（含其所属需求）—— 外层据此回写**双方**完成时间。
-                var mergedTarget = winnerState.MergedTask;
-                if (mergedTarget is not null)
+                mergedTargets.Add((mergedTarget!.SourceDraftId, mergedTarget.PlannedStartTime, mergedTarget.PlannedEndTime));
+
+                // ── C3（0号位 §3 C3）：**合并落定的批也要计入本方案完工时刻** ──
+                //   旧实现只在 `batchTasks.Count > 0` 时更新 `planCompletion` ⇒ 纯合并方案（全部批都靠合并落定）
+                //   `planCompletion` 停在 `DateTime.MinValue`，却照样参加 `CompareBatchPlans` 的交期比较
+                //   ⇒ 「没排」被当成「排得最早」，必然胜出。
+                //   修法：合并落定批以**目标 Task 的真实结束时刻**计入（与内层 Routing 试排对
+                //   `mergedIntoTask` 用合并后 End 的既有纪律一致，不做二次累计）。
+                if (mergedTarget.PlannedEndTime > planCompletion)
                 {
-                    mergedTargets.Add((mergedTarget.SourceDraftId, mergedTarget.PlannedStartTime, mergedTarget.PlannedEndTime));
+                    planCompletion = mergedTarget.PlannedEndTime;
                 }
 
                 // Merge 成功：本批无新 Task（份额已并入既有 Task），继续下一批。
@@ -6902,6 +6919,14 @@ internal class PhaseTwoInitialScheduler
         //   `policy.MaxOptimizationSplitCount` / `policy.MaxBatchCandidates` 自 v5.1.10 收口①（2026-10-09 生效）
         //   起投影恒 null 且**主链不得消费**（B-007）。
         var solverBudget = budget ?? SolverBatchBudget.VersionedSafeDefault;
+
+        // ── 预算名额不得被**基线自己**占掉（2026-11-07 实测修正）──
+        //   基线（`baselineCount`）已经作为 `list[0]` 恒存在、循环里还会 `continue` 跳过，
+        //   若它继续留在 `counts` 里参与预算截断，就等于**白吃一个优化名额**。
+        //   开关关闭时碰巧无害（基线恰是最靠近经济参考的那个）；开关打开后
+        //   `{1,3,4,6}` 取前 3 个 ⇒ 把「Preferred 附近」的 6 挤掉 ⇒ 经济软层根本没机会比较
+        //   （实测：`BP_R2a` 由 6 批胜出变成 4 批胜出）。⇒ 截断前先剔除基线。
+        counts.Remove(baselineCount);
 
         // ── BATCH-02.2：预算限制的是**比较工作量**，不是物理批数 ──
         //   旧写法：全部候选按「离 nMin 越近越优先」排序后截断 ⇒ `economicReferenceCount` 很大时

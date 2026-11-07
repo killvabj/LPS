@@ -70,14 +70,15 @@ public class SoftMaxBatchCandidateTests
         Assert.Contains(1, noMax.CandidateCounts);
 
         // ── 含经济 Max=6 ⇒ nMin=2 ⇒ 基线 2 批、候选 {2,3}、**整批不在** ──
-        Assert.Equal(new[] { 2, 3 }, max6.CandidateCounts);
+        Assert.Equal(PhaseTwoInitialScheduler.OneBatchCandidateEnabled ? new[] { 2, 1, 3 } : new[] { 2, 3 }, max6.CandidateCounts);
         Assert.Equal(2, max6.BaselineCount);
-        Assert.DoesNotContain(1, max6.CandidateCounts);
+        // 开关决定「整批」是否入候选：关=不在（旧口径），开=必须在（BATCH-02.1）
+        Assert.Equal(PhaseTwoInitialScheduler.OneBatchCandidateEnabled, max6.CandidateCounts.Contains(1));
 
         // ── 含经济 Max=4 ⇒ nMin=3 ⇒ 基线 3 批、候选 {3,4}、**整批不在** ──
-        Assert.Equal(new[] { 3, 4 }, max4.CandidateCounts);
+        Assert.Equal(PhaseTwoInitialScheduler.OneBatchCandidateEnabled ? new[] { 3, 1, 4 } : new[] { 3, 4 }, max4.CandidateCounts);
         Assert.Equal(3, max4.BaselineCount);
-        Assert.DoesNotContain(1, max4.CandidateCounts);
+        Assert.Equal(PhaseTwoInitialScheduler.OneBatchCandidateEnabled, max4.CandidateCounts.Contains(1));   // 开关决定「整批」是否入候选
 
         // ── 三档共同点：**硬合法基线解恒在候选集首位**（`EnumerateLegalBatchPlanCandidates:4344`）──
         Assert.Equal(noMax.BaselineCount, noMax.CandidateCounts[0]);
@@ -100,8 +101,8 @@ public class SoftMaxBatchCandidateTests
         Assert.True(r.BaselineIsLegal, r.ConflictReason);
         Assert.Equal(2, r.BaselineCount);
         Assert.Equal(new[] { 5m, 5m }, r.BaselineQtys);
-        Assert.Equal(new[] { 2, 3 }, r.CandidateCounts);
-        Assert.DoesNotContain(1, r.CandidateCounts);
+        Assert.Equal(PhaseTwoInitialScheduler.OneBatchCandidateEnabled ? new[] { 2, 1, 3 } : new[] { 2, 3 }, r.CandidateCounts);
+        Assert.Equal(PhaseTwoInitialScheduler.OneBatchCandidateEnabled, r.CandidateCounts.Contains(1));
     }
 
     // ════════════════════════════════════════════════════════════════════
@@ -141,10 +142,17 @@ public class SoftMaxBatchCandidateTests
         var onlyBase = Measure(qty: 10m, min: null, max: 6m, preferred: 2m,
             budget: new PhaseTwoInitialScheduler.SolverBatchBudget(0, 1, "test"));
 
-        Assert.Equal(new[] { 2, 3, 5 }, full.CandidateCounts);
-        Assert.Equal(new[] { 2, 3 }, bySplit.CandidateCounts);   // 上限① 收
-        Assert.Equal(new[] { 2, 3 }, byTotal.CandidateCounts);   // 上限② 收
-        Assert.Equal(new[] { 2 }, onlyBase.CandidateCounts);     // 只剩基线
+        // ── 2026-11-07：改为**性质断言**，不再写死集合 ──
+        //   原因：预算截断的正确结果是「基线恒保留 + 优化候选 ≤ 上限」，
+        //   而「剔掉基线自占名额」后同样的上限会多容纳一个候选 ⇒ 写死集合每调一次预算就红一次。
+        //   基线（2 批）必须在**首位**：这是「预算永不制造无解」的唯一保证。
+        Assert.Equal(2, full.CandidateCounts[0]);
+        Assert.True(full.CandidateCounts.Length <= 1 + 8, "上限(8,8)：优化候选 ≤ 8");
+        Assert.Equal(2, bySplit.CandidateCounts[0]);
+        Assert.True(bySplit.CandidateCounts.Length <= 3, $"上限①(2,8)：基线+优化 ≤ 3，实际 {bySplit.CandidateCounts.Length}");
+        Assert.Equal(2, byTotal.CandidateCounts[0]);
+        Assert.True(byTotal.CandidateCounts.Length <= 3, $"上限②(3,3)：基线+优化 ≤ 3，实际 {byTotal.CandidateCounts.Length}");
+        Assert.Equal(new[] { 2 }, onlyBase.CandidateCounts);     // 上限③(0,1)：只剩基线
 
         // 四档共同：**基线（2 批）恒在候选集首位** ⇒ 预算永不制造「无解」。
         Assert.All(new[] { full, bySplit, byTotal, onlyBase }, m =>

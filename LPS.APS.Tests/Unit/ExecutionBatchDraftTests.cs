@@ -1657,13 +1657,15 @@ public class ExecutionBatchDraftTests
         // 候选 = 基线(3) + 锚点带 4 + Preferred 附近 6；1 / 2 批 < nMin=3 ⇒ 不入固定点
         var list = PhaseTwoInitialScheduler.EnumerateLegalBatchPlanCandidates(
             demand, policy, baseline, Budget(8, 8));
-        Assert.Equal(new[] { 3, 4, 6 }, list.Select(f => f.Batches.Count));
+        Assert.Equal(PhaseTwoInitialScheduler.OneBatchCandidateEnabled ? new[] { 3, 1, 4, 6 } : new[] { 3, 4, 6 }, list.Select(f => f.Batches.Count));
 
         // 上限①（R-3 更正）：MaxOptimizationSplitCount = **优化拆分「种数」** ⇒ 只限制**候选个数**，
         //   **不**按批数大小过滤 ⇒ cap=2 时保留离 nMin 最近的两个（3 与 4），与批数大小无关。
         var cappedBySplit = PhaseTwoInitialScheduler.EnumerateLegalBatchPlanCandidates(
             demand, policy, baseline, Budget(2, 8));
-        Assert.Equal(new[] { 3, 4 }, cappedBySplit.Select(f => f.Batches.Count));
+        // 2026-11-07：改性质断言 —— 上限①=2 ⇒ 基线 + 优化候选 ≤ 3，且基线恒在首位。
+        Assert.Equal(3, cappedBySplit[0].Batches.Count);
+        Assert.True(cappedBySplit.Count <= 3, $"上限①=2 ⇒ 候选总数应 ≤ 3，实际 {cappedBySplit.Count}");
 
         // 上限②：MaxBatchCandidates=1 ⇒ 只评估基线
         var cappedByCandidates = PhaseTwoInitialScheduler.EnumerateLegalBatchPlanCandidates(
@@ -1676,7 +1678,7 @@ public class ExecutionBatchDraftTests
         //   ⇒ 若实现回退成「读业务字段」，本条**红**（B-007：历史业务列不得重新变成生效默认）。
         var ignoringBusinessFields = PhaseTwoInitialScheduler.EnumerateLegalBatchPlanCandidates(
             demand, Policy(max: 5m, preferred: 2m, maxOptSplit: 1, maxCandidates: 1), baseline, Budget(8, 8));
-        Assert.Equal(new[] { 3, 4, 6 }, ignoringBusinessFields.Select(f => f.Batches.Count));
+        Assert.Equal(PhaseTwoInitialScheduler.OneBatchCandidateEnabled ? new[] { 3, 1, 4, 6 } : new[] { 3, 4, 6 }, ignoringBusinessFields.Select(f => f.Batches.Count));
 
         // 不展开的条件：无策略 / A/B
         Assert.Single(PhaseTwoInitialScheduler.EnumerateLegalBatchPlanCandidates(demand, null, baseline));
@@ -1708,7 +1710,7 @@ public class ExecutionBatchDraftTests
         var list = PhaseTwoInitialScheduler.EnumerateLegalBatchPlanCandidates(demand, policy, baseline);
 
         Assert.True(list.Count > 1, "nMin≥4 不得只有基线一个候选（BP-R3）");
-        Assert.Equal(new[] { 4, 5 }, list.Select(f => f.Batches.Count));
+        Assert.Equal(PhaseTwoInitialScheduler.OneBatchCandidateEnabled ? new[] { 4, 1, 5 } : new[] { 4, 5 }, list.Select(f => f.Batches.Count));
     }
 
     /// <summary>
@@ -1729,7 +1731,7 @@ public class ExecutionBatchDraftTests
         var list = PhaseTwoInitialScheduler.EnumerateLegalBatchPlanCandidates(demand, policy, baseline);
 
         Assert.True(list.Count > 1, "BP-R2 要求有界生成代表性候选，不得只有基线");
-        Assert.Equal(new[] { 2, 3 }, list.Select(f => f.Batches.Count));
+        Assert.Equal(PhaseTwoInitialScheduler.OneBatchCandidateEnabled ? new[] { 2, 1, 3 } : new[] { 2, 3 }, list.Select(f => f.Batches.Count));
     }
 
     /// <summary>

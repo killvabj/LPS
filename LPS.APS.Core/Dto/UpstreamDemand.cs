@@ -62,6 +62,20 @@ public sealed class UpstreamDemand
     public decimal? Quantity { get; init; }
 
     /// <summary>
+    /// 库存消耗日（CoverageDays，单位「天」，小数）。**数值越小越紧急**。
+    /// <para>口径（0号位 2026-11-06 补充裁决 ＋ 用户定盘）：</para>
+    /// <para>· 仓库范围 **ZP / AC / M**（AC 必须纳入）；</para>
+    /// <para>· `CoverageDays = 三类仓内该物料的合资格实物库存 ÷ 该物料的日均消耗`；</para>
+    /// <para>· 库存与日均**均按 `(厂,仓,料)` 去重后再求和**——同一三键在
+    ///   `InventoryAvailableSupplyDetail` 里会因多条可用性规则各生成一行（实测 4 行、Quantity 完全相同），
+    ///   按明细行直接求和会成倍放大；</para>
+    /// <para>· `null` = **无可信日均**（ODS 无该料行，或明确日均 = 0）⇒ 排序时必须置末，
+    ///   **不得按 0 处理**（否则把「无法判定」排成最紧急）；</para>
+    /// <para>· `0` = **日均 &gt; 0 但库存为 0**（`ZERO_STOCK`）⇒ 真·最紧急。</para>
+    /// </summary>
+    public decimal? StockConsumeDay { get; init; }
+
+    /// <summary>
     /// 订单规范 Id（EXPEDITE 前置竞争层身份键 = ScopeJsonV2.OrderTargets.OrderCanonicalId，S5/PM 0923）。
     /// 普通 FULL 排程可空；EXPEDITE 触发时用于识别「提前」需求。
     /// </summary>

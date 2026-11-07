@@ -9755,6 +9755,14 @@ public class PeggingOrchestrator : IPeggingOrchestrator
 
     private sealed class FamilyCodeRow { public int Id { get; set; } public string Code { get; set; } = string.Empty; }
     private sealed class DeptCodeRow { public int Id { get; set; } public string? SourceDeptCode { get; set; } }
+    /// <summary>库存消耗日聚合行（2026-11-06）：物料级库存与日均。</summary>
+    private sealed class StockCoverageRow
+    {
+        public string MaterialCode { get; set; } = string.Empty;
+        public decimal StockQty { get; set; }
+        public decimal AdcSum { get; set; }
+        public int AdcRows { get; set; }
+    }
     /// <summary>`ProductionDepartment.Id → DeptCode`（2026-11-06，`TaskDispatch.ProductionDepartmentCode` 用）。</summary>
     private sealed class DeptIdCodeRow { public int Id { get; set; } public string? DeptCode { get; set; } }
     /// <summary>PI → 数量（2026-11-06，C 桶自由量计算用）。</summary>
@@ -12344,6 +12352,93 @@ public class PeggingOrchestrator : IPeggingOrchestrator
     }
 
     // ─────────────────────────────────────────────────────────────────────────
+    // 库存消耗日（CoverageDays，2026-11-06 新增）
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// 按物料计算「库存消耗日」（CoverageDays，单位天，小数；**数值越小越紧急**）。
+    ///
+    /// <para><b>口径</b>（0号位 2026-11-06 补充裁决 ＋ 用户定盘）：</para>
+    /// <list type="number">
+    ///   <item>仓库范围 **ZP / AC / M** 三类（AC 必须纳入；其它仓属性不参与）；</item>
+    ///   <item>库存 = 该物料在三类仓内的合资格实物库存；日均 = 该物料在三类仓内的日均消耗；</item>
+    ///   <item><b>两个量都必须先按 `(厂,仓,料)` 去重再求和</b>。原因：同一三键在
+    ///     `InventoryAvailableSupplyDetail` 里会因多条可用性规则各生成一行——实测
+    ///     `3|990101|RAW-00-96001597` 有 **4 行、Quantity 完全相同（33,881）**，
+    ///     按明细行直接 SUM 会把它放大 4 倍；日均同理（回填时同三键的每一行都赋了同一个值）。</item>
+    ///   <item>`CoverageDays = 库存 ÷ 日均`。</item>
+    /// </list>
+    ///
+    /// <para><b>返回值语义</b>：</para>
+    /// <list type="bullet">
+    ///   <item>`null` = **无可信日均**（ODS 无该料行，或日均 = 0）⇒ 排序置末，**不得按 0 处理**
+    ///     （0 是 `ZERO_STOCK`，真·最紧急，两者必须分开——3号位 回执 §二-3）；</item>
+    ///   <item>`0` = 日均 &gt; 0 但库存为 0（`ZERO_STOCK`）；</item>
+    ///   <item>`&gt;0` = 正常覆盖天数，**不做上界截断**（0号位 §四-2）。</item>
+    /// </list>
+    /// </summary>
+    private async Task<Dictionary<string, decimal?>> LoadStockConsumeDayByMaterialAsync(
+        IReadOnlyCollection<string> materialCodes,
+        CancellationToken ct)
+    {
+        var result = new Dictionary<string, decimal?>(StringComparer.Ordinal);
+        var codes = materialCodes.Where(c => !string.IsNullOrWhiteSpace(c)).Distinct(StringComparer.Ordinal).ToList();
+        if (codes.Count == 0) return result;
+
+        var rows = await QueryChunkedInAsync(codes, chunk =>
+            _connectionManager.QueryAsync<StockCoverageRow>(
+                @"WITH cons AS (
+                      -- 日均：**以 ODS 消耗为主体**（不能以库存表为主体——库存为 0 的物料在
+                      --   `InventoryAvailableSupplyDetail` 里根本没有行，会被误判成「无消耗」，
+                      --   而它其实是 ZERO_STOCK，最紧急的那一类）。
+                      --   按 (厂,仓,料) 去重后求和：AC/ZP/M 三类仓。
+                      SELECT o.MaterialCode, o.FactoryCode, o.WarehouseCode,
+                             MAX(CAST(o.TotalConsumptionQty AS DECIMAL(18,6)) / NULLIF(o.LookbackDays, 0)) AS Adc
+                      FROM   ext_ODS_InventoryConsumptionSummary_View o
+                      INNER JOIN ext_MES_ProcessCode_View pc
+                              ON  pc.ProcessCode = RIGHT('000000' + o.WarehouseCode, 6)
+                              AND pc.ERPProperty IN (N'ZP', N'AC', N'M')
+                      WHERE  o.MaterialCode IN @Codes
+                      GROUP BY o.MaterialCode, o.FactoryCode, o.WarehouseCode
+                  ),
+                  stk AS (
+                      -- 库存：三类仓内按 (厂,仓,料) 去重后求和（同三键会因多条可用性规则重复，
+                      --   实测 `3|990101|RAW-00-96001597` 有 4 行、Quantity 完全相同）
+                      SELECT d.MaterialCode, d.FactoryId, d.StorageCode,
+                             MAX(d.Quantity) AS Qty
+                      FROM   InventoryAvailableSupplyDetail d
+                      INNER JOIN ext_MES_ProcessCode_View pc
+                              ON  pc.ProcessCode = RIGHT('000000' + d.StorageCode, 6)
+                              AND pc.ERPProperty IN (N'ZP', N'AC', N'M')
+                      WHERE  d.MaterialCode IN @Codes
+                      GROUP BY d.MaterialCode, d.FactoryId, d.StorageCode
+                  )
+                  SELECT c.MaterialCode                       AS MaterialCode,
+                         SUM(c.Adc)                           AS AdcSum,
+                         COUNT(*)                             AS AdcRows,
+                         ISNULL((SELECT SUM(s.Qty) FROM stk s WHERE s.MaterialCode = c.MaterialCode), 0) AS StockQty
+                  FROM   cons c
+                  GROUP BY c.MaterialCode",
+                new { Codes = chunk },
+                db: DatabaseId.APS));
+
+        foreach (var r in rows)
+        {
+            // 无可信日均（ODS 无行 或 日均=0）⇒ null，排序置末；不得伪造 0
+            if (r.AdcRows == 0 || r.AdcSum <= 0m)
+            {
+                result[r.MaterialCode] = null;
+                continue;
+            }
+
+            // 有日均但三类仓内无库存 ⇒ ZERO_STOCK，CoverageDays = 0（最紧急）
+            result[r.MaterialCode] = r.StockQty <= 0m ? 0m : r.StockQty / r.AdcSum;
+        }
+
+        return result;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
     // PeggingLoop 主逻辑
     // ─────────────────────────────────────────────────────────────────────────
 
@@ -12997,6 +13092,10 @@ public class PeggingOrchestrator : IPeggingOrchestrator
         //   ① EXPEDITE 只在本轮内前置 —— 只喂给第 1 轮，不带进后续轮（否则插单会跨轮置顶）；
         //   ② 某轮无匹配段 ⇒ 执行器自带「DemandKey ASC 兜底 + WARNING」，不并入前一轮；
         //   ③ 供给池是一个共用池，按轮顺序消耗（池在 BuildSolveRequestAsync 装载一次，这里不碰）。
+        // 2026-11-06：库存消耗日（CoverageDays）按物料一次装载，供 DemPriority 的 STOCKCONSUMEDAY 字段使用。
+        var stockConsumeDayByMaterial = await LoadStockConsumeDayByMaterialAsync(
+            orders.Select(o => o.MaterialCode).Distinct(StringComparer.Ordinal).ToList(), ct);
+
         var rounds = orders
             .Select(o => o.CompetitionRound)
             .Distinct()
@@ -13034,6 +13133,8 @@ public class PeggingOrchestrator : IPeggingOrchestrator
                 NonStockShipmentType = o.NonStockShipmentType,
                 MaterialCode         = o.MaterialCode,
                 Quantity             = o.OrderQuantity,
+                // 库存消耗日（天，小数，越小越紧急）；null = 无可信日均 ⇒ 排序置末
+                StockConsumeDay      = stockConsumeDayByMaterial.TryGetValue(o.MaterialCode, out var scd) ? scd : null,
                 DelayStatus  = o.DelayStatus,   // 01 v1.13 :536 / Pegging v1.6 :257 需求排序可用条件
                 // ProtectionStatus：全库无该列（sys.columns 查无），保持 null（不造假）。
                 SourceDemand = o
