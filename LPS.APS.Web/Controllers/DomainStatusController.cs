@@ -1,3 +1,4 @@
+using System.Security.Claims;
 using Microsoft.AspNetCore.Authorization;
 using LPS.APS.Core.Authorization;
 using LPS.APS.Core.DTOs.Governance;
@@ -26,15 +27,22 @@ namespace LPS.APS.Web.Controllers;
 public class DomainStatusController : ControllerBase
 {
     private readonly IRunLifecycleService _runLifecycleService;
+    private readonly IDataScopeService _dataScopeService;
     private readonly ILogger<DomainStatusController> _logger;
 
     public DomainStatusController(
         IRunLifecycleService runLifecycleService,
+        IDataScopeService dataScopeService,
         ILogger<DomainStatusController> logger)
     {
         _runLifecycleService = runLifecycleService ?? throw new ArgumentNullException(nameof(runLifecycleService));
+        _dataScopeService = dataScopeService ?? throw new ArgumentNullException(nameof(dataScopeService));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
     }
+
+    /// <summary>解析当前登录用户 Id（无效返回 0 → 范围解析为拒绝全部，安全默认）</summary>
+    private int GetCurrentUserId()
+        => int.TryParse(User.FindFirst(ClaimTypes.NameIdentifier)?.Value, out var id) ? id : 0;
 
     /// <summary>
     /// 查询排程域状态（G8）
@@ -45,6 +53,11 @@ public class DomainStatusController : ControllerBase
     ///     · Run 不存在 / ExpectedDomainKeysJson 缺失或损坏（InvalidOperationException）→ 404
     ///     · 其他异常 → 500
     ///     · 正常空域状态（合法 ExpectedDomainKeys 但计划域当前无记录）→ 200 + []
+    ///
+    /// 【数据范围过滤 2026-11-07（4号位 越权缺陷函，口径=甲方 A 案）】
+    ///   原实现不调用 IDataScopeService ⇒ 未授权用户可见整批 Run 的全部域状态。
+    ///   现按 Domain 维度逐条 Allows 过滤：Global 全放行；有范围集合按集；**无 Domain 维度授权 ⇒ 全部滤除（fail-closed）**。
+    ///   过滤后为空 = 200 + []（与 order-query/schedule 同口径：空集合不区分"无权"与"确无"，均不泄露存在性）。
     /// </summary>
     /// <param name="scheduleRunId">排程运行ID</param>
     /// <param name="cancellationToken">取消令牌</param>
@@ -56,7 +69,12 @@ public class DomainStatusController : ControllerBase
         try
         {
             var result = await _runLifecycleService.GetRunDomainStatusAsync(scheduleRunId, cancellationToken);
-            return Ok(ApiResponse<IReadOnlyList<RunDomainStatusDto>>.Success(result));
+
+            // 11-07：按数据范围（Domain 维度）过滤；Global/集合/未授权三维度由 Allows 统一判定，未授权 fail-closed
+            var scope = await _dataScopeService.ResolveScopeAsync(GetCurrentUserId(), cancellationToken);
+            var filtered = result.Where(d => scope.Allows(DataScopeTypes.Domain, d.DomainKey)).ToList();
+
+            return Ok(ApiResponse<IReadOnlyList<RunDomainStatusDto>>.Success(filtered));
         }
         catch (InvalidOperationException ex)
         {

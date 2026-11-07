@@ -174,6 +174,15 @@ public sealed class DemandPriorityExecutor : IDemandPriorityExecutor
                 EnsureKnownField(condition.FieldName);
             }
 
+            // DNF 条件组：组内每条条件同样是白名单字段，漏检等于把未知字段拖到求值期才炸
+            foreach (var group in segment.MatchConditionGroups)
+            {
+                foreach (var condition in group.Conditions)
+                {
+                    EnsureKnownField(condition.FieldName);
+                }
+            }
+
             foreach (var sortField in segment.SortFields)
             {
                 EnsureKnownField(sortField.FieldName);
@@ -197,6 +206,44 @@ public sealed class DemandPriorityExecutor : IDemandPriorityExecutor
 
     private bool IsMatchSegment(UpstreamDemand demand, PrioritySegmentConfig segment)
     {
+        // ── 路线甲 DNF（组内 AND、组间 OR）─────────────────────────────────────────────
+        //   非空即以组为准、**忽略平铺列表**（与冻结快照 `PrioritySegment.MatchConditionGroups` 的优先级一致）。
+        //   2026-11-07 接线：此前执行器只读平铺 `MatchConditions`，投影层对非空组 fail-closed 抛错，
+        //   导致契约里的段2「1∧2∧(3∨4)」在现网只能落 flat＝组A，组B（`IssueDate<TODAY-30`）不可达。
+        //   ⚠ 空组（无任何条件）**不成立**：AND over empty set 恒真，会让该段退化成「无条件命中」
+        //   吞掉其后所有段（First-Match）；发布校验亦拒绝空组，此处再兜一层。
+        if (segment.MatchConditionGroups.Count > 0)
+        {
+            foreach (var group in segment.MatchConditionGroups)
+            {
+                if (group.Conditions.Count == 0)
+                {
+                    _logger.LogWarning(
+                        "DemandPriority SegmentOrder={Order}: 条件组为空（组内无条件），按不成立处理——"
+                        + "空组不得退化为无条件命中", segment.SegmentOrder);
+                    continue;
+                }
+
+                var groupMatched = true;
+                foreach (var condition in group.Conditions)
+                {
+                    if (!EvaluateCondition(demand, condition))
+                    {
+                        groupMatched = false;
+                        break;
+                    }
+                }
+
+                if (groupMatched)
+                {
+                    return true;   // 任一 AND 组全成立 ⇒ 命中
+                }
+            }
+
+            return false;          // 所有组均未全成立
+        }
+
+        // 存量平铺语义：组为空时回退（全部条件 AND 才命中）
         if (segment.MatchConditions.Count == 0)
         {
             return true;
@@ -213,11 +260,26 @@ public sealed class DemandPriorityExecutor : IDemandPriorityExecutor
         return true;
     }
 
+    /// <summary>需要两两大小比较的操作符（`EQ`/`IN` 走的是相等/集合语义，不受本处空值规则影响）。</summary>
+    private static bool IsRangeOperator(string operatorText)
+        => operatorText is "LT" or "LTE" or "GT" or "GTE";
+
     private bool EvaluateCondition(UpstreamDemand demand, MatchCondition condition)
     {
         var fieldValue = GetFieldValue(demand, condition.FieldName);
+        var operatorText = condition.Operator.ToUpperInvariant();
 
-        return condition.Operator.ToUpperInvariant() switch
+        // ── 空值 × 范围比较 ⇒ **一律不命中**（fail-closed；3号位 2026-11-07 转办 A-2）──────────────
+        //   `GetFieldValue` 对空的日期/数值字段返回 `""` ⇒ `CompareNumericOrDate` 的日期/数值分支双双落空
+        //   ⇒ 落到 `string.Compare("", 日期串)`，结果恒 < 0 ⇒ **`LTE 某日` 对 null 字段恒判真**，
+        //   `GT 某日` 恒判假。契约语义是「字段无值 ⇒ 不参与大小比较」——「无法判定」不等于「满足」。
+        //   若将来要支持「空值命中某段」，必须在配置里显式用 `EQ ""` 表达，不得靠字符串比较的巧合。
+        if (fieldValue.Length == 0 && IsRangeOperator(operatorText))
+        {
+            return false;
+        }
+
+        return operatorText switch
         {
             // OrderType 的 SO/WO 旧词等价归一（3号位 实施包 §二B），两侧同时施加
             "EQ" => string.Equals(NormalizeFieldValue(condition.FieldName, fieldValue),
@@ -256,18 +318,27 @@ public sealed class DemandPriorityExecutor : IDemandPriorityExecutor
             {
                 var isAscending = string.Equals(sortField.Direction, "ASC", StringComparison.OrdinalIgnoreCase);
 
-                if (orderedQuery == null)
+                // ── 每个排序键前置一个「空值秩」键，**恒升序** ⇒ 无论 ASC/DESC，null 一律排在本段之后 ──
+                //   原实现只用 `MaxValue` 哨兵垫 null，只在 ASC 生效；DESC 时哨兵成了最大值 ⇒
+                //   **null 被排到最前**（3号位 2026-11-07 转办 A-1 实测：`SortFields=[StockConsumeDay DESC]`
+                //   下 `d_A=1 / d_B=null` 排出 `[B,A]`，期望 `[A,B]`）。ORDER BY 的 null 排位由「方向」决定
+                //   是各家实现的惯例差异，这里**显式定死**：null 永远置末，与 `UpstreamDemand` 字段注释一致。
+                //   ⚠ 只对**可空的值类型字段**（日期/数值）加秩；字符串字段原本就 `?? string.Empty`，
+                //   加秩会改变其存量排序（空串当前按字典序参与），不在本次缺陷范围内。
+                if (IsNullableSortField(sortField.FieldName))
                 {
-                    orderedQuery = isAscending
+                    orderedQuery = orderedQuery == null
+                        ? query.OrderBy(d => IsNullForSort(d, sortField.FieldName))
+                        : orderedQuery.ThenBy(d => IsNullForSort(d, sortField.FieldName));
+                }
+
+                orderedQuery = orderedQuery == null
+                    ? (isAscending
                         ? query.OrderBy(d => GetComparableValue(d, sortField.FieldName))
-                        : query.OrderByDescending(d => GetComparableValue(d, sortField.FieldName));
-                }
-                else
-                {
-                    orderedQuery = isAscending
+                        : query.OrderByDescending(d => GetComparableValue(d, sortField.FieldName)))
+                    : (isAscending
                         ? orderedQuery.ThenBy(d => GetComparableValue(d, sortField.FieldName))
-                        : orderedQuery.ThenByDescending(d => GetComparableValue(d, sortField.FieldName));
-                }
+                        : orderedQuery.ThenByDescending(d => GetComparableValue(d, sortField.FieldName)));
             }
 
             query = orderedQuery ?? query;
@@ -344,7 +415,32 @@ public sealed class DemandPriorityExecutor : IDemandPriorityExecutor
     }
 
     /// <summary>
+    /// 该排序字段是否为**可空的日期/数值**字段 —— 只有这些字段需要额外的「空值秩」键。
+    /// 字符串字段原本就 `?? string.Empty`，不在此列（加秩会改动其存量排序）。
+    /// </summary>
+    private static bool IsNullableSortField(string fieldName) => fieldName.ToUpperInvariant() switch
+    {
+        "DUEDATE" or "ISSUEDATE" or "CUSTOMERDUEDATE" or "QUANTITY" or "STOCKCONSUMEDAY" => true,
+        _ => false
+    };
+
+    /// <summary>
+    /// 空值秩：<c>true</c>＝该字段无值。作为**恒升序**的首键 ⇒ null 永远排在本段之后（ASC/DESC 皆然）。
+    /// </summary>
+    private static bool IsNullForSort(UpstreamDemand demand, string fieldName) => fieldName.ToUpperInvariant() switch
+    {
+        "DUEDATE"         => demand.DueDate is null,
+        "ISSUEDATE"       => demand.IssueDate is null,
+        "CUSTOMERDUEDATE" => demand.CustomerDueDate is null,
+        "QUANTITY"        => demand.Quantity is null,
+        "STOCKCONSUMEDAY" => demand.StockConsumeDay is null,
+        _ => false
+    };
+
+    /// <summary>
     /// 段内排序取值：日期/数值必须给**强类型**，否则字符串序会把 "10" 排在 "9" 之前。
+    /// <para>这里的 `?? MaxValue` 只在**同为空值的那一组内部**参与比较（空值已被 <see cref="IsNullForSort"/>
+    /// 键整体排到段末），因此不再承担「null 置末」的职责，也不会在 DESC 下把空值顶到最前。</para>
     /// </summary>
     private IComparable GetComparableValue(UpstreamDemand demand, string fieldName)
     {
@@ -360,7 +456,7 @@ public sealed class DemandPriorityExecutor : IDemandPriorityExecutor
             // 2026-11-06 V1.1 新增（3号位 实施包 v1.0 §四.1）
             "CUSTOMERDUEDATE"      => demand.CustomerDueDate ?? DateTime.MaxValue,
             "QUANTITY"             => demand.Quantity ?? decimal.MaxValue,
-            // null（无可信日均）置末；0（ZERO_STOCK）排最前 —— 两者语义不同，不能塌成一个
+            // 0（ZERO_STOCK，真·最紧急）必须与 null（无可信日均）分开，不能塌成一个
             "STOCKCONSUMEDAY"      => demand.StockConsumeDay ?? decimal.MaxValue,
             "CUSTOMERSEGMENT"      => demand.CustomerSegment ?? string.Empty,
             "TRANSPORTMODE"        => demand.TransportMode ?? string.Empty,

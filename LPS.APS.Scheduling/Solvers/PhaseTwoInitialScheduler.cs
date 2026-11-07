@@ -9679,7 +9679,8 @@ internal class PhaseTwoInitialScheduler
     /// ⚠ 合批**不得**为省 Setup 延误更紧急一方（M-02）：落定前按**两需求各自有效交期**双重把关（P0-04 口径的多工序版）。
     /// </summary>
     /// <returns>合批后的代表 Task（完成时间最晚者，供候选比较取真实完成时间）；失败返回 null（已恢复目标批）。</returns>
-    private FinalTaskDraft? TryMergeDemandIntoStageBatch(
+    // 2026-11-07：`private` → `internal`，仅供 LPS.APS.Tests 直调（C2-04 三 Operation Stage 合批的数量闭合反证）
+    internal FinalTaskDraft? TryMergeDemandIntoStageBatch(
         LogicalProductionDemand demand,
         List<OperationNode> operations,
         RoutingGraph routingGraph,

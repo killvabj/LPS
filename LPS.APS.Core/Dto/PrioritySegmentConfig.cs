@@ -38,9 +38,19 @@ public sealed class PrioritySegmentConfig
     public bool IsEnabled { get; init; }
 
     /// <summary>
-    /// 匹配条件列表（AND关系，全部满足才进入该段）
+    /// 匹配条件列表（AND关系，全部满足才进入该段）。
+    /// **仅在 <see cref="MatchConditionGroups"/> 为空时生效**（存量平铺语义）。
     /// </summary>
     public IReadOnlyList<MatchCondition> MatchConditions { get; init; } = [];
+
+    /// <summary>
+    /// 命中条件组（**路线甲 DNF：组内 AND、组间 OR**；3号位 实施包 v1.0 §一.4）。
+    /// 非空即以本组为准、**忽略** <see cref="MatchConditions"/>；为空则回退平铺列表（存量语义不变）。
+    /// <para>例「1 并 2 并 (3 或 4)」＝组A{1,2,3}、组B{1,2,4}：任一 AND 组全成立即命中。</para>
+    /// <para>空组（<c>Conditions.Count == 0</c>）**不成立**——否则空组会退化成「无条件命中」把后续段吞掉；
+    /// 发布校验亦拒绝空组。</para>
+    /// </summary>
+    public IReadOnlyList<PriorityConditionGroup> MatchConditionGroups { get; init; } = [];
 
     /// <summary>
     /// 排序字段列表（依次排序，第一个字段优先级最高）
@@ -52,4 +62,14 @@ public sealed class PrioritySegmentConfig
     /// 最终兜底：DemandKey ASC
     /// </summary>
     public IReadOnlyList<string> StableTieBreakFields { get; init; } = [];
+}
+
+/// <summary>
+/// 一条 AND 条件组（DNF 的「组」）：组内条件全部满足才算本组成立，组间取 OR。
+/// 与冻结快照的 <c>SegmentConditionGroup</c> 同构，投影层只是把强类型枚举换成执行器字符串词表。
+/// </summary>
+public sealed class PriorityConditionGroup
+{
+    /// <summary>组内条件（AND 语义）</summary>
+    public IReadOnlyList<MatchCondition> Conditions { get; init; } = [];
 }

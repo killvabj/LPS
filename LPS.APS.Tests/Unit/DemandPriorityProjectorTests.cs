@@ -37,8 +37,10 @@ public class DemandPriorityProjectorTests
     ///
     /// ⚠ 段1 `CUSTOMERDUEDATE` 已升为整数偏移 `20`（换算链已接通：Provider 传 FrozenAt + Projector 换算
     /// `FrozenAt.Date+20`）。故本组 `Project()` 一律传 <see cref="TestFrozenAt"/>，否则整数偏移遇 null 冻结点
-    /// 会 fail-closed 抛错。构造需求时**避开依赖换算阈值**：段1 命中用 CustomerDueDate=null
-    /// （空串 LTE 换算后日期成立）、段2 用 MaterialCode FINAL* 作主路由，保证路由确定。
+    /// 会 fail-closed 抛错。构造需求时段1 给定**落在窗口内的具体客户交期**（2026-11-10 ≤ 11-01+20），
+    /// 段2 用 MaterialCode FINAL* 作主路由，保证路由确定。
+    /// ⚠ 2026-11-07 前本组靠「`CustomerDueDate=null` 空串 LTE 恒真」把 A 送进段1——那是执行器缺陷
+    /// （3号位 转办件 A-2），修复后必须给真日期，否则 A 会落到未命中兜底。
     /// </summary>
     private static readonly DateTime TestFrozenAt = new(2026, 11, 1, 15, 30, 0);
     private const string RealSnapshot811Json = """
@@ -89,8 +91,11 @@ public class DemandPriorityProjectorTests
 
         var demands = new List<UpstreamDemand>
         {
-            // 段1（round1）：销售订单·厂外客户区分·CustomerDueDate=null ⇒ 段1 的 CUSTOMERDUEDATE LTE 占位对空串成立
-            new() { DemandKey = "A", OrderType = "SALES_ORDER", CustomerSegment = "JAPAN", CustomerDueDate = null },
+            // 段1（round1）：销售订单·厂外客户区分·客户交期落在换算窗口内
+            //   ⚠ 2026-11-07 起**必须给真日期**：执行器已按 3号位 转办件 A-2 修掉「空值 × 范围比较恒真」
+            //   （原 `""` 落字符串比较 ⇒ `LTE` 恒判真），`CustomerDueDate=null` 不再命中段1。
+            //   TestFrozenAt=11-01 + 偏移 20 ⇒ 阈值 11-21；取值 11-10 稳落在窗口内。
+            new() { DemandKey = "A", OrderType = "SALES_ORDER", CustomerSegment = "JAPAN", CustomerDueDate = new DateTime(2026, 11, 10) },
             // 段2（round1）：生产指示·MaterialCode FINAL*·库存消耗<=0
             new() { DemandKey = "B", OrderType = "PRODUCTION_INSTRUCTION", MaterialCode = "FINAL-PART-1", StockConsumeDay = 0 },
             // 段6（round3）：生产指示·非FINAL ⇒ 只落段6

@@ -167,6 +167,37 @@ public sealed class DemandPriorityValidator
             ValidateMatchCondition(segment.SegmentOrder, condition, errors);
         }
 
+        // ── 路线甲 DNF 条件组（2026-11-07 执行器接线后放行）─────────────────────────────
+        //   ①组内每条条件走与平铺条件**同一套**校验（操作符/值/值域）；
+        //   ②**空组一律拒绝**：AND over empty set 恒真 ⇒ 该段会退化成「无条件命中」把后续段全吞掉，
+        //     而且它不会进 `ValidateFallbackSegment`（那里按平铺条件数判定）⇒ 必须在源头拦。
+        //   ③组非空时平铺列表被执行器忽略 ⇒ 两者同时配置属歧义配置，报错要求二选一。
+        var groups = segment.MatchConditionGroups;
+        if (groups is { Count: > 0 })
+        {
+            if (segment.MatchConditions.Count > 0)
+            {
+                errors.Add(
+                    $"Segment {segment.SegmentOrder}: 同时配置了 MatchConditions（平铺）与 MatchConditionGroups（条件组），"
+                    + "执行器以条件组为准、平铺列表会被忽略；请只保留一种写法");
+            }
+
+            for (var i = 0; i < groups.Count; i++)
+            {
+                if (groups[i].Conditions.Count == 0)
+                {
+                    errors.Add(
+                        $"Segment {segment.SegmentOrder}: 第 {i + 1} 个条件组为空（组内无条件）——"
+                        + "空组会恒成立并吞掉其后所有段，必须删除或补条件");
+                }
+
+                foreach (var condition in groups[i].Conditions)
+                {
+                    ValidateMatchCondition(segment.SegmentOrder, condition, errors);
+                }
+            }
+        }
+
         if (segment.SortFields.Count == 0)
         {
             warnings.Add($"Segment {segment.SegmentOrder}: 建议配置至少一个排序字段（当前保持原顺序）");
@@ -185,7 +216,12 @@ public sealed class DemandPriorityValidator
     /// </summary>
     private void ValidateFallbackSegment(DemandPriorityBlock block, List<string> errors)
     {
-        var fallbacks = block.Segments.Where(s => s.MatchConditions.Count == 0).ToList();
+        // ⚠ 有**非空条件组**的段不是兜底段：执行器此时以组为准、忽略平铺列表，
+        //   若只按 `MatchConditions.Count == 0` 判定，会把「组非空但平铺为空」的正常段误当成兜底段
+        //   （3号位 转办件 B 的段2 正是这种形态：组A/组B 均非空、平铺列表为空）。
+        var fallbacks = block.Segments
+            .Where(s => s.MatchConditions.Count == 0 && (s.MatchConditionGroups is not { Count: > 0 }))
+            .ToList();
         if (fallbacks.Count == 0)
         {
             return;
@@ -300,6 +336,18 @@ public sealed class DemandPriorityValidator
             if (!SupportedDemandFields.Contains(condition.Field))
             {
                 errors.Add($"Segment {segment.SegmentOrder}: 匹配字段 {condition.Field} 不在合法字段白名单内");
+            }
+        }
+
+        // DNF 条件组（路线甲）：组内条件同样要过白名单，否则运行期才炸
+        foreach (var group in segment.MatchConditionGroups ?? [])
+        {
+            foreach (var condition in group.Conditions)
+            {
+                if (!SupportedDemandFields.Contains(condition.Field))
+                {
+                    errors.Add($"Segment {segment.SegmentOrder}: 条件组内的匹配字段 {condition.Field} 不在合法字段白名单内");
+                }
             }
         }
 

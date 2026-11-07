@@ -19,6 +19,9 @@ namespace LPS.APS.Application.Services;
 ///    执行器白名单外的枚举值一律**显式抛错**，不猜配——与执行器 P1-02「未知字段显式报错」同一口径。
 /// 2. **Value**：快照为 <c>object?</c>（JSON 反序列化后实为 <see cref="JsonElement"/>；<c>In</c> 时为数组）
 ///    → 统一转字符串；<c>In</c> 用逗号连接（执行器 IN 分支按 ',' 拆分）。
+/// 2b. **MatchConditionGroups（路线甲 DNF）**：组内 AND、组间 OR，**整组逐条**投影（与平铺条件同一 `ProjectCondition`）。
+///    组非空 ⇒ 执行器忽略平铺列表；组为空 ⇒ 回退平铺（存量快照语义不变）。
+///    2026-11-07 前此处 fail-closed，执行器接线后改为放行。
 /// 3. **CompetitionRound（竞争轮次）**：**fail-closed**，三种情形分开处理 ——
 ///    <list type="bullet">
 ///      <item>整块**没有任何段**声明 <c>CompetitionRound</c> ⇒ 全部投影为
@@ -110,15 +113,17 @@ internal static class DemandPriorityProjector
     private static PrioritySegmentConfig ProjectSegment(
         PrioritySegment segment, int competitionRound, DateTime? frozenAt)
     {
-        // 路线甲 DNF 条件组：运行侧（A系）尚未接线，投影层不支持。若不拦而只投平铺 MatchConditions，
-        // 会静默丢掉条件组、导致命中判定错误——比报错危险得多，故 fail-closed（实施包 §五 空转声明）。
-        if (segment.MatchConditionGroups is { Count: > 0 })
-        {
-            throw new NotSupportedException(
-                $"DemandPriority 快照 Segment {segment.SegmentOrder}({segment.SegmentName}) 使用了"
-                + " 条件组 MatchConditionGroups（路线甲 DNF），但 2号位 执行器/1号位 A系 DNF 尚未接线，"
-                + " 投影暂不支持；请先 1↔3 契约对齐接线后再启用，不得静默丢弃。");
-        }
+        // 路线甲 DNF 条件组（2026-11-07 接线，3号位《null 双缺陷／DNF 段2／CustomerDueDate 分叉》转办件 B）：
+        // 组内 AND、组间 OR；非空即以组为准、忽略平铺列表（与快照契约 `MatchConditionGroups` 的优先级一致）。
+        // 原实现在此处 fail-closed 抛 `NotSupportedException`（防静默丢组），现执行器已支持真 OR 组求值，
+        // 改为**整组投影**：组内每条条件走与平铺条件**同一个** `ProjectCondition`，
+        // 因此相对日阈值换算（`CustomerDueDate` 的 `TODAY+N`）在组内同样生效，不会出现两套口径。
+        var groups = (segment.MatchConditionGroups ?? [])
+            .Select(g => new PriorityConditionGroup
+            {
+                Conditions = g.Conditions.Select(c => ProjectCondition(c, frozenAt)).ToList()
+            })
+            .ToList();
 
         return new PrioritySegmentConfig
         {
@@ -126,6 +131,7 @@ internal static class DemandPriorityProjector
             SegmentOrder = segment.SegmentOrder,
             IsEnabled = segment.IsEnabled,
             MatchConditions = segment.MatchConditions.Select(c => ProjectCondition(c, frozenAt)).ToList(),
+            MatchConditionGroups = groups,
             SortFields = segment.SortFields.Select(ProjectSortField).ToList(),
             // Tie-break 已是强类型枚举，成员名即执行器词表词 ⇒ 只做 ToString()，
             // 不再有别名换算（历史别名已在 TieBreakFieldJsonConverter 的反序列化处归一化）。
@@ -167,11 +173,13 @@ internal static class DemandPriorityProjector
     private static readonly string[] RelativeDateThresholdOperators = ["LT", "LTE", "GT", "GTE"];
 
     /// <summary>
-    /// 该条件是否为「相对日阈值」。**只认 `CustomerDueDate`** —— 这是 3号位 明确点名的唯一字段。
-    /// 不顺手扩到 `DUEDATE`：那会把「显式日期的字段」悄悄改成「偏移语义」，属于自造口径。
+    /// 该条件是否为「相对日阈值」。支持 `CustomerDueDate` ＋ `IssueDate`（2号位 2026-11-07 回执答 A-扩）。
+    /// 段2 组B 用 `IssueDate &lt; 冻结日-30`（相对日），须走换算否则 `-30` 原样进执行器恒不命中（空转）。
+    /// 不扩到 `DUEDATE`：那会把「显式日期的字段」悄悄改成「偏移语义」，属于自造口径（防空转）。
     /// </summary>
     private static bool IsRelativeDateThreshold(string fieldName, string operatorText)
-        => string.Equals(fieldName, "CUSTOMERDUEDATE", StringComparison.OrdinalIgnoreCase)
+        => (string.Equals(fieldName, "CUSTOMERDUEDATE", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(fieldName, "ISSUEDATE", StringComparison.OrdinalIgnoreCase))
            && RelativeDateThresholdOperators.Contains(operatorText, StringComparer.OrdinalIgnoreCase);
 
     /// <summary>

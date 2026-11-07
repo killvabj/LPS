@@ -324,7 +324,17 @@ ORDER BY t.OperationSeq";
         //   冻结 01 §64：计划延期唯一判定 = 本版本 MAX(PlannedEndTime) 日期 vs CustomerDueDate。
         //   UnscheduledCount（原"无权威口径⇒0"撤销）：本版本无 Task 行即未排产——§64 判定自带该判据，
         //   与列表富化同一批数据，**未排产单列、不得混入"未延迟"**。RiskCount 维持从 OrderScheduleSummary（空表⇒0）。
+        // 11-07 修复（4号位 缺陷函「数据范围过滤致订单摘要超时」）：
+        //   原把 Task 聚合写成内联派生表；带范围过滤时**首次编译**改走嵌套循环，Task 聚合被逐组重扫
+        //   （实测 7,953 次 / 445,131 逻辑读 / 12.4s 撞 10s 超时；无过滤与缓存复用均为百毫秒级）。
+        //   ⇒ 改两段式临时表：Task 聚合先落 #tc（一次扫描、主键基数明确），再与订单范围过滤关联。
+        //   两参数域（无过滤 / Factory+Domain 过滤）实测均 ~90–110ms，确定性不靠提示。
+        //   ⚠ 与订单列表的 RECOMPILE 病**方向相反**：此处坏在「新编译本身」，加 RECOMPILE 反而必现 12.2s；
+        //   全局 OPTION(HASH JOIN) 也不可用——riskCount 子查询下提示会导致「无法生成计划」500（11-07 实测）。
         var sql = @"
+SET NOCOUNT ON;
+CREATE TABLE #tc(OrderId bigint PRIMARY KEY, MaxEnd datetime2(7));
+INSERT #tc SELECT OrderId, MAX(PlannedEndTime) FROM [Task] WHERE PlanVersionId = @PlanVersionId GROUP BY OrderId;
 SELECT
     @PlanVersionId AS PlanVersionId,   -- 回填入参（此前漏挑该列 → Dapper 填默认 0，4号位 10-14 R5 报）
     COUNT(*) AS TotalCount,
@@ -343,11 +353,11 @@ SELECT
     SUM(CASE WHEN tc.OrderId IS NULL OR o.CustomerDueDate IS NULL THEN 1 ELSE 0 END) AS UnscheduledCount
 FROM [Order] o
 LEFT JOIN Factory f ON f.Id = o.FactoryId
-LEFT JOIN (SELECT OrderId, MAX(PlannedEndTime) AS MaxEnd
-             FROM [Task] WHERE PlanVersionId = @PlanVersionId GROUP BY OrderId) tc ON tc.OrderId = o.Id
+LEFT JOIN #tc tc ON tc.OrderId = o.Id
 WHERE o.PlanVersionId = @PlanVersionId
     AND (@HasFactories = 0 OR f.Code IN @AllowedFactories)
-    AND (@HasDomains = 0 OR o.DomainKey IN @AllowedDomains)";
+    AND (@HasDomains = 0 OR o.DomainKey IN @AllowedDomains);
+DROP TABLE #tc;";
 
         var parameters = new
         {

@@ -16,6 +16,12 @@ public sealed class UpstreamDemand
     public string? OrderType { get; init; }
     public string? DelayStatus { get; init; }
     public string? CustomerTier { get; init; }
+    /// <summary>
+    /// 交期（排序/命中用）。**当前取值与 <see cref="CustomerDueDate"/> 同源同值**，二者皆取自
+    /// `[Order].CustomerDueDate`（其上游是 ODS `v_APS_SalesOrder.DueDate` ← `V_AllSalesInstr.ReceiveDate`，
+    /// 即**出荷指示入物流日**）。本链路上**没有独立的「客户要求交期」列** —— 命名易误读，详见
+    /// <see cref="CustomerDueDate"/> 的说明。
+    /// </summary>
     public DateTime? DueDate { get; init; }
     public DateTime? IssueDate { get; init; }
     public string? ProtectionStatus { get; init; }
@@ -31,8 +37,18 @@ public sealed class UpstreamDemand
 
     /// <summary>
     /// 出荷指示入物流日（3号位 定义为「独立新增字段，与 <see cref="DueDate"/> 并列」）。
-    /// ⚠ 当前装载源与 <see cref="DueDate"/> 同值（`[Order].CustomerDueDate`，订单表无第二个「入物流日」列）；
-    ///   待 PM 的 `TODAY+20`/OffsetDays 口径落地后，二者才会真正分叉。
+    /// <para>**源链（2026-11-06 用户两次确认定盘，不要再当缺口重开）**：</para>
+    /// <para>`V_AllSalesInstr.ReceiveDate`（ERP 出荷指示的入物流日，随返信/延迟变化）
+    ///   → ODS `v_APS_SalesOrder.DueDate` → `[Order].CustomerDueDate` → 本字段。</para>
+    /// <para>⚠ 两个容易误读的点，写死在此：</para>
+    /// <para>① **ODS 视图里那列虽然叫 `DueDate`，装的正是入物流日**。本链路上**没有独立的「客户要求交期」列**，
+    ///   所以本字段取到的就是真值，**不是「借 <see cref="DueDate"/> 近似」**。</para>
+    /// <para>② 本字段与 <see cref="DueDate"/> 目前同值，是因为二者都取自 `[Order].CustomerDueDate`；
+    ///   真正「分叉」的另一条路是 `[Order].OriginalDueDate`
+    ///   （= `ODBC_V_U13_Requisition.ReceiveDate`，**原始**入物流日、永不变化，与现值实测差 5.87%），
+    ///   而该列已被 3号位 实施包 §一.1 明确剔除、不进排序。</para>
+    /// <para>⇒ 早期那句「待 PM 的 `TODAY+20`/OffsetDays 口径落地后二者才会真正分叉」**是暂态表述，已作废**：
+    ///   `TODAY+20` 是**阈值换算**（冻结日 + 偏移天数，用于条件比较），与字段取值来源无关，不会让两列分叉。</para>
     /// </summary>
     public DateTime? CustomerDueDate { get; init; }
 
