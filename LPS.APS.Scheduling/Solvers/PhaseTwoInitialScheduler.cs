@@ -19,6 +19,17 @@ namespace LPS.APS.Scheduling.Solvers;
 /// </summary>
 internal class PhaseTwoInitialScheduler
 {
+    // ── 2026-11-09（0号位《同PI锚批优先排序与首个可行即停止 v1.0》）四模式进程级开关 ──
+    //   LEGACY   = 原实现（**默认**，关闭时不改变任何业务结果）
+    //   PI_ONLY  = 只做同 PI 过滤
+    //   PI_SORT  = 同 PI 过滤 + 按交期/批量排序（仍全部试算）
+    //   PI_FIRST = 同 PI + 排序 + 首个物理可行锚批评价完毕后停止
+    //   启动时读取一次、进程内冻结；热路径不读环境变量。未知取值按 LEGACY 安全退回。
+    private static readonly string P2AnchorMode =
+        Environment.GetEnvironmentVariable("APS_P2_ANCHOR_MODE") ?? "LEGACY";
+    private static bool P2FilterByPi => P2AnchorMode is "PI_ONLY" or "PI_SORT" or "PI_FIRST";
+    private static bool P2SortAnchors => P2AnchorMode is "PI_SORT" or "PI_FIRST";
+    private static bool P2StopAtFirstFeasible => P2AnchorMode == "PI_FIRST";
     /// <summary>
     /// 「按 Start 升序」的日历表缓存（2026-10-20 第五刀）。
     /// 键 = 资源 Id；值 = (源列表引用, 升序列表)。
@@ -680,6 +691,8 @@ internal class PhaseTwoInitialScheduler
         foreach (var demand in sortedDemands)
         {
             SolverDiagnostics.SetPhase2DemandProgress(++phase2Processed);
+            // 2026-11-09 Step 1（专家 Q3/Q4）：低频分桶画像。未设 `APS_P2_BUCKET_CSV` 时第一行即返回（零成本）。
+            Phase2WindowProfiler.Tick(phase2Processed);
 
             // 2026-10-26 取消支持（2号位《PV190 第二次现场》§6.3-4）：**粒度＝一条需求**。
             //   放在这里而不是内层找槽循环：内层是超热路径，进内层检查的代价必须先量；
@@ -1353,6 +1366,8 @@ internal class PhaseTwoInitialScheduler
             //   四层目标 + 批数 tiebreak；**无改善时基线（nMin）胜出** ⇒ 既有行为不被改写。
             var planCandidates = EnumerateLegalBatchPlanCandidates(
                 actualDemand, batchPolicy, formation, ResolveSolverBatchBudget(request));
+            // 2026-11-09 Step 1（专家 Q4）：候选形状直方图。只累加计数，不改候选、不改选择。
+            Phase2WindowProfiler.RecordCandidateShape(planCandidates.Count);
             // 2026-10-20 性能（第二刀）：批方案择优**已经**在克隆缓冲上把胜出方案完整跑过一遍
             //   ⇒ 把那份试排状态留到落定阶段直接采纳，不再在真实表上重跑（见下方落定段注释）。
             BatchPlanTrialState? pickedBatchPlan = null;
@@ -4403,7 +4418,7 @@ internal class PhaseTwoInitialScheduler
                     // 2026-10-08 COW + 有序插入：先脱钩，再按 Start 二分定位插入（维持读端可二分的不变式）
                     AddOccupancyWindow(resourceOccupancy, occupancyPristine, resourceId,
                         new TimeWindow(foundSlot.Value.Start, foundSlot.Value.End), occupancyInsertLog);
-                    constraints.ProductTimeline.Place(resourceId, foundSlot.Value.End, demand.MaterialId);
+                    constraints.ProductTimeline.Place(resourceId, foundSlot.Value.End, demand.MaterialId, TimelinePlaceSource.Phase2ScheduleA);
 
                     // P0-17修复：应用Routing LagTime到前序工序的结束时间约束
                     // currentEndTime应该是加工开始时间（Setup之前）
@@ -4696,7 +4711,7 @@ internal class PhaseTwoInitialScheduler
                     // 资源占用从Setup开始
                     // 2026-10-08 COW + 有序插入（正排写点；天然追加到末尾 ⇒ 退化为 O(1)）
                     AddOccupancyWindow(resourceOccupancy, occupancyPristine, resourceId, occSlot, occupancyInsertLog);
-                    constraints.ProductTimeline.Place(resourceId, occSlot.End, demand.MaterialId);
+                    constraints.ProductTimeline.Place(resourceId, occSlot.End, demand.MaterialId, TimelinePlaceSource.Phase2ScheduleB);
 
                     // 第4轮C2修复：记录该Operation的实际完成时间，供后续工序使用
                     operationEndTimes[operationKey] = occSlot.End;
@@ -7326,6 +7341,14 @@ internal class PhaseTwoInitialScheduler
             var stageBatches = FindMergeableStageBatches(
                 demand, operations, scheduledTasks, constraints, demandByKey, batchGroupsIndex,
                 requireIdentityPreservingMerge);
+            // 2026-11-09 M2（0号位 v1.0 §2.2）：先按**全部已承接成员**做同 PI 核验并剔除跨 PI/混 PI 候选，
+            //   再按「锚批交期不晚于当前需求且最接近 → 同交期批量小 → 稳定批键」排序。
+            //   排序**只决定先试谁**，绝不执行真实排程、也不把晚交期当硬失败。LEGACY 不进入本段。
+            var piAnchorRejected = P2FilterByPi
+                ? PiStageAnchorPriority.FilterAndSort(
+                    stageBatches, demand, constraints, demandByKey, allocationTaskShare,
+                    applySorting: P2SortAnchors)
+                : 0;
 
             // ── 无合法合批目标 ⇒ 唯一候选 = 独立排程（**一次**运行；与 OWN-P0-02 之前逐字一致）──
             //   这是常态路径：多工序 C 需求在开 Merge 时不因此多跑一次排程。
@@ -7494,6 +7517,9 @@ internal class PhaseTwoInitialScheduler
             //   此前只有「TryMergeStageBatch 次数 / BatchPlanTrial 次数」这个**比值**（5.2 / 12.9 / 30.0），
             //   既不是真实均值、也没有最大值/分布 ⇒ 本行直接登记本体。纯观测。
             SolverDiagnostics.CountAnchorLoop(stageBatches.Count);
+            // 2026-11-09 M3：候选总数与实际完整试排次数必须分开统计 —— 早停时两者不同。
+            int anchorsTried = 0;
+            bool firstFeasibleFound = false;
 
             // ── 2026-10-26 自报（纯观测）：本需求合批擂台的**墙钟**与其中**回滚占比** ──
             //   为什么加：PV190 现场 3 条需求吃掉 70% 墙钟，而对外只有 `Hotspot` 的**聚合秒数**，
@@ -7509,6 +7535,23 @@ internal class PhaseTwoInitialScheduler
 
             for (var anchorIndex = 0; anchorIndex < stageBatches.Count; anchorIndex++)
             {
+                // 2026-11-09（应 0号位 资料要求）：把锚批按「同 PI / 跨 PI / PI 缺失」分类。
+                //   0=同 PI，1=跨 PI，2=取不到 PI（需求或锚批任一侧缺失）。纯观测，不参与任何判定。
+                int mergePiClass = 2;
+                var demandPiForStats = demand.ProductionInstructionNo;
+                if (!string.IsNullOrEmpty(demandPiForStats)
+                    && stageBatches[anchorIndex].Count > 0
+                    && stageBatches[anchorIndex][0].SourceDraftId is { } anchorSrcKeyForPi
+                    && demandByKey.TryGetValue(anchorSrcKeyForPi, out var anchorDemandForPi)
+                    && !string.IsNullOrEmpty(anchorDemandForPi.ProductionInstructionNo))
+                {
+                    mergePiClass = string.Equals(anchorDemandForPi.ProductionInstructionNo, demandPiForStats, StringComparison.Ordinal)
+                        ? 0
+                        : 1;
+                }
+
+                SolverDiagnostics.CountMergePi(mergePiClass, SolverDiagnostics.MergePiMetric.Anchor);
+                long mergePiStartTs = System.Diagnostics.Stopwatch.GetTimestamp();
                 // ── 2026-10-26 第十二刀：取消检查点下沉到**每个锚批** ──
                 //   病：`Schedule` 的逐需求循环里只有 `:451` 一个检查点（无令牌时零开销，行为逐位不变），
                 //    PV190 卡顿恰恰卡在**单条需求内部**的合批擂台 —— 624 秒里锚点循环一次都不回外层，
@@ -7519,6 +7562,7 @@ internal class PhaseTwoInitialScheduler
                 //   抛出时机在**本锚点尚未改动任何表**之前 ⇒ 上一锚点的 `discardAfterRun` 已完成，
                 //   不存在「半改」的占用表；且本类的 `BeginBatchGroupsOverlay` 覆盖层由 `finally` 回滚。
                 cancellationToken.ThrowIfCancellationRequested();
+                anchorsTried++;
 
                 long swTimelineAnchor = SolverDiagnostics.HotspotStart();
                 constraints.ProductTimeline = realTimeline.Clone();
@@ -7551,6 +7595,7 @@ internal class PhaseTwoInitialScheduler
                 FinalTaskDraft? anchorRepresentative;
                 List<FinalTaskDraft> anchorCombinedTasks;
                 SolverDiagnostics.CountMergeTrialStarted();
+                SolverDiagnostics.CountMergePi(mergePiClass, SolverDiagnostics.MergePiMetric.Trial);
                 try
                 {
                     anchorRepresentative = TryMergeDemandIntoStageBatch(
@@ -7568,6 +7613,10 @@ internal class PhaseTwoInitialScheduler
                 }
 
                 SolverDiagnostics.HotspotEnd(swMergeBatch, SolverDiagnostics.Hotspot.TryMergeStageBatch);
+                SolverDiagnostics.CountMergePi(
+                    mergePiClass,
+                    SolverDiagnostics.MergePiMetric.Ticks,
+                    System.Diagnostics.Stopwatch.GetTimestamp() - mergePiStartTs);
                 // v5.0 §1.4.1：试排产不出任何 Task ⇒ 硬约束（日历/资源）拒绝，**不是**择优判负。
                 if (anchorRepresentative is null) SolverDiagnostics.CountMergeHardRejectedCalendar();
                 var anchorSetup = anchorCombinedTasks.Sum(t => t.SetupTime);
@@ -7708,6 +7757,7 @@ internal class PhaseTwoInitialScheduler
                 if (mergeWins)
                 {
                     bestAnchorIndex = anchorIndex;
+                    SolverDiagnostics.CountMergePi(mergePiClass, SolverDiagnostics.MergePiMetric.Adopted);
                     bestMergeRepresentative = anchorRepresentative;
                     bestMergeCombinedTasks = anchorCombinedTasks;
                     bestMergeSetup = anchorSetup;
@@ -7732,6 +7782,16 @@ internal class PhaseTwoInitialScheduler
                     // v5.0 §1.4.1：合批方案**合法产出了**，只是在冻结层序比较中落败 ⇒
                     //   与「硬拒绝」「没找到锚点」是三种不同结论，不得混记。
                     SolverDiagnostics.CountMergeComparedRejected();
+                }
+
+                // 2026-11-09 M4（0号位 v1.0 §2.3）：**第一条真实物理可行锚批**已完成与独立基线的既有比较。
+                //   它最终是否采纳，由上方 `PreferStageMerge` 层序决定；**不得**继续试第二条可行锚批。
+                //   ⚠ 判据是 `anchorRepresentative is not null`（真实试排返回非 null），
+                //      **不是** `mergeWins`（那是"是否采纳合批"，两个不同问题）。
+                if (P2StopAtFirstFeasible && anchorRepresentative is not null)
+                {
+                    firstFeasibleFound = true;
+                    break;
                 }
             }
 
@@ -7778,7 +7838,7 @@ internal class PhaseTwoInitialScheduler
                         Level = "Warning",
                         Message =
                             $"合批擂台慢：本需求 {anchorLoopMs} ms，其中占用回滚 {rollbackMs:F0} ms（{rollbackShare:F0}%）；"
-                            + $"锚批 {stageBatches.Count} 个；"
+                            + $"锚批候选 {stageBatches.Count} 个，实际试排 {anchorsTried} 个，同PI校验剔除 {piAnchorRejected} 个；"
                             + $"本 Run 回滚日志峰值 {SolverDiagnostics.OccupancyRollbackInsertMax} 条、"
                             + $"被触及资源窗表峰值 {SolverDiagnostics.OccupancyRollbackWindowMax} 条、"
                             + $"回滚调用 {SolverDiagnostics.OccupancyRollbackCalls} 次。"
@@ -7853,10 +7913,17 @@ internal class PhaseTwoInitialScheduler
                                     : $"两侧判平（第 ⑤ 层）⇒ **维持擂主**（{incumbentLabel}）；"
                                       + "**非**因资源效率择优";
 
-                    var scope = adoptedByMerge
-                        ? "本条代表**决定最终采纳（合批）方案**的那一次比较"
-                        : $"全部 {stageBatches.Count} 个合批候选均被否决 ⇒ 维持统一基线（未合批）；"
-                          + "本条代表**最后一次**比较（**不代表**本轮全部候选的择优原因）";
+                    var scope = !P2StopAtFirstFeasible
+                        ? (adoptedByMerge
+                            ? "本条代表**决定最终采纳（合批）方案**的那一次比较"
+                            : $"全部 {stageBatches.Count} 个合批候选均被否决 ⇒ 维持统一基线（未合批）；"
+                              + "本条代表**最后一次**比较（**不代表**本轮全部候选的择优原因）")
+                        : (adoptedByMerge
+                            ? $"按优先序试排 {anchorsTried}/{stageBatches.Count} 个锚批，首可行且优于独立基线，采纳合并；"
+                            : firstFeasibleFound
+                                ? $"按优先序试排 {anchorsTried}/{stageBatches.Count} 个锚批；首可行未优于独立基线，采纳独立方案；其后未试"
+                                : $"全部 {anchorsTried} 个同PI合格锚批均未物理可行，采纳独立方案；")
+                          + "本条只描述已实际试算的比较，不推断未尝试锚批结果";
 
                     // J13-05：本条留痕里的「④.6 增量」是**哪个口径**的键 —— 由下方 `R-2 排序键口径=…` 段写明，
                     //   否则读者会把「含人工槽增量」当成决定依据（只有**未投影**时它才真是决定依据）。
@@ -9333,6 +9400,11 @@ internal class PhaseTwoInitialScheduler
     {
         var candidates = new List<List<FinalTaskDraft>>();
 
+        // ── 2026-11-09 M1（0号位《同PI锚批优先排序 v1.0 §2.1》）：同 PI 是普通 C 桶 Stage 真实合批的
+        //   **必要业务归属**；无可信 PI 时**不得**凭物料相同猜测 PI 归属 ⇒ 本需求没有合法合批锚批。
+        //   独立排程与下发资格不受影响（调用方照常走独立方案）。仅新模式启用；LEGACY 逐字不变。
+        if (P2FilterByPi && string.IsNullOrWhiteSpace(demand.ProductionInstructionNo)) return candidates;
+
         // 候选 Path 的工序身份 → 该工序真实路径身份（供逐 Task 校验 Route/Path）。
         var opByKey = new Dictionary<OperationNodeKey, OperationNode>();
         foreach (var op in operations)
@@ -9397,6 +9469,14 @@ internal class PhaseTwoInitialScheduler
             //   ⚠ 只是**判定次序**变化，**判据集合、判据内容、命中结果全部不变**（不是放宽/收紧任何条件）。
             if (anchorTask.MaterialId != demand.MaterialId) continue;
             if (anchorTask.FactoryId != demand.FactoryId) continue;
+            // 2026-11-09 M1（同PI廉价预筛）：放在物料/工厂整数判定之后、`groupOps` 哈希构造之前，
+            //   避免为跨 PI 候选白建工序集合。`Ordinal` 精确比较，不 Trim、不以物料代替 PI 身份。
+            if (P2FilterByPi)
+            {
+                if (!demandByKey.TryGetValue(sourceKey, out var piCandidate)
+                    || !string.Equals(piCandidate.ProductionInstructionNo,
+                                      demand.ProductionInstructionNo, StringComparison.Ordinal)) continue;
+            }
 
             var groupOps = new HashSet<OperationNodeKey>();
             foreach (var t in group)
@@ -9764,7 +9844,7 @@ internal class PhaseTwoInitialScheduler
         // item1 接线（阶段二）：产品时间线同步——Merge 是同物料合并（v1.2 §六 同产品语义，Setup 继承不变），
         // 仅占用末端延长：移除旧末端、登记新末端。
         constraints.ProductTimeline.Remove(targetResourceId, targetTask.PlannedEndTime, targetTask.MaterialId);
-        constraints.ProductTimeline.Place(targetResourceId, newEndTime, targetTask.MaterialId);
+        constraints.ProductTimeline.Place(targetResourceId, newEndTime, targetTask.MaterialId, TimelinePlaceSource.Phase2MergeDetach);
 
         return mergedTask; // 合并成功，返回合并后的Task
     }
@@ -10150,7 +10230,7 @@ internal class PhaseTwoInitialScheduler
 
         foreach (var (resourceId, end, materialId) in removedTimeline)
         {
-            constraints.ProductTimeline.Place(resourceId, end, materialId);
+            constraints.ProductTimeline.Place(resourceId, end, materialId, TimelinePlaceSource.Phase2Rebuild);
         }
 
         foreach (var (resourceId, window) in removedWindows)

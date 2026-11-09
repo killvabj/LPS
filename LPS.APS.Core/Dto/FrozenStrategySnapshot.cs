@@ -356,8 +356,8 @@ public sealed class WarehouseOffsetRule
 
 public sealed class PlanningYieldRule
 {
-    public string MaterialId { get; set; } = "";          // = 物料编码 MaterialCode（R04 良率 3↔2 已签：以 MaterialCode 为准，2号位 会签见 20261023 五项会签）；需求侧已用 Material 表 Id↔MaterialCode 映射把数值 Id 转成编码后再与快照内本字段比对，故快照存编码、直接等值比对，无两套身份
-    public string? StageCode { get; set; }                // 空 = Material 级默认
+    public string MaterialId { get; set; } = "";          // = 物料编码 MaterialCode（R04 良率 3↔2 已签：以 MaterialCode 为准，2号位 会签见 20261023 五项会签）；需求侧已用 Material 表 Id↔MaterialCode 映射把数值 Id 转成编码后再与快照内本字段比对，故快照存编码、直接等值比对，无两套身份。【契约升版 v1.4 2026-11-09】空串 = 该 StageCode 全物料通配（PlanningYieldResolver 命中全物料该 Stage，优先级低于物料精确/物料级默认；发布校验已忽略空串引用），非无效值
+    public string? StageCode { get; set; }                // 空 = Material 级默认；MaterialId 非空时为空 ⇒ 物料级默认；MaterialId 为空时须有值（才能构成「全物料该 Stage 通配」）
     public decimal YieldPercent { get; set; }             // 0 < YieldPercent <= 100
 }
 

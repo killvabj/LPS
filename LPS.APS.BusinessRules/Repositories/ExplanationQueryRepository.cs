@@ -123,4 +123,75 @@ ORDER BY COUNT(*) DESC";
             Items = items
         };
     }
+
+    /// <summary>
+    /// FULL-06（0号位任务书 11-09 §2.A）：Demand Q/S/U 对账读模型。
+    /// 判据=证据键 `UnscheduledSource` 三族（**不是 ObjectType**——同 ORDER+TaskId NULL 下混有 1号位
+    /// `evidenceType=PI_FREE_OVER_COMMIT/EXECUTION_OVER_COMMIT` 诊断族，实测 999464 为 2,390 行，不得合并）。
+    /// Q/S/U/OverlapDetected/ReasonCodeGap/UpstreamReasonCode 一律 `JSON_VALUE` **原值透出**，
+    /// 读侧不重算、不用 min/max 掩盖 S&gt;Q（修数=2号位 FULL-01）。
+    /// JSON 布尔取 'true'/'false' 文本显式转 bit，缺键=NULL（区别于 false）。
+    /// </summary>
+    public async Task<List<DemandReconciliationRowDto>> QueryDemandReconciliationAsync(
+        int planVersionId,
+        int? scheduleRunId = null,
+        long? orderId = null,
+        string? logicalDemandKey = null,
+        string? unscheduledSource = null,
+        int skip = 0,
+        int take = 100,
+        CancellationToken ct = default)
+    {
+        var sql = @"
+SELECT
+    Id,
+    PlanVersionId,
+    ScheduleRunId,
+    OrderId,
+    StageCode,
+    ReasonCode,
+    Severity,
+    JSON_VALUE(EvidenceJson, '$.LogicalDemandKey')                              AS LogicalDemandKey,
+    TRY_CAST(JSON_VALUE(EvidenceJson, '$.MaterialId')          AS int)          AS MaterialId,
+    JSON_VALUE(EvidenceJson, '$.DomainKey')                                     AS DomainKey,
+    TRY_CAST(JSON_VALUE(EvidenceJson, '$.AllocationSequence')  AS int)          AS AllocationSequence,
+    TRY_CAST(JSON_VALUE(EvidenceJson, '$.NetOutputQty')        AS decimal(18,4)) AS NetOutputQty,
+    TRY_CAST(JSON_VALUE(EvidenceJson, '$.ScheduledShareQty')   AS decimal(18,4)) AS ScheduledShareQty,
+    TRY_CAST(JSON_VALUE(EvidenceJson, '$.UnscheduledQty')      AS decimal(18,4)) AS UnscheduledQty,
+    JSON_VALUE(EvidenceJson, '$.UnscheduledSource')                             AS UnscheduledSource,
+    CASE JSON_VALUE(EvidenceJson, '$.OverlapDetected')
+         WHEN 'true'  THEN CAST(1 AS bit) WHEN 'false' THEN CAST(0 AS bit) ELSE NULL END AS OverlapDetected,
+    CASE JSON_VALUE(EvidenceJson, '$.ReasonCodeGap')
+         WHEN 'true'  THEN CAST(1 AS bit) WHEN 'false' THEN CAST(0 AS bit) ELSE NULL END AS ReasonCodeGap,
+    JSON_VALUE(EvidenceJson, '$.UpstreamReasonCode')                            AS UpstreamReasonCode,
+    CreatedAt
+FROM ScheduleExplanationFact
+WHERE PlanVersionId = @PlanVersionId
+    AND JSON_VALUE(EvidenceJson, '$.UnscheduledSource')
+        IN ('UNSCHEDULED_TASK', 'RECONCILIATION_REMAINDER', 'RECONCILIATION_FULLY_SCHEDULED')
+    AND (@ScheduleRunId IS NULL OR ScheduleRunId = @ScheduleRunId)
+    AND (@OrderId IS NULL OR OrderId = @OrderId)
+    AND (@LogicalDemandKey IS NULL OR JSON_VALUE(EvidenceJson, '$.LogicalDemandKey') = @LogicalDemandKey)
+    AND (@UnscheduledSourceFilter IS NULL OR JSON_VALUE(EvidenceJson, '$.UnscheduledSource') = @UnscheduledSourceFilter)
+ORDER BY
+    CASE Severity WHEN 'ERROR' THEN 1 WHEN 'WARN' THEN 2 ELSE 3 END,
+    Id   -- tiebreaker：分页确定性（同 QueryAsync 惯例）
+OFFSET @Skip ROWS FETCH NEXT @Take ROWS ONLY";
+
+        var results = await _connectionManager.QueryAsync<DemandReconciliationRowDto>(
+            sql,
+            new
+            {
+                PlanVersionId = planVersionId,
+                ScheduleRunId = scheduleRunId,
+                OrderId = orderId,
+                LogicalDemandKey = logicalDemandKey,
+                UnscheduledSourceFilter = unscheduledSource,
+                Skip = skip,
+                Take = take
+            },
+            CommandType.Text, DatabaseId.APS, commandTimeout: 30);
+
+        return results.ToList();
+    }
 }

@@ -37,14 +37,19 @@ public sealed class DemandPriorityConfigProvider : IDemandPriorityConfigProvider
     /// <exception cref="NotSupportedException">快照使用了 2号位 执行器不支持的字段/操作符/排序方向。</exception>
     public async Task<DemandPriorityConfig> GetPriorityConfigAsync(
         long strategyProfileVersionId,
+        DateTime? frozenAtAnchor = null,
         CancellationToken cancellationToken = default)
     {
         var snapshot = await _frozenStrategySnapshotProvider
             .GetFrozenStrategySnapshotAsync(strategyProfileVersionId, cancellationToken);
 
-        // 传 `FrozenAt`：`CustomerDueDate` 的相对日阈值（配置存整数偏移，如 `20`）在此换算成具体日期。
-        //   依据 3号位 2026-11-06 回执 §三：Run 冻结日 = `FrozenStrategySnapshot.FrozenAt` 的日期部分。
-        //   不传 ⇒ 投影层遇到相对日阈值会显式抛错（fail-closed，不静默退化成字符串比较）。
-        return DemandPriorityProjector.Project(snapshot.DemandPriority, snapshot.FrozenAt);
+        // 相对日阈值（`CustomerDueDate ≤ 冻结日+20`）的换算基准。
+        //   【FULL-08 / 2026-11-09】优先用调用方传入的 **Run 级锚点**（Pegging 传 `DataCutoffTime`）：
+        //     `FrozenAt` 在缓存命中路径每次 `DateTime.Now` 重置（= 快照装载时刻），
+        //     跨午夜的同一 Run 里，先后两个域可能拿到相差一天的日期，且不报错、只影响排序。
+        //   锚点缺省（单测/夹具/无 Run 上下文）时退回 `snapshot.FrozenAt`，行为与改动前一致。
+        //   两者都拿不到 ⇒ 投影层遇到相对日阈值会显式抛错（fail-closed，不静默退化成字符串比较）。
+        var anchor = frozenAtAnchor ?? snapshot.FrozenAt;
+        return DemandPriorityProjector.Project(snapshot.DemandPriority, anchor);
     }
 }

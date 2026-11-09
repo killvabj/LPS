@@ -92,4 +92,40 @@ public class ExplanationController : ControllerBase
             return ApiResponse<ExplanationSummaryDto>.Fail(500, $"Query failed: {ex.Message}");
         }
     }
+
+    /// <summary>
+    /// Demand 数量对账读模型（**FULL-06**，0号位 11-09 任务书 §2.A）：
+    /// `GET /api/explanation/demand-reconciliation?planVersionId=…`
+    /// 同 Run／同 PlanVersion／同 Demand 的 Q/S/U **原值**+事实类型三族（判据=UnscheduledSource，非 ObjectType）；
+    /// 读侧不重算、不掩盖 S&gt;Q（211 行现值如实透出，修数=2号位 FULL-01）。
+    /// </summary>
+    [HttpGet("demand-reconciliation")]
+    public async Task<ApiResponse<List<DemandReconciliationRowDto>>> GetDemandReconciliation(
+        [FromQuery] int planVersionId,
+        [FromQuery] int? scheduleRunId = null,
+        [FromQuery] long? orderId = null,
+        [FromQuery] string? logicalDemandKey = null,
+        [FromQuery] string? unscheduledSource = null,
+        [FromQuery] int skip = 0,
+        [FromQuery] int take = 100,
+        CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            var result = await _service.QueryDemandReconciliationAsync(
+                planVersionId, scheduleRunId, orderId, logicalDemandKey,
+                unscheduledSource, skip, take, cancellationToken);
+
+            return ApiResponse<List<DemandReconciliationRowDto>>.Success(result);
+        }
+        catch (ArgumentException ex)
+        {
+            return ApiResponse<List<DemandReconciliationRowDto>>.Fail(400, ex.Message);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to query demand reconciliation facts");
+            return ApiResponse<List<DemandReconciliationRowDto>>.Fail(500, $"Query failed: {ex.Message}");
+        }
+    }
 }

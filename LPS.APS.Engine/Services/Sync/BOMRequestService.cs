@@ -49,6 +49,15 @@ public class BOMRequestService : IBOMRequestService
             spParams.Add("@RootCount", dbType: DbType.Int32, direction: ParameterDirection.Output);
             spParams.Add("@TotalOrderCount", dbType: DbType.Int32, direction: ParameterDirection.Output);
 
+            // 2026-11-09【O53】表头与明细口径对齐：**显式传日期窗，不吃 SP 的默认值**。
+            //   SP `sp_GetActiveRootBOMNOs` 的 `@StartDate` 缺省时会被置成 `CAST(GETDATE() AS DATE)`，
+            //   而本方法的明细查询自 `r14034`（2026-11-05）起只卡上界（`DueDate <= 今天+90`，逾期单必须纳入）
+            //   ⇒ 两者相差「逾期销售订单」那一截：11-07 实测 表头 182,703 / 明细 184,517，差 **1,814**
+            //     ＝当日逾期 SO 数；11-09 复算差 **837**，同构。
+            //   这里把下界放到 1900-01-01，使表头与明细同口径；上界仍显式给 `今天+90`，不依赖 SP 默认。
+            spParams.Add("@StartDate", new DateTime(1900, 1, 1), dbType: DbType.Date);
+            spParams.Add("@EndDate", DateTime.Today.AddDays(90), dbType: DbType.Date);
+
             await _connectionManager.QueryAsync<ActiveBOMNODto>(
                 "sp_GetActiveRootBOMNOs",
                 spParams,

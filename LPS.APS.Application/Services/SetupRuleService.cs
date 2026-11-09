@@ -144,7 +144,7 @@ public sealed class SetupRuleService : ISetupRuleService
             ToMaterialId = input.ToMaterialId,
             RuleType = SetupTransitionRuleType.Exact,
             SetupMinutes = input.SetupMinutes,
-            IsActive = true,
+            IsActive = input.IsActive, // #67 契约扩展（2026-11-07）：不再硬置 true，取写输入
             CreatedBy = actorUserCode,
             // CreatedAt 须显式打戳（非空 DateTime，缺省会带 0001-01-01 → 序列化空值异常）
             CreatedAt = DateTime.Now,
@@ -183,7 +183,7 @@ public sealed class SetupRuleService : ISetupRuleService
             ResourceId = input.ResourceId,
             RuleType = SetupTransitionRuleType.Default,
             SetupMinutes = input.SetupMinutes,
-            IsActive = true,
+            IsActive = input.IsActive, // #67 契约扩展（2026-11-07）：不再硬置 true，取写输入
             CreatedBy = actorUserCode,
             // CreatedAt 同病（见 CreateExactAsync 注释）：DEFAULT 创建亦须显式打戳
             CreatedAt = DateTime.Now,
@@ -219,7 +219,7 @@ public sealed class SetupRuleService : ISetupRuleService
         var version = await GetVersionForWriteAsync(existing.RuleSetVersionId, ct);
 
         var updated = BuildUpdated(existing, input.ProductionDepartmentId, input.StageCode, input.OperationCode,
-            input.ResourceId, input.FromMaterialId, input.ToMaterialId, input.SetupMinutes, actorUserCode);
+            input.ResourceId, input.FromMaterialId, input.ToMaterialId, input.SetupMinutes, input.IsActive, actorUserCode);
 
         var all = SetupTransitionRuleProjector.ExtractRules(version.ContentSnapshotJson);
         EnsureNoConflict(all, updated, excludingId: id);
@@ -248,7 +248,7 @@ public sealed class SetupRuleService : ISetupRuleService
         var version = await GetVersionForWriteAsync(existing.RuleSetVersionId, ct);
 
         var updated = BuildUpdated(existing, input.ProductionDepartmentId, input.StageCode, input.OperationCode,
-            input.ResourceId, fromMaterialId: null, toMaterialId: null, input.SetupMinutes, actorUserCode);
+            input.ResourceId, fromMaterialId: null, toMaterialId: null, input.SetupMinutes, input.IsActive, actorUserCode);
 
         var all = SetupTransitionRuleProjector.ExtractRules(version.ContentSnapshotJson);
         EnsureNoConflict(all, updated, excludingId: id);
@@ -556,7 +556,7 @@ public sealed class SetupRuleService : ISetupRuleService
     private static SetupTransitionRule BuildUpdated(
         SetupTransitionRule existing,
         int departmentId, string stageCode, string operationCode, int resourceId,
-        int? fromMaterialId, int? toMaterialId, decimal setupMinutes, string actorUserCode)
+        int? fromMaterialId, int? toMaterialId, decimal setupMinutes, bool isActive, string actorUserCode)
     {
         return new SetupTransitionRule
         {
@@ -570,7 +570,7 @@ public sealed class SetupRuleService : ISetupRuleService
             ToMaterialId = toMaterialId,
             RuleType = existing.RuleType,
             SetupMinutes = setupMinutes,
-            IsActive = existing.IsActive,
+            IsActive = isActive, // #67 契约扩展（2026-11-07）：更新可调整启停，不再沿用快照原值
             CreatedAt = existing.CreatedAt,
             CreatedBy = existing.CreatedBy,
             UpdatedAt = existing.UpdatedAt,
@@ -858,6 +858,7 @@ public sealed class SetupRuleService : ISetupRuleService
             ToMaterialId = rule.ToMaterialId,
             ToMaterialCode = toCode,
             SetupMinutes = rule.SetupMinutes,
+            IsActive = rule.IsActive, // #67 契约扩展（2026-11-07）：读回带真实启停
             Status = DeriveStatus(versionStatus),
             CreatedBy = rule.CreatedBy,
             CreatedAt = rule.CreatedAt,

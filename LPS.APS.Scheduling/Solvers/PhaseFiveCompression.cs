@@ -308,7 +308,13 @@ internal class PhaseFiveCompression
                 }
                 else
                 {
-                    reason = "Phase 2 初始排程失败，Phase 4 修复未成功";
+                    // ── 2026-11-09 FULL-04 整改：**不得用中文阶段日志当生产原因** ──
+                    //   依据 0号位 2026-10-12 §5.3 裁决：`UnscheduledTaskResult.Reason` 是 **Solver 诊断输入**，
+                    //   2号位 负责分类转存；1号位 义务是「可区分的诊断类别 + 未满足数量 + 真实约束证据」。
+                    //   原文 `"Phase 2 初始排程失败，Phase 4 修复未成功"` 是**算法内部中文阶段日志**，
+                    //   已被该裁决明令禁止。改为稳定机器可读类别（**非 15 码**，0号位 本轮明确「不捏造 15 码」）。
+                    //   人可读正文仍由下方 `phase2BlockDetail` → `SolveTraceNote` 承载，信息量不减。
+                    reason = "PHASE2_INITIAL_SCHEDULE_FAILED";
 
                     // ── 2026-10-25（响应 2号位《单域可复现样本与自查方式》§7.1）──
                     //   `Reason` **一个字不改**（既有归属结果零变化），只补**人可读正文**：
@@ -346,11 +352,11 @@ internal class PhaseFiveCompression
                 //   —— 必须区别于「完全没排下」，否则「失败批没排出来」会被「需求已修复」掩盖。
                 //   判据取**最终任务集合**而非 `RepairedTasks`：Phase2 成功的批不在 `RepairedTasks` 里，
                 //   只看 `RepairedTasks` 会把「Phase2 落了一批 / Phase4 一批没修成」误报成「完全没排下」。
-                reason = "Phase 4 局部修复后仍有执行批未排下";
+                reason = "PHASE4_PARTIAL_BATCH_UNSCHEDULED";
             }
             else
             {
-                reason = "Phase 4 局部修复后仍无法排程";
+                reason = "PHASE4_REPAIR_FAILED";
             }
 
             ReportUnscheduled(demandKey, reason);
@@ -3512,10 +3518,25 @@ internal class PhaseFiveCompression
 
         // 4. 验证FinalTask Resource硬互斥（同一资源上的时间段不重叠）
         // 非资源工序 Task（ResourceId=NULL）不占资源 → 不参与资源互斥校验（0号位 2026-09-22 裁决）
+        // ── 2026-11-09（应 2号位 Run 999423 `FAMILY_JS` 整域 0 产出）：**空占用窗不得参与互斥校验** ──
+        //   零时长任务（`EffProcMin=0` 且 `SetupMin=0`）的占用窗是 `[t, t)` —— **空集**，
+        //   按半开区间定义不与任何窗相交，语义上也不消耗资源。
+        //   但 2026-10-27 那次只修了「空窗落在别人起点/终点」的情形（那时 `a.End > b.Start` 或
+        //   `a.Start < b.End` 恰好为假）；**空窗落在别人窗口内部**时两个不等号同时成立 ⇒ 仍被误判冲突。
+        //   实测反例（`FAMILY_JS`，2027-02-11 16:15:25）：
+        //     A `ca3c097f` [2027-02-09 12:34:28 - 2027-02-12 09:38:49]（EffProcMin=1444.36）
+        //     B `ec86af23` [2027-02-11 16:15:25 - 2027-02-11 16:15:25]（EffProcMin=0）
+        //   —— B 是空窗，落在 A 的内部，被判「重叠」⇒ 整个域 `Success=false`、0 产出。
+        //   **这不是放宽硬校验**：真实重叠仍是两个非空窗，过滤条件对它们恒真，判据一字未动。
         var tasksByResource = tasks
             .Where(t => t.ResourceId is not null)
             .GroupBy(t => t.ResourceId!.Value)
-            .ToDictionary(g => g.Key, g => g.OrderBy(t => t.PlannedStartTime).ToList());
+            .ToDictionary(
+                g => g.Key,
+                g => g
+                    .Where(t => t.PlannedStartTime.AddMinutes(-(double)t.SetupTime) < t.PlannedEndTime)
+                    .OrderBy(t => t.PlannedStartTime)
+                    .ToList());
 
         foreach (var resourceGroup in tasksByResource.Values)
         {

@@ -64,13 +64,20 @@ public class BomRealtimeExpandService : IBomRealtimeExpandService
 
             if (headerExists == 0)
             {
+                // 2026-11-09（5号位《回两函》§三 确认）：实时批头状态由 'PENDING' 改 'REALTIME'。
+                //   · `Status` 列为 nvarchar(40)、**无 CHECK 约束** ⇒ 加值零 DDL（其已核）。
+                //   · 目的：把「白天实时批」与「夜间正式批的 PENDING」在状态上分开，
+                //     清理侧不必再靠 `NOT LIKE 'RT:%'` 前缀排除；切换窗口内两条谓词并存，
+                //     待本服务部署后由 5号位 撤掉前缀条件。
+                //   · 消费侧无影响：`BomBatchExpandService` 只按 SUCCESS 身份选批（实时批从无 SUCCESS），
+                //     `BOMResultPullService` 只认 READY ⇒ 本头改状态不进任何选批路径。
                 await _connectionManager.ExecuteAsync(
                     @"INSERT INTO MES_API_BOM_Request (BatchNo, Status, RootCount, CreatedAt, RetryCount)
-                      VALUES (@BatchNo, 'PENDING', 0, GETDATE(), 0)",
+                      VALUES (@BatchNo, 'REALTIME', 0, GETDATE(), 0)",
                     new { BatchNo = daytimeBatchNo },
                     db: DatabaseId.ODS);
 
-                _logger.LogInformation("白天 BOM 实时展开：已建白天批次头 BatchNo={BatchNo}（FK 锚定用）", daytimeBatchNo);
+                _logger.LogInformation("白天 BOM 实时展开：已建白天批次头 BatchNo={BatchNo}（Status=REALTIME，FK 锚定用）", daytimeBatchNo);
             }
         }
 

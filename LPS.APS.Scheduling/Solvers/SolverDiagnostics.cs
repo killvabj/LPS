@@ -254,6 +254,32 @@ public static class SolverDiagnostics
         /// <summary>`FindMergeableStageBatches` 的**候选扫描**次数（= 进入该方法且走到扫描段的次数）。</summary>
         public long MergeScanCalls;
 
+        /// <summary>
+        /// 2026-11-09 Step 1：产品时间线 `Place`（写入）调用次数。纯观测。
+        ///   用途：区分「写得更多了」与「每次写更贵了」—— 分桶画像里 `TimelinePlace` 耗时涨 13.9 倍，
+        ///   但只有次数才能判定是哪种。
+        /// </summary>
+        public long TimelinePlaceCalls;
+
+        /// <summary>
+        /// 2026-11-09 Step 1：按<b>调用来源</b>分桶的写入次数（下标 = <see cref="TimelinePlaceSource"/>）。纯观测。
+        ///   分桶画像已证明「每条需求写入次数 27 倍增长而试排次数不变」⇒ 必须定位到具体调用点。
+        /// </summary>
+        public readonly long[] TimelinePlaceBySource = new long[8];
+
+        /// <summary>
+        /// 2026-11-09：合批锚点擂台按「同 PI / 跨 PI / PI 缺失」分类的计数（应 0号位 资料要求）。
+        ///   下标 = <c>类别 * 4 + 指标</c>（类别 0=同PI / 1=跨PI / 2=PI缺失；指标见 <see cref="MergePiMetric"/>）。
+        ///   用途：回答「跨 PI 的合批候选是不是白白消耗了大量完整试排」。纯观测，不参与任何判定。
+        /// </summary>
+        public readonly long[] MergePiStats = new long[12];
+
+        /// <summary>
+        /// 2026-11-09 Step 1：产品时间线 `Compact`（增量压缩回基线）运行次数。纯观测。
+        ///   `Compact` 会整表复制外层资源字典并归并受影响资源的整条 list ⇒ 是「每次更贵」的头号嫌疑。
+        /// </summary>
+        public long TimelineCompactRuns;
+
         /// <summary>Σ 每次扫描遍历的批分组数（`groups.Count`）—— 「每条需求 O(批数)」的成本来源。</summary>
         public long MergeScanGroupSum;
 
@@ -2267,6 +2293,55 @@ public static class SolverDiagnostics
     internal static void CountMergeHit()
     {
         if (Current.Value is { } c) System.Threading.Interlocked.Increment(ref c.MergeHits);
+    }
+
+    /// <summary>2026-11-09 Step 1：产品时间线写入次数（纯观测，不参与判定）。按调用来源分桶。</summary>
+    internal static void CountTimelinePlace(TimelinePlaceSource source = TimelinePlaceSource.Unknown)
+    {
+        if (Current.Value is { } c)
+        {
+            System.Threading.Interlocked.Increment(ref c.TimelinePlaceCalls);
+            var idx = (int)source;
+            if (idx >= 0 && idx < c.TimelinePlaceBySource.Length)
+            {
+                System.Threading.Interlocked.Increment(ref c.TimelinePlaceBySource[idx]);
+            }
+        }
+    }
+
+    /// <summary>2026-11-09 Step 1：产品时间线压缩次数（纯观测，不参与判定）。</summary>
+    internal static void CountTimelineCompact()
+    {
+        if (Current.Value is { } c) System.Threading.Interlocked.Increment(ref c.TimelineCompactRuns);
+    }
+
+    /// <summary>2026-11-09：合批擂台分类统计的四个指标（下标就用作 `MergePiStats` 的偏移）。</summary>
+    internal enum MergePiMetric
+    {
+        /// <summary>本类锚批被拿到擂台上的次数。</summary>
+        Anchor = 0,
+
+        /// <summary>真正进入完整试排（`TryMergeDemandIntoStageBatch`）的次数。</summary>
+        Trial = 1,
+
+        /// <summary>完整试排累计耗时（`Stopwatch` ticks）。</summary>
+        Ticks = 2,
+
+        /// <summary>最终被选为擂台胜者的次数。</summary>
+        Adopted = 3,
+    }
+
+    /// <summary>2026-11-09：按类别累加合批擂台统计（纯观测，不参与任何判定）。</summary>
+    internal static void CountMergePi(int piClass, MergePiMetric metric, long delta = 1)
+    {
+        if (Current.Value is { } c)
+        {
+            var idx = piClass * 4 + (int)metric;
+            if (idx >= 0 && idx < c.MergePiStats.Length)
+            {
+                System.Threading.Interlocked.Add(ref c.MergePiStats[idx], delta);
+            }
+        }
     }
 
     /// <summary>2026-11-07 W1：登记一次合批**未命中**。纯观测。</summary>

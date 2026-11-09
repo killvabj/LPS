@@ -1946,7 +1946,7 @@ public class ExecutionBatchDraftTests
         Assert.True(totalShare < 10m, $"部分落定 ⇒ ΣShare 必须 < 声明量 10，实测 {totalShare}");
 
         // ④ 未排量**带数量**出口（冻结 `U-003`「不得丢数」），Reason 仍逐字可判。
-        Assert.Equal("Phase 2 初始排程失败，Phase 4 修复未成功", unscheduled.Reason);
+        Assert.Equal("PHASE2_INITIAL_SCHEDULE_FAILED", unscheduled.Reason);
         Assert.Equal(1, result.Summary.UnscheduledCount);
         Assert.True(result.Summary.ScheduledCount > 0);
     }
@@ -2003,7 +2003,7 @@ public class ExecutionBatchDraftTests
 
         // 判据取**最终任务集合**（`PhaseFiveCompression.cs` 的未排清单组装）⇒ 本例
         //   「Phase2 两批都没落、Phase4 修好一批」报此原因（区别于「完全没排下」）。
-        Assert.Equal("Phase 4 局部修复后仍有执行批未排下", unscheduled.Reason);
+        Assert.Equal("PHASE4_PARTIAL_BATCH_UNSCHEDULED", unscheduled.Reason);
         Assert.Equal(1, result.Summary.UnscheduledCount);
         Assert.True(result.Summary.ScheduledCount > 0);
     }

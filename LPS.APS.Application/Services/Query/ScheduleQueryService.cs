@@ -796,7 +796,8 @@ public class ScheduleQueryService : IScheduleQueryService
                      AND {DelayedOnDate("t_b.PlannedEndTime", "ob.CustomerDueDate")})",
             parameters);
 
-        // 3. 汇总组装（crossDomain 计数未落盘，保守返 0；estimatedOnlyCount 归 2号位 返 null —— v1.2 §三 3.3 / §九-b）
+        // 3. 汇总组装（CAND-01 防误导·0号位 11-09 §4：crossDomain 两计数未落盘 ⇒ 返 null（整键省略），
+        //    旧「保守返 0」会把"未计算"冒充"判过且为零"，作废；estimatedOnlyCount 归 2号位 返 null —— v1.2 §三 3.3）
         return new CandidateComparisonDto
         {
             TaskChangeSummary = new TaskChangeSummaryDto
@@ -805,13 +806,13 @@ public class ScheduleQueryService : IScheduleQueryService
                 Removed = removed,
                 TimeShifted = timeShifted,
                 ResourceChanged = resourceChanged,
-                CrossDomainBlocked = 0
+                CrossDomainBlocked = null   // CAND-01：未计算≠0（任务书 §4；完整计数=P1）
             },
             ImpactSummary = new ImpactSummaryDto
             {
                 ImpactedOrderCount = impactedOrders,
                 NewDelayCount = newDelays,
-                CrossDomainImpacted = 0,
+                CrossDomainImpacted = null,   // CAND-01：未计算≠0（任务书 §4）
                 EstimatedOnlyCount = null
             },
             BaseSummary = baseSummary,

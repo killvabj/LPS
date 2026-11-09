@@ -27,4 +27,18 @@ public interface IExplanationQueryRepository
     Task<ExplanationSummaryDto> GetSummaryAsync(
         int planVersionId,
         CancellationToken ct = default);
+
+    /// <summary>
+    /// Demand 数量对账读模型（**FULL-06**）：按 `EvidenceJson.UnscheduledSource` 三族取 Q/S/U 原值，
+    /// 不重算、不掩盖 S&gt;Q（详见 <see cref="DemandReconciliationRowDto"/> 类型注释）。
+    /// </summary>
+    Task<List<DemandReconciliationRowDto>> QueryDemandReconciliationAsync(
+        int planVersionId,
+        int? scheduleRunId = null,
+        long? orderId = null,
+        string? logicalDemandKey = null,
+        string? unscheduledSource = null,
+        int skip = 0,
+        int take = 100,
+        CancellationToken ct = default);
 }

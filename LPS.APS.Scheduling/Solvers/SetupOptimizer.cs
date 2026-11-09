@@ -519,6 +519,29 @@ public class SetupOptimizer
 /// - 放置/移动/合并时由调用方同步 Place/Remove（与 resourceOccupancy 成对维护）。
 /// 性能：二分查询 O(log n) + 有序插入；10万 Task 规模标定如现瓶颈再换结构（性能标定阶段处理）。
 /// </summary>
+/// <summary>
+/// 2026-11-09 Step 1：`ResourceProductTimeline.Place` 的**调用来源**，仅用于分桶计数。
+///   目的：分桶画像显示「每条需求的写入次数从 62 涨到 1,637（27 倍）」，但试排次数是平的
+///   ⇒ 必须知道写到底来自哪条路径，否则无从下手。纯观测，不参与任何判定。
+/// </summary>
+internal enum TimelinePlaceSource
+{
+    /// <summary>未打标（Phase4/Phase5 等非 Phase2 路径，本轮窗口内不活跃）。</summary>
+    Unknown = 0,
+
+    /// <summary>Phase2 排程路径 A（`PhaseTwoInitialScheduler.cs:4410`，正排找槽后落位）。</summary>
+    Phase2ScheduleA = 1,
+
+    /// <summary>Phase2 排程路径 B（`PhaseTwoInitialScheduler.cs:4703`，倒排落位）。</summary>
+    Phase2ScheduleB = 2,
+
+    /// <summary>Phase2 合批摘除后重放（`PhaseTwoInitialScheduler.cs:9771`）。</summary>
+    Phase2MergeDetach = 3,
+
+    /// <summary>Phase2 落定重建（`PhaseTwoInitialScheduler.cs:10157`）。</summary>
+    Phase2Rebuild = 4,
+}
+
 internal sealed class ResourceProductTimeline
 {
     // ── 2026-10-20 八次定位：COW 深拷 ⇒「不可变基线 + 小增量覆盖」（性能，语义不变）──
@@ -723,6 +746,8 @@ internal sealed class ResourceProductTimeline
     /// </summary>
     private void Compact()
     {
+        SolverDiagnostics.CountTimelineCompact();   // 2026-11-09 Step 1：压缩次数（纯观测）
+
         // 增量层若正被子克隆共享，先分离：下面要清空自己的增量，不能波及子克隆。
         EnsureOwnDelta();
 
@@ -873,10 +898,12 @@ internal sealed class ResourceProductTimeline
         => tombstones is not null && tombstones.TryGetValue(entry, out var n) ? n : 0;
 
     /// <summary>登记一个已放置 Task 的产品与占用结束时间（追加进本实例增量：O(1)、零拷贝）。</summary>
-    public void Place(int resourceId, DateTime occEnd, int materialId)
+    public void Place(int resourceId, DateTime occEnd, int materialId,
+                      TimelinePlaceSource source = TimelinePlaceSource.Unknown)
     {
         // 2026-10-20 八次定位：产品时间线**写入**总成本（含增量分离 + 追加 + 偶发压缩）。纯观测。
         long sw = SolverDiagnostics.HotspotStart();
+        SolverDiagnostics.CountTimelinePlace(source);   // 2026-11-09 Step 1：按来源分桶计数（纯观测）
 
         // 2026-10-20 二十二次定位：单独量「克隆后首次写入的整层增量分离」。纯观测。
         long swOwn = SolverDiagnostics.HotspotStart();

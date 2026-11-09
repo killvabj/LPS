@@ -22,6 +22,7 @@ public sealed class DemandPriorityFixtureProvider : IDemandPriorityConfigProvide
     /// </summary>
     public Task<DemandPriorityConfig> GetPriorityConfigAsync(
         long strategyProfileVersionId,
+        DateTime? frozenAtAnchor = null,
         CancellationToken cancellationToken = default)
     {
         // INTEGRATION TODO: 实际实现应调用3号位API获取FrozenStrategySnapshot

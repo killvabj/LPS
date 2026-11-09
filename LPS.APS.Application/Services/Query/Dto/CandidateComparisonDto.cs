@@ -39,9 +39,10 @@ public class TaskChangeSummaryDto
 
     /// <summary>
     /// 跨域阻挡任务数（复用 G7 域依赖）
-    /// ⚠️ 任务级跨域阻挡判定未落盘（与 G2-b 同一缺口），v1.2 保守返回 0，待 2号位 对齐（v1.2 §九-b）
+    /// **CAND-01 防误导（0号位任务书 11-09 §4）**：判定未落盘 ⇒ 返回 null（WhenWritingNull 整键省略），
+    /// 不再以肯定态 0 冒充"判过且为零"（旧「v1.2 保守返 0」作废）。完整跨域计数属 P1，勿在 P0 开工。
     /// </summary>
-    public int CrossDomainBlocked { get; set; }
+    public int? CrossDomainBlocked { get; set; }
 }
 
 /// <summary>影响汇总（H1）</summary>
@@ -55,9 +56,10 @@ public class ImpactSummaryDto
 
     /// <summary>
     /// 跨域影响数（复用 G7 域依赖）
-    /// ⚠️ 任务级跨域影响计数未对齐，v1.2 保守返回 0，待 2号位 对齐（v1.2 §九-b）
+    /// **CAND-01 防误导（0号位任务书 11-09 §4）**：计数未对齐 ⇒ 返回 null（整键省略），不以 0 冒充真值。
+    /// 完整跨域候选影响计算列为 P1。
     /// </summary>
-    public int CrossDomainImpacted { get; set; }
+    public int? CrossDomainImpacted { get; set; }
 
     /// <summary>订单级估算数（⚠️ 2号位 边界，v1.2 未对齐返回 null，见 v1.2 §三 3.3）</summary>
     public int? EstimatedOnlyCount { get; set; }

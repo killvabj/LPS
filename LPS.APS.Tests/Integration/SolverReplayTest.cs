@@ -224,5 +224,18 @@ public class SolverReplayTest
         _output.WriteLine("");
         _output.WriteLine("   ⚠ `Counters.HotspotMs` 的跨度**会嵌套**（试排包含排程，排程包含找槽），"
             + "所以各槽相加**大于** P2 是正常的；只有**逐拍做差**才能看出这一段时间谁在涨。");
+
+        // ── 合批采纳链（纯观测读数，用来判定「锚点擂台是不是纯空转」）──────────────
+        //   判据链：AnchorFound → TrialStarted → (HardRejectedCalendar | ComparedRejected | Adopted)
+        //   采纳数取差值 —— 计数器里没有独立的 Adopted 字段。
+        var adopted = c.MergeTrialStarted - c.MergeHardRejectedCalendar - c.MergeComparedRejected;
+        _output.WriteLine("");
+        _output.WriteLine("── 合批采纳链 ──────────────────────────────────────────────");
+        _output.WriteLine($"   锚点找到 {c.MergeAnchorFound,12:N0} | 开始试排 {c.MergeTrialStarted,12:N0} | "
+            + $"硬拒(日历) {c.MergeHardRejectedCalendar,10:N0} | 比较落败 {c.MergeComparedRejected,10:N0} | "
+            + $"⇒ 采纳 {adopted,10:N0}");
+        _output.WriteLine($"   单工序路径：尝试 {c.MergeAttempts,12:N0} | 命中 {c.MergeHits,12:N0} | "
+            + $"未命中 {c.MergeMisses,12:N0}");
+        _output.WriteLine($"   无合法锚点 {c.MergeNotEligible,12:N0} | 被执行批身份守卫挡 {c.MergeIdentityUnrepresentable,12:N0}");
     }
 }

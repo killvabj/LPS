@@ -228,6 +228,18 @@ public static class HangfireServiceExtensions
             mute ? NeverFireCron :"50 1 * * *",
             new RecurringJobOptions { TimeZone = TimeZoneInfo.Local });
 
+        // BOM 请求残留清理（生产：每日01:00）— 5号位 2026-11-09《回两函》§四
+        // ⚠️ 责任：5号位 出 SP＋管口径＋验收；2号位 每日 EXEC＋排期＋值守；Owner 授权注册（已于 2026-11-09 完成）
+        // ⚠️ 时间点 01:00 在 bom-request-push（00:00）与 nightly-batch（00:30）之后：
+        //    段1 谓词是 `CreatedAt < 当日`，当日推送的批不会被清；跨日的 PENDING 才清。
+        // 段1 PENDING∧非RT∧跨日 → 先删明细后翻头 SUPERSEDED；段2 超30天 → 先删明细再删头；段3 RT: 头不动
+        // 日志 MES_API_BOM_Request_Log，BatchNo='CLEANUP_yyyyMMdd'（全零行＝当晚干净，断档＝日任务没跑）
+        RecurringJob.AddOrUpdate<IBomResidueCleanupService>(
+            "bom-request-residue-cleanup",
+            service => service.CleanupAsync(CancellationToken.None),
+            mute ? NeverFireCron : "0 1 * * *",
+            new RecurringJobOptions { TimeZone = TimeZoneInfo.Local });
+
         // 物料×阶段→默认生产部门 上下文重建（生产：每日01:55）— §4.3c MaterialStageDeptContext
         // ⚠️ 排在 domain-dependency-scan（01:50）之后、scheduling-trigger（02:00）之前
         // 全量重建 MaterialStageDeptContext（SCD Type 2），供 1号位排程按 (MaterialId,StageCode) 锁定 Routing 三件套

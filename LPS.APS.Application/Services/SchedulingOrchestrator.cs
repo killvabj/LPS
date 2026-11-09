@@ -390,23 +390,48 @@ public class SchedulingOrchestrator : ISchedulingOrchestrator
 
                 // 依赖感知阻断：仅当本 Domain 直接/间接依赖某个已失败上游时才阻断（§5/§7/§15/§23），
                 // 而非一刀切阻断所有后续 Domain。
+                //
+                // 【2026-11-09 O52】阻断前先算「真影响」，**受影响订单为 0 就不阻断**。
+                //   实测教训（Run 999423）：`FAMILY_JS` 失败后按传递闭包连带打死 LGJ/TZP/VALVE/WKQ，
+                //   4 域合计 30,385 单被阻断，而按一层 BOM 反查**真正引用 JS 那 14 个半成品的订单仅 127 单（0.42%）**，
+                //   其中 `FAMILY_LGJ` 593 单**受影响 0**。域级闭包判定过粗，会把本来能排的域整域判死。
+                //   口径：受影响 = 本域订单（`[Order]`）× 其直接 BOM 子件 × 失败上游在该 PV 产出的半成品。
                 if (failedDomainKeys.Count > 0
                     && upstreamClosure.TryGetValue(domainKey, out var upstreams)
                     && upstreams.Overlaps(failedDomainKeys))
                 {
-                    await BlockDomainAsync(planVersion.Id);
-                    _logger.LogWarning(
-                        "[{RunId}] Domain {DomainKey} 因上游失败被阻断: PlanVersionId={PlanVersionId}，失败上游={Upstream}",
-                        scheduleRunId, domainKey, planVersion.Id, string.Join(",", failedDomainKeys));
-                    domainResults.Add(new SchedulingRunResult
+                    var hitUpstreams = upstreams
+                        .Where(u => failedDomainKeys.Contains(u, StringComparer.OrdinalIgnoreCase))
+                        .OrderBy(u => u, StringComparer.OrdinalIgnoreCase)
+                        .ToList();
+
+                    var affectedOrders = await CountAffectedOrdersAsync(
+                        planVersion.Id, hitUpstreams);
+
+                    if (affectedOrders == 0)
                     {
-                        PlanVersionId = planVersion.Id,
-                        VersionCode   = planVersion.VersionCode,
-                        IsSuccess     = false,
-                        ErrorMessage  = $"上游 Domain 失败被阻断（失败上游={string.Join(",", failedDomainKeys)}）"
-                    });
-                    failedDomainKeys.Add(domainKey);
-                    continue;
+                        // 上游失败但本域没有任何订单引用其产出 ⇒ 不阻断，正常排程（WARN 留痕，不静默）
+                        _logger.LogWarning(
+                            "[{RunId}] Domain {DomainKey} 的上游 {Upstream} 已失败，但本域**无订单引用其产出** ⇒ 不阻断，正常排程（UPSTREAM_FAILED_NO_IMPACT）",
+                            scheduleRunId, domainKey, string.Join(",", hitUpstreams));
+                    }
+                    else
+                    {
+                        await BlockDomainAsync(planVersion.Id);
+                        _logger.LogWarning(
+                            "[{RunId}] Domain {DomainKey} 因上游失败被阻断: PlanVersionId={PlanVersionId}，失败上游={Upstream}，受影响订单={Affected}",
+                            scheduleRunId, domainKey, planVersion.Id,
+                            string.Join(",", hitUpstreams), affectedOrders);
+                        domainResults.Add(new SchedulingRunResult
+                        {
+                            PlanVersionId = planVersion.Id,
+                            VersionCode   = planVersion.VersionCode,
+                            IsSuccess     = false,
+                            ErrorMessage  = $"上游 Domain 失败被阻断（失败上游={string.Join(",", hitUpstreams)}；受影响订单={affectedOrders}）"
+                        });
+                        failedDomainKeys.Add(domainKey);
+                        continue;
+                    }
                 }
 
                 // 失败回滚锚点：本 Domain 的消耗若因失败不落库，账本也不能留下痕迹
@@ -529,7 +554,7 @@ public class SchedulingOrchestrator : ISchedulingOrchestrator
     /// <summary>O38 聚合读数。</summary>
     private sealed class StaleCreatedDispatchStat
     {
-        public int RowCount { get; set; }
+        public int StaleRowCount { get; set; }
         public int WorkOrderCount { get; set; }
         public decimal Qty { get; set; }
     }
@@ -591,14 +616,17 @@ public class SchedulingOrchestrator : ISchedulingOrchestrator
         var prevSnapshotAt = prev.PrevSnapshotAt.Value;
 
         var stat = await _connectionManager.QueryFirstOrDefaultAsync<StaleCreatedDispatchStat>(
-            @"SELECT COUNT(*) AS RowCount,
+            // 2026-11-07：列别名**不能叫 `RowCount`** —— `ROWCOUNT` 是 T-SQL 保留字（`SET ROWCOUNT n`），
+            //   `AS RowCount` 报「关键字 'RowCount' 附近有语法错误」，连带把 `WHERE` 的 `AND` 也判错；
+            //   真跑 Run 999423 收口时 `WarnStaleCreatedDispatchRowsAsync` 即因此抛错、整个 Run 落 FAILED。
+            @"SELECT COUNT(*) AS StaleRowCount,
                      COUNT(DISTINCT d.MESWorkOrderNo) AS WorkOrderCount,
                      ISNULL(SUM(d.Quantity), 0) AS Qty"
             + StaleCreatedDispatchPredicate,
             new { Run = scheduleRunId, PrevRun = prevRun, PrevSnapshotAt = prevSnapshotAt },
             db: DatabaseId.APS);
 
-        if (stat == null || stat.RowCount == 0)
+        if (stat == null || stat.StaleRowCount == 0)
         {
             return;
         }
@@ -617,7 +645,7 @@ public class SchedulingOrchestrator : ISchedulingOrchestrator
             "（Run={Run} / 上一份快照 Run={PrevRun}），**已按第三项持续扣减**。" +
             "⇒ 请人工到 MES 侧确认这些工单是否确实不存在；确认不存在后走 A5（`SNAPSHOT_MISSING` → FAILED → 重发）。" +
             "**本方不自动释放，避免与 MES 双建。** 样本：{Sample}",
-            stat.RowCount,
+            stat.StaleRowCount,
             stat.WorkOrderCount,
             stat.Qty,
             scheduleRunId,
@@ -1641,6 +1669,38 @@ public class SchedulingOrchestrator : ISchedulingOrchestrator
     }
 
     /// <summary>
+    /// 统计「本域有多少订单真正引用了失败上游的产出」（O52，2026-11-09）。
+    ///
+    /// 口径：`[Order]`（本 PV） × `APS_BOM_RAW` **直接子件** × `Domain_Dependency` 中这些上游域的边料。
+    /// 只算**一层** BOM：多层展开会把量放大、且单域十万单级别成本高；一层足以区分
+    /// 「整域无影响」（可放行）与「确有影响」（需阻断），这正是本判据要做的二选一。
+    ///
+    /// 实测校准（Run 999423 / `FAMILY_JS` 失败）：LGJ 593 单 → **0**；TZP 20,782 → **16**；
+    /// VALVE 8,884 → **38**；WKQ 126 → **73**。合计 30,385 单中真受影响仅 127 单。
+    /// </summary>
+    private async Task<int> CountAffectedOrdersAsync(
+        int planVersionId,
+        IReadOnlyCollection<string> upstreamDomainKeys)
+    {
+        if (upstreamDomainKeys.Count == 0) return 0;
+
+        var json = System.Text.Json.JsonSerializer.Serialize(upstreamDomainKeys);
+        return await _connectionManager.QueryFirstOrDefaultAsync<int>(
+            @"SELECT COUNT(DISTINCT o.OrderNo)
+              FROM [Order] o
+              WHERE o.PlanVersionId = @PlanVersionId
+                AND EXISTS (
+                    SELECT 1
+                    FROM APS_BOM_RAW b
+                    INNER JOIN Domain_Dependency d ON d.ChildMaterialCode = b.ChildMaterialCode
+                    WHERE b.ParentMaterialCode = o.MaterialCode
+                      AND d.UpstreamDomainCode IN (SELECT [value] FROM OPENJSON(@Domains)))",
+            new { PlanVersionId = planVersionId, Domains = json },
+            db: DatabaseId.APS,
+            commandTimeout: 300);
+    }
+
+    /// <summary>
     /// 阶段1: 装载排程沙盘（从APS库读取数据组装 SchedulingContext）
     /// 
     /// 子步骤（2号位端到端通路，**2026-10-13 按代码更正**）：
@@ -2557,7 +2617,76 @@ public class SchedulingOrchestrator : ISchedulingOrchestrator
     /// 构建每个 Domain 的传递上游闭包（直接 + 间接上游），用于失败阻断按依赖边传播。
     /// 无依赖边时返回空字典（不阻断，全部按冻结顺序执行）。
     /// </summary>
-    private static Dictionary<string, HashSet<string>> BuildUpstreamClosure(
+    /// <summary>
+    /// Tarjan 强连通分量（O52，2026-11-09）。
+    ///
+    /// 为什么需要：`Domain_Dependency` 的边按「半成品物料在域间流动」聚合，A 供 B、B 也供 A ⇒ 必然成环。
+    /// 实测（2026-11-09）26 条边里至少四组互为上下游：CYL↔TZP／QT↔XC／CYL↔VALVE／TZP↔LGJ。
+    /// 环内按传递闭包互相阻断 ⇒ 任一域失败会连坐整环。
+    ///
+    /// 规模：节点＝本 Run 的域数（实测 11），递归深度安全。
+    /// </summary>
+    internal static Dictionary<string, int> ComputeStronglyConnectedComponents(
+        List<(string Upstream, string Downstream)> edges,
+        IReadOnlyList<string> domainKeys)
+    {
+        var adj = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
+        foreach (var dk in domainKeys) adj[dk] = new List<string>();
+        foreach (var (up, dn) in edges)
+        {
+            if (adj.TryGetValue(up, out var list) && adj.ContainsKey(dn)) list.Add(dn);
+        }
+
+        var index = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        var low = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        var onStack = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var stack = new Stack<string>();
+        var component = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        var nextIndex = 0;
+        var nextComponent = 0;
+
+        void StrongConnect(string v)
+        {
+            index[v] = nextIndex;
+            low[v] = nextIndex;
+            nextIndex++;
+            stack.Push(v);
+            onStack.Add(v);
+
+            foreach (var w in adj[v])
+            {
+                if (!index.ContainsKey(w))
+                {
+                    StrongConnect(w);
+                    low[v] = Math.Min(low[v], low[w]);
+                }
+                else if (onStack.Contains(w))
+                {
+                    low[v] = Math.Min(low[v], index[w]);
+                }
+            }
+
+            if (low[v] != index[v]) return;
+
+            string popped;
+            do
+            {
+                popped = stack.Pop();
+                onStack.Remove(popped);
+                component[popped] = nextComponent;
+            } while (!string.Equals(popped, v, StringComparison.OrdinalIgnoreCase));
+            nextComponent++;
+        }
+
+        foreach (var dk in domainKeys)
+        {
+            if (!index.ContainsKey(dk)) StrongConnect(dk);
+        }
+
+        return component;
+    }
+
+    internal static Dictionary<string, HashSet<string>> BuildUpstreamClosure(
         List<(string Upstream, string Downstream)> edges,
         IReadOnlyList<string> domainKeys)
     {
@@ -2568,11 +2697,23 @@ public class SchedulingOrchestrator : ISchedulingOrchestrator
         foreach (var dk in domainKeys)
             closure[dk] = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
+        // 【2026-11-09 O52】先做 SCC 缩点：**同一强连通分量内的域不互相阻断**。
+        //   边按「半成品在域间流动」聚合，双向流动必然成环（实测 CYL↔TZP／QT↔XC／CYL↔VALVE／TZP↔LGJ 四组）；
+        //   环内若按传递闭包互相阻断，任一域失败会把整环连坐。
+        //   缩点后：同分量内不连边（各自担自己的失败），环外真上下游照旧传播。
+        var scc = ComputeStronglyConnectedComponents(edges, domainKeys);
+
         var adjacency = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
         foreach (var dk in domainKeys)
             adjacency[dk] = new List<string>();
         foreach (var (up, dn) in edges)
-            adjacency[up].Add(dn);
+        {
+            // 两端都必须在本 Run 的域集合内，否则 BFS 走到域外节点会 KeyNotFound
+            if (!adjacency.TryGetValue(up, out var edgeList) || !adjacency.ContainsKey(dn)) continue;
+            if (scc.TryGetValue(up, out var c1) && scc.TryGetValue(dn, out var c2) && c1 == c2)
+                continue;   // 同分量：不连边，避免环内互相阻断
+            edgeList.Add(dn);
+        }
 
         // 对每个源节点 BFS，把源标记为其所有可达下游的传递上游
         foreach (var dk in domainKeys)

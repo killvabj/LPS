@@ -22,6 +22,9 @@ public enum YieldMatchLevel
 
     /// <summary>该物料**没有任何可用规则** ⇒ 100 兜底（不放大）；即「缺配」。</summary>
     NO_CONFIG = 4,
+
+    /// <summary>未命中该物料精确，命中「空 MaterialId（物料编码）＋该 Stage」的通配规则（全物料该 Stage）。</summary>
+    STAGE_WILDCARD = 5,
 }
 
 /// <summary>良率取值结果：百分数 ＋ 来源等级。</summary>
@@ -33,11 +36,13 @@ public readonly record struct YieldResolution(decimal Percent, YieldMatchLevel L
 /// **分 Stage** 计划良率解析（G-1「逐 Stage 计划加工量」的良率口径；
 /// 1号位 2026-10-25 核证回执 §五 点名，参数次序由 3号位 2026-10-23 五项会签回执第 2 项定）。
 ///
-/// 【三级次序】
+/// 【四级次序】
 ///   ① `(MaterialCode, StageCode)` **精确命中** → 用它；
 ///   ② 未命中 → 该物料的**物料级默认**（`StageCode` 为空的行）；
-///   ③ 两者皆无 / 值越界（≤0 或 &gt;100）→ **100**（不放大，与既有缺配兜底同向）；
-///   ④ 同一键重复发布 → **取最低良率**（3号位 回执逐字「运行时取最低良率兜底」）。
+///   ③ 仍无 → **全物料 Stage 通配**（`MaterialId`（物料编码）为空的规则，匹配该 `StageCode` 的所有物料，契约升版）；
+///   ④ 全无 / 值越界（≤0 或 &gt;100）→ **100**（不放大，与既有缺配兜底同向）；
+///   ⑤ 同一键重复发布 → **取最低良率**（3号位 回执逐字「运行时取最低良率兜底」）。
+///   注：`MaterialId` 空串 = 全物料该 Stage 通配（不再跳过）；空 M + 空 Stage 的「全局通配」本轮不开放。
 ///
 /// 【来源标记（R04 Y-02／Y-03）】<see cref="ResolveWithSource"/> 除数值外还返回
 ///   <see cref="YieldMatchLevel"/>，区分「精确命中／回退物料默认／规则越界／完全缺配」四种情形。
@@ -67,15 +72,37 @@ public static class PlanningYieldResolver
         if (yields is not { Count: > 0 } || string.IsNullOrWhiteSpace(materialCode))
             return new YieldResolution(NoLoss, YieldMatchLevel.NO_CONFIG);
 
-        decimal? stageExact = null;
-        decimal? materialDefault = null;
+        decimal? stageExact = null;          // 优先级1 物料精确 Stage
+        decimal? materialDefault = null;     // 优先级2 物料级默认（StageCode 空）
+        decimal? wildcardStage = null;       // 优先级3 空 MaterialId（物料编码）＋该 Stage ⇒ 全物料该 Stage 通配
         var sawOutOfRange = false;
+        var sawWildcardStageOutOfRange = false;
         var hasStageCode = !string.IsNullOrWhiteSpace(stageCode);
 
         foreach (var rule in yields)
         {
             if (rule is null) continue;
-            if (!string.Equals(rule.MaterialId, materialCode, StringComparison.OrdinalIgnoreCase)) continue;
+
+            var isWildcard = string.IsNullOrWhiteSpace(rule.MaterialId);   // 空 MaterialId = 全物料通配（契约升版）
+            if (isWildcard)
+            {
+                // 通配规则：只认带该 Stage 的全物料（MaterialId 空串 + StageCode 空 ⇒ 无范围通配，忽略）
+                var ruleStageLevel = !string.IsNullOrWhiteSpace(rule.StageCode);
+                if (!ruleStageLevel) continue;   // 空 M + 空 Stage 的「全局通配」本轮不开放，避免隐式放大范围
+                if (!(hasStageCode && string.Equals(rule.StageCode, stageCode, StringComparison.OrdinalIgnoreCase)))
+                    continue;                    // 别的 Stage 的通配，与本次无关
+                if (rule.YieldPercent <= 0m || rule.YieldPercent > NoLoss)
+                {
+                    sawWildcardStageOutOfRange = true;
+                    continue;
+                }
+                if (wildcardStage is null || rule.YieldPercent < wildcardStage.Value)
+                    wildcardStage = rule.YieldPercent;
+                continue;
+            }
+
+            if (!string.Equals(rule.MaterialId, materialCode, StringComparison.OrdinalIgnoreCase))
+                continue;
 
             var isStageLevel = !string.IsNullOrWhiteSpace(rule.StageCode);
             if (isStageLevel
@@ -100,11 +127,14 @@ public static class PlanningYieldResolver
             }
         }
 
+        // 优先级：物料精确 Stage > 物料级默认 > Stage 通配（全物料）> 越界兜底 > 缺配兜底
         if (stageExact is not null)
             return new YieldResolution(stageExact.Value, YieldMatchLevel.STAGE_EXACT);
         if (materialDefault is not null)
             return new YieldResolution(materialDefault.Value, YieldMatchLevel.MATERIAL_DEFAULT);
-        if (sawOutOfRange)
+        if (wildcardStage is not null)
+            return new YieldResolution(wildcardStage.Value, YieldMatchLevel.STAGE_WILDCARD);
+        if (sawOutOfRange || sawWildcardStageOutOfRange)
             return new YieldResolution(NoLoss, YieldMatchLevel.OUT_OF_RANGE);
 
         return new YieldResolution(NoLoss, YieldMatchLevel.NO_CONFIG);
