@@ -51,6 +51,8 @@ export interface ParameterRow {
   type: 'NUMBER' | 'BOOLEAN' | 'STRING' | 'PERCENT' | 'DURATION' | 'TEXT_LIST'
   /** 中文标签（来自 `parameterBlockFields` 字段目录；目录外老键为 undefined） */
   label?: string
+  /** 一句话业务说明（字段目录口径；表格里做参数名悬停提示） */
+  hint?: string
   /** 内容层枚举可选项（有值时渲染下拉；value 是写回 JSON 的数字序号） */
   options?: readonly ParameterEnumOption[]
   /** 数值边界（后端发布校验口径；有值时 ElInputNumber 夹住） */
@@ -100,6 +102,7 @@ export function flattenBlocks(blocks: ParameterSetBlocks): ParameterRow[] {
           value: isTextList ? value : JSON.stringify(value),
           type: isTextList ? 'TEXT_LIST' : 'STRING',
           label: def?.label,
+          hint: def?.hint,
           inert: isInertBlockField(block, keyPath),
           hidden,
           fixed,
@@ -116,6 +119,7 @@ export function flattenBlocks(blocks: ParameterSetBlocks): ParameterRow[] {
         value,
         type: inferType(path[path.length - 1] ?? '', value),
         label: def?.label,
+        hint: def?.hint,
         options: lookupParameterEnum(block, path),
         min: limits.min,
         max: limits.max,

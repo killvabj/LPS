@@ -929,6 +929,11 @@ internal class PhaseTwoInitialScheduler
 
             // 步骤 1：为每条候选求工序列表（纯读，不改任何上下文）。
             var plannedCandidates = new List<(RoutePathKey Key, RoutingGraph Graph, List<OperationNode> Ops)>();
+            // 2026-11-07 v5.0 A3：候选工序序列指纹集合 —— **只用于统计重复候选条数**。
+            //   判据口径 = 「本需求内工序序列逐字相同」⇒ 这是记忆化能省钱的**上界**；
+            //   真实记忆化还要求占用基线/前置承接/Setup 邻居等另外几项相等，只会比这个数更小。
+            //   纯观测：不影响候选顺序、不影响择优、不改任何上下文。
+            var opSignatureSeen = new HashSet<string>(StringComparer.Ordinal);
             foreach (var (pathKey, graph) in candidatePaths)
             {
                 var ops = GetOperationsFromStage(
@@ -994,6 +999,10 @@ internal class PhaseTwoInitialScheduler
                 }
 
                 plannedCandidates.Add((pathKey, graph, ops));
+
+                // 2026-11-07 v5.0 A3：登记本条候选（下标在 Add 之前 = 原下标）。
+                SolverDiagnostics.CountRoutingCandidate(
+                    plannedCandidates.Count - 1, ops.Count, !opSignatureSeen.Add(OpSequenceSignature(ops)));
             }
 
             if (plannedCandidates.All(p => p.Ops.Count == 0))
@@ -3837,7 +3846,35 @@ internal class PhaseTwoInitialScheduler
     /// <summary>
     /// 合批份额**浅拷**（候选试排隔离用）。
     ///
-    /// ── 2026-10-19 性能整改：由「深拷」改为「浅拷 + 写时换槽」 ──
+    //// <summary>
+    /// 2026-11-07 v5.0 A3：候选**工序序列指纹**。
+    ///   【用途】只回答一个问题：同一需求的两条 Routing 候选，是否**工序序列逐字相同**。
+    ///     相同 ⇒ 在「占用基线 / 前置承接 / Setup 邻居 / 批身份 / 目标」也相同的条件下，
+    ///     两次完整试排的结果必然相同 ⇒ 这是**记忆化的上界**。
+    ///     ⚠ 这只是**必要条件**，不是充分条件；真实可省的量只会更小，不会更大。
+    ///   【为什么不用对象引用】两条候选来自不同 Path 的图，对象不复用；
+    ///     指纹取「Stage / 工序码 / 部门 / 标准工时 / 规划模式」——这五项决定下游排程输入。
+    ///   【成本】每条 (需求 × Path) 只算一次（不是每次试排），可忽略。
+    ///   纯观测，不参与任何业务判定。
+    /// </summary>
+    private static string OpSequenceSignature(List<OperationNode> ops)
+    {
+        if (ops.Count == 0) return string.Empty;
+
+        var sb = new System.Text.StringBuilder(ops.Count * 28);
+        foreach (var op in ops)
+        {
+            sb.Append(op.StageCode ?? "-").Append('/')
+              .Append(op.OperationCode).Append('/')
+              .Append(op.ProductionDepartmentId).Append('/')
+              .Append(op.StandardDuration.ToString("F4", System.Globalization.CultureInfo.InvariantCulture)).Append('/')
+              .Append(op.OperationPlanningMode).Append('|');
+        }
+
+        return sb.ToString();
+    }
+
+    // ── 2026-10-19 性能整改：由「深拷」改为「浅拷 + 写时换槽」 ──
     /// 【为什么】旧写法 `source.ToDictionary(kv => kv.Key, kv => new List&lt;&gt;(kv.Value))` 对**每个条目**
     ///   都 `new List&lt;&gt;` 一次。实测（`正式基准_规模扫描_热点定位`，FinalTask=11,124 / resources=16）：
     ///   本方法被调用 **115,521** 次、份额表约 **7,400** 条 ⇒ 约 **8.5 亿次 `List` 分配**，
@@ -3882,13 +3919,26 @@ internal class PhaseTwoInitialScheduler
     private readonly List<(string Key, bool Existed, List<(string DemandKey, decimal ShareQty)>? Previous)>
         _shareUndo = new();
 
-    /// <summary>2026-10-20 十六刀：当前被日志跟踪的份额表实例（`null` = 不跟踪）。</summary>
-    private Dictionary<string, List<(string DemandKey, decimal ShareQty)>>? _shareUndoTarget;
+    /// <summary>
+    /// 2026-11-07 v5.0 A1：被日志跟踪的份额表实例**栈**（空 = 不跟踪）。
+    ///   【为什么从单值改成栈】旧实现是单个字段 ⇒ 嵌套使用会互相顶掉：
+    ///     外层（候选试排）开始跟踪真表后，内层（锚点擂台）再 `BeginShareUndo` 会把外层顶掉，
+    ///     内层回滚末尾的 `= null` 又让外层**从此不再记账** ⇒ 外层回滚时漏还原且不报错。
+    ///     改成栈后**取栈顶**（= 最内层）判定是否记账，与旧单值语义在「只有一层」时**逐位相同**；
+    ///     出栈条件与旧实现一致（只在日志回退到空时清栈）。
+    ///   纯记录结构，**不改任何业务判定**。
+    /// </summary>
+    private readonly Stack<Dictionary<string, List<(string DemandKey, decimal ShareQty)>>> _shareUndoTargets = new();
+
+    /// <summary>当前是否由**最内层**日志帧跟踪 <paramref name="table"/>（旧单值语义的等价写法）。</summary>
+    private bool IsShareUndoTarget(
+        Dictionary<string, List<(string DemandKey, decimal ShareQty)>> table)
+        => _shareUndoTargets.Count > 0 && ReferenceEquals(_shareUndoTargets.Peek(), table);
 
     /// <summary>2026-10-20 十六刀：开启份额撤销日志，返回当前日志水位（供 <see cref="RollbackShareUndo"/> 用）。</summary>
     private int BeginShareUndo(Dictionary<string, List<(string DemandKey, decimal ShareQty)>> table)
     {
-        _shareUndoTarget = table;
+        _shareUndoTargets.Push(table);
         return _shareUndo.Count;
     }
 
@@ -3913,7 +3963,13 @@ internal class PhaseTwoInitialScheduler
         _shareUndo.RemoveRange(mark, _shareUndo.Count - mark);
         if (_shareUndo.Count == 0)
         {
-            _shareUndoTarget = null;
+            // 与旧实现等价：日志退到空 ⇒ 不再跟踪任何表。
+            _shareUndoTargets.Clear();
+        }
+        else if (IsShareUndoTarget(table))
+        {
+            // 本帧已回滚完，退出最内层；外层帧（若有）继续记账。
+            _shareUndoTargets.Pop();
         }
     }
 
@@ -3923,7 +3979,7 @@ internal class PhaseTwoInitialScheduler
         string key,
         List<(string DemandKey, decimal ShareQty)> value)
     {
-        if (ReferenceEquals(table, _shareUndoTarget))
+        if (IsShareUndoTarget(table))
         {
             _shareUndo.Add((key, table.TryGetValue(key, out var previous), previous));
         }
@@ -3936,7 +3992,7 @@ internal class PhaseTwoInitialScheduler
         Dictionary<string, List<(string DemandKey, decimal ShareQty)>> table,
         string key)
     {
-        if (ReferenceEquals(table, _shareUndoTarget))
+        if (IsShareUndoTarget(table))
         {
             _shareUndo.Add((key, table.TryGetValue(key, out var previous), previous));
         }
@@ -7448,6 +7504,9 @@ internal class PhaseTwoInitialScheduler
             var swAnchorLoop = System.Diagnostics.Stopwatch.StartNew();
             var rollbackMsBefore = SolverDiagnostics.HotspotMsTotal(SolverDiagnostics.Hotspot.OccupancyRollback);
 
+            // 2026-11-07 v5.0 §1.4.1：本需求**找到了真实锚点**（下面每个锚点都是一次真实重排）。
+            if (stageBatches.Count > 0) SolverDiagnostics.CountMergeAnchorFound();
+
             for (var anchorIndex = 0; anchorIndex < stageBatches.Count; anchorIndex++)
             {
                 // ── 2026-10-26 第十二刀：取消检查点下沉到**每个锚批** ──
@@ -7491,6 +7550,7 @@ internal class PhaseTwoInitialScheduler
                 long swMergeBatch = SolverDiagnostics.HotspotStart();
                 FinalTaskDraft? anchorRepresentative;
                 List<FinalTaskDraft> anchorCombinedTasks;
+                SolverDiagnostics.CountMergeTrialStarted();
                 try
                 {
                     anchorRepresentative = TryMergeDemandIntoStageBatch(
@@ -7508,6 +7568,8 @@ internal class PhaseTwoInitialScheduler
                 }
 
                 SolverDiagnostics.HotspotEnd(swMergeBatch, SolverDiagnostics.Hotspot.TryMergeStageBatch);
+                // v5.0 §1.4.1：试排产不出任何 Task ⇒ 硬约束（日历/资源）拒绝，**不是**择优判负。
+                if (anchorRepresentative is null) SolverDiagnostics.CountMergeHardRejectedCalendar();
                 var anchorSetup = anchorCombinedTasks.Sum(t => t.SetupTime);
 
                 // 合批侧经济软偏离（2026-10-14 **二次修正**）：数量 = 锚点批累计量 + 本需求本批数量
@@ -7664,6 +7726,12 @@ internal class PhaseTwoInitialScheduler
                     decisiveChallengerCombinedTasks = anchorCombinedTasks;
                     decisiveChallengerNonSetupIncrement = anchorNonSetupKey;
                     decisiveByTieBreak = winsByTieBreak;
+                }
+                else if (anchorRepresentative is not null)
+                {
+                    // v5.0 §1.4.1：合批方案**合法产出了**，只是在冻结层序比较中落败 ⇒
+                    //   与「硬拒绝」「没找到锚点」是三种不同结论，不得混记。
+                    SolverDiagnostics.CountMergeComparedRejected();
                 }
             }
 

@@ -153,6 +153,17 @@
  *              5号位 11-02 复函 §二：落地时点=V1.1、前移终止、**墙钟 occupiedHours 分子撤回**（跨天 119 条 ⇒ 天天假超载），
  *              分子改工时口径（按桶切分工时）、分母 availableHours 沿用、超载判定不随本轮落地 ⇒ 页面零改动
  *  - 接受类（脏数据风险）：VERIFY_ALLOW_WRITE=1 GROUP=j-10a node scripts/verify-acceptance.mjs
+ *  - 需求优先级「轮 ⊃ 段」分组段：GROUP=pseg node scripts/verify-acceptance.mjs（PSEG01-PSEG08 静态，不登录）：
+ *              轮次做外层分组容器、段在组内有序；界面讲清「轮内排序、三轮不混池」；
+ *              空轮次显式提示（后端该轮走 DemandKey ASC 兜底）；不再提供「不声明轮次」；
+ *              序列化契约（PascalCase 键名 + 全声明才写 CompetitionRound）未变
+ *  - 审核 217fa2 前端可自改项段：GROUP=audit-ui node scripts/verify-acceptance.mjs（AU01-AU06 静态，不登录）：
+ *              0号位 11-07 审核里 4 项「前端可直接修复」的静态锁 ——
+ *              B-01 甘特任务清单列序重排 + 补「计划数量/计划加工量」（CSV 早有、表格漏显示）
+ *              B-02 TaskShare 三态（原判据 `length > 1` 把「恰好 1 条」误判成缺数据）
+ *              B-03 任务详情提示里硬编码的「默认 95%」良率已撤（权威口径待 1/2/5 确认）
+ *              C-01 订单列表补「APS 预计完成时间」主列（原先只在详情抽屉里有）
+ *              D-02 候选影响摘要「新增延期」→「新增延期任务」（后端 newDelayCount = Task 数）
  *  - Windows Git Bash：env 前缀可用；或直接改脚本末尾 GROUP 默认值
  */
 
@@ -2775,19 +2786,27 @@ function runParameterSetUxStatic() {
       : `清单${p35List ? '对' : `不符（实际 ${inertPaths.length} 项）`} / 排除项${p35Excluded ? '干净' : '混入了已消费或待激活字段'} / 判定函数${p35Helper ? '有' : '缺'} / 行接线${p35Wired ? '两处' : '未接全'}`
   )
 
-  const p36Tag = /v-if="row\.inert"[\s\S]{0,90}暂未生效/.test(page)
+  /* 2026-11-07（3号位回执 §五 K 表落地）：徽标文案不再硬编码「暂未生效」四个字 ——
+   *   逐字段按 R1 台账给「暂未生效 / 受控废弃」等文案（真源在
+   *   `parameterBlockFields.ts` 的 `INERT_ANNOTATIONS`，见 PM11）。
+   *   但**渲染条件仍必须是 row.inert** —— 否则已配置的无效字段看不出没生效。 */
+  const p36Tag = /v-if="row\.inert"/.test(page) && /inertAnnotationOfRow\(row\)\.tag/.test(page)
   assert(
-    'P36 静态：参数表行按 row.inert 标「暂未生效」（已配置的无效字段必须能一眼看出）',
+    'P36 静态：参数表行按 row.inert 标「暂未生效」类标注（文案逐字段取自 R1 台账）',
     p36Tag,
     p36Tag ? '行级标注' : '行级标注缺失或不再受 row.inert 条件渲染'
   )
 
   const p37Option =
-    /v-if="isInertBlockField\(addFieldBlock, f\.path\)"[\s\S]{0,160}暂未生效/.test(page)
-  const p37Note = /该参数暂未生效：排产运行期还没读取它/.test(page)
+    /v-if="isInertBlockField\(addFieldBlock, f\.path\)"[\s\S]{0,200}inertAnnotationOf\(addFieldBlock, f\.path\)\.tag/.test(
+      page
+    )
+  const p37Note =
+    /addFieldInertAnnotation\.note/.test(page) &&
+    /排产运行期还没读取它，配置后不会改变排产结果；后端接入后自动生效，不用重配。/.test(catalog)
   const p37Ok = p37Option && p37Note
   assert(
-    'P37 静态：「新增字段」候选也标「暂未生效」+ 弹窗补一句大白话（否则加完才发现没用）',
+    'P37 静态：「新增字段」候选也标「暂未生效」类标注 + 弹窗补一句大白话（否则加完才发现没用）',
     p37Ok,
     p37Ok ? '选项标签 + 说明' : `选项标签${p37Option ? '有' : '缺'} / 说明${p37Note ? '有' : '缺'}`
   )
@@ -3868,6 +3887,214 @@ function runParameterMaintenanceStatic() {
       : `buildPutBody=${pm06Put ? '原样' : '被过滤'} 删行=${pm06NoDelete ? '无' : '有'} diff=${
           pm06Diff ? '照常' : '丢失'
         }`
+  )
+
+  /* -------- PM07 「新增字段」候选清单排除 D 类（2026-11-07；0号位工作台 7 项 D 类）--------
+   * 起因：D 类「V1 固定」原先只在**表内**禁改，但仍在「新增字段」候选清单里
+   *   ⇒ 用户可以把冻结值写成别的（`WarnOnlyOnMaxImpacted` 写 false、
+   *   `StageOverlap.AllowOverlap` 写 true、`IsPrimaryObjective` 写 false）。
+   * 工作簿口径：7 项 D 类「V1 固定、不得随意改动」⇒ 用户不得写入。
+   * 反向破坏自证：把 listAbsentFields 里的 `!isFixedValueBlockField(...)` 删掉 ⇒ PM07 转红。
+   */
+  const pm07Fn = fnBodyOf(catSrc, 'isFixedValueBlockField')
+  const pm07Ok =
+    /maintenance\s*===\s*'D'/.test(pm07Fn) &&
+    /!isFixedValueBlockField\(block,\s*f\.path\)/.test(la) &&
+    /isFixedValueBlockField/.test(catSrc)
+  assert(
+    'PM07 静态：「新增字段」候选清单排除 D 类 V1 固定（用户不得写入冻结值）',
+    pm07Ok,
+    pm07Ok
+      ? 'isFixedValueBlockField 已接入候选过滤'
+      : `判定函数=${/maintenance\s*===\s*'D'/.test(pm07Fn) ? '有' : '缺'} 候选过滤=${
+          /!isFixedValueBlockField\(block,\s*f\.path\)/.test(la) ? '有' : '缺'
+        }`
+  )
+
+  /* -------- PM08 D 类 6 项逐条锁定（工作簿 7 项中的参数集 6 项；第 7 项在需求优先级段位）--------
+   * D 类清单：#8 Sticky.RequireReleaseRecord · #16 PiSort.UseStablePiNoTieBreak ·
+   *   #26 OnTimeTarget.IsPrimaryObjective · #28 Split.LimitMandatorySplit ·
+   *   #32 StageOverlap.AllowOverlap · #46 WarnOnlyOnMaxImpacted
+   * 反向破坏自证：把任一项的 maintenance 改成 'A'/删掉 ⇒ PM08 转红（逐项验）。
+   */
+  const PM08_D_CLASS = [
+    'Sticky.RequireReleaseRecord',
+    'PiSort.UseStablePiNoTieBreak',
+    'OnTimeTarget.IsPrimaryObjective',
+    'Split.LimitMandatorySplit',
+    'StageOverlap.AllowOverlap',
+    'WarnOnlyOnMaxImpacted'
+  ]
+  const pm08Bad = PM08_D_CLASS.filter((p) => classOf(p) !== 'D')
+  const pm08DCount = (catSrc.match(/maintenance:\s*'D'/g) || []).length
+  const pm08Ok = pm08Bad.length === 0 && pm08DCount === PM08_D_CLASS.length
+  assert(
+    'PM08 静态：D 类 V1 固定 6 项逐条标注为 D，且目录里 D 类不多不少',
+    pm08Ok,
+    pm08Ok
+      ? `6 项命中，D 类计数=${pm08DCount}`
+      : `不符=${pm08Bad.join('; ') || '无'} D类计数=${pm08DCount}（期望 ${PM08_D_CLASS.length}）`
+  )
+
+  /* -------- PM09 取值域提示按真实字典（0号位工作台「不用示例 SO 直接发布」）--------
+   * #6 ProtectedOrderTypes：需求保护按 **Ordinal 精确匹配** 比订单真实 OrderType
+   *   （`DemandProtectionTriggerEvaluator.cs:184`），实库值只有
+   *   `PRODUCTION_INSTRUCTION` / `SALES_ORDER`（`OrderQueryDtos.cs:24`）
+   *   ⇒ 提示词写「如 SO / WO」会把用户推向永不命中的值。
+   * #5 VipTierValue：按 Ordinal 精确等值比 CustomerTier（`:167`），
+   *   实库值域已由 2号位 2026-11-06 校准收敛为 VIP / GENERAL。
+   * 反向破坏自证：把提示词改回「如 SO / WO」或去掉真实码 ⇒ PM09 转红。
+   */
+  const hintOf = (path) => {
+    const i = catSrc.indexOf(`path: '${path}'`)
+    if (i < 0) return ''
+    const next = catSrc.indexOf("path: '", i + 8)
+    const entry = catSrc.slice(i, next < 0 ? catSrc.length : next)
+    const m = entry.match(/hint:\s*'([^']*)'/)
+    return m ? m[1] : ''
+  }
+  const pm09Vip = hintOf('Trigger.VipTierValue')
+  const pm09Order = hintOf('Trigger.ProtectedOrderTypes')
+  const pm09Ok =
+    pm09Vip.includes('VIP') &&
+    pm09Vip.includes('GENERAL') &&
+    pm09Order.includes('SALES_ORDER') &&
+    pm09Order.includes('PRODUCTION_INSTRUCTION') &&
+    !/如\s*SO/.test(pm09Order) &&
+    !/SO\s*\/\s*WO/.test(pm09Order)
+  assert(
+    'PM09 静态：锁块两个取值域提示写真实字典码（VIP/GENERAL、SALES_ORDER/PRODUCTION_INSTRUCTION），不再写「如 SO / WO」',
+    pm09Ok,
+    pm09Ok
+      ? '两处提示均指向真实码'
+      : `VipTierValue=[${pm09Vip}] ProtectedOrderTypes=[${pm09Order}]`
+  )
+
+  /* -------- PM10 R1 台账 K1~K12 与字段目录逐项一致（2026-11-07 3号位回执 §二 / §五）--------
+   * 出处：3号位 自有文档目录 R1 台账（0号位 定：不并入冻结《开发实施包 v2.4》）。
+   * 判据（三条独立，缺一即红）：
+   *   ① 台账 12 项与 `INERT_FIELD_PATHS` **一一对应**（不多不少、逐项可寻）
+   *   ② K 编号恰为 K1~K12、不重号
+   *   ③ 台账 cls ∈ {D,E,F,H} 的项，字段目录 `maintenance` 必须等于该 cls；
+   *      cls ∈ {A, DEPRECATED} 的项，目录**不得**标 `maintenance`（A/B 类目录里不标）
+   * 反向破坏自证：改台账任一项的键 / 分类，或从台账里删一项 ⇒ PM10 转红。
+   */
+  const literalOf = (src, marker) => {
+    const i = src.indexOf(marker)
+    if (i < 0) return ''
+    const open = src.indexOf('{', i)
+    if (open < 0) return ''
+    let depth = 0
+    for (let j = open; j < src.length; j++) {
+      if (src[j] === '{') depth++
+      else if (src[j] === '}') {
+        depth--
+        if (depth === 0) return src.slice(open, j + 1)
+      }
+    }
+    return ''
+  }
+  /** 取对象/数组字面量（`key: {…}` 与 `key: […]` 都吃） */
+  const blockLitOf = (lit, key) => {
+    const i = lit.indexOf(`${key}:`)
+    if (i < 0) return ''
+    const rest = lit.slice(i + key.length + 1)
+    const off = rest.search(/[[{]/)
+    if (off < 0) return ''
+    const open = i + key.length + 1 + off
+    const openCh = lit[open]
+    const closeCh = openCh === '[' ? ']' : '}'
+    let depth = 0
+    for (let j = open; j < lit.length; j++) {
+      if (lit[j] === openCh) depth++
+      else if (lit[j] === closeCh) {
+        depth--
+        if (depth === 0) return lit.slice(open, j + 1)
+      }
+    }
+    return ''
+  }
+  const ledgerSrc = literalOf(catSrc, 'export const INERT_FIELD_LEDGER')
+  const ledgerEntries = []
+  for (const blk of ['lock', 'supply', 'procurement', 'solverStrategy', 'candidateGuardrail']) {
+    const lit = blockLitOf(ledgerSrc, blk)
+    for (const m of lit.matchAll(/'([^']+)':\s*\{\s*k:\s*'(K\d+)',\s*cls:\s*'([A-Z]+)'/g)) {
+      ledgerEntries.push({ block: blk, path: m[1], k: m[2], cls: m[3] })
+    }
+  }
+  const inertLit = literalOf(catSrc, 'export const INERT_FIELD_PATHS')
+  const inertSet = new Set()
+  for (const blk of ['lock', 'supply', 'procurement', 'solverStrategy', 'candidateGuardrail']) {
+    const lit = blockLitOf(inertLit, blk)
+    for (const m of lit.matchAll(/'([^']+)'/g)) inertSet.add(`${blk}.${m[1]}`)
+  }
+  const ledgerSet = new Set(ledgerEntries.map((e) => `${e.block}.${e.path}`))
+  const pm10Missing = [...inertSet].filter((p) => !ledgerSet.has(p))
+  const pm10Extra = [...ledgerSet].filter((p) => !inertSet.has(p))
+  const ks = ledgerEntries.map((e) => e.k)
+  const expectedKs = Array.from({ length: 12 }, (_, i) => `K${i + 1}`)
+  const pm10KsOk =
+    ks.length === 12 && new Set(ks).size === 12 && expectedKs.every((k) => ks.includes(k))
+  const pm10ClsBad = ledgerEntries
+    .filter((e) => ['D', 'E', 'F', 'H'].includes(e.cls))
+    .filter((e) => classOf(e.path) !== e.cls)
+    .map((e) => `${e.k} ${e.path}: 台账 ${e.cls} 目录 ${classOf(e.path) || '无'}`)
+  const pm10Unmarked = ledgerEntries
+    .filter((e) => e.cls === 'A' || e.cls === 'DEPRECATED')
+    .filter((e) => classOf(e.path) !== '')
+    .map((e) => `${e.k} ${e.path}: 不该有 maintenance（实得 ${classOf(e.path)}）`)
+  const pm10Ok =
+    ledgerEntries.length === 12 &&
+    pm10Missing.length === 0 &&
+    pm10Extra.length === 0 &&
+    pm10KsOk &&
+    pm10ClsBad.length === 0 &&
+    pm10Unmarked.length === 0
+  assert(
+    'PM10 静态：R1 台账 K1~K12 与「暂未生效」12 项、字段目录分类逐项一致',
+    pm10Ok,
+    pm10Ok
+      ? '12 项一一对应、K1~K12 不重号、分类与目录一致'
+      : `台账项数=${ledgerEntries.length} 缺=${pm10Missing.join(',') || '无'} 多=${pm10Extra.join(',') || '无'} K编号=${pm10KsOk ? 'OK' : '错'} 分类不符=${pm10ClsBad.join('; ') || '无'} 误标=${pm10Unmarked.join('; ') || '无'}`
+  )
+
+  /* -------- PM11 「暂未生效」标注文案不得是假承诺（2026-11-07 3号位回执 §五 K8）--------
+   * 起因：页面原话「排产运行期还没读取它…后端接入后自动生效，不用重配」对 **K8 受控废弃**
+   *   是假承诺（`AvailableTimeCalculator.cs:28` 写明「0号位 已同意后续受控废弃」，
+   *   不会再接入）；对 **K1** 也不够准（还得业务上先决定开不开放）；对 **D 类固定项** 同样不准。
+   * 判据：
+   *   ① K8（`OverdueMargin.MinimumExtraDays`）标注含「受控废弃」且**不含**「接入后自动生效」
+   *   ② K1（`Trigger.AllowPmcManualProtection`）标注含「正式开放」
+   *   ③ D 类三项标注**不含**「接入后自动生效」
+   *   ④ 页面不再硬编码那句话（改走 `inertAnnotationOf`）
+   * 反向破坏自证：把 K8 的标注改回含「接入后自动生效」/ 去掉「正式开放」/ 页面写死文案 ⇒ PM11 转红。
+   */
+  const annLit = literalOf(catSrc, 'const INERT_ANNOTATIONS')
+  const annOf = (path) => {
+    for (const m of annLit.matchAll(/'([^']+)':\s*\{\s*tag:\s*'([^']*)',\s*note:\s*'([^']*)'/g)) {
+      if (m[1] === path) return { tag: m[2], note: m[3] }
+    }
+    return null
+  }
+  const annK8 = annOf('OverdueMargin.MinimumExtraDays')
+  const annK1 = annOf('Trigger.AllowPmcManualProtection')
+  const annD = [
+    'Sticky.RequireReleaseRecord',
+    'OnTimeTarget.IsPrimaryObjective',
+    'Split.LimitMandatorySplit'
+  ].map((p) => annOf(p))
+  const pm11K8Ok = !!annK8 && annK8.tag.includes('受控废弃') && !annK8.note.includes('接入后自动生效')
+  const pm11K1Ok = !!annK1 && annK1.note.includes('正式开放')
+  const pm11DOk = annD.every((a) => !!a && !a.note.includes('接入后自动生效'))
+  const pm11ViewOk =
+    /inertAnnotationOf\(/.test(psPage) && !/该参数暂未生效：排产运行期还没读取它/.test(psPage)
+  const pm11Ok = pm11K8Ok && pm11K1Ok && pm11DOk && pm11ViewOk
+  assert(
+    'PM11 静态：「暂未生效」标注按字段分文案，受控废弃/待开放/固定项不写「接入后自动生效」（假承诺）',
+    pm11Ok,
+    pm11Ok
+      ? 'K8=受控废弃 · K1=待开放 · D 类=固定项 · 页面走统一标注'
+      : `K8=${pm11K8Ok ? 'OK' : `错[${annK8 ? `${annK8.tag}|${annK8.note}` : '缺'}]`} K1=${pm11K1Ok ? 'OK' : '错'} D类=${pm11DOk ? 'OK' : '错'} 页面=${pm11ViewOk ? 'OK' : '仍写死文案'}`
   )
 }
 
@@ -11990,7 +12217,9 @@ function verifyGantt() {
   //    余下 3 项里有 2 项（设备不可用窗口 / 受影响 KPI）属 B1 读侧，**后端已落码**，
   //    dev 当前 0 条 OFF 窗口只是**数据缺**（不是恒 null），故本条措辞由「恒 null」改为「可缺键」。
   const guards = [
-    ['订单份额', /v-if="selectedTask\.taskShare && selectedTask\.taskShare\.length > 1"/],
+    // 2026-11-07 审核 B-02：判据由 `> 1` 改 `> 0` —— 恰好 1 条份额时也渲染份额表，
+    //   原判据把它归到「未提供」⇒ 单订单任务看不到自己的份额（真 bug）。
+    ['订单份额', /v-if="selectedTask\.taskShare && selectedTask\.taskShare\.length > 0"/],
     ['设备不可用窗口', /selectedResource\?\.unavailableWindows\?\.length/],
     ['受影响 KPI', /v-if="impactedTaskIds\.length > 0"/]
   ]
@@ -13843,7 +14072,10 @@ function verifyGantt() {
     return m ? m[1] : ''
   })()
   const gt119Export =
-    /'部门',[\s\S]{0,40}'阶段',[\s\S]{0,40}'生产指示号'/.test(gt119ExportColsSrc) &&
+    // 2026-11-07 审核 B-01 重排列序：CSV 与表格同序（阶段 → 部门 → … → 任务号/订单号/生产指示号），
+    //   原来「部门→阶段→生产指示号」连排是旧列序的副产物，不是契约；这里改成新列序下的同序断言。
+    /'阶段',[\s\S]{0,40}'部门'/.test(gt119ExportColsSrc) &&
+    /'生产指示号'/.test(gt119ExportColsSrc) &&
     /'人工槽'/.test(gt119ExportColsSrc) &&
     /t\.departmentName \?\? ''/.test(ganttCode) &&
     /t\.stageCode \?\? ''/.test(ganttCode) &&
@@ -16114,6 +16346,38 @@ function verifyRulesSplit() {
       rulesView.includes('onSaveDraft'),
     `编辑器守卫=${editorGuarded} 脏禁用=${rulesView.includes(':disabled="!segmentsDirty"')}`)
 
+  /* -------- R48：稳定排序键是 D 类 V1 固定（2026-11-07；0号位工作台第 56 条）--------
+   * 工作簿第 56 条 `DemandPriority.Segments[].StableTieBreakFields[]` 判为 **D V1固定**：
+   * 「V1 沿冻结 DEMANDKEY，不开放配置其他随机或不稳定键」；后端 `TieBreakField` 枚举也只有 DEMANDKEY
+   * （`FrozenStrategySnapshot.cs:236-240`）。
+   * ⇒ 原先的开关能写出**空数组**（＝关掉稳定排序），与 D 类相抵触 ⇒ 撤开关，恒写 DEMANDKEY。
+   * 反向破坏自证：把 FIXED_TIE_BREAK_FIELD 改成别的值 / 恢复开关 ⇒ R48 转红。 */
+  const segViewSrc = stripComments(readSrc('views/Aps/components/PrioritySegmentEditor.vue')).replace(
+    /<!--[\s\S]*?-->/g,
+    ''
+  )
+  const r48Const =
+    /export const FIXED_TIE_BREAK_FIELD = 'DEMANDKEY'/.test(editorSrc) &&
+    /export const FIXED_TIE_BREAK_FIELD = 'DEMANDKEY'/.test(
+      readSrc('api/aps-v1/prioritySegmentEditor.ts')
+    )
+  const r48Read =
+    /stableTieBreakFields:\s*\[FIXED_TIE_BREAK_FIELD\]/.test(editorSrc) &&
+    /stableTieBreakFields:\s*\[FIXED_TIE_BREAK_FIELD\]/.test(segViewSrc)
+  const r48Write = /StableTieBreakFields:\s*\[FIXED_TIE_BREAK_FIELD\]/.test(editorSrc)
+  const r48NoSwitch =
+    !/onTieBreak/.test(segViewSrc) &&
+    !/v-model="[^"]*stableTieBreakFields/.test(segViewSrc) &&
+    !/editor\.update\([^\n]*stableTieBreakFields/.test(segViewSrc)
+  const r48ShowFixed =
+    /\{\{\s*FIXED_TIE_BREAK_FIELD\s*\}\}/.test(segViewSrc) && /V1 固定/.test(segViewSrc)
+  const r48Ok = r48Const && r48Read && r48Write && r48NoSwitch && r48ShowFixed
+  assert(
+    'R48 静态：稳定排序键恒为 DEMANDKEY 且页面无开关（D 类 V1 固定，第 56 条）',
+    r48Ok,
+    `常量=${r48Const} 读入=${r48Read} 写回=${r48Write} 无开关=${r48NoSwitch} 只读展示=${r48ShowFixed}`
+  )
+
   /* ===== RP01-RP07：整版发布权限收口 + ⑦ 换型规则只读汇总（2026-10-27） =====
    * 依据：0号位「规则集多主题协作与统一发布」v1.0（丙案）+ 致 3/4号位任务书 v1.0。
    *   - 整版发布只能走 aps.rule.publish；Setup 侧 `rule-set-versions/{id}/publish` 前端不封装、不调用
@@ -16579,16 +16843,20 @@ function verifyRulesSplit() {
     inertStartRP23 >= 0 && inertEndRP23 > inertStartRP23
       ? blockFieldsSrcRP23.slice(inertStartRP23, inertEndRP23)
       : ''
+  /* RP23（2026-11-07 撤标后修正）：成熟度两项已在目录里，但**不再标「暂未生效」**——
+   * 需求保护消费链 2026-11-06/07 落 dev（`DemandProtectionTriggerEvaluator.cs:191/197` 真读这两项），
+   * 与锁块其余 6 项 Trigger.* 一并撤标（22 → 12）。继续标「暂未生效」= 对真生效字段说谎。
+   * DNF 条件组（`TriggerConditionGroups` / `MatchConditionGroups`）运行侧未接线 ⇒ 仍不落地（负断言）。 */
   const rp23 =
     lockSrcRP23.includes("path: 'Trigger.ProtectMaturityStatus'") &&
     lockSrcRP23.includes("path: 'Trigger.MaturityStatusValues'") &&
-    inertSrcRP23.includes("'Trigger.ProtectMaturityStatus'") &&
-    inertSrcRP23.includes("'Trigger.MaturityStatusValues'") &&
+    !inertSrcRP23.includes("'Trigger.ProtectMaturityStatus'") &&
+    !inertSrcRP23.includes("'Trigger.MaturityStatusValues'") &&
     !/TriggerConditionGroups/.test(blockFieldsSrcRP23 + editorSrc + psegViewRP19) &&
     !/MatchConditionGroups/.test(editorSrc + psegViewRP19)
-  assert('RP23 静态：参数集锁定块新增成熟度两项并标「暂未生效」；DNF 条件组编辑器未提前落地（负断言）',
+  assert('RP23 静态：参数集锁定块含成熟度两项且已撤「暂未生效」标（已接线）；DNF 条件组编辑器未提前落地（负断言）',
     rp23,
-    `目录两项=${lockSrcRP23.includes("path: 'Trigger.ProtectMaturityStatus'") && lockSrcRP23.includes("path: 'Trigger.MaturityStatusValues'")} 含 TriggerConditionGroups=${/TriggerConditionGroups/.test(blockFieldsSrcRP23 + editorSrc + psegViewRP19)} 含 MatchConditionGroups=${/MatchConditionGroups/.test(editorSrc + psegViewRP19)}`)
+    `目录两项=${lockSrcRP23.includes("path: 'Trigger.ProtectMaturityStatus'") && lockSrcRP23.includes("path: 'Trigger.MaturityStatusValues'")} 已撤标=${!inertSrcRP23.includes("'Trigger.ProtectMaturityStatus'") && !inertSrcRP23.includes("'Trigger.MaturityStatusValues'")} 含 TriggerConditionGroups=${/TriggerConditionGroups/.test(blockFieldsSrcRP23 + editorSrc + psegViewRP19)} 含 MatchConditionGroups=${/MatchConditionGroups/.test(editorSrc + psegViewRP19)}`)
 
   const rp05 =
     rulesViewNoHtml.includes('发布规则集版本（整版）') &&
@@ -17445,6 +17713,291 @@ function verifyCapacityCaliber() {
   )
 }
 
+/* ============================================================
+ * GROUP=audit-ui —— 0号位《APS_V1_Front_UI_Audit_217fa2_v1_1_FULL.md》
+ *   前端可自改项的静态锁（2026-11-07 整改）
+ *
+ * 覆盖审核里的 4 项「前端可直接修复」：
+ *   B-01 甘特任务清单列序重排 + 补「计划数量/计划加工量」（CSV 早有、表格漏显示）
+ *   B-02 甘特 TaskShare 三态（原判据 `length > 1` 把「恰好 1 条」误判成缺数据）
+ *   B-03 任务详情提示里硬编码的「默认 95%」良率已撤（权威口径待 1/2/5 确认）
+ *   C-01 订单列表补「APS 预计完成时间」主列（原先只在详情抽屉里有）
+ *   D-02 候选影响摘要「新增延期」→「新增延期任务」（后端 newDelayCount = Task 数）
+ *
+ * 纯静态组：不登录、后端没起也能跑。
+ * 反向破坏自证：scripts/selfverify-audit-ui.mjs（逐条改坏 ⇒ 对应 AU 必须转红）。
+ */
+function verifyAuditUi() {
+  log('\n[AU] 审核 217fa2 前端可自改项静态锁（audit-ui — 2026-11-07）')
+
+  const ganttSrc = readSrc('views/Aps/Gantt.vue')
+  const orderSrc = readSrc('views/Aps/Order.vue')
+  const candSrc = readSrc('views/Aps/Candidate.vue')
+  const ganttCode = stripComments(ganttSrc)
+  const orderCode = stripComments(orderSrc)
+  const candCode = stripComments(candSrc)
+  /** 去掉 HTML 注释再取标签序列（避免注释里的字面量把列序探针带偏） */
+  const stripHtmlComments = (s) => s.replace(/<!--[\s\S]*?-->/g, '')
+
+  /* ===== AU01：任务清单列序按「车间看单」重排 ===== */
+  const au01Start = ganttSrc.indexOf('class="task-list-head"')
+  const au01End = ganttSrc.indexOf('class="task-list-pager"', au01Start)
+  const au01Pane =
+    au01Start >= 0 && au01End > au01Start ? stripHtmlComments(ganttSrc.slice(au01Start, au01End)) : ''
+  const au01Labels = [...au01Pane.matchAll(/label="([^"]+)"/g)].map((m) => m[1])
+  const au01Order = [
+    '物料',
+    '阶段',
+    '部门',
+    '资源',
+    '人工槽',
+    '工序',
+    '计划数量',
+    '计划加工量',
+    '计划开始',
+    '计划结束',
+    '状态',
+    'MES 工单号',
+    '下发状态',
+    '客户交期',
+    '延期时长',
+    '主要原因',
+    '延期',
+    '任务号',
+    '订单号',
+    '生产指示号'
+  ]
+  const au01Idx = au01Order.map((n) => au01Labels.indexOf(n))
+  const au01Ordered = au01Idx.every((v, i) => v >= 0 && (i === 0 || v > au01Idx[i - 1]))
+  assert(
+    'AU01 静态：甘特任务清单列序＝物料→阶段→部门→资源/人工槽→工序→数量→时间→状态→MES→交期/延期/原因，任务号/订单号/指示号在尾',
+    au01Ordered,
+    au01Ordered
+      ? `列序=${au01Labels.join('|')}`
+      : `列序错 位次=${au01Order.map((n, i) => `${n}:${au01Idx[i]}`).join(' ')}`
+  )
+
+  /* ===== AU02：补「计划数量/计划加工量」两列 + CSV 表头与取值条数一致（不错位） ===== */
+  const au02Cols =
+    /label="计划数量"[\s\S]{0,240}row\.netQty[\s\S]{0,160}row\.uom/.test(au01Pane) &&
+    /label="计划加工量"[\s\S]{0,300}row\.plannedProcessQty != null/.test(au01Pane)
+  const au02Header = ganttCode.match(/const EXPORT_COLUMNS = \[([\s\S]*?)\] as const/)?.[1] ?? ''
+  const au02Payload = ganttCode.match(/lines\.push\(\s*\[([\s\S]*?)\]\s*\.map\(csvCell\)/)?.[1] ?? ''
+  /** 顶层逗号计数 = 数组元素个数（跟踪括号深度与字符串态，防元素内逗号/引号骗过） */
+  const countTopLevel = (s) => {
+    if (!s.trim()) return 0
+    let depth = 0
+    let inStr = false
+    let quote = ''
+    let commas = 0
+    for (let i = 0; i < s.length; i++) {
+      const ch = s[i]
+      if (inStr) {
+        if (ch === quote && s[i - 1] !== '\\') inStr = false
+        continue
+      }
+      if (ch === "'" || ch === '"' || ch === '`') {
+        inStr = true
+        quote = ch
+        continue
+      }
+      if (ch === '[' || ch === '(' || ch === '{') {
+        depth++
+        continue
+      }
+      if (ch === ']' || ch === ')' || ch === '}') {
+        depth--
+        continue
+      }
+      if (ch === ',' && depth === 0) commas++
+    }
+    return commas + 1
+  }
+  const au02HeadN = countTopLevel(au02Header)
+  const au02PayN = countTopLevel(au02Payload)
+  const au02Align = au02HeadN > 0 && au02HeadN === au02PayN
+  const au02CsvHead = /'计划数量'/.test(au02Header) && /'单位'/.test(au02Header) && /'计划加工量'/.test(au02Header)
+  const au02CsvVals =
+    /t\.netQty/.test(au02Payload) &&
+    /t\.uom/.test(au02Payload) &&
+    /t\.plannedProcessQty \?\? ''/.test(au02Payload)
+  assert(
+    'AU02 静态：任务清单补「计划数量/计划加工量」两列，CSV 表头与取值条数一致（不错位）',
+    au02Cols && au02Align && au02CsvHead && au02CsvVals,
+    `表格两列=${au02Cols} CSV表头=${au02CsvHead} CSV取值=${au02CsvVals} 条数(头=${au02HeadN}/值=${au02PayN})=${au02Align}`
+  )
+
+  /* ===== AU03：TaskShare 三态 ===== */
+  const au03Guard = /v-if="selectedTask\.taskShare && selectedTask\.taskShare\.length > 0"/.test(
+    ganttSrc
+  )
+  const au03Titles =
+    /const taskShareTitle = computed/.test(ganttCode) &&
+    /本任务由 1 个订单承接/.test(ganttCode) &&
+    /一个任务承接 \$\{n\} 个订单/.test(ganttCode)
+  const au03Empty = /未提供订单份额数据（TaskShare）/.test(ganttSrc) && !/单 Order 任务/.test(ganttSrc)
+  assert(
+    'AU03 静态：TaskShare 三态（1 条＝本任务由 1 个订单承接 / 多条＝共担 / 0 条＝未提供），不再把 1 条误判成缺数据',
+    au03Guard && au03Titles && au03Empty,
+    `判据>0=${au03Guard} 两态文案=${au03Titles} 0条文案=${au03Empty}`
+  )
+
+  /* ===== AU04：硬编码「默认 95%」已撤 ===== */
+  const au04Gone = !/默认\s*95\s*%/.test(ganttSrc) && !/良率（默认/.test(ganttSrc)
+  assert(
+    'AU04 静态：任务详情提示不再写死「默认 95%」良率（权威口径待 1/2/5 确认 ⇒ 前端不假定具体数值）',
+    au04Gone,
+    au04Gone ? '已清零' : '仍写死默认良率'
+  )
+
+  /* ===== AU05：订单列表补「APS 预计完成时间」主列（紧邻客户交期） ===== */
+  const au05Col =
+    /label="APS 预计完成时间"[\s\S]{0,400}row\.plannedCompletionTime/.test(orderCode) &&
+    /v-if="row\.plannedCompletionTime"[\s\S]{0,320}未排产/.test(orderCode)
+  const au05DueAt = orderCode.indexOf('label="客户交期"')
+  const au05PlanAt = orderCode.indexOf('label="APS 预计完成时间"')
+  const au05PrioAt = orderCode.indexOf('label="优先级"')
+  const au05Adjacent =
+    au05DueAt >= 0 && au05PlanAt > au05DueAt && au05PrioAt > au05PlanAt
+  assert(
+    'AU05 静态：订单列表有「APS 预计完成时间」列（取后端 plannedCompletionTime、缺键显示「未排产」）且紧邻客户交期',
+    au05Col && au05Adjacent,
+    `列位=${au05Col} 相邻(交期=${au05DueAt}/预计=${au05PlanAt}/优先级=${au05PrioAt})=${au05Adjacent}`
+  )
+
+  /* ===== AU06：候选影响摘要「新增延期」→「新增延期任务」（计数单位＝任务） ===== */
+  const au06Label = /新增延期任务/.test(candCode) && !/>新增延期</.test(candCode)
+  const au06Unit = /按任务数统计，不是订单数/.test(candCode)
+  assert(
+    'AU06 静态：候选影响摘要「新增延期」→「新增延期任务」（后端 newDelayCount＝Task 数，不与「受影响订单数」混淆）',
+    au06Label && au06Unit,
+    `标签=${au06Label} 单位说明=${au06Unit}`
+  )
+}
+
+/* ============================================================
+ * GROUP=pseg —— 需求优先级「轮 ⊃ 段」分组（2026-11-09）
+ *
+ * 冻结 01 v1.15 §16：「三轮不得混池；每一轮内继续依有序规则段→第一命中→段内排序」
+ *   ⇒ 段是**轮内**的有序规则段，段序只在轮内有效。
+ * 后端消费顺序（`PeggingOrchestrator.cs:13452-13457`）：逐轮取 `Segments.Where(轮次相等)`，
+ *   轮内再按 `SegmentOrder` 升序 First Match。
+ *
+ * 改动前的问题：轮次下拉是段的一个属性、且没有标签，界面把「轮 ⊃ 段」压平成一张扁平列表
+ *   ⇒ 用户看不出「第 2 段」是「第 2 轮里的段」还是「第 1 轮里的第 2 个段」；
+ *   且空轮次完全隐形（后端该轮会走 DemandKey ASC 兜底 + WARNING）。
+ * 本组锁住改后的呈现与契约。
+ *
+ * 纯静态组：不登录、后端没起也能跑。
+ * 反向破坏自证：scripts/selfverify-pseg.mjs（逐条改坏 ⇒ 对应 PSEG 必须转红）。
+ */
+function verifyPrioritySegmentGroups() {
+  log('\n[PSEG] 需求优先级「轮 ⊃ 段」分组静态锁（pseg — 2026-11-09）')
+
+  const compRaw = readSrc('views/Aps/components/PrioritySegmentEditor.vue')
+  const comp = stripComments(compRaw)
+  const apiRaw = readSrc('api/aps-v1/prioritySegmentEditor.ts')
+  const api = stripComments(apiRaw)
+  /** 只取模板段（用户可见文案的判据不许被文件头注释带偏） */
+  const tpl = compRaw.slice(compRaw.indexOf('<template>'), compRaw.lastIndexOf('</template>'))
+  const tplCode = tpl.replace(/<!--[\s\S]*?-->/g, '')
+
+  /* ===== PSEG01：编辑器按轮次分组渲染（轮在外、段在内） ===== */
+  const pseg01 =
+    /v-for="g in groups"[^>]*class="round-group"/.test(tpl) &&
+    /const groups = computed\(\(\) => groupSegmentsByRound\(rows\.value\)\)/.test(comp) &&
+    /export function groupSegmentsByRound/.test(api)
+  assert(
+    'PSEG01 静态：段位编辑器按轮次分组渲染（轮次是外层分组容器，段在组内）',
+    pseg01,
+    `模板分组=${/v-for="g in groups"/.test(tpl)} computed=${/groupSegmentsByRound\(rows\.value\)/.test(comp)} 纯函数=${/export function groupSegmentsByRound/.test(api)}`
+  )
+
+  /* ===== PSEG02：界面写明「轮 ⊃ 段」的关系 ===== */
+  const pseg02 =
+    tplCode.includes('每一轮内部按') &&
+    tplCode.includes('不同轮次不混池') &&
+    tplCode.includes('段是轮次里面的规则段')
+  assert(
+    'PSEG02 静态：编辑器顶部用大白话讲清「每一轮内部排序、三轮不混池、段在轮内」',
+    pseg02,
+    `每一轮内部按=${tplCode.includes('每一轮内部按')} 不混池=${tplCode.includes('不同轮次不混池')} 段在轮内=${tplCode.includes('段是轮次里面的规则段')}`
+  )
+
+  /* ===== PSEG03：每轮显示段数 + 空轮次兜底提示 ===== */
+  const pseg03 =
+    /本轮 \{\{ g\.segments\.length \}\} 段/.test(tpl) &&
+    tplCode.includes('本轮暂无段位。若有需求落到本轮，将按需求键兜底排序。')
+  assert(
+    'PSEG03 静态：轮次组显示「本轮 N 段」，空轮次显式提示会走需求键兜底排序（不再隐形）',
+    pseg03,
+    `段数=${/本轮 \{\{ g\.segments\.length \}\} 段/.test(tpl)} 空轮次提示=${tplCode.includes('本轮暂无段位。若有需求落到本轮，将按需求键兜底排序。')}`
+  )
+
+  /* ===== PSEG04：不再提供「不声明轮次」（整块未声明在后端等价第 1 轮） ===== */
+  const shortRoundEntries = (api.match(/\{ value: ([123]), label: '第 \1 轮' \}/g) || []).length
+  const noUndeclared = !tplCode.includes('不声明轮次') && !/value="-1"/.test(tplCode)
+  const normalizeToRound1 = /competitionRound: s\.competitionRound \?\? 1/.test(api)
+  const shortNamesInPicker = /v-for="r in COMPETITION_ROUND_SHORT"/.test(tpl)
+  const pseg04 = noUndeclared && normalizeToRound1 && shortRoundEntries === 3 && shortNamesInPicker
+  assert(
+    'PSEG04 静态：轮次只有第 1/2/3 轮，不给「不声明轮次」选项；后端没给轮次时归第 1 轮（与投影层 DefaultCompetitionRound=1 等价）',
+    pseg04,
+    `无不声明选项=${noUndeclared} 归一第1轮=${normalizeToRound1} 短名三项=${shortRoundEntries} 短名用于下拉=${shortNamesInPicker}`
+  )
+
+  /* ===== PSEG05：序列化契约未变（PascalCase 键名 + 全声明才写 CompetitionRound） ===== */
+  const pseg05 =
+    /allDeclared\s*=\s*rows\.length\s*>\s*0\s*&&\s*rows\.every\(/.test(api) &&
+    /allDeclared\s*\?\s*\{\s*CompetitionRound:/.test(api) &&
+    /SegmentOrder:\s*s\.orderInSegment/.test(api) &&
+    /SegmentName:/.test(api) &&
+    /MatchConditions:/.test(api) &&
+    /SortFields:/.test(api) &&
+    /StableTieBreakFields:/.test(api)
+  assert(
+    'PSEG05 静态：段位序列化契约未变（PrioritySegment 带 Disallow，键名 PascalCase；竞争轮次「全声明才写」）',
+    pseg05,
+    `全声明才写=${/allDeclared\s*\?\s*\{\s*CompetitionRound:/.test(api)} 键名齐=${/SegmentName:/.test(api) && /MatchConditions:/.test(api) && /SortFields:/.test(api) && /StableTieBreakFields:/.test(api)}`
+  )
+
+  /* ===== PSEG06：段的上移/下移只在同轮内 ===== */
+  const pseg06 =
+    /function sameRound/.test(comp) &&
+    /sameRound\(list\[j\], seg\)/.test(comp) &&
+    /:disabled="!canMove\(seg, -1\)"/.test(tpl) &&
+    /:disabled="!canMove\(seg, 1\)"/.test(tpl)
+  assert(
+    'PSEG06 静态：段的上移/下移只在同轮内移动（段序只在轮内有效，跨轮平移会破坏轮内先后）',
+    pseg06,
+    `sameRound=${/function sameRound/.test(comp)} 同轮相邻=${/sameRound\(list\[j\], seg\)/.test(comp)} 禁用态=${/:disabled="!canMove\(seg, -1\)"/.test(tpl)}`
+  )
+
+  /* ===== PSEG07：改归属轮次后段落到目标轮末尾 ===== */
+  const pseg07 =
+    /function moveToRound/.test(comp) && /list\.splice\(last \+ 1, 0, seg\)/.test(comp)
+  assert(
+    'PSEG07 静态：段改归属轮次时从原轮摘出、插到目标轮末尾（不留在原位造成跨轮交错）',
+    pseg07,
+    `moveToRound=${/function moveToRound/.test(comp)} 插入目标轮尾=${/list\.splice\(last \+ 1, 0, seg\)/.test(comp)}`
+  )
+
+  /* ===== PSEG08：三轮各有一条归属对象说明（冻结 §16） ===== */
+  const scopeStart = api.indexOf('export const COMPETITION_ROUND_SCOPE')
+  const scopeBlock =
+    scopeStart < 0 ? '' : api.slice(scopeStart, api.indexOf('}', scopeStart) + 1)
+  const scopeEntries = (scopeBlock.match(/^\s*[123]:\s*'/gm) || []).length
+  const pseg08 =
+    scopeStart >= 0 &&
+    scopeEntries === 3 &&
+    /scope: COMPETITION_ROUND_SCOPE\[r\.value\] \?\? ''/.test(api)
+  assert(
+    'PSEG08 静态：三轮各有一条「这一轮装哪类需求」的归属说明（冻结 01 v1.15 §16）',
+    pseg08,
+    `常量=${scopeStart >= 0} 条数=${scopeEntries} 组头取用=${/scope: COMPETITION_ROUND_SCOPE\[r\.value\]/.test(api)}`
+  )
+}
+
 async function main() {
   log(`\n========== APS V1 4号位 v1.4 §二十九 U23-U50 验收 ==========`)
   log(`API Base: ${API_BASE}`)
@@ -17480,7 +18033,9 @@ async function main() {
     'icons',
     'publish-concept',
     'delivery',
-    'capacity'
+    'capacity',
+    'audit-ui',
+    'pseg'
   ])
   const adminToken = STATIC_ONLY_GROUPS.has(GROUP) ? '' : await loginAsAdmin()
 
@@ -17584,6 +18139,9 @@ async function main() {
   if (GROUP === 'all' || GROUP === 'menu') {
     verifyMenuGroup()
   }
+  if (GROUP === 'all' || GROUP === 'pseg') {
+    verifyPrioritySegmentGroups()
+  }
   if (GROUP === 'all' || GROUP === 'overview') {
     await verifyOverview(adminToken)
   }
@@ -17631,6 +18189,9 @@ async function main() {
   }
   if (GROUP === 'all' || GROUP === 'capacity') {
     verifyCapacityCaliber()
+  }
+  if (GROUP === 'all' || GROUP === 'audit-ui') {
+    verifyAuditUi()
   }
 
   log(`\n========== 结果 ==========`)

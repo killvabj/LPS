@@ -569,7 +569,9 @@ watch(
           <span class="sum-val">{{ compNN.impactSummary.impactedOrderCount }}</span>
         </div>
         <div class="sum-pill" :class="{ hot: compNN.impactSummary.newDelayCount > 0 }">
-          <span class="sum-label">新增延期</span>
+          <span class="sum-label" title="候选版本里新增延期的任务条数（按任务数统计，不是订单数）"
+            >新增延期任务</span
+          >
           <span class="sum-val">{{ compNN.impactSummary.newDelayCount }}</span>
         </div>
         <div class="sum-pill" :class="{ hot: (compNN.impactSummary.estimatedOnlyCount ?? 0) > 0 }">

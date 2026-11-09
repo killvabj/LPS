@@ -91,14 +91,20 @@ export const useRulesStore = defineStore('aps.rules', () => {
     if (statusFilter.value === NO_VERSION) {
       arr = arr.filter((r) => !r.hasVersion)
     } else if (statusFilter.value !== 'ALL') {
-      arr = arr.filter((r) => r.status === statusFilter.value)
+      // 版本状态只对**有版本**的行成立：无版本的行后端 status 缺失，
+      // 前端为了列表展示兜底成 DRAFT ⇒ 若不排除，点「草稿」会捞出几百个根本没版本的行。
+      arr = arr.filter((r) => r.hasVersion && r.status === statusFilter.value)
     }
     return filterByScope(arr, apsAuth.dataScope, (r) =>
       r.domainKey === 'ALL' ? {} : { domainKey: r.domainKey }
     )
   })
 
-  /** 状态分布（顶部 KPI 用）—— v1.4 §二十 6 态 */
+  /** 状态分布（顶部 KPI 用）—— v1.4 §二十 6 态
+   *
+   *  只数**有版本**的行：无版本行后端 status 缺失，前端兜底成 DRAFT，
+   *  计进去会让「草稿」虚高到几百（dev 实测：真草稿 3 个，页面曾显示 886）。
+   */
   const statusCounts = computed(() => {
     const c: Record<RuleStatus, number> = {
       DRAFT: 0,
@@ -109,6 +115,7 @@ export const useRulesStore = defineStore('aps.rules', () => {
       ARCHIVED: 0
     }
     ruleSets.value.forEach((r) => {
+      if (!r.hasVersion) return
       c[r.status] = (c[r.status] ?? 0) + 1
     })
     return c

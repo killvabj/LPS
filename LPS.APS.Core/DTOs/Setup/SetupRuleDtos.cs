@@ -54,6 +54,9 @@ public sealed class SetupRuleDto
     /// <summary>换型分钟（&gt; 0）</summary>
     public decimal SetupMinutes { get; set; }
 
+    /// <summary>是否启用（契约扩展 #67，2026-11-07：读回带真实 IsActive，服务端不再硬置 true）</summary>
+    public bool IsActive { get; set; } = true;
+
     /// <summary>派生状态：DRAFT / ACTIVE / DEPRECATED（源自所属版本六态）</summary>
     public string Status { get; set; } = string.Empty;
 
@@ -99,6 +102,9 @@ public sealed class SetupRuleExactInput
 
     /// <summary>换型分钟（&gt; 0，否则 422）</summary>
     public decimal SetupMinutes { get; set; }
+
+    /// <summary>是否启用（默认 true；#67 契约扩展，2026-11-07，创建即可置 false 停用）</summary>
+    public bool IsActive { get; set; } = true;
 }
 
 /// <summary>
@@ -124,6 +130,9 @@ public sealed class SetupRuleDefaultInput
 
     /// <summary>换型分钟（&gt; 0，否则 422）</summary>
     public decimal SetupMinutes { get; set; }
+
+    /// <summary>是否启用（默认 true；#67 契约扩展，2026-11-07，创建即可置 false 停用）</summary>
+    public bool IsActive { get; set; } = true;
 
     /// <summary>
     /// 未映射请求字段（模型绑定器对未知字段静默忽略，DEFAULT 携带产品字段须由此显式拦截 → 422）。

@@ -286,17 +286,17 @@ watch([ganttWindow, () => ganttData.value?.planVersionId], () => {
  *  - 加 UTF-8 BOM（U+FEFF）：Excel 打开中文不乱码（无 BOM 时 Excel 按 ANSI 解码）
  */
 const EXPORT_COLUMNS = [
-  '任务号',
-  '订单号',
   '物料编码',
   '物料名称',
-  '工序',
-  '部门',
   '阶段',
-  '生产指示号',
+  '部门',
   '资源编码',
   '资源名称',
   '人工槽',
+  '工序',
+  '计划数量',
+  '单位',
+  '计划加工量',
   '计划开始',
   '计划结束',
   '时长(h)',
@@ -307,8 +307,9 @@ const EXPORT_COLUMNS = [
   '延期时长(h)',
   '主要原因',
   '延期',
-  '数量',
-  '单位'
+  '任务号',
+  '订单号',
+  '生产指示号'
 ] as const
 
 /** CSV 单元格转义：含分隔符/引号/换行时用双引号包起来，内部引号翻倍 */
@@ -335,17 +336,17 @@ function exportTaskList(): void {
         : ''
     lines.push(
       [
-        t.taskNo,
-        t.orderNo ?? '',
         t.materialCode ?? '',
         t.materialName ?? '',
-        t.operationCode,
-        t.departmentName ?? '',
         t.stageCode ?? '',
-        t.mtS_InstructionNo ?? '',
+        t.departmentName ?? '',
         r?.resourceCode ?? '未分配',
         r?.resourceName ?? '未分配',
         t.manualSlotId != null ? '人工' : '',
+        t.operationCode,
+        t.netQty,
+        t.uom,
+        t.plannedProcessQty ?? '',
         start,
         end,
         hours,
@@ -356,8 +357,9 @@ function exportTaskList(): void {
         t.delayHours != null ? t.delayHours.toFixed(1) : '',
         primaryDelayReasonText(t) ?? '',
         t.isDelayed ? '是' : '',
-        t.netQty,
-        t.uom
+        t.taskNo,
+        t.orderNo ?? '',
+        t.mtS_InstructionNo ?? ''
       ]
         .map(csvCell)
         .join(',')
@@ -562,6 +564,16 @@ const taskListPaged = computed(() => {
   const start = (taskListPage.value - 1) * TASK_LIST_PAGE_SIZE
   return taskListRows.value.slice(start, start + TASK_LIST_PAGE_SIZE)
 })
+
+/**
+ * 任务清单「资源」列文案：编码 + 名称（审核 B-01 要「设备号」；后端两个字段都给）。
+ * 人工槽行（manualSlotId 有值）资源侧为空 ⇒ 显示「—」，不编设备号。
+ */
+function taskResourceText(row: { resourceId?: number }): string {
+  const r = row.resourceId == null ? undefined : ganttResourceMap.value.get(row.resourceId)
+  if (!r) return '—'
+  return resourceCodeNameParts(r).join(' ') || '—'
+}
 
 /* ===== 泳道（Y 轴；按 groupBy 维度动态生成） ===== */
 interface Lane {
@@ -1515,6 +1527,17 @@ const selectedTask = computed<GanttTaskDto | null>(() => {
 
 /** 换型时间来源标签（未知值降级原样显示，不查表硬取） */
 const selectedSetupSourceMeta = computed(() => setupSourceMetaOf(selectedTask.value?.setupSource))
+
+/**
+ * TaskShare 区块标题（审核 B-02 三态）：
+ * 1 条 ⇒ 本任务由 1 个订单承接；多条 ⇒ 共担；0 条 ⇒ 不渲染本区块。
+ * 措辞只说后端给的事实，不替后端断言「单订单任务」或「共担」。
+ */
+const taskShareTitle = computed(() => {
+  const n = selectedTask.value?.taskShare?.length ?? 0
+  if (n <= 1) return '订单份额 — 本任务由 1 个订单承接'
+  return `订单份额 — 一个任务承接 ${n} 个订单`
+})
 
 /** 当前 Task 关联的资源（用于展示 Resource Down / 不可用窗口） */
 const selectedResource = computed(() => {
@@ -2932,34 +2955,49 @@ function triggerRescheduleForResource(): void {
           </ElButton>
         </div>
         <ElTable :data="taskListPaged" size="small" border max-height="520" style="width: 100%">
-          <ElTableColumn prop="taskNo" label="任务号" min-width="150" show-overflow-tooltip />
-          <ElTableColumn label="订单号" min-width="140" show-overflow-tooltip>
-            <template #default="{ row }">{{ row.orderNo ?? '—' }}</template>
+          <!-- 列序按「车间看单」的读法重排（0号位 2026-11-07 审核 B-01）：
+               物料 → 阶段 → 部门 → 资源/人工槽 → 工序 → 数量 → 时间 → 状态 → MES → 交期/延期/原因。
+               任务号 / 订单号 / 生产指示号是排产追溯主键，挪到表尾（高级列），不占前视线。
+               大工艺中文名待 5号位 出正式字典 ⇒ 阶段列仍显示 stageCode，前端不自造译名。 -->
+          <ElTableColumn label="物料" min-width="170" show-overflow-tooltip>
+            <template #default="{ row }">
+              <span>{{ row.materialCode ?? '—' }}</span>
+              <span v-if="row.materialName" class="task-list-muted">{{ row.materialName }}</span>
+            </template>
           </ElTableColumn>
-          <ElTableColumn label="物料" min-width="160" show-overflow-tooltip>
-            <template #default="{ row }">{{ row.materialCode ?? '—' }}</template>
+          <ElTableColumn label="阶段" width="110" show-overflow-tooltip>
+            <template #default="{ row }">{{ row.stageCode ?? '—' }}</template>
           </ElTableColumn>
-          <ElTableColumn prop="operationCode" label="工序" width="100" />
           <!-- 任务清单信息补全（5号位 2026-11-05 r14043/14044）：部门名 / 阶段 / 生产指示号
                缺键=后端无值 ⇒ 显示「—」（旧版本接口不会带这三键） -->
           <ElTableColumn label="部门" min-width="160" show-overflow-tooltip>
             <template #default="{ row }">{{ row.departmentName ?? '—' }}</template>
           </ElTableColumn>
-          <ElTableColumn label="阶段" width="110" show-overflow-tooltip>
-            <template #default="{ row }">{{ row.stageCode ?? '—' }}</template>
-          </ElTableColumn>
-          <ElTableColumn label="生产指示号" min-width="150" show-overflow-tooltip>
-            <template #default="{ row }">{{ row.mtS_InstructionNo ?? '—' }}</template>
-          </ElTableColumn>
-          <ElTableColumn label="资源" min-width="140" show-overflow-tooltip>
-            <template #default="{ row }">
-              {{ ganttResourceMap.get(row.resourceId ?? -1)?.resourceCode ?? '—' }}
-            </template>
+          <!-- 资源：编码 + 名称（后端两个字段都给；列表不显示内部 Id） -->
+          <ElTableColumn label="资源" min-width="150" show-overflow-tooltip>
+            <template #default="{ row }">{{ taskResourceText(row) }}</template>
           </ElTableColumn>
           <!-- 人工槽：有 manualSlotId 才是人工作业行（与设备资源互斥）；内部 id 不上列表 -->
           <ElTableColumn label="人工槽" width="90" align="center">
             <template #default="{ row }">
               <span v-if="row.manualSlotId != null">人工</span>
+              <span v-else class="task-list-muted">—</span>
+            </template>
+          </ElTableColumn>
+          <ElTableColumn prop="operationCode" label="工序" width="100" />
+          <!-- 计划数量 = 净需求（netQty）；CSV 早就带这列、表格漏显示（审核 B-01） -->
+          <ElTableColumn label="计划数量" width="120" align="right">
+            <template #default="{ row }">
+              <span v-if="row.netQty != null">{{ row.netQty }} {{ row.uom ?? '' }}</span>
+              <span v-else class="task-list-muted">—</span>
+            </template>
+          </ElTableColumn>
+          <!-- 计划加工量 = 含良率补偿的加工数（后端可选键，缺键即「—」，不拿净需求顶替） -->
+          <ElTableColumn label="计划加工量" width="120" align="right">
+            <template #default="{ row }">
+              <span v-if="row.plannedProcessQty != null"
+                >{{ row.plannedProcessQty }} {{ row.uom ?? '' }}</span
+              >
               <span v-else class="task-list-muted">—</span>
             </template>
           </ElTableColumn>
@@ -3015,6 +3053,14 @@ function triggerRescheduleForResource(): void {
               <ElTag v-if="row.isDelayed" type="danger" size="small">延期</ElTag>
               <span v-else class="task-list-muted">-</span>
             </template>
+          </ElTableColumn>
+          <!-- 高级列（审核 B-01：任务号 / 主订单 / PI 号挪到表尾，不占前视线） -->
+          <ElTableColumn prop="taskNo" label="任务号" min-width="150" show-overflow-tooltip />
+          <ElTableColumn label="订单号" min-width="140" show-overflow-tooltip>
+            <template #default="{ row }">{{ row.orderNo ?? '—' }}</template>
+          </ElTableColumn>
+          <ElTableColumn label="生产指示号" min-width="150" show-overflow-tooltip>
+            <template #default="{ row }">{{ row.mtS_InstructionNo ?? '—' }}</template>
           </ElTableColumn>
         </ElTable>
         <div class="task-list-pager">
@@ -3198,7 +3244,7 @@ function triggerRescheduleForResource(): void {
                         </template>
                         <ElTooltip
                           v-if="selectedTask.plannedProcessQty != null"
-                          :content="`计划加工 = 净需求 ÷ 良率（默认 95%）；两者不可混用`"
+                          :content="`计划加工 = 净需求 ÷ 良率；两者不可混用`"
                           placement="top"
                         >
                           <ElTag size="small" type="info" effect="plain" style="margin-left: 6px">
@@ -3542,14 +3588,18 @@ function triggerRescheduleForResource(): void {
                        5号位 2026-11-05 答复：判定语义无冻结明文、`Pegging.IsCrossDomain` 是边属性非阻挡判定，
                        V1 不做（字段恒缺键）⇒ 与 B6/B7/B8 同判撤除，不留永不出现的告警位。 -->
 
-                  <!-- U04：TaskShare 一个 Task 承接多 Order -->
+                  <!-- U04：TaskShare 三态（审核 B-02）：
+                       ① 有 1 条 ⇒ 该任务由 1 个订单承接（**不是**「没数据」）；
+                       ② 有多条 ⇒ 共担；
+                       ③ 后端没下发 ⇒ 才叫「未提供」。
+                       原判据 `length > 1` 把「恰好 1 条」误判成缺数据 ⇒ 单订单任务看不到自己的份额。 -->
                   <div
-                    v-if="selectedTask.taskShare && selectedTask.taskShare.length > 1"
+                    v-if="selectedTask.taskShare && selectedTask.taskShare.length > 0"
                     class="taskshare-section"
                   >
                     <div class="taskshare-title">
                       <Icon icon="vi-mdi:share-variant" />
-                      订单份额 — 一个任务承接 {{ selectedTask.taskShare.length }} 个订单
+                      {{ taskShareTitle }}
                     </div>
                     <ElTable :data="selectedTask.taskShare" size="small" border>
                       <ElTableColumn prop="orderNo" label="订单号" width="160">

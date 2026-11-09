@@ -161,6 +161,23 @@ public static class SolverDiagnostics
         public long MergeIdentityUnrepresentable;
 
         /// <summary>
+        /// 2026-11-07 v5.0 §1.4.1：**找到真实合批锚点**的需求批次数（`stageBatches.Count &gt; 0`）。
+        /// 判据链：`AnchorFound → TrialStarted → (HardRejectedCalendar | ComparedRejected | Adopted)`。
+        /// 只有这一整条链都成立，才能说「合并真的试过并因为某个具体原因没成」。
+        /// 纯观测。
+        /// </summary>
+        public long MergeAnchorFound;
+
+        /// <summary>v5.0 §1.4.1：真正**开始重排**（进 `TryMergeDemandIntoStageBatch`）的次数。</summary>
+        public long MergeTrialStarted;
+
+        /// <summary>v5.0 §1.4.1：试排**因硬约束（日历/资源）产不出任何 Task** 的次数。</summary>
+        public long MergeHardRejectedCalendar;
+
+        /// <summary>v5.0 §1.4.1：试排产出了合法合批方案，但在冻结层序比较中**落败**的次数。</summary>
+        public long MergeComparedRejected;
+
+        /// <summary>
         /// 2026-11-06 BATCH-02（0号位 e31a6fb 指令）：**「1 批」作为待试排候选被纳入**的次数。
         ///   判据：本值应 ≈ `AllowSplit=true` 的需求数；若长期远小于它，说明整批仍被某处排除。
         ///   纯观测，不参与任何判定。
@@ -301,8 +318,40 @@ public static class SolverDiagnostics
         public long CloneOccupancyKeyMax;
         public long CloneOccupancyKeySum;
 
+        /// <summary>
+        /// 2026-11-07 v5.0 A1：`CloneOccupancy` 源字典**键数**的幂次桶（只记分布，不记样本）。
+        ///   桶 `i`（i ≥ 1）覆盖 `[2^(i-1), 2^i - 1]`，桶 0 = 0 键。
+        ///   有了它才算得出 P50/P95/P99；旧字段只有峰值，回答不了「大多数时候拷多长」。
+        ///   纯观测，不参与任何业务判定。
+        /// </summary>
+        public long[] CloneOccupancyKeyBuckets = new long[33];
+
         /// <summary>2026-10-27 形状探针：`new List&lt;FinalTaskDraft&gt;(scheduledTasks)` 克隆时**任务表长度**的峰值。</summary>
         public long CloneTaskListLenMax;
+
+        /// <summary>2026-11-07 v5.0 A1：`CloneTaskList` **任务表长度**的幂次桶（桶定义同 <see cref="CloneOccupancyKeyBuckets"/>）。</summary>
+        public long[] CloneTaskListLenBuckets = new long[33];
+
+        /// <summary>2026-11-07 v5.0 A1：`CloneTaskList` 的**调用次数**（分布百分比的分母）。</summary>
+        public long CloneTaskListCalls;
+
+        /// <summary>
+        /// 2026-11-07 v5.0 A3：Routing 候选**总条数**（每条候选 = 一次完整试排）。
+        ///   【为什么先量这个】A3 允许记忆化的前提是「七项冻结输入全相等」。
+        ///     若候选之间工序序列本就条条不同，那么记忆化**一分钱也省不到** ——
+        ///     先证明重复存在，再谈缓存，否则等于凭感觉改算法。
+        ///   纯观测，不参与任何业务判定。
+        /// </summary>
+        public long RoutingCandidateTotal;
+
+        /// <summary>2026-11-07 v5.0 A3：**工序序列与本需求前面某条候选完全相同**的候选条数（= 可记忆化的上界）。</summary>
+        public long RoutingCandidateDuplicateOps;
+
+        /// <summary>2026-11-07 v5.0 A3：每需求候选条数的幂次桶（桶定义同 <see cref="CloneOccupancyKeyBuckets"/>）。</summary>
+        public long[] RoutingCandidatePerDemandBuckets = new long[33];
+
+        /// <summary>2026-11-07 v5.0 A3：单条候选的工序数峰值。</summary>
+        public long RoutingCandidateOpsMax;
 
         /// <summary>
         /// 2026-10-27 形状探针：批分组**覆盖层尾部长度**（`AppendBatchGroupsOverlayTail` 的 `tasks.Count - from`）
@@ -1541,6 +1590,57 @@ public static class SolverDiagnostics
 
     private static string TextBucket(string? s) => string.IsNullOrWhiteSpace(s) ? "(空)" : s!;
 
+    /// <summary>
+    /// 2026-11-07 v5.0 A1：把幂次桶还原成 P50/P95/P99 + 非空桶清单。
+    ///   ⚠ 分位是**上界**：桶只知道 `[2^(i-1), 2^i - 1]`，所以 `P95≤顶沿`，不是精确值。
+    ///   桶 0 的顶沿记 0；桶 `i≥1` 的顶沿 = `2^i - 1`。
+    ///   纯观测，不参与任何业务判定。
+    /// </summary>
+    private static string DescribeShapeBuckets(long[] buckets, long total, long max)
+    {
+        if (buckets is null || total <= 0)
+        {
+            return $"(无样本) 峰值={max:N0}";
+        }
+
+        long cum = 0;
+        var p50 = -1;
+        var p95 = -1;
+        var p99 = -1;
+
+        for (var i = 0; i < buckets.Length; i++)
+        {
+            cum += buckets[i];
+            if (p50 < 0 && cum * 2 >= total) p50 = i;                 // ≥50%
+            if (p95 < 0 && cum * 100 >= total * 95) p95 = i;          // ≥95%
+            if (p99 < 0 && cum * 100 >= total * 99) p99 = i;          // ≥99%
+        }
+
+        static long Top(int i) => i <= 0 ? 0 : (1L << i) - 1;   // 桶 i 的上沿 = 2^i - 1
+
+        var sb = new System.Text.StringBuilder();
+        sb.Append($"P50≤{Top(p50):N0}  P95≤{Top(p95):N0}  P99≤{Top(p99):N0}  Max={max:N0}");
+        sb.Append("  ｜ 非空桶: ");
+
+        var any = false;
+        var listed = 0;
+        for (var i = 0; i < buckets.Length && listed < 14; i++)
+        {
+            if (buckets[i] <= 0) continue;
+            any = true;
+            listed++;
+            var lo = i <= 0 ? 0 : 1L << (i - 1);
+            var hi = i <= 0 ? 0 : (1L << i) - 1;
+            var pct = 100d * buckets[i] / total;
+            sb.Append($"[{lo:N0}-{hi:N0}]={pct:N1}% ");
+        }
+
+        if (!any) sb.Append("(全空，计数未接线?)");
+        else if (listed >= 14) sb.Append("…(仅列前 14 个非空桶)");
+
+        return sb.ToString();
+    }
+
     /// <summary>把需求分类画像打进当前输出（Run 结束、`Scope.Dispose` 时一次）。</summary>
     private static void DumpDemandProfiles()
     {
@@ -1641,10 +1741,28 @@ public static class SolverDiagnostics
                 $"[SHAPE] CloneOccupancy: {occCalls:N0} 次, 平均键数={occMean:N1}, 峰值键数={c.CloneOccupancyKeyMax:N0}, "
                 + $"总耗时={occMs:N0}ms, 每次={occUs:N1}µs "
                 + $"⇒ 每键每次={occUs / Math.Max(occMean, 1d):N3}µs/键");
+            Console.WriteLine(
+                "[SHAPE] CloneOccupancy 键数分布（幂次桶, 上界=桶上沿）: "
+                + DescribeShapeBuckets(c.CloneOccupancyKeyBuckets, c.CloneOccupancy, c.CloneOccupancyKeyMax));
 
             Console.WriteLine(
                 $"[SHAPE] CloneTaskList: {taskCalls:N0} 次, 峰值长度={c.CloneTaskListLenMax:N0}, "
                 + $"总耗时={taskMs:N0}ms, 每次={taskUs:N1}µs");
+            Console.WriteLine(
+                "[SHAPE] CloneTaskList 长度分布（幂次桶, 上界=桶上沿）: "
+                + DescribeShapeBuckets(c.CloneTaskListLenBuckets, c.CloneTaskListCalls, c.CloneTaskListLenMax));
+
+            // ── 2026-11-07 v5.0 A3：冗余试排到底有多冗余 ──────────────────
+            //   判据：`工序重复条数 ÷ 候选总条数` 就是**记忆化的收益上界**；
+            //     若接近 0 ⇒ 候选条条不同，记忆化一分钱省不到，别做。
+            var candTotal = c.RoutingCandidateTotal;
+            var candDup = c.RoutingCandidateDuplicateOps;
+            Console.WriteLine(
+                $"[SHAPE] Routing 候选: 总条数={candTotal:N0}, 工序序列重复={candDup:N0}"
+                + $" ({(candTotal > 0 ? 100d * candDup / candTotal : 0d):F1}%), 单条工序数峰值={c.RoutingCandidateOpsMax:N0}");
+            Console.WriteLine(
+                "[SHAPE] 每需求候选条数分布（幂次桶, 上界=桶上沿）: "
+                + DescribeShapeBuckets(c.RoutingCandidatePerDemandBuckets, candTotal, c.RoutingCandidateOpsMax));
 
             // ── 候选并行到底有没有真并行（2026-10-27 诊断）──────────────────
             //   判据：候选耗时之和 ÷ Parallel.For 墙钟。
@@ -1885,6 +2003,7 @@ public static class SolverDiagnostics
         if (Current.Value is not { } c) return;
         System.Threading.Interlocked.Add(ref c.CloneOccupancyKeySum, keyCount);
         if (keyCount > c.CloneOccupancyKeyMax) c.CloneOccupancyKeyMax = keyCount;
+        System.Threading.Interlocked.Increment(ref c.CloneOccupancyKeyBuckets[ShapeBucketOf(keyCount)]);
     }
 
     /// <summary>2026-10-27 形状探针：登记 `new List&lt;FinalTaskDraft&gt;(scheduledTasks)` 的**任务表长度**。纯观测。</summary>
@@ -1892,6 +2011,36 @@ public static class SolverDiagnostics
     {
         if (Current.Value is not { } c) return;
         if (taskCount > c.CloneTaskListLenMax) c.CloneTaskListLenMax = taskCount;
+        System.Threading.Interlocked.Increment(ref c.CloneTaskListCalls);
+        System.Threading.Interlocked.Increment(ref c.CloneTaskListLenBuckets[ShapeBucketOf(taskCount)]);
+    }
+
+    /// <summary>
+    /// 2026-11-07 v5.0 A3：登记一条 Routing 候选。
+    ///   <paramref name="position"/> = 它在本需求候选表中的下标（0 起）；
+    ///   <paramref name="duplicateOps"/> = 工序序列是否与本需求前面某条候选逐字相同。
+    ///   纯观测，不参与任何业务判定。
+    /// </summary>
+    internal static void CountRoutingCandidate(int position, int opsCount, bool duplicateOps)
+    {
+        if (Current.Value is not { } c) return;
+        System.Threading.Interlocked.Increment(ref c.RoutingCandidateTotal);
+        if (duplicateOps) System.Threading.Interlocked.Increment(ref c.RoutingCandidateDuplicateOps);
+        if (opsCount > c.RoutingCandidateOpsMax) c.RoutingCandidateOpsMax = opsCount;
+        System.Threading.Interlocked.Increment(
+            ref c.RoutingCandidatePerDemandBuckets[ShapeBucketOf(position + 1)]);
+    }
+
+    /// <summary>
+    /// 2026-11-07 v5.0 A1：把长度映射到幂次桶号。
+    ///   `v ≤ 0` ⇒ 0；否则桶 `i = ⌊log2 v⌋ + 1` ⇒ 桶 i 覆盖 `[2^(i-1), 2^i - 1]`。
+    ///   为什么不上真直方图：热路径上不能分配、不能加锁；幂次桶只需一次 `Interlocked.Increment`。
+    /// </summary>
+    private static int ShapeBucketOf(int v)
+    {
+        if (v <= 0) return 0;
+        var i = System.Numerics.BitOperations.Log2((uint)v) + 1;
+        return i < 33 ? i : 32;
     }
 
     /// <summary>
@@ -2136,6 +2285,30 @@ public static class SolverDiagnostics
     internal static void CountMergeIdentityUnrepresentable()
     {
         if (Current.Value is { } c) System.Threading.Interlocked.Increment(ref c.MergeIdentityUnrepresentable);
+    }
+
+    /// <summary>v5.0 §1.4.1：登记一次「找到真实合批锚点」。纯观测。</summary>
+    internal static void CountMergeAnchorFound()
+    {
+        if (Current.Value is { } c) System.Threading.Interlocked.Increment(ref c.MergeAnchorFound);
+    }
+
+    /// <summary>v5.0 §1.4.1：登记一次「真正开始重排」。纯观测。</summary>
+    internal static void CountMergeTrialStarted()
+    {
+        if (Current.Value is { } c) System.Threading.Interlocked.Increment(ref c.MergeTrialStarted);
+    }
+
+    /// <summary>v5.0 §1.4.1：登记一次「试排因硬约束产不出 Task」。纯观测。</summary>
+    internal static void CountMergeHardRejectedCalendar()
+    {
+        if (Current.Value is { } c) System.Threading.Interlocked.Increment(ref c.MergeHardRejectedCalendar);
+    }
+
+    /// <summary>v5.0 §1.4.1：登记一次「合法合批方案在层序比较中落败」。纯观测。</summary>
+    internal static void CountMergeComparedRejected()
+    {
+        if (Current.Value is { } c) System.Threading.Interlocked.Increment(ref c.MergeComparedRejected);
     }
 
     /// <summary>

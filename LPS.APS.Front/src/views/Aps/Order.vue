@@ -619,6 +619,17 @@ onMounted(async () => {
             </span>
           </template>
         </ElTableColumn>
+        <!-- APS 预计完成时间（审核 C-01：原先只在详情抽屉里有，业务用户得逐行点开才能核对两个日期）
+             后端口径 = 该订单在当前版本全部 Task 的 MAX(PlannedEndTime)（后端算，前端不自算）；
+             未排产（无 Task 行）⇒ 整键省略 ⇒ 显示「未排产」，与「交付状态」列同词。 -->
+        <ElTableColumn label="APS 预计完成时间" width="150">
+          <template #default="{ row }">
+            <span v-if="row.plannedCompletionTime">
+              {{ formatUtcDateTime(row.plannedCompletionTime) }}
+            </span>
+            <span v-else class="muted" title="该订单在当前版本没有排产任务">未排产</span>
+          </template>
+        </ElTableColumn>
         <ElTableColumn prop="priority" label="优先级" width="80" align="right" />
         <ElTableColumn label="订单状态" width="90" align="center">
           <template #default="{ row }">

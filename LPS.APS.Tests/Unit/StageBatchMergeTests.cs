@@ -3087,6 +3087,62 @@ public class StageBatchMergeTests
     }
 
     /// <summary>
+    /// **v5.0 §1.4.1**：把「合批没成」拆到**具体阶段**，不再用一次 `TryMergeOrSchedule` 调用冒充「合并真实失败」。
+    ///
+    /// 判据链：`AnchorFound → TrialStarted → (HardRejectedCalendar | ComparedRejected | Adopted)`。
+    ///
+    /// 本用例 = **宽日历 + 无换型**（合批在冻结目标的 ③ 更早完成这一层就判负）：
+    ///   锚点能找到（A 的完整 Stage 批）、试排真的跑了、合批方案也合法产出了，
+    ///   只是在层序比较中**落败** ⇒ 必须记 `ComparedRejected`，而**不是** `HardRejectedCalendar`。
+    ///
+    /// 这正好回应 0号位：「`MergeAttempts>0` 不能单独证明候选过了锚点检查、实际开始重排、又因真实 Calendar 失败」。
+    /// </summary>
+    [Fact(DisplayName = "v5.0 §1.4.1 · 合批失败的阶段可辨：锚点→试排→择优落败（非日历硬拒）")]
+    public async Task V5_MergeStageChain_ComparedRejected_IsDistinguishedFrom_CalendarReject()
+    {
+        var request = Build(
+            paths: new[] { ThreeOpPath("RT", 1, 1, 2, 3, 1m) },
+            demands: new[]
+            {
+                new DemandSpec("A", 1, 30m, Day.AddDays(200)),
+                new DemandSpec("B", 2, 10m, Day.AddDays(200))
+            },
+            calendar: new[]
+            {
+                (1, Day.AddDays(120), Day.AddDays(125)),
+                (2, Day.AddDays(120), Day.AddDays(125)),
+                (3, Day.AddDays(120), Day.AddDays(125))
+            },
+            allowMerge: true,
+            allowSplit: false);
+
+        using var diag = SolverDiagnostics.BeginScope();
+        var result = await _solver.SolveAsync(request);
+        var c = diag.Counters;
+
+        Assert.True(result.Success, result.ErrorMessage);
+        Assert.Empty(result.UnscheduledTasks);
+
+        // ① 锚点找到
+        Assert.True(c.MergeAnchorFound > 0,
+            $"没找到任何合批锚点（AnchorFound={c.MergeAnchorFound}）⇒ 本夹具打不到这条链");
+
+        // ② 真的开始重排（不是只走到 if 分支就返回）
+        Assert.True(c.MergeTrialStarted > 0,
+            $"锚点有了但从没真正试排（TrialStarted={c.MergeTrialStarted}）");
+
+        // ③ 合批方案**合法产出**，但择优落败 —— 这与「日历装不下」是两回事
+        Assert.True(c.MergeComparedRejected > 0,
+            $"合批方案应合法产出后判负，实际 ComparedRejected={c.MergeComparedRejected}"
+            + $" / HardRejectedCalendar={c.MergeHardRejectedCalendar}");
+
+        // ④ 本夹具日历充裕 ⇒ **不得**记成日历硬拒
+        Assert.Equal(0L, c.MergeHardRejectedCalendar);
+        Assert.Equal(0L, c.MergeHits);
+    }
+
+
+    /// <summary>
     /// **W4 · T1 结构层**（v3.0 §2.4 第一段）：验证两条**结构事实**，不发明新业务模式：
     ///   ① **Setup 占用起点**：换型时间算在 `[PlannedStartTime, PlannedEndTime)` **之内且在加工之前**
     ///      ⇒ 该 Task 的跨度必须等于 `SetupTime + 数量 × 单件工时`；
