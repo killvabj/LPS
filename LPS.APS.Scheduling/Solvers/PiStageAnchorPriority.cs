@@ -113,6 +113,90 @@ internal static class PiStageAnchorPriority
         return initialCount - candidates.Count;
     }
 
+    /// <summary>
+    /// 2026-11-10（0号位《Phase2 安全性能优化 v1.0》§3-B3 / §7 第 2 步）：
+    ///   **单工序**候选 Task 的就地排序。口径与 <see cref="FilterAndSort"/> 完全一致：
+    ///   ① 锚批交期 ≤ 当前需求 ⇒ tier 0，越接近越前；② 晚于当前 ⇒ tier 1，越接近越前；
+    ///   ③ 任一方缺有效交期 ⇒ tier 2 置后；④ 同级按锚批当前批量升序；⑤ 再按稳定键断平。
+    ///
+    /// <para>⚠ 这里**不做 PI 过滤** —— 单工序路径的 PI 守卫已在 `ScanMergeCandidateRange` 里逐条做过；
+    ///   本方法只负责「先试谁」，不改变候选集合，也不执行任何真实排程。</para>
+    ///
+    /// <para>⚠ 只原地重排调用方传入的局部列表，不修改 Task 对象、份额表或占用表。</para>
+    /// </summary>
+    public static void SortSingleOpCandidates(
+        List<FinalTaskDraft> candidates,
+        LogicalProductionDemand currentDemand,
+        ConstraintContext constraints,
+        Dictionary<string, LogicalProductionDemand> demandByKey,
+        Dictionary<string, List<(string DemandKey, decimal ShareQty)>> shares)
+    {
+        if (candidates is null || candidates.Count < 2)
+        {
+            return;
+        }
+
+        var currentDue = constraints.EffectiveDueJudgementBound(currentDemand);
+        var keyed = new List<(FinalTaskDraft Task, int Tier, long Dist, decimal Qty, string Key)>(candidates.Count);
+
+        foreach (var task in candidates)
+        {
+            // 锚批有效交期取「全部已承接成员」的最早值；同一需求的多个 Operation 会重复登记，只取最小。
+            var anchorDue = DateTime.MaxValue;
+            if (!string.IsNullOrWhiteSpace(task.SourceDraftId)
+                && demandByKey.TryGetValue(task.SourceDraftId, out var sourceDemand))
+            {
+                anchorDue = constraints.EffectiveDueJudgementBound(sourceDemand);
+            }
+
+            if (shares is not null && shares.TryGetValue(task.FinalDraftId, out var composition))
+            {
+                foreach (var (memberKey, _) in composition)
+                {
+                    if (demandByKey.TryGetValue(memberKey, out var member))
+                    {
+                        var due = constraints.EffectiveDueJudgementBound(member);
+                        if (due < anchorDue) anchorDue = due;
+                    }
+                }
+            }
+
+            int tier;
+            long distance;
+            if (anchorDue == DateTime.MaxValue || currentDue == DateTime.MaxValue)
+            {
+                tier = 2;
+                distance = 0;
+            }
+            else if (anchorDue <= currentDue)
+            {
+                tier = 0;
+                distance = currentDue.Ticks - anchorDue.Ticks;
+            }
+            else
+            {
+                tier = 1;
+                distance = anchorDue.Ticks - currentDue.Ticks;
+            }
+
+            keyed.Add((task, tier, distance, task.Quantity, task.FinalDraftId ?? string.Empty));
+        }
+
+        keyed.Sort(static (a, b) =>
+        {
+            var r = a.Tier.CompareTo(b.Tier);
+            if (r != 0) return r;
+            r = a.Dist.CompareTo(b.Dist);
+            if (r != 0) return r;
+            r = a.Qty.CompareTo(b.Qty);
+            if (r != 0) return r;
+            return string.CompareOrdinal(a.Key, b.Key);
+        });
+
+        candidates.Clear();
+        foreach (var e in keyed) candidates.Add(e.Task);
+    }
+
     private static bool TryGetAnchorDueAndCheckPi(
         List<FinalTaskDraft> group,
         LogicalProductionDemand currentDemand,

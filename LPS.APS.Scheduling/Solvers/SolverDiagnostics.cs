@@ -274,6 +274,25 @@ public static class SolverDiagnostics
         /// </summary>
         public readonly long[] MergePiStats = new long[12];
 
+        /// <summary>2026-11-09：本次求解收到的需求总条数 / 其中 `ProductionInstructionNo` 非空白的条数。纯观测。</summary>
+        public long SingleOpMergeSkippedNoPi;
+
+        public long PiFillTotal;
+        public long PiFillPresent;
+
+        /// <summary>
+        /// 2026-11-09：「PI 缺失」类的**成因分解**（把 99.4% 拆开，避免把"查表失败"误算成"没填 PI"）。
+        ///   [0] 当前需求自己没有 PI；[1] 锚批代表需求在 `demandByKey` 里查不到；[2] 锚批代表需求有键但 PI 为空。
+        /// </summary>
+        public readonly long[] MergePiMissingReason = new long[3];
+
+        /// <summary>
+        /// 2026-11-09：累计在**合批试排内部**消耗的 `BatchPlanTrial` 毫秒数。
+        ///   用途：`BatchPlanTrial` 热点会嵌套在合批试排里；用它做差，才能把
+        ///   「拆批方案试排」拆成「合批里的」与「独立路径上的」两部分。纯观测。
+        /// </summary>
+        public double BatchTrialMsInMerge;
+
         /// <summary>
         /// 2026-11-09 Step 1：产品时间线 `Compact`（增量压缩回基线）运行次数。纯观测。
         ///   `Compact` 会整表复制外层资源字典并归并受影响资源的整条 list ⇒ 是「每次更贵」的头号嫌疑。
@@ -2329,6 +2348,37 @@ public static class SolverDiagnostics
 
         /// <summary>最终被选为擂台胜者的次数。</summary>
         Adopted = 3,
+    }
+
+    /// <summary>2026-11-09：单工序合批因「当前需求无 PI」被 O(1) 短路跳过的次数（纯观测）。</summary>
+    internal static void CountSingleOpMergeSkippedNoPi()
+    {
+        if (Current.Value is { } c) System.Threading.Interlocked.Increment(ref c.SingleOpMergeSkippedNoPi);
+    }
+
+    /// <summary>2026-11-09：累加「合批试排内部的拆批方案试排」耗时（纯观测）。</summary>
+    internal static void AddBatchTrialMsInMerge(double delta)
+    {
+        if (Current.Value is { } c) c.BatchTrialMsInMerge += delta;
+    }
+
+    /// <summary>2026-11-09：记录需求 PI 填充率（一次性，纯观测）。</summary>
+    internal static void SetPiFill(long total, long present)
+    {
+        if (Current.Value is { } c)
+        {
+            c.PiFillTotal = total;
+            c.PiFillPresent = present;
+        }
+    }
+
+    /// <summary>2026-11-09：「PI 缺失」成因分解（0=需求自身无PI / 1=锚批查不到 / 2=锚批PI为空）。纯观测。</summary>
+    internal static void CountMergePiMissing(int reason)
+    {
+        if (Current.Value is { } c && reason >= 0 && reason < 3)
+        {
+            System.Threading.Interlocked.Increment(ref c.MergePiMissingReason[reason]);
+        }
     }
 
     /// <summary>2026-11-09：按类别累加合批擂台统计（纯观测，不参与任何判定）。</summary>

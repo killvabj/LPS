@@ -25,8 +25,19 @@ internal class PhaseTwoInitialScheduler
     //   PI_SORT  = 同 PI 过滤 + 按交期/批量排序（仍全部试算）
     //   PI_FIRST = 同 PI + 排序 + 首个物理可行锚批评价完毕后停止
     //   启动时读取一次、进程内冻结；热路径不读环境变量。未知取值按 LEGACY 安全退回。
-    private static readonly string P2AnchorMode =
+    private static readonly string P2AnchorModeFromEnv =
         Environment.GetEnvironmentVariable("APS_P2_ANCHOR_MODE") ?? "LEGACY";
+
+    /// <summary>
+    /// 测试专用覆盖。生产代码**从不调用**；未设置时行为与「只读环境变量」逐字相同。
+    /// 存在理由：`P2AnchorModeFromEnv` 是进程级只读，单元测试无法在同一进程内切换四种模式，
+    /// 而 §C 的反证矩阵需要逐模式验证。
+    /// </summary>
+    private static string? _p2AnchorModeOverride;
+
+    internal static void OverrideAnchorModeForTest(string? mode) => _p2AnchorModeOverride = mode;
+
+    private static string P2AnchorMode => _p2AnchorModeOverride ?? P2AnchorModeFromEnv;
     private static bool P2FilterByPi => P2AnchorMode is "PI_ONLY" or "PI_SORT" or "PI_FIRST";
     private static bool P2SortAnchors => P2AnchorMode is "PI_SORT" or "PI_FIRST";
     private static bool P2StopAtFirstFeasible => P2AnchorMode == "PI_FIRST";
@@ -462,6 +473,100 @@ internal class PhaseTwoInitialScheduler
         // P0-08：同 PI 连续份额先于自由份额。稳定重排，仅在同 PI 组内把连续份额移到自由份额之前，
         // 跨 PI 相对顺序按「该 PI 首次出现位置」保持，避免破坏跨物料父子拓扑序。
         sortedDemands = OrderContinuityFirst(sortedDemands);
+
+        // 2026-11-09：一次性统计**需求侧** PI 填充率（纯观测）。用途：把「PI 缺失」到底是
+        //   「输入没填」还是「查表失败」分开，不拿推断当证据。
+        SolverDiagnostics.SetPiFill(
+            sortedDemands.Count,
+            sortedDemands.Count(d => !string.IsNullOrWhiteSpace(d.ProductionInstructionNo)));
+
+        // 2026-11-09：PI 审计（仅在分桶画像开启时执行一次；关闭时零开销）。
+        //   质疑点：78.9% 的需求没有 PI 这个数只有一个来源 ⇒ 用「不同 PI 个数 / 是否被共享 / 原值样例」
+        //   做独立交叉验证。若 distinct ≈ present，则 PI 是一需求一值的伪键，"同 PI 合批"在数据上不成立。
+        if (Phase2WindowProfiler.IsEnabled)
+        {
+            var lines = new List<string>();
+            long total = sortedDemands.Count;
+            long present = sortedDemands.Count(d => !string.IsNullOrWhiteSpace(d.ProductionInstructionNo));
+            lines.Add($"demand_total={total}");
+            lines.Add($"demand_with_pi={present}");
+            lines.Add($"demand_without_pi={total - present}");
+
+            var piCounts = new Dictionary<string, int>(StringComparer.Ordinal);
+            var piSamples = new List<string>(8);
+            foreach (var d in sortedDemands)
+            {
+                var pi = d.ProductionInstructionNo;
+                if (string.IsNullOrWhiteSpace(pi)) continue;
+                piCounts.TryGetValue(pi, out var cnt);
+                piCounts[pi] = cnt + 1;
+                if (piSamples.Count < 5) piSamples.Add(pi);
+            }
+
+            long multi = 0;
+            long maxPer = 0;
+            foreach (var kv in piCounts)
+            {
+                if (kv.Value > 1) multi++;
+                if (kv.Value > maxPer) maxPer = kv.Value;
+            }
+
+            lines.Add($"distinct_pi_values={piCounts.Count}");
+            lines.Add($"pi_shared_by_more_than_one_demand={multi}");
+            lines.Add($"max_demands_per_single_pi={maxPer}");
+            for (var i = 0; i < piSamples.Count; i++) lines.Add($"sample[{i}]={piSamples[i]}");
+
+            void DumpSide(string tag, Func<LogicalProductionDemand, bool> pick)
+            {
+                var set = sortedDemands.Where(pick).ToList();
+                lines.Add($"[{tag}] count={set.Count}"
+                    + $" | IsContinuation={set.Count(d => d.IsContinuation)}"
+                    + $" | IsRootDemand={set.Count(d => d.IsRootDemand)}"
+                    + $" | hasOrderId={set.Count(d => d.OrderId is not null)}"
+                    + $" | hasBomNo={set.Count(d => !string.IsNullOrWhiteSpace(d.BomNo))}"
+                    + $" | hasRequestDetailId={set.Count(d => d.RequestDetailId is not null)}"
+                    + $" | hasContinuationKey={set.Count(d => !string.IsNullOrWhiteSpace(d.ContinuationKey))}");
+            }
+
+            DumpSide("with_pi", d => !string.IsNullOrWhiteSpace(d.ProductionInstructionNo));
+            DumpSide("without_pi", d => string.IsNullOrWhiteSpace(d.ProductionInstructionNo));
+
+            foreach (var g in sortedDemands
+                         .Where(d => string.IsNullOrWhiteSpace(d.ProductionInstructionNo))
+                         .GroupBy(d => d.StartStageCode ?? "(null)")
+                         .OrderByDescending(g => g.Count())
+                         .Take(12))
+            {
+                lines.Add($"without_pi_start_stage[{g.Key}]={g.Count()}");
+            }
+
+            foreach (var g in sortedDemands
+                         .Where(d => !string.IsNullOrWhiteSpace(d.ProductionInstructionNo))
+                         .GroupBy(d => d.StartStageCode ?? "(null)")
+                         .OrderByDescending(g => g.Count())
+                         .Take(12))
+            {
+                lines.Add($"with_pi_start_stage[{g.Key}]={g.Count()}");
+            }
+
+            // ── A1 / B1（0号位《BOM采购/内制纠偏…指令》）：输入边界与去重口径 ──
+            lines.Add($"lpd_raw_count={request.LogicalProductionDemands.Count}");
+            lines.Add($"lpd_distinct_LogicalDemandKey={request.LogicalProductionDemands.Select(d => d.LogicalDemandKey).Distinct(StringComparer.Ordinal).Count()}");
+            lines.Add($"allocation_lineage_count={request.AllocationLineage?.Count ?? 0}");
+            lines.Add($"material_constraints_slices={request.MaterialConstraints?.Count ?? 0}");
+            lines.Add($"material_requirement_links={request.MaterialRequirementLinks?.Count ?? 0}");
+            lines.Add($"pi_remaining_facts={request.PiRemainingFacts?.Count ?? 0}");
+            lines.Add($"pi_stage_quantity_baselines={request.PiStageQuantityBaselines?.Count ?? 0}");
+
+            var auditWithPi = sortedDemands.Where(d => !string.IsNullOrWhiteSpace(d.ProductionInstructionNo)).ToList();
+            var auditNoPi = sortedDemands.Where(d => string.IsNullOrWhiteSpace(d.ProductionInstructionNo)).ToList();
+            lines.Add($"[qty] with_pi_NetOutputQty={auditWithPi.Sum(d => d.NetOutputQty)} planned_process_qty={auditWithPi.Sum(d => d.PlannedProcessQty)}");
+            lines.Add($"[qty] without_pi_NetOutputQty={auditNoPi.Sum(d => d.NetOutputQty)} planned_process_qty={auditNoPi.Sum(d => d.PlannedProcessQty)}");
+            lines.Add($"[grid] with_pi_root={auditWithPi.Count(d => d.IsRootDemand)} with_pi_nonroot={auditWithPi.Count(d => !d.IsRootDemand)}"
+                + $" no_pi_root={auditNoPi.Count(d => d.IsRootDemand)} no_pi_nonroot={auditNoPi.Count(d => !d.IsRootDemand)}");
+
+            Phase2WindowProfiler.WritePiAuditReport(lines);
+        }
 
         // 资源占用追踪：ResourceId → 已占用时间窗列表
         var resourceOccupancy = InitializeResourceOccupancy(request.Resources, constraints);
@@ -7539,15 +7644,27 @@ internal class PhaseTwoInitialScheduler
                 //   0=同 PI，1=跨 PI，2=取不到 PI（需求或锚批任一侧缺失）。纯观测，不参与任何判定。
                 int mergePiClass = 2;
                 var demandPiForStats = demand.ProductionInstructionNo;
-                if (!string.IsNullOrEmpty(demandPiForStats)
-                    && stageBatches[anchorIndex].Count > 0
-                    && stageBatches[anchorIndex][0].SourceDraftId is { } anchorSrcKeyForPi
-                    && demandByKey.TryGetValue(anchorSrcKeyForPi, out var anchorDemandForPi)
-                    && !string.IsNullOrEmpty(anchorDemandForPi.ProductionInstructionNo))
+                if (string.IsNullOrWhiteSpace(demandPiForStats))
                 {
-                    mergePiClass = string.Equals(anchorDemandForPi.ProductionInstructionNo, demandPiForStats, StringComparison.Ordinal)
-                        ? 0
-                        : 1;
+                    SolverDiagnostics.CountMergePiMissing(0);   // 当前需求自身没有 PI
+                }
+                else if (stageBatches[anchorIndex].Count == 0
+                         || stageBatches[anchorIndex][0].SourceDraftId is not { } anchorSrcKeyForPi
+                         || !demandByKey.TryGetValue(anchorSrcKeyForPi, out var anchorDemandForPi))
+                {
+                    SolverDiagnostics.CountMergePiMissing(1);   // 锚批代表需求查不到（不是"没填PI"）
+                }
+                else
+                {
+                    var anchorPiForStats = anchorDemandForPi.ProductionInstructionNo;
+                    if (string.IsNullOrWhiteSpace(anchorPiForStats))
+                    {
+                        SolverDiagnostics.CountMergePiMissing(2);   // 锚批代表需求有键但 PI 为空
+                    }
+                    else
+                    {
+                        mergePiClass = string.Equals(anchorPiForStats, demandPiForStats, StringComparison.Ordinal) ? 0 : 1;
+                    }
                 }
 
                 SolverDiagnostics.CountMergePi(mergePiClass, SolverDiagnostics.MergePiMetric.Anchor);
@@ -7596,6 +7713,11 @@ internal class PhaseTwoInitialScheduler
                 List<FinalTaskDraft> anchorCombinedTasks;
                 SolverDiagnostics.CountMergeTrialStarted();
                 SolverDiagnostics.CountMergePi(mergePiClass, SolverDiagnostics.MergePiMetric.Trial);
+                // 2026-11-09 拆解 ②：量「合批试排内部」用掉多少拆批方案试排（未开画像时零开销）
+                var profCounters = Phase2WindowProfiler.IsEnabled ? SolverDiagnostics.LiveCounters : null;
+                var profBatchTrialBefore = profCounters is null
+                    ? 0d
+                    : profCounters.HotspotMs(SolverDiagnostics.Hotspot.BatchPlanTrial);
                 try
                 {
                     anchorRepresentative = TryMergeDemandIntoStageBatch(
@@ -7617,6 +7739,11 @@ internal class PhaseTwoInitialScheduler
                     mergePiClass,
                     SolverDiagnostics.MergePiMetric.Ticks,
                     System.Diagnostics.Stopwatch.GetTimestamp() - mergePiStartTs);
+                if (profCounters is not null)
+                {
+                    SolverDiagnostics.AddBatchTrialMsInMerge(
+                        profCounters.HotspotMs(SolverDiagnostics.Hotspot.BatchPlanTrial) - profBatchTrialBefore);
+                }
                 // v5.0 §1.4.1：试排产不出任何 Task ⇒ 硬约束（日历/资源）拒绝，**不是**择优判负。
                 if (anchorRepresentative is null) SolverDiagnostics.CountMergeHardRejectedCalendar();
                 var anchorSetup = anchorCombinedTasks.Sum(t => t.SetupTime);
@@ -7788,6 +7915,16 @@ internal class PhaseTwoInitialScheduler
                 //   它最终是否采纳，由上方 `PreferStageMerge` 层序决定；**不得**继续试第二条可行锚批。
                 //   ⚠ 判据是 `anchorRepresentative is not null`（真实试排返回非 null），
                 //      **不是** `mergeWins`（那是"是否采纳合批"，两个不同问题）。
+                // ── 2026-11-09 P0 修正（0号位《BOM并行期 Phase2 安全性能优化 v1.0》§1 表 / §6.1）──
+                //   旧判据 `anchorRepresentative is not null` 只表示"物理可行"，**不能**作为停止条件：
+                //   首锚物理可行但输给独立方案时，第二锚仍可能被采纳 ⇒ 直接 break 会漏掉。
+                //   现改为：**只有"真实可行且按原比较胜过独立基线"（`mergeWins`）才停止**；
+                //   物理可行但比较落败 ⇒ 继续下一个锚批。
+                //   ⚠ 本修正覆盖 2026-11-09 前件 v1.0 §2.3 / §3-M4 的相反表述，以后到的本件为准。
+                // 2026-11-10（0号位《审核与下一轮指令 v1.0》§0.2 / §2）：**恢复甲方案** ——
+                //   首个通过完整硬约束的物理可行锚批，完成与独立排程的既有比较后**立即停止**；
+                //   **即使比较输给独立方案也停止**（`mergeWins` 只决定是否采纳合批，不决定是否继续找锚批）。
+                //   ⚠ 2026-11-09 优化指导 §6.1、2026-11-10 前件 §3-B4 中"必须 mergeWins 才停"的表述**已被撤销**。
                 if (P2StopAtFirstFeasible && anchorRepresentative is not null)
                 {
                     firstFeasibleFound = true;
@@ -8019,8 +8156,27 @@ internal class PhaseTwoInitialScheduler
 
         if (candidateTasks.Count > 0)
         {
-            // 尝试将Demand合并到第一个候选Task
-            var targetTask = candidateTasks[0];
+            // ── 2026-11-10 §7 第2步（0号位《Phase2 安全性能优化 v1.0》§3-B3）──
+            //   先按「锚批交期不晚于当前需求且最接近 → 同交期批量小 → 稳定键」排序，**再取第一个**。
+            //   ⚠ 本刀**只改"先试谁"，不改成"试几个"**：`TryMergeDemandIntoTask` 失败时是否已完整回滚
+            //     尚未核实，0号位 §3-B3 明令"试算失败可能已修改状态，不得裸套 foreach"。
+            //     故仍然是**单次尝试**；"依次试到首个可采纳"待回滚安全性核证后再单独一刀。
+            //   `LEGACY` 不进入本段 ⇒ 顺序与行为逐字不变。
+            if (P2SortAnchors)
+            {
+                PiStageAnchorPriority.SortSingleOpCandidates(
+                    candidateTasks, demand, constraints, demandByKey, allocationTaskShare);
+            }
+
+            // ── 2026-11-10 §7 第2步（甲方案）：按已排好的优先序**依次试到首个成功**；硬失败换下一个。
+            //   【为什么现在敢循环】已核实 `TryMergeDemandIntoTask` 的 **9 个失败出口全部在
+            //     第一处写入（`:10010 AddOccupancyWindow`）之前返回** ⇒ 失败时**无副作用**，
+            //     连试多个候选不会留脏状态（这正是 0号位 §3-B3 要求先核的那一条）。
+            //   `LEGACY` 下 `attemptLimit == 1` ⇒ 只试第一个，与旧行为**逐字等价**。
+            var attemptLimit = P2SortAnchors ? candidateTasks.Count : 1;
+            for (var attemptIndex = 0; attemptIndex < attemptLimit; attemptIndex++)
+            {
+            var targetTask = candidateTasks[attemptIndex];
 
             // 检查合并后是否破坏交期：合并后Duration增加，End时间延后
             var mergedTask = TryMergeDemandIntoTask(demand, targetTask, routingGraph, constraints, resourceOccupancy, allocationTaskShare, planningEnd, demandByKey, batchDraftKey, occupancyPristine);
@@ -8055,6 +8211,7 @@ internal class PhaseTwoInitialScheduler
                 // 不生成新Task
                 return new List<FinalTaskDraft>();
             }
+            }   // 结束「依次试到首个成功」循环（LEGACY 下 attemptLimit==1 ⇒ 与旧行为逐字等价）
         }
 
         // 无法合并：正常排程
@@ -8432,6 +8589,16 @@ internal class PhaseTwoInitialScheduler
             return candidates; // 多工序不支持Merge
         }
 
+        // ── 2026-11-09 第一刀A（0号位《BOM并行期 Phase2 安全性能优化 v1.0》§2-A2）──
+        //   无 PI ⇒ 不存在「同 PI 的真实合批锚点」，扫完整张历史 Task 表也找不到 ⇒ **O(1) 直接返回**。
+        //   ⚠ 只短路「跨需求合批」，**不短路独立排程、拆批与 Routing**：本需求照常产 Task、照常判未排，
+        //     也照常可被 MES 判定资格。仅新模式启用；LEGACY 走原全表扫描，行为逐字不变。
+        if (P2FilterByPi && string.IsNullOrWhiteSpace(demand.ProductionInstructionNo))
+        {
+            SolverDiagnostics.CountSingleOpMergeSkippedNoPi();
+            return candidates;
+        }
+
         var targetOp = operations[0];
 
         // ── 2026-10-27 三十六刀（**已撤销**）：曾在此做「同输入去重」，实测无效 ──
@@ -8586,6 +8753,17 @@ internal class PhaseTwoInitialScheduler
             if (!demandByKey.TryGetValue(task.SourceDraftId, out var sourceDemand))
             {
                 continue; // 无法追溯来源 demand，保守不 merge
+            }
+
+            // 2026-11-09 第一刀A 守卫（0号位 §2-A2）：**来源需求 PI 必须与当前需求一致**。
+            //   跨 PI 只能按 Setup 连续生产，不得合成同一执行批 / MES 工单。
+            //   `Ordinal` 精确比较：不 Trim、不折大小写 —— 不做规范化以免制造虚假"同 PI"。
+            if (P2FilterByPi
+                && (string.IsNullOrWhiteSpace(sourceDemand.ProductionInstructionNo)
+                    || !string.Equals(sourceDemand.ProductionInstructionNo,
+                                      demand.ProductionInstructionNo, StringComparison.Ordinal)))
+            {
+                continue;
             }
             // P0-07：连续份额任务不能被普通 Merge 吸收，自由份额也不得并入连续份额任务（保逐工单身份）。
             // NoSplitMerge（不拆不合）显式落实：任一侧带该标记都不得合批。

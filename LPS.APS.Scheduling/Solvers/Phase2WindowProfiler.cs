@@ -26,6 +26,65 @@ namespace LPS.APS.Scheduling.Solvers;
 /// </summary>
 internal static class Phase2WindowProfiler
 {
+    /// <summary>是否开启分桶画像。供热路径做「零成本」判定用。</summary>
+    public static bool IsEnabled => Enabled;
+
+    /// <summary>
+    /// 2026-11-09：PI 填充率**审计**（只在画像开启时写一个旁路文本文件）。
+    ///   目的：不只数「多少条有 PI」，还要看「有多少个不同的 PI、PI 有没有被共享、原值长什么样」，
+    ///   以判断 `ProductionInstructionNo` 到底是真·生产指令号，还是一需求一值的伪键。
+    /// </summary>
+    /// <summary>2026-11-09：写出 PI 审计报告（逐行）。仅在画像开启时落一个旁路文本。</summary>
+    public static void WritePiAuditReport(IReadOnlyList<string> lines)
+    {
+        if (!Enabled || string.IsNullOrWhiteSpace(CsvPath))
+        {
+            return;
+        }
+
+        try
+        {
+            using var w = new StreamWriter(CsvPath + ".pi_audit.txt", append: false, Encoding.UTF8);
+            foreach (var line in lines)
+            {
+                w.WriteLine(line);
+            }
+        }
+        catch
+        {
+            // 观测失败绝不影响跑批。
+        }
+    }
+
+    public static void WritePiAudit(
+        long total, long present, long distinct, long multiDemandPiCount, long maxDemandsPerPi,
+        IReadOnlyList<string> samples)
+    {
+        if (!Enabled || string.IsNullOrWhiteSpace(CsvPath))
+        {
+            return;
+        }
+
+        try
+        {
+            using var w = new StreamWriter(CsvPath + ".pi_audit.txt", append: false, Encoding.UTF8);
+            w.WriteLine($"demand_total={total}");
+            w.WriteLine($"demand_with_pi={present}");
+            w.WriteLine($"distinct_pi_values={distinct}");
+            w.WriteLine($"pi_shared_by_more_than_one_demand={multiDemandPiCount}");
+            w.WriteLine($"max_demands_per_single_pi={maxDemandsPerPi}");
+            w.WriteLine("--- samples (first non-empty) ---");
+            for (var i = 0; i < samples.Count; i++)
+            {
+                w.WriteLine($"sample[{i}]={samples[i]}");
+            }
+        }
+        catch
+        {
+            // 观测失败绝不影响跑批。
+        }
+    }
+
     private const string PathEnvVar = "APS_P2_BUCKET_CSV";
     private const string SizeEnvVar = "APS_P2_BUCKET_SIZE";
 
@@ -55,6 +114,8 @@ internal static class Phase2WindowProfiler
     private static long _lastTimelinePlaceCalls;
     private static long _lastTimelineCompactRuns;
     private static readonly long[] _lastPlaceBySource = new long[8];
+    private static double _lastBatchTrialMs;
+    private static double _lastBtInMerge;
     private static int _windowIndex;
 
     // ── 候选形状直方图（Q4 / Step 1）：候选数 0 / 1 / 2 / 3 / 4+ ──
@@ -92,7 +153,19 @@ internal static class Phase2WindowProfiler
     /// </summary>
     public static void Tick(int processed)
     {
-        if (!Enabled || processed - _lastProcessed < WindowSize)
+        if (!Enabled)
+        {
+            return;
+        }
+
+        // 第一次调用即记录起点：否则第 1 桶的墙钟恒为 0，
+        // 就算不出「跑到第 5000 条花了多久」——而固定前缀对拍正需要这个数。
+        if (_lastTs == 0L)
+        {
+            _lastTs = System.Diagnostics.Stopwatch.GetTimestamp();
+        }
+
+        if (processed - _lastProcessed < WindowSize)
         {
             return;
         }
@@ -142,6 +215,11 @@ internal static class Phase2WindowProfiler
 
             // 合批擂台按 PI 分类（累计值，最后一行的值即为全量）
             var mps = counters.MergePiStats;
+            var mpsr = counters.MergePiMissingReason;
+
+            // 拆解 ②：拆批方案试排总量 vs 其中落在合批试排内部的部分
+            var batchTrialMs = counters.HotspotMs(SolverDiagnostics.Hotspot.BatchPlanTrial);
+            var btInMerge = counters.BatchTrialMsInMerge;
 
             var row = string.Join(",",
                 (_windowIndex + 1).ToString(CultureInfo.InvariantCulture),
@@ -184,6 +262,13 @@ internal static class Phase2WindowProfiler
                 mps[9].ToString(CultureInfo.InvariantCulture),   // PI缺失 试排
                 mps[10].ToString(CultureInfo.InvariantCulture),  // PI缺失 ticks
                 mps[11].ToString(CultureInfo.InvariantCulture),  // PI缺失 胜出
+                counters.PiFillTotal.ToString(CultureInfo.InvariantCulture),
+                counters.PiFillPresent.ToString(CultureInfo.InvariantCulture),
+                mpsr[0].ToString(CultureInfo.InvariantCulture),   // 缺失：需求自身无PI
+                mpsr[1].ToString(CultureInfo.InvariantCulture),   // 缺失：锚批查不到
+                mpsr[2].ToString(CultureInfo.InvariantCulture),   // 缺失：锚批PI为空
+                (batchTrialMs - _lastBatchTrialMs).ToString("F0", CultureInfo.InvariantCulture),
+                (btInMerge - _lastBtInMerge).ToString("F0", CultureInfo.InvariantCulture),
                 Interlocked.Read(ref CandidateHistogram[0]).ToString(CultureInfo.InvariantCulture),
                 Interlocked.Read(ref CandidateHistogram[1]).ToString(CultureInfo.InvariantCulture),
                 Interlocked.Read(ref CandidateHistogram[2]).ToString(CultureInfo.InvariantCulture),
@@ -211,6 +296,8 @@ internal static class Phase2WindowProfiler
             _lastTimelineMs = timelineMs;
             _lastTimelinePlaceCalls = timelinePlaceCalls;
             _lastTimelineCompactRuns = timelineCompactRuns;
+            _lastBatchTrialMs = batchTrialMs;
+            _lastBtInMerge = btInMerge;
             for (var i = 0; i < _lastPlaceBySource.Length && i < pbs.Length; i++)
             {
                 _lastPlaceBySource[i] = pbs[i];
@@ -252,6 +339,8 @@ internal static class Phase2WindowProfiler
                 + "pi_same_anchor,pi_same_trial,pi_same_ticks,pi_same_adopt,"
                 + "pi_cross_anchor,pi_cross_trial,pi_cross_ticks,pi_cross_adopt,"
                 + "pi_miss_anchor,pi_miss_trial,pi_miss_ticks,pi_miss_adopt,"
+                + "pi_fill_total,pi_fill_present,miss_no_pi_on_demand,miss_anchor_not_found,miss_anchor_pi_empty,"
+                + "batch_trial_ms,batch_trial_ms_in_merge,"
                 + "cand0,cand1,cand2,cand3,cand4plus,cand_samples");
             _headerWritten = true;
         }
