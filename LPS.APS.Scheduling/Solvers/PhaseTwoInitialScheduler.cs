@@ -41,6 +41,45 @@ internal class PhaseTwoInitialScheduler
     private static bool P2FilterByPi => P2AnchorMode is "PI_ONLY" or "PI_SORT" or "PI_FIRST";
     private static bool P2SortAnchors => P2AnchorMode is "PI_SORT" or "PI_FIRST";
     private static bool P2StopAtFirstFeasible => P2AnchorMode == "PI_FIRST";
+
+    // ── 2026-11-10 A6（0号位《Batch_Code_Review_and_Action_Plan v1.0》§4-A6 / §5.1 正交拆分）──
+    //   问题：`LEGACY → PI_ONLY` 一次改了三件事（多 Op 候选 PI 过滤、单 Op 无 PI 快路、来源 PI 守卫），
+    //     所以「2.19×」是**组合收益**，分不出单 Op 快路自己贡献多少。
+    //   做法：把后两件拆成**独立的实验开关**，只在对照实验里覆盖，不改变四种模式的默认语义：
+    //     · `APS_P2_SINGLEOP_FASTPATH=0|1` —— 单 Op「无 PI 直接跳过锚批扫描」快路
+    //     · `APS_P2_SOURCE_PI_GUARD=0|1`  —— 单 Op「来源需求 PI 必须一致」守卫（含 P0-03 全份额核验）
+    //   未设环境变量 ⇒ 回落到 `P2FilterByPi`（即四模式现有语义**逐字不变**）。
+    //
+    //   ⇒ 由此可构造 0号位 要求的正交对照：
+    //     S0 = LEGACY
+    //     S1 = PI_ONLY + FASTPATH=0 + GUARD=0    （只有旧的多 Op PI 过滤）
+    //     S2 = PI_ONLY + FASTPATH=1 + GUARD=1    （本次报告的状态）
+    //     S3 = S2 再多 Op 同 PI 索引（下一刀，未实施）
+    //   **S1→S2 才是本轮新改动的增量**；S0→S2 是整组规则调整的总收益。
+    private static readonly string? P2SingleOpFastPathFromEnv =
+        Environment.GetEnvironmentVariable("APS_P2_SINGLEOP_FASTPATH");
+    private static readonly string? P2SourcePiGuardFromEnv =
+        Environment.GetEnvironmentVariable("APS_P2_SOURCE_PI_GUARD");
+    private static string? _p2SingleOpFastPathOverride;
+    private static string? _p2SourcePiGuardOverride;
+
+    /// <summary>仅供 LPS.APS.Tests 做正交对照；生产路径不调用（默认仍由四种模式决定）。</summary>
+    internal static void OverrideExperimentSwitchesForTest(string? singleOpFastPath, string? sourcePiGuard)
+    {
+        _p2SingleOpFastPathOverride = singleOpFastPath;
+        _p2SourcePiGuardOverride = sourcePiGuard;
+    }
+
+    private static string? P2RawFastPath => _p2SingleOpFastPathOverride ?? P2SingleOpFastPathFromEnv;
+    private static string? P2RawSourceGuard => _p2SourcePiGuardOverride ?? P2SourcePiGuardFromEnv;
+
+    /// <summary>单 Op「无 PI 直接跳过锚批扫描」快路是否启用。缺省跟随 `P2FilterByPi`。</summary>
+    private static bool P2SingleOpNoPiFastPath =>
+        P2RawFastPath is null ? P2FilterByPi : P2RawFastPath != "0";
+
+    /// <summary>单 Op「来源需求与全部份额成员 PI 必须一致」守卫是否启用。缺省跟随 `P2FilterByPi`。</summary>
+    private static bool P2SourcePiGuard =>
+        P2RawSourceGuard is null ? P2FilterByPi : P2RawSourceGuard != "0";
     /// <summary>
     /// 「按 Start 升序」的日历表缓存（2026-10-20 第五刀）。
     /// 键 = 资源 Id；值 = (源列表引用, 升序列表)。
@@ -7745,7 +7784,15 @@ internal class PhaseTwoInitialScheduler
                         profCounters.HotspotMs(SolverDiagnostics.Hotspot.BatchPlanTrial) - profBatchTrialBefore);
                 }
                 // v5.0 §1.4.1：试排产不出任何 Task ⇒ 硬约束（日历/资源）拒绝，**不是**择优判负。
-                if (anchorRepresentative is null) SolverDiagnostics.CountMergeHardRejectedCalendar();
+                if (anchorRepresentative is null)
+                {
+                    SolverDiagnostics.CountMergeHardRejectedCalendar();
+                }
+                else
+                {
+                    // A4：物理可行（试排产出了合法合批方案）—— 与"是否被采纳"是两个不同事实。
+                    SolverDiagnostics.CountMergePhysicalFeasible();
+                }
                 var anchorSetup = anchorCombinedTasks.Sum(t => t.SetupTime);
 
                 // 合批侧经济软偏离（2026-10-14 **二次修正**）：数量 = 锚点批累计量 + 本需求本批数量
@@ -7885,6 +7932,8 @@ internal class PhaseTwoInitialScheduler
                 {
                     bestAnchorIndex = anchorIndex;
                     SolverDiagnostics.CountMergePi(mergePiClass, SolverDiagnostics.MergePiMetric.Adopted);
+                    // A4：本次比较胜出（≠ 最终采纳：后续锚点仍可能改写擂主，尽管甲方案下首可行即停）。
+                    SolverDiagnostics.CountMergeComparedWins();
                     bestMergeRepresentative = anchorRepresentative;
                     bestMergeCombinedTasks = anchorCombinedTasks;
                     bestMergeSetup = anchorSetup;
@@ -7984,6 +8033,8 @@ internal class PhaseTwoInitialScheduler
             }
 
             var adoptedByMerge = bestAnchorIndex >= 0;
+            // A4：**最终采纳**才 +1（把"试排过/物理可行/比较胜出"三个数彻底分开）。
+            if (adoptedByMerge) SolverDiagnostics.CountMergeFinallyAdopted();
             var traceLayer = adoptedByMerge ? bestDecidingLayer : lastReachedLayer;
 
             if (traceLayer == FrozenLayer.ResourceEfficiency)
@@ -8152,7 +8203,8 @@ internal class PhaseTwoInitialScheduler
 
         // 检测是否可以合并到已有Task
         var candidateTasks = FindMergeableTasks(
-            demand, operations, scheduledTasks, constraints, demandByKey, requireIdentityPreservingMerge);
+            demand, operations, scheduledTasks, constraints, demandByKey, allocationTaskShare,
+            requireIdentityPreservingMerge);
 
         if (candidateTasks.Count > 0)
         {
@@ -8169,9 +8221,14 @@ internal class PhaseTwoInitialScheduler
             }
 
             // ── 2026-11-10 §7 第2步（甲方案）：按已排好的优先序**依次试到首个成功**；硬失败换下一个。
-            //   【为什么现在敢循环】已核实 `TryMergeDemandIntoTask` 的 **9 个失败出口全部在
-            //     第一处写入（`:10010 AddOccupancyWindow`）之前返回** ⇒ 失败时**无副作用**，
-            //     连试多个候选不会留脏状态（这正是 0号位 §3-B3 要求先核的那一条）。
+            //   【为什么现在敢循环】已核实 `TryMergeDemandIntoTask` 的**全部 `return null` 出口都返回在
+            //     该方法的第一处状态写入之前**（第一处写入 = 份额 `ShareSet`，其后才是占用
+            //     `AddOccupancyWindow`）⇒ 失败时**无副作用**，连试多个候选不会留脏状态
+            //     （这正是 0号位 §3-B3 要求先核的那一条）。
+            //   ⚠ 不写死行号：本文件行号会随改动漂移，上一版此处写的 `:10010` 已失真
+            //     （0号位 2026-11-10《Batch_Code_Review_and_Action_Plan v1.0》R03 就此提出质疑）。
+            //     判据改为「所有失败出口 vs 第一处写入」的相对位置，并由 `PiAnchorGateTests`
+            //     的 `A2_*` 用例直调内部方法实测份额表/占用表/任务表零变化。
             //   `LEGACY` 下 `attemptLimit == 1` ⇒ 只试第一个，与旧行为**逐字等价**。
             var attemptLimit = P2SortAnchors ? candidateTasks.Count : 1;
             for (var attemptIndex = 0; attemptIndex < attemptLimit; attemptIndex++)
@@ -8179,14 +8236,15 @@ internal class PhaseTwoInitialScheduler
             var targetTask = candidateTasks[attemptIndex];
 
             // 检查合并后是否破坏交期：合并后Duration增加，End时间延后
-            var mergedTask = TryMergeDemandIntoTask(demand, targetTask, routingGraph, constraints, resourceOccupancy, allocationTaskShare, planningEnd, demandByKey, batchDraftKey, occupancyPristine);
+            // A3/R06：把正排同一个 `planningStart` / `dynamicMaterialFloor` 传进合并守卫，
+//   否则「物料可用时间」在合并路径上没有口径（本方法两个参数本身就是从 `TryMergeOrSchedule` 透传下来的）。
+            var mergedTask = TryMergeDemandIntoTask(demand, targetTask, routingGraph, constraints, resourceOccupancy, allocationTaskShare, planningEnd, demandByKey, batchDraftKey, occupancyPristine, planningStart, dynamicMaterialFloor);
             if (mergedTask != null)
             {
                 // 合并成功：替换scheduledTasks中的旧Task
                 var index = scheduledTasks.FindIndex(t => t.FinalDraftId == targetTask.FinalDraftId);
                 if (index >= 0)
                 {
-                    var endChanged = mergedTask.PlannedEndTime != targetTask.PlannedEndTime;
                     // ── 2026-10-27 四十一刀：**按需拷贝**，不再就地把入参任务表改掉 ──
                     //   改前：每次试排前先整表拷一遍（275,454 个引用 ≈ 2.2 MB），只为「万一要换一条」。
                     //     实测 PV190：`CloneTaskList` 174,595 次（试排）+ 24,822 次（`SelectBestBatchPlan`），
@@ -8200,9 +8258,20 @@ internal class PhaseTwoInitialScheduler
                     var replaced = new List<FinalTaskDraft>(scheduledTasks);
                     replaced[index] = mergedTask;
                     replacedTaskTable = replaced;
-                    // 与旧判据**逐字等价**：旧实现用「试排前后 PlannedEndTime 是否变化」推断合并，
-                    // 故此处也只在**结束时间真的变了**时才上报 —— 收紧语义增量，保证零回归。
-                    mergedIntoTask = endChanged ? mergedTask : null;
+                    // ── 2026-11-10 R04（0号位《Batch_Code_Review_and_Action_Plan v1.0》§3-R04 / §4-A2）──
+                    //   旧判据：`mergedIntoTask = (mergedTask.PlannedEndTime != targetTask.PlannedEndTime) ? mergedTask : null`
+                    //     —— 用「结束时刻是否变化」**推断**是否发生合并。
+                    //   反证（`PhaseTwoMergeZeroSideEffectTests.MergeCanSucceed_WhileEndTimeUnchanged`，已实测红→可达）：
+                    //     当 `demand.PlannedProcessQty = 0` 而 `NetOutputQty > 0` 时，
+                    //     `mergedQty` 不变 ⇒ 时长不变 ⇒ `PlannedEndTime` **不变**；
+                    //     但 `Quantity` 已 +NetOutputQty、份额也已写入 ⇒ **合并真实发生**。
+                    //   旧判据把它上报成「没有产出」，而任务表其实已被替换 ⇒ **上报与状态不一致**
+                    //     （上层按未合并处理，会漏记 demandCompletion / 误判该需求未落定）。
+                    //   ⇒ 按**真实采纳事实**上报：`TryMergeDemandIntoTask` 返回非 null 即代表合并成立，
+                    //     下面任务表也已替换，两者必须同向。
+                    //   ⚠ **这是缺陷修复，不挂在任何模式开关后**（0号位 R04 定性为「已证实代码判据」）。
+                    //     影响面：仅当「合并成功且结束时刻恰好不变」时与旧行为不同（输入侧前提：计划加工量 0）。
+                    mergedIntoTask = mergedTask;
                 }
                 else
                 {
@@ -8578,6 +8647,7 @@ internal class PhaseTwoInitialScheduler
         List<FinalTaskDraft> scheduledTasks,
         ConstraintContext constraints,
         Dictionary<string, LogicalProductionDemand> demandByKey,
+        Dictionary<string, List<(string DemandKey, decimal ShareQty)>> allocationTaskShare,
         bool requireIdentityPreserving = false)
     {
         var candidates = new List<FinalTaskDraft>();
@@ -8593,7 +8663,9 @@ internal class PhaseTwoInitialScheduler
         //   无 PI ⇒ 不存在「同 PI 的真实合批锚点」，扫完整张历史 Task 表也找不到 ⇒ **O(1) 直接返回**。
         //   ⚠ 只短路「跨需求合批」，**不短路独立排程、拆批与 Routing**：本需求照常产 Task、照常判未排，
         //     也照常可被 MES 判定资格。仅新模式启用；LEGACY 走原全表扫描，行为逐字不变。
-        if (P2FilterByPi && string.IsNullOrWhiteSpace(demand.ProductionInstructionNo))
+        // A6 正交拆分：本快路由 `P2SingleOpNoPiFastPath` 单独控制（缺省 = `P2FilterByPi`，语义不变），
+        //   以便用 `APS_P2_SINGLEOP_FASTPATH=0` 关掉它、单独量出它自己的增量（S1 vs S2）。
+        if (P2SingleOpNoPiFastPath && string.IsNullOrWhiteSpace(demand.ProductionInstructionNo))
         {
             SolverDiagnostics.CountSingleOpMergeSkippedNoPi();
             return candidates;
@@ -8648,7 +8720,8 @@ internal class PhaseTwoInitialScheduler
                 var local = new List<FinalTaskDraft>();
                 ScanMergeCandidateRange(
                     scheduledTasks, lo, hi, local,
-                    demand, targetOp, targetStageCode, requireIdentityPreserving, constraints, demandByKey);
+                    demand, targetOp, targetStageCode, requireIdentityPreserving, constraints, demandByKey,
+                    allocationTaskShare);
                 buffers[p] = local;
             });
 
@@ -8661,10 +8734,16 @@ internal class PhaseTwoInitialScheduler
         {
             ScanMergeCandidateRange(
                 scheduledTasks, 0, scheduledTasks.Count, candidates,
-                demand, targetOp, targetStageCode, requireIdentityPreserving, constraints, demandByKey);
+                demand, targetOp, targetStageCode, requireIdentityPreserving, constraints, demandByKey,
+                allocationTaskShare);
         }
 
         SolverDiagnostics.HotspotEnd(swFindTasks, SolverDiagnostics.Hotspot.MergeFindTasks);
+
+        // A6（§4-A6 / §7.5）：单 Op 扫描三量 —— 扫了几次、扫过多少元素、留下几个候选。
+        //   此前单 Op 一侧只有「快路跳过了几次」（`SingleOpMergeSkippedNoPi`），
+        //   没扫时省了多少完全是黑盒 ⇒ 无法给 S1→S2 的增量做定量归因。
+        SolverDiagnostics.CountSingleOpScan(scheduledTasks.Count, candidates.Count);
 
         return candidates;
     }
@@ -8684,7 +8763,8 @@ internal class PhaseTwoInitialScheduler
         string targetStageCode,
         bool requireIdentityPreserving,
         ConstraintContext constraints,
-        Dictionary<string, LogicalProductionDemand> demandByKey)
+        Dictionary<string, LogicalProductionDemand> demandByKey,
+        Dictionary<string, List<(string DemandKey, decimal ShareQty)>> allocationTaskShare)
     {
         // 2026-10-27 三十八刀：改用 `Span` 下标遍历（不再走 `List` 枚举器：省掉每次 `MoveNext` 的版本号
         //   比对与 `Current` 取值，语义逐字等价 —— 仍然是「按下标 0..Count-1 顺序扫同一批引用」）。
@@ -8758,12 +8838,70 @@ internal class PhaseTwoInitialScheduler
             // 2026-11-09 第一刀A 守卫（0号位 §2-A2）：**来源需求 PI 必须与当前需求一致**。
             //   跨 PI 只能按 Setup 连续生产，不得合成同一执行批 / MES 工单。
             //   `Ordinal` 精确比较：不 Trim、不折大小写 —— 不做规范化以免制造虚假"同 PI"。
-            if (P2FilterByPi
+            // A6 正交拆分：来源 PI 守卫由 `P2SourcePiGuard` 单独控制（缺省 = `P2FilterByPi`）。
+            if (P2SourcePiGuard
                 && (string.IsNullOrWhiteSpace(sourceDemand.ProductionInstructionNo)
                     || !string.Equals(sourceDemand.ProductionInstructionNo,
                                       demand.ProductionInstructionNo, StringComparison.Ordinal)))
             {
                 continue;
+            }
+
+            // ── 2026-11-10 P0-03（0号位《审核与下一轮指令 v1.0》§4）──
+            //   **只看 `SourceDraftId` 不足以证明整批同 PI**：该 Task 可能此前已吸收多条需求
+            //   （`allocationTaskShare[FinalDraftId]` 里有多条成员）。任一份额成员 PI 缺失、
+            //   查不到、或与当前需求不一致 ⇒ **本 Task 不得作为同 PI 合批锚点**。
+            //   ⚠ 只读份额表，不修改；不放宽任何既有锁/Stage/Route/资源门禁。`LEGACY` 不进入本段。
+            //
+            //   ── 2026-11-10 A1（0号位《Batch_Code_Review_and_Action_Plan v1.0》§4-A1 / R02）补齐 ──
+            //   原先只核「查不到 / PI 空 / PI 不一致」三类，仍漏**份额成员自身**的两类资格：
+            //     ① 同一 `DemandKey` 在份额里出现两次（重复计份额会破坏 ΣShare 闭合）；
+            //     ② 成员是 A/B 连续份额（`IsContinuation`）或不拆不合（`NoSplitMerge`）。
+            //   这两类对**代表源需求**已在 `:8804-8808` 拦过，但对**历史成员**没有任何拦截
+            //   ⇒ 一条此前并入了被禁止合批需求的 Task，仍会被当成本轮合法锚点。
+            //   A1 逐字要求「任一缺键、PI空、不同PI、重复同Demand份额、继续执行／NoSplitMerge
+            //   等**不得在筛选阶段放行**」，故在此统一并入同一道守卫（同向拒绝，不新增放行分支）。
+            if (P2SourcePiGuard && allocationTaskShare is not null
+                && allocationTaskShare.TryGetValue(task.FinalDraftId, out var anchorShares)
+                && anchorShares is { Count: > 0 })
+            {
+                var identityBroken = false;
+                HashSet<string>? seenMembers = anchorShares.Count > 1
+                    ? new HashSet<string>(StringComparer.Ordinal)
+                    : null;
+
+                foreach (var (memberKey, _) in anchorShares)
+                {
+                    // ① 同一需求重复登记份额 ⇒ 该批身份不可信。
+                    if (seenMembers is not null && !seenMembers.Add(memberKey))
+                    {
+                        identityBroken = true;
+                        break;
+                    }
+
+                    // ② 成员必须可追溯、有可信 PI、且与当前需求同 PI。
+                    if (!demandByKey.TryGetValue(memberKey, out var member)
+                        || string.IsNullOrWhiteSpace(member.ProductionInstructionNo)
+                        || !string.Equals(member.ProductionInstructionNo,
+                                          demand.ProductionInstructionNo, StringComparison.Ordinal))
+                    {
+                        identityBroken = true;
+                        break;
+                    }
+
+                    // ③ 成员自身不得是 A/B 连续份额或不拆不合需求。
+                    if (member.IsContinuation || member.NoSplitMerge)
+                    {
+                        identityBroken = true;
+                        break;
+                    }
+                }
+
+                if (identityBroken)
+                {
+                    SolverDiagnostics.CountSingleOpAnchorMixedPiRejected();
+                    continue;
+                }
             }
             // P0-07：连续份额任务不能被普通 Merge 吸收，自由份额也不得并入连续份额任务（保逐工单身份）。
             // NoSplitMerge（不拆不合）显式落实：任一侧带该标记都不得合批。
@@ -9774,7 +9912,13 @@ internal class PhaseTwoInitialScheduler
         DateTime planningEnd,
         Dictionary<string, LogicalProductionDemand>? demandByKey = null,
         string? batchDraftKey = null,   // P1-01：目标 Task 未归批时，合并结果**采用本批键**（批身份不丢）
-        Dictionary<int, List<TimeWindow>>? occupancyPristine = null)   // 2026-10-08 COW：写占用表前脱钩
+        Dictionary<int, List<TimeWindow>>? occupancyPristine = null,   // 2026-10-08 COW：写占用表前脱钩
+        // ── 2026-11-10 A3 / R06（0号位《Batch_Code_Review_and_Action_Plan v1.0》§4-A3）──
+        //   物料可用时间口径（与正排/倒排同一个 `GetMaterialEarliestTime`）。
+        //   缺省时用 `targetTask.PlannedStartTime` 当 planningStart、`DateTime.MinValue` 当动态下界
+        //   ⇒ 无物料约束的调用方（含全部单测夹具）比较恒不成立，行为与补丁前逐字相同。
+        DateTime? planningStart = null,
+        DateTime? dynamicMaterialFloor = null)
     {
         // 计算合并后的总数量
         var mergedQty = targetTask.PlannedProcessQty + demand.PlannedProcessQty;
@@ -9828,13 +9972,45 @@ internal class PhaseTwoInitialScheduler
             return null; // 延长后超出**真实资源日历窗**（无合法承载），无法合并
         }
 
+        // ── A3 / R06（0号位 2026-11-10《Batch_Code_Review_and_Action_Plan v1.0》§4-A3）──
+        //   **合并保留 target 的 `PlannedStartTime`** ⇒ 若本条需求的物料要到更晚才可用，
+        //   这次合并就把它**提前消费**了（资源在物料到货之前就开始加工）。
+        //   口径与独立排程完全一致：同一个 `GetMaterialEarliestTime`（Quantity-Time 分段累计
+        //   ＋ 跨物料子件完成下界 `dynamicMaterialFloor`），数量取 `NetOutputQty` ——
+        //   与 `:4350`（倒排）、`:4593`（正排）两处调用点同参同序。
+        //   ⚠ 只在载荷真的带物料约束（或动态下界）时才可能拒绝；否则该函数回落到
+        //     `planningStart`，而下面比较的是 `target.PlannedStartTime < planningStart`，
+        //     缺省情形下 planningStart 就取 target 起点 ⇒ 恒不成立 ⇒ 既有调用点零影响。
+        var mergePlanningStart = planningStart ?? targetTask.PlannedStartTime;
+        var materialEarliest = GetMaterialEarliestTime(
+            demand.AllocationSequence,
+            demand.NetOutputQty,
+            constraints,
+            mergePlanningStart,
+            dynamicMaterialFloor ?? DateTime.MinValue,
+            out _);
+        if (targetTask.PlannedStartTime < materialEarliest)
+        {
+            // 锚批起点早于本条需求的最早可用物料时刻 ⇒ 合并会把未到物料提前投入。
+            return null;
+        }
+
         // ── P0-04（0号位 2026-10-07 (5).md）：Merge 必须校验**交期不被破坏** ──
         //   旧实现只查 PlanningEnd + 资源后续冲突，**未查新 Demand 的有效交期，也未查被合并 Task
         //   已有份额的交期是否因延长而恶化**。合批会延长 Task 的 PlannedEndTime ⇒ 必须验证：
         //   ① 本 Demand：newEndTime 不得越过 `RequiredAvailableTime`（有效交期）；
         //   ② target 已服务的**全部既有份额**（血缘在 allocationTaskShare，另加 SourceDraftId 兜底）：
         //      目标 Task 原完成时间已合规，但延长后若越过任一既有份额的交期 ⇒ 该份额被推违约 ⇒ 放弃合并。
-        if (demand.RequiredAvailableTime != DateTime.MaxValue && newEndTime > demand.RequiredAvailableTime)
+        // ── 2026-11-10 R05（0号位《Batch_Code_Review_and_Action_Plan v1.0》§3-R05）──
+        //   核实结论：**确实是两套判据**。原实现这里用裸 `RequiredAvailableTime`，
+        //   而多 Op 排序（`PiStageAnchorPriority`）、Phase3 诊断、Phase5 压缩、查询侧
+        //   全部用 `EffectiveDueJudgementBound` —— 客户 DATE 交期按**当日整天**算按期
+        //   （0号位 2026-10-31 v3.0:18「最终完成 < 次日00:00」）。
+        //   两套并存时，一条 DATE 交期 11-20 的需求：Phase3 判「按期」，合并侧却要求
+        //   11-20 00:00 前完成 ⇒ **同一笔延期在合并路径上被多判一次**。
+        //   ⇒ 统一到 `EffectiveDueJudgementBound`（纯放宽、不放行任何跨 PI/跨 Path 合并）。
+        var demandDueBound = constraints.EffectiveDueJudgementBound(demand);
+        if (demandDueBound != DateTime.MaxValue && newEndTime > demandDueBound)
         {
             return null;
         }
@@ -9844,9 +10020,13 @@ internal class PhaseTwoInitialScheduler
             var targetDue = DateTime.MaxValue;
             void WidenDue(string demandKey)
             {
-                if (demandByKey.TryGetValue(demandKey, out var d) && d.RequiredAvailableTime < targetDue)
+                // R05：既有份额的交期同样走 `EffectiveDueJudgementBound`（与上面本需求同一口径，
+                //   也与 Phase3/Phase5/查询侧一致）——否则同一个 Task 里「本需求」和「历史成员」
+                //   会用两种交期判据，客户 DATE 交期上更紧的那一侧会把合法合并误杀。
+                if (demandByKey.TryGetValue(demandKey, out var d))
                 {
-                    targetDue = d.RequiredAvailableTime;
+                    var memberBound = constraints.EffectiveDueJudgementBound(d);
+                    if (memberBound < targetDue) targetDue = memberBound;
                 }
             }
 
@@ -10277,7 +10457,36 @@ internal class PhaseTwoInitialScheduler
         var dueCurrent = constraints.EffectiveDueJudgementBound(demand);
         var worsensAnchor = dueAnchor != DateTime.MaxValue && combinedEnd > dueAnchor;
         var worsensCurrent = dueCurrent != DateTime.MaxValue && combinedEnd > dueCurrent;
-        if (worsensAnchor || worsensCurrent)
+
+        // ── 2026-11-10 A4-3（0号位《Batch_Code_Review_and_Action_Plan v1.0》§4-A4）──
+        //   上面两方只覆盖「锚批的**代表**源需求」与「本次需求」。锚批若此前已吸收过第三条需求
+        //   （`allocationTaskShare[fid]` 里除代表源需求外的成员），**它的交期完全没被检查**
+        //   ⇒ 合批可以把那个更早的历史成员推违约，而方案仍被判「合法」。
+        //   单 Op 路径（`TryMergeDemandIntoTask` 的 `WidenDue`）已按份额全量校验，多 Op 必须同等。
+        //   ⚠ 只做**收紧**：不改变 `worsensAnchor/worsensCurrent` 的既有判据，也不放宽任何门禁。
+        //   ⚠ 读的是**摘除段**已经抓到的 `removedShares`，不是全局 `allocationTaskShare`：
+//     前者就是「本锚批此刻真实承载的全部份额」（含此前并入的历史成员），且时序在重跑之前，
+//     不受合批产生新 `FinalDraftId` 的影响。
+        var worsensMember = false;
+        if (!worsensAnchor && !worsensCurrent)
+        {
+            foreach (var (_, memberShares) in removedShares)
+            {
+                foreach (var (memberKey, _) in memberShares)
+                {
+                    if (!demandByKey.TryGetValue(memberKey, out var member)) continue;
+                    var memberDue = constraints.EffectiveDueJudgementBound(member);
+                    if (memberDue != DateTime.MaxValue && combinedEnd > memberDue)
+                    {
+                        worsensMember = true;
+                        break;
+                    }
+                }
+                if (worsensMember) break;
+            }
+        }
+
+        if (worsensAnchor || worsensCurrent || worsensMember)
         {
             // V1_3 F-01：本路径试排**已成功**（`combinedTasks` 非空）⇒ 其占用/时间线写入必须按身份整体回滚。
             SolverDiagnostics.CountOccupancyRollbackUnmatched(

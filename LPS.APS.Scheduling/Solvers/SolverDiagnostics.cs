@@ -177,6 +177,43 @@ public static class SolverDiagnostics
         /// <summary>v5.0 §1.4.1：试排产出了合法合批方案，但在冻结层序比较中**落败**的次数。</summary>
         public long MergeComparedRejected;
 
+        // ─────────────────────────────────────────────────────────────────────
+        // 2026-11-10 A4（0号位《Batch_Code_Review_and_Action_Plan v1.0》§4-A4）
+        //   —— 多 Op 擂台必须区分**三个不同事实**：
+        //     ① `MergeTrialStarted`  = 试排了几次（锚点擂台出手次数）
+        //     ② `MergePhysicalFeasible` = 其中**物理可行**（`TryMergeDemandIntoStageBatch` 返回非 null）
+        //     ③ `MergeFinallyAdopted` = 擂台结束后**真的采纳合批**的需求批次数（`bestAnchorIndex >= 0`）
+        //   0号位 逐字要求「出具 physicalFeasible、comparedWins、finallyAdopted 三个**不同**计数」。
+        //   恒等式（可当场验算）：`MergePhysicalFeasible = MergeTrialStarted − MergeHardRejectedCalendar`。
+        //   ⚠ 三者**不是**同一个事实的三种说法：一个需求可以试排 5 个锚、2 个物理可行、
+        //     1 个比较胜出，最后仍可能因甲方案选中的那个被判平 ⇒ 最终不采纳 ⇒ `MergeFinallyAdopted = 0`。
+        // ─────────────────────────────────────────────────────────────────────
+
+        /// <summary>A4：**物理可行**的锚批试排次数（试排产出了合法合批方案，与择优胜负无关）。</summary>
+        public long MergePhysicalFeasible;
+
+        /// <summary>A4：物理可行且**本次比较胜出**（`mergeWins == true`）的次数。不等同于最终采纳。</summary>
+        public long MergeComparedWins;
+
+        /// <summary>A4：擂台结束后**真正采纳合批**的需求批次数（`bestAnchorIndex &gt;= 0`）。</summary>
+        public long MergeFinallyAdopted;
+
+        // ─────────────────────────────────────────────────────────────────────
+        // 2026-11-10 A6（0号位《Batch_Code_Review_and_Action_Plan v1.0》§4-A6 / §7.5）
+        //   —— **单 Op** 锚表扫描的三个量。此前只有多 Op 的 `MergeScanCalls` /
+        //     `MergeScanGroupSum` / `MergeScanGroupMax`，单 Op 一侧完全是黑盒，
+        //     导致「快路到底省了多少次扫描」无法量化。
+        // ─────────────────────────────────────────────────────────────────────
+
+        /// <summary>A6：进入 `ScanMergeCandidateRange` 的次数（= 单 Op 真的扫了一次历史 Task 表）。</summary>
+        public long SingleOpScanCalls;
+
+        /// <summary>A6：单 Op 扫描过的**历史 Task 元素总数**（每次扫描的元素数累计）。</summary>
+        public long SingleOpScannedTaskCount;
+
+        /// <summary>A6：单 Op 扫描后**留下的候选锚批个数**累计（不含被 PI/身份/路径挡掉的）。</summary>
+        public long SingleOpCandidateCount;
+
         /// <summary>
         /// 2026-11-06 BATCH-02（0号位 e31a6fb 指令）：**「1 批」作为待试排候选被纳入**的次数。
         ///   判据：本值应 ≈ `AllowSplit=true` 的需求数；若长期远小于它，说明整批仍被某处排除。
@@ -276,6 +313,12 @@ public static class SolverDiagnostics
 
         /// <summary>2026-11-09：本次求解收到的需求总条数 / 其中 `ProductionInstructionNo` 非空白的条数。纯观测。</summary>
         public long SingleOpMergeSkippedNoPi;
+
+        /// <summary>
+        /// 2026-11-10 P0-03：单工序锚批因**已承接份额中存在跨 PI 成员**被拒绝的次数（纯观测）。
+        ///   只看 `SourceDraftId` 不足以证明整批同 PI —— 一个 Task 可能此前已吸收多条需求。
+        /// </summary>
+        public long SingleOpAnchorMixedPiRejected;
 
         public long PiFillTotal;
         public long PiFillPresent;
@@ -2350,6 +2393,12 @@ public static class SolverDiagnostics
         Adopted = 3,
     }
 
+    /// <summary>2026-11-10 P0-03：单工序锚批因「已承接份额含跨 PI 成员」被拒（纯观测）。</summary>
+    internal static void CountSingleOpAnchorMixedPiRejected()
+    {
+        if (Current.Value is { } c) System.Threading.Interlocked.Increment(ref c.SingleOpAnchorMixedPiRejected);
+    }
+
     /// <summary>2026-11-09：单工序合批因「当前需求无 PI」被 O(1) 短路跳过的次数（纯观测）。</summary>
     internal static void CountSingleOpMergeSkippedNoPi()
     {
@@ -2434,6 +2483,33 @@ public static class SolverDiagnostics
     internal static void CountMergeComparedRejected()
     {
         if (Current.Value is { } c) System.Threading.Interlocked.Increment(ref c.MergeComparedRejected);
+    }
+
+    /// <summary>A4：登记一次「锚批试排**物理可行**」。纯观测。</summary>
+    internal static void CountMergePhysicalFeasible()
+    {
+        if (Current.Value is { } c) System.Threading.Interlocked.Increment(ref c.MergePhysicalFeasible);
+    }
+
+    /// <summary>A4：登记一次「物理可行且本次比较**胜出**」。纯观测。</summary>
+    internal static void CountMergeComparedWins()
+    {
+        if (Current.Value is { } c) System.Threading.Interlocked.Increment(ref c.MergeComparedWins);
+    }
+
+    /// <summary>A4：登记一次「擂台结束后**最终采纳合批**」。纯观测。</summary>
+    internal static void CountMergeFinallyAdopted()
+    {
+        if (Current.Value is { } c) System.Threading.Interlocked.Increment(ref c.MergeFinallyAdopted);
+    }
+
+    /// <summary>A6：登记一次单 Op 锚表扫描及其规模。纯观测。</summary>
+    internal static void CountSingleOpScan(long scannedTaskCount, long candidateCount)
+    {
+        if (Current.Value is not { } c) return;
+        System.Threading.Interlocked.Increment(ref c.SingleOpScanCalls);
+        System.Threading.Interlocked.Add(ref c.SingleOpScannedTaskCount, scannedTaskCount);
+        System.Threading.Interlocked.Add(ref c.SingleOpCandidateCount, candidateCount);
     }
 
     /// <summary>

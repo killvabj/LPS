@@ -198,6 +198,14 @@ public class BOMResultPullService : IBOMResultPullService
                 // Step 5c: 生成 OrderBomRequestLink（v5.0.31 Order→BOM追溯链闭合）
                 await GenerateOrderBomRequestLinkAsync(sqlConn, sqlTx, batchNo, planVersionIds);
 
+                // Step 5d（O67，2026-11-10）：跨厂交接边 ODS → APS 本地缓存表，**同批同事务**。
+                //   冻结 `07 v5.0.46` 要求 APS 侧保留本地缓存（维护责任人＝2号位）、供 Pegging 直接读取；
+                //   此前该表从未创建，Pegging 每轮运行时跨库读 ODS 同义词。
+                //   跨厂边与 APS_BOM_RAW 由同一次 `bom-batch-expand` 产出、`BatchNo` 相同
+                //   （实测 `REQ_20261107_501c1f85b951447`：边 CreatedAt 13:49:20 < BOM SyncedAt 13:58:05）
+                //   ⇒ 放进同一事务，天然与 BOM 快照对齐，不会出现「边新批、BOM 旧批」的错配。
+                await PullCrossFactoryEdgeAsync(sqlConn, sqlTx, batchNo);
+
                 return pulled;
             }, DatabaseId.APS);
 
@@ -255,6 +263,79 @@ public class BOMResultPullService : IBOMResultPullService
         _logger.LogInformation("独立接货完成: BatchNo={BatchNo}, 行数={PulledCount}", batchNo, pulledCount);
 
         return new BOMIntakeResult { BatchNo = batchNo, PulledCount = pulledCount };
+    }
+
+    /// <summary>
+    /// **O67（2026-11-10）**：跨厂交接边 ODS → APS 本地缓存表 `APS_BOM_CROSS_FACTORY_EDGE_RAW`。
+    ///
+    /// <para><b>为什么要有这一步</b>：冻结《07 v5.1.16》「APS 缓存补充：APS_BOM_CROSS_FACTORY_EDGE_RAW（v5.0.46）」
+    /// 逐字——「所属库：APS_Production / 维护责任人：2号位 / **从 ODS 搬运到 APS 本地，供 Pegging 直接读取**」，
+    /// 建表 DDL 见冻结《08 v5.1.8.10》§3.15。该表此前**从未创建**，Pegging 一直每轮运行时跨库读 ODS 同义词。</para>
+    ///
+    /// <para><b>为什么放在这个事务里</b>：跨厂边与 `APS_BOM_RAW` 由同一次 `bom-batch-expand` 产出、`BatchNo` 相同
+    /// （2026-11-10 实测 `REQ_20261107_501c1f85b951447`：边 `CreatedAt` 13:49:20 早于 BOM `SyncedAt` 13:58:05）。
+    /// 与 BOM 全量重灌放在同一 APS 事务内 ⇒ 要么一起生效、要么一起回滚，不会出现「BOM 换了新批、跨厂边还是旧批」。</para>
+    ///
+    /// <para><b>为什么 TRUNCATE 而不是按批删</b>：与 `APS_BOM_RAW` 同口径——单批制，排程只用最新批次，历史不保留；
+    /// 事务内可回滚，失败不留空表。</para>
+    /// </summary>
+    private async Task PullCrossFactoryEdgeAsync(SqlConnection connection, SqlTransaction transaction, string batchNo)
+    {
+        await connection.ExecuteAsync("TRUNCATE TABLE APS_BOM_CROSS_FACTORY_EDGE_RAW", transaction: transaction);
+
+        // 源表列：ODS `MES_APS_BOM_Workset_CrossFactoryEdge`
+        //   （Id/BatchNo/WorksetId/BOMNO/ParentMaterialCode/ChildMaterialCode/FromStageCode/
+        //     FromFactoryCode/ToStageCode/ToProcessCode/ToFactoryCode/CreatedAt）
+        // 目标表 `CreatedAt` 取 APS 落库时刻（列 DEFAULT GETDATE()），故**不映射**，以便日后查「这批是什么时候缓存进来的」。
+        const string sourceSql = @"
+            SELECT BatchNo,
+                   WorksetId,
+                   BOMNO,
+                   ParentMaterialCode,
+                   ChildMaterialCode,
+                   FromStageCode,
+                   FromFactoryCode,
+                   ToStageCode,
+                   ToProcessCode,
+                   ToFactoryCode
+            FROM MES_APS_BOM_Workset_CrossFactoryEdge
+            WHERE BatchNo = @BatchNo";
+
+        var columnMappings = new Dictionary<string, string>
+        {
+            ["BatchNo"] = "BatchNo",
+            ["WorksetId"] = "WorksetId",
+            ["BOMNO"] = "BOMNO",
+            ["ParentMaterialCode"] = "ParentMaterialCode",
+            ["ChildMaterialCode"] = "ChildMaterialCode",
+            ["FromStageCode"] = "FromStageCode",
+            ["FromFactoryCode"] = "FromFactoryCode",
+            ["ToStageCode"] = "ToStageCode",
+            ["ToProcessCode"] = "ToProcessCode",
+            ["ToFactoryCode"] = "ToFactoryCode"
+        };
+
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        await _connectionManager.BulkCopyFromReaderToTransactionAsync(
+            sourceSql: sourceSql,
+            sourceParameters: new { BatchNo = batchNo },
+            sourceDb: DatabaseId.ODS,
+            destinationTable: "APS_BOM_CROSS_FACTORY_EDGE_RAW",
+            destinationConnection: connection,
+            destinationTransaction: transaction,
+            columnMappings: columnMappings,
+            batchSize: 10000,
+            timeoutSeconds: BulkCopyTimeoutSeconds);
+        sw.Stop();
+
+        var pulled = await connection.ExecuteScalarAsync<int>(
+            "SELECT COUNT(*) FROM APS_BOM_CROSS_FACTORY_EDGE_RAW WHERE BatchNo = @BatchNo",
+            new { BatchNo = batchNo },
+            transaction: transaction);
+
+        _logger.LogInformation(
+            "[O67] 跨厂边缓存完成: BatchNo={BatchNo}, APS_BOM_CROSS_FACTORY_EDGE_RAW={Count} 行, 耗时={Elapsed}ms",
+            batchNo, pulled, sw.ElapsedMilliseconds);
     }
 
     /// <summary>

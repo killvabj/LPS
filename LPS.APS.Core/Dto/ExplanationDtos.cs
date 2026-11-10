@@ -18,6 +18,12 @@ public sealed class ExplanationDto
     /// <summary>关联订单ID</summary>
     public long? OrderId { get; init; }
 
+    /// <summary>订单号（**4号位 R3 可读标识，11-10 补投影**：Order 表直读；无 OrderId 行=null 整键省略。实测 999472 ORDER 族 JOIN 命中 996/996=100%）</summary>
+    public string? OrderNo { get; init; }
+
+    /// <summary>物料编码（**4号位 R3**：证据 `MaterialId` → Material.MaterialCode；证据无该键/不可关联=null。勿与内部主键混用作展示）</summary>
+    public string? MaterialCode { get; init; }
+
     /// <summary>关联任务ID</summary>
     public long? TaskId { get; init; }
 

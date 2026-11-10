@@ -4410,6 +4410,13 @@ public class PeggingOrchestrator : IPeggingOrchestrator
 
         public int TotalEntries { get; private set; }
 
+        /// <summary>
+        /// R02-O02 T01 诊断（2026-11-10）：**没有锁键**的供给条目数（虚拟供给，或无物理来源身份者）。
+        /// 这些条目按 0号位「空键不可作正式持久锁」不参与锁定，但**照常参与分配**。
+        /// 落一个计数而不是逐条 WARN，是为了不在十万级供给上刷日志；由装载收尾一次性上报。
+        /// </summary>
+        public int EntriesWithoutSupplyKey { get; private set; }
+
         /// <summary>本次运行供给快照的数据截止时点（= ScheduleRun.DataCutoffTime；编排层 Set，缺省回退 Now）。</summary>
         public DateTime DataCutoffTime { get; set; }
 
@@ -4552,6 +4559,10 @@ public class PeggingOrchestrator : IPeggingOrchestrator
             {
                 OriginalQty     = qty,
                 RemainingQty    = qty,
+                // R02-O02 T01（2026-11-10）：此前**全仓无赋值点**、恒 `""` ⇒ 硬锁通道结构性失效。
+                // 现统一经 `BuildSupplyLockKey` 产出；虚拟供给（★见该方法 default 分支）无持久物理身份 ⇒ 留空、不开锁，
+                // 但仍在池里参与分配（0号位 Q2：不建跨轮持久锁，保护数量语义不延期）。
+                SupplyKey       = BuildSupplyLockKey(sourceType, physicalSourceKey, materialId, factoryId) ?? string.Empty,
                 MaterialId      = materialId,
                 AvailableAt     = availableAt,
                 SourceType      = sourceType,
@@ -4579,6 +4590,8 @@ public class PeggingOrchestrator : IPeggingOrchestrator
                 var available = qty - upstreamConsumed;
                 entry.RemainingQty = available > 0m ? available : 0m;
             }
+
+            if (string.IsNullOrEmpty(entry.SupplyKey)) EntriesWithoutSupplyKey++;
 
             list.Add(entry);
             TotalEntries++;
@@ -4724,6 +4737,7 @@ public class PeggingOrchestrator : IPeggingOrchestrator
             foreach (var (key, list) in _ledger)
                 copy._ledger[key] = list.Select(CloneEntry).ToList();
             copy.TotalEntries = TotalEntries;
+            copy.EntriesWithoutSupplyKey = EntriesWithoutSupplyKey;
             return copy;
         }
 
@@ -4786,6 +4800,84 @@ public class PeggingOrchestrator : IPeggingOrchestrator
     internal static string BuildInventoryPhysicalKey(
         string? sourceSystem, int? erpMasterId, int? mesId, string? storageCode, int factoryId)
         => $"PHY:{sourceSystem ?? "-"}:{erpMasterId?.ToString() ?? "-"}:{mesId?.ToString() ?? "-"}:{storageCode ?? "-"}:{factoryId}";
+
+    /// <summary>`DemandSupplyHardLock.SupplyKey` 列宽（`NVARCHAR(200)`，R02-O02 T01 明示上限）。</summary>
+    internal const int SupplyKeyMaxLength = 200;
+
+    /// <summary>
+    /// **R02-O02 T01（2026-11-10）**：供给物理锁键 —— `DemandSupplyHardLock.SupplyKey` 的**唯一生成函数**。
+    /// 写锁、读锁、释放、回放一律经此函数产出/比对，不得在别处另行拼装。
+    ///
+    /// 【为什么单独一个键，而不直接复用 `PhysicalSourceKey`】
+    ///   `PhysicalSourceKey` 同时承担四个互不相同的用途：①硬锁身份 ②跨域守恒账本（`RecordPhysicalConsumption`）
+    ///   ③超耗核对分组（`:3719`）④厂间调拨单身份（`ShippingInstructionNo`，且红线⑤⑥ 在 `:4006` 拿它和
+    ///   `SourceReference` 逐字比）。其中 ④ 要求它**保持裸单号**——给 SH 加前缀会让红线当场报「跨SH串用」。
+    ///   故锁键在 `PhysicalSourceKey` 之上**另加类型命名空间与物料/工厂**，两者各司其职、互不牵连。
+    ///
+    /// 【取值规则】一律 `<命名空间>:<物理来源身份>:<物料ID>:<工厂ID>`：
+    ///   · `INVENTORY`          → 复用 `PHY:`（0号位 明示「已有合法 `PHY:` 就是库存类型前缀，不强制改名」）＋物料
+    ///   · `WIP`/`PRODUCTION_INSTRUCTION` → `PI:`（生产指示号）
+    ///   · `PIPELINE`           → `PO:`（采购单号＋行号）
+    ///   · `INTER_FACTORY_ORDER`→ `SH:`（出荷指示号）——**0号位 明令 SH 不得裸单号**
+    ///   · 其余（`NEW_REQUIREMENT`/`PLANNING_PURCHASE_PLACEHOLDER`/`UPSTREAM_DOMAIN_PRODUCTION`）→ `null`
+    ///     虚拟供给没有持久物理身份，按 Q2 「不建跨轮持久锁」，但**仍在池里参与分配**。
+    ///
+    /// 【为什么返回 `null` 而不抛错】0号位 T01 原文「空键不可作正式持久锁，**不可因一个供给缺键就将其它合法
+    ///   供给静默漏锁**」——单条无键只是这一条不开锁，不许连坐整轮。真正的「静默」由调用方按计数上报阻断。
+    ///   但**命名空间与类型不符**（如 `INVENTORY` 却给了 `PI:` 前缀，即 0号位 点名的「前缀对、类型错」）属实现
+    ///   缺陷，同样返回 `null` 交由计数上报，绝不猜一个键出来。
+    ///
+    /// 【键长】`SupplyKey NVARCHAR(200)`（T01 明示）。超长**抛错**（fail closed），不截断——
+    ///   截断会让两条不同供给撞成同一把锁，比报错危险得多。
+    /// </summary>
+    internal static string? BuildSupplyLockKey(
+        Core.Enum.SupplySourceType sourceType,
+        string? physicalSourceKey,
+        int materialId,
+        int factoryId)
+    {
+        if (string.IsNullOrWhiteSpace(physicalSourceKey)) return null;
+
+        var raw = physicalSourceKey.Trim();
+        string key;
+
+        switch (sourceType)
+        {
+            case Core.Enum.SupplySourceType.INVENTORY:
+                // `BuildInventoryPhysicalKey` 已含工厂，此处只补物料以杜绝「同仓同厂不同物料串锁」。
+                if (!raw.StartsWith("PHY:", StringComparison.Ordinal)) return null;
+                key = $"{raw}:{materialId}";
+                break;
+
+            case Core.Enum.SupplySourceType.WIP:
+            case Core.Enum.SupplySourceType.PRODUCTION_INSTRUCTION:
+                if (!raw.StartsWith("PI:", StringComparison.Ordinal)) return null;
+                key = $"{raw}:{materialId}:{factoryId}";
+                break;
+
+            case Core.Enum.SupplySourceType.PIPELINE:
+                if (!raw.StartsWith("PO:", StringComparison.Ordinal)) return null;
+                key = $"{raw}:{materialId}:{factoryId}";
+                break;
+
+            case Core.Enum.SupplySourceType.INTER_FACTORY_ORDER:
+                // 入池侧 SH 的 PhysicalSourceKey 就是裸出荷指示号；此处补命名空间，**不回写** PhysicalSourceKey。
+                key = raw.StartsWith("SH:", StringComparison.Ordinal)
+                    ? $"{raw}:{materialId}:{factoryId}"
+                    : $"SH:{raw}:{materialId}:{factoryId}";
+                break;
+
+            default:
+                return null;
+        }
+
+        if (key.Length > SupplyKeyMaxLength)
+            throw new InvalidOperationException(
+                $"R02-O02 T01：SupplyKey 超长 {key.Length} > {SupplyKeyMaxLength}（类型={sourceType}，" +
+                $"物料={materialId}，工厂={factoryId}，物理来源={raw}）。不得截断——截断会让两条不同供给撞成同一把锁。");
+
+        return key;
+    }
 
     /// <summary>
     /// R03-02（Candidate 侧，2026-10-25 0号位 授权「甲」口径）：跨 Run 的**聚合**供给身份键
@@ -4870,7 +4962,13 @@ public class PeggingOrchestrator : IPeggingOrchestrator
         // 供给身份字段
         // ═══════════════════════════════════════════════════════════════════════
 
-        /// <summary>供给唯一身份键（格式：MaterialId|FactoryId|SourceType|SupplySourceId）</summary>
+        /// <summary>
+        /// 供给**物理锁身份键**（`DemandSupplyHardLock.SupplyKey` 的比对值）。
+        /// 格式由 <see cref="BuildSupplyLockKey"/> 统一产出：`&lt;类型命名空间&gt;:&lt;物理来源身份&gt;:&lt;物料ID&gt;:&lt;工厂ID&gt;`。
+        /// 空串 ＝ 该供给无持久物理身份（虚拟供给／无单号在途）⇒ **不参与锁定，但照常参与分配**。
+        /// ⚠ 注意与 <see cref="PhysicalSourceKey"/> 分工不同：后者还被跨域守恒账本、超耗核对与
+        /// 厂间调拨单身份（红线⑤⑥）复用，**不得**把两者合并或互相回写。
+        /// </summary>
         public string SupplyKey                         { get; init; } = string.Empty;
 
         /// <summary>物理来源键（例如：ProductionInstructionNo、InventoryBatchNo、PONo等）</summary>
@@ -6678,14 +6776,12 @@ public class PeggingOrchestrator : IPeggingOrchestrator
             return;
         }
 
-        // ── R02-O02（2026-10-30）：硬锁通道「盲」闸门 ────────────────────────────────────
-        //   事实：`SupplyLedgerEntry.SupplyKey` 全仓**无任何赋值点**（`SupplyPool.Add` 的初始化器里没有它）
-        //   ⇒ 每条供给的 SupplyKey 恒为 `""`，`allSupplyKeys` 恒等于 `[""]`，
-        //   下面只会发出**一次** `WHERE SupplyKey = ''` 的查询，永远匹配不到任何行。
-        //   今天 `DemandSupplyHardLock` 为 0 行，结果无害；但一旦 0号位 授权写入方落锁，
-        //   锁会**静默失效**（表里有锁、跑批当没有）——这正是「不得解除旧硬锁」最危险的失败形态。
-        //   故此处只做一件事：**有 ACTIVE 锁却匹配不到供给时直接失败**，不静默跑完。
-        //   不改 SupplyKey 口径（那是 1↔2/治理侧的契约，须由 0号位 定），只把静默改成显式。
+        // ── R02-O02 硬锁通道「盲」闸门 ────────────────────────────────────────────────
+        //   【2026-11-10 已补齐键】`SupplyLedgerEntry.SupplyKey` 原**全仓零赋值点**、恒 `""`，
+        //   `allSupplyKeys` 恒为 `[""]`，锁装载只会发一次 `WHERE SupplyKey = ''`、永远匹配不到行。
+        //   本轮已改为经 `BuildSupplyLockKey` 赋真值（见 `SupplyPool.Add`），键不再全空。
+        //   本闸门保留为**最后一道防线**：若日后有人把赋值点改回空、或装载整体失配，
+        //   仍会在「表里有 ACTIVE 锁」时立刻失败，而不是当作没锁继续排（那种失败形态无任何告警可追溯）。
         var blind = DetectBlindHardLockChannel(
             allSupplyKeys, await CountActiveHardLocksAsync());
         if (blind != null)
@@ -6694,10 +6790,19 @@ public class PeggingOrchestrator : IPeggingOrchestrator
             throw new InvalidOperationException(blind);
         }
 
-        // 批量查询所有供给上的活跃 Lock
-        var lockTasks = allSupplyKeys.Select(key => _lockRepo.GetActiveLocksOnSupplyAsync(key, ct));
-        var lockResults = await System.Threading.Tasks.Task.WhenAll(lockTasks);
-        var allLocks = lockResults.SelectMany(x => x).ToList();
+        // R02-O02 T02（2026-11-10）：改为**键集合一次性查询**，替掉原「每个键一次查询」的 N+1。
+        //   原写法 `allSupplyKeys.Select(key => GetActiveLocksOnSupplyAsync(key))` 在供给上万条时
+        //   就是上万次往返；0号位 T02 明令「先解决逐键 N+1 再赋予真实 SupplyKey」，故与本批同改。
+        //   分块经 `QueryJsonInAsync`（单 JSON 参数 ＋ `OPENJSON`），不裸拼大 IN、不并发轰库。
+        //   空键在这里已被排除：空键本就不参与锁定（0号位「空键不可作正式持久锁」）。
+        var lockKeys = allSupplyKeys.Where(k => !string.IsNullOrWhiteSpace(k)).ToList();
+        var allLocks = lockKeys.Count == 0
+            ? new List<DemandSupplyHardLock>()
+            : (await QueryJsonInAsync<string, DemandSupplyHardLock>(
+                    lockKeys,
+                    json => _lockRepo.GetActiveLocksOnSupplyKeysAsync(json, ct),
+                    chunkSize: 20_000,
+                    tag: "R02-O02 硬锁集合查询")).ToList();
 
         if (allLocks.Count == 0)
         {
@@ -6708,10 +6813,22 @@ public class PeggingOrchestrator : IPeggingOrchestrator
         // 按 SupplyKey 分组，附加到对应的 SupplyLedgerEntry
         var locksBySupplyKey = allLocks.GroupBy(l => l.SupplyKey).ToDictionary(g => g.Key, g => g.ToList());
 
+        // R02-O02 T03（2026-11-10）：同一 SupplyKey 可能落在**多条**供给条目上（同一物理数量被装载两次）。
+        //   原写法对每条匹配到的条目都执行 `entry.LockedQty += dbLock.LockedQty` ⇒ **锁量凭条目数翻倍**，
+        //   等于凭空锁掉一倍供给。0号位 T03 原文「共享同一物理数量时不允许简单叠加成两份占用」。
+        //   现改为：同一键只挂一次（挂到首条，确定性），其余条目跳过并留 WARN 供装载侧查重。
+        var attachedLockKeys = new HashSet<string>(StringComparer.Ordinal);
+        var duplicatedLockKeyEntries = 0;
+
         foreach (var entry in pool.GetAllEntries())
         {
             if (locksBySupplyKey.TryGetValue(entry.SupplyKey, out var locks))
             {
+                if (!string.IsNullOrEmpty(entry.SupplyKey) && !attachedLockKeys.Add(entry.SupplyKey))
+                {
+                    duplicatedLockKeyEntries++;
+                    continue;
+                }
                 foreach (var dbLock in locks)
                 {
                     // 只映射「供需绑定关系」两类。`EXECUTION` 刻意**不**映射（B4 §5.4）：
@@ -6749,6 +6866,18 @@ public class PeggingOrchestrator : IPeggingOrchestrator
             }
         }
 
+        if (duplicatedLockKeyEntries > 0)
+            _logger.LogWarning(
+                "[Pegging][R02-O02] 供给池存在重复 SupplyKey：{Dup} 条供给与前者同键，锁**只挂首条**以免锁量翻倍。" +
+                "请查装载侧是否把同一物理数量装了两遍（锁条目 {LockCount} 条、唯一键 {KeyCount} 个）。",
+                duplicatedLockKeyEntries, allLocks.Count, locksBySupplyKey.Count);
+
+        if (pool.EntriesWithoutSupplyKey > 0)
+            _logger.LogInformation(
+                "[Pegging][R02-O02] 供给条目 {Total} 条，其中 {NoKey} 条无锁键（虚拟供给或无物理来源身份），" +
+                "按 0号位「空键不可作正式持久锁」不参与锁定，**仍照常参与分配**；可锁键 {KeyCount} 个。",
+                pool.TotalEntries, pool.EntriesWithoutSupplyKey, lockKeys.Count);
+
         _logger.LogDebug(
             "[Pegging] 已加载 {LockCount} 条活跃 Lock 记录到供给池",
             allLocks.Count);
@@ -6759,9 +6888,12 @@ public class PeggingOrchestrator : IPeggingOrchestrator
     ///
     /// 返回 <c>null</c> ＝ 通道正常（或今天还没有锁）；返回非空字符串 ＝ 必须失败的原因文本。
     ///
-    /// 【为什么不直接修 `SupplyKey`】它的口径属于「治理/契约」层（`DemandSupplyHardLock.SupplyKey`
-    ///   实体注释示例是 `INVENTORY_MAT001_F01_WH01` 这种复合键），而写锁的一方今天根本不存在。
-    ///   在写端还没定口径时先自造一个键，等于把错误口径固化进数据。**故只把静默改成显式。**
+    /// 【2026-11-10 更新：`SupplyKey` 已补齐生成函数 `BuildSupplyLockKey`】
+    ///   2026-10-30 当时的顾虑是「写锁的一方不存在、口径未定，自造键等于把错误口径固化」。
+    ///   0号位 2026-11-07《R02O02 统一审核回复》已明令按 `T01`–`T08` 落实并给出口径约束
+    ///   （类型命名空间、`SH` 不得裸单号、键长 ≤200、空键不可作正式持久锁），该顾虑已消除。
+    ///   本闸门**保留**，作用从「替代键口径」变成「键口径失效时的最后一道防线」：
+    ///   一旦有人把赋值点改回空、或装载整体失配，仍会在有锁时立刻失败而不是静默跑完。
     ///
     /// 【为什么必须拦】不拦的话，锁表一旦有数据，跑批会**当作没有锁**继续排——
     ///   表现是「保护失效但一切正常」，比直接报错危险得多（无任何告警可追溯）。
@@ -8773,16 +8905,40 @@ public class PeggingOrchestrator : IPeggingOrchestrator
         // 现改为**整表一次拉回 + 本地过滤**：远端仅 18,842 行（实测 0.18s 拉全表），仍只 1 次往返，
         // 且不再把大 JSON 交给链接服务器。`ORDER BY` 原样保留 ⇒ 组内 EdgeSequence 编号与改前逐行一致。
         var materialSet = new HashSet<string>(materialCodes, StringComparer.Ordinal);
-        var remoteRows = await _connectionManager.QueryAsync<CrossFactoryEdgeLoadRow>(
+        // O67（2026-11-10）：改读 **APS 本地缓存表**。
+        //   冻结 `07 v5.0.46` 明写该表「从 ODS 搬运到 APS 本地，供 Pegging 直接读取」、维护责任人＝2号位；
+        //   此前表未建、本方法每轮运行时跨库读 ODS 同义词。搬运已随 BOM 接货同事务落库（`PullCrossFactoryEdgeAsync`）。
+        //   ⚠ 兜底：本地表为空（尚未接货到本表）时回退读 ODS 同义词并 WARN ——
+        //     不得因为缓存未就绪就让跨厂事实静默消失（宁可走慢路径，不可少事实）。
+        var remoteRows = (await _connectionManager.QueryAsync<CrossFactoryEdgeLoadRow>(
             @"SELECT ChildMaterialCode,
                      FromStageCode,
                      FromFactoryCode,
                      ToStageCode,
                      ToFactoryCode
-              FROM ext_MES_APS_BOM_Workset_CrossFactoryEdge
+              FROM APS_BOM_CROSS_FACTORY_EDGE_RAW
               ORDER BY ChildMaterialCode, BatchNo, WorksetId, Id",
             null,
-            db: DatabaseId.APS);
+            db: DatabaseId.APS)).ToList();
+
+        if (remoteRows.Count == 0)
+        {
+            _logger.LogWarning(
+                "[Pegging][O67] APS 本地缓存表 APS_BOM_CROSS_FACTORY_EDGE_RAW 为空（尚未接货到本表），" +
+                "本次回退读 ODS 同义词 ext_MES_APS_BOM_Workset_CrossFactoryEdge。" +
+                "跨厂事实不丢，但走跨库路径；下一次 BOM 接货后本表自动填充，届时本告警自然消失。");
+
+            remoteRows = (await _connectionManager.QueryAsync<CrossFactoryEdgeLoadRow>(
+                @"SELECT ChildMaterialCode,
+                         FromStageCode,
+                         FromFactoryCode,
+                         ToStageCode,
+                         ToFactoryCode
+                  FROM ext_MES_APS_BOM_Workset_CrossFactoryEdge
+                  ORDER BY ChildMaterialCode, BatchNo, WorksetId, Id",
+                null,
+                db: DatabaseId.APS)).ToList();
+        }
         var rows = remoteRows.Where(r => materialSet.Contains(r.ChildMaterialCode)).ToList();
 
         var map = new Dictionary<string, List<CrossFactoryEdgeFact>>();
@@ -12774,15 +12930,33 @@ public class PeggingOrchestrator : IPeggingOrchestrator
         /// 轮次只影响 `DemandSequence` 的**赋值先后**，不新增排序键 ⇒ `RunBfsLoop` 仍只按
         /// `DemandSequence` 升序，1号位 零改动。
         ///
-        /// 判据（三条轴分开，不得合并）：
-        ///   轴 A 成品层身份 = `Material.MaterialCode LIKE 'FINAL_FG%'`
-        ///     （冻结标准化身份：`01 v1.14 :3406`／`04 V3.31 :175`；**不是** MaterialType、**不是** BOM 拓扑、**不是** P 前缀）；
-        ///   轴 B 上层承接事实 = 该 PI 是否被销售指示引用（已由视图 P 支的 `NOT EXISTS` 落成「P 行／非 P 行」）；
-        ///   ⇒ 孤儿 MTS = P 行 ∧ 非 `FINAL_FG` ⇒ 第 3 轮；成品顶层 MTS 与普通 SO ⇒ 第 1 轮。
+        /// 判据（两条轴分开，不得合并）——**2026-11-10 O49 修订**，见 <see cref="ClassifyCompetitionRound"/>：
+        ///   轴 A 成品层身份 = 码前缀 `FINAL_FG`（用户 2026-11-10 定性：成品只在成品库/出口库，必然 `FINAL_FG`）。
+        ///     ⚠ **不得改用 `Material.MaterialType`**——`FG-` 那 28,632 行被判成 `FINISHED_GOOD` 属主档数据问题。
+        ///   轴 B 上层承接事实 = 该 PI 是否被销售指示引用（已由视图 P 支的 `NOT EXISTS` 落成「P 行／非 P 行」）。
+        ///     该轴**不是**单号形态猜测：视图 `v_APS_SalesOrder` 的 P 支自带
+        ///     `WHERE NOT EXISTS(SELECT 1 FROM V_AllSalesInstr WHERE ProdId = p.IssueID)`，
+        ///     故「P 行」本身就是「该 PI 无任何销售指示承接」这条事实的落库形态。
+        ///   ⇒ 孤儿 MTS = P 行 ∧ 非成品 ⇒ 第 3 轮；成品顶层 MTS 与普通 SO ⇒ 第 1 轮。
         /// 轮次 ≠ BOM 计算层级（0号位 Q1 明令）。
-        /// PV190 实测：22,017 行全部 `FINAL_FG` ⇒ 本属性全批为 1，行为与改动前逐字样一致。
+        /// ⚠ 第 2 轮（SH 源厂履约）**仍未落码**：0号位 2026-11-09 明令它须由「本次 Pegging 的合法上层关系」
+        ///   判定，而轮次用于**分配之前**的排序 ⇒ 需先解决「排序在前、承接结果在后」的时序问题。
+        ///   在落码前，凡命中第 2 轮形态（`SourceFactoryId &lt;&gt; FactoryId`）的订单仍落第 1/3 轮，属已知 OPEN。
         /// </summary>
         public int CompetitionRound { get; set; } = 1;
+
+        /// <summary>
+        /// 来源工厂（跨厂单的源厂）。O49 轴「是否跨厂」输入。
+        /// 与 <see cref="FactoryId"/> 不等即「跨厂 PI 候选」——但 0号位 2026-11-09 明令
+        /// **不得据此自动认定为 SH**，Round2 还须有真实上层承接。此处只作诊断与将来判据入参。
+        /// </summary>
+        public int? SourceFactoryId { get; set; }
+
+        /// <summary>
+        /// 需求保护资格（`PROTECTED` / `UNPROTECTED`），由冻结快照 `$.Lock.Trigger` 派生（B4 §三）。
+        /// 在 <c>BuildDemandSequenceMapAsync</c> 里一次性写入，Pegging 之后建锁侧直接读，不再重算。
+        /// </summary>
+        public string ProtectionStatus { get; set; } = DemandProtectionTriggerEvaluator.UnprotectedStatus;
     }
 
     private async Task<IReadOnlyList<OrderPeggingRow>> LoadOrdersForPeggingAsync(
@@ -12852,14 +13026,15 @@ public class PeggingOrchestrator : IPeggingOrchestrator
                          o.MTS_InstructionNo,
                          o.OrderNo,
                          o.SourceOrderId,
-                         -- ── 竞争轮次（B1 §3.1）：**只分类、不过滤**，需求集合与改动前逐行一致 ──
-                         -- 孤儿 MTS = P 行 ∧ 非 FINAL_FG ⇒ 第 3 轮；其余（普通 SO、成品顶层 MTS）⇒ 第 1 轮。
-                         -- 成品层判据用 FINAL_FG 前缀（01 v1.14 :3406 / 04 V3.31 :175「FINAL 不是 MaterialType」），
-                         -- 不用 MaterialType、不用 BOM 拓扑、不单靠 P 前缀（0号位 Q2）。
-                         -- PV190 实测：22,017 行全 FINAL_FG ⇒ 全批落 1，行为零变化。
-                         CASE WHEN o.OrderNo LIKE 'P%'
-                                   AND m.MaterialCode NOT LIKE 'FINAL_FG%'
-                              THEN 3 ELSE 1 END AS CompetitionRound
+                         -- ── 竞争轮次（B1 §3.1 / O49）：**只分类、不过滤**，需求集合与改动前逐行一致 ──
+                         -- 2026-11-10 O49：轮次判定从 SQL CASE 移入 C# 纯函数（ClassifyCompetitionRound），便于单测。
+                         --   **成品层判据 = 码前缀 `FINAL_FG`** —— 用户 2026-11-10 当面定性：
+                         --   「成品只可能出现于成品库，也就是出口库，肯定都是 `FINAL_FG`，如果有其他 `FG` 开头，肯定是有问题」。
+                         --   ⇒ `Material.MaterialType` **不可作成品判据**：实测有 28,632 行码为 `FG-` 的物料
+                         --     其 `MaterialType` 被打成 `FINISHED_GOOD`，而按上述业务口径这批是**主档数据问题**，待 5号位 清理重同步。
+                         --   ⚠ 另一轴（P 行 / O 行）保持不变：视图 P 支的 `WHERE NOT EXISTS(销售指示引用该 PI)`
+                         --     已把「该 PI 无销售指示承接」落成 P 行身份，不是单号形态猜测。
+                         o.SourceFactoryId
                   FROM [Order] o
                   INNER JOIN Material m ON m.Id = o.MaterialId
                   INNER JOIN Factory  f ON f.Id = o.FactoryId
@@ -12875,7 +13050,59 @@ public class PeggingOrchestrator : IPeggingOrchestrator
                 new { OrderIds = chunk, ScheduleRunId = scheduleRunId },
                 db: DatabaseId.APS));
 
+        // O49（2026-11-10）：轮次改为 C# 侧纯函数判定（可单测），不再藏在 SQL 的 CASE 里。
+        foreach (var row in rows)
+            row.CompetitionRound = ClassifyCompetitionRound(row.OrderNo, row.MaterialCode);
+
+        // O49 诊断：跨厂 PI 候选仍落第 3 轮的数量。
+        //   0号位 2026-11-09 明令「不得将跨厂 PI 自动认定为 SH」⇒ 此处**只数不判**。
+        //   作用是把「Round2 未落码」的规模每轮显式留痕，免得外部把这批单当成已确认的孤儿。
+        var crossFactoryInRound3 = rows.Count(r =>
+            r.SourceFactoryId.HasValue && r.SourceFactoryId.Value != r.FactoryId && r.CompetitionRound == 3);
+        if (crossFactoryInRound3 > 0)
+            _logger.LogWarning(
+                "[Pegging][O49] 跨厂 PI 候选 {Cross} 条仍落第 3 轮（孤儿兜底）：Round2（SH 源厂履约）尚未落码，" +
+                "这批订单的轮次**不是**按「本次 Pegging 的真实上层承接」判定的，不得据此认定其确为孤儿。" +
+                "PlanVersionId={Pv}",
+                crossFactoryInRound3, request.PlanVersionId);
+
         return rows.ToList();
+    }
+
+    /// <summary>
+    /// **O49（2026-11-10）竞争轮次判定** —— 纯函数，供 <see cref="LoadOrdersForPeggingAsync"/> 与单测共用。
+    ///
+    /// <para><b>现状能判的（第 1／3 轮）</b>：</para>
+    /// <list type="bullet">
+    ///   <item>轴 A 成品层：码前缀 <c>FINAL_FG</c>。依据＝用户 2026-11-10 当面定性
+    ///     「成品只可能出现于成品库，也就是出口库，肯定都是 `FINAL_FG`；如果有其他 `FG` 开头，肯定是有问题」。
+    ///     ⚠ **不得改用 `Material.MaterialType`**：实测 28,632 行码为 `FG-` 的物料 `MaterialType` 被打成
+    ///     `FINISHED_GOOD`，按上述口径那是**主档数据问题**（待 5号位 清理重同步），拿它判成品会把坏数据当权威。</item>
+    ///   <item>轴 B 上层承接：`P` 行身份。它不是单号形态猜测——视图 `v_APS_SalesOrder` 的 P 支自带
+    ///     `WHERE NOT EXISTS(V_AllSalesInstr.ProdId = p.IssueID)`，「P 行」即「该 PI 无销售指示承接」的落库形态。</item>
+    /// </list>
+    ///
+    /// <para><b>现状判不了的（第 2 轮）</b>：0号位 2026-11-09 明令 SH 源厂履约必须由「本次 Pegging 的
+    /// 合法上层关系」判定，禁止用 `OrderNo` 前缀／`MaterialCode`／跨厂标记等静态特征代替，且
+    /// **不得将跨厂 PI 自动认定为 SH**。而轮次用于**分配之前**的排序 ⇒ 需先解决
+    /// 「排序在前、承接结果在后」的时序问题（0号位 提到的「两阶段识别」之一）。
+    /// <b>在解决前，本函数不产出 2</b>，命中第 2 轮形态者仍落第 1／3 轮，并由调用方记 WARN 留痕。
+    /// </para>
+    /// </summary>
+    internal static int ClassifyCompetitionRound(string? orderNo, string? materialCode)
+    {
+        // 轴 B：P 行 = 该 PI 无销售指示承接（视图 NOT EXISTS 的落库形态）。
+        var isPiSelfRow = !string.IsNullOrEmpty(orderNo) && (orderNo[0] == 'P' || orderNo[0] == 'p');
+        if (!isPiSelfRow)
+            return 1;   // 普通销售订单 / 成品顶层 MTS ⇒ 第 1 轮
+
+        // 轴 A：PI 自身行里，成品层 ⇒ 第 1 轮；其余 ⇒ 第 3 轮（孤儿 MTS）。
+        //   成品判据 = 码前缀 `FINAL_FG`（用户 2026-11-10 定性：成品只在成品库/出口库，必然 `FINAL_FG`）。
+        //   **不用 `Material.MaterialType`**：`FG-` 那一批被判成 FINISHED_GOOD 属主档数据问题，待清理重同步。
+        return materialCode is not null
+               && materialCode.StartsWith("FINAL_FG", StringComparison.OrdinalIgnoreCase)
+            ? 1
+            : 3;
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -13108,8 +13335,13 @@ public class PeggingOrchestrator : IPeggingOrchestrator
         var bomAnchors = await LoadBomAnchorsAsync(request.PlanVersionId, ct);
         var bomNoByOrder = bomAnchors.ToDictionary(kv => kv.Key, kv => kv.Value.ResolvedBOMNO);
 
-        return RunBfsLoop(orders, demandSequenceByOrder, request, bom, bomStructure, supplyPool, ct, out _,
+        var loopResult = RunBfsLoop(orders, demandSequenceByOrder, request, bom, bomStructure, supplyPool, ct, out _,
             structuresByBomNo, bomNoByOrder);
+
+        // R02-O02 T03 影子（2026-11-10）：只算不写，先量影响面。零行为变更。
+        LogDemandSupplyLockShadow(orders, loopResult);
+
+        return loopResult;
     }
 
     /// <summary>
@@ -13735,6 +13967,14 @@ public class PeggingOrchestrator : IPeggingOrchestrator
         var protectionBasisTime = request.SnapshotAt == default ? DateTime.Now : request.SnapshotAt;
         var protectionStatusByOrder = DeriveDemandProtectionStatus(lockBlock, orders, protectionBasisTime);
 
+        // R02-O02 T03（2026-11-10）：把资格回写到订单行。
+        //   Pegging 之后的建锁侧需要「这条分配所属订单是否受保护」，而订单行是那一段唯一还活着的载体；
+        //   在此一次写入，下游不再重算（重算要再取一次冻结快照，且可能与排序时用的不是同一份）。
+        foreach (var o in orders)
+            o.ProtectionStatus = protectionStatusByOrder.TryGetValue(o.OrderId, out var protectionStatus0)
+                ? protectionStatus0
+                : DemandProtectionTriggerEvaluator.UnprotectedStatus;
+
         // S5（PM 0923）：EXPEDITE 身份 = ScopeJsonV2.OrderTargets.OrderCanonicalId，仅 PriorityMode=EXPEDITE 时生效；
         // 作为「可调整 Demand 排序前置竞争层」传给 Executor（V1 全量重排：expedite 需求整体前置，层内仍按冻结策略竞争）。
         var expediteOrderCanonicalIds = await LoadExpediteOrderCanonicalIdsAsync(request, ct);
@@ -14147,6 +14387,14 @@ public class PeggingOrchestrator : IPeggingOrchestrator
                 ? supply.PhysicalSourceKey
                 : null,
             FactoryCode = supply.FactoryCode,
+            // O62（2026-11-10）：工厂主键从供给台账直接透传。原下游 `BuildMaterialConstraints` 用
+            //   `int.TryParse(alloc.FactoryCode)` 反解文本厂码，必然失败 ⇒ `MaterialAvailabilitySlice.FactoryId`
+            //   恒 0。此处一次带出，下游不再反解。
+            FactoryId = supply.FactoryId,
+            // R02-O02 T03（2026-11-10）：建锁需要「这条分配属于哪个订单、落在哪批物理供给上」。
+            //   订单 Id 取自需求账本；物理锁键取自供给台账（第 1 段 r14120 起才有真值）。
+            OrderId = demand.CurrentOrderId ?? demand.RootOrderId ?? 0,
+            SupplyKey = supply.SupplyKey,
             BomLevel = bomLevel,
             AvailableAt = supply.AvailableAt,
             Priority = demand.Priority
@@ -14288,6 +14536,141 @@ public class PeggingOrchestrator : IPeggingOrchestrator
 
         var available = remainingQty - outstandingReserve;
         return available > 0m ? available : 0m;
+    }
+
+    /// <summary>R02-O02 T03 锁草案（影子阶段只算不写）。</summary>
+    internal sealed record DemandSupplyLockDraft(
+        string SupplyKey,
+        string DemandKey,
+        long OrderId,
+        decimal LockedQty,
+        string LockType)
+    {
+        /// <summary>3号位 2026-11-10 界定：优先级／产品族／客户保护 ⇒ 数量预留型（1 对 N，组内可用、组外竞争剩余）。</summary>
+        internal const string DemandProtection = "DEMAND_PROTECTION";
+
+        /// <summary>1 对 1 独占型。今天**没有任何数据源能判**（客户指定料／工单专用料／冻结区），不产。</summary>
+        internal const string StrictBinding = "STRICT_BINDING";
+    }
+
+    /// <summary>
+    /// **R02-O02 T03（2026-11-10）**：为「受保护需求真实获得的必要份额」构造锁草案。纯函数，可单测。
+    ///
+    /// <para><b>口径逐条对应 0号位 T03 原文</b>：</para>
+    /// <list type="number">
+    ///   <item>「仅对本次规则合法判定受保护且**真实获得**的必要份额」——只处理 `PROTECTED` 订单，
+    ///     且锁量取 `AllocatedQuantity`（真分到的量），不是需求量、不是供给总量。</item>
+    ///   <item>「不得超过该 Demand 的合法必要量、该物理供给可分配余额」——两条上限**由构造保证**：
+    ///     分配本身就发生在原子扣减里，`AllocatedQty ≤ 当时 RemainingQty ≤ 该供给原量`。</item>
+    ///   <item>「共享同一物理数量时不允许简单叠加成两份占用」——① 只锁根需求 `BomLevel == 0`
+    ///     （保护的是订单自身那层的供给份额；BOM 下阶是派生内部需求，逐层建锁会把一份保护放大成多份）；
+    ///     ② 同一 `(SupplyKey, DemandKey)` 多笔分配先合并再产一条。</item>
+    ///   <item>「空键不可作正式持久锁」——`SupplyKey` 为空（虚拟供给／无单号在途）一律跳过。</item>
+    ///   <item>锁型：只产 `DEMAND_PROTECTION`。现有保护触发（剩余时间／延期／VIP／订单类型／成熟度）
+    ///     均属 3号位 2026-11-10 界定的「优先级／客户保护」；`STRICT_BINDING` 今天无判据来源，不产。</item>
+    /// </list>
+    ///
+    /// <para><b>影子阶段</b>：本函数不写库。落库（含幂等与同事务）在 T03 第二步。</para>
+    /// </summary>
+    internal static IReadOnlyList<DemandSupplyLockDraft> BuildDemandSupplyLockDrafts(
+        IReadOnlyList<SupplyAllocationItem> allocations,
+        IReadOnlyDictionary<long, string> protectionStatusByOrder)
+    {
+        if (allocations is null || allocations.Count == 0 || protectionStatusByOrder is null)
+            return Array.Empty<DemandSupplyLockDraft>();
+
+        var merged = new Dictionary<(string SupplyKey, string DemandKey), (long OrderId, decimal Qty)>();
+
+        foreach (var a in allocations)
+        {
+            if (a is null) continue;
+            if (a.BomLevel != 0) continue;                 // 只锁根需求
+            if (a.OrderId <= 0) continue;
+            if (string.IsNullOrWhiteSpace(a.SupplyKey)) continue;   // 空键不可作正式持久锁
+            if (a.AllocatedQuantity <= 0m) continue;
+
+            if (!protectionStatusByOrder.TryGetValue(a.OrderId, out var status)) continue;
+            if (!string.Equals(status, DemandProtectionTriggerEvaluator.ProtectedStatus, StringComparison.Ordinal))
+                continue;
+
+            var key = (a.SupplyKey, a.DemandKey);
+            if (merged.TryGetValue(key, out var cur))
+                merged[key] = (cur.OrderId, cur.Qty + a.AllocatedQuantity);
+            else
+                merged[key] = (a.OrderId, a.AllocatedQuantity);
+        }
+
+        return merged
+            .Select(kv => new DemandSupplyLockDraft(
+                kv.Key.SupplyKey, kv.Key.DemandKey, kv.Value.OrderId,
+                kv.Value.Qty, DemandSupplyLockDraft.DemandProtection))
+            .OrderBy(d => d.SupplyKey, StringComparer.Ordinal)
+            .ThenBy(d => d.DemandKey, StringComparer.Ordinal)
+            .ToList();
+    }
+
+    /// <summary>
+    /// **R02-O02 T03 影子模式（2026-11-10）**：算出「若建锁会锁什么」，只记日志、**不落库**。
+    ///
+    /// <para>为什么先影子：锁一旦存在就会**真的挡人** —— `ComputeDemandProtectionCap` 会把非受保护需求
+    /// 从该供给能取的上限压到「剩余 − 未取走的预留」。等于直接改排产结果，不能一把推上去。</para>
+    ///
+    /// <para>本方法零行为变更：不写库、不改供给池、不参与分配判定。</para>
+    /// </summary>
+    private void LogDemandSupplyLockShadow(
+        IReadOnlyList<OrderPeggingRow> orders,
+        PeggingResultVoucher voucher)
+    {
+        try
+        {
+            var statusByOrder = new Dictionary<long, string>(orders.Count);
+            foreach (var o in orders) statusByOrder[o.OrderId] = o.ProtectionStatus;
+
+            var protectedOrders = orders.Count(o =>
+                string.Equals(o.ProtectionStatus, DemandProtectionTriggerEvaluator.ProtectedStatus, StringComparison.Ordinal));
+            if (protectedOrders == 0)
+            {
+                _logger.LogInformation(
+                    "[Pegging][R02-O02 T03 影子] 本域无受保护订单（`$.Lock.Trigger` 未命中任何订单）⇒ 建锁量为 0。");
+                return;
+            }
+
+            var drafts = BuildDemandSupplyLockDrafts(voucher.SupplyAllocations, statusByOrder);
+            var ordersWithLock = drafts.Select(d => d.OrderId).Distinct().Count();
+            var suppliesWithLock = drafts.Select(d => d.SupplyKey).Distinct(StringComparer.Ordinal).Count();
+            var totalLocked = drafts.Sum(d => d.LockedQty);
+
+            // 受保护但一件锁都没有的订单：要么根需求压根没分到真实供给（全转新增生产），
+            // 要么分到的是虚拟供给（无物理键）。两种都意味着「保护了但没有可持久化的份额」。
+            var lockedOrderIds = drafts.Select(d => d.OrderId).ToHashSet();
+            var protectedWithoutLock = orders.Count(o =>
+                string.Equals(o.ProtectionStatus, DemandProtectionTriggerEvaluator.ProtectedStatus, StringComparison.Ordinal)
+                && !lockedOrderIds.Contains(o.OrderId));
+
+            _logger.LogInformation(
+                "[Pegging][R02-O02 T03 影子] 受保护订单={Protected}，其中可建锁={WithLock}、**无可持久化份额={WithoutLock}**；" +
+                "锁草案={Drafts} 条、涉及物理供给={Supplies} 个、Σ锁定量={TotalQty}。**本次未落库**（影子模式）。",
+                protectedOrders, ordersWithLock, protectedWithoutLock,
+                drafts.Count, suppliesWithLock, totalLocked);
+
+            if (drafts.Count > 0)
+            {
+                var top = drafts
+                    .GroupBy(d => d.SupplyKey, StringComparer.Ordinal)
+                    .Select(g => new { Key = g.Key, Qty = g.Sum(x => x.LockedQty), N = g.Count() })
+                    .OrderByDescending(x => x.Qty)
+                    .Take(5);
+
+                _logger.LogInformation(
+                    "[Pegging][R02-O02 T03 影子] 锁定量前 5 的物理供给：{Top}",
+                    string.Join(" | ", top.Select(x => $"{x.Key} Σ{x.Qty}（{x.N} 条）")));
+            }
+        }
+        catch (Exception ex)
+        {
+            // 影子诊断不得影响主流程：算不出来只留痕，不抛。
+            _logger.LogWarning(ex, "[Pegging][R02-O02 T03 影子] 统计失败（不影响排程，影子模式无副作用）");
+        }
     }
 
     /// <summary>
@@ -15093,7 +15476,7 @@ public class PeggingOrchestrator : IPeggingOrchestrator
         return lineage;
     }
 
-    private IReadOnlyList<MaterialAvailabilitySlice> BuildMaterialConstraints(PeggingResultVoucher voucher)
+    internal static IReadOnlyList<MaterialAvailabilitySlice> BuildMaterialConstraints(PeggingResultVoucher voucher)
     {
         var constraints = new List<MaterialAvailabilitySlice>();
 
@@ -15114,15 +15497,14 @@ public class PeggingOrchestrator : IPeggingOrchestrator
 
             if (alloc.AvailableAt.HasValue)
             {
-                var factoryId = 0;
-                if (int.TryParse(alloc.FactoryCode, out var fid))
-                    factoryId = fid;
-
+                // O62（2026-11-10）：原写法 `int.TryParse(alloc.FactoryCode, out var fid)` 对文本厂码
+                //   （`BJ`/`TJ`/`CN`/`CN6厂`/`SH`）**必然失败** ⇒ 此处 `FactoryId` 恒为 0（沉默列缺陷）。
+                //   现改为取 `SupplyAllocationItem.FactoryId`（由供给池账号逐条透传），不再反解字符串。
                 constraints.Add(new MaterialAvailabilitySlice
                 {
                     AllocationSequence = alloc.AllocationSequence,
                     MaterialId = alloc.SupplyMaterialId,
-                    FactoryId = factoryId,
+                    FactoryId = alloc.FactoryId,
                     Quantity = alloc.AllocatedQuantity,
                     AvailableTime = alloc.AvailableAt.Value,
                     SourceType = alloc.SourceType.ToString(),

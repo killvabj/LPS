@@ -38,6 +38,16 @@ public class OrderLoadingService : IOrderLoadingService
             var parameters = new DynamicParameters();
             parameters.Add("@PlanVersionId", planVersionId, DbType.Int32);
 
+            // O63（2026-11-10）：先取 PV 状态，用于把「算完之后补装」显式留痕。
+            //   背景：`LoadOrdersToActivePlanVersionsAsync` **有意**把活跃订单补装进 ACTIVE PlanVersion
+            //   （那时该 PV 早已算完、Status<>BUILDING），因为 ACTIVE PV 兼作白天候选的订单池。
+            //   这是设计，不是缺陷；但补装进来的订单**不属于该 PV 的排程结果**（它们没有对应 Task）。
+            //   不显式留痕的话，任何人拿 `[Order]` 与本 PV 的 Task 对账，都会把这些单误读成「未排程」。
+            var pvStatus = await _connectionManager.QueryFirstOrDefaultAsync<string>(
+                @"SELECT Status FROM PlanVersion WHERE Id = @Id",
+                new { Id = planVersionId },
+                db: DatabaseId.APS);
+
             var result = await _connectionManager.QueryFirstOrDefaultAsync<OrderLoadingResultDto>(
                 "sp_SyncOrdersToPartitionTable",
                 parameters,
@@ -50,6 +60,20 @@ public class OrderLoadingService : IOrderLoadingService
             _logger.LogInformation(
                 "订单装载完成：PlanVersionId={PlanVersionId}, 装载={InsertCount}条, 耗时={Elapsed}ms",
                 planVersionId, insertCount, stopwatch.ElapsedMilliseconds);
+
+            // O63：算完之后才补进来的订单必须可分辨。判据＝`[Order].UpdatedAt > PlanVersion.ComputedAt`
+            //   （`sp_SyncOrdersToPartitionTable` 的 DelayStatus 刷新明写「不触碰 UpdatedAt」，
+            //   故该列即「入表时刻」，不会被后续维护改写）。
+            //   任何「本 PV 需求 vs 任务」的对账，都应当用「算前订单」口径，否则会把补装单算成漏排。
+            if (insertCount > 0 && !string.Equals(pvStatus, "BUILDING", StringComparison.OrdinalIgnoreCase))
+            {
+                _logger.LogWarning(
+                    "O63 向**已算完**的 PlanVersion 补装了 {InsertCount} 条订单：" +
+                    "PlanVersionId={PlanVersionId}, Status={Status}。这批订单**不在该 PV 的排程结果内**（无对应 Task）。" +
+                    "这是白天候选订单池的预期行为（见 LoadOrdersToActivePlanVersionsAsync），不是漏排；" +
+                    "做「需求↔任务」对账时须用算前口径（[Order].UpdatedAt <= PlanVersion.ComputedAt）。",
+                    insertCount, planVersionId, pvStatus);
+            }
 
             return insertCount;
         }

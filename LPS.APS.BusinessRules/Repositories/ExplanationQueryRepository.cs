@@ -30,30 +30,34 @@ public class ExplanationQueryRepository : IExplanationQueryRepository
     {
         var sql = @"
 SELECT
-    Id,
-    PlanVersionId,
-    ScheduleRunId,
-    ObjectType,
-    OrderId,
-    TaskId,
-    ResourceId,
-    StageCode,
-    ReasonCode,
-    Severity,
-    ImpactHours,
-    EvidenceJson,
-    CreatedAt
-FROM ScheduleExplanationFact
-WHERE PlanVersionId = @PlanVersionId
-    AND (@ObjectType IS NULL OR ObjectType = @ObjectType)
-    AND (@OrderId IS NULL OR OrderId = @OrderId)
-    AND (@TaskId IS NULL OR TaskId = @TaskId)
-    AND (@ReasonCode IS NULL OR ReasonCode = @ReasonCode)
-    AND (@Severity IS NULL OR Severity = @Severity)
+    f.Id,
+    f.PlanVersionId,
+    f.ScheduleRunId,
+    f.ObjectType,
+    f.OrderId,
+    o.OrderNo                                     AS OrderNo,        -- 4号位 R3 可读标识（11-10）：LEFT JOIN，不可关联=null 整键省略
+    m.MaterialCode                                AS MaterialCode,   -- 4号位 R3：证据 MaterialId → Material；无键/不可关联=null
+    f.TaskId,
+    f.ResourceId,
+    f.StageCode,
+    f.ReasonCode,
+    f.Severity,
+    f.ImpactHours,
+    f.EvidenceJson,
+    f.CreatedAt
+FROM ScheduleExplanationFact f
+LEFT JOIN [Order] o ON o.Id = f.OrderId
+LEFT JOIN Material m ON m.Id = TRY_CAST(JSON_VALUE(f.EvidenceJson, '$.MaterialId') AS int)
+WHERE f.PlanVersionId = @PlanVersionId
+    AND (@ObjectType IS NULL OR f.ObjectType = @ObjectType)
+    AND (@OrderId IS NULL OR f.OrderId = @OrderId)
+    AND (@TaskId IS NULL OR f.TaskId = @TaskId)
+    AND (@ReasonCode IS NULL OR f.ReasonCode = @ReasonCode)
+    AND (@Severity IS NULL OR f.Severity = @Severity)
 ORDER BY
-    CASE Severity WHEN 'ERROR' THEN 1 WHEN 'WARN' THEN 2 ELSE 3 END,
-    ImpactHours DESC,
-    Id   -- tiebreaker：分页确定性（全链清扫）
+    CASE f.Severity WHEN 'ERROR' THEN 1 WHEN 'WARN' THEN 2 ELSE 3 END,
+    f.ImpactHours DESC,
+    f.Id   -- tiebreaker：分页确定性（全链清扫）
 OFFSET @Skip ROWS FETCH NEXT @Take ROWS ONLY";
 
         var parameters = new

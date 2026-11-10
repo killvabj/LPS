@@ -16,6 +16,18 @@ public interface IDemandSupplyHardLockRepository
         CancellationToken cancellationToken = default);
 
     /// <summary>
+    /// **R02-O02 T02（2026-11-10）**：按**键集合**一次性取活跃锁。
+    ///
+    /// 存在理由：原实现按「每个供给键一次查询」逐键取锁，供给上万条时就是上万次往返（0号位 点名的 N+1）。
+    /// 本方法只传**一个 JSON 参数**、SQL 侧 `OPENJSON` 表值连接，单批键数由调用方分块控制，
+    /// 既不裸拼大 `IN`、也不并发轰库。返回行仍是各键上的 ACTIVE 锁，**结果集与逐键查询等价**。
+    /// </summary>
+    /// <param name="supplyKeysJson">`string[]` 的 JSON 序列化文本（调用方分块，单块建议 ≤20,000 个键）。</param>
+    Task<IEnumerable<DemandSupplyHardLock>> GetActiveLocksOnSupplyKeysAsync(
+        string supplyKeysJson,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
     /// 查询需求上的活跃 Lock（根据 DemandKey）
     /// </summary>
     Task<IEnumerable<DemandSupplyHardLock>> GetActiveLocksOnDemandAsync(

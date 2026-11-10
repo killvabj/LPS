@@ -193,7 +193,29 @@ public class SupplyAllocationItem
     public string? ShippingInstructionNo { get; set; }
 
     public string FactoryCode { get; set; } = string.Empty;
+
+    /// <summary>
+    /// 供给工厂的**主键**（`Factory.Id`），与 <see cref="FactoryCode"/> 同源同次取。
+    ///
+    /// 【为什么单独存一个整数】`FactoryCode` 是文本厂码（`BJ`/`TJ`/`CN`/`CN6厂`/`SH`），
+    /// 下游需要 `FactoryId` 时**不能靠 `int.TryParse` 反解**——文本码永远解析失败、静默得 0。
+    /// 2026-11-10 前 `BuildMaterialConstraints` 正是这么写的 ⇒ `MaterialAvailabilitySlice.FactoryId`
+    /// **100% 为 0**（当时该字段无消费者，属沉默列缺陷，`O62`）。
+    /// 现由供给池台账（`SupplyLedgerEntry.FactoryId`）直接透传，不再反解。
+    /// </summary>
+    public int FactoryId { get; set; }
+
     public int BomLevel { get; set; }
+
+    /// <summary>本笔分配所属订单 Id（`DemandBalance.CurrentOrderId`）。R02-O02 T03 建锁时用于取该订单的保护资格。</summary>
+    public long OrderId { get; set; }
+
+    /// <summary>
+    /// 供给的**物理锁键**（`SupplyLedgerEntry.SupplyKey`，由 `BuildSupplyLockKey` 统一产出）。
+    /// 空串 ＝ 该供给无持久物理身份（虚拟供给／无单号在途）⇒ 不建锁。
+    /// </summary>
+    public string SupplyKey { get; set; } = string.Empty;
+
     public DateTime? AvailableAt { get; set; }
 
     /// <summary>

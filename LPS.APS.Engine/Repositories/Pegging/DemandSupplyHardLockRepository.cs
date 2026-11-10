@@ -39,6 +39,33 @@ public class DemandSupplyHardLockRepository : IDemandSupplyHardLockRepository
             db: DatabaseId.APS);
     }
 
+    /// <summary>
+    /// R02-O02 T02（2026-11-10）：键集合一次性取 ACTIVE 锁（替代逐键 N+1）。
+    /// 单 JSON 参数 ＋ `OPENJSON` 表值连接；空集合直接返回空，不发查询。
+    /// </summary>
+    public async Task<IEnumerable<DemandSupplyHardLock>> GetActiveLocksOnSupplyKeysAsync(
+        string supplyKeysJson,
+        CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(supplyKeysJson))
+            return Array.Empty<DemandSupplyHardLock>();
+
+        // 不加强制 JOIN 提示：锁表与单个键集都小，让优化器自选；强制 HASH 在该基数上反而不被采纳并出警告。
+        // 无裸大 IN（单 JSON 参数 ＋ OPENJSON），亦不并发 — 符合 0号位 T02 的「受控技术实现」要求。
+        const string sql = @"
+            SELECT l.*
+            FROM [dbo].[DemandSupplyHardLock] l
+            INNER JOIN OPENJSON(@SupplyKeysJson) j
+                    ON j.[value] = l.[SupplyKey]
+            WHERE l.[Status] = N'ACTIVE'
+            ORDER BY l.[CreatedAt]";
+
+        return await _connectionManager.QueryAsync<DemandSupplyHardLock>(
+            sql,
+            new { SupplyKeysJson = supplyKeysJson },
+            db: DatabaseId.APS);
+    }
+
     public async Task<IEnumerable<DemandSupplyHardLock>> GetActiveLocksOnDemandAsync(
         string demandKey,
         CancellationToken cancellationToken = default)
