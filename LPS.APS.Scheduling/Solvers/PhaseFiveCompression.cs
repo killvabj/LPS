@@ -2893,12 +2893,24 @@ internal class PhaseFiveCompression
             .GroupBy(t => t.SourceDraftId)
             .ToDictionary(g => g.Key, g => g.OrderBy(t => t.PlannedStartTime).ToList());
 
+        // ── 2026-11-10 B-02 第一刀：**需求查表从 O(n) 线性扫改成 O(1) 字典** ──
+        //   原实现：下面那个 179,528 次的外层循环里，每个需求都做一次
+        //     `request.LogicalProductionDemands.FirstOrDefault(d => d.LogicalDemandKey == key)`
+        //   —— 对**全量需求列表**的线性扫描 + 字符串比较，且发生在循环内部
+        //   ⇒ 复杂度 O(需求数²)，全量约 1.6×10¹⁰ 次比较。
+        //   实测（50k 档）：`GenerateDependencies` = 14,076 ms，是 Phase5 单项最大的一块。
+        //   改法：循环外建一次字典（O(n)），循环内 O(1) 查。
+        //   【等价性】`FirstOrDefault` 取**首个**匹配；这里 `GroupBy + First` 同样取首个，
+        //     且天然容忍重复键（直接用 `ToDictionary` 遇重复键会抛，反而更脆）。
+        var demandByKey = request.LogicalProductionDemands
+            .GroupBy(d => d.LogicalDemandKey, StringComparer.Ordinal)
+            .ToDictionary(g => g.Key, g => g.First(), StringComparer.Ordinal);
+
         // 为每个需求生成工序依赖
         foreach (var demandGroup in tasksByDemand)
         {
-            var demand = request.LogicalProductionDemands
-                .FirstOrDefault(d => d.LogicalDemandKey == demandGroup.Key);
-            if (demand == null) continue;
+            // B-02：改用循环外建好的字典（原为线性 `FirstOrDefault`，O(需求数²)）
+            if (!demandByKey.TryGetValue(demandGroup.Key, out var demand)) continue;
 
             // ── P0-04（0号位 2026-10-07《未命名的Markdown文件 (7).md》§六 / §十三 反证 ⑧）：**逐批**建边 ──
             //   旧实现按需求整体取 `demandGroup.Value` ⇒ 同一需求的两批 Task 落在同一集合，
@@ -3296,6 +3308,225 @@ internal class PhaseFiveCompression
              + $";End={task.PlannedEndTime:yyyy-MM-dd HH:mm:ss}"
              + $";SpanMin={(task.PlannedEndTime - occStart).TotalMinutes:F1}"
              + $";AllocSeq={allocSeq}";
+    }
+
+    /// <summary>
+    /// 2026-11-11 P0-04 第 8 项**三层闭合**（0号位《APS V1｜0号位对FAMILY_CYL P0-04与多Routing数量闭合问题的审核判定及一次性成套整改指令 v1.0》§3）。
+    ///
+    /// <para><b>为什么要重写</b>：旧实现按 <c>(Demand, Stage, OperationCode)</c> 聚合后要求每道工序都等于
+    ///   <c>Demand.NetOutputQty</c>。当一条需求拆成两个执行批、两批选择**不同的合法互斥 Path**（工序集合不同）时，
+    ///   每道工序天然只承担总量的一部分 ⇒ 必然误判。冻结《04_APS核心排产全流程走查 V3.32》`:189` 明文
+    ///   「允许 EB001→Route A/Path1、EB002→Route B/Path2」⇒ 旧判据与冻结冲突。</para>
+    ///
+    /// <para><b>三层各自独立，缺一不可</b>（0号位 §3.1）：</para>
+    /// <list type="bullet">
+    ///   <item><b>L2 执行批完整链</b>：以 <c>(LogicalDemandKey, StageCode, SEB)</c> 为主核证域；
+    ///        同批内 <c>RouteCode+PathId</c> 必须一致（否则 <c>BATCH_ROUTE_MIXED</c>），
+    ///        <c>StageExecutionBatchQty</c> 同批必须一致。</item>
+    ///   <item><b>L1 需求/Stage 净量</b>：**每批净产出只计一次**，按 <c>(Demand, Stage)</c> 汇总后与
+    ///        <c>EligibleStageDemandQty</c> 比：已排需求严格相等；未排需求允许小于但**绝不允许大于**。</item>
+    ///   <item><b>L3 工序份额</b>：对一个已确定的批+Path，每个工序在该批内的 ΣTask份额 = 该批净产出。</item>
+    /// </list>
+    ///
+    /// <para><b>⚠ 数量口径边界</b>：<c>EligibleStageDemandQty</c> 取 <c>request.StageProcessQuantities.PlannedProcessQty</c>
+    ///   （该字段注释为「投入侧，已按现行良率口径放大」），缺失时回落 <c>Demand.NetOutputQty</c>。
+    ///   良率 ≠ 100% 时两者存在口径差，**已登记为待 2号位 确认项**，本方法不自行放大或缩小。</para>
+    /// </summary>
+    private ValidationResult? ValidateDemandStageClosure(
+        List<FinalTaskDraft> tasks,
+        DomainSolveRequest request,
+        HashSet<string> unscheduledDemandKeys,
+        Dictionary<string, List<(string DemandKey, decimal ShareQty)>> mergeLineage)
+    {
+        var demandByKey = request.LogicalProductionDemands
+            .GroupBy(d => d.LogicalDemandKey)
+            .ToDictionary(g => g.Key, g => g.First());
+
+        // ⚠ `StageProcessQuantities` 不再参与本层计算：
+        //   ① 它的 `PlannedProcessQty` 是**投入侧（含良率放大）**，不能当净需求量（实测 37.3737 vs 37）；
+        //   ② 它按**BOM 全链**登记 Stage，不等于本次选中 Path 的 Stage 集合（实测 `999487_1` 的 `TJ_FINAL`）。
+        //   `EligibleStageDemandQty` 改用 `Demand.NetOutputQty`（需求级净量），见下方注释。
+
+        // ── L2 第一步：按 (Demand, Stage, SEB) 收集 Task 及其**本需求份额** ──
+        //   用 `GetTaskDemandComposition`（含 merge 血缘），不用 `Task.Quantity`
+        //   —— 合批 Task 的 Quantity 是多需求之和，直接用会误判。
+        var batchMembers = new Dictionary<(string Demand, string Stage, string Seb), List<(FinalTaskDraft Task, decimal DemandQty)>>();
+        var order = new List<(string Demand, string Stage, string Seb)>();
+
+        foreach (var task in tasks)
+        {
+            if (task.IsVirtual) continue;   // 虚拟节点（StageTimingNode）非生产载体
+            var seb = task.StageExecutionBatchDraftKey ?? task.ExecutionBatchDraftKey ?? "(no-seb)";
+            foreach (var (compositionDemand, qty) in GetTaskDemandComposition(task, demandByKey, mergeLineage))
+            {
+                var key = (compositionDemand.LogicalDemandKey, task.StageCode ?? string.Empty, seb);
+                if (!batchMembers.TryGetValue(key, out var list))
+                {
+                    list = new List<(FinalTaskDraft, decimal)>();
+                    batchMembers[key] = list;
+                    order.Add(key);
+                }
+                list.Add((task, qty));
+            }
+        }
+
+        // ── L2 第二步 + L3：逐批校验 Path 一致性、编制量一致性、工序份额闭合 ──
+        //   batchNet = 该批的净产出（每批只计一次，供 L1 汇总）
+        var batchNet = new Dictionary<(string Demand, string Stage, string Seb), decimal>();
+        string? firstError = null;
+
+        foreach (var key in order)
+        {
+            var members = batchMembers[key];
+
+            // L2-a：同批内真实 Path 必须一致
+            var routeCodes = new HashSet<string>(StringComparer.Ordinal);
+            var pathIds = new HashSet<long?>();
+            foreach (var (t, _) in members)
+            {
+                routeCodes.Add(t.RouteCode ?? string.Empty);
+                pathIds.Add(t.PathId);
+            }
+            if (routeCodes.Count > 1 || pathIds.Count > 1)
+            {
+                firstError ??= $"BATCH_ROUTE_MIXED: 需求 {key.Demand} Stage {key.Stage} 执行批 {key.Seb} "
+                    + $"内混入多条 Path（RouteCode=[{string.Join(",", routeCodes)}] PathId=[{string.Join(",", pathIds)}]）"
+                    + " —— 一个 Execution Batch 只能绑定一条完整 RouteCode+PathId";
+                continue;
+            }
+
+            // L2-b：同批 StageExecutionBatchQty 必须一致（有值时）
+            var declaredBatchQty = new HashSet<decimal>();
+            foreach (var (t, _) in members)
+            {
+                if (t.StageExecutionBatchQty is { } v) declaredBatchQty.Add(v);
+            }
+            if (declaredBatchQty.Count > 1)
+            {
+                firstError ??= $"BATCH_QTY_INCONSISTENT: 需求 {key.Demand} Stage {key.Stage} 执行批 {key.Seb} "
+                    + $"内 StageExecutionBatchQty 不一致（[{string.Join(",", declaredBatchQty)}]）";
+                continue;
+            }
+
+            // L3：按工序聚合本需求份额
+            var byOp = new Dictionary<string, decimal>(StringComparer.Ordinal);
+            foreach (var (t, qty) in members)
+            {
+                var op = t.OperationCode ?? string.Empty;
+                byOp.TryGetValue(op, out var acc);
+                byOp[op] = acc + qty;
+            }
+
+            // 该批对**本需求**的净产出 = 本需求在该批内各工序的份额（同批各工序应等量）。
+            //   ⚠ **不能**用 `StageExecutionBatchQty`：那是**整批**的量（合批时含其他需求的份额，
+            //     M_01 实测：整批 50 = A30+B20，而需求 B 的净产出份额是 20）⇒ 拿它比会把合法合批判死。
+            //   `StageExecutionBatchQty` 只用于上面 L2-b 的「同批一致」校验，不参与量值。
+            decimal net = 0m;
+            foreach (var kv in byOp) { net = kv.Value; break; }
+            batchNet[key] = net;
+
+            // L3：每个工序在该批内的份额必须等于该批净产出
+            foreach (var kv in byOp)
+            {
+                if (Math.Abs(kv.Value - net) > 0.001m)
+                {
+                    firstError ??= $"BATCH_OP_QTY_MISMATCH: 需求 {key.Demand} Stage {key.Stage} 执行批 {key.Seb} "
+                        + $"工序 {kv.Key} 份额={kv.Value} ≠ 该批净产出={net}";
+                }
+            }
+        }
+
+        // ── L1：按 (Demand, Stage) 汇总**每批净产出一次**，与该 Stage 的合法量比 ──
+        var netByDemandStage = new Dictionary<(string Demand, string Stage), decimal>();
+        foreach (var kv in batchNet)
+        {
+            var k = (kv.Key.Demand, kv.Key.Stage);
+            netByDemandStage.TryGetValue(k, out var acc);
+            netByDemandStage[k] = acc + kv.Value;
+        }
+
+        // ── L1 核证域：**只收「实际有批的 (Demand, Stage)」** ──
+        //   ⚠ 实测（FAMILY_CYL `999487_1`）：`StageProcessQuantities` 里登记了 `TJ_FINAL`，
+        //     但该需求本次选中路径根本不走 `TJ_FINAL` ⇒ 一条 Task 都没有。
+        //     若把「登记的 Stage」也纳入核证域，就会要求它为 0 的产出配一个不存在的应排量 ⇒ 误报 Gap。
+        //     登记的 Stage 集合是**按 BOM 全链**给的，不等于本次选中 Path 的 Stage 集合。
+        //   ⇒ 核证域收「实际有批的」；**完全没排的 Stage 不在此层检测** ——
+        //     按 0号位 §3.1 L1 原文，那种情形需要「明确记录的 `UnscheduledStageQty`」，
+        //     而契约当前**没有该载体**（已登记待 2号位 提供）。缺批的需求整体会进
+        //     `unscheduledDemandKeys`（Phase3 按「有没有 Task」判定），由未排出口承担，不会在此漏放。
+        var domainSet = new HashSet<(string Demand, string Stage)>(netByDemandStage.Keys);
+
+        foreach (var (dk, stageCode) in domainSet)
+        {
+            if (string.IsNullOrEmpty(dk)) continue;
+            if (!demandByKey.TryGetValue(dk, out var closureDemand)) continue;
+
+            // ── `EligibleStageDemandQty` 取**需求级净量** `NetOutputQty` ──
+            //   ⚠ **不能**用 `StageProcessQuantities.PlannedProcessQty`：该字段是**投入侧、已按良率放大**。
+            //     实测（FAMILY_CYL `999487_1379`）：`PlannedProcessQty=37.3737`、净产出=37，良率≈99%
+            //     ⇒ 拿投入量当净需求量比，会把**合法**结果判成 `DEMAND_STAGE_QTY_GAP`。
+            //   多 Stage 时每个 Stage 都要加工整份净量（与输入一致：`999474_1` 的 TJ_ASSY / TJ_FINAL 都是 300）。
+            //   ⚠ 登记待核：契约当前**没有**「Stage 级合法净量」载体（`PlannedProcessQty` 是投入侧）；
+            //     本方法按 0号位 §3.1「无合法 Stage 数量载体时登记契约待核，不编造数量」，
+            //     以需求净量代位，**不自行按良率折算**。待 2号位 提供合法 Stage 净量后改回。
+            var eligible = closureDemand.NetOutputQty;
+            if (eligible <= 0m) continue;
+
+            netByDemandStage.TryGetValue((dk, stageCode), out var actual);
+
+            var demandUnscheduled = unscheduledDemandKeys.Contains(dk);
+
+            if (demandUnscheduled)
+            {
+                // 未排需求：允许小于，绝不允许大于
+                if (actual > eligible + 0.001m)
+                {
+                    firstError ??= $"DEMAND_STAGE_QTY_OVER: 需求 {dk} Stage {stageCode} 未排定却超额产出 "
+                        + $"实际={actual} > 应排={eligible}";
+                }
+            }
+            else
+            {
+                // 已排需求：必须严格闭合
+                if (Math.Abs(actual - eligible) > 0.001m)
+                {
+                    firstError ??= actual > eligible
+                        ? $"DEMAND_STAGE_QTY_OVER: 需求 {dk} Stage {stageCode} 超额产出 实际={actual} > 应排={eligible}"
+                        : $"DEMAND_STAGE_QTY_GAP: 需求 {dk} Stage {stageCode} 数量未闭合 实际={actual} < 应排={eligible}";
+                }
+            }
+        }
+
+        return firstError is null ? null : new ValidationResult { IsValid = false, ErrorMessage = firstError };
+    }
+
+    /// <summary>
+    /// 收集一个需求涉及的 Stage 集合：优先取 <c>StageProcessQuantities</c> 中该需求登记的 Stage，
+    /// 缺失时回落 <c>StageSequenceChains</c>（按物料）与需求的 <c>StartStageCode</c>。
+    /// 只为闭合校验定域，不改任何排程输入。
+    /// </summary>
+    private static IEnumerable<string> CollectStagesForDemand(
+        LogicalProductionDemand demand, DomainSolveRequest request)
+    {
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+
+        if (request.StageProcessQuantities is { Count: > 0 } spq)
+        {
+            foreach (var q in spq)
+            {
+                if (string.Equals(q.LogicalDemandKey, demand.LogicalDemandKey, StringComparison.Ordinal)
+                    && !string.IsNullOrEmpty(q.StageCode) && seen.Add(q.StageCode))
+                {
+                    yield return q.StageCode;
+                }
+            }
+        }
+
+        if (seen.Count == 0 && !string.IsNullOrEmpty(demand.StartStageCode))
+        {
+            seen.Add(demand.StartStageCode);
+            yield return demand.StartStageCode;
+        }
     }
 
     private ValidationResult ValidateHardResult(
@@ -3736,6 +3967,13 @@ internal class PhaseFiveCompression
             }
         }
 
+        // ── 2026-11-11 PV999487 定位：**扫完所有需求再返回**，并把每条不闭合的明细记下来 ──
+        //   原实现遇到第一条不闭合就 `return`，只报了 `999487_126`（25.5 vs 51）一条，
+        //   无法知道「一共多少条、各自长什么样」。改成：全部扫完、逐条登记、最后仍返回**第一个**错误
+        //   （`ErrorMessage` 逐字与改前相同，返回值语义不变）。
+        string? firstClosureError = null;
+        Dictionary<string, List<FinalTaskDraft>>? tasksByDemandForDiag = null;
+
         foreach (var demandGroup in compositionByDemandOp.GroupBy(kvp => kvp.Key.DemandKey))
         {
             if (!demandByKeyForClosure.TryGetValue(demandGroup.Key, out var closureDemand))
@@ -3745,6 +3983,7 @@ internal class PhaseFiveCompression
 
             var expectedQty = closureDemand.NetOutputQty;
             var demandIsUnscheduled = unscheduledDemandKeys.Contains(demandGroup.Key);
+            SolverDiagnostics.ClosureBreakRecord? record = null;
 
             foreach (var opKvp in demandGroup)
             {
@@ -3754,25 +3993,80 @@ internal class PhaseFiveCompression
                 {
                     if (opQty > expectedQty + 0.001m)
                     {
-                        return new ValidationResult
+                        record ??= new SolverDiagnostics.ClosureBreakRecord
                         {
-                            IsValid = false,
-                            ErrorMessage = $"需求 {demandGroup.Key} 未排定却产出超额 FinalTask: "
-                                + $"工序 ({opKvp.Key.StageCode}/{opKvp.Key.OperationCode}) Σ数量={opQty} > 需求 NetOutputQty={expectedQty}"
-                                + "（重复执行批链 ⇒ 物理生产数量被放大）"
+                            DemandKey = demandGroup.Key,
+                            NetOutputQty = expectedQty,
+                            JudgedUnscheduled = true
                         };
+                        record.Ops.Add((opKvp.Key.StageCode, opKvp.Key.OperationCode, opQty));
+                        firstClosureError ??= $"需求 {demandGroup.Key} 未排定却产出超额 FinalTask: "
+                            + $"工序 ({opKvp.Key.StageCode}/{opKvp.Key.OperationCode}) Σ数量={opQty} > 需求 NetOutputQty={expectedQty}"
+                            + "（重复执行批链 ⇒ 物理生产数量被放大）";
                     }
                 }
                 else if (Math.Abs(opQty - expectedQty) > 0.001m)
                 {
-                    return new ValidationResult
+                    record ??= new SolverDiagnostics.ClosureBreakRecord
                     {
-                        IsValid = false,
-                        ErrorMessage = $"需求 {demandGroup.Key} 工序 ({opKvp.Key.StageCode}/{opKvp.Key.OperationCode}) 数量未闭合: "
-                            + $"Σ各 Execution Batch Quantity={opQty}, 需求 NetOutputQty={expectedQty}"
+                        DemandKey = demandGroup.Key,
+                        NetOutputQty = expectedQty,
+                        JudgedUnscheduled = false
                     };
+                    record.Ops.Add((opKvp.Key.StageCode, opKvp.Key.OperationCode, opQty));
+                    firstClosureError ??= $"需求 {demandGroup.Key} 工序 ({opKvp.Key.StageCode}/{opKvp.Key.OperationCode}) 数量未闭合: "
+                        + $"Σ各 Execution Batch Quantity={opQty}, 需求 NetOutputQty={expectedQty}";
                 }
             }
+
+            if (record is not null)
+            {
+                // 惰性建索引：只在真的出现不闭合时才付这次 O(n)，正常跑批零开销
+                tasksByDemandForDiag ??= tasks
+                    .GroupBy(t => t.SourceDraftId)
+                    .ToDictionary(g => g.Key, g => g.ToList());
+
+                if (tasksByDemandForDiag.TryGetValue(demandGroup.Key, out var demandTasks))
+                {
+                    foreach (var t in demandTasks)
+                    {
+                        record.Tasks.Add(new SolverDiagnostics.TaskDetail
+                        {
+                            FinalDraftId = t.FinalDraftId,
+                            Quantity = t.Quantity,
+                            StageCode = t.StageCode ?? string.Empty,
+                            OperationCode = t.OperationCode ?? string.Empty,
+                            RouteCode = t.RouteCode,
+                            PathId = t.PathId,
+                            ExecutionBatchDraftKey = t.ExecutionBatchDraftKey,
+                            PlannedStartTime = t.PlannedStartTime,
+                            PlannedEndTime = t.PlannedEndTime
+                        });
+                    }
+                }
+
+                SolverDiagnostics.RecordClosureBreak(record);
+            }
+        }
+
+        // ── 2026-11-11 P0-04 第 8 项：**判定改用三层闭合**（0号位《P0-04与多Routing数量闭合审核判定 v1.0》§3）──
+        //   上面那段「按 (需求, 工序) 聚合、每工序都要等于 NetOutputQty」**降级为诊断视角**：
+        //     它把「一条需求拆多批、各批选不同合法 Path」误判成失败（FAMILY_CYL 200 条即此形态）。
+        //     但仍保留收集，因为它能给出「哪些需求的工序量对不上」的清单，便于定位。
+        //   ⇒ 真正的放行/拦截由 `ValidateDemandStageClosure` 的三层（L2 批完整链 / L1 需求Stage净量 / L3 工序份额）决定。
+        var threeLayerResult = ValidateDemandStageClosure(tasks, request, unscheduledDemandKeys, mergeLineage);
+        if (threeLayerResult is not null)
+        {
+            if (firstClosureError is not null)
+            {
+                threeLayerResult = new ValidationResult
+                {
+                    IsValid = false,
+                    ErrorMessage = threeLayerResult.ErrorMessage
+                        + " ｜ [按工序聚合视角] " + firstClosureError
+                };
+            }
+            return threeLayerResult;
         }
 
         return new ValidationResult { IsValid = true };

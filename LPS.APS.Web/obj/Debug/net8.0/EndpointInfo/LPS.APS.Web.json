@@ -609,7 +609,7 @@
         "tags": [
           "DomainStatus"
         ],
-        "summary": "查询排程域状态（G8）\r\n            \r\n【异常→HTTP 语义修正 2026-10-16（4号位 R4 联调回执）】\r\n  原实现 catch Exception → ApiResponse.Fail(500)。但 Fail 只改 body.code、HTTP 状态恒 200，\r\n  前端无法区分「查询失败」与「该 Run 无域状态记录」。现与 GovernanceController 同逻辑端点对齐：\r\n    · Run 不存在 / ExpectedDomainKeysJson 缺失或损坏（InvalidOperationException）→ 404\r\n    · 其他异常 → 500\r\n    · 正常空域状态（合法 ExpectedDomainKeys 但计划域当前无记录）→ 200 + []",
+        "summary": "查询排程域状态（G8）\r\n            \r\n【异常→HTTP 语义修正 2026-10-16（4号位 R4 联调回执）】\r\n  原实现 catch Exception → ApiResponse.Fail(500)。但 Fail 只改 body.code、HTTP 状态恒 200，\r\n  前端无法区分「查询失败」与「该 Run 无域状态记录」。现与 GovernanceController 同逻辑端点对齐：\r\n    · Run 不存在 / ExpectedDomainKeysJson 缺失或损坏（InvalidOperationException）→ 404\r\n    · 其他异常 → 500\r\n    · 正常空域状态（合法 ExpectedDomainKeys 但计划域当前无记录）→ 200 + []\r\n            \r\n【数据范围过滤 2026-11-07（4号位 越权缺陷函，口径=甲方 A 案）】\r\n  原实现不调用 IDataScopeService ⇒ 未授权用户可见整批 Run 的全部域状态。\r\n  现按 Domain 维度逐条 Allows 过滤：Global 全放行；有范围集合按集；**无 Domain 维度授权 ⇒ 全部滤除（fail-closed）**。\r\n  过滤后为空 = 200 + []（与 order-query/schedule 同口径：空集合不区分\"无权\"与\"确无\"，均不泄露存在性）。",
         "parameters": [
           {
             "name": "scheduleRunId",
@@ -757,6 +757,94 @@
               "text/json": {
                 "schema": {
                   "$ref": "#/components/schemas/ExplanationSummaryDtoApiResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/explanation/demand-reconciliation": {
+      "get": {
+        "tags": [
+          "Explanation"
+        ],
+        "summary": "Demand 数量对账读模型（**FULL-06**，0号位 11-09 任务书 §2.A）：\r\n`GET /api/explanation/demand-reconciliation?planVersionId=…`\r\n同 Run／同 PlanVersion／同 Demand 的 Q/S/U **原值**+事实类型三族（判据=UnscheduledSource，非 ObjectType）；\r\n读侧不重算、不掩盖 S>Q（211 行现值如实透出，修数=2号位 FULL-01）。",
+        "parameters": [
+          {
+            "name": "planVersionId",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "format": "int32"
+            }
+          },
+          {
+            "name": "scheduleRunId",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "format": "int32"
+            }
+          },
+          {
+            "name": "orderId",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          },
+          {
+            "name": "logicalDemandKey",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "unscheduledSource",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "skip",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "default": 0
+            }
+          },
+          {
+            "name": "take",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "default": 100
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "$ref": "#/components/schemas/DemandReconciliationRowDtoListApiResponse"
+                }
+              },
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DemandReconciliationRowDtoListApiResponse"
+                }
+              },
+              "text/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DemandReconciliationRowDtoListApiResponse"
                 }
               }
             }
@@ -2360,6 +2448,66 @@
             "name": "scheduleRunId",
             "in": "path",
             "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int32"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          }
+        }
+      }
+    },
+    "/api/Governance/rule-sets/versions": {
+      "get": {
+        "tags": [
+          "Governance"
+        ],
+        "summary": "规则集「主子表联查·一版一行」列表（路线 A，2026-11-11：规则集维护页新列表源）。\r\n每主表 N 个版本 ⇒ N 行，各版本状态独立可读，修复旧列表（GET /rule-sets）把 Status 取「最新创建版本」\r\n被同族新草稿覆盖生效 PUBLISHED 的问题。保留既有 GET /rule-sets（一主表带最新概要）供策略包下拉等场景。",
+        "description": "开发者：3号位。参数语义与 M:LPS.APS.Web.Controllers.GovernanceController.GetRuleSets(System.Nullable{System.Boolean},System.String,System.Nullable{System.Int32},System.Nullable{System.Int32},System.Threading.CancellationToken) 一致：activeOnly 三态 / keyword 匹配 Code/Name / 分页。零 DDL。",
+        "parameters": [
+          {
+            "name": "activeOnly",
+            "in": "query",
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "name": "keyword",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "status",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "page",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "format": "int32"
+            }
+          },
+          {
+            "name": "pageSize",
+            "in": "query",
             "schema": {
               "type": "integer",
               "format": "int32"
@@ -9191,6 +9339,124 @@
         },
         "additionalProperties": false
       },
+      "DemandReconciliationRowDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "planVersionId": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "scheduleRunId": {
+            "type": "integer",
+            "format": "int32",
+            "nullable": true
+          },
+          "orderId": {
+            "type": "integer",
+            "format": "int64",
+            "nullable": true
+          },
+          "stageCode": {
+            "type": "string",
+            "nullable": true
+          },
+          "reasonCode": {
+            "type": "string",
+            "nullable": true
+          },
+          "severity": {
+            "type": "string",
+            "nullable": true
+          },
+          "logicalDemandKey": {
+            "type": "string",
+            "nullable": true
+          },
+          "materialId": {
+            "type": "integer",
+            "format": "int32",
+            "nullable": true
+          },
+          "domainKey": {
+            "type": "string",
+            "nullable": true
+          },
+          "allocationSequence": {
+            "type": "integer",
+            "format": "int32",
+            "nullable": true
+          },
+          "netOutputQty": {
+            "type": "number",
+            "format": "double",
+            "nullable": true
+          },
+          "scheduledShareQty": {
+            "type": "number",
+            "format": "double",
+            "nullable": true
+          },
+          "unscheduledQty": {
+            "type": "number",
+            "format": "double",
+            "nullable": true
+          },
+          "unscheduledSource": {
+            "type": "string",
+            "nullable": true
+          },
+          "overlapDetected": {
+            "type": "boolean",
+            "nullable": true
+          },
+          "reasonCodeGap": {
+            "type": "boolean",
+            "nullable": true
+          },
+          "upstreamReasonCode": {
+            "type": "string",
+            "nullable": true
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "date-time"
+          }
+        },
+        "additionalProperties": false
+      },
+      "DemandReconciliationRowDtoListApiResponse": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "message": {
+            "type": "string",
+            "nullable": true
+          },
+          "data": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DemandReconciliationRowDto"
+            },
+            "nullable": true
+          },
+          "traceId": {
+            "type": "string",
+            "nullable": true
+          },
+          "timestamp": {
+            "type": "string",
+            "format": "date-time"
+          }
+        },
+        "additionalProperties": false
+      },
       "DisableRequest": {
         "type": "object",
         "properties": {
@@ -9335,6 +9601,14 @@
           "orderId": {
             "type": "integer",
             "format": "int64",
+            "nullable": true
+          },
+          "orderNo": {
+            "type": "string",
+            "nullable": true
+          },
+          "materialCode": {
+            "type": "string",
             "nullable": true
           },
           "taskId": {
@@ -13367,6 +13641,9 @@
           "setupMinutes": {
             "type": "number",
             "format": "double"
+          },
+          "isActive": {
+            "type": "boolean"
           }
         },
         "additionalProperties": { }
@@ -13405,6 +13682,9 @@
           "setupMinutes": {
             "type": "number",
             "format": "double"
+          },
+          "isActive": {
+            "type": "boolean"
           }
         },
         "additionalProperties": false

@@ -47,6 +47,30 @@ public interface IParameterSetRepository
         int? take = null,
         CancellationToken ct = default);
 
+    /// <summary>
+    /// 参数集「主子表联查·一版一行」列表（2026-11-11，路线 A：参数集维护页新列表源）。
+    /// 每条 = 一条 ParameterSet + 其一个 ParameterSetVersion；同族 N 个版本 ⇒ N 行，各版本状态独立可读，
+    /// 避免旧列表（<see cref="GetListWithVersionAsync"/>）把 Status 取「最新创建版本」导致
+    /// 生效 PUBLISHED 与新草稿互相覆盖（参数集缺陷 2026-11-11 定位——同规则集 OUTER APPLY TOP1 因）。
+    /// 过滤/分页与 <see cref="GetListAsync"/> 同语义：activeOnly=仅启用主表、keyword=匹配 ParameterSetCode/Name、
+    /// status=版本状态精确匹配、name=名称模糊匹配；每主表内按 VersionId ASC 稳定排序。
+    /// </summary>
+    /// <param name="activeOnly">true=仅启用主表（IsActive=1）；null=不区分</param>
+    /// <param name="keyword">模糊关键字，匹配 ParameterSetCode 或 ParameterSetName（null=不过滤）</param>
+    /// <param name="status">版本状态精确匹配（如 PUBLISHED/DRAFT；null=不过滤）</param>
+    /// <param name="name">参数集名称模糊匹配（%name%；null=不过滤）</param>
+    /// <param name="skip">跳过行数（分页 offset；null=不分页）</param>
+    /// <param name="take">返回行数（分页 size；null=不分页）</param>
+    /// <param name="ct">取消令牌</param>
+    Task<IReadOnlyList<ParameterSetVersionRowDto>> GetVersionsWithMainAsync(
+        bool? activeOnly = null,
+        string? keyword = null,
+        string? status = null,
+        string? name = null,
+        int? skip = null,
+        int? take = null,
+        CancellationToken ct = default);
+
     // ==================== 主表写路径（2026-10-25：补齐 4号位 缺口「参数集缺主表写端点」，照 rule-set 10-22 范式） ====================
 
     /// <summary>

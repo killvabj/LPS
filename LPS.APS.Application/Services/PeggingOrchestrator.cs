@@ -82,7 +82,8 @@ public class PeggingOrchestrator : IPeggingOrchestrator
             request.PlanVersionId, request.OrderIds.Count);
 
         // ── 运行进度（可观测性，2号位）──────────────────────────────────────────────
-        //   每个阶段一行写进 `ComputeStageProgress`，后台每 2 秒刷一次心跳。
+        //   每个阶段一行写进 `ComputeStageProgress`，后台每 **5 秒**刷一次心跳
+        //   （`ComputeStageProgressMonitor.HeartbeatInterval`，改那里即改这里，别在注释里另记一个数）。
         //   为什么要有：历史上多次「跑了几十分钟不知道在干嘛」，只能登服务器 tail 日志，
         //   而日志会被轮转、上线后也没人守着。有了这张表，任意客户端一条 SQL 即可回答
         //   「算到哪一步 / 这一步多久 / 是卡住还是在算（心跳年龄）」。
@@ -676,7 +677,7 @@ public class PeggingOrchestrator : IPeggingOrchestrator
         //   越界由 Guard 抛 `ScopeViolationException`（不在此处自判、不缓存、不带 actor/DataScope）。
         //
         //   ⚠ `ScheduleRunId` 的 **0 = 无 Run** 是既有哨兵：手动/联调入口 `RunSchedulingAsync` 恒传 0
-        //     （`SchedulingOrchestrator.cs:471`／`:481`），该值经 `LoadSchedulingContextAsync` 原样落进
+        //     （`SchedulingOrchestrator.RunSchedulingAsync` 的两个重载），该值经 `LoadSchedulingContextAsync` 原样落进
         //     `SchedulingContext.ScheduleRunId`；而 Guard 对 `<= 0` 判「Run 非法」直接抛
         //     `DEPT_SCOPE_ACTOR_UNRESOLVED`。⇒ 此处把 **0 还原成 null**（Guard 契约里的「手动/联调入口无 Run ⇒
         //     跳过并留痕」），**不是**重新推导主体，也不改变任何「该不该判」的取舍。生产两入口
@@ -1217,8 +1218,12 @@ public class PeggingOrchestrator : IPeggingOrchestrator
     /// <see cref="DomainSolveRequest"/> 后即返回，供探针逐项核对载荷（需求数量闭合、PI 归属、
     /// 分桶守恒/E≤Q、Routing 依赖闭合、部门上下文覆盖、Stage 链有序等）。
     ///
-    /// ⚠️ 与生产路径 <c>ExecutePeggingWorkflowAsync</c> 的唯一差异 = **到 solveRequest 为止就返回**：
-    /// 同一 <c>BuildSolveRequestAsync</c>、同一 <c>ExecutePeggingLoopAsync</c>、同一供给池装载。
+    /// ⚠️ 与生产路径 <c>ExecutePeggingWorkflowAsync</c> 的差异 = **到 solveRequest 为止就返回**
+    /// （两者共用同一 <c>BuildSolveRequestAsync</c>、同一 <c>ExecutePeggingLoopAsync</c>、同一供给池装载），
+    /// **但不止这一处**：生产路径另有两道前置闸门本入口不执行 ——
+    ///   ① BOM 输入有效性（`Snapshot.InputState != Available` ⇒ Fail-Closed 返回）；
+    ///   ② 库存快照新鲜度 `EnsureInventorySnapshotFreshAsync`。
+    ///   ⇒ 探针跑通**不等于**生产 Run 能过闸，别拿探针结果替代生产可达性判断。
     /// <c>persistPositionSnapshot:false</c> —— 探针不覆盖夜间 run 的 PI Position 快照。
     /// </summary>
     /// <param name="persistPositionSnapshot">
@@ -1400,19 +1405,25 @@ public class PeggingOrchestrator : IPeggingOrchestrator
     /// 统一事务落库：**单次 <c>ExecuteInTransactionAsync</c>，任一失败全部回滚**。
     ///
     /// 【2026-10-13 更正】原注释写「DELETE 占位 Task → INSERT Task → INSERT Pegging 血缘 → INSERT AllocationLedger。四步」，
-    /// **与代码不符且已证实误导**：本方法内**没有任何 DELETE**；`AllocationLedger` 全仓**无此表**（无 DDL / 无引用）。
-    /// 实际语句组为**五段**，全部挂在同一个 `tx` 上：
+    /// **与代码不符且已证实误导**：`AllocationLedger` 全仓**无此表**（无 DDL / 无引用），那一步不存在。
+    /// 「本方法内**没有任何 DELETE**」这句**本身也已过期**：2026-11-07「轮清移出条件分支」整改后，
+    /// 本方法内确有 `DELETE FROM [TaskDispatch]`（清上轮 `PENDING` 下发行，见 `TaskDispatch` 段落）。
+    /// 落库主体为**五段 INSERT**，全部挂在同一个 `tx` 上：
     ///   ① INSERT `[Task]`（逐条 `solveResult.FinalTasks`）
     ///   ② INSERT `[Pegging]`（Task→Task 血缘）
     ///   ③ INSERT `AllocationTaskShare`（需求↔Task 份额；前置 Inv1~Inv4 fail-closed 校验）
     ///   ④ INSERT `PeggingSupplyAllocation`（仅非 Task 供给）
     ///   ⑤ INSERT `ScheduleExplanationFact`（解释事实）
-    /// 求解**前**的清场 DELETE 不在本方法内，而在 `SchedulingOrchestrator` 的跑前幂等清理（按 PlanVersionId 四条 DELETE）。
+    /// 另有一段 `TaskDispatch` 下发作废／重发：回收超 30 分钟 `PROCESSING` 租约（UPDATE 回 `PENDING`）
+    ///   → `DELETE` 上轮 `PENDING` → INSERT 本轮草案。
+    /// 求解**前**的清场 DELETE 仍不在本方法内，而在 `SchedulingOrchestrator` 的跑前幂等清理（按 PlanVersionId 四条 DELETE）。
     /// </summary>
     /// <param name="deptContexts">
     /// A1：本 Run 需求物料的部门事实（`MaterialStageDeptContext(IsCurrent=1)` 裁剪行，调用方在**事务外**装载）。
     /// 源＝ERP 物料级部门码经 `ProductionDepartment` 归一化（`sp_RebuildMaterialStageDeptContext`，无 RoutingOperation join）。
-    /// 用途为填 `Task.ProductionDepartmentId`；**未命中不算异常**，留 NULL 并记 Issue[DEPT_CONTEXT_MISS]。
+    /// 用途为填 `Task.ProductionDepartmentId`；**未命中不是「留 NULL 了事」**——J14-06 口径为 Fail-Closed：
+    ///   缺口那批 FinalTask **不 INSERT**（不会落下 `ProductionDepartmentId=NULL` 的 Task）；本域一条可落库的
+    ///   都没有而缺口非空时**抛异常、整事务回滚**。分区见 `PartitionByDepartment`。
     /// </param>
     /// <param name="supplyPool">
     /// 本域供给池。**只为取计划良率三态只读计数**（`YieldDiagnostics` 与 `PlanningYieldDuplicateKeyCount()`），
@@ -1485,7 +1496,8 @@ public class PeggingOrchestrator : IPeggingOrchestrator
     /// <summary>
     /// `TaskDispatch`（下发中间表）行的**暂存形态**：Task 未插入时 `SourceTaskId` 未知，先记 `RowIndex`
     /// （= `executableTasks` 序号），批量插入 Task 拿回 Id 数组后再投影。
-    /// 只用于 A/B 桶（有 `MESWorkOrderNo`）；C 桶待建单回接后再补。
+    /// 三种行同表同批写入：A/B 桶 `DispatchStatus='CREATED'` 且带 `MESWorkOrderNo`；
+    ///   **C 桶同样在本方法内建草案**（`DispatchStatus='PENDING'`、`MESWorkOrderNo=null`），不是「回接后再补」。
     /// </summary>
     private sealed class TaskDispatchDraft
     {
@@ -1784,7 +1796,7 @@ public class PeggingOrchestrator : IPeggingOrchestrator
                 //   （`PhaseTwoInitialScheduler` 的 `SourceDraftId = demand.LogicalDemandKey`），每个 Task 由**一条**需求
                 //   派生 ⇒ 取该需求自己的 `OrderId` 即可，一对一、无歧义（实测多份额同 Task 仅 131/106,224 = 0.12%，
                 //   且那是份额层的一对多，不影响任务的主订单归属）。
-                // 【与 AllocationTaskShare 的关系】份额表 `RootOrderId` 已是真值（`:2211` 从 DemandKey 反解），
+                // 【与 AllocationTaskShare 的关系】份额表 `RootOrderId` 已是真值（`ExtractOrderIdFromDemandKey` 从 DemandKey 反解），
                 //   仍是"权威数量归属"；本列是**主展示/统计入口**，两者不冲突，覆盖率 100% vs 30.7%
                 //   （顶层独立需求按 07 §4.4 不虚构 Allocation，故没有份额行）。
                 var orderIdByDemandKey = voucher.LogicalProductionDemands
@@ -1877,7 +1889,8 @@ public class PeggingOrchestrator : IPeggingOrchestrator
                     .Where(r => !string.IsNullOrEmpty(r.PI))
                     .ToDictionary(r => r.PI!, r => r.Qty, StringComparer.Ordinal);
 
-                // MES 已有工单计划量（按 PI 汇总；无 Run 则为空 ⇒ 无法建 C 桶单，见下）
+                // MES 已有工单计划量（按 PI 汇总）。**无 Run 时本字典为空，但 C 桶照样建单**：
+                //   `piFreeQty = PI 总量 − 0` 仍可 > 0，C 桶只依赖 `piFreeQty`、不判 Run ⇒ 空字典不是建单前置条件。
                 //
                 // ── `O31`：**只剔 `DELETED`，别的状态一个都不许剔**（5号位 2026-11-07 §一 认此项）──
                 //   ▸ `DELETED` = **取消释放**：工单已取消，其计划量不该再占 `Q`。剔它是在纠正实现偏差
@@ -2078,8 +2091,10 @@ public class PeggingOrchestrator : IPeggingOrchestrator
 
                     // 真实路径身份落库（红线 Q1 / RT-001 / DB-002）：1号位 FinalTaskDraft 原样透传，**不回填 DEFAULT/1**。
                     //   ⚠ `FinalTaskDraft.PathId` 是 `long?`，而 Task.PathId 是 `INT`（DDL v5.1.8.3）⇒ 越界即置 NULL，不静默截断。
-                    //   ⚠ 当前值仍会是 DEFAULT/1 —— 因为 1号位 侧 `StageTimingNodeBuilder` 尚硬编码
-                    //     RouteCode=="DEFAULT"，2号位 不敢先停归一化（见台账 §T-1008l）。待 1号位 整改后本列自动变真值。
+                    //   ⚠ 当前落库值仍会是 DEFAULT/1 —— 根因是**路由归一化仍 ON**（1号位 `StageTimingNodeBuilder`
+                    //     多处注明「V1 现状：全部 op 均为 DEFAULT/1 ⇒ 该 Route 唯一 Path」），**不是** 1号位 硬编码：
+                    //     未选定路径的锁定任务自 2026-10-07 P0-01 二次整改起已改**Fail Closed**、禁写 DEFAULT/1。
+                    //     待归一化关闭（真实多 Path 落地）后本列自动变真值。
                     int? persistPathId =
                         final.PathId is { } pid && pid >= int.MinValue && pid <= int.MaxValue ? (int)pid : null;
 
@@ -2192,7 +2207,9 @@ public class PeggingOrchestrator : IPeggingOrchestrator
                             // O34（2026-11-07）：工序名三元唯一命中；未命中/多名/无部门 ⇒ NULL（不猜）
                             OperationName    = ResolveOperationNameOrNull(
                                 operationNameByKey, final.MaterialId, persistDepartmentId, final.OperationCode),
-                            // C 桶由 1号位 给 Stage 执行批键（A/B 桶留空，见 09-29 加列脚本口径）；当前 1号位 尚未产出 ⇒ 恒 NULL
+                            // C 桶由 1号位 给 Stage 执行批键（A/B 桶留空，见 09-29 加列脚本口径）。
+                            // ⚠ 1号位 侧 **AUD-1-002 整改后已产出**（`CreateTask` / `CreateNonResourceTask` / `Merge` 三处，
+                            //   C 桶给值、A/B 留空）⇒ 本列**不再是**「恒 NULL」；空值只代表该 Task 属 A/B 桶或无批键。
                             StageExecutionBatchDraftKey = string.IsNullOrWhiteSpace(final.StageExecutionBatchDraftKey) ? null : final.StageExecutionBatchDraftKey,
                             StageExecutionBatchQty      = final.StageExecutionBatchQty,
                             CreatedAt        = now,
@@ -2816,7 +2833,7 @@ public class PeggingOrchestrator : IPeggingOrchestrator
                         }
                     }
 
-                    // 需求起始 Stage（`FillStartStageCodes` 已在 :715 回填，早于本落库）——
+                    // 需求起始 Stage（`FillStartStageCodes` 已在其调用点回填，早于本落库段）——
                     //   `DemandStageCode` 的确定真值来源，不推不断。
                     var startStageByDemandKey = voucher.LogicalProductionDemands
                         .Where(d => !string.IsNullOrEmpty(d.StartStageCode))
@@ -2951,7 +2968,7 @@ public class PeggingOrchestrator : IPeggingOrchestrator
                 //     (3) B10 拿 `ORDER_…` 键去比 `LogicalDemandKey` ⇒ **每条已排需求都被误报为「缺失」**、
                 //         `ScheduledDemandCount` 无意义、Severity 恒 ERROR（对账行沦为噪声）。
                 //   修法：走 1号位 自己的任务↔需求链接 `FinalTaskDraft.FinalDraftId → SourceDraftId`
-                //   （`SourceDraftId` 即 `LogicalDemandKey`，含 `/WO:…`、`/FREE` 分片后缀，见 `:569`/`:581`），
+                //   （`SourceDraftId` 即 `LogicalDemandKey`，含 `/WO:…`、`/FREE` 分片后缀，见 `BucketContinuityShares` / `ContinuityKeyOf`），
                 //   与 `UnscheduledTaskResult.DraftId` **同命名空间**，且**天然覆盖分片**。
                 //   计算核已抽为纯函数 `QuantityReconciliation`（可单测，见 `QuantityReconciliationTests`）。
                 // 只用**真正落库**的 FinalTask：被部门 Fail-Closed 隔离的那部分不构成「已排」，
@@ -3591,7 +3608,9 @@ public class PeggingOrchestrator : IPeggingOrchestrator
                 //   ⚠ 不建 Task／TaskNo／MES工单（0号位 §9.2／§9.3）—— 本块只读 `Fact` 计数与样本。
                 //   ⚠ `CompletionTimeCertain == false` 的行**不得**作承诺／供给可用时间／下游 `AvailableTime`；
                 //     闸门由 `DemandCompletionDiagnostics.CertainOnly` 承担（单测覆盖）。本行只如实计数。
-                //   ⚠ 当前生产侧尚未置值（恒 `null`）⇒ `CertainNullCount == FactCount` 是预期状态，不是告警。
+                //   ⚠ 1号位 自 R09-②（2026-10-29 落码）起三态转满：`StageTimingNodeBuilder` 对每条 Fact 都置
+                //     `true`/`false`，不再产出 `null` ⇒ 生产态 `CertainNullCount` 应为 0；`CertainFalseCount > 0`
+                //     即闸门已在生效，**不再**是「恒 null、不排除任何行」的预期状态。`null` 只为旧载荷兼容保留。
                 {
                     var completionSummary = DemandCompletionDiagnostics.Summarize(solveResult.DemandCompletions);
 
@@ -4045,7 +4064,15 @@ public class PeggingOrchestrator : IPeggingOrchestrator
         /// （多份 BOM 的配比叠在一起）。而一笔订单只走**一个** ResolvedBOMNO（`OrderBomRequestLink`），
         /// 故展开必须按订单自己的 BOMNO 取边。空值＝该行无 BOMNO（退化口径：按全部边展开）。
         /// </summary>
-        string? BomNo);
+        string? BomNo)
+    {
+        /// <summary>
+        /// 子件**应归属的账面工厂码**（`APS_BOM_RAW.ChildRequiredFactory`）。
+        /// 递归时据此把子件需求改到它自己的厂，而不是继承父厂。空值语义见
+        /// <see cref="BomComponent.ChildRequiredFactoryCode"/>。
+        /// </summary>
+        public string? ChildRequiredFactoryCode { get; init; }
+    }
 
     private sealed record BomSnapshot(
         ILookup<string, BomEdge> ByParent,
@@ -4087,6 +4114,14 @@ public class PeggingOrchestrator : IPeggingOrchestrator
         /// 后者不得被当成「本次不需要 Stage/无需求」静默放行（0号位 2026-10-17 §三.D）。
         /// </summary>
         public BomInputState InputState { get; init; } = BomInputState.Available;
+
+        /// <summary>
+        /// 工厂码 → 工厂 Id（`Factory` 主档，`IsActive=1`）。供 BOM 递归把
+        /// <see cref="BomComponent.ChildRequiredFactoryCode"/> 解析成可入池的工厂 Id。
+        /// 空字典 ⇒ 无法解析，子件保持父厂并记 Issue。
+        /// </summary>
+        public IReadOnlyDictionary<string, int> FactoryIdByCode { get; init; }
+            = new Dictionary<string, int>(StringComparer.Ordinal);
     }
 
     /// <summary>
@@ -4120,6 +4155,8 @@ public class PeggingOrchestrator : IPeggingOrchestrator
         public bool IsLeaf                    { get; set; }
         public bool IsPurchased               { get; set; }
         public string? ChildRequiredStageCode { get; set; }
+        /// <summary>子件应归属的账面工厂码（R17 产物）。空 = 外购件；见 `BomComponent.ChildRequiredFactoryCode`。</summary>
+        public string? ChildRequiredFactory    { get; set; }
     }
 
     /// <summary>
@@ -4203,8 +4240,11 @@ public class PeggingOrchestrator : IPeggingOrchestrator
     ///   `null` = 未标注 ⇒ 按现状放行（向后兼容，旧载荷一律落此支）；`true` = 可信。
     ///   ⇒ **唯一排除项是 `false`**，由 <see cref="CertainOnly"/> 承担。
     ///
-    /// 【当前实效】生产侧尚未置值（恒 `null`）⇒ 闸门**当前不排除任何行**，
-    ///   计数会如实显示 `CertainNullCount == FactCount`。这是「契约骨架已落、置值未落」的状态，不是故障。
+    /// 【当前实效】1号位 自 **R09-②（2026-10-29 落码）** 起三态已转满：`StageTimingNodeBuilder` 对每条 Fact
+    ///   逐条求值五条不确定判据（缺 LT／路径未定／无真实依据／无可靠 WORK／无位置），命中置 `false`、
+    ///   其余置 `true`，**不再产出 `null`**。⇒ 生产态 `CertainNullCount` 应为 **0**；
+    ///   一旦 `CertainFalseCount > 0`，就是闸门**确实在排除行**，不是「置值未落」。
+    ///   `null` 一支只为**旧载荷／历史数据**向后兼容保留。
     ///
     /// ⚠ **只读**：不参与判定、不中断 Run、不建 Task／TaskNo／MES工单（0号位 §9.2／§9.3）。
     /// </summary>
@@ -4809,9 +4849,12 @@ public class PeggingOrchestrator : IPeggingOrchestrator
     /// 写锁、读锁、释放、回放一律经此函数产出/比对，不得在别处另行拼装。
     ///
     /// 【为什么单独一个键，而不直接复用 `PhysicalSourceKey`】
-    ///   `PhysicalSourceKey` 同时承担四个互不相同的用途：①硬锁身份 ②跨域守恒账本（`RecordPhysicalConsumption`）
-    ///   ③超耗核对分组（`:3719`）④厂间调拨单身份（`ShippingInstructionNo`，且红线⑤⑥ 在 `:4006` 拿它和
-    ///   `SourceReference` 逐字比）。其中 ④ 要求它**保持裸单号**——给 SH 加前缀会让红线当场报「跨SH串用」。
+    ///   `PhysicalSourceKey` 曾同时承担四个用途；**自 2026-11-10 本函数落地起，①硬锁身份已改由 `SupplyKey`
+    ///   单独承担**，`PhysicalSourceKey` 只剩三个，且这三个都不许被锁键改写：
+    ///   ①跨域守恒账本（`RecordPhysicalConsumption`）
+    ///   ②超耗核对分组（`ValidatePeggingResult` 的 R03-01/02 合计校验）
+    ///   ③厂间调拨单身份（`ShippingInstructionNo`；红线⑤⑥ 在 `ValidateShConsistency` 拿它和
+    ///   `SourceReference` 逐字比）。其中 ③ 要求它**保持裸单号**——给 SH 加前缀会让红线当场报「跨SH串用」。
     ///   故锁键在 `PhysicalSourceKey` 之上**另加类型命名空间与物料/工厂**，两者各司其职、互不牵连。
     ///
     /// 【取值规则】一律 `<命名空间>:<物理来源身份>:<物料ID>:<工厂ID>`：
@@ -4955,7 +4998,7 @@ public class PeggingOrchestrator : IPeggingOrchestrator
         /// <summary>剩余可用数量（遍历时可变，初始值=OriginalQty）</summary>
         public decimal RemainingQty                     { get; set; }
 
-        /// <summary>已锁定份额（STRICT_BINDING/DEMAND_PROTECTION/Execution）</summary>
+        /// <summary>已锁定份额（`STRICT_BINDING` / `DEMAND_PROTECTION`；`EXECUTION` 已于 2026-11-07 按 B4 §5.4 删除）</summary>
         public decimal LockedQty                        { get; set; }
 
         // ═══════════════════════════════════════════════════════════════════════
@@ -5041,7 +5084,7 @@ public class PeggingOrchestrator : IPeggingOrchestrator
         /// <summary>本次运行的Allocation记录列表（用于追溯和校验）</summary>
         public List<AllocationRecord> Allocations       { get; init; } = new();
 
-        /// <summary>Lock记录列表（STRICT_BINDING/DEMAND_PROTECTION/Execution）</summary>
+        /// <summary>Lock记录列表（`STRICT_BINDING` / `DEMAND_PROTECTION`；`EXECUTION` 已于 2026-11-07 按 B4 §5.4 删除）</summary>
         public List<LockRecord> Locks                   { get; init; } = new();
     }
 
@@ -5675,7 +5718,14 @@ public class PeggingOrchestrator : IPeggingOrchestrator
         //   ⇒ 本层在入池前用 `IsForbiddenStandaloneSupplyType` 拦下（见下方循环），不依赖对方先改白名单。
         // 厂间在途分两类（PM 2026-09-09 v1.0）：PI 级 Transit = PI Position（LoadTransitFactsAsync →
         // ProductionInstructionPositionCalculator）；SH 级供给 = [Order] CustomerSegment='跨厂' 订单
-        // （LoadInterFactoryShipmentsAsync 单一供给，不再三段式 Transit/Received 闭合）。均待真实事实就绪后正式启用。
+        // （LoadInterFactoryShipmentsAsync 单一供给，不再三段式 Transit/Received 闭合）。
+        // ⚠ 两条链**均已接线**，不是「待启用」，但**两条的事实状态完全不同**：
+        //   · SH 侧（本方法下方 shipments 循环）**有事实**：2026-11-10 15:54 实测
+        //     `[Order] CustomerSegment='INTER_FACTORY'` = **1,593 行**
+        //     （其中 `OrderType='SALES_ORDER' AND Quantity>0` = **1,589**，即真正可入池的量）。
+        //     ⚠ 判据值是英文码 `INTER_FACTORY`（`CustomerSegmentCodes.InterFactory`），**不是中文「跨厂」**；
+        //       按中文字面查恒得 0 行 —— 2026-11-10 本轮曾据中文字面误判「SH 无事实」，已订正。
+        //   · PI 级 Transit 侧：链路已接，但 `ext_ERP_InterplantInTransit_View` = **0 行**，是真没有在途事实。
         var rawFacts = await _timedSupplyFactLoader.LoadRawFactsAsync(
             new SupplyFactScope { DataCutoffTime = cutoff }, ct);
 
@@ -5917,8 +5967,10 @@ public class PeggingOrchestrator : IPeggingOrchestrator
         // SH 本身是 Order（OrderType=SALES_ORDER + CustomerSegment='跨厂'，OrderNo=SH号），
         // 单一 Supply 身份，禁拆 Transit/Received/Unproduced 三段；单个 SH 整单一次入库。
         // 每 SH 只入池一条（PhysicalSourceKey=SH号=OrderNo），量=Order.Quantity（指令总量），由红线③⑥ 防重复计量。
-        // AvailableAt = SourceReadyTime + CrossFactoryLT；SourceReadyTime = max(源厂 Task PlannedEndTime)，
-        // 依赖 Layer-2「源厂需求→求解→回传」（待 PM 接口/源厂方向字段落地）——当前置 null（源厂未排），见台账。
+        // AvailableAt = SourceReadyTime + CrossFactoryLT；SourceReadyTime = max(源厂 Task PlannedEndTime)。
+        // ⚠ 缺的是 **Layer-2「源厂需求→求解→回传」的产出**，**不是字段**：源厂方向字段（`[Order].SourceFactoryId`）
+        //   已落地并在下方按 A5 三态判（UNKNOWN / MASKED / 健康）；源厂域尚未排产 ⇒ SourceReadyTime 无从取，
+        //   故 AvailableAt 仍置 null（见下方 TODO(Layer-2)）。
         var shipments = await LoadInterFactoryShipmentsAsync(request.PlanVersionId, ct);
         Mark($"⑥厂间 SH 供给({shipments.Count}行)");
         foreach (var s in shipments)
@@ -7344,13 +7396,14 @@ public class PeggingOrchestrator : IPeggingOrchestrator
     ///
     /// 【2026-10-26 更正】原注释写「2号位据此把未定位份额路由到新增生产」，**与可执行代码相反**：
     ///   · 本仓 `LPS.APS.Application` **没有任何一行读 `PositionType.UNLOCATED` 作判据**（唯二两处读
-    ///     `PositionType` 的是 `:6680` 转字符串留痕、`:12946-12947` 读 `FIRST_STAGE_PENDING`/`STAGE_WAITING`）；
-    ///   · 与本类 `:7035`「落入 UNLOCATED（**不得删除 Supply / 转新增生产**）」、`:12883`「UNLOCATED ⇒ 不产行」
-    ///     两句新注释直接矛盾 ⇒ 本句是旧漂移，作废。
+    ///     `PositionType` 的是 `MapPositionSnapshots` 转字符串留痕、`BuildPiStageQuantityBaselines` 读
+    ///     `FIRST_STAGE_PENDING`/`STAGE_WAITING`）；
+    ///   · 与本类 `AttributeInterplantTransitToPi`「落入 UNLOCATED（**不得删除 Supply / 转新增生产**）」、
+    ///     `BuildPiStageQuantityBaselines`「UNLOCATED ⇒ 不产行」两句新注释直接矛盾 ⇒ 本句是旧漂移，作废。
     ///   · 0号位 2026-10-26《XC范围·影子计量与时间单位正式回复 v1.1》§〇二.2 再次明令：
     ///     **不得把「普通库存被拒」自动转译为 PI 的 `UNLOCATED`／MES 在制／新增生产需求**。
     ///     `UNLOCATED` 只表示「已有真实 PI，但其在 Position 中位置不可信」，**不是**供给资格结果的通用兜底。
-    ///   · 真缺口走的是 `:12378` 的**自制件供给不足 ⇒ `NEW_REQUIREMENT` 缺口虚拟供给**（正常 BFS 递归），
+    ///   · 真缺口走的是 `NetAndAllocate` 的**自制件供给不足 ⇒ `NEW_REQUIREMENT` 缺口虚拟供给**（正常 BFS 递归），
     ///     与 UNLOCATED 无因果链。
     /// </summary>
     private async Task<(IReadOnlyDictionary<string, ProductionInstructionPositionResult> Positions,
@@ -7630,7 +7683,7 @@ public class PeggingOrchestrator : IPeggingOrchestrator
                 },
                 StringComparer.Ordinal);
 
-        // 1.5) PI 级库存事实（ext_ 同义词：ERP_Inventory_View.WarehouseCode=6位工序码 → MES_ProcessCode_View.StageCode）
+        // 1.5) PI 级库存事实（ext_ 同义词：ext_ERP_Inventory_View.WarehouseCode=6位工序码 → ext_MES_ProcessCode_View.StageCode）
         //      ⚠️ XC 仓在装载侧剔除（冻结 `11 v2.5 §176`）：同一批 XC 只能走 1.6 的 PI 级专路，
         //      不得从 InventoryAvailableSupplyDetail 再派生一份同份额 PiInventories。
         var piInventoryMap = await LoadPiInventoryFactsAsync(piFacts, wipStageRows, ct);
@@ -8889,7 +8942,17 @@ public class PeggingOrchestrator : IPeggingOrchestrator
 
     /// <summary>
     /// 装载跨厂边事实（CrossFactoryEdge）。
-    /// 链：ext_MES_APS_BOM_Workset_CrossFactoryEdge（18374 行）。
+    /// 链：ODS `MES_APS_BOM_Workset_CrossFactoryEdge` → APS 本地缓存 `APS_BOM_CROSS_FACTORY_EDGE_RAW`。
+    ///
+    /// 【只取 `STAGE_INTERNAL`】该表自 2026-11-10 起承载**两类边**（5号位 契约扩展，`EdgeRelationType`）：
+    ///   · `STAGE_INTERNAL`（旧语义，637 行）＝ 子件自身阶段链内相邻段换厂 ⇒ **本方法唯一消费的类型**；
+    ///   · `PARENT_CHILD`（新增，569,541 行）＝ 子件阈值段→父件工序段的父子跨厂跳变
+    ///     ⇒ 消费口径**待 0号位 裁 A/B/C**，裁前**不得**喂给任何制造厂/运输判据。
+    ///   若不过滤：`ProductionInstructionPositionCalculator` 只按 `(FromFactoryCode, ToFactoryCode)` 配对，
+    ///   而实测 **10 个 `STAGE_INTERNAL` 厂对全部同时出现在 `PARENT_CHILD`**（有链内边的 258 个子件中
+    ///   252 个同时带父子边）⇒ `matchingEdges.Count>1` 几乎必然成立 ⇒ 在途 Stage 定位被打成
+    ///   `TRANSIT_AMBIGUOUS_STAGE`（**WARN、不报错**）并降级为 `StageCode=null`。
+    ///
     /// 归组键 = ChildMaterialCode（PI 物料作为子件、其产品跨厂转运的边）；
     /// 组内按 (From,To) 四元组去重后自编号 EdgeSequence（物理表无此列）。
     /// </summary>
@@ -8917,16 +8980,34 @@ public class PeggingOrchestrator : IPeggingOrchestrator
                      ToStageCode,
                      ToFactoryCode
               FROM APS_BOM_CROSS_FACTORY_EDGE_RAW
+              WHERE EdgeRelationType = 'STAGE_INTERNAL'
               ORDER BY ChildMaterialCode, BatchNo, WorksetId, Id",
             null,
             db: DatabaseId.APS)).ToList();
 
         if (remoteRows.Count == 0)
         {
-            _logger.LogWarning(
-                "[Pegging][O67] APS 本地缓存表 APS_BOM_CROSS_FACTORY_EDGE_RAW 为空（尚未接货到本表），" +
-                "本次回退读 ODS 同义词 ext_MES_APS_BOM_Workset_CrossFactoryEdge。" +
-                "跨厂事实不丢，但走跨库路径；下一次 BOM 接货后本表自动填充，届时本告警自然消失。");
+            // 分清「缓存为空（未接货）」与「缓存有行但新列全 NULL（旧二进制搬运）」——
+            //   两种都回退读 ODS，但成因不同、处置不同，不能糊成一句「为空」。
+            var cacheTotal = (await _connectionManager.QueryAsync<int>(
+                "SELECT COUNT(*) FROM APS_BOM_CROSS_FACTORY_EDGE_RAW",
+                db: DatabaseId.APS, commandTimeout: 60)).FirstOrDefault();
+
+            if (cacheTotal > 0)
+            {
+                _logger.LogWarning(
+                    "[Pegging][跨厂边] APS 本地缓存表有 {Total} 行，但 `STAGE_INTERNAL` 0 行 —— " +
+                    "说明该批是用**不含 `EdgeRelationType` 的旧二进制**搬运的（新列全 NULL）。" +
+                    "本次回退读 ODS 并按类型过滤；下一次 BOM 接货（新二进制）后自动恢复，届时本告警消失。",
+                    cacheTotal);
+            }
+            else
+            {
+                _logger.LogWarning(
+                    "[Pegging][O67] APS 本地缓存表 APS_BOM_CROSS_FACTORY_EDGE_RAW 为空（尚未接货到本表），" +
+                    "本次回退读 ODS 同义词 ext_MES_APS_BOM_Workset_CrossFactoryEdge。" +
+                    "跨厂事实不丢，但走跨库路径；下一次 BOM 接货后本表自动填充，届时本告警自然消失。");
+            }
 
             remoteRows = (await _connectionManager.QueryAsync<CrossFactoryEdgeLoadRow>(
                 @"SELECT ChildMaterialCode,
@@ -8935,6 +9016,7 @@ public class PeggingOrchestrator : IPeggingOrchestrator
                          ToStageCode,
                          ToFactoryCode
                   FROM ext_MES_APS_BOM_Workset_CrossFactoryEdge
+                  WHERE EdgeRelationType = 'STAGE_INTERNAL'
                   ORDER BY ChildMaterialCode, BatchNo, WorksetId, Id",
                 null,
                 db: DatabaseId.APS)).ToList();
@@ -8963,6 +9045,13 @@ public class PeggingOrchestrator : IPeggingOrchestrator
             }
             map[group.Key] = edges;
         }
+
+        // 一行留痕，直接回答「过滤器生效没有」：应为 子件≈258、边≈637（`STAGE_INTERNAL` 口径）。
+        //   若这里变成五位数，说明类型过滤没落到 SQL 上 —— 别等 `TRANSIT_AMBIGUOUS_STAGE` 才发现。
+        _logger.LogInformation(
+            "[Pegging][跨厂边] 装载 STAGE_INTERNAL 边 {EdgeCount} 条 / {MaterialCount} 个子件" +
+            "（源读 {RawCount} 行、按本域物料裁剪后 {MatchedCount} 行；PARENT_CHILD 未消费 —— 消费口径待 0号位 裁 A/B/C）。",
+            map.Values.Sum(v => v.Count), map.Count, remoteRows.Count, rows.Count);
 
         return map;
     }
@@ -10342,7 +10431,11 @@ public class PeggingOrchestrator : IPeggingOrchestrator
         return null;
     }
 
-    /// <summary>工厂口径：参数行未限厂时视为通配（冻结口径，FACTORY_STAGE_DEFAULT 依赖此语义）。</summary>
+    /// <summary>
+    /// 工厂口径：**查询目标工厂**（入参 `factoryCode`）未给定时视为通配（冻结口径，`FACTORY_STAGE_DEFAULT` 依赖此语义）。
+    /// ⚠ 判的是**入参**，不是参数行自己的 `r.FactoryCode`：参数行 `FactoryCode` 为空**不**构成通配，
+    ///   反向也不成立（入参给出时，参数行 `FactoryCode` 必须逐字相等才命中）。
+    /// </summary>
     private static bool SameFactoryCode(StageLeadTimeParamRow r, string? factoryCode) =>
         string.IsNullOrEmpty(factoryCode) || string.Equals(r.FactoryCode, factoryCode, StringComparison.Ordinal);
 
@@ -10782,7 +10875,7 @@ public class PeggingOrchestrator : IPeggingOrchestrator
         //     副作用：1) `[Task].RouteCode/PathId` 全成假值，订单级路线追溯不成立；
         //             2) 不同 RouteCode 的同名工序/资质/依赖塌进同一键，逼出三处"归一化自造重复"的补丁。
         //   【前提已消失】1号位 2026-11-09 回执确认：`LPS.APS.Scheduling` 内 `"DEFAULT"` 字面量 9 处
-        //     **无一处是路由筛选**；键已升维为 `RoutePathKey.Of(RouteCode, PathId)`（`:1728`「禁止跨 Path 连边」）。
+        //     **无一处是路由筛选**；键已升维为 `RoutePathKey.Of(RouteCode, PathId)`（真实路径隔离，禁跨 Path 连边/合并）。
         //   ⇒ **本处不再归一化**，真实路径原样交给 Solver；去重键一律按真实路径隔离，**禁止跨 Path 合并**。
         var opSeen = new HashSet<(int, int, string, int, string)>();
         var opDeduped = operations
@@ -11618,7 +11711,7 @@ public class PeggingOrchestrator : IPeggingOrchestrator
                 g => g.Key,
                 g => g.Select(o => (o.RouteCode, o.PathId)).Distinct().ToList());
 
-        var alreadyReal = 0;        // 已带真实值（5号位 按 slice 交付）
+        var alreadyReal = 0;        // 已带真实值（`BucketContinuityShares` 从工单级 `ExistingExecutionContextDto` 带入；slice DTO 无此两列）
         var missingRouteCode = 0;
         var missingPathId = 0;
         var noRouting = 0;
@@ -12174,7 +12267,8 @@ public class PeggingOrchestrator : IPeggingOrchestrator
                WHERE IsActive = 1",
             db: DatabaseId.APS)).ToList();
 
-        // 部门 → 工厂：部门级日历行本身也带 FactoryId，但主档才是权威归属（与 `SchedulingOrchestrator:1072` 同源）。
+        // 部门 → 工厂：部门级日历行本身也带 FactoryId，但主档才是权威归属
+        //   （与 `SchedulingOrchestrator` 装载人工能力槽时的 `SELECT Id, FactoryId FROM ProductionDepartment` 同源）。
         var factoryIdByDepartmentId = (await _connectionManager.QueryAsync<DepartmentFactoryRow>(
                 @"SELECT Id, FactoryId FROM ProductionDepartment",
                 db: DatabaseId.APS))
@@ -12546,7 +12640,10 @@ public class PeggingOrchestrator : IPeggingOrchestrator
                          b.LLC,
                          b.IsLeaf,
                          ISNULL(mc.IsPurchased, 0) AS IsPurchased,
-                         b.ChildRequiredStageCode
+                         b.ChildRequiredStageCode,
+                         -- 2026-11-10 O65：子件**应归属的账面工厂**（R17 产物）。
+                         --   此前不取 ⇒ 边结构无工厂 ⇒ 递归把父厂原样下传 ⇒ 子件永远在父厂做。
+                         b.ChildRequiredFactory
                   FROM APS_BOM_RAW b
                   LEFT JOIN Material mc ON mc.MaterialCode = b.ChildMaterialCode
                   WHERE b.BatchNo = @BatchNo
@@ -12782,7 +12879,13 @@ public class PeggingOrchestrator : IPeggingOrchestrator
             r.IsLeaf,
             r.IsPurchased,
             r.ChildRequiredStageCode,
-            r.BomNo?.Trim())).ToList();
+            r.BomNo?.Trim())
+        {
+            // 2026-11-10 O65：边上带子件自己的制造厂
+            ChildRequiredFactoryCode = string.IsNullOrWhiteSpace(r.ChildRequiredFactory)
+                ? null
+                : r.ChildRequiredFactory!.Trim(),
+        }).ToList();
 
         // LLC 取各物料在所有 BOM 路径中出现的最小值
         var llcByMaterial = dedupedRows
@@ -12844,11 +12947,21 @@ public class PeggingOrchestrator : IPeggingOrchestrator
                     StringComparer.Ordinal),
                 StringComparer.Ordinal);
 
+        // 2026-11-10 O65：工厂码 → Id，供递归把子件的「应归属厂」解析成可入池的 Id。
+        //   与 `LoadStageLeadTimeParamsAsync` 的工厂口径同源（`Factory` 主档、`IsActive=1`）。
+        var factoryIdByCode = (await _connectionManager.QueryAsync<FactoryCodeRow>(
+                "SELECT Id, Code FROM Factory WHERE IsActive = 1",
+                db: DatabaseId.APS))
+            .Where(r => !string.IsNullOrWhiteSpace(r.Code))
+            .GroupBy(r => r.Code.Trim(), StringComparer.Ordinal)
+            .ToDictionary(g => g.Key, g => g.First().Id, StringComparer.Ordinal);
+
         return new BomSnapshot(edges.ToLookup(e => e.ParentCode), llcByMaterial, isPurchasedByMaterial, edges.Count,
                                materialUniverse, Freeze(parentsByBomChild), Freeze(thresholdsByBomChild))
         {
             BatchNo = linkedBatchNo,
             InputState = BomInputState.Available,
+            FactoryIdByCode = factoryIdByCode,
         };
     }
 
@@ -13414,6 +13527,28 @@ public class PeggingOrchestrator : IPeggingOrchestrator
                 string.Join(",", traversalStats.MissingChildMaterialCodes.Take(10)));
         }
 
+        // O65（2026-11-10）：子件制造厂归属留痕。三类分开报，不许糊成一句「兜底了」。
+        _logger.LogInformation(
+            "[Pegging][O65] 子件按自己的制造厂落需求：改厂 {Rehomed} 对｜空值缺值 {Missing} 对｜厂码查无 {Unknown} 对",
+            traversalStats.ChildFactoryRehomed,
+            traversalStats.ChildFactoryMissing,
+            traversalStats.ChildFactoryUnknown);
+
+        if (traversalStats.ChildFactoryMissing > 0)
+            _logger.LogWarning(
+                "[Pegging][O65] 有 {N} 对 (子件|父厂) 在**需要自制**却缺 `ChildRequiredFactory` —— " +
+                "按 5号位 定性空值本应全部是外购件；走到自制递归仍是空 ⇒ 属缺值（Produce 非外购但要求厂为空）。" +
+                "本次保持父厂继续跑，不静默、不猜。样例={Sample}",
+                traversalStats.ChildFactoryMissing,
+                string.Join(",", traversalStats.ChildFactoryMissingSamples.Take(10)));
+
+        if (traversalStats.ChildFactoryUnknown > 0)
+            _logger.LogWarning(
+                "[Pegging][O65] 有 {N} 对 (子件|厂码) 的 `ChildRequiredFactory` 在 `Factory` 主档查无（含停用/非生产厂）—— " +
+                "本次保持父厂继续跑。样例={Sample}",
+                traversalStats.ChildFactoryUnknown,
+                string.Join(",", traversalStats.ChildFactoryUnknownSamples.Take(10)));
+
         voucher.IsFullyAllocated = voucher.ShortageQuantity == 0;
         voucher.ExecutionTimeMs = loopSw.ElapsedMilliseconds;
         return voucher;
@@ -13453,12 +13588,13 @@ public class PeggingOrchestrator : IPeggingOrchestrator
     /// </summary>
     private static (BomStructure Union, IReadOnlyDictionary<string, BomStructure> ByBomNo) ToBomStructures(
         BomSnapshot bom)
-        => ToBomStructures(bom.ByParent.SelectMany(g => g), bom.IsPurchasedByMaterial);
+        => ToBomStructures(bom.ByParent.SelectMany(g => g), bom.IsPurchasedByMaterial, bom.FactoryIdByCode);
 
     /// <summary>分桶实现（`internal` 供单测直接断言「跨 BOMNO 不求和」）。</summary>
     internal static (BomStructure Union, IReadOnlyDictionary<string, BomStructure> ByBomNo) ToBomStructures(
         IEnumerable<BomEdge> edges,
-        IReadOnlyDictionary<string, bool> isPurchasedByMaterial)
+        IReadOnlyDictionary<string, bool> isPurchasedByMaterial,
+        IReadOnlyDictionary<string, int>? factoryIdByCode = null)
     {
         var union = new Dictionary<string, Dictionary<string, BomComponent>>(StringComparer.Ordinal);
         var byBom = new Dictionary<string, Dictionary<string, Dictionary<string, BomComponent>>>(StringComparer.Ordinal);
@@ -13480,11 +13616,12 @@ public class PeggingOrchestrator : IPeggingOrchestrator
         }
 
         var isPurchased = isPurchasedByMaterial;
+        var factoryMap = factoryIdByCode ?? new Dictionary<string, int>(StringComparer.Ordinal);
         return (
-            new BomStructure(Freeze(union), isPurchased),
+            new BomStructure(Freeze(union), isPurchased) { FactoryIdByCode = factoryMap },
             byBom.ToDictionary(
                 kv => kv.Key,
-                kv => new BomStructure(Freeze(kv.Value), isPurchased),
+                kv => new BomStructure(Freeze(kv.Value), isPurchased) { FactoryIdByCode = factoryMap },
                 StringComparer.Ordinal));
 
         // 同父同子在同一桶内累加配比（干净 BOM 语义）
@@ -13495,9 +13632,18 @@ public class PeggingOrchestrator : IPeggingOrchestrator
                 target[edge.ParentCode] = children = new Dictionary<string, BomComponent>(StringComparer.Ordinal);
 
             if (children.TryGetValue(edge.ChildCode, out var existing))
-                children[edge.ChildCode] = existing with { QtyPerUnit = existing.QtyPerUnit + edge.Qty };
+                children[edge.ChildCode] = existing with
+                {
+                    QtyPerUnit = existing.QtyPerUnit + edge.Qty,
+                    // 同父同子合并时工厂取「首个非空」：同一 BOMNO 内该值逐边同源；
+                    // 跨 BOMNO 的合并只发生在无锚点的退化并集路径（`union`），该路径下工厂本就不可判。
+                    ChildRequiredFactoryCode = existing.ChildRequiredFactoryCode ?? edge.ChildRequiredFactoryCode,
+                };
             else
-                children[edge.ChildCode] = new BomComponent(edge.ChildCode, edge.ChildMaterialId, edge.Qty);
+                children[edge.ChildCode] = new BomComponent(edge.ChildCode, edge.ChildMaterialId, edge.Qty)
+                {
+                    ChildRequiredFactoryCode = edge.ChildRequiredFactoryCode,
+                };
         }
 
         static IReadOnlyDictionary<string, IReadOnlyList<BomComponent>> Freeze(
@@ -13510,7 +13656,8 @@ public class PeggingOrchestrator : IPeggingOrchestrator
 
     /// <summary>
     /// 新 BFS 逐层主流程（阶段2 S2.3，PM 0918-3 §二 批准的「宽度优先逐层 + 每(order,material)同一计算上下文一次净额」）。
-    /// 不切主链，仅作双跑对照。与旧 DFS 的等价性见方案 §三.3；核心差异：
+    /// **本方法即现行主链**（2026-09-18 用户裁决由 DFS 切至 BFS）；旧 DFS 只留给
+    ///   <see cref="RunDualCompareAsync"/> 作对照。与旧 DFS 的等价性见方案 §三.3；核心差异：
     ///   a) 每 (order, material, factory) 恰一次 NetAndAllocate（共享子件不再指数重复展开）；
     ///   b) 共享子件生产合并为一张 LPD（碎片 300+300 → 一张 600）；
     ///   c) 血缘边由本层按 ParentEdges 逐边建（一个节点多父 → 多条 Consumer→Producer 边，RequiredQty=父净×配比）。
@@ -13540,6 +13687,11 @@ public class PeggingOrchestrator : IPeggingOrchestrator
         var orderIdx = 0;
         var loopSw = System.Diagnostics.Stopwatch.StartNew();
         traversalStats = new BomTraversalStats();
+
+        // O65：工厂 Id → 码（供子件改厂后仍能拿到可读厂码；同码多 Id 取首个，与装载侧口径一致）。
+        var factoryCodeById = bom.FactoryIdByCode
+            .GroupBy(kv => kv.Value)
+            .ToDictionary(g => g.Key, g => g.First().Key);
 
         foreach (var order in orderedOrders)
         {
@@ -13576,6 +13728,12 @@ public class PeggingOrchestrator : IPeggingOrchestrator
             var root = new BomOrderDemand(order.OrderId, order.MaterialId, order.MaterialCode, order.FactoryId, order.DemandQty);
             var nodes = explosion.ExplodeOrderStructure(structure, root);
 
+            // 2026-11-10 O65：每个物料的**制造厂**（来自展开层按边解析）。此前所有节点一律 = 订单厂。
+            //   ⚠ 下面父件产出查找必须用**父件自己的**厂，不能用 node.FactoryId —— 子件改厂后
+            //     两者不同，用错会让跨厂子件查不到父产出、需求静默归零。
+            var factoryIdByMaterialCode = new Dictionary<string, int>(StringComparer.Ordinal);
+            foreach (var n in nodes) factoryIdByMaterialCode[n.MaterialCode] = n.FactoryId;
+
             // produced：本订单内 (material|factory) → 净额承接结果（父净驱动的源量）。
             // 合并 Key = 订单(循环外层) + material + factory；生产上下文(Stage/Domain/必要Routing)为扩展点
             // （PM 0918-3 §二：不得只按 MaterialId 合并；当前数据单订单内 factory 唯一，预留扩展位）。
@@ -13587,16 +13745,38 @@ public class PeggingOrchestrator : IPeggingOrchestrator
                 {
                     traversalStats.Record(node.MaterialCode, node.FactoryId);
 
+                    // O65：按节点工厂来源留痕（改厂／缺值兜底／厂码查无／多父冲突分开计）。
+                    switch (node.FactorySource)
+                    {
+                        case BomFactorySource.Rerouted:
+                            traversalStats.RecordChildFactoryRehomed(node.MaterialCode, order.FactoryCode, node.FactoryId.ToString());
+                            break;
+                        case BomFactorySource.MissingFallback:
+                            traversalStats.RecordChildFactoryMissing(node.MaterialCode, order.FactoryCode);
+                            break;
+                        case BomFactorySource.UnknownFallback:
+                            traversalStats.RecordChildFactoryUnknown(node.MaterialCode, node.MaterialCode);
+                            break;
+                        case BomFactorySource.ConflictFirstParentWins:
+                            traversalStats.RecordChildFactoryConflict(node.MaterialCode);
+                            break;
+                    }
+
                     // 下级依赖需求 = Σ 父件净产出 × 配比（等效旧实现 `AllocatedQty × edge.Qty`）
+                    // O65：父件按**它自己的厂**取产出（父子可能不同厂）。
                     decimal gross = level == 0
                         ? order.DemandQty
                         : node.ParentEdges.Sum(e =>
-                            produced.TryGetValue(SupplyPool.BuildKey(e.ParentMaterialCode, node.FactoryId), out var p)
+                            produced.TryGetValue(SupplyPool.BuildKey(e.ParentMaterialCode,
+                                    factoryIdByMaterialCode.TryGetValue(e.ParentMaterialCode, out var pf) ? pf : node.FactoryId), out var p)
                                 ? p.ProducedQty * e.QtyPerUnit
                                 : 0m);
 
+                    // 节点工厂码：优先按 Id 反查主档，查不到退回订单厂码（保证下游拿到可读厂码，不传空）。
+                    var nodeFactoryCode = factoryCodeById.TryGetValue(node.FactoryId, out var nfc) ? nfc : order.FactoryCode;
+
                     var outcome = NetAndAllocate(
-                        order, node.MaterialCode, node.MaterialId, node.FactoryId, order.FactoryCode,
+                        order, node.MaterialCode, node.MaterialId, node.FactoryId, nodeFactoryCode,
                         gross, level, demandSequence, bom, supplyPool, voucher,
                         consumerLogicalDemandKey: null, consumerMaterialId: 0);
 
@@ -13637,6 +13817,34 @@ public class PeggingOrchestrator : IPeggingOrchestrator
             traversalStats.DuplicateExpansions,
             orderedOrders.Count,
             loopSw.ElapsedMilliseconds);
+
+        // O65（2026-11-10）：子件制造厂归属留痕。四类分开报 —— 改厂、缺值、厂码查无、多父冲突。
+        _logger.LogInformation(
+            "[Pegging][O65] 子件按自己的制造厂落需求：改厂 {Rerouted} 个｜空值缺值 {Missing} 个｜厂码查无 {Unknown} 个｜多父冲突 {Conflict} 个",
+            traversalStats.ChildFactoryRehomed,
+            traversalStats.ChildFactoryMissing,
+            traversalStats.ChildFactoryUnknown,
+            traversalStats.ChildFactoryConflict);
+
+        if (traversalStats.ChildFactoryMissing > 0)
+            _logger.LogWarning(
+                "[Pegging][O65] {N} 个子件**要自制却缺 `ChildRequiredFactory`** —— 按 5号位 定性空值本应全是外购件，" +
+                "走到自制展开仍是空 ⇒ 属缺值（Produce 非外购但要求厂为空）。本次保持父厂继续跑。样例={Sample}",
+                traversalStats.ChildFactoryMissing,
+                string.Join(",", traversalStats.ChildFactoryMissingSamples.Take(10)));
+
+        if (traversalStats.ChildFactoryUnknown > 0)
+            _logger.LogWarning(
+                "[Pegging][O65] {N} 个子件的 `ChildRequiredFactory` 在 `Factory` 主档查无（含停用/非生产厂），本次保持父厂。样例={Sample}",
+                traversalStats.ChildFactoryUnknown,
+                string.Join(",", traversalStats.ChildFactoryUnknownSamples.Take(10)));
+
+        if (traversalStats.ChildFactoryConflict > 0)
+            _logger.LogWarning(
+                "[Pegging][O65] {N} 个物料被不同父边指定了**不同的**应归属厂 —— 节点按物料唯一，只能取首个父边的厂，" +
+                "该物料在另一厂的需求本批**未建**。样例={Sample}",
+                traversalStats.ChildFactoryConflict,
+                string.Join(",", traversalStats.ChildFactoryConflictSamples.Take(10)));
 
         // BOMNO 分桶命中率：`按BOMNO` 是正常路径；`锚点BOMNO无行`/`无锚点` 走的是全部边并集（退化口径，留痕）。
         if (structuresByBomNo is not null || bomNoByOrder is not null)
@@ -13987,7 +14195,8 @@ public class PeggingOrchestrator : IPeggingOrchestrator
         // 三条口径：
         //   ① EXPEDITE 只在本轮内前置 —— 只喂给第 1 轮，不带进后续轮（否则插单会跨轮置顶）；
         //   ② 某轮无匹配段 ⇒ 执行器自带「DemandKey ASC 兜底 + WARNING」，不并入前一轮；
-        //   ③ 供给池是一个共用池，按轮顺序消耗（池在 BuildSolveRequestAsync 装载一次，这里不碰）。
+        //   ③ 供给池是一个共用池，按轮顺序消耗（池由 `ExecutePeggingWorkflowAsync` / `RunPeggingOnlyAsync`
+        //      在进 Pegging 循环前装载一次并传入；`BuildSolveRequestAsync` 不装载、这里也不碰）。
         // 2026-11-06：库存消耗日（CoverageDays）按物料一次装载，供 DemPriority 的 STOCKCONSUMEDAY 字段使用。
         var stockConsumeDayByMaterial = await LoadStockConsumeDayByMaterialAsync(
             orders.Select(o => o.MaterialCode).Distinct(StringComparer.Ordinal).ToList(), ct);
@@ -14273,7 +14482,8 @@ public class PeggingOrchestrator : IPeggingOrchestrator
     /// 一笔供需Allocation成功时，必须在同一内存动作中完成：
     /// 1. 校验Demand还有余额
     /// 2. 校验Supply还有余额
-    /// 3. 校验资格（Eligibility，当前版本暂不实现，待5号位规则引擎接入）
+    /// 3. 校验资格（Eligibility；**已实现**，现只有「供需物料一致」这条防御性红线，
+    ///    见 `ValidateEligibility`；复杂资格规则待 5号位 规则引擎接入后在该方法内扩展）
     /// 4. 校验Strict Binding
     /// 5. 校验Demand Protection
     /// 6. 扣DemandBalance
@@ -14754,6 +14964,41 @@ public class PeggingOrchestrator : IPeggingOrchestrator
         public string? MaxSharedMaterialCode { get; private set; }
         public long MaximumVisits { get; private set; }
 
+        // ── O65（2026-11-10）：子件制造厂归属的三类留痕 ──
+        private readonly HashSet<string> _childFactoryRehomedKeys = new(StringComparer.Ordinal);
+        private readonly HashSet<string> _childFactoryMissingKeys = new(StringComparer.Ordinal);
+        private readonly HashSet<string> _childFactoryUnknownKeys = new(StringComparer.Ordinal);
+
+        /// <summary>子件被改到**自己的**制造厂（与父厂不同）的 (子件|父厂|自己厂) 去重对数。</summary>
+        public long ChildFactoryRehomed => _childFactoryRehomedKeys.Count;
+
+        /// <summary>递归点上 `ChildRequiredFactory` 为空（缺值）的 (子件|父厂) 去重对数。</summary>
+        public long ChildFactoryMissing => _childFactoryMissingKeys.Count;
+
+        /// <summary>厂码在 `Factory` 主档查无的 (子件|厂码) 去重对数。</summary>
+        public long ChildFactoryUnknown => _childFactoryUnknownKeys.Count;
+
+        private readonly HashSet<string> _childFactoryConflictKeys = new(StringComparer.Ordinal);
+        /// <summary>多父边给出**不同**应归属厂的子件数（节点按物料唯一，只能取首个父边的厂）。</summary>
+        public long ChildFactoryConflict => _childFactoryConflictKeys.Count;
+        public IReadOnlyCollection<string> ChildFactoryConflictSamples => _childFactoryConflictKeys;
+
+        public void RecordChildFactoryConflict(string materialCode)
+            => _childFactoryConflictKeys.Add(materialCode);
+
+        public IReadOnlyCollection<string> ChildFactoryRehomedSamples => _childFactoryRehomedKeys;
+        public IReadOnlyCollection<string> ChildFactoryMissingSamples => _childFactoryMissingKeys;
+        public IReadOnlyCollection<string> ChildFactoryUnknownSamples => _childFactoryUnknownKeys;
+
+        public void RecordChildFactoryRehomed(string childCode, string fromCode, string toCode)
+            => _childFactoryRehomedKeys.Add($"{childCode}|{fromCode}→{toCode}");
+
+        public void RecordChildFactoryMissing(string childCode, string parentFactoryCode)
+            => _childFactoryMissingKeys.Add($"{childCode}|父厂{parentFactoryCode}");
+
+        public void RecordChildFactoryUnknown(string childCode, string factoryCode)
+            => _childFactoryUnknownKeys.Add($"{childCode}|厂码{factoryCode}");
+
         /// <summary>
         /// BOM 子件在 <c>Material</c> 主档中**缺行**的边数（被跳过的下钻次数）。
         /// 见 <see cref="RecordMissingChildMaterial"/>：`LoadBomSnapshotAsync` 的
@@ -14843,12 +15088,18 @@ public class PeggingOrchestrator : IPeggingOrchestrator
             {
                 foreach (var edge in children)
                 {
+                    // 2026-11-10 O65：子件按**它自己的应归属厂**落需求，不再一律继承父厂。
+                    //   此前 `factoryId/factoryCode` 原样下传 ⇒ BOM 说"该子件在 BJ 做"，需求建在 TJ，
+                    //   在制 PI 在 BJ、需求键在 TJ，供给池键 `物料|工厂` 对不上 ⇒ 全转新增生产 ⇒ 无 PI。
+                    var (childFactoryId, childFactoryCode) =
+                        ResolveChildFactory(bom, edge, factoryId, factoryCode, traversalStats);
+
                     TraverseBomNode(
                         order,
                         edge.ChildCode,
                         edge.ChildMaterialId,
-                        factoryId,
-                        factoryCode,
+                        childFactoryId,
+                        childFactoryCode,
                         outcome.ProducedQty * edge.Qty,
                         bomLevel + 1,
                         demandSequence,
@@ -14868,6 +15119,46 @@ public class PeggingOrchestrator : IPeggingOrchestrator
         {
             visited.Remove(nodeKey);
         }
+    }
+
+    /// <summary>
+    /// 2026-11-10 O65：解析**子件自己的**制造厂，决定它的需求落在哪个厂。
+    ///
+    /// 判据（5号位 2026-11-10《跨厂工厂事实三问逐答》§问1 ＋ 0号位 v1.1 §⑤）：
+    ///   · 边上带 `ChildRequiredFactory`（R17 产物）且能在 `Factory` 主档解析 ⇒ **用该厂**；
+    ///   · 空值 ⇒ 按 5号位 定性是**外购件**（该批 2,716,680 行全空、100% 外购）。但**能走到本方法
+    ///     说明该子件确要自制**——外购件在 `NetAndAllocate` 已返回 null 不再下钻 ⇒ 空值即**缺值**，
+    ///     保持父厂并记 Issue 交出去，不静默兜底；
+    ///   · 厂码在 `Factory` 主档查无（含非生产厂 / 已停用）⇒ 保持父厂并记 Issue。
+    ///
+    /// ⚠ 这里**不做**「一律回退父件厂」的业务承诺：回退只是「不因为有缺值就丢掉整条需求」的
+    ///   最小可运行处置，缺值本身必须被看见（计数 + 取样 + 日志），而不是被当成正常。
+    /// </summary>
+    private static (int FactoryId, string FactoryCode) ResolveChildFactory(
+        BomSnapshot bom,
+        BomEdge edge,
+        int parentFactoryId,
+        string parentFactoryCode,
+        BomTraversalStats? stats)
+    {
+        var required = edge.ChildRequiredFactoryCode;
+        if (string.IsNullOrWhiteSpace(required))
+        {
+            stats?.RecordChildFactoryMissing(edge.ChildCode, parentFactoryCode);
+            return (parentFactoryId, parentFactoryCode);
+        }
+
+        var code = required!.Trim();
+        if (!bom.FactoryIdByCode.TryGetValue(code, out var id))
+        {
+            stats?.RecordChildFactoryUnknown(edge.ChildCode, code);
+            return (parentFactoryId, parentFactoryCode);
+        }
+
+        if (id != parentFactoryId)
+            stats?.RecordChildFactoryRehomed(edge.ChildCode, parentFactoryCode, code);
+
+        return (id, code);
     }
 
     /// <summary>某节点净额承接的结果：NetOutput（NEW_REQUIREMENT 净产出）与生产 LPD 身份（未生产=null）。</summary>
@@ -15066,7 +15357,8 @@ public class PeggingOrchestrator : IPeggingOrchestrator
         }
 
         // 自制件：生成 NEW_REQUIREMENT（缺口）虚拟供给，通过原子Allocation流程处理
-        // 符合§5.3和§5.4要求：必须经过完整的10步原子校验，AllocationSequence在成功时生成
+        // 符合§5.3和§5.4要求：必须经过完整的**9 步**原子校验（原第 6 步「Execution 不可逆事实」
+        // 已于 2026-11-07 按 B4 §5.4 删除，见 `TryAtomicAllocation` 文档），AllocationSequence 在成功时生成
 
         // 添加虚拟 NEW_REQUIREMENT（缺口）供给到SupplyPool（返回引用直接分配；NEW_REQUIREMENT 属缺口结果，
         // 不参与 GetEntries 三类排序，故不能依赖 .Last() 取回）
@@ -15184,7 +15476,8 @@ public class PeggingOrchestrator : IPeggingOrchestrator
     /// 连接/去重/歧义处理见 <see cref="ExecutionConstraintProjector"/>。
     ///
     /// 【早退两条（与改造前 `Array.Empty` 等价 ⇒ 零回归）】
-    ///   ① 非 Candidate；② 无 `BasePlanVersionId`。任何一条不静默：均落日志。
+    ///   ① 非 Candidate；② 无 `BasePlanVersionId`。任何一条均**直接返回 `AnchorPayload.Empty`、不落日志**
+    ///   （调用点亦无告警；FULL 路径每次都走这支，静默是刻意的，勿据「无日志」推断未执行）。
     ///
     /// 【⚠ 范围边界：FULL 侧不在此处】`SchedulingOrchestrator` 的 FULL 路径
     ///   `sourcePlanVersionId = null` ⇒ `BasePlanVersionId = null` ⇒ 本方法恒早退。
@@ -15485,11 +15778,12 @@ public class PeggingOrchestrator : IPeggingOrchestrator
             // ── NEW_REQUIREMENT（自制缺口虚拟供给）**不是物料可用性**，不得进 `MaterialConstraints` ──
             //   ① 语义：`MaterialAvailability` 是「物料最早到手时间」，供 1号位 `GetMaterialEarliestTime` 作
             //      **正/倒排起始下界**（P0-05）；NEW_REQUIREMENT 是「这笔需求要靠自己生产补上」的**缺口标记**，
-            //      `PeggingResultVoucher` 契约明示其**不写 PeggingSupplyAllocation**（同 `:1330` / `:9412`
-            //      统计真实供给时的同一排除口径）。
-            //   ② 事实：该虚拟供给的 `AvailableAt` = `order.DueDate`（`TryExpandSelfMadeNode` 内 `availableAt:
-            //      order.DueDate`）。把它当可用性 ⇒ 每个自制需求的**最早开工时间恒等于自己的交期** ⇒ 正排只能
-            //      排在交期之后，无交期之后的产能即整域 0 Task（2026-10-19 受控回归实证：四例 FinalTask=0）。
+            //      `PeggingResultVoucher` 契约明示其**不写 PeggingSupplyAllocation**（同
+            //      `FindPhysicalOverConsumption` / `AggregateByPhysicalSupply` 统计真实供给时的同一排除口径）。
+            //   ② 事实：该虚拟供给的 `AvailableAt` = `order.DueDate`（`NetAndAllocate` 的自制缺口分支
+            //      `supplyPool.Add(..., availableAt: order.DueDate, ...)`）。把它当可用性 ⇒ 每个自制需求的
+            //      **最早开工时间恒等于自己的交期** ⇒ 正排只能排在交期之后，无交期之后的产能即整域 0 Task
+            //      （2026-10-19 受控回归实证：四例 FinalTask=0）。
             //   ③ 真供给（库存／采购在途／生产指示／采购占位）**照旧保留** —— 只有缺口标记被剔除；
             //      缺口对应的**生产需求**本身已由 `LogicalProductionDemand` 承载，不依赖本条提供"可用量"。
             if (alloc.SourceType == Core.Enum.SupplySourceType.NEW_REQUIREMENT)
@@ -15524,8 +15818,10 @@ public class PeggingOrchestrator : IPeggingOrchestrator
     ///
     /// 【为什么必须有】1号位 B-009 合法量门禁（<c>PhaseTwoInitialScheduler.ApplyPiLegalQuantityGate</c>）取
     ///   <c>cap = min(PI Original, PI Remaining, StageFreeEligibleQty − 同PI同Stage已占)</c>。
-    ///   后两项**只有装载层能给**：1号位 消费形状 <c>PiStageQuantityContext</c> 的调用点当前传 <c>null</c>
-    ///   ⇒ 门禁生产态不可达（1号位 已如实声明，不宣称 B-009 达标）。本方法即补该缺口的**上游产物**。
+    ///   后两项**只有装载层能给**。⚠ **接线已完成**：1号位 `PhaseTwoInitialScheduler` 按
+    ///   <c>request.PiStageQuantityBaselines</c> 建 `(PI, 物料, Stage)` 索引（`BuildPiStageQuantityIndex`），
+    ///   我方在 `ExecutePeggingWorkflowAsync` 把本方法产出填进 `DomainSolveRequest.PiStageQuantityBaselines`
+    ///   ⇒ 门禁**在生产态可达**（基线为空时才退化为仅总量闸封顶）。
     ///
     /// 【口径（冻结，非我方发明）】业务基线 v1.10 §1231（同句重复于 03 v1.8 §43／06 v1.35 §257／07 v5.1.10 §4590／
     ///   10 v1.7 §48／**11 v2.1 §50**）逐字：`StageFreeEligibleQty`＝「PI Position/NextOperationContext、A/B已执行、

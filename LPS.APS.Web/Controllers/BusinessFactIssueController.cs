@@ -57,6 +57,14 @@ public class BusinessFactIssueController : ControllerBase
     ///
     /// 实现：全链路下推 allowedFactories 到 SQL WHERE，null = Global 全放行。
     /// </summary>
+    /// <summary>
+    /// 11-11（4号位《业务事实问题表工厂视角改版》件 §二）：新增两个可选参数——
+    /// `issueType`（问题类型等值，10 码封闭值域，空串=不过滤）；
+    /// `keyword`（模糊：BOM 源打 Detail/BOMNO/Parent+ChildMaterialCode 四列，MSC 源无单据号列只打 Detail/MaterialCode；
+    ///  CI 排序规则大小写不敏感；**各自源内先过滤**，不跨源取数）。
+    /// 同时修复：`factoryCode` 此前被接受但从未下推（列表与计数都丢参）⇒ 现在两路都生效；
+    /// `CountAllAsync` 与列表同参数集（total/列表分叉同型清扫）。
+    /// </summary>
     [HttpGet]
     public async Task<ApiResponse<PageResult<BusinessFactIssueDto>>> QueryAll(
         [FromQuery] string? source = null,
@@ -64,6 +72,8 @@ public class BusinessFactIssueController : ControllerBase
         [FromQuery] string? factoryCode = null,
         [FromQuery] string? severity = null,
         [FromQuery] string? reviewStatus = null,
+        [FromQuery] string? issueType = null,
+        [FromQuery] string? keyword = null,
         [FromQuery] int pageIndex = 1,
         [FromQuery] int pageSize = 20,
         CancellationToken cancellationToken = default)
@@ -88,9 +98,10 @@ public class BusinessFactIssueController : ControllerBase
             var skip = (pageIndex - 1) * pageSize;
             var items = await _service.QueryAllAsync(
                 source, materialCode, factoryCode, severity, reviewStatus,
-                skip, pageSize, cancellationToken, allowedFactories);
+                issueType, keyword, skip, pageSize, cancellationToken, allowedFactories);
             var total = await _service.CountAllAsync(
-                source, materialCode, severity, reviewStatus, cancellationToken, allowedFactories);
+                source, materialCode, factoryCode, severity, reviewStatus,
+                issueType, keyword, cancellationToken, allowedFactories);
 
             return ApiResponse<PageResult<BusinessFactIssueDto>>.Success(new PageResult<BusinessFactIssueDto>
             {

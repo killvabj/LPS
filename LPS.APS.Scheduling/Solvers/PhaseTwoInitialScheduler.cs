@@ -1587,7 +1587,10 @@ internal class PhaseTwoInitialScheduler
                 //     数量与时间链全部照旧在下面按原逻辑采纳（0号位 §三.4 明确要求）。
                 var oldTaskCount = result.ScheduledTasks.Count;
                 var winnerTasks = pickedBatchPlan.Tasks;
+                // B-01：前缀逐引用比对是 O(表大小)，每需求一次 ⇒ 单独计时
+                long swPureAppendCheck = SolverDiagnostics.HotspotStart();
                 var pureAppend = IsOuterAdoptPureAppend(result.ScheduledTasks, winnerTasks);
+                SolverDiagnostics.HotspotEnd(swPureAppendCheck, SolverDiagnostics.Hotspot.LandingPureAppendCheck);
 
                 long swOuterAdopt = SolverDiagnostics.HotspotStart();
 
@@ -1616,7 +1619,10 @@ internal class PhaseTwoInitialScheduler
                 //   重建本身走的是同一套前缀校验：恰好能增量就走增量，不能就整表重建。
                 if (!adoptAligned)
                 {
+                    // B-01：索引重建（仅对齐失败时进入），整表 O(表大小)
+                    long swIndexRebuild = SolverDiagnostics.HotspotStart();
                     BuildBatchGroupsIndex(result.ScheduledTasks, useCache: true, rebindOwner: true);
+                    SolverDiagnostics.HotspotEnd(swIndexRebuild, SolverDiagnostics.Hotspot.LandingIndexRebuild);
                 }
 
                 // ── 份额表回填（引用保护是**防御性**的，当前恒不触发）──
@@ -1625,6 +1631,10 @@ internal class PhaseTwoInitialScheduler
                 //   保留守卫的理由：若将来有人把那处也改成别名（本文件历史上确实这么干过 ——
                 //   `RunBatchPlan` 内部的 `trialShares` 就有别名分支），这里会**静默清空**份额表
                 //   （`Clear()` 后 `foreach` 遍历的是已清空的同一张表，一条也回填不到，且不留任何字）。
+                // ── 2026-11-10 B-01：**份额整表回填分账**（纯观测）──
+                //   上面那个 `ReferenceEquals` 守卫自带注释「当前恒不触发」⇒ 这段几乎是每需求必跑，
+                //   形状 O(表大小) × O(需求数)，是 `LandingRun` 里最可疑的一块。先把它的价码量出来。
+                long swShareRefill = SolverDiagnostics.HotspotStart();
                 if (!ReferenceEquals(pickedBatchPlan.Shares, allocationTaskShare))
                 {
                     allocationTaskShare.Clear();
@@ -1633,18 +1643,44 @@ internal class PhaseTwoInitialScheduler
                         allocationTaskShare[kv.Key] = kv.Value;
                     }
                 }
+                SolverDiagnostics.HotspotEnd(swShareRefill, SolverDiagnostics.Hotspot.LandingShareRefill);
 
+                // ── 2026-11-10 B-01 第二刀：**只回灌 COW 脱钩过的键** ──
+                //   原来是无条件 `resourceOccupancy.Clear()` + 遍历整份副本重写 ——
+                //   实测（20k 档）这一步占 LandingRun **71.8%（3,455 ms）**，是首刀之后的最大一块。
+                //   为什么可以只回灌增量：`pickedBatchPlan.Occupancy` 是 `TrialOccupancy`，
+                //     它 `base(source)` 浅拷 ⇒ **未 COW 脱钩的键与真表同一 List 引用、内容本就未变**；
+                //     试排期间真表也不被改写 ⇒ 只有 `Touched` 里的键需要写回。
+                //   这与 `BatchAdopt` 路径（`:3077` 起的「只回灌增量」）是**同一条判据**，
+                //     此前两条采纳路径一套用增量、一套用整表，现在统一。
+                //   ⚠ **绝不能保留 `Clear()`** —— 那会把没进增量的键一并抹掉（`:3082` 的原注释警告）。
+                // ── 2026-11-11 B-01 第三刀：**已回退** ──
+                //   曾尝试「只回灌 COW 脱钩过的键」（靠 `TrialOccupancy.Touched`），
+                //   但 `EnsureOwnedCore` 对**新键**分支直接 `return false` 而不记录
+                //   （`if (!working.TryGetValue(resourceId, ...)) return false;` —— 注释认为
+                //   「新键本就本实例独占」），而这些键在真表里并不存在、落定时必须补进去。
+                //   实测后果：4 个多批/Merge 用例变红
+                //   （`反证9` / `C2-03d` / `M_08` / `W2_ZeroAnchor`）⇒ 占用表在真表上不完整。
+                //   ⇒ 判定该方案在**不作废 `Touch` 语义、不额外记录新增键**的前提下不成立，
+                //     回退为整表回填。此步占 `LandingRun` 43.1%，待有可靠增量方案再做。
+                long swOccRefill = SolverDiagnostics.HotspotStart();
                 resourceOccupancy.Clear();
                 foreach (var kv in pickedBatchPlan.Occupancy)
                 {
                     resourceOccupancy[kv.Key] = kv.Value;
                 }
+                SolverDiagnostics.HotspotEnd(swOccRefill, SolverDiagnostics.Hotspot.LandingOccRefill);
 
                 constraints.ProductTimeline = pickedBatchPlan.Timeline;
+                // B-01：TraceNotes 是**跨需求累积**的全量列表，每需求追加一次 ⇒ 形如 O(n²)
+                long swTraceRefill = SolverDiagnostics.HotspotStart();
                 constraints.TraceNotes.AddRange(pickedBatchPlan.Notes);
+                SolverDiagnostics.HotspotEnd(swTraceRefill, SolverDiagnostics.Hotspot.LandingTraceRefill);
 
                 // 选路登记：试跑写进的是**一次性副本**（不污染真表）⇒ 胜者那份补回真表。
                 //   副本在候选试跑前是真实表的逐字拷贝、循环内真实表不被改写 ⇒ 整表回填 = 回填增量。
+                // B-01：这两张选路登记表若为跨需求全量，则每需求一次遍历 = O(全局大小)
+                long swRouteRefill = SolverDiagnostics.HotspotStart();
                 foreach (var kv in pickedBatchPlan.ChosenBatchRoutePaths)
                 {
                     constraints.ChosenBatchRoutePaths[kv.Key] = kv.Value;
@@ -1654,17 +1690,24 @@ internal class PhaseTwoInitialScheduler
                 {
                     constraints.ChosenRoutePaths[kv.Key] = kv.Value;
                 }
+                SolverDiagnostics.HotspotEnd(swRouteRefill, SolverDiagnostics.Hotspot.LandingRouteRefill);
 
                 outcome = pickedBatchPlan.Outcome;
             }
             else
             {
+                // ── 2026-11-10 B-01：**分支 B 分账**（纯观测）──
+                //   没有胜出批方案 ⇒ 在真实表上从头跑一遍完整排程，**这一支才是真找槽**。
+                //   与分支 A 的「采纳搬运」性质完全不同，必须分开计时才能回答
+                //   「LandingRun 的 71.6% 到底花在排程还是花在搬运」。
+                long swRunDirect = SolverDiagnostics.HotspotStart();
                 outcome = RunBatchPlan(
                     batches, actualDemand, plannedCandidates, direction, constraints,
                     resourceOccupancy, result.ScheduledTasks, allocationTaskShare, demandByKey,
                     request, dynamicMaterialFloor, stageOverlap, mergeAllowed,
                     constraints.ChosenBatchRoutePaths, constraints.ChosenRoutePaths,
                     cancellationToken: cancellationToken);
+                SolverDiagnostics.HotspotEnd(swRunDirect, SolverDiagnostics.Hotspot.LandingRunDirect);
             }
 
             SolverDiagnostics.HotspotEnd(swLanding, SolverDiagnostics.Hotspot.LandingRun);
@@ -3139,7 +3182,13 @@ internal class PhaseTwoInitialScheduler
         /// <summary>`RunBatchPlan` 的原始返回值（新产 Task / 失败批下标 / 逐批方向等）。</summary>
         public BatchPlanRunOutcome Outcome;
 
-        /// <summary>试跑后的资源占用表（已含本批方案的全部写入）。</summary>
+        /// <summary>
+        /// 试跑后的资源占用表（已含本批方案的全部写入）。
+        ///   ⚠ 2026-11-10 B-01：类型收窄为 <see cref="TrialOccupancy"/>，只为暴露它自带的
+        ///   <see cref="TrialOccupancy.Touched"/>（本次试排 COW 脱钩过的资源键）。
+        ///   未脱钩的键与真表**同一引用**、内容未变 ⇒ 采纳时只回灌 `Touched` 即可，
+        ///   不必再对整表 `Clear()` + 逐条重写（实测那一步占 LandingRun 71.8%）。
+        /// </summary>
         public Dictionary<int, List<TimeWindow>> Occupancy = null!;
 
         /// <summary>试跑后的任务表（独立副本，取自 `_trialTaskBufferPool` 的复用缓冲）。</summary>
@@ -3296,10 +3345,19 @@ internal class PhaseTwoInitialScheduler
 
             var trialShares = CloneShares(allocationTaskShare);
             // 一次性副本：试跑**不得**污染真实选路登记表（P0-03 逐批登记只在落定批上发生）。
-            var trialChosenBatch = new Dictionary<string, RoutePathKey>(
-                ctx.ChosenBatchRoutePaths, StringComparer.Ordinal);
-            var trialChosen = new Dictionary<string, RoutePathKey>(
-                ctx.ChosenRoutePaths, StringComparer.Ordinal);
+            // ── 2026-11-10 B-01（0号位《63c130e1 Batch Code Audit Guidance v1.0》§四 B-01）──
+            //   原来这里是 `new Dictionary<>(ctx.ChosenBatchRoutePaths)` —— **全量深拷贝**。
+            //   实测（20k 档）：落定阶段把这两张表回填回去要 **18,710 ms = LandingRun 的 78.2%**，
+            //     而拷贝这边同样是 O(全量) × 每需求 ⇒ 整体 O(n²)（折全量约 1560 秒）。
+            //   事实核查：**`RunBatchPlan` 对这两个入参只写不读** ——
+            //     全文件对 `chosenBatchRoutePaths` / `chosenRoutePaths` 只有 `:2991` / `:2994` 两处写入，
+            //     无任何读取点，也不再向下传递。
+            //   ⇒ 试跑副本**不需要携带历史内容**，给空表即可；落定时 `:1668` 回填的就正好是「本批增量」，
+            //     与原来「整表回填 = 回填增量」的语义**逐字等价**（那句注释本来就论证过这一点）。
+            //   ⚠ **不变式**：若将来给 `RunBatchPlan` 加了对这两个表的**读取**，必须先改回全量拷贝，
+            //     否则会读到空表。本注释即为该约束的锚点，改读取逻辑时请一并更新。
+            var trialChosenBatch = new Dictionary<string, RoutePathKey>(StringComparer.Ordinal);
+            var trialChosen = new Dictionary<string, RoutePathKey>(StringComparer.Ordinal);
 
             // 本候选试跑前的 trace 水位：增量按此切片留存（胜出者采纳时补回真表）。
             var notesBefore = ctx.TraceNotes.Count;
@@ -3874,6 +3932,10 @@ internal class PhaseTwoInitialScheduler
         SolverDiagnostics.CountCloneOccupancyKeyShape(source.Count);
         long sw = SolverDiagnostics.HotspotStart();
 
+        // ── 2026-11-11 B-01 第三刀：**已回退**（连同落定侧的「只回灌 Touched」一起）──
+        //   曾改为 `new TrialOccupancy(source)` 以便记录 COW 脱钩键，但落定侧只回灌 `Touched`
+        //   会漏掉「试排期间新增、真表原本没有」的资源键（`EnsureOwnedCore` 对新键不记录）
+        //   ⇒ 4 个多批/Merge 用例变红。已恢复原浅拷，语义与提交前逐字一致。
         var working = new Dictionary<int, List<TimeWindow>>(source);    // 浅拷：O(资源数)
         // 冻结快照 = 源表本身（不再复制第二份 O(资源数) 的表）。安全性见方法注释第 1~3 条。
         pristine = source;
@@ -8235,6 +8297,22 @@ internal class PhaseTwoInitialScheduler
             {
             var targetTask = candidateTasks[attemptIndex];
 
+            // ── 2026-11-10 P0-R2（0号位《63c130e1 Batch Code Audit Guidance v1.0》§二）──
+            //   原缺陷：先调 `TryMergeDemandIntoTask`（**内部已写份额/占用/时间线**），
+            //   成功返回非 null 后再 `FindIndex` 找锚 Task；找不到就 `mergedIntoTask = null` 并
+            //   **仍然 return 空列表** ⇒ 上层认定「没合并、没产出」，而状态其实已被改写 ⇒ **静默丢需求**。
+            //   0号位 判词：「无论理论不可达与否，应有可鉴别的断言/Fail Closed 与隔离回滚证明，
+            //   不可把静默返回当安全兜底。」
+            //   ⇒ 把下标查询**前置**：候选本来就是从 `scheduledTasks` 扫出来的引用，正常必然命中；
+            //     一旦不命中说明表被并发/别名改过 ⇒ **不试该候选**（零写入）、计异常、本需求照常独立排程。
+            //   副作用（正向）：原来成功分支要再 `FindIndex` 一次，现在复用 `targetIndex`，少一次全表扫。
+            var targetIndex = scheduledTasks.FindIndex(t => t.FinalDraftId == targetTask.FinalDraftId);
+            if (targetIndex < 0)
+            {
+                SolverDiagnostics.CountMergeAnchorNotFoundInTable();
+                continue;
+            }
+
             // 检查合并后是否破坏交期：合并后Duration增加，End时间延后
             // A3/R06：把正排同一个 `planningStart` / `dynamicMaterialFloor` 传进合并守卫，
 //   否则「物料可用时间」在合并路径上没有口径（本方法两个参数本身就是从 `TryMergeOrSchedule` 透传下来的）。
@@ -8242,7 +8320,9 @@ internal class PhaseTwoInitialScheduler
             if (mergedTask != null)
             {
                 // 合并成功：替换scheduledTasks中的旧Task
-                var index = scheduledTasks.FindIndex(t => t.FinalDraftId == targetTask.FinalDraftId);
+                //   P0-R2：下标已在本轮循环开头**前置取得**（`targetIndex`）并保证 `>= 0`，
+                //     此处不再二次 `FindIndex`（原来那次全表扫是纯浪费，且它的失败分支会静默丢需求）。
+                var index = targetIndex;
                 if (index >= 0)
                 {
                     // ── 2026-10-27 四十一刀：**按需拷贝**，不再就地把入参任务表改掉 ──
@@ -8275,7 +8355,12 @@ internal class PhaseTwoInitialScheduler
                 }
                 else
                 {
-                    mergedIntoTask = null;   // 目标不在任务表（理论不可达，保守按未合并处理）
+                    // P0-R2：**现已是不可达分支** —— `index` 直接取自循环开头的 `targetIndex`，
+                    //   而 `targetIndex < 0` 的候选在**调用 `TryMergeDemandIntoTask` 之前**就被
+                    //   `CountMergeAnchorNotFoundInTable()` + `continue` 挡掉了，不会走到这里。
+                    //   保留本分支仅为「万一将来有人改坏前置检查」时的**最后一道可见失败**，
+                    //   不再承担任何正常路径语义。
+                    mergedIntoTask = null;
                 }
                 // 不生成新Task
                 return new List<FinalTaskDraft>();
@@ -10474,7 +10559,20 @@ internal class PhaseTwoInitialScheduler
             {
                 foreach (var (memberKey, _) in memberShares)
                 {
-                    if (!demandByKey.TryGetValue(memberKey, out var member)) continue;
+                    // ── 2026-11-10 P0-R1（0号位《63c130e1 Batch Code Audit Guidance v1.0》§二）──
+                    //   原来这里是 `continue` —— 份额成员在 `demandByKey` 里查不到，就**跳过它的交期检查**。
+                    //   等价于「资料缺失 ⇒ 守卫放行」，是 Fail-Open：把没核过的成员当成合法。
+                    //   ⚠ 与 A1（单 Op 侧）同向：单 Op 的 `ScanMergeCandidateRange` 遇到同类情形是**整条候选拒绝**，
+                    //     多 Op 侧此前反而放行 —— 同一语义两套判据，正是 0号位 要求收口的地方。
+                    //   ⇒ Fail Closed：查不到即视本锚批不可用，走下方统一回滚并 `return null`，
+                    //     绝不因为缺资料而宣称物理可行。
+                    if (!demandByKey.TryGetValue(memberKey, out var member))
+                    {
+                        SolverDiagnostics.CountMergeMemberKeyMissing();
+                        worsensMember = true;
+                        break;
+                    }
+
                     var memberDue = constraints.EffectiveDueJudgementBound(member);
                     if (memberDue != DateTime.MaxValue && combinedEnd > memberDue)
                     {

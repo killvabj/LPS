@@ -27,6 +27,8 @@ public class BusinessFactIssueService
         string? factoryCode = null,
         string? severity = null,
         string? reviewStatus = null,
+        string? issueType = null,
+        string? keyword = null,
         int skip = 0,
         int take = 100,
         CancellationToken ct = default,
@@ -38,21 +40,27 @@ public class BusinessFactIssueService
 
         return await _repository.QueryAllAsync(
             source, materialCode, factoryCode, severity, reviewStatus,
-            skip, take, ct, allowedFactories);
+            issueType, keyword, skip, take, ct, allowedFactories);
     }
 
     /// <summary>
-    /// 聚合命中总数（分页前，供 PageResult.Total）
+    /// 聚合命中总数（分页前，供 PageResult.Total）。
+    /// 11-11（4号位件）：**与 QueryAllAsync 同参数集**——旧签名缺 factoryCode/issueType/keyword，
+    /// 带这三个筛选时 total 会大于列表实际口径（total/列表分叉缺陷同型清扫）。
     /// </summary>
     public async Task<int> CountAllAsync(
         string? source = null,
         string? materialCode = null,
+        string? factoryCode = null,
         string? severity = null,
         string? reviewStatus = null,
+        string? issueType = null,
+        string? keyword = null,
         CancellationToken ct = default,
         IReadOnlySet<string>? allowedFactories = null)
     {
         return await _repository.CountAllAsync(
-            source, materialCode, severity, reviewStatus, ct, allowedFactories);
+            source, materialCode, factoryCode, severity, reviewStatus,
+            issueType, keyword, ct, allowedFactories);
     }
 }

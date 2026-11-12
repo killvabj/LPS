@@ -208,3 +208,12 @@ D:\WorkSpace_LocalLib\Windsurf WorkSpace\LPS_SVN\LPS.APS.Web\obj\Debug\net8.0\LP
 D:\WorkSpace_LocalLib\Windsurf WorkSpace\LPS_SVN\LPS.APS.Web\obj\Debug\net8.0\LPS.APS.Web.genruntimeconfig.cache
 D:\WorkSpace_LocalLib\Windsurf WorkSpace\LPS_SVN\LPS.APS.Web\obj\Debug\net8.0\ref\LPS.APS.Web.dll
 D:\WorkSpace_LocalLib\Windsurf WorkSpace\LPS_SVN\LPS.APS.Web\obj\Debug\net8.0\staticwebassets.upToDateCheck.txt
+D:\WorkSpace_LocalLib\Windsurf WorkSpace\LPS_SVN\LPS.APS.Web\bin\Debug\net8.0\LPS.APS.Web.staticwebassets.runtime.json
+D:\WorkSpace_LocalLib\Windsurf WorkSpace\LPS_SVN\LPS.APS.Web\bin\Debug\net8.0\LPS.APS.Web.runtimeconfig.dev.json
+D:\WorkSpace_LocalLib\Windsurf WorkSpace\LPS_SVN\LPS.APS.Web\obj\Debug\net8.0\HotReload\Microsoft.NET.Sdk.BlazorWeb.HotReload.lib.module.js
+D:\WorkSpace_LocalLib\Windsurf WorkSpace\LPS_SVN\LPS.APS.Web\obj\Debug\net8.0\HotReload\Microsoft.NET.Sdk.BlazorWeb.HotReload.BrowserTools.js
+D:\WorkSpace_LocalLib\Windsurf WorkSpace\LPS_SVN\LPS.APS.Web\obj\Debug\net8.0\HotReload\Microsoft.NET.Sdk.BlazorWeb.HotReload.BrowserTools.Config.js
+D:\WorkSpace_LocalLib\Windsurf WorkSpace\LPS_SVN\LPS.APS.Web\obj\Debug\net8.0\HotReload\browser-tools-key.public.json
+D:\WorkSpace_LocalLib\Windsurf WorkSpace\LPS_SVN\LPS.APS.Web\obj\Debug\net8.0\HotReload\browser-tools-key.private.json
+D:\WorkSpace_LocalLib\Windsurf WorkSpace\LPS_SVN\LPS.APS.Web\obj\Debug\net8.0\jsmodules\jsmodules.build.manifest.json
+D:\WorkSpace_LocalLib\Windsurf WorkSpace\LPS_SVN\LPS.APS.Web\obj\Debug\net8.0\scopedcss\scopedcss.cache

@@ -121,7 +121,13 @@ public class BOMResultPullService : IBOMResultPullService
                 Quantity,
                 Level,
                 ChildRequiredStageCode,
-                ChildRequiredFactory
+                ChildRequiredFactory,
+                -- 2026-11-10：`ChildSourceHintCode`(0-11) 是 5号位 **推要求厂的判据本身**
+                --   （R17 `ProduceToFactoryMap` → `ChildRequiredFactory`）。此前只搬输出、不搬依据，
+                --   导致该列空值时无从复核「是设计还是缺数据」。
+                --   ⚠ 红线：只作判据留痕（对账/诊断），**不得**进任何 make-or-buy 分支
+                --   （0号位《BOM 唯一判据》：自制/外购只看本订单有效 BOM 有无下阶）。
+                ChildSourceHintCode
             FROM MES_APS_BOM_Workset
             WHERE BatchNo = @BatchNo
             ORDER BY Level, ParentMaterialCode";
@@ -135,7 +141,8 @@ public class BOMResultPullService : IBOMResultPullService
             ["Quantity"] = "Quantity",
             ["Level"] = "Level",
             ["ChildRequiredStageCode"] = "ChildRequiredStageCode",
-            ["ChildRequiredFactory"] = "ChildRequiredFactory"
+            ["ChildRequiredFactory"] = "ChildRequiredFactory",
+            ["ChildSourceHintCode"] = "ChildSourceHintCode"
         };
 
         try
@@ -285,7 +292,7 @@ public class BOMResultPullService : IBOMResultPullService
 
         // 源表列：ODS `MES_APS_BOM_Workset_CrossFactoryEdge`
         //   （Id/BatchNo/WorksetId/BOMNO/ParentMaterialCode/ChildMaterialCode/FromStageCode/
-        //     FromFactoryCode/ToStageCode/ToProcessCode/ToFactoryCode/CreatedAt）
+        //     FromFactoryCode/ToStageCode/ToProcessCode/ToFactoryCode/**EdgeRelationType**/CreatedAt）
         // 目标表 `CreatedAt` 取 APS 落库时刻（列 DEFAULT GETDATE()），故**不映射**，以便日后查「这批是什么时候缓存进来的」。
         const string sourceSql = @"
             SELECT BatchNo,
@@ -297,7 +304,11 @@ public class BOMResultPullService : IBOMResultPullService
                    FromFactoryCode,
                    ToStageCode,
                    ToProcessCode,
-                   ToFactoryCode
+                   ToFactoryCode,
+                   -- 2026-11-10：5号位 契约扩展，同一张表承载两类边
+                   --   （STAGE_INTERNAL=旧语义 637 / PARENT_CHILD=父子跳变 569,541）。
+                   --   必须搬 —— 否则装载侧无从按类型过滤，在途 Stage 定位会被打成歧义。
+                   EdgeRelationType
             FROM MES_APS_BOM_Workset_CrossFactoryEdge
             WHERE BatchNo = @BatchNo";
 
@@ -312,7 +323,8 @@ public class BOMResultPullService : IBOMResultPullService
             ["FromFactoryCode"] = "FromFactoryCode",
             ["ToStageCode"] = "ToStageCode",
             ["ToProcessCode"] = "ToProcessCode",
-            ["ToFactoryCode"] = "ToFactoryCode"
+            ["ToFactoryCode"] = "ToFactoryCode",
+            ["EdgeRelationType"] = "EdgeRelationType"
         };
 
         var sw = System.Diagnostics.Stopwatch.StartNew();

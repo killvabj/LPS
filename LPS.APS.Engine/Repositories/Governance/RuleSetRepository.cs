@@ -147,6 +147,85 @@ public class RuleSetRepository : IRuleSetRepository
         return results.ToList();
     }
 
+    // ==================== 主子表联查·一版一行（2026-11-11，路线 A：规则集维护页新列表源） ====================
+
+    /// <inheritdoc />
+    public async Task<IReadOnlyList<RuleSetVersionRowDto>> GetVersionsWithMainAsync(
+        bool? activeOnly = null,
+        string? keyword = null,
+        string? status = null,
+        string? name = null,
+        int? skip = null,
+        int? take = null,
+        CancellationToken ct = default)
+    {
+        // 路线 A（缺陷 2026-11-11）：规则集列表改「一主表 + 一版本 = 一行」。
+        // 每主表 N 个 RuleSetVersion ⇒ N 行，各版本状态独立可读，不再像旧列表
+        // （GetListWithVersionAsync OUTER APPLY TOP1）那样把 Status 取「最新创建版本」、
+        // 被同族新草稿覆盖生效 PUBLISHED。主表过滤/分页与 GetListAsync 同语义。
+        var sql = new StringBuilder(@"
+            SELECT
+                r.[Id]           AS RuleSetId,
+                r.[RuleSetCode], r.[RuleSetName], r.[Description], r.[IsActive],
+                r.[CreatedAt]    AS RuleSetCreatedAt,
+                v.[Id]           AS VersionId,
+                v.[VersionCode], v.[Status],
+                v.[EffectiveFrom], v.[EffectiveTo],
+                v.[PublishedAt],  v.[PublishedBy],
+                v.[CreatedAt]
+            FROM [dbo].[RuleSet] r
+            INNER JOIN [dbo].[RuleSetVersion] v ON v.[RuleSetId] = r.[Id]
+            WHERE 1 = 1");
+
+        var parameters = new DynamicParameters();
+        if (activeOnly.HasValue)
+        {
+            sql.Append(" AND r.[IsActive] = @IsActive");
+            parameters.Add("IsActive", activeOnly.Value);
+        }
+
+        if (!string.IsNullOrWhiteSpace(keyword))
+        {
+            sql.Append(" AND (r.[RuleSetCode] LIKE @Keyword OR r.[RuleSetName] LIKE @Keyword)");
+            parameters.Add("Keyword", $"%{keyword.Trim()}%");
+        }
+
+        if (!string.IsNullOrWhiteSpace(status))
+        {
+            // 版本状态精确匹配（DRAFT/PUBLISHED 等；与 GET /rule-sets 的 Status 同词表）
+            sql.Append(" AND v.[Status] = @Status");
+            parameters.Add("Status", status.Trim());
+        }
+
+        if (!string.IsNullOrWhiteSpace(name))
+        {
+            // 规则集名称模糊匹配
+            sql.Append(" AND r.[RuleSetName] LIKE @Name");
+            parameters.Add("Name", $"%{name.Trim()}%");
+        }
+
+        // 每主表内按版本 Id ASC 稳定排序（历史在前、最新在后），保证行序确定。
+        sql.Append(@"
+            ORDER BY r.[Id] DESC, v.[Id] ASC");
+
+        if (skip.HasValue)
+        {
+            sql.Append(" OFFSET @Skip ROWS");
+            parameters.Add("Skip", skip.Value);
+        }
+
+        if (take.HasValue)
+        {
+            sql.Append(" FETCH NEXT @Take ROWS ONLY");
+            parameters.Add("Take", take.Value);
+        }
+
+        var results = await _connectionManager.QueryAsync<RuleSetVersionRowDto>(
+            sql.ToString(), parameters, db: DatabaseId.APS);
+
+        return results.ToList();
+    }
+
     // ==================== 主表写路径（2026-10-22：补齐 4号位 缺口，3号位 治理） ====================
 
     public async Task<RuleSet?> GetByIdAsync(long id, CancellationToken ct = default)

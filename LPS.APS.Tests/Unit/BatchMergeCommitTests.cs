@@ -356,6 +356,13 @@ public sealed class BatchMergeCommitTests
         var demandByKey = new Dictionary<string, LogicalProductionDemand>(StringComparer.Ordinal)
         {
             ["A"] = Demand("A", 30m),   // 锚点需求（可被 CloneDemandWithBatchQty 克隆）
+            // ── 2026-11-10 P0-R1 补齐 ──
+            //   上面 `shares` 里每道 Task 都有 `A30 + B20`，但原夹具只建了 "A"。
+            //   以前 `TryMergeDemandIntoStageBatch` 对查不到的份额成员是 `continue`（Fail-Open）
+            //   ⇒ 本用例能在「B 的来源无从追溯」的情况下照样跑绿 —— 正是 0号位 P0-R1 指出的那种放行。
+            //   改为 Fail Closed 后，缺 "B" 会让整锚被拒（返回 null），用例红得对。
+            //   ⇒ 补齐 "B"，让夹具反映真实的「份额成员一定来自输入需求」这一前提。
+            ["B"] = Demand("B", 20m),
         };
 
         // **一次调用**把 C10 并入整批（不是逐道调三次）
@@ -474,5 +481,73 @@ public sealed class BatchMergeCommitTests
         Assert.Single(d1);
         Assert.Equal(5m, d1.Sum(s => s.ShareQty));
         Assert.Equal(5m, shares.Values.SelectMany(v => v).Sum(s => s.ShareQty));
+    }
+
+    /// <summary>
+    /// 2026-11-10 P0-R1 反证（0号位《63c130e1 Batch Code Audit Guidance v1.0》§二）：
+    /// **份额里的成员键在 <c>demandByKey</c> 里查不到 ⇒ 整锚拒绝，且状态零变化。**
+    ///
+    /// <para>【为什么要这条】原实现对查不到的成员是 <c>continue</c>（Fail-Open）——
+    /// 等于「资料缺失 ⇒ 交期守卫放行 ⇒ 仍宣称物理可行」。0号位 明令收口。</para>
+    ///
+    /// <para>【鉴别力】把生产代码里那处 Fail Closed 改回 <c>continue</c>，本用例**立刻变红**。</para>
+    ///
+    /// <para>【不碰数据库】纯内存夹具，零 DB。</para>
+    /// </summary>
+    [Fact(DisplayName = "P0-R1 · 份额成员缺 demandByKey 键 ⇒ 整锚拒绝（Fail Closed）")]
+    public void StageMerge_MemberKeyMissing_MustRejectAnchor()
+    {
+        var constraints = ThreeOpConstraints();
+        var targetBatch = AnchorStageBatch();
+
+        var occupancy = new Dictionary<int, List<TimeWindow>>
+        {
+            [ResourceId] = targetBatch.Select(t => new TimeWindow(t.PlannedStartTime, t.PlannedEndTime)).ToList(),
+        };
+        var scheduled = new List<FinalTaskDraft>(targetBatch);
+
+        // 每道 Task 上 A30 + B20 —— 与 `StageMerge_ThreeOperations_CountsPhysicalOnce` 同形
+        var shares = new Dictionary<string, List<(string DemandKey, decimal ShareQty)>>(StringComparer.Ordinal);
+        foreach (var t in targetBatch)
+        {
+            shares[t.FinalDraftId] = new List<(string, decimal)> { ("A", 30m), ("B", 20m) };
+        }
+
+        // ⚠ 故意**只建 A、不建 B** —— 这就是「份额里有该成员、但其来源无从追溯」的现场
+        var demandByKey = new Dictionary<string, LogicalProductionDemand>(StringComparer.Ordinal)
+        {
+            ["A"] = Demand("A", 30m),
+        };
+
+        string TaskSig() => string.Join("|", scheduled.Select(t => t.FinalDraftId + ":" + t.PlannedProcessQty));
+        string ShareSig() => string.Join("|", shares.OrderBy(k => k.Key, StringComparer.Ordinal)
+            .Select(k => k.Key + "=" + string.Join(";", k.Value.Select(x => x.DemandKey + ":" + x.ShareQty))));
+        var taskBefore = TaskSig();
+        var shareBefore = ShareSig();
+
+        using var scope = SolverDiagnostics.BeginScope();
+        var counters = scope.Counters;
+
+        var merged = Scheduler.TryMergeDemandIntoStageBatch(
+            Demand("C", 10m), ThreeOps(), ThreeOpGraph(), "FORWARD", targetBatch, constraints,
+            occupancy, scheduled, shares, demandByKey,
+            T0, T0.AddDays(30), T0, new StageOverlapParams(), null,
+            out var combinedTasks);
+
+        // ── ① 必须拒绝（Fail Closed）──
+        Assert.True(merged is null,
+            "份额成员 B 在 demandByKey 里查不到，整锚**应当**被拒；"
+            + "返回非 null 说明退回了 Fail-Open —— 拿没核过的成员当物理可行。");
+
+        // ── ② 零产出 ──
+        Assert.Empty(combinedTasks);
+
+        // ── ③ 五项状态零变化（这里能直接观察的是任务表与份额表）──
+        Assert.Equal(taskBefore, TaskSig());
+        Assert.Equal(shareBefore, ShareSig());
+
+        // ── ④ 异常键必须被计数到，不能悄悄吞掉 ──
+        Assert.True(counters.MergeMemberKeyMissing > 0,
+            $"缺键应当被登记，实得 {counters.MergeMemberKeyMissing} 次。");
     }
 }

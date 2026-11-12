@@ -144,6 +144,82 @@ public class ParameterSetRepository : IParameterSetRepository
         return results.ToList();
     }
 
+    // ==================== 主子表联查·一版一行（2026-11-11，路线 A：参数集维护页新列表源） ====================
+
+    /// <inheritdoc />
+    public async Task<IReadOnlyList<ParameterSetVersionRowDto>> GetVersionsWithMainAsync(
+        bool? activeOnly = null,
+        string? keyword = null,
+        string? status = null,
+        string? name = null,
+        int? skip = null,
+        int? take = null,
+        CancellationToken ct = default)
+    {
+        // 路线 A（缺陷 2026-11-11）：参数集列表改「一主表 + 一版本 = 一行」。
+        // 每主表 N 个 ParameterSetVersion ⇒ N 行，各版本状态独立可读，不再像旧列表
+        // （GetListWithVersionAsync OUTER APPLY TOP1）那样把 Status 取「最新创建版本」、
+        // 被同族新草稿覆盖生效 PUBLISHED。主表过滤/分页与 GetListAsync 同语义。
+        var sql = new StringBuilder(@"
+            SELECT
+                p.[Id]           AS ParameterSetId,
+                p.[ParameterSetCode], p.[ParameterSetName], p.[Description], p.[IsActive],
+                p.[CreatedAt]    AS ParameterSetCreatedAt,
+                v.[Id]           AS VersionId,
+                v.[VersionCode], v.[Status], v.[IsDefault],
+                v.[EffectiveFrom], v.[EffectiveTo],
+                v.[PublishedAt],  v.[PublishedBy],
+                v.[CreatedAt]
+            FROM [dbo].[ParameterSet] p
+            INNER JOIN [dbo].[ParameterSetVersion] v ON v.[ParameterSetId] = p.[Id]
+            WHERE 1 = 1");
+
+        var parameters = new DynamicParameters();
+        if (activeOnly.HasValue)
+        {
+            sql.Append(" AND p.[IsActive] = @IsActive");
+            parameters.Add("IsActive", activeOnly.Value);
+        }
+
+        if (!string.IsNullOrWhiteSpace(keyword))
+        {
+            sql.Append(" AND (p.[ParameterSetCode] LIKE @Keyword OR p.[ParameterSetName] LIKE @Keyword)");
+            parameters.Add("Keyword", $"%{keyword.Trim()}%");
+        }
+
+        if (!string.IsNullOrWhiteSpace(status))
+        {
+            sql.Append(" AND v.[Status] = @Status");
+            parameters.Add("Status", status.Trim());
+        }
+
+        if (!string.IsNullOrWhiteSpace(name))
+        {
+            sql.Append(" AND p.[ParameterSetName] LIKE @Name");
+            parameters.Add("Name", $"%{name.Trim()}%");
+        }
+
+        sql.Append(@"
+            ORDER BY p.[Id] DESC, v.[Id] ASC");
+
+        if (skip.HasValue)
+        {
+            sql.Append(" OFFSET @Skip ROWS");
+            parameters.Add("Skip", skip.Value);
+        }
+
+        if (take.HasValue)
+        {
+            sql.Append(" FETCH NEXT @Take ROWS ONLY");
+            parameters.Add("Take", take.Value);
+        }
+
+        var results = await _connectionManager.QueryAsync<ParameterSetVersionRowDto>(
+            sql.ToString(), parameters, db: DatabaseId.APS);
+
+        return results.ToList();
+    }
+
     // ==================== 主表写路径（2026-10-25：补齐 4号位 缺口，3号位 治理） ====================
 
     public async Task<ParameterSet?> GetByIdAsync(long id, CancellationToken ct = default)

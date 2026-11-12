@@ -49,4 +49,11 @@ public class FieldDiff
 
     /// <summary>是否有变化</summary>
     public bool IsChanged { get; set; }
+
+    /// <summary>
+    /// 该字段对比过程的告警（纯展示文案，null=无告警）。
+    /// 用于 ⑦ 换型规则子块**业务键重复 fail-soft**：源/目标内部存在同键多条时，首条参与比较、其余剔除，
+    /// 本字段给出「有 N 条因业务键重复未参与比较」的大白话提示（478 缺陷纵深防御）。
+    /// </summary>
+    public string? Warning { get; set; }
 }

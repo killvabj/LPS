@@ -111,6 +111,13 @@ public class GovernanceVersionService : IGovernanceVersionService
         version.Status = GovernanceVersionStatus.Published;
         version.PublishedAt = DateTime.Now;
         version.PublishedBy = publishedBy;
+        // 生效窗新口径（0号位/PM 2026-11-11 裁定，推翻 10-11 乙裁「NULL 常开窗」）：
+        // 发布时 EffectiveFrom = 发布时间（版本进入生命周期打开时刻）；停用时写 EffectiveTo 见 Disable*。
+        // 仅 EffectiveFrom 为空才回填——不覆盖既有带窗历史版本（已发布内容不可原地改红线）。
+        if (version.EffectiveFrom is null)
+        {
+            version.EffectiveFrom = DateTime.Now;
+        }
 
         // P1-03：审计前置预检（跨库无 2PC）——审计库不可写则整操作失败、业务零变更。
         await _auditLogRepository.EnsureWritableAsync(ct);
@@ -171,6 +178,12 @@ public class GovernanceVersionService : IGovernanceVersionService
         version.Status = GovernanceVersionStatus.Published;
         version.PublishedAt = DateTime.Now;
         version.PublishedBy = publishedBy;
+        // 生效窗新口径（0号位/PM 2026-11-11 裁定，推翻 10-11 乙裁「NULL 常开窗」）：
+        // 发布时 EffectiveFrom = 发布时间；停用时写 EffectiveTo 见 Disable*。仅空才回填，不覆盖带窗历史版本。
+        if (version.EffectiveFrom is null)
+        {
+            version.EffectiveFrom = DateTime.Now;
+        }
 
         // P1-03：审计前置预检（跨库无 2PC）——审计库不可写则整操作失败、业务零变更。
         await _auditLogRepository.EnsureWritableAsync(ct);
@@ -329,6 +342,13 @@ public class GovernanceVersionService : IGovernanceVersionService
 
         var beforeStatus = version.Status;
         version.Status = GovernanceVersionStatus.Disabled;
+        // 生效窗新口径（0号位/PM 2026-11-11 裁定，推翻 10-11 乙裁「NULL 常开窗」）：
+        // 停用时 EffectiveTo = 停用时刻（版本生命周期关闭）；发布写 EffectiveFrom 见 Publish*。
+        // 仅 EffectiveTo 为空才回填——不覆盖既有带窗历史版本（已发布内容不可原地改红线）。
+        if (version.EffectiveTo is null)
+        {
+            version.EffectiveTo = DateTime.Now;
+        }
 
         // P1-03：审计前置预检（跨库无 2PC）——审计库不可写则整操作失败、业务零变更。
         await _auditLogRepository.EnsureWritableAsync(ct);
@@ -373,6 +393,13 @@ public class GovernanceVersionService : IGovernanceVersionService
 
         var beforeStatus = version.Status;
         version.Status = GovernanceVersionStatus.Disabled;
+        // 生效窗新口径（0号位/PM 2026-11-11 裁定，推翻 10-11 乙裁「NULL 常开窗」）：
+        // 停用时 EffectiveTo = 停用时刻（版本生命周期关闭）；发布写 EffectiveFrom 见 Publish*。
+        // 仅 EffectiveTo 为空才回填——不覆盖既有带窗历史版本（已发布内容不可原地改红线）。
+        if (version.EffectiveTo is null)
+        {
+            version.EffectiveTo = DateTime.Now;
+        }
 
         // P1-03：审计前置预检（跨库无 2PC）——审计库不可写则整操作失败、业务零变更。
         await _auditLogRepository.EnsureWritableAsync(ct);
@@ -416,6 +443,13 @@ public class GovernanceVersionService : IGovernanceVersionService
 
         var beforeStatus = version.Status;
         version.Status = GovernanceVersionStatus.Disabled;
+        // 生效窗新口径（0号位/PM 2026-11-11 裁定，推翻 10-11 乙裁「NULL 常开窗」）：
+        // 停用时 EffectiveTo = 停用时刻（版本生命周期关闭）；发布写 EffectiveFrom 见 Publish*。
+        // 仅 EffectiveTo 为空才回填——不覆盖既有带窗历史版本（已发布内容不可原地改红线）。
+        if (version.EffectiveTo is null)
+        {
+            version.EffectiveTo = DateTime.Now;
+        }
 
         await _strategyProfileVersionRepository.UpdateAsync(version, ct);
 
@@ -897,6 +931,12 @@ public class GovernanceVersionService : IGovernanceVersionService
             SetupTransitionRuleProjector.ExtractRules(sourceVersion.ContentSnapshotJson),
             SetupTransitionRuleProjector.ExtractRules(targetVersion.ContentSnapshotJson));
 
+        // 甲（2026-11-11）：⑦ 子块业务键重复 fail-soft —— 首条参与比较、其余剔除并显式计数回报，
+        // 不再 ToDictionary 抛异常 400；有重复时给前端一条可读告警，避免把退化键误当真实增删改。
+        var warning = diff.HasDuplicates
+            ? $"换型 ⑦ 子块存在业务键重复：源 {diff.DuplicateSourceCount} 条、目标 {diff.DuplicateTargetCount} 条，重复项已剔除，未参与本次比较。"
+            : null;
+
         return new FieldDiff
         {
             FieldName = fieldName,
@@ -904,6 +944,7 @@ public class GovernanceVersionService : IGovernanceVersionService
             SourceValue = sourceBlock,
             TargetValue = targetBlock,
             IsChanged = diff.IsChanged,
+            Warning = warning,
         };
     }
 
@@ -2061,6 +2102,12 @@ public class GovernanceVersionService : IGovernanceVersionService
         version.Status = GovernanceVersionStatus.Published;
         version.PublishedAt = DateTime.Now;
         version.PublishedBy = publishedBy;
+        // 生效窗新口径（0号位/PM 2026-11-11 裁定，推翻 10-11 乙裁「NULL 常开窗」）：
+        // 发布时 EffectiveFrom = 发布时间；停用时写 EffectiveTo 见 Disable*。仅空才回填，不覆盖带窗历史版本。
+        if (version.EffectiveFrom is null)
+        {
+            version.EffectiveFrom = DateTime.Now;
+        }
 
         await _strategyProfileVersionRepository.UpdateAsync(version, ct);
 
@@ -2300,6 +2347,11 @@ public class GovernanceVersionService : IGovernanceVersionService
         version.PublishedBy = existing.PublishedBy;
         version.ApprovedAt = existing.ApprovedAt;
         version.ApprovedBy = existing.ApprovedBy;
+        // 甲（2026-11-11，4号位 生效窗缺回填：PUT 读改写未回填 EffectiveFrom/EffectiveTo 会抹窗——仓储 UPDATE
+        // 照写两列，而前端提交体不含这两列 ⇒ 读改写回传 null ⇒ 库中已有窗口被抹成 NULL。回填 existing 防抹窗，
+        // 与 TaskSplitRuleConfigGovernanceService/StageLeadTimeParamGovernanceService 既有写法一致，纯缺陷修复）。
+        version.EffectiveFrom = existing.EffectiveFrom;
+        version.EffectiveTo = existing.EffectiveTo;
         // Q2（4号位 2026-10-15）：快照载体为内部可重放 JSON，generic Update 永不合法写它（内容经主题 JSON
         // 归一化或 SetupRuleService 独立写路径）。回填 existing 防止读改写回传 null 时 EnsureXxxNormalized
         // 重建快照丢弃独立子块（SetupTransitionRules 仅存于该列）；置于归一化之前使子块保留提取读到既有快照。
@@ -2394,6 +2446,9 @@ public class GovernanceVersionService : IGovernanceVersionService
         version.PublishedBy = existing.PublishedBy;
         version.ApprovedAt = existing.ApprovedAt;
         version.ApprovedBy = existing.ApprovedBy;
+        // 甲（2026-11-11，4号位 生效窗缺回填）：PUT 读改写回填 EffectiveFrom/EffectiveTo 防抹窗（同规则集族，纯缺陷修复）。
+        version.EffectiveFrom = existing.EffectiveFrom;
+        version.EffectiveTo = existing.EffectiveTo;
         // Q2（4号位 2026-10-15）：回填 existing，防止读改写回传 null 时 EnsureXxxNormalized 重建快照丢弃
         // BatchPolicy 子块（仅存于该列；参数集读路径 R2 已置空，此隐患当前即存在）。
         version.ContentSnapshotJson = existing.ContentSnapshotJson;
@@ -2582,6 +2637,10 @@ public class GovernanceVersionService : IGovernanceVersionService
         version.PublishedBy = existing.PublishedBy;
         version.ApprovedAt = existing.ApprovedAt;
         version.ApprovedBy = existing.ApprovedBy;
+        // 甲（2026-11-11，4号位 生效窗缺回填）：PUT 读改写回填 EffectiveFrom/EffectiveTo 防抹窗
+        //（策略包版本 UPDATE 亦照写两列；前端当前带这两列构建提交体，但回填保护防漏带/第三方调用抹窗）。
+        version.EffectiveFrom = existing.EffectiveFrom;
+        version.EffectiveTo = existing.EffectiveTo;
 
         var beforeVersionCode = existing.VersionCode;
 

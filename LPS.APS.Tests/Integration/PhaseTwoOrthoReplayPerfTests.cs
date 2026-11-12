@@ -105,7 +105,12 @@ public class PhaseTwoOrthoReplayPerfTests
     private sealed record Measurement(
         string Label, bool Success, string? Error, double WallSeconds, long Phase2Ms,
         long ScanCalls, long ScannedTasks, long Candidates, long SkippedNoPi,
-        long MergeAttempts, long PhysicalFeasible, long FinallyAdopted, int FinalTasks);
+        long MergeAttempts, long PhysicalFeasible, long FinallyAdopted, int FinalTasks,
+        // ── 2026-11-10 B-01：`LandingRun` 内部分账（纯观测）──
+        //   `Counters.HotspotMs(...)` 返回 `double`（内部是 ticks→ms 的浮点换算）
+        double LandingMs, double ShareRefillMs, double OccRefillMs,
+        double OuterAdoptMs, double RunDirectMs, double PureAppendCheckMs, double IndexRebuildMs, double TraceRefillMs,
+        double AdoptReconcileMs, double RouteRefillMs);
 
     private async Task<Measurement> RunAsync(string jsonPath, int limit, string fastPath, string guard, string label)
     {
@@ -156,10 +161,152 @@ public class PhaseTwoOrthoReplayPerfTests
                 c.MergeAttempts,
                 c.MergePhysicalFeasible,
                 c.MergeFinallyAdopted,
-                result?.FinalTasks?.Count ?? 0);
+                result?.FinalTasks?.Count ?? 0,
+                // B-01 分账：LandingRun 总量 vs 其中两张表的整表回填
+                c.HotspotMs(SolverDiagnostics.Hotspot.LandingRun),
+                c.HotspotMs(SolverDiagnostics.Hotspot.LandingShareRefill),
+                c.HotspotMs(SolverDiagnostics.Hotspot.LandingOccRefill),
+                c.HotspotMs(SolverDiagnostics.Hotspot.OuterAdopt),
+                c.HotspotMs(SolverDiagnostics.Hotspot.LandingRunDirect),
+                c.HotspotMs(SolverDiagnostics.Hotspot.LandingPureAppendCheck),
+                c.HotspotMs(SolverDiagnostics.Hotspot.LandingIndexRebuild),
+                c.HotspotMs(SolverDiagnostics.Hotspot.LandingTraceRefill),
+                c.HotspotMs(SolverDiagnostics.Hotspot.BatchGroupAdoptReconcile),
+                c.HotspotMs(SolverDiagnostics.Hotspot.LandingRouteRefill));
 
             _output.WriteLine($"[A6] {label} 结束：{DateTime.Now:HH:mm:ss}，墙钟 {m.WallSeconds:F1}s，"
                               + $"Success={m.Success}，FinalTask={m.FinalTasks}");
+
+            // ── 2026-11-10 B-01（0号位 §四 B-01）：把 LandingRun 这个 71.6% 的黑盒切开 ──
+            _output.WriteLine($"[B-01] {label} LandingRun 分账：");
+            _output.WriteLine($"        LandingRun 合计   = {m.LandingMs,10:F0} ms  （占 P2 {Pct(m.LandingMs, m.Phase2Ms)}）");
+            _output.WriteLine($"        ├ 份额整表回填   = {m.ShareRefillMs,10:F0} ms  （占 LandingRun {Pct(m.ShareRefillMs, m.LandingMs)}）");
+            _output.WriteLine($"        └ 占用整表回填   = {m.OccRefillMs,10:F0} ms  （占 LandingRun {Pct(m.OccRefillMs, m.LandingMs)}）");
+            var bothRefill = m.ShareRefillMs + m.OccRefillMs;
+            _output.WriteLine($"        两张表回填合计   = {bothRefill,10:F0} ms  （占 LandingRun {Pct(bothRefill, m.LandingMs)}）");
+            _output.WriteLine($"        分支A 采纳(OuterAdopt) = {m.OuterAdoptMs,10:F0} ms  （占 LandingRun {Pct(m.OuterAdoptMs, m.LandingMs)}）");
+            _output.WriteLine($"        分支B 真跑(RunBatchPlan) = {m.RunDirectMs,8:F0} ms  （占 LandingRun {Pct(m.RunDirectMs, m.LandingMs)}）");
+            _output.WriteLine($"        前缀比对(PureAppendCheck) = {m.PureAppendCheckMs,8:F0} ms  （占 LandingRun {Pct(m.PureAppendCheckMs, m.LandingMs)}）");
+            _output.WriteLine($"        索引重建(IndexRebuild)   = {m.IndexRebuildMs,8:F0} ms  （占 LandingRun {Pct(m.IndexRebuildMs, m.LandingMs)}）");
+            _output.WriteLine($"        TraceNotes 回填          = {m.TraceRefillMs,8:F0} ms  （占 LandingRun {Pct(m.TraceRefillMs, m.LandingMs)}）");
+            _output.WriteLine($"        索引对齐(AdoptReconcile) = {m.AdoptReconcileMs,8:F0} ms  （占 LandingRun {Pct(m.AdoptReconcileMs, m.LandingMs)}）");
+            _output.WriteLine($"        选路回填(RouteRefill)    = {m.RouteRefillMs,8:F0} ms  （占 LandingRun {Pct(m.RouteRefillMs, m.LandingMs)}）");
+            // ── 2026-11-10 B-02（0号位 §四 B-02）：Phase5 分账 ──
+            //   0号位 原话：「不要将 472.3 秒一概称为『压缩空隙』耗时」。
+            //   全量复测里 Phase5 已从 472 s 涨到 923 s，与 Phase2 并列最大 ⇒ 必须先拆开看。
+            //   这些槽**早就存在**（`SolverDiagnostics.Hotspot.Phase5*`），此前只是没人输出。
+            var p5Items = new (string Name, int Slot, bool Child)[]
+            {
+                ("CompactGaps（压缩空隙）",         SolverDiagnostics.Hotspot.Phase5CompactGaps, false),
+                ("  +- CompactPrep",               SolverDiagnostics.Hotspot.Phase5CompactPrep, true),
+                ("  +- CompactIndex",              SolverDiagnostics.Hotspot.Phase5CompactIndex, true),
+                ("  +- CompactLoop",               SolverDiagnostics.Hotspot.Phase5CompactLoop, true),
+                ("OptimizeSetupSequences（换型）",  SolverDiagnostics.Hotspot.Phase5SetupSeq, false),
+                ("BuildTerminalContributions",     SolverDiagnostics.Hotspot.Phase5Terminal, false),
+                ("GenerateDependencies（依赖）",    SolverDiagnostics.Hotspot.Phase5Deps, false),
+                ("Unsched 未排量（合计）",          SolverDiagnostics.Hotspot.Phase5Unsched, false),
+                ("  +- 扫 Phase2",                 SolverDiagnostics.Hotspot.Phase5UnschedP2, true),
+                ("  +- 扫 Phase4",                 SolverDiagnostics.Hotspot.Phase5UnschedP4, true),
+                ("  +- 聚合",                      SolverDiagnostics.Hotspot.Phase5UnschedAgg, true),
+                ("AllocationShares（份额）",        SolverDiagnostics.Hotspot.Phase5Shares, false),
+                ("Validate（硬校验）",              SolverDiagnostics.Hotspot.Phase5Validate, false),
+                ("CalendarScan（日历扫描）",        SolverDiagnostics.Hotspot.Phase5CalendarScan, false),
+                ("FinalDiagnose（最终诊断）",       SolverDiagnostics.Hotspot.Phase5FinalDiagnose, false),
+                ("ResultAssembly（结果组装）",      SolverDiagnostics.Hotspot.Phase5ResultAssembly, false),
+                // ⚠ 2026-11-11 更正：`StageTimingBuild` **嵌套在** `ResultAssembly` 内
+                //   （实测两者数值几乎相等：29,137 vs 29,136）⇒ 属**子项**，
+                //   此前误标为顶层项，导致「顶层合计」多算一遍（80.2 s vs 段时长 51.1 s）。
+                ("  +- StageTimingBuild",          SolverDiagnostics.Hotspot.Phase5StageTimingBuild, true),
+            };
+            _output.WriteLine($"[P5] {label} Phase5 分账：");
+            double p5Top = 0;
+            foreach (var (nm, slot, child) in p5Items)
+            {
+                var v = c.HotspotMs(slot);
+                if (!child) p5Top += v;
+                _output.WriteLine($"        {nm,-34} = {v,10:F0} ms");
+            }
+            _output.WriteLine($"        == 顶层项合计（不含子项）   = {p5Top,10:F0} ms");
+
+            // ── 2026-11-11 FULL-02 真实路径验证（0号位《夜间FULL计算整改与联合回归任务书 v1.0》§2.B）──
+            //   任务书要求「最终 Task 及 MES 执行身份保留实际 RouteCode/PathId，不得回退 DEFAULT/1」。
+            //   这里只**观测**产出里的真实取值分布，不改任何判定。
+            if (result?.FinalTasks is { Count: > 0 } ft)
+            {
+                var byRoute = ft
+                    .GroupBy(t => t.RouteCode ?? "(null)")
+                    .OrderByDescending(g => g.Count())
+                    .Take(8)
+                    .Select(g => $"{g.Key}={g.Count()}");
+                var defaultRoute = ft.Count(t => string.Equals(t.RouteCode, "DEFAULT", StringComparison.Ordinal));
+                var nonOnePath = ft.Count(t => t.PathId != 1);
+                _output.WriteLine($"[FULL-02] {label} FinalTask RouteCode 分布（Top8）：{string.Join(" | ", byRoute)}");
+                _output.WriteLine($"[FULL-02] {label} RouteCode==DEFAULT 的 Task：{defaultRoute} / {ft.Count}；PathId != 1 的 Task：{nonOnePath}");
+            }
+
+            // ── 2026-11-11 任务书 §3「联合 FULL Run 状态」：未排量 + 原因码缺口 ──
+            //   任务书 FULL-04 关心「未排是否有法定原因码」，这里一并量出来（只观测）。
+            if (result is not null)
+            {
+                var un = result.UnscheduledTasks ?? Array.Empty<UnscheduledTaskResult>();
+                var atQuery = request.LogicalProductionDemands.Count;
+                var unQty = 0m;
+                for (var ui = 0; ui < un.Count; ui++) unQty += un[ui].UnscheduledQty;
+                var withReason = 0;
+                for (var ui = 0; ui < un.Count; ui++)
+                {
+                    if (!string.IsNullOrWhiteSpace(un[ui].Reason)) withReason++;
+                }
+                _output.WriteLine($"[RUN] {label} 未排需求 {un.Count} / {atQuery}，未排量合计 {unQty:F3}");
+                _output.WriteLine($"[RUN] {label} 其中带原因码 {withReason}，**空原因 {un.Count - withReason}**");
+
+                // FULL-04：不仅要「非空」，还要看填的是不是法定码。给出取值分布（Top10）。
+                var reasonTop = un
+                    .Where(x => !string.IsNullOrWhiteSpace(x.Reason))
+                    .GroupBy(x => x.Reason)
+                    .OrderByDescending(g => g.Count())
+                    .Take(10)
+                    .Select(g => $"{g.Key}={g.Count()}");
+                _output.WriteLine($"[RUN] {label} Reason 取值分布（Top10）：{string.Join(" | ", reasonTop)}");
+
+                // ── 2026-11-11 需求级数量闭合诊断（对应 2号位 FAMILY_CYL「25.5 vs 51」）──
+                //   目的：验证「部分排程」机制是否在别的域也存在 —— 即同一条需求只排出一部分 Task。
+                //   判据与 Phase5 硬校验同源：Σ(Task.Quantity by SourceDraftId) vs demand.NetOutputQty。
+                if (result.FinalTasks is { Count: > 0 } allTasks)
+                {
+                    var qtyByDemand = new Dictionary<string, decimal>(StringComparer.Ordinal);
+                    for (var ti = 0; ti < allTasks.Count; ti++)
+                    {
+                        var t = allTasks[ti];
+                        var dk = t.SourceDraftId;
+                        if (string.IsNullOrEmpty(dk)) continue;
+                        qtyByDemand.TryGetValue(dk, out var acc);
+                        qtyByDemand[dk] = acc + t.Quantity;
+                    }
+
+                    var partial = 0;
+                    var exact = 0;
+                    var over = 0;
+                    var missingDemand = 0;
+                    foreach (var kv in qtyByDemand)
+                    {
+                        var dm = request.LogicalProductionDemands.FirstOrDefault(d => d.LogicalDemandKey == kv.Key);
+                        if (dm is null) { missingDemand++; continue; }
+                        var diff = kv.Value - dm.NetOutputQty;
+                        if (Math.Abs(diff) <= 0.001m) exact++;
+                        else if (diff > 0) over++;
+                        else partial++;
+                    }
+                    _output.WriteLine($"[CLOSURE] {label} 有 Task 的需求 {qtyByDemand.Count} 个："
+                        + $"完全闭合 {exact}｜**部分排程 {partial}**｜超额 {over}｜查不到需求 {missingDemand}");
+                }
+            }
+
+            var accounted = bothRefill + m.OuterAdoptMs + m.RunDirectMs
+                            + m.PureAppendCheckMs + m.IndexRebuildMs
+                            + m.TraceRefillMs + m.AdoptReconcileMs + m.RouteRefillMs;
+            _output.WriteLine($"        ── 已归因合计     = {accounted,10:F0} ms  （占 LandingRun {Pct(accounted, m.LandingMs)}）");
+            _output.WriteLine($"        ── 仍未归因       = {m.LandingMs - accounted,10:F0} ms  （占 LandingRun {Pct(m.LandingMs - accounted, m.LandingMs)}）");
             return m;
         }
         finally
@@ -168,6 +315,10 @@ public class PhaseTwoOrthoReplayPerfTests
             PhaseTwoInitialScheduler.OverrideAnchorModeForTest(null);
         }
     }
+
+    /// <summary>占比文本；分母非正时给 <c>—</c>，避免出现 Infinity/NaN 干扰读数。</summary>
+    private static string Pct(double part, double whole)
+        => whole > 0 ? $"{part * 100.0 / whole:F1}%" : "—";
 
     /// <summary>流式反序列化（与 `SolverReplayTest` 同一组选项，读写对称）。</summary>
     private static DomainSolveRequest Load(string jsonPath)

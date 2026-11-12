@@ -126,6 +126,48 @@ public class GovernanceVersionCrudTests
     }
 
     [Fact]
+    public async Task UpdateRuleSet_前端提交体不带生效窗_读改写回填保留既有窗口()
+    {
+        // 甲（2026-11-11，4号位 生效窗缺回填）：PUT 提交体不含 EffectiveFrom/EffectiveTo（前端 rules.ts 无这两列），
+        // UpdateRuleSetVersionAsync 读改写须回填 existing 的窗口，否则仓储 UPDATE 照写两列把既有窗口抹成 NULL。
+        var existingFrom = new DateTime(2026, 7, 4, 14, 2, 5);
+        var existingTo = new DateTime(2026, 8, 3, 14, 2, 5);
+        var existing = new RuleSetVersion
+        {
+            Id = 1,
+            RuleSetId = 10,
+            VersionCode = "V1",
+            Status = GovernanceVersionStatus.Draft,
+            EffectiveFrom = existingFrom,
+            EffectiveTo = existingTo,
+            ContentSnapshotJson = SnapshotWithDemandPriority("基线")
+        };
+        _ruleSetRepo.Setup(r => r.GetByIdAsync(1, It.IsAny<CancellationToken>())).ReturnsAsync(existing);
+        RuleSetVersion? captured = null;
+        _ruleSetRepo.Setup(r => r.UpdateAsync(It.IsAny<RuleSetVersion>(), It.IsAny<CancellationToken>()))
+            .Callback<RuleSetVersion, CancellationToken>((v, _) => captured = v)
+            .Returns(Task.CompletedTask);
+
+        // 前端提交体：无 EffectiveFrom/EffectiveTo（漏带）
+        var update = new RuleSetVersion
+        {
+            Id = 1,
+            RuleSetId = 10,
+            VersionCode = "V1",
+            Status = GovernanceVersionStatus.Draft,
+            DemandPriorityJson = ValidDemandPriorityJson()
+        };
+
+        // Act
+        await _service.UpdateRuleSetVersionAsync(1, update, ActorUserId, default);
+
+        // Assert —— 落库实体窗口保留 existing 原值，不被 null 抹掉
+        captured.Should().NotBeNull();
+        captured!.EffectiveFrom.Should().Be(existingFrom);
+        captured.EffectiveTo.Should().Be(existingTo);
+    }
+
+    [Fact]
     public async Task UpdateRuleSet_DISABLED版本_拒绝修改()
     {
         // Arrange —— 绕过路径 4：失效版本不可再改

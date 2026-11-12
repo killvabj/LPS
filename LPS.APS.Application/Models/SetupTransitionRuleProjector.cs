@@ -108,8 +108,23 @@ public static class SetupTransitionRuleProjector
                 return new List<SetupTransitionRule>();
             }
 
-            var rules = block.Deserialize<List<SetupTransitionRule>>(JsonOptions);
-            return rules ?? new List<SetupTransitionRule>();
+            var rules = new List<SetupTransitionRule>();
+            foreach (var element in block.EnumerateArray())
+            {
+                // 丙（2026-11-11，478 缺陷根治）：数组元素呈 `{ "setup_rule": { … } }` 单键包裹形状
+                // （FOR JSON PATH 写回特征）时，取 setup_rule 内层反序列化；否则按扁平形状原样反序列化。
+                // 旧逻辑把包裹行全落成默认值 → 业务键退化全同（E|0|||0||）→ diff 的 ToDictionary 抛重复键 400、
+                // 读端点返回全零行、fork 回写会洗掉 6 条真规则。
+                var target = element.ValueKind == JsonValueKind.Object
+                    && element.TryGetProperty("setup_rule", out var inner)
+                    && inner.ValueKind == JsonValueKind.Object
+                        ? inner
+                        : element;
+
+                rules.Add(target.Deserialize<SetupTransitionRule>(JsonOptions)!);
+            }
+
+            return rules;
         }
         catch (JsonException ex)
         {
@@ -248,8 +263,11 @@ public static class SetupTransitionRuleProjector
         ArgumentNullException.ThrowIfNull(source);
         ArgumentNullException.ThrowIfNull(target);
 
-        var sourceByKey = source.ToDictionary(BuildBusinessKey);
-        var targetByKey = target.ToDictionary(BuildBusinessKey);
+        // 甲（2026-11-11，478 缺陷纵深防御）：杜绝 ToDictionary 抛重复键 400、也杜绝 GroupBy().First() 静默吞——
+        // 按业务键分组，每键**首条参与比较**，其余视为重复并**显式计数**回报（DuplicateSourceCount / DuplicateTargetCount），
+        // 既不复现全段 400，也不静默丢失「源/目标内部到底有无重复」的事实。
+        var (sourceByKey, sourceDupes) = GroupUniqueByBusinessKey(source);
+        var (targetByKey, targetDupes) = GroupUniqueByBusinessKey(target);
 
         int added = 0, removed = 0, modified = 0;
         foreach (var (key, targetRule) in targetByKey)
@@ -277,7 +295,31 @@ public static class SetupTransitionRuleProjector
             AddedCount = added,
             ModifiedCount = modified,
             RemovedCount = removed,
+            DuplicateSourceCount = sourceDupes,
+            DuplicateTargetCount = targetDupes,
         };
+    }
+
+    /// <summary>
+    /// 按业务键分组取唯一：每键**首条**保留进字典，其余计数为重复（fail-soft 且显式计数）。
+    /// Returns (唯一键字典, 重复条数)。
+    /// </summary>
+    private static (Dictionary<string, SetupTransitionRule> Unique, int Duplicates) GroupUniqueByBusinessKey(
+        IReadOnlyList<SetupTransitionRule> rules)
+    {
+        var unique = new Dictionary<string, SetupTransitionRule>();
+        int duplicates = 0;
+        foreach (var rule in rules)
+        {
+            if (unique.TryAdd(BuildBusinessKey(rule), rule))
+            {
+                continue;
+            }
+
+            duplicates++;
+        }
+
+        return (unique, duplicates);
     }
 }
 
@@ -292,6 +334,18 @@ public class SetupRuleBusinessDiffResult
 
     /// <summary>源有而目标无的规则数（按业务键）</summary>
     public int RemovedCount { get; set; }
+
+    /// <summary>
+    /// 源列表内部**业务键重复**的规则条数（首条保留参与比较，其余计入本项；fail-soft 显式回报，非静默吞）。
+    /// 正常数据为 0；>0 表明源版本 ⑦ 子块存在同键多条（含 inactive+active 同键、或序列化退化键），未参与比较。
+    /// </summary>
+    public int DuplicateSourceCount { get; set; }
+
+    /// <summary>目标列表内部 **业务键重复** 的规则条数（语义同 <see cref="DuplicateSourceCount"/>，作用于 target）。</summary>
+    public int DuplicateTargetCount { get; set; }
+
+    /// <summary>源或目标内部是否存在业务键重复（前端用于展示「部分规则未参与比较」告警位）。</summary>
+    public bool HasDuplicates => DuplicateSourceCount != 0 || DuplicateTargetCount != 0;
 
     /// <summary>是否存在业务内容变更（任一计数不为 0）</summary>
     public bool IsChanged => AddedCount != 0 || ModifiedCount != 0 || RemovedCount != 0;

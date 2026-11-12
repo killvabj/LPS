@@ -362,6 +362,37 @@ public class RealDomainFullRunTest
             var perCall = calls > 0 ? ms * 1000d / calls : 0d;
             _output.WriteLine($"[SD] 热点 {name}: {ms:N0}ms / {calls:N0} 次 = {perCall:N1}µs/次");
         }
+
+        // ── 2026-11-11 临时诊断（PV999487 定位用，仅日志、不改 CSV、不改流程）──
+        //   背景：Phase5 数量闭合校验原来遇到第一条就 return，只报了 `999487_126` 25.5 vs 51。
+        //   1号位 已改为「扫完所有并逐条登记」⇒ 这里把登记下来的**全部**不闭合需求打出来，
+        //   含每条需求的 Task 明细（RouteCode / PathId / ExecutionBatchDraftKey / 各 Task 数量），
+        //   用来判断「是不是同一条需求被两条路径各排一半」这类猜测。
+        var closureBreaks = c.ClosureBreaks;
+        _output.WriteLine($"[CLOSURE-BREAK] 需求级数量不闭合登记数 = {closureBreaks.Count}"
+            + (closureBreaks.Count >= LPS.APS.Scheduling.Solvers.SolverDiagnostics.Counters.MaxClosureBreakRecords
+                ? "（已达上限，未记全）" : ""));
+
+        foreach (var rec in closureBreaks.Take(20))
+        {
+            _output.WriteLine($"[CLOSURE-BREAK] 需求 {rec.DemandKey} | NetOutputQty={rec.NetOutputQty} "
+                + $"| 判为未排={rec.JudgedUnscheduled} | Task数={rec.Tasks.Count}");
+            foreach (var op in rec.Ops)
+            {
+                _output.WriteLine($"    工序 {op.StageCode}/{op.OperationCode}: ΣTask量={op.SumQty}");
+            }
+            foreach (var t in rec.Tasks.Take(8))
+            {
+                _output.WriteLine($"    Task {t.FinalDraftId} q={t.Quantity} "
+                    + $"Route={t.RouteCode ?? "(null)"} PathId={t.PathId?.ToString() ?? "(null)"} "
+                    + $"Batch={t.ExecutionBatchDraftKey ?? "(null)"} {t.StageCode}/{t.OperationCode} "
+                    + $"{t.PlannedStartTime:MM-dd HH:mm}→{t.PlannedEndTime:MM-dd HH:mm}");
+            }
+            if (rec.Tasks.Count > 8)
+            {
+                _output.WriteLine($"    …另有 {rec.Tasks.Count - 8} 个 Task 未列出");
+            }
+        }
     }
 
     /// <summary>

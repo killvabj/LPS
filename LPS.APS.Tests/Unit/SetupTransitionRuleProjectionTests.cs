@@ -359,6 +359,107 @@ public class SetupTransitionRuleProjectionTests
     }
 
     [Fact]
+    public void CompareBusinessContent_同键重复_failSoft不抛且显式计数并首条参与()
+    {
+        // 甲（2026-11-11，478 缺陷纵深防御）：业务键重复不再 ToDictionary 抛 400，改首条参与、其余计数。
+        var src = new List<SetupTransitionRule>
+        {
+            Rule2(op: "OP10", minutes: 30m),   // 首条，业务键 E|1|S1|OP10|10|0|0
+            Rule2(op: "OP10", minutes: 99m),   // 重复键（同 OP10），应计入 DuplicateSourceCount
+            Rule2(op: "OP20", minutes: 40m),
+        };
+        var tgt = new List<SetupTransitionRule>
+        {
+            Rule2(op: "OP10", minutes: 45m),   // 与源首条同键但分钟不同 → Modified
+            Rule2(op: "OP20", minutes: 40m),
+        };
+
+        var act = () => SetupTransitionRuleProjector.CompareBusinessContent(src, tgt);
+        act.Should().NotThrow();
+        var diff = SetupTransitionRuleProjector.CompareBusinessContent(src, tgt);
+
+        diff.DuplicateSourceCount.Should().Be(1);
+        diff.DuplicateTargetCount.Should().Be(0);
+        diff.HasDuplicates.Should().BeTrue();
+        // 首条 OP10(30m) 与目标 OP10(45m) 对比 → Modified；重复项 (OP10,99m) 剔除未参与。
+        diff.ModifiedCount.Should().Be(1);
+        diff.IsChanged.Should().BeTrue();
+    }
+
+    [Fact]
+    public void CompareBusinessContent_重复不参与增删改_不误判加删()
+    {
+        // 纯脏开的数据：源里只有一个真实键但重复 3 次 → 不应判为「删了 3 个」也不是「加了 3 个」，
+        // 而应重复计数 = 2、删/加 = 0（重复被剔除、首条在目标缺失才计 Removed）。
+        var src = new List<SetupTransitionRule>
+        {
+            Rule2(op: "OP10", minutes: 30m),
+            Rule2(op: "OP10", minutes: 30m),
+            Rule2(op: "OP10", minutes: 30m),
+        };
+        var emptyTgt = new List<SetupTransitionRule>();
+
+        var diff = SetupTransitionRuleProjector.CompareBusinessContent(src, emptyTgt);
+
+        diff.DuplicateSourceCount.Should().Be(2);
+        diff.RemovedCount.Should().Be(1); // 仅首条键在目标缺失
+        diff.AddedCount.Should().Be(0);
+        diff.ModifiedCount.Should().Be(0);
+    }
+
+    [Fact]
+    public void ExtractRules_数组元素setup_rule单键包裹_解包读到真值()
+    {
+        // 丙（2026-11-11，478 缺陷根治）：`[{ "setup_rule": {…} }]` 包裹形状（FOR JSON PATH 写回特征）
+        // 须解一层 setup_rule，否则 7 条真规则全落默认值 → 读端点全零行、diff 键退化全同。
+        var wrapperJson = "{\"SetupTransitionRules\":["
+            + "{\"setup_rule\":{\"Id\":4780000001,\"RuleSetVersionId\":478,\"ProductionDepartmentId\":1,\"StageCode\":\"S1\",\"OperationCode\":\"OP10\",\"ResourceId\":10,\"FromMaterialId\":101,\"ToMaterialId\":102,\"RuleType\":\"EXACT\",\"SetupMinutes\":30,\"IsActive\":true}},"
+            + "{\"setup_rule\":{\"Id\":4780000002,\"RuleSetVersionId\":478,\"ProductionDepartmentId\":1,\"StageCode\":\"S1\",\"OperationCode\":\"OP20\",\"ResourceId\":10,\"FromMaterialId\":null,\"ToMaterialId\":null,\"RuleType\":\"DEFAULT\",\"SetupMinutes\":40,\"IsActive\":true}}"
+            + "]}";
+
+        var rules = SetupTransitionRuleProjector.ExtractRules(wrapperJson);
+
+        rules.Should().HaveCount(2);
+        rules[0].ProductionDepartmentId.Should().Be(1);
+        rules[0].StageCode.Should().Be("S1");
+        rules[0].OperationCode.Should().Be("OP10");
+        rules[0].ResourceId.Should().Be(10);
+        rules[0].FromMaterialId.Should().Be(101);
+        rules[0].ToMaterialId.Should().Be(102);
+        rules[0].RuleType.Should().Be(SetupTransitionRuleType.Exact);
+        rules[0].SetupMinutes.Should().Be(30);
+        rules[1].OperationCode.Should().Be("OP20");
+        rules[1].RuleType.Should().Be(SetupTransitionRuleType.Default);
+        rules[1].SetupMinutes.Should().Be(40);
+    }
+
+    [Fact]
+    public void ExtractRules_双层包裹与源对比_业务键正常参与()
+    {
+        // 组合验证：丙（解包）后 478 的 3 EXACT + 4 DEFAULT（包裹形状）与正常扁平目标对比，
+        // 键不再退化全同、无重复告警、增删改按真值判定（不复现 400，也不误判）。
+        var srcWrapper = "{\"SetupTransitionRules\":["
+            + "{\"setup_rule\":{\"ProductionDepartmentId\":1,\"StageCode\":\"S1\",\"OperationCode\":\"OP10\",\"ResourceId\":10,\"FromMaterialId\":101,\"ToMaterialId\":102,\"RuleType\":\"EXACT\",\"SetupMinutes\":30}},"
+            + "{\"setup_rule\":{\"ProductionDepartmentId\":1,\"StageCode\":\"S1\",\"OperationCode\":\"OP20\",\"ResourceId\":10,\"FromMaterialId\":null,\"ToMaterialId\":null,\"RuleType\":\"DEFAULT\",\"SetupMinutes\":40}}"
+            + "]}";
+        var flatTgt = new List<SetupTransitionRule>
+        {
+            Rule2(op: "OP10", from: 101, to: 102, ruleType: SetupTransitionRuleType.Exact, minutes: 45m),
+            Rule2(op: "OP20", ruleType: SetupTransitionRuleType.Default, minutes: 40m),
+        };
+
+        var srcRules = SetupTransitionRuleProjector.ExtractRules(srcWrapper);
+        var diff = SetupTransitionRuleProjector.CompareBusinessContent(srcRules, flatTgt);
+
+        diff.DuplicateSourceCount.Should().Be(0);
+        diff.HasDuplicates.Should().BeFalse();
+        diff.ModifiedCount.Should().Be(1); // OP10 EXACT 30→45m
+        diff.AddedCount.Should().Be(0);
+        diff.RemovedCount.Should().Be(0);
+        diff.IsChanged.Should().BeTrue();
+    }
+
+    [Fact]
     public void BuildBusinessKey_单源_与GetDiff同口径()
     {
         // 与 SetupRuleService.BuildKey 同一实现（已委托到本方法），验证键含类型前缀 + 业务元组

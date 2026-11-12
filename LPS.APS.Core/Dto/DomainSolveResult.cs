@@ -102,8 +102,8 @@ public sealed class FinalTaskDraft
     ///
     ///   ⚠ 乘数取**该 draft 自己的 <see cref="PlannedProcessQty"/>**（计划加工数量，含计划良率放大）；
     ///   不得套需求级的 `demand.PlannedProcessQty` —— 拆批／合批时 1号位 已把拆后值／合并值
-    ///   **写进该 draft 的 `PlannedProcessQty`**（拆批 `PhaseFourLocalRepair.cs:1786`、
-    ///   合批 `PhaseTwoInitialScheduler.cs:7606`），故消费侧**不需特判**。
+    ///   **写进该 draft 的 `PlannedProcessQty`**（拆批、合批都在 1号位 侧就地改写该 draft 的值），
+    ///   故消费侧**不需特判**。⇒ 按符号找（`PlannedProcessQty =` 的赋值点），别按行号跳。
     ///   <see cref="Quantity"/> 是净合格产出（`NetOutputQty`，**不含**良率放大），不可当乘数 —— 拿它算会短一截。
     ///   现役加工时长的五个计算点一律乘 `PlannedProcessQty`（1号位 2026-10-26 回执 §五 逐处列出）。
     ///   **本字段由 1号位 填值，我方只按值使用、不自行推算。**
@@ -320,8 +320,9 @@ public sealed class DemandCompletionFact
     /// 【2号位 读侧义务】`false` 的完成时间进入「时间不可信」计数（证据 JSON / 未排口径），
     ///   不进入任何承诺或供给可用时间。
     ///
-    /// 【交付状态 2026-10-25】契约骨架已落；**生产侧尚未置值**（恒 `null` ⇒ 零回归）。
-    ///   置值随「缺 LT / 缺 WORK 两类判据」在 1号位 消费侧扩判据后同步落码。
+    /// 【交付状态】2026-10-25 落契约骨架；**1号位 已于 R09-②（2026-10-29 落码）三态转满**：
+    ///   `StageTimingNodeBuilder` 逐条求值五条不确定判据（缺 LT／路径未定／无真实依据／无可靠 WORK／无位置），
+    ///   命中置 `false`、否则置 `true`，**不再产出 `null`**。`null` 一支自此只服务于旧载荷兼容。
     /// </summary>
     public bool? CompletionTimeCertain { get; init; }
 

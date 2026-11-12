@@ -1,3 +1,4 @@
+using LPS.APS.Core.DTOs.Governance;
 using LPS.APS.Core.Entities.APS;
 
 namespace LPS.APS.Core.Interfaces;
@@ -26,6 +27,30 @@ public interface IStrategyProfileRepository
     System.Threading.Tasks.Task<IReadOnlyList<StrategyProfile>> GetListAsync(
         bool? activeOnly = null,
         string? keyword = null,
+        int? skip = null,
+        int? take = null,
+        CancellationToken ct = default);
+
+    /// <summary>
+    /// 策略包「主子表联查·一版一行」列表（2026-11-11，路线 A：策略包维护页新列表源）。
+    /// 每条 = 一条 StrategyProfile + 其一个 StrategyProfileVersion；同族 N 个版本 ⇒ N 行。
+    /// 策略包版本本身无 RunType 列（P0-06 契约），RunType 经父表冗余随行；版本绑定
+    /// RuleSetVersionId / ParameterSetVersionId 一并随行供前端直显。
+    /// 过滤/分页语义：activeOnly=仅启用主表、keyword=匹配 StrategyProfileCode/Name、
+    /// status=版本状态精确匹配、name=策略包名称模糊匹配；每主表内按 VersionId ASC 稳定排序。
+    /// </summary>
+    /// <param name="activeOnly">true=仅启用主表（IsActive=1）；null=不区分</param>
+    /// <param name="keyword">模糊关键字，匹配 StrategyProfileCode 或 StrategyProfileName（null=不过滤）</param>
+    /// <param name="status">版本状态精确匹配（如 PUBLISHED/DRAFT；null=不过滤）</param>
+    /// <param name="name">策略包名称模糊匹配（%name%；null=不过滤）</param>
+    /// <param name="skip">跳过行数（分页 offset；null=不分页）</param>
+    /// <param name="take">返回行数（分页 size；null=不分页）</param>
+    /// <param name="ct">取消令牌</param>
+    System.Threading.Tasks.Task<IReadOnlyList<StrategyProfileVersionRowDto>> GetVersionsWithMainAsync(
+        bool? activeOnly = null,
+        string? keyword = null,
+        string? status = null,
+        string? name = null,
         int? skip = null,
         int? take = null,
         CancellationToken ct = default);

@@ -1175,6 +1175,28 @@ public class GovernanceController : ControllerBase
 
     #region 主表列表与运行支撑（G1/G7：3-4联调）
 
+    /// <summary>
+    /// 规则集「主子表联查·一版一行」列表（路线 A，2026-11-11：规则集维护页新列表源）。
+    /// 每主表 N 个版本 ⇒ N 行，各版本状态独立可读，修复旧列表（GET /rule-sets）把 Status 取「最新创建版本」
+    /// 被同族新草稿覆盖生效 PUBLISHED 的问题。保留既有 GET /rule-sets（一主表带最新概要）供策略包下拉等场景。
+    /// </summary>
+    /// <remarks>开发者：3号位。参数语义与 <see cref="GetRuleSets"/> 一致：activeOnly 三态 / keyword 匹配 Code/Name / 分页。零 DDL。</remarks>
+    [Authorize(Policy = PermissionCodes.RuleView)]
+    [HttpGet("rule-sets/versions")]
+    public async Task<IActionResult> GetRuleSetVersionsWithMain(
+        [FromQuery] bool? activeOnly = null,
+        [FromQuery] string? keyword = null,
+        [FromQuery] string? status = null,
+        [FromQuery] string? name = null,
+        [FromQuery] int? page = null,
+        [FromQuery] int? pageSize = null,
+        CancellationToken ct = default)
+    {
+        var (skip, take) = ResolvePaging(page, pageSize);
+        var result = await _ruleSetRepo.GetVersionsWithMainAsync(activeOnly, keyword, status, name, skip, take, ct);
+        return Ok(ApiResponse<IReadOnlyList<RuleSetVersionRowDto>>.Success(result));
+    }
+
     /// <summary>规则集主表列表（G1/A1：4号位规则集列表页；R2 起返回含最新版本摘要的列表 DTO）</summary>
     /// <remarks>开发者：3号位。activeOnly 三态语义（契约 v1.0 2026-10-10）：true=仅查 IsActive=1；false=仅查 IsActive=0（≠查全部）；缺省=不过滤全量。dev DB 当前无停用数据，传 false 恒返 0（客观状态非 bug）。</remarks>
     [Authorize(Policy = PermissionCodes.RuleView)]
@@ -1207,6 +1229,25 @@ public class GovernanceController : ControllerBase
         return Ok(ApiResponse<IReadOnlyList<ParameterSetListItemDto>>.Success(result));
     }
 
+    /// <summary>参数集主从联查·一版一行（2026-11-11，路线 A：参数集维护页新列表源）</summary>
+    /// <remarks>开发者：3号位。每行=一条 ParameterSet + 其一个版本，各版本状态独立，修复旧列表 Status 取「最新创建版本」
+    /// 被新草稿覆盖 PUBLISHED 的缺陷（同规则集 OUTER APPLY TOP1 因）。status/name 为新增筛选（对齐 rule-sets/versions）。</remarks>
+    [Authorize(Policy = PermissionCodes.ParameterView)]
+    [HttpGet("parameter-sets/versions")]
+    public async Task<IActionResult> GetParameterSetVersionsWithMain(
+        [FromQuery] bool? activeOnly = null,
+        [FromQuery] string? keyword = null,
+        [FromQuery] string? status = null,
+        [FromQuery] string? name = null,
+        [FromQuery] int? page = null,
+        [FromQuery] int? pageSize = null,
+        CancellationToken ct = default)
+    {
+        var (skip, take) = ResolvePaging(page, pageSize);
+        var result = await _parameterSetRepo.GetVersionsWithMainAsync(activeOnly, keyword, status, name, skip, take, ct);
+        return Ok(ApiResponse<IReadOnlyList<ParameterSetVersionRowDto>>.Success(result));
+    }
+
     /// <summary>策略包主表列表（G1/A12：4号位策略包列表页）</summary>
     /// <remarks>开发者：3号位。activeOnly 三态语义（契约 v1.0 2026-10-10）：true=仅查 IsActive=1；false=仅查 IsActive=0（≠查全部）；缺省=不过滤全量。dev DB 当前无停用数据，传 false 恒返 0（客观状态非 bug）。</remarks>
     [Authorize(Policy = PermissionCodes.StrategyView)]
@@ -1221,6 +1262,25 @@ public class GovernanceController : ControllerBase
         var (skip, take) = ResolvePaging(page, pageSize);
         var result = await _strategyProfileRepo.GetListAsync(activeOnly, keyword, skip, take, ct);
         return Ok(ApiResponse<IReadOnlyList<StrategyProfile>>.Success(result));
+    }
+
+    /// <summary>策略包主从联查·一版一行（2026-11-11，路线 A：策略包维护页新列表源）</summary>
+    /// <remarks>开发者：3号位。每行=一条 StrategyProfile + 其一个版本，逐版本可见状态（旧列表纯主表无版本信息）；
+    /// 经父表带 RunType，随行 RuleSetVersionId/ParameterSetVersionId 绑定。status/name 为新增筛选（对齐 rule-sets/versions）。</remarks>
+    [Authorize(Policy = PermissionCodes.StrategyView)]
+    [HttpGet("strategy-profiles/versions")]
+    public async Task<IActionResult> GetStrategyProfileVersionsWithMain(
+        [FromQuery] bool? activeOnly = null,
+        [FromQuery] string? keyword = null,
+        [FromQuery] string? status = null,
+        [FromQuery] string? name = null,
+        [FromQuery] int? page = null,
+        [FromQuery] int? pageSize = null,
+        CancellationToken ct = default)
+    {
+        var (skip, take) = ResolvePaging(page, pageSize);
+        var result = await _strategyProfileRepo.GetVersionsWithMainAsync(activeOnly, keyword, status, name, skip, take, ct);
+        return Ok(ApiResponse<IReadOnlyList<StrategyProfileVersionRowDto>>.Success(result));
     }
 
     /// <summary>规则集当前生效 PUBLISHED 版本直达（G3/C2：当前 Published 版本展示；生效窗口过滤；多候选报错）</summary>

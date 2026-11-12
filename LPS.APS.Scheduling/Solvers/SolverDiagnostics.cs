@@ -198,6 +198,31 @@ public static class SolverDiagnostics
         /// <summary>A4：擂台结束后**真正采纳合批**的需求批次数（`bestAnchorIndex &gt;= 0`）。</summary>
         public long MergeFinallyAdopted;
 
+        /// <summary>
+        /// 2026-11-10 P0-R1：多 Op Stage 合批核验 `removedShares` 历史成员时，
+        /// **份额里有的成员键在 `demandByKey` 里查不到**的次数（纯观测）。
+        ///   这不是「跳过了一个没用的成员」，而是「有一条已并入的份额，其来源需求无从追溯」。
+        ///   按 Fail Closed 处理：整锚拒绝 + 回滚。
+        /// </summary>
+        public long MergeMemberKeyMissing;
+
+        /// <summary>
+        /// 2026-11-10 P0-R2：单 Op 候选 Task 在 `scheduledTasks` 里**下标找不到**的次数（纯观测）。
+        ///   正常不可达（候选就是从 `scheduledTasks` 扫出来的引用）⇒ 一旦非零，说明表被并发/别名改过。
+        ///   处理方式：**不试该候选**（前置 `continue`），本需求照常走独立排程 —— 既不留脏状态，也不静默丢需求。
+        /// </summary>
+        public long MergeAnchorNotFoundInTable;
+
+        /// <summary>
+        /// 2026-11-11 PV999487（FAMILY_CYL）定位：**需求级数量不闭合的明细**。
+        ///   `ValidateHardResult` 原来遇到第一条不闭合就 `return`，只报了一条（`999487_126` 25.5 vs 51），
+        ///   看不到全貌。本集合收集**全部**不闭合需求，供一次性定位。
+        ///   ⚠ 纯观测；有上限（见 `MaxClosureBreakRecords`），不会无界增长。
+        /// </summary>
+        public readonly List<ClosureBreakRecord> ClosureBreaks = new();
+
+        internal const int MaxClosureBreakRecords = 200;
+
         // ─────────────────────────────────────────────────────────────────────
         // 2026-11-10 A6（0号位《Batch_Code_Review_and_Action_Plan v1.0》§4-A6 / §7.5）
         //   —— **单 Op** 锚表扫描的三个量。此前只有多 Op 的 `MergeScanCalls` /
@@ -770,7 +795,7 @@ public static class SolverDiagnostics
         /// <para>已被 <c>LPS.APS.Tests/Unit/SolverDiagnosticsSlotTests.cs</c> 钉死：
         /// 反射取最大槽号 + 1 必须等于本值，否则单测红。</para>
         /// </summary>
-        public const int HotspotCount = 78;
+        public const int HotspotCount = 85;
 
         // 2026-10-27 四十二刀：**并发安全**（候选并行前置条件）。
         //   原来用 `+=` / `++`，多线程同时写会丢更新 —— 而这两个数组正是判断「改快了没有」的唯一依据，
@@ -1239,6 +1264,90 @@ public static class SolverDiagnostics
         ///   A/B 判据：本槽 ÷ `DemandSchedule` 或 Phase2Ms，看采纳占多少。
         /// </summary>
         public const int OuterAdopt = 77;
+
+        // ══════════════════════════════════════════════════════════════════
+        // **2026-11-10 B-01（0号位《63c130e1 Batch Code Audit Guidance v1.0》§四 B-01）**
+        //   目标：把 `LandingRun`（全量实测 1,999,501 ms = Phase2 的 71.6%）**再切成可归因的几块**。
+        //   现状：`LandingRun` 区间内只有 `OuterAdopt`（任务表替换）和 `BatchPlanTrial`（上游试排）有名字，
+        //     而紧随其后的**份额表全量 Clear+回填**与**占用表全量 Clear+回填**完全没有埋点。
+        //   为什么盯这两块：`PhaseTwoInitialScheduler.cs:1628` 的 `ReferenceEquals` 守卫自带注释
+        //     「当前恒不触发」⇒ 每次落定都会 `Clear()` 后逐条回填整张表，形状是
+        //     O(表大小) × O(需求数)，是全量跑里最容易失控的那类。
+        //   纯观测，不参与任何判定。
+        // ══════════════════════════════════════════════════════════════════
+
+        /// <summary>`LandingRun` 内：`allocationTaskShare` **整表 Clear + 逐条回填**的耗时。</summary>
+        public const int LandingShareRefill = 78;
+
+        /// <summary>`LandingRun` 内：`resourceOccupancy` **整表 Clear + 逐条回填**的耗时。</summary>
+        public const int LandingOccRefill = 79;
+
+        /// <summary>
+        /// `LandingRun` 内：**分支 B** —— 没有胜出批方案（`pickedBatchPlan is null`）时，
+        ///   直接调 `RunBatchPlan` 在真实表上**从头跑一遍完整排程**的耗时
+        ///   （`PhaseTwoInitialScheduler.cs:1662`）。
+        ///   ⚠ 这是**真找槽**的那一支，与分支 A 的「采纳搬运」性质完全不同，
+        ///     0号位 看到的 71.6% 到底花在哪一支，靠本槽与 <see cref="OuterAdopt"/> 之比来分。
+        /// </summary>
+        public const int LandingRunDirect = 80;
+
+        /// <summary>
+        /// `LandingRun` 内：`IsOuterAdoptPureAppend` 的**前缀逐引用比对**（`PhaseTwoInitialScheduler.cs:1590`）。
+        ///   形状 O(表大小) ⇒ 每需求一次、表越长越贵，是剩余未归因部分的第一嫌疑。
+        /// </summary>
+        public const int LandingPureAppendCheck = 81;
+
+        /// <summary>
+        /// `LandingRun` 内：`BuildBatchGroupsIndex` 的**索引重建**（`PhaseTwoInitialScheduler.cs:1619`，
+        ///   仅当 `TryReconcileBatchGroupsBeforeReplace` 对齐失败时进入）。
+        /// </summary>
+        public const int LandingIndexRebuild = 82;
+
+        /// <summary>
+        /// `LandingRun` 内：`constraints.TraceNotes.AddRange(pickedBatchPlan.Notes)` 的耗时
+        ///   （`PhaseTwoInitialScheduler.cs:1644`）。
+        ///   `TraceNotes` 是**跨需求累积**的全量列表，每需求追加一次 ⇒ 形如 O(n²)，
+        ///   是剩余未归因部分的头号嫌疑。
+        /// </summary>
+        public const int LandingTraceRefill = 83;
+
+        /// <summary>
+        /// `LandingRun` 内：`ChosenBatchRoutePaths` / `ChosenRoutePaths` 两个字典的**回填循环**
+        ///   （`PhaseTwoInitialScheduler.cs:1648`~`1656`）。
+        ///   若这两个字典承载的是**跨需求全量**选路登记，则每需求一次遍历 = O(全局大小) ⇒ O(n²)。
+        /// </summary>
+        public const int LandingRouteRefill = 84;
+    }
+
+    /// <summary>
+    /// 2026-11-11：需求级数量不闭合的**一条明细**（纯观测）。
+    ///   为什么需要：PV999487 只报了一条 `999487_126`（25.5 vs 51），而现场是「有一条不合格 ⇒ 整个 PV 作废」，
+    ///   所以必须知道**总共有多少条不闭合、各自长什么样**，否则定位只能靠猜。
+    /// </summary>
+    public sealed class ClosureBreakRecord
+    {
+        public string DemandKey = string.Empty;
+        public decimal NetOutputQty;
+        /// <summary>该需求是否被判为未排（决定走哪条校验分支）。</summary>
+        public bool JudgedUnscheduled;
+        /// <summary>按 (StageCode, OperationCode) 聚合的 ΣTask 数量。</summary>
+        public List<(string StageCode, string OperationCode, decimal SumQty)> Ops = new();
+        /// <summary>该需求名下的全部 Task（原始量，未经份额分摊）。</summary>
+        public List<TaskDetail> Tasks = new();
+    }
+
+    /// <summary>不闭合需求名下的一个 Task 的关键身份字段。</summary>
+    public sealed class TaskDetail
+    {
+        public string FinalDraftId = string.Empty;
+        public decimal Quantity;
+        public string StageCode = string.Empty;
+        public string OperationCode = string.Empty;
+        public string? RouteCode;
+        public long? PathId;
+        public string? ExecutionBatchDraftKey;
+        public DateTime PlannedStartTime;
+        public DateTime PlannedEndTime;
     }
 
     private static readonly AsyncLocal<Counters?> Current = new();
@@ -2501,6 +2610,37 @@ public static class SolverDiagnostics
     internal static void CountMergeFinallyAdopted()
     {
         if (Current.Value is { } c) System.Threading.Interlocked.Increment(ref c.MergeFinallyAdopted);
+    }
+
+    /// <summary>
+    /// 2026-11-10 P0-R1（0号位《63c130e1 Batch Code Audit Guidance v1.0》§二）：
+    /// 份额成员键在 `demandByKey` 里查不到 ⇒ 无法核验其交期/数量/PI 身份 ⇒ 整锚拒绝。
+    /// 纯观测，判定由调用点的 `worsensMember = true` 给出。
+    /// </summary>
+    internal static void CountMergeMemberKeyMissing()
+    {
+        if (Current.Value is { } c) System.Threading.Interlocked.Increment(ref c.MergeMemberKeyMissing);
+    }
+
+    /// <summary>2026-11-10 P0-R2：单 Op 候选 Task 在任务表里下标找不到 ⇒ 不试该候选。纯观测。</summary>
+    internal static void CountMergeAnchorNotFoundInTable()
+    {
+        if (Current.Value is { } c) System.Threading.Interlocked.Increment(ref c.MergeAnchorNotFoundInTable);
+    }
+
+    /// <summary>
+    /// 2026-11-11 PV999487 定位：登记一条「需求级数量不闭合」明细（纯观测，有上限）。
+    /// </summary>
+    internal static void RecordClosureBreak(ClosureBreakRecord record)
+    {
+        if (Current.Value is not { } c) return;
+        lock (c.ClosureBreaks)
+        {
+            if (c.ClosureBreaks.Count < Counters.MaxClosureBreakRecords)
+            {
+                c.ClosureBreaks.Add(record);
+            }
+        }
     }
 
     /// <summary>A6：登记一次单 Op 锚表扫描及其规模。纯观测。</summary>

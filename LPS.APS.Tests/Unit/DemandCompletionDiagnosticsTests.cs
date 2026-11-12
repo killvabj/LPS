@@ -13,7 +13,7 @@ namespace LPS.APS.Tests.Unit;
 /// 断言的正是本改动**声明的目的**（不是「跑绿即有效」）：
 ///   ① **闸门只排 `false`** —— `null`（未标注，向后兼容）与 `true`（可信）放行，`false`（缺 LT／缺合法 WORK）排除；
 ///   ② **只读** —— `Summarize` 不改动入参集合，不产生任何 Task 语义；
-///   ③ 计数如实 —— 当前生产侧尚未置值（恒 `null`）时 `CertainNullCount == FactCount`，不得被算成「不可信」；
+///   ③ 计数如实 —— `null`（旧载荷未标注）时 `CertainNullCount == FactCount`，不得被算成「不可信」；
 ///   ④ 样本上限 10 条（抽样非全量清单）。
 ///
 /// 被测对象 `DemandCompletionDiagnostics` / `DemandCompletionSummary` 都是 `internal`，经 `InternalsVisibleTo` 对测试可见。
@@ -85,14 +85,14 @@ public class DemandCompletionDiagnosticsTests
     // ── ③ 计数如实 ────────────────────────────────────────────────────
 
     [Fact]
-    public void 汇总_生产现状_全部未标注时不误判为不可信()
+    public void 汇总_旧载荷全部未标注时不误判为不可信()
     {
         var facts = Enumerable.Range(1, 7).Select(i => Fact($"D{i}", null)).ToList();
 
         var summary = DemandCompletionDiagnostics.Summarize(facts);
 
         summary.FactCount.Should().Be(7);
-        summary.CertainNullCount.Should().Be(7, "生产侧尚未置值 ⇒ 全部落 null 支");
+        summary.CertainNullCount.Should().Be(7, "`null` = 旧载荷未标注 ⇒ 全部落 null 支");
         summary.CertainFalseCount.Should().Be(0, "`null` 不是 `false`，不得计入不可信");
         summary.CertainTrueCount.Should().Be(0);
         summary.AnyUncertain.Should().BeFalse();

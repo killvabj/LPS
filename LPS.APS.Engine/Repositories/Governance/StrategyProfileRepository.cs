@@ -1,6 +1,7 @@
 using System.Text;
 using Dapper;
 using LPS.APS.Core.Entities.APS;
+using LPS.APS.Core.DTOs.Governance;
 using LPS.APS.Core.Interfaces;
 using LPS.APS.Engine.Data;
 using Microsoft.Extensions.Logging;
@@ -88,6 +89,84 @@ public class StrategyProfileRepository : IStrategyProfileRepository
         }
 
         var results = await _connectionManager.QueryAsync<StrategyProfile>(
+            sql.ToString(), parameters, db: DatabaseId.APS);
+
+        return results.ToList();
+    }
+
+    // ==================== 主子表联查·一版一行（2026-11-11，路线 A：策略包维护页新列表源） ====================
+
+    /// <inheritdoc />
+    public async Task<IReadOnlyList<StrategyProfileVersionRowDto>> GetVersionsWithMainAsync(
+        bool? activeOnly = null,
+        string? keyword = null,
+        string? status = null,
+        string? name = null,
+        int? skip = null,
+        int? take = null,
+        CancellationToken ct = default)
+    {
+        // 路线 A（缺陷 2026-11-11）：策略包列表改「一主表 + 一版本 = 一行」。
+        // 旧列表（GetListAsync）纯主表不含任何版本状态/绑定信息；本行形态逐版本可见状态，
+        // 并经父表带出 RunType（StrategyProfileVersion 无 RunType 列，P0-06 契约），
+        // 且随行 RuleSetVersionId/ParameterSetVersionId 绑定（策略包版本须引用已发布规则/参数版本）。
+        var sql = new StringBuilder(@"
+            SELECT
+                s.[Id]           AS StrategyProfileId,
+                s.[StrategyProfileCode], s.[StrategyProfileName], s.[Description],
+                s.[RunType], s.[IsActive],
+                s.[CreatedAt]    AS StrategyProfileCreatedAt,
+                v.[Id]           AS VersionId,
+                v.[VersionCode], v.[Status],
+                v.[RuleSetVersionId], v.[ParameterSetVersionId], v.[IsDefault],
+                v.[EffectiveFrom], v.[EffectiveTo],
+                v.[PublishedAt],  v.[PublishedBy],
+                v.[CreatedAt]
+            FROM [dbo].[StrategyProfile] s
+            INNER JOIN [dbo].[StrategyProfileVersion] v ON v.[StrategyProfileId] = s.[Id]
+            WHERE 1 = 1");
+
+        var parameters = new DynamicParameters();
+        if (activeOnly.HasValue)
+        {
+            sql.Append(" AND s.[IsActive] = @IsActive");
+            parameters.Add("IsActive", activeOnly.Value);
+        }
+
+        if (!string.IsNullOrWhiteSpace(keyword))
+        {
+            sql.Append(" AND (s.[StrategyProfileCode] LIKE @Keyword OR s.[StrategyProfileName] LIKE @Keyword)");
+            parameters.Add("Keyword", $"%{keyword.Trim()}%");
+        }
+
+        if (!string.IsNullOrWhiteSpace(status))
+        {
+            sql.Append(" AND v.[Status] = @Status");
+            parameters.Add("Status", status.Trim());
+        }
+
+        if (!string.IsNullOrWhiteSpace(name))
+        {
+            sql.Append(" AND s.[StrategyProfileName] LIKE @Name");
+            parameters.Add("Name", $"%{name.Trim()}%");
+        }
+
+        sql.Append(@"
+            ORDER BY s.[Id] DESC, v.[Id] ASC");
+
+        if (skip.HasValue)
+        {
+            sql.Append(" OFFSET @Skip ROWS");
+            parameters.Add("Skip", skip.Value);
+        }
+
+        if (take.HasValue)
+        {
+            sql.Append(" FETCH NEXT @Take ROWS ONLY");
+            parameters.Add("Take", take.Value);
+        }
+
+        var results = await _connectionManager.QueryAsync<StrategyProfileVersionRowDto>(
             sql.ToString(), parameters, db: DatabaseId.APS);
 
         return results.ToList();

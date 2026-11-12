@@ -17,3 +17,4 @@ D:\WorkSpace_LocalLib\Windsurf WorkSpace\LPS_SVN\LPS.APS.Engine\obj\Debug\net8.0
 D:\WorkSpace_LocalLib\Windsurf WorkSpace\LPS_SVN\LPS.APS.Engine\obj\Debug\net8.0\LPS.APS.Engine.pdb
 D:\WorkSpace_LocalLib\Windsurf WorkSpace\LPS_SVN\LPS.APS.Engine\obj\Debug\net8.0\LPS.APS.Engine.genruntimeconfig.cache
 D:\WorkSpace_LocalLib\Windsurf WorkSpace\LPS_SVN\LPS.APS.Engine\obj\Debug\net8.0\ref\LPS.APS.Engine.dll
+D:\WorkSpace_LocalLib\Windsurf WorkSpace\LPS_SVN\LPS.APS.Engine\bin\Debug\net8.0\LPS.APS.Engine.runtimeconfig.dev.json

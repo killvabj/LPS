@@ -22,6 +22,9 @@ public class BusinessFactIssueRepository : IBusinessFactIssueRepository
         string? materialCode = null,
         string? severity = null,
         string? reviewStatus = null,
+        string? issueType = null,
+        string? keyword = null,
+        string? factoryCode = null,
         int skip = 0,
         int take = 50,
         CancellationToken ct = default,
@@ -57,6 +60,9 @@ WHERE 1=1
     AND (@MaterialCode IS NULL OR ParentMaterialCode = @MaterialCode OR ChildMaterialCode = @MaterialCode)
     AND (@Severity IS NULL OR Severity = @Severity)
     AND (@ReviewStatus IS NULL OR ReviewStatus = @ReviewStatus)
+    AND (@IssueType IS NULL OR IssueType = @IssueType)
+    AND (@Kw IS NULL OR Detail LIKE @Kw OR BOMNO LIKE @Kw OR ParentMaterialCode LIKE @Kw OR ChildMaterialCode LIKE @Kw)
+    AND (@UserFactoryCode IS NULL OR COALESCE(ExpectedFactory, ActualFactory) = @UserFactoryCode)
     AND (@HasFactories = 0 OR COALESCE(ExpectedFactory, ActualFactory) IN @AllowedFactories)
 ORDER BY
     CASE Severity
@@ -76,6 +82,9 @@ OFFSET @Skip ROWS FETCH NEXT @Take ROWS ONLY";
             MaterialCode = materialCode,
             Severity = severity,
             ReviewStatus = reviewStatus,
+            IssueType = string.IsNullOrWhiteSpace(issueType) ? null : issueType.Trim(),
+            Kw = string.IsNullOrWhiteSpace(keyword) ? null : "%" + keyword.Trim() + "%",   // CI 排序规则(Chinese_PRC_CI_AS)天然大小写不敏感
+            UserFactoryCode = string.IsNullOrWhiteSpace(factoryCode) ? null : factoryCode.Trim(),
             HasFactories = hasFactories,
             AllowedFactories = allowedFactories,
             Skip = skip,
@@ -96,6 +105,9 @@ OFFSET @Skip ROWS FETCH NEXT @Take ROWS ONLY";
         string? materialCode = null,
         string? severity = null,
         string? reviewStatus = null,
+        string? issueType = null,
+        string? keyword = null,
+        string? factoryCode = null,
         int skip = 0,
         int take = 50,
         CancellationToken ct = default,
@@ -133,6 +145,9 @@ WHERE 1=1
     AND (@MaterialCode IS NULL OR m.MaterialCode = @MaterialCode)
     AND (@Severity IS NULL OR m.Severity = @Severity)
     AND (@ReviewStatus IS NULL OR m.ReviewStatus = @ReviewStatus)
+    AND (@IssueType IS NULL OR m.IssueType = @IssueType)
+    AND (@Kw IS NULL OR m.Detail LIKE @Kw OR m.MaterialCode LIKE @Kw)   -- 本源无单据号列，keyword 只打 Detail/MaterialCode（4号位件 §2.2 如实口径）
+    AND (@UserFactoryCode IS NULL OR pc.FactoryCode = @UserFactoryCode)
     AND (@HasFactories = 0 OR pc.FactoryCode IN @AllowedFactories)
 ORDER BY
     CASE m.Severity
@@ -142,7 +157,8 @@ ORDER BY
         WHEN 'INFO' THEN 2
         ELSE 3
     END,
-    m.CreatedAt DESC
+    m.CreatedAt DESC,
+    m.MaterialCode, m.IssueType   -- tiebreaker：同 CreatedAt 并列时的定序键，翻页不重不漏（全链清扫同型）
 OFFSET @Skip ROWS FETCH NEXT @Take ROWS ONLY";
 
         var parameters = new
@@ -151,6 +167,9 @@ OFFSET @Skip ROWS FETCH NEXT @Take ROWS ONLY";
             MaterialCode = materialCode,
             Severity = severity,
             ReviewStatus = reviewStatus,
+            IssueType = string.IsNullOrWhiteSpace(issueType) ? null : issueType.Trim(),
+            Kw = string.IsNullOrWhiteSpace(keyword) ? null : "%" + keyword.Trim() + "%",
+            UserFactoryCode = string.IsNullOrWhiteSpace(factoryCode) ? null : factoryCode.Trim(),
             HasFactories = hasFactories,
             AllowedFactories = allowedFactories,
             Skip = skip,
@@ -169,6 +188,8 @@ OFFSET @Skip ROWS FETCH NEXT @Take ROWS ONLY";
         string? factoryCode = null,
         string? severity = null,
         string? reviewStatus = null,
+        string? issueType = null,
+        string? keyword = null,
         int skip = 0,
         int take = 100,
         CancellationToken ct = default,
@@ -180,6 +201,8 @@ OFFSET @Skip ROWS FETCH NEXT @Take ROWS ONLY";
         // skip > take 时必空。两表分属不同服务器（BOM Issues=ODS，MSC=APS_Production），
         // 无法单 SQL UNION ALL，故各源取自己的 top (skip+take)：任一源的全局 top (skip+take)
         // 行必含自身 top (skip+take)，合并后再全局排序取窗口，语义正确。
+        // 11-11（4号位件）：issueType/keyword/factoryCode **在各自源内先过滤**再取 top，
+        // 避免"跨源先取数后过滤"的窗口偏差——keyword 过滤请保持本形态，勿上移。
         var innerTake = skip + take;
 
         // BOM Workset Issues
@@ -187,7 +210,8 @@ OFFSET @Skip ROWS FETCH NEXT @Take ROWS ONLY";
         {
             var bomIssues = await QueryBomWorksetIssuesAsync(
                 materialCode: materialCode, severity: severity,
-                reviewStatus: reviewStatus, take: innerTake, ct: ct,
+                reviewStatus: reviewStatus, issueType: issueType, keyword: keyword,
+                factoryCode: factoryCode, take: innerTake, ct: ct,
                 allowedFactories: allowedFactories);
             allIssues.AddRange(bomIssues);
         }
@@ -197,7 +221,8 @@ OFFSET @Skip ROWS FETCH NEXT @Take ROWS ONLY";
         {
             var mscIssues = await QueryMaterialStageContextIssuesAsync(
                 materialCode: materialCode, severity: severity,
-                reviewStatus: reviewStatus, take: innerTake, ct: ct,
+                reviewStatus: reviewStatus, issueType: issueType, keyword: keyword,
+                factoryCode: factoryCode, take: innerTake, ct: ct,
                 allowedFactories: allowedFactories);
             allIssues.AddRange(mscIssues);
         }
@@ -214,11 +239,14 @@ OFFSET @Skip ROWS FETCH NEXT @Take ROWS ONLY";
             .ToList();
     }
 
-    /// <summary>BOM Workset Issues 命中总数（同查询1 WHERE，不含分页）</summary>
+    /// <summary>BOM Workset Issues 命中总数（同查询1 WHERE，不含分页；11-11 与列表同参数集）</summary>
     public async Task<int> CountBomWorksetIssuesAsync(
         string? materialCode = null,
         string? severity = null,
         string? reviewStatus = null,
+        string? issueType = null,
+        string? keyword = null,
+        string? factoryCode = null,
         CancellationToken ct = default,
         IReadOnlySet<string>? allowedFactories = null)
     {
@@ -233,6 +261,9 @@ WHERE 1=1
     AND (@MaterialCode IS NULL OR ParentMaterialCode = @MaterialCode OR ChildMaterialCode = @MaterialCode)
     AND (@Severity IS NULL OR Severity = @Severity)
     AND (@ReviewStatus IS NULL OR ReviewStatus = @ReviewStatus)
+    AND (@IssueType IS NULL OR IssueType = @IssueType)
+    AND (@Kw IS NULL OR Detail LIKE @Kw OR BOMNO LIKE @Kw OR ParentMaterialCode LIKE @Kw OR ChildMaterialCode LIKE @Kw)
+    AND (@UserFactoryCode IS NULL OR COALESCE(ExpectedFactory, ActualFactory) = @UserFactoryCode)
     AND (@HasFactories = 0 OR COALESCE(ExpectedFactory, ActualFactory) IN @AllowedFactories)";
 
         var parameters = new
@@ -240,6 +271,9 @@ WHERE 1=1
             MaterialCode = materialCode,
             Severity = severity,
             ReviewStatus = reviewStatus,
+            IssueType = string.IsNullOrWhiteSpace(issueType) ? null : issueType.Trim(),
+            Kw = string.IsNullOrWhiteSpace(keyword) ? null : "%" + keyword.Trim() + "%",
+            UserFactoryCode = string.IsNullOrWhiteSpace(factoryCode) ? null : factoryCode.Trim(),
             HasFactories = hasFactories,
             AllowedFactories = allowedFactories
         };
@@ -248,11 +282,14 @@ WHERE 1=1
             sql, parameters, CommandType.Text, DatabaseId.APS, commandTimeout: 30);
     }
 
-    /// <summary>MaterialStageDeptContext Issues 命中总数（同查询2 WHERE，不含分页）</summary>
+    /// <summary>MaterialStageDeptContext Issues 命中总数（同查询2 WHERE，不含分页；11-11 与列表同参数集）</summary>
     public async Task<int> CountMaterialStageContextIssuesAsync(
         string? materialCode = null,
         string? severity = null,
         string? reviewStatus = null,
+        string? issueType = null,
+        string? keyword = null,
+        string? factoryCode = null,
         CancellationToken ct = default,
         IReadOnlySet<string>? allowedFactories = null)
     {
@@ -269,6 +306,9 @@ WHERE 1=1
     AND (@MaterialCode IS NULL OR m.MaterialCode = @MaterialCode)
     AND (@Severity IS NULL OR m.Severity = @Severity)
     AND (@ReviewStatus IS NULL OR m.ReviewStatus = @ReviewStatus)
+    AND (@IssueType IS NULL OR m.IssueType = @IssueType)
+    AND (@Kw IS NULL OR m.Detail LIKE @Kw OR m.MaterialCode LIKE @Kw)
+    AND (@UserFactoryCode IS NULL OR pc.FactoryCode = @UserFactoryCode)
     AND (@HasFactories = 0 OR pc.FactoryCode IN @AllowedFactories)";
 
         var parameters = new
@@ -276,6 +316,9 @@ WHERE 1=1
             MaterialCode = materialCode,
             Severity = severity,
             ReviewStatus = reviewStatus,
+            IssueType = string.IsNullOrWhiteSpace(issueType) ? null : issueType.Trim(),
+            Kw = string.IsNullOrWhiteSpace(keyword) ? null : "%" + keyword.Trim() + "%",
+            UserFactoryCode = string.IsNullOrWhiteSpace(factoryCode) ? null : factoryCode.Trim(),
             HasFactories = hasFactories,
             AllowedFactories = allowedFactories
         };
@@ -288,16 +331,21 @@ WHERE 1=1
     public async Task<int> CountAllAsync(
         string? source = null,
         string? materialCode = null,
+        string? factoryCode = null,
         string? severity = null,
         string? reviewStatus = null,
+        string? issueType = null,
+        string? keyword = null,
         CancellationToken ct = default,
         IReadOnlySet<string>? allowedFactories = null)
     {
         var total = 0;
         if (string.IsNullOrEmpty(source) || source == "BOM_WORKSET")
-            total += await CountBomWorksetIssuesAsync(materialCode, severity, reviewStatus, ct, allowedFactories);
+            total += await CountBomWorksetIssuesAsync(materialCode, severity, reviewStatus,
+                issueType, keyword, factoryCode, ct, allowedFactories);
         if (string.IsNullOrEmpty(source) || source == "MATERIAL_STAGE_CONTEXT")
-            total += await CountMaterialStageContextIssuesAsync(materialCode, severity, reviewStatus, ct, allowedFactories);
+            total += await CountMaterialStageContextIssuesAsync(materialCode, severity, reviewStatus,
+                issueType, keyword, factoryCode, ct, allowedFactories);
         return total;
     }
 }

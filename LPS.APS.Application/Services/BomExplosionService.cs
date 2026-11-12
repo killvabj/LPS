@@ -119,10 +119,16 @@ public sealed class BomExplosionService : IBomExplosionService
         var isPurchasedByCode = new Dictionary<string, bool>(StringComparer.Ordinal);
         var parentEdgesByCode = new Dictionary<string, Dictionary<int, BomParentEdge>>(StringComparer.Ordinal);
 
+        // 2026-11-10 O65：每个物料的**制造厂**（此前一律写 root.FactoryId ⇒ 子件永远继承父厂）。
+        //   解析依据 = 该子件入边上的 `ChildRequiredFactory`（R17 产物），经 `Factory` 主档映射成 Id。
+        var factoryIdByCode = new Dictionary<string, int>(StringComparer.Ordinal);
+        var factorySourceByCode = new Dictionary<string, BomFactorySource>(StringComparer.Ordinal);
+
         var expanded = new HashSet<string>(StringComparer.Ordinal); // 子件已完整枚举（记忆化）
         var onPath = new HashSet<string>(StringComparer.Ordinal);   // 当前 DFS 路径（拦真实环）
 
-        Discover(root.RootMaterialCode, root.RootMaterialId, parentCode: "", parentId: 0, qtyPerUnit: 0m);
+        Discover(root.RootMaterialCode, root.RootMaterialId, parentCode: "", parentId: 0, qtyPerUnit: 0m,
+                 parentFactoryId: root.FactoryId, requiredFactoryCode: null);
 
         // 阶段② 最深层（LLC）拓扑弛豫：level[child] = max(level[parent] + 1)。
         var levelByCode = new Dictionary<string, int>(StringComparer.Ordinal);
@@ -157,20 +163,41 @@ public sealed class BomExplosionService : IBomExplosionService
         }
 
         return levelByCode
-            .Select(kv => new BomLevelNode(
-                MaterialId: idByCode[kv.Key],
-                MaterialCode: kv.Key,
-                FactoryId: root.FactoryId,
-                Level: kv.Value,
-                IsPurchased: isPurchasedByCode[kv.Key],
-                ParentEdges: parentEdgesByCode.TryGetValue(kv.Key, out var edgeMap)
+            .Select(kv =>
+            {
+                var edges = parentEdgesByCode.TryGetValue(kv.Key, out var edgeMap)
                     ? (IReadOnlyList<BomParentEdge>)edgeMap.Values.OrderBy(e => e.ParentMaterialId).ToList()
-                    : Array.Empty<BomParentEdge>()))
+                    : Array.Empty<BomParentEdge>();
+
+                // 多父冲突：同一子件被不同父边指定了不同的应归属厂。节点按物料唯一 ⇒ 只能取首个父边的厂，
+                //   这里把冲突标出来（不静默），由主链计数并告警。
+                var distinctRequired = edges
+                    .Where(e => !string.IsNullOrWhiteSpace(e.ChildRequiredFactoryCode))
+                    .Select(e => e.ChildRequiredFactoryCode!.Trim())
+                    .Distinct(StringComparer.Ordinal)
+                    .Count();
+
+                var source = distinctRequired > 1
+                    ? BomFactorySource.ConflictFirstParentWins
+                    : factorySourceByCode[kv.Key];
+
+                return new BomLevelNode(
+                    MaterialId: idByCode[kv.Key],
+                    MaterialCode: kv.Key,
+                    FactoryId: factoryIdByCode[kv.Key],
+                    Level: kv.Value,
+                    IsPurchased: isPurchasedByCode[kv.Key],
+                    ParentEdges: edges)
+                {
+                    FactorySource = source,
+                };
+            })
             .OrderBy(n => n.Level)
             .ThenBy(n => n.MaterialCode, StringComparer.Ordinal)
             .ToList();
 
-        void Discover(string code, int id, string parentCode, int parentId, decimal qtyPerUnit)
+        void Discover(string code, int id, string parentCode, int parentId, decimal qtyPerUnit,
+                      int parentFactoryId, string? requiredFactoryCode)
         {
             if (onPath.Contains(code)) return; // 真实环 back-edge：不记父边、不展开、不抬层
 
@@ -180,20 +207,64 @@ public sealed class BomExplosionService : IBomExplosionService
                 if (!parentEdgesByCode.TryGetValue(code, out var edgeMap))
                     parentEdgesByCode[code] = edgeMap = new Dictionary<int, BomParentEdge>();
                 if (!edgeMap.ContainsKey(parentId))
-                    edgeMap[parentId] = new BomParentEdge(parentId, parentCode, qtyPerUnit);
+                    edgeMap[parentId] = new BomParentEdge(parentId, parentCode, qtyPerUnit)
+                    {
+                        ChildRequiredFactoryCode = string.IsNullOrWhiteSpace(requiredFactoryCode)
+                            ? null
+                            : requiredFactoryCode!.Trim(),
+                    };
             }
 
             if (expanded.Contains(code)) return; // 子树已完整枚举：只补记上方父边，不再重走子件
 
+            // ── 制造厂归属（O65）──────────────────────────────────────────────
+            //   根 = 订单厂；子件 = 按入边 `ChildRequiredFactory` 解析。
+            //   空值按 5号位 定性是外购件（不制造），但**走到这里说明该子件未被判为采购件**，
+            //   故仍是缺值 ⇒ 保持父厂 + 打 MissingFallback，由主链计数告警，不静默。
+            // 采购/自制与工厂判定同源：采购件空厂＝正常（5号位：空值 100% 是外购行）；
+            //   自制件空厂＝缺值。先算 IsPurchased 再定来源，否则 39.8 万采购件会把缺值计数淹没。
+            var isPurchased = structure.IsPurchasedByMaterial.TryGetValue(code, out var purchased) && purchased;
+
+            int resolvedFactoryId;
+            BomFactorySource source;
+            if (parentId == 0)
+            {
+                resolvedFactoryId = root.FactoryId;
+                source = BomFactorySource.SameAsParent;
+            }
+            else if (string.IsNullOrWhiteSpace(requiredFactoryCode))
+            {
+                resolvedFactoryId = parentFactoryId;
+                source = isPurchased
+                    ? BomFactorySource.PurchasedNoFactory
+                    : BomFactorySource.MissingFallback;
+            }
+            else if (!structure.FactoryIdByCode.TryGetValue(requiredFactoryCode!.Trim(), out resolvedFactoryId))
+            {
+                resolvedFactoryId = parentFactoryId;
+                source = BomFactorySource.UnknownFallback;
+            }
+            else
+            {
+                source = resolvedFactoryId == parentFactoryId
+                    ? BomFactorySource.SameAsParent
+                    : BomFactorySource.Rerouted;
+            }
+
+            factoryIdByCode[code] = resolvedFactoryId;
+            factorySourceByCode[code] = source;
+
             idByCode[code] = id;
-            isPurchasedByCode[code] = structure.IsPurchasedByMaterial.TryGetValue(code, out var purchased) && purchased;
+            isPurchasedByCode[code] = isPurchased;
             expanded.Add(code);
 
             if (isPurchasedByCode[code]) return; // 采购件即叶，不下钻（对齐旧 TraverseBomNode）
 
             onPath.Add(code);
             foreach (var child in GetUnitVector(structure, code))
-                Discover(child.ChildCode, child.ChildMaterialId, code, id, child.QtyPerUnit);
+                Discover(child.ChildCode, child.ChildMaterialId, code, id, child.QtyPerUnit,
+                         parentFactoryId: resolvedFactoryId,
+                         requiredFactoryCode: child.ChildRequiredFactoryCode);
             onPath.Remove(code);
         }
     }
