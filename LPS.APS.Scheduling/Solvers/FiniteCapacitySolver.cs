@@ -176,6 +176,11 @@ public class FiniteCapacitySolver : IFiniteCapacityScheduler
         }
         SolverDiagnostics.EndPhase(p2, 2);
 
+        // 2026-11-14 探针：Phase2 交付时的同资源重叠（`APS_P5_OVERLAP_PROBE=1` 才写，零行为变更）
+        PhaseFiveCompression.ProbeOverlaps("AFTER_PHASE2", scheduleResult.ScheduledTasks);
+        // 2026-11-16 探针：Phase2 交付时的跨物料 TaskDependency 越序（`APS_P5_XMAT_PROBE=1` 才写）
+        PhaseFiveCompression.ProbeCrossMaterial("AFTER_PHASE2", scheduleResult.ScheduledTasks, request, constraints);
+
         // ═══════════════════════════════════════════════
         // Phase 3: 可行性与延期诊断
         // ═══════════════════════════════════════════════
@@ -195,6 +200,19 @@ public class FiniteCapacitySolver : IFiniteCapacityScheduler
         var p4 = SolverDiagnostics.StartPhase();
         var repairResult = phase4.Repair(request, scheduleResult, diagnostics, constraints, cancellationToken);
         SolverDiagnostics.EndPhase(p4, 4);
+
+        // 2026-11-14 探针：Phase4 之后的合并结果（与 Phase5 入口同口径）
+        //   —— Phase4 会**原地替换** `scheduleResult.ScheduledTasks` 并把新增批放进 `RepairedTasks`，
+        //      故这里必须合并两表才等价于 `Compress` 的 `allScheduledTasks`。
+        {
+            var combined = new List<FinalTaskDraft>(
+                scheduleResult.ScheduledTasks.Count + repairResult.RepairedTasks.Count);
+            combined.AddRange(scheduleResult.ScheduledTasks);
+            combined.AddRange(repairResult.RepairedTasks);
+            PhaseFiveCompression.ProbeOverlaps("AFTER_PHASE4", combined);
+            // 2026-11-16 探针：Phase4 之后的跨物料 TaskDependency 越序
+            PhaseFiveCompression.ProbeCrossMaterial("AFTER_PHASE4", combined, request, constraints);
+        }
 
         // ═══════════════════════════════════════════════
         // Phase 5: 压缩空隙与最终评价

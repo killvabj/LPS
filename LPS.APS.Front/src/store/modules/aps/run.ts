@@ -22,6 +22,7 @@ import { computed, ref } from 'vue'
 import {
   runApi,
   overviewApi,
+  strategyProfileApi,
   ApiError,
   type ActiveVersionPanel,
   type RecoverFailedRunResult,
@@ -70,7 +71,7 @@ export interface RunListItem extends ScheduleRunGovDto {
   expectedDomainKeys: DomainKey[] | null
 }
 
-/** 后端给的是 JSON 数组字符串；解析失败不抛，按 null 走「无域限定」放行 */
+/** 后端给的是 JSON 数组字符串；解析失败不抛，按 null 走「这次排产没登记排程域」 */
 function parseDomainKeysJson(raw?: string | null): DomainKey[] | null {
   if (!raw) return null
   try {
@@ -81,9 +82,29 @@ function parseDomainKeysJson(raw?: string | null): DomainKey[] | null {
   }
 }
 
+/** 后端行 → 列表项（补解析后的排程域数组） */
+function toRunListItem(r: ScheduleRunGovDto): RunListItem {
+  return {
+    ...r,
+    expectedDomainKeys: parseDomainKeysJson(r.expectedDomainKeysJson)
+  }
+}
+
+/** 分页端点不可用时（后端未部署）从数组端点取的条数 */
+const RUNS_FALLBACK_TAKE = 50
+
 export const useRunStore = defineStore('aps.run', () => {
   // ===== state =====
   const runs = ref<RunListItem[]>([])
+  /**
+   * 分页状态（3号位 2026-11-12 R4：服务端分页端点 `GET /api/governance/runs/paged`）
+   *  - `runsTotal` = **过滤后**全量条数（服务端给，与列表同 where）
+   *  - `runsPagedAvailable` = 分页端点是否可用；false = 该端点尚未部署，已降级到数组端点
+   */
+  const runsTotal = ref(0)
+  const runsPage = ref(1)
+  const runsPageSize = ref(20)
+  const runsPagedAvailable = ref(false)
   const activeVersions = ref<ActiveVersionPanel[]>([])
   const domainStatuses = ref<RunDomainStatusItem[]>([])
   /** 域状态对应的 Run（取最近一次）；null = 尚无可取数的 Run */
@@ -98,6 +119,16 @@ export const useRunStore = defineStore('aps.run', () => {
    */
   const domainStatusHasDenominator = ref(false)
 
+  /**
+   * 策略包版本 Id → 版本码（仅用于把 Run 上的内部 Id 显示成人能读的版本码）。
+   *
+   * 数据面 ④ `GET /api/governance/strategy-profiles/versions`（3号位，权限 aps.strategy.view）。
+   * 取不到时**不冒充「没有版本」**：置空对照表 + `strategyProfileVersionLookupOk=false`，
+   * 页面显示「—」并在悬停时说明取数原因。
+   */
+  const strategyProfileVersionCodes = ref<Record<number, string>>({})
+  const strategyProfileVersionLookupOk = ref(true)
+
   const loading = ref(false)
   const error = ref<string | null>(null)
   const errors = ref<RunSectionError[]>([])
@@ -106,26 +137,49 @@ export const useRunStore = defineStore('aps.run', () => {
   const recovering = ref(false)
 
   // ===== getters =====
-  /** P1-15：业务范围（前端防御；后端亦有二次校验） */
+  /**
+   * P1-15 业务范围：**只用于写操作的前端防御**（后端亦有二次校验）。
+   *
+   * 批次**可见性**不由前端判 —— 一律以服务端返回为准（3号位 2026-11-12 R4 铁律：
+   * 「服务端是唯一裁决方，前端不再自判范围」）。
+   */
   const apsAuth = useApsAuthStore()
 
   /**
-   * Run 是否落在当前用户业务范围内。
+   * 可见批次 = **服务端返回的批次**。
    *
-   * ⚠️ 2026-10-16：后端 `ScheduleRunGov` 只给 `ExpectedDomainKeysJson` **JSON 字符串**，
-   *    且 dev 实测 44 条里只有 7 条有值（其余被 WhenWritingNull 省略）。
-   *    缺该字段时**按放行处理**（无域限定 = 全员可见），不猜、不拿别的字段顶替 ——
-   *    否则 37 条会被静默隐藏、页面又变成「空」。已随函请后端确认该字段是否应补齐。
+   * ⚠️ 2026-11-12：旧写法在前端又按 `dataScope.domainKeys` 过滤一次，且「没登记预期域的批次」
+   *    一律放行。3号位 R4 裁定「前端不再自判范围」+ Q2 裁定「没登记排程域的批次仅 Global 可见」
+   *    ⇒ 这层前端判定已删除；范围收窄改由服务端负责：
+   *    `GET /api/governance/runs` / `runs/paged` 已加 Domain 授权过滤（R1 已落码，
+   *    `OPENJSON` EXISTS 精确过滤，total 与列表同 where）。
    */
-  function runInScope(run: RunListItem): boolean {
-    const keys = apsAuth.dataScope.domainKeys
-    if (keys.length === 0) return true
-    if (!run.expectedDomainKeys || run.expectedDomainKeys.length === 0) return true
-    return run.expectedDomainKeys.some((k) => keys.includes(k))
-  }
+  const visibleRuns = computed(() => runs.value)
 
-  const visibleRuns = computed(() => runs.value.filter(runInScope))
-  const latestRun = computed<RunListItem | null>(() => visibleRuns.value[0] ?? null)
+  /**
+   * 最近一次排产（= **最近一次「可见」排产**）。
+   *
+   * 2026-11-12 3号位 R4 追加要求：主视图按「最近可见批次」定位，不取「全局最近批次」——
+   * 受限账号不该看到自己无权看的批次。可见性由服务端过滤决定（见 `visibleRuns`）。
+   *
+   * ⚠️ 2026-11-11：后端 `ScheduleRunRepository.cs:61` 是 `ORDER BY [Id] DESC`，
+   *    **不是按启动时间**；Id 与启动时间不同序时（补录历史批次、并发写入）
+   *    直接取 `[0]` 会把「最近一次」认错 ⇒ 此处显式按 `startedAt` 倒序。
+   */
+  const runsByStartedDesc = computed(() =>
+    [...visibleRuns.value].sort(
+      (a, b) => new Date(b.startedAt).getTime() - new Date(a.startedAt).getTime()
+    )
+  )
+
+  /**
+   * 最近一次排产（= **最近一次「可见」排产**）—— 主视图用的那一条。
+   *
+   * ⚠️ 服务端分页后**不能**拿「当前页第一行」当主视图：翻到第 2 页时主视图会换成第 2 页的批次。
+   *    ⇒ 主视图只跟第 1 页走（3号位 2026-11-12 R4 追加要求：按「最近可见批次」定位，
+   *    不取「全局最近批次」）。可见性由服务端过滤决定（见 `visibleRuns`）。
+   */
+  const latestRun = ref<RunListItem | null>(null)
 
   /** 各状态计数（四值齐全，未出现的状态为 0，不开新键） */
   const runStatusCounts = computed(() => {
@@ -147,10 +201,16 @@ export const useRunStore = defineStore('aps.run', () => {
   )
 
   // ===== actions =====
-  async function load(): Promise<void> {
+  /**
+   * 页面数据装载。
+   *
+   * @param page 批次记录表要显示的页（1 基）；不传 = 保持当前页（刷新不跳页）
+   */
+  async function load(page?: number): Promise<void> {
     loading.value = true
     error.value = null
     errors.value = []
+    const targetPage = page ?? runsPage.value
     const failed = (section: string, err: unknown, fallback: string) =>
       errors.value.push({
         section,
@@ -162,13 +222,30 @@ export const useRunStore = defineStore('aps.run', () => {
 
     // ---- ① Run 列表（页面主体）----
     try {
-      const rows = await runApi.listRuns(50)
-      runs.value = rows.map((r) => ({
-        ...r,
-        expectedDomainKeys: parseDomainKeysJson(r.expectedDomainKeysJson)
-      }))
+      // 优先服务端分页端点（R4，3号位已落码但**尚未部署**）⇒ 取不到时降级到数组端点，
+      //   页面照常有数据、只是不能翻页（runsPagedAvailable=false，页面不显示翻页控件）。
+      const paged = await runApi
+        .listRunsPaged({ page: targetPage, pageSize: runsPageSize.value })
+        .catch(() => null)
+      if (paged) {
+        runs.value = paged.items.map(toRunListItem)
+        runsTotal.value = paged.total ?? paged.items.length
+        runsPage.value = paged.page ?? targetPage
+        runsPagedAvailable.value = true
+      } else {
+        const rows = await runApi.listRuns(RUNS_FALLBACK_TAKE)
+        runs.value = rows.map(toRunListItem)
+        runsTotal.value = rows.length
+        runsPage.value = 1
+        runsPagedAvailable.value = false
+      }
+      // 主视图只跟第 1 页走（翻页不应把主视图换成第 2 页的批次）
+      if (runsPage.value === 1) {
+        latestRun.value = runsByStartedDesc.value[0] ?? null
+      }
     } catch (err) {
       runs.value = []
+      latestRun.value = null
       failed('排产记录', err, '加载排产记录失败')
     }
 
@@ -184,7 +261,7 @@ export const useRunStore = defineStore('aps.run', () => {
     //  没有 runId 就不发请求（路由是 {scheduleRunId:int}）。
     //  后端对「该 Run 没登记 ExpectedDomainKeysJson」的 run 返 404（实测 run 160 如此，
     //  45 条里 37 条属此类）⇒ 走卡片里的空态，不进 errors[]、不弹全局 toast。
-    const latest = visibleRuns.value[0]
+    const latest = latestRun.value
     if (!latest) {
       domainStatuses.value = []
       domainStatusRunId.value = null
@@ -204,6 +281,22 @@ export const useRunStore = defineStore('aps.run', () => {
           failed('排程域状态', err, '加载排程域状态失败')
         }
       }
+    }
+
+    // ---- ④ 策略包版本码对照（3号位）----
+    // 只是把 Run 上的策略包版本 Id 翻成版本码；取不到不阻塞页面主体，
+    // 页面显示「—」并在悬停时说明（不冒充「这一版没有策略包」）。
+    try {
+      const rows = await strategyProfileApi.listProfileVersionRows()
+      const map: Record<number, string> = {}
+      rows.forEach((r) => {
+        map[r.versionId] = r.versionCode
+      })
+      strategyProfileVersionCodes.value = map
+      strategyProfileVersionLookupOk.value = true
+    } catch {
+      strategyProfileVersionCodes.value = {}
+      strategyProfileVersionLookupOk.value = false
     }
 
     loading.value = false
@@ -276,6 +369,12 @@ export const useRunStore = defineStore('aps.run', () => {
     }
   }
 
+  /** 翻页 / 改每页条数（页面只走这一个入口；改条数后回到第 1 页） */
+  async function changePage(page: number, size?: number): Promise<void> {
+    if (size && size !== runsPageSize.value) runsPageSize.value = size
+    await load(page)
+  }
+
   function handleError(err: unknown): void {
     if (err instanceof ApiError) {
       error.value =
@@ -287,10 +386,16 @@ export const useRunStore = defineStore('aps.run', () => {
 
   function reset(): void {
     runs.value = []
+    runsTotal.value = 0
+    runsPage.value = 1
+    runsPagedAvailable.value = false
+    latestRun.value = null
     activeVersions.value = []
     domainStatuses.value = []
     domainStatusRunId.value = null
     domainStatusHasDenominator.value = false
+    strategyProfileVersionCodes.value = {}
+    strategyProfileVersionLookupOk.value = true
     error.value = null
     errors.value = []
     lastRecover.value = null
@@ -298,12 +403,19 @@ export const useRunStore = defineStore('aps.run', () => {
 
   return {
     runs,
+    runsTotal,
+    runsPage,
+    runsPageSize,
+    runsPagedAvailable,
     visibleRuns,
+    runsByStartedDesc,
     latestRun,
     activeVersions,
     domainStatuses,
     domainStatusRunId,
     domainStatusHasDenominator,
+    strategyProfileVersionCodes,
+    strategyProfileVersionLookupOk,
     loading,
     error,
     errors,
@@ -311,8 +423,8 @@ export const useRunStore = defineStore('aps.run', () => {
     recovering,
     runStatusCounts,
     attentionRuns,
-    runInScope,
     load,
+    changePage,
     recoverFailedRun,
     validateDomainKeys,
     reset,

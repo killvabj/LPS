@@ -115,12 +115,16 @@ const cases = [
     all: true
   },
 
-  /* ===== R45-R47：停用行默认折叠 + 开关必须还在（2026-10-30）===== */
+  /* ===== R45-R47：停用行可见性口径（2026-11-11 规则集页改口径后）
+   *  · 规则集页：撤「显示已停用」开关 + 撤 KPI 横条 ⇒ 「全部」页签含停用，
+   *    改用「关键词 / 主表状态 / 排序」筛选条件；
+   *  · 参数集页、策略包页：维持「默认折叠 + 留开关」原口径。
+   *  ⇒ 下面三条变异改打在**参数集**侧（开关仍在的那一族），规则集侧另加两条新变异。 */
   {
     // 开关默认值改成 true ⇒ 默认又显示停用行 ⇒ R45 必须转红
     id: 'R45',
     group: 'rules',
-    file: STORE_RULE,
+    file: STORE_PS,
     from: 'const showInactive = ref(false)',
     to: 'const showInactive = ref(true)'
   },
@@ -128,17 +132,43 @@ const cases = [
     // 判据改成「只留停用行」⇒ 与探针要求的 `isActive !== false` 不符 ⇒ R46 必须转红
     id: 'R46',
     group: 'rules',
-    file: STORE_RULE,
-    from: 'if (!showInactive.value) arr = arr.filter((r) => r.isActive !== false)',
-    to: 'if (!showInactive.value) arr = arr.filter((r) => r.isActive === false)'
+    file: STORE_PS,
+    from: 'if (!showInactive.value) arr = arr.filter((p) => p.isActive !== false)',
+    to: 'if (!showInactive.value) arr = arr.filter((p) => p.isActive === false)'
   },
   {
     // 开关文案彻底改掉 ⇒ 页面上不再有「显示已停用」⇒ R47 必须转红
     id: 'R47',
     group: 'rules',
-    file: PAGE_RULE,
+    file: PAGE_PS,
     from: '显示已停用（{{ inactiveCount }}）',
     to: '显示停用条目（{{ inactiveCount }}）'
+  },
+  {
+    // 规则集页把「显示已停用」开关加回来 ⇒ R47（规则集页不应再有开关）必须转红
+    id: 'R47',
+    group: 'rules',
+    file: PAGE_RULE,
+    from: '<div class="filter-tools">',
+    to:
+      '<div class="filter-tools">\n        <label class="show-inactive-toggle"><ElSwitch v-model="showInactive" /><span>显示已停用</span></label>'
+  },
+  {
+    // 规则集 store 把「默认折叠停用行」的开关加回来 ⇒ R45（规则集侧不应再有 showInactive）必须转红
+    id: 'R45',
+    group: 'rules',
+    file: STORE_RULE,
+    from: "  const listActiveFilter = ref<'ALL' | 'ACTIVE' | 'INACTIVE'>('ALL')",
+    to:
+      "  const showInactive = ref(false)\n  const listActiveFilter = ref<'ALL' | 'ACTIVE' | 'INACTIVE'>('ALL')"
+  },
+  {
+    // 规则集 store 的「主表状态：停用」分支被改掉 ⇒ R46（主表状态筛选必须完整）必须转红
+    id: 'R46',
+    group: 'rules',
+    file: STORE_RULE,
+    from: "    } else if (listActiveFilter.value === 'INACTIVE') {",
+    to: "    } else if (listActiveFilter.value === 'STOPPED') {"
   },
   {
     // 策略包页列表回退成直出全量 ⇒ 「防回退」那一条必须转红

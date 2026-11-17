@@ -126,6 +126,46 @@ public class CrossMaterialTimingConstraintTests
         Assert.Contains("环", result.ErrorMessage);
     }
 
+    /// <summary>
+    /// 2026-11-14（用户裁决）：成环**只让环上需求未排**，环外需求照排，整体不再判技术失败。
+    /// 冻结依据：`06 v1.42:498`「无根据不得一律使整个 Domain 失败」；
+    ///           `01 v1.16:1446` 等「受影响需求局部未排，其余合法需求不受牵连」。
+    ///
+    /// 与上一条 `Cycle_Detected_ReturnsTechnicalFailure` 的区别：那条是**全部**需求都在环上
+    /// （无其余合法需求可排）⇒ 仍判技术失败；本条只有一个子图成环 ⇒ 局部未排。
+    /// </summary>
+    [Fact]
+    public async Task Cycle_PartialOnlyCyclicDemandsUnscheduled_RestStillScheduled()
+    {
+        // A ↔ B 成环；C 独立
+        var request = Build(
+            new[]
+            {
+                D("A", 1, 1, new DateTime(2026, 9, 5), 1),
+                D("B", 2, 2, new DateTime(2026, 9, 5), 2),
+                D("C", 3, 3, new DateTime(2026, 9, 5), 3),
+            },
+            new[]
+            {
+                L("A", "B"),
+                L("B", "A"),
+            },
+            "FORWARD", PlanningStart, PlanningEnd, TimeSpan.FromDays(30));
+
+        var result = await _solver.SolveAsync(request);
+
+        Assert.True(result.Success, result.ErrorMessage);
+
+        // 环上两个需求：未排，且不产 Task
+        Assert.Contains(result.UnscheduledTasks, u => u.DraftId == "A");
+        Assert.Contains(result.UnscheduledTasks, u => u.DraftId == "B");
+        Assert.DoesNotContain(result.FinalTasks, t => t.SourceDraftId == "A");
+        Assert.DoesNotContain(result.FinalTasks, t => t.SourceDraftId == "B");
+
+        // 环外需求：照排
+        Assert.Contains(result.FinalTasks, t => t.SourceDraftId == "C");
+    }
+
     [Fact]
     public async Task MultiLevelBom_GrandparentAfterParentAfterChild()
     {

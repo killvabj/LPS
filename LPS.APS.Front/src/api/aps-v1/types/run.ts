@@ -68,6 +68,20 @@ export interface ScheduleRunGovDto {
   errorMessage?: string | null
 }
 
+/**
+ * Run 列表分页返回体（3号位 2026-11-12 R4 新增端点 `GET /api/governance/runs/paged`）
+ *  - 与后端 `ScheduleRunGovPage` 同形（Items / Total / Page / PageSize，JSON 为 camelCase）
+ *  - 服务端排序已改 `[StartedAt] DESC, [Id] DESC`（修 Id 序≠启动时间序致翻页重复/漏行）
+ *  - `total` 为**按业务范围过滤后**的全量条数（与列表同 where）
+ *  - 既有数组端点 `GET /api/governance/runs` **原样保留**（不破坏既有消费方）
+ */
+export interface ScheduleRunGovPage {
+  items: ScheduleRunGovDto[]
+  total: number
+  page: number
+  pageSize: number
+}
+
 /** FAILED 恢复输入（U19：新建 Run，不直接改 FAILED → RUNNING） */
 export interface RecoverFailedRunInput {
   originalRunId: number

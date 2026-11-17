@@ -37,6 +37,18 @@ export interface DepartmentLookupItem {
   factoryId?: number | null
 }
 
+/** 生产部门项（GET /api/production-departments；5号位 ProductionDepartmentController 出参） */
+export interface ProductionDepartmentItem {
+  /** 生产部门 Id（= RoutingOperation.ProductionDepartmentId 的 FK 值） */
+  id: number
+  /** 部门编码（如 BJ_ASSY_涂布组） */
+  deptCode: string
+  /** 部门名称（如 BJ组立_涂布组）—— 用户展示口径 */
+  deptName: string
+  /** 是否启用 */
+  isActive: boolean
+}
+
 export const departmentLookupApi = {
   /**
    * 全量活跃部门（GET）
@@ -55,6 +67,18 @@ export const departmentLookupApi = {
     } catch {
       return []
     }
+  },
+
+  /**
+   * 生产部门全量（GET，**带部门名称**）
+   *  - 后端端点：GET /api/production-departments（5号位 ProductionDepartmentController）
+   *  - 出参：{ id, deptCode, deptName, isActive }；dev 实测 288 行（无分页）
+   *  - 用途：把「生产部门 Id」翻译成「部门名称」展示（如 OPM 工序列表的部门列）
+   *  - ⚠️ 权限：aps.resourcecalendar.view（资源日历域）⇒ 只持 aps.rule.* 的角色会 403
+   *  - 严格版（失败抛错）：页面据此区分「取不到部门名」与「没有部门」
+   */
+  async listProductionDepartmentsOrThrow(): Promise<ProductionDepartmentItem[]> {
+    return apsHttp.get<ProductionDepartmentItem[]>({ url: '/api/production-departments' })
   },
 
   /**

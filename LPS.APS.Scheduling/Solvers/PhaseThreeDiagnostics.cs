@@ -32,6 +32,13 @@ namespace LPS.APS.Scheduling.Solvers;
 internal class PhaseThreeDiagnostics
 {
     /// <summary>
+    /// 2026-11-14（EX-T01 / L1-01）：判定「物料齐套时点是否就是实际开工的绑定约束」的时间容差（分钟）。
+    ///   排程侧按分钟级放置，1 分钟内视为同一时点；超出即认定物料**不是**绑定入边（只是候选），
+    ///   不再抢容量/日历/前序的归因。
+    /// </summary>
+    private const double MaterialBindingToleranceMinutes = 1.0;
+
+    /// <summary>
     /// 执行可行性诊断
     /// </summary>
     public DiagnosticsResult Diagnose(
@@ -291,7 +298,11 @@ internal class PhaseThreeDiagnostics
         return index;
     }
 
-    private string DiagnoseDelayReason(
+    /// <remarks>
+    /// 2026-11-14（EX-T01）：`private` → `internal`，**仅供 `LPS.APS.Tests` 做判据正反例**。
+    ///   与同文件其它为测试开放的方法（`:281` 等）同口径；生产调用链不变。
+    /// </remarks>
+    internal string DiagnoseDelayReason(
         LogicalProductionDemand demand,
         List<FinalTaskDraft> demandTasks,
         ConstraintContext constraints,
@@ -362,17 +373,73 @@ internal class PhaseThreeDiagnostics
             return "RESOURCE_CAPACITY_WAIT";
         }
 
-        // 4. 物料可用时间
-        if (constraints.MaterialAvailability.TryGetValue(demand.AllocationSequence, out var segments))
+        // ── 4. 物料可用时间（2026-11-14 EX-T01 / L1-01：判据改为「累计满足本批 Q 的时点」）──
+        //
+        //   【旧判据为什么错】原写法 `firstTaskStart < segments.Min(AvailableTime)`：
+        //     排程侧 `GetMaterialEarliestTime` 已保证开工不早于物料可用 ⇒ 该条件在正常结果里
+        //     **恒为假**；而物料真把开工顶后的情形**一条都不命中**（被归到容量/日历/前序）。
+        //   【新判据】按 `AvailableTime` 升序累计 `Quantity`，取「累计首次 ≥ 本需求 `NetOutputQty`」
+        //     的时点 = 本批物料齐套时点（与 Phase2 同一口径）。再与本次实际首工序开工比较：
+        //       · 齐套时点 ≈ 实际开工（容差内） ⇒ 物料是**绑定**约束（BINDING）
+        //       · 齐套时点 < 实际开工           ⇒ 物料只是**候选**，真正顶住的是别的入边（CANDIDATE，不抢归因）
+        //       · 累计仍不足本批 Q               ⇒ 真实缺料（BINDING，缺口可量化）
+        //   证据写进 `EvidenceJson.details`（经 `extraDetails` 拼入）。
+        //   ⚠ 不新增 ReasonCode：仍用既有 15 码 `MATERIAL_SHORTAGE`。
+        //   EX-T01 收尾（2026-11-16）：物料被判「候选（非生效）」时，也把它的齐套时点与 slack 记进证据，
+        //     让「最终原因=设备/日历，但物料其实已齐」这类并列事实可查，而不是只暴露单一原因。
+        string? materialCandidate = null;
+        if (constraints.MaterialAvailability.TryGetValue(demand.AllocationSequence, out var segments)
+            && segments.Count > 0)
         {
-            var earliestMaterialTime = segments.Min(s => s.AvailableTime);
-            var firstTaskStart = demandTasks.Min(t => t.PlannedStartTime);
-
-            if (firstTaskStart < earliestMaterialTime)
+            var requiredQty = demand.NetOutputQty;
+            decimal accumulated = 0m;
+            DateTime? materialReadyAt = null;
+            foreach (var segment in segments.OrderBy(s => s.AvailableTime))
             {
+                accumulated += segment.Quantity;
+                if (accumulated >= requiredQty)
+                {
+                    materialReadyAt = segment.AvailableTime;
+                    break;
+                }
+            }
+
+            var firstTaskStart = demandTasks.Min(t => t.PlannedStartTime);
+            var inv = System.Globalization.CultureInfo.InvariantCulture;
+
+            if (materialReadyAt is null)
+            {
+                // 累计仍不足本批 Q ⇒ 真实缺料
                 evidenceType = "MATERIAL";
+                extraDetails =
+                    ",\"bindingState\":\"BINDING\",\"materialReadyAt\":null"
+                    + ",\"actualStart\":\"" + firstTaskStart.ToString("O", inv) + "\""
+                    + ",\"requiredQty\":" + requiredQty.ToString("0.####", inv)
+                    + ",\"accumulatedQty\":" + accumulated.ToString("0.####", inv);
                 return "MATERIAL_SHORTAGE";
             }
+
+            var gapMinutes = (firstTaskStart - materialReadyAt.Value).TotalMinutes;
+            if (Math.Abs(gapMinutes) <= MaterialBindingToleranceMinutes)
+            {
+                // 实际开工正好卡在齐套时点 ⇒ 物料是绑定约束
+                evidenceType = "MATERIAL";
+                extraDetails =
+                    ",\"bindingState\":\"BINDING\""
+                    + ",\"materialReadyAt\":\"" + materialReadyAt.Value.ToString("O", inv) + "\""
+                    + ",\"actualStart\":\"" + firstTaskStart.ToString("O", inv) + "\""
+                    + ",\"requiredQty\":" + requiredQty.ToString("0.####", inv)
+                    + ",\"accumulatedQty\":" + accumulated.ToString("0.####", inv)
+                    + ",\"slackMinutes\":" + gapMinutes.ToString("0.###", inv);
+                return "MATERIAL_SHORTAGE";
+            }
+
+            // 齐套时点明显早于实际开工 ⇒ 物料只是候选，不抢其它归因（不 return），但记录该候选证据。
+            materialCandidate =
+                ",\"materialCandidate\":{\"bindingState\":\"CANDIDATE\""
+                + ",\"materialReadyAt\":\"" + materialReadyAt.Value.ToString("O", inv) + "\""
+                + ",\"actualStart\":\"" + firstTaskStart.ToString("O", inv) + "\""
+                + ",\"slackMinutes\":" + gapMinutes.ToString("0.###", inv) + "}";
         }
 
         // 5. 资源容量不足
@@ -398,6 +465,7 @@ internal class PhaseThreeDiagnostics
         if (resourceIds.Any(rid => resourceUtilization.ContainsKey(rid) && resourceUtilization[rid] > request.StrategySnapshot.SolverStrategy.CapacityShortageUtilizationThreshold))
         {
             evidenceType = "CAPACITY";
+            extraDetails = materialCandidate ?? string.Empty;
             return "RESOURCE_CAPACITY_WAIT";
         }
 
@@ -419,6 +487,7 @@ internal class PhaseThreeDiagnostics
                 !eligibleResources.Contains(taskResourceId))
             {
                 evidenceType = "ROUTING";
+                extraDetails = materialCandidate ?? string.Empty;
                 return "ROUTING_FALLBACK";
             }
         }
@@ -475,12 +544,14 @@ internal class PhaseThreeDiagnostics
             if (coveredMinutes < gapMinutes)
             {
                 evidenceType = "CALENDAR";
+                extraDetails = materialCandidate ?? string.Empty;
                 return "RESOURCE_CAPACITY_WAIT";
             }
         }
 
         // 8. 默认原因：前序延期或其他约束
         evidenceType = "PRECEDENCE";
+        extraDetails = materialCandidate ?? string.Empty;
         return "PRECEDENCE_WAIT";
     }
 

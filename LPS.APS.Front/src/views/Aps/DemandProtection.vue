@@ -11,21 +11,18 @@
  * 本期范围（用户决策）：
  *  - 只支持 Full Release（与 2号位 IDemandSupplyHardLockRepository.ReleaseLocksAsync 1:1）
  *  - 列表接口返回详情（list = preview，Drawer 不发二次请求）
- *  - 复用 Manual ETA 样板（KPI + 筛选 + Table + Drawer）
  *
- * 页面分区：
- *  - 顶部 page-header（标题 / 刷新）
- *  - 约束提示条（4→5→2 链路 / 不计算保护数量 / 只支持 Full Release）
- *  - 错误条
- *  - KPI 4 卡（总数 / Active / 已释放 / 锁定总量）
- *  - 筛选 + 操作（DemandType / LockType / ActiveOnly / 重置 / 筛选 / 批量释放 (N)）
- *  - 主表格（带 selection 行 + Lock 明细列）
- *  - 详情 Drawer（基本信息 / 锁明细 / 释放表单 / 已释放只读 / 严格绑定提示）
- *  - 批量释放 Modal（共享 reason + 汇总）
+ * 11-14 工厂用户视角改版：
+ *  - 删页头大标题页头（2026-10-16 定调：页面不要大标题页头）；刷新收进列表卡片头
+ *  - 删两列死数据（物料 / 工厂：后端 DTO 无此字段，store 恒置 undefined）
+ *  - 删明细抽屉「锁 ID」列、删失败提示里的 LockId（列表不显示内部 ID）
+ *  - 筛选改大白话（需求单号 / 供给单号 / 保护类别 / 状态）；「重置」改为清空后立即重查
+ *  - 状态文案统一：生效中 / 已释放 / 部分释放 / 已失效
+ *  - 空态给下一步（锁在排产时自动生成；可清空筛选重试）
+ *  - 不可释放逐行给出原因（tooltip 说明，不让用户猜）
  *
  * RBAC（@see 审核报告 P1-14/15）：
- *  - VIEWER：禁用 批量释放 / 行内 [释放] / Drawer [确认释放] 按钮
- *  - PMC+：可写
+ *  - aps.demand_protection.release 权限码持有者才可写
  *  - STRICT_BINDING：仅展示不允许释放（tooltip 说明）
  */
 
@@ -46,7 +43,6 @@ import type {
 } from '@/api/aps-v1'
 import {
   DEMAND_TYPE_LABELS,
-  HARD_LOCK_STATUS_LABELS,
   HARD_LOCK_SUPPLY_TYPE_LABELS,
   LOCK_TYPE_LABELS
 } from '@/api/aps-v1'
@@ -77,8 +73,6 @@ const { list, currentDetail, loading, releasing, error, lastFilter } = storeToRe
 
 /* ===== 权限门控（v1.2 §23.1 权限码门控）=====
  *  - aps.demand_protection.release：dev seed 下仅 aps.admin.system 持有
- *  - 行为变化（vs v1.1）：原 4 角色（PMC/RULE_ADMIN/RULE_PUBLISHER/SYSTEM_ADMIN）皆可释放；
- *    切换到权限码后只有 SYSTEM_ADMIN 可见释放按钮，符合 §二十五 后端权威职责
  *  - 不用角色判断的原因：与 3号位后端二次校验用同一码
  */
 const canWrite = computed(() => apsAuth.has('aps.demand_protection.release'))
@@ -92,11 +86,36 @@ function canRelease(row: DemandProtectionDto): boolean {
   return true
 }
 
+/** 不可释放的原因（tooltip 说清楚，不让用户猜） */
+function releaseBlockedReason(row: DemandProtectionDto): string {
+  if (!canWrite.value) return '当前账号没有释放权限'
+  if (row.lockType === 'STRICT_BINDING') return '严格绑定的供给不能手工释放，请走重排流程'
+  if (row.status === 'RELEASED') return '该需求已全部释放'
+  if (row.status === 'PARTIALLY_RELEASED') return '该需求已有明细被释放，只剩部分可放'
+  if (row.lockIds.length === 0) return '没有可释放的供给明细'
+  return ''
+
+}
+
 /* ===== 状态 / 类型 映射 ===== */
 const STATUS_TAG: Record<DemandProtectionStatus, 'success' | 'info' | 'warning'> = {
   ACTIVE: 'success',
   RELEASED: 'info',
   PARTIALLY_RELEASED: 'warning'
+}
+
+/** 聚合行状态文案（与表格状态列一致） */
+const STATUS_LABEL: Record<DemandProtectionStatus, string> = {
+  ACTIVE: '生效中',
+  RELEASED: '已释放',
+  PARTIALLY_RELEASED: '部分释放'
+}
+
+/** 供给明细状态文案（筛选下拉 + 明细表共用） */
+const LOCK_STATUS_LABEL: Record<HardLockStatus, string> = {
+  ACTIVE: '生效中',
+  RELEASED: '已释放',
+  BROKEN: '已失效'
 }
 
 const LOCK_TYPE_TAG: Record<'DEMAND_PROTECTION' | 'STRICT_BINDING', 'warning' | 'danger'> = {
@@ -110,7 +129,7 @@ const SUPPLY_STATUS_TAG: Record<HardLockStatus, 'success' | 'info' | 'danger'> =
   BROKEN: 'danger'
 }
 
-/* ===== 筛选本地 state（变更后点 [筛选] 才生效） =====
+/* ===== 筛选本地 state（变更后点 [查询] 才生效） =====
  * 形状对齐 5号位 GET /api/demand-protection QueryAsync 签名：
  *  - demandKey / supplyKey：substring LIKE
  *  - lockType / status：单值字符串（与 backend 枚举字面量一致）
@@ -133,14 +152,17 @@ function syncFilterDraft(): void {
 
 async function applyFilter(): Promise<void> {
   syncFilterDraft()
+  selectedRows.value = []
   await store.load(filterDraft.value)
 }
 
-function resetFilters(): void {
+/** 重置 = 清空条件并立即重查（否则用户点了「重置」看不到变化） */
+async function resetFilters(): Promise<void> {
   filterDemandKey.value = ''
   filterSupplyKey.value = ''
   filterLockType.value = ''
   filterStatus.value = ''
+  await applyFilter()
 }
 
 async function refresh(): Promise<void> {
@@ -148,8 +170,24 @@ async function refresh(): Promise<void> {
   await store.load()
 }
 
+/** 当前已生效的筛选条件（大白话） */
+const appliedFilterText = computed(() => {
+  const f = lastFilter.value
+  const parts: string[] = []
+  if (f.demandKey) parts.push(`需求单号含「${f.demandKey}」`)
+  if (f.supplyKey) parts.push(`供给单号含「${f.supplyKey}」`)
+  if (f.lockType) parts.push(`保护类别 ${LOCK_TYPE_LABELS[f.lockType]}`)
+  if (f.status) parts.push(`状态 ${LOCK_STATUS_LABEL[f.status]}`)
+  return parts.join(' · ')
+})
+
 /* ===== 主表格多选 + 行点击 ===== */
 const selectedRows = ref<DemandProtectionDto[]>([])
+
+/** 行键（需求单号） */
+function rowKeyOf(row: DemandProtectionDto): string {
+  return row.demandKey
+}
 
 function onSelectionChange(rows: DemandProtectionDto[]): void {
   selectedRows.value = rows
@@ -163,6 +201,9 @@ function selectable(row: DemandProtectionDto): boolean {
 /** 可释放的选中行（防御性过滤，避免外部绕过 selectable 传入） */
 const releasableSelection = computed(() => selectedRows.value.filter((r) => canRelease(r)))
 
+/** 列表内可释放的行数（列表卡片头提示用） */
+const releasableCount = computed(() => list.value.filter((r) => canRelease(r)).length)
+
 /** 批量释放总 lock 数 + 总 lockedQty（仅 releasable 选中部分） */
 const batchSummary = computed(() => {
   const rows = releasableSelection.value
@@ -171,6 +212,12 @@ const batchSummary = computed(() => {
     lockCount: rows.reduce((sum, r) => sum + r.lockIds.length, 0),
     lockedQty: rows.reduce((sum, r) => sum + r.lockedQty, 0)
   }
+})
+
+const batchButtonTip = computed(() => {
+  if (!canWrite.value) return '当前账号没有释放权限'
+  if (!releasableSelection.value.length) return '请先勾选要释放的记录'
+  return `将释放 ${batchSummary.value.demandCount} 条需求 / ${batchSummary.value.lockCount} 条供给明细`
 })
 
 /* ===== 详情 Drawer ===== */
@@ -184,11 +231,9 @@ const drawerReason = ref('')
 /**
  * 释放原因校验规则
  * ⚠️ 2026-09-14 治理红线复核说明（@see APS_V1_各号位AI冻结基线治理红线_v1.0_20260914.md §4.2）：
- *  - 「必填」= 冻结业务基线审计需求（@see 4号位文档第 X 节）
- *  - 历史曾加 ≥5 字符硬约束，来自 9月13日 1号位 `未命名的Markdown文件.md` 解读，非 0 号位正式裁决（@see §十三）
- *  - 1 号位 ≠ 0 号位 → 该硬约束不能直接落地
- *  - 当前仅保留「必填」+ 200 字符上限（审计可读性）；如 0 号位正式裁决再补 ≥N 字符约束
- *  - 批量释放 batchRules 同理
+ *  - 「必填」= 冻结业务基线审计需求
+ *  - 历史曾加 ≥5 字符硬约束，来自 9月13日 1号位解读，非 0 号位正式裁决 ⇒ 不落地
+ *  - 当前仅保留「必填」+ 200 字符上限；批量释放 batchRules 同理
  */
 const drawerRules = {
   reason: [{ required: true, message: '请输入释放原因', trigger: 'blur' }]
@@ -231,7 +276,7 @@ async function confirmRelease(): Promise<void> {
   try {
     await ElMessageBox.confirm(
       `将释放需求保护：${currentDetail.value.demandKey}\n\n` +
-        `范围：该需求下全部 ${currentDetail.value.lockCount} 条 Lock（共 ${currentDetail.value.lockedQty} 数量）\n` +
+        `范围：该需求下全部 ${currentDetail.value.lockCount} 条供给明细（共 ${currentDetail.value.lockedQty} 数量）\n` +
         `原因：${drawerReason.value.trim()}\n\n` +
         `释放后对应供给回到可分配池，且不可撤销。`,
       '确认释放',
@@ -260,27 +305,35 @@ async function confirmRelease(): Promise<void> {
   }
 }
 
+/** 锁明细的可读标识（供给类型 + 供给单号；不给内部 ID） */
+function lockLabelOf(lockId: number): string {
+  for (const row of list.value) {
+    const d = row.lockDetails.find((x) => x.lockId === lockId)
+    if (!d) continue
+    const type = HARD_LOCK_SUPPLY_TYPE_LABELS[d.supplyType] ?? d.supplyType
+    return d.supplyKey ? `${type} / ${d.supplyKey}` : type
+  }
+  return '供给明细'
+}
+
 /** 释放结果展示：成功汇总 toast，失败明细 alert */
 function showReleaseOutcome(perLock: DemandProtectionReleaseResult[]): void {
   const released = perLock.filter((r) => r.status === 'RELEASED')
   const failed = perLock.filter((r) => r.status === 'FAILED')
+  const failedLines = failed
+    .map((f) => `· ${lockLabelOf(f.lockId)}：${f.failureReason ?? '未知'}`)
+    .join('\n')
   if (failed.length === 0) {
-    ElMessage.success(`已释放 ${released.length} 条锁`)
+    ElMessage.success(`已释放 ${released.length} 条供给明细`)
     return
   }
   if (released.length === 0) {
-    ElMessage.error(`全部 ${failed.length} 条锁释放失败`)
-    ElMessageBox.alert(
-      failed.map((f) => `· LockId=${f.lockId}：${f.failureReason ?? '未知'}`).join('\n'),
-      '释放失败明细',
-      { type: 'error' }
-    )
+    ElMessage.error(`全部 ${failed.length} 条供给明细释放失败`)
+    ElMessageBox.alert(failedLines, '释放失败明细', { type: 'error' })
     return
   }
   ElMessageBox.alert(
-    `成功 ${released.length} 条，失败 ${failed.length} 条\n\n` +
-      `失败明细：\n` +
-      failed.map((f) => `· LockId=${f.lockId}：${f.failureReason ?? '未知'}`).join('\n'),
+    `成功 ${released.length} 条，失败 ${failed.length} 条\n\n失败明细：\n${failedLines}`,
     '部分失败',
     { type: 'warning' }
   )
@@ -324,7 +377,7 @@ async function submitBatch(): Promise<void> {
 
   try {
     await ElMessageBox.confirm(
-      `将批量释放 ${batchSummary.value.demandCount} 条需求保护（共 ${batchSummary.value.lockCount} 条 Lock / 锁定量 ${batchSummary.value.lockedQty}）\n\n` +
+      `将批量释放 ${batchSummary.value.demandCount} 条需求保护（共 ${batchSummary.value.lockCount} 条供给明细 / 锁定量 ${batchSummary.value.lockedQty}）\n\n` +
         `原因：${batchReason.value.trim()}\n\n` +
         `本操作不可撤销。`,
       '确认批量释放',
@@ -350,7 +403,7 @@ async function submitBatch(): Promise<void> {
     const releasedCount = result.perLock.filter(
       (r: DemandProtectionReleaseResult) => r.status === 'RELEASED'
     ).length
-    ElMessage.success(`已批量释放 ${result.succeeded.length} 条需求保护 / ${releasedCount} 条锁`)
+    ElMessage.success(`已批量释放 ${result.succeeded.length} 条需求保护 / ${releasedCount} 条供给明细`)
     selectedRows.value = []
     closeBatchModal()
   } else if (result.succeeded.length === 0) {
@@ -360,7 +413,7 @@ async function submitBatch(): Promise<void> {
       (r: DemandProtectionReleaseResult) => r.status === 'RELEASED'
     ).length
     ElMessageBox.alert(
-      `成功 ${result.succeeded.length} 条需求保护 / ${releasedLockCount} 条锁；失败 ${result.failed.length} 条需求保护\n\n` +
+      `成功 ${result.succeeded.length} 条需求保护 / ${releasedLockCount} 条供给明细；失败 ${result.failed.length} 条需求保护\n\n` +
         `失败明细：\n` +
         result.failed.map((f) => `· ${f.demandKey}：${f.message}`).join('\n'),
       '部分失败',
@@ -375,123 +428,100 @@ onMounted(refresh)
 
 <template>
   <div class="aps-dp">
-    <!-- ===== 顶部 ===== -->
-    <div class="page-header">
-      <h2 class="page-title">需求保护释放</h2>
-      <ElButton :loading="loading" @click="refresh">
-        <Icon icon="vi-ep:refresh" />
-        刷新
-      </ElButton>
-    </div>
-
     <!-- ===== 错误条 ===== -->
     <ElAlert v-if="error" type="error" :closable="false" show-icon :title="`加载失败：${error}`" />
 
-    <!-- ===== 筛选 + 操作 ===== -->
-    <ElCard class="panel">
-      <template #header>
-        <div class="panel-header">
-          <span>筛选条件</span>
-          <span class="hint-text">
-            <span v-if="lastFilter.demandKey">· 需求键含 "{{ lastFilter.demandKey }}"</span>
-            <span v-if="lastFilter.supplyKey">· 供给键含 "{{ lastFilter.supplyKey }}"</span>
-            <span v-if="lastFilter.lockType"
-              >· 锁类型 {{ LOCK_TYPE_LABELS[lastFilter.lockType] }}</span
-            >
-            <span v-if="lastFilter.status"
-              >· 状态 {{ HARD_LOCK_STATUS_LABELS[lastFilter.status] }}</span
-            >
-            <span
-              v-if="
-                !lastFilter.demandKey &&
-                !lastFilter.supplyKey &&
-                !lastFilter.lockType &&
-                !lastFilter.status
-              "
-              >全部</span
-            >
-          </span>
-        </div>
-      </template>
+    <!-- ===== 筛选 ===== -->
+    <ElCard class="panel" shadow="never">
       <div class="filter-row">
-        <div class="filter-item">
-          <label>需求稳定键</label>
-          <ElInput
-            v-model="filterDemandKey"
-            placeholder="需求键 substring 模糊匹配"
-            clearable
-            style="width: 220px"
-          />
-        </div>
-        <div class="filter-item">
-          <label>供给稳定键</label>
-          <ElInput
-            v-model="filterSupplyKey"
-            placeholder="供给键 substring 模糊匹配"
-            clearable
-            style="width: 220px"
-          />
-        </div>
-        <div class="filter-item">
-          <label>锁类型</label>
-          <ElSelect
-            v-model="filterLockType"
-            placeholder="全部锁类型"
-            clearable
-            style="width: 160px"
-          >
-            <ElOption label="需求保护 (DEMAND_PROTECTION)" value="DEMAND_PROTECTION" />
-            <ElOption label="严格绑定 (STRICT_BINDING)" value="STRICT_BINDING" />
-          </ElSelect>
-        </div>
-        <div class="filter-item">
-          <label>状态</label>
-          <ElSelect v-model="filterStatus" placeholder="全部状态" clearable style="width: 160px">
-            <ElOption label="生效中 (ACTIVE)" value="ACTIVE" />
-            <ElOption label="已释放 (RELEASED)" value="RELEASED" />
-            <ElOption label="已失效 (BROKEN)" value="BROKEN" />
-          </ElSelect>
-        </div>
-        <div class="filter-actions">
-          <ElButton @click="resetFilters">重置</ElButton>
-          <ElButton type="primary" :loading="loading" @click="applyFilter">筛选</ElButton>
-          <ElTooltip
-            :content="
-              releasableSelection.length
-                ? `将释放 ${batchSummary.demandCount} 条需求 / ${batchSummary.lockCount} 条锁`
-                : '请先勾选可释放的记录'
-            "
-            placement="top"
-          >
-            <ElButton
-              type="danger"
-              plain
-              :disabled="!canWrite || releasableSelection.length === 0"
-              @click="openBatchModal"
-            >
-              <Icon icon="vi-mdi:shield-off-outline" />
-              批量释放{{ releasableSelection.length ? ` (${releasableSelection.length})` : '' }}
-            </ElButton>
-          </ElTooltip>
-        </div>
+        <ElInput
+          v-model="filterDemandKey"
+          class="filter-input"
+          placeholder="需求单号：订单号 / 工作集号 / PI 需求号"
+          clearable
+          @keyup.enter="applyFilter"
+        >
+          <template #prefix>
+            <Icon icon="vi-ep:search" />
+          </template>
+        </ElInput>
+        <ElInput
+          v-model="filterSupplyKey"
+          class="filter-input"
+          placeholder="供给单号：库存批次 / 采购单 / 在制工单"
+          clearable
+          @keyup.enter="applyFilter"
+        />
+        <ElSelect
+          v-model="filterLockType"
+          class="filter-select"
+          placeholder="保护类别"
+          clearable
+        >
+          <ElOption label="需求保护" value="DEMAND_PROTECTION" />
+          <ElOption label="严格绑定" value="STRICT_BINDING" />
+        </ElSelect>
+        <ElSelect v-model="filterStatus" class="filter-select" placeholder="状态" clearable>
+          <ElOption label="生效中" value="ACTIVE" />
+          <ElOption label="已释放" value="RELEASED" />
+          <ElOption label="已失效" value="BROKEN" />
+        </ElSelect>
+        <ElButton type="primary" :loading="loading" @click="applyFilter">
+          <Icon icon="vi-ep:search" />
+          查询
+        </ElButton>
+        <ElButton @click="resetFilters">重置</ElButton>
+      </div>
+      <div v-if="appliedFilterText" class="filter-applied">
+        当前筛选：{{ appliedFilterText }}
       </div>
     </ElCard>
 
-    <!-- ===== 主表格 ===== -->
-    <ElCard class="panel">
+    <!-- ===== 列表 ===== -->
+    <ElCard class="panel" shadow="never">
       <template #header>
         <div class="panel-header">
-          <span>需求保护列表（{{ list.length }} 条）</span>
-          <span class="hint-text">点击行可查看锁明细；不可释放行复选框自动禁用</span>
+          <div class="panel-title">
+            <span>需求保护</span>
+            <span class="muted small">{{ list.length }} 条</span>
+            <span v-if="releasableCount" class="muted small">· 其中 {{ releasableCount }} 条可释放</span>
+          </div>
+          <div class="panel-actions">
+            <ElButton size="small" plain :loading="loading" @click="refresh">
+              <Icon icon="vi-ep:refresh" />
+              刷新
+            </ElButton>
+            <ElTooltip :content="batchButtonTip" placement="top">
+              <span>
+                <ElButton
+                  size="small"
+                  type="danger"
+                  plain
+                  :disabled="!canWrite || releasableSelection.length === 0"
+                  @click="openBatchModal"
+                >
+                  <Icon icon="vi-mdi:shield-off-outline" />
+                  批量释放{{ releasableSelection.length ? ` (${releasableSelection.length})` : '' }}
+                </ElButton>
+              </span>
+            </ElTooltip>
+          </div>
         </div>
       </template>
-      <div v-if="!list.length" class="panel-empty">
-        <ElEmpty description="无需求保护数据" />
+
+      <div v-if="loading && !list.length" class="panel-loading">加载中…</div>
+      <div v-else-if="!list.length" class="panel-empty">
+        <ElEmpty description="没有需求保护记录">
+          <p class="empty-hint">
+            需求保护锁在排产时自动生成：需求与可用供给冲突时，系统会先锁住这部分供给。
+            当前没有记录，可换个需求单号重试，或清空筛选条件查看全部。
+          </p>
+        </ElEmpty>
       </div>
       <ElTable
         v-else
         :data="list"
-        :row-key="(r: DemandProtectionDto) => r.demandKey"
+        :row-key="rowKeyOf"
         size="small"
         border
         stripe
@@ -501,31 +531,17 @@ onMounted(refresh)
         @row-click="openDetail"
       >
         <ElTableColumn type="selection" width="46" :selectable="selectable" />
-        <ElTableColumn label="需求类型" width="120" align="center">
+        <ElTableColumn label="需求" min-width="240">
           <template #default="{ row }">
-            <ElTag size="small" type="info">{{ DEMAND_TYPE_LABELS[row.demandType] }}</ElTag>
-          </template>
-        </ElTableColumn>
-        <ElTableColumn label="需求稳定键" min-width="220">
-          <template #default="{ row }">
+            <ElTag size="small" type="info" effect="plain">
+              {{ DEMAND_TYPE_LABELS[row.demandType] }}
+            </ElTag>
             <ElTooltip :content="row.demandKey" placement="top">
               <span class="code-tag">{{ row.demandKey }}</span>
             </ElTooltip>
           </template>
         </ElTableColumn>
-        <ElTableColumn label="物料" width="120">
-          <template #default="{ row }">
-            <span v-if="row.materialCode">{{ row.materialCode }}</span>
-            <span v-else class="muted">-</span>
-          </template>
-        </ElTableColumn>
-        <ElTableColumn label="工厂" width="80" align="center">
-          <template #default="{ row }">
-            <span v-if="row.factory">{{ row.factory }}</span>
-            <span v-else class="muted">-</span>
-          </template>
-        </ElTableColumn>
-        <ElTableColumn label="锁类型" width="110" align="center">
+        <ElTableColumn label="保护类别" width="100" align="center">
           <template #default="{ row }">
             <ElTag :type="LOCK_TYPE_TAG[row.lockType]" size="small">
               {{ LOCK_TYPE_LABELS[row.lockType] }}
@@ -542,58 +558,53 @@ onMounted(refresh)
         <ElTableColumn label="状态" width="100" align="center">
           <template #default="{ row }">
             <ElTag :type="STATUS_TAG[row.status]" size="small">
-              {{
-                row.status === 'ACTIVE'
-                  ? '生效中'
-                  : row.status === 'RELEASED'
-                    ? '已释放'
-                    : '部分释放'
-              }}
+              {{ STATUS_LABEL[row.status] }}
             </ElTag>
           </template>
         </ElTableColumn>
-        <ElTableColumn label="创建" min-width="170">
+        <ElTableColumn label="锁定时间" width="120" align="center">
           <template #default="{ row }">
-            <span class="muted small code-tag">{{ row.createdBy }}</span>
-            <span class="muted small"> · {{ dayjs(row.createdAt).format('MM-DD HH:mm') }}</span>
+            <ElTooltip
+              :content="`锁定来源：${row.createdBy} · ${dayjs(row.createdAt).format('YYYY-MM-DD HH:mm')}`"
+              placement="top"
+            >
+              <span class="muted small">{{ dayjs(row.createdAt).format('MM-DD HH:mm') }}</span>
+            </ElTooltip>
           </template>
         </ElTableColumn>
-        <ElTableColumn label="释放" min-width="170">
+        <ElTableColumn label="释放" width="140" align="center">
           <template #default="{ row }">
             <template v-if="row.releasedAt">
-              <span class="muted small code-tag">{{ row.releasedBy ?? '-' }}</span>
-              <span class="muted small"> · {{ dayjs(row.releasedAt).format('MM-DD HH:mm') }}</span>
+              <span class="muted small">{{ dayjs(row.releasedAt).format('MM-DD HH:mm') }}</span>
+              <span class="muted small"> · {{ row.releasedBy ?? '-' }}</span>
             </template>
             <span v-else class="muted">-</span>
           </template>
         </ElTableColumn>
-        <ElTableColumn label="操作" width="180" fixed="right" align="center">
+        <ElTableColumn label="操作" width="160" fixed="right" align="center">
           <template #default="{ row }">
             <ElButton size="small" plain @click.stop="openDetail(row)">
               <Icon icon="vi-mdi:eye-outline" />
               查看
             </ElButton>
-            <ElTooltip
-              v-if="row.lockType === 'STRICT_BINDING'"
-              content="严格绑定锁不支持手工释放，请走重排流程"
-              placement="top"
-            >
-              <ElButton size="small" type="danger" plain :disabled="true" @click.stop>
-                <Icon icon="vi-mdi:lock-outline" />
-                释放
-              </ElButton>
-            </ElTooltip>
             <ElButton
-              v-else
+              v-if="canRelease(row)"
               size="small"
               type="danger"
               plain
-              :disabled="!canRelease(row)"
               @click.stop="openReleaseFromRow(row)"
             >
               <Icon icon="vi-mdi:shield-off-outline" />
               释放
             </ElButton>
+            <ElTooltip v-else :content="releaseBlockedReason(row)" placement="top">
+              <span>
+                <ElButton size="small" plain disabled @click.stop>
+                  <Icon icon="vi-mdi:lock-outline" />
+                  释放
+                </ElButton>
+              </span>
+            </ElTooltip>
           </template>
         </ElTableColumn>
       </ElTable>
@@ -659,17 +670,14 @@ onMounted(refresh)
           <ElDescriptionsItem label="需求类型">{{
             DEMAND_TYPE_LABELS[currentDetail.demandType]
           }}</ElDescriptionsItem>
-          <ElDescriptionsItem label="锁类型">
+          <ElDescriptionsItem label="保护类别">
             <ElTag :type="LOCK_TYPE_TAG[currentDetail.lockType]" size="small">
               {{ LOCK_TYPE_LABELS[currentDetail.lockType] }}
             </ElTag>
           </ElDescriptionsItem>
-          <ElDescriptionsItem label="需求稳定键" :span="2">
+          <ElDescriptionsItem label="需求单号" :span="2">
             <span class="code-tag">{{ currentDetail.demandKey }}</span>
           </ElDescriptionsItem>
-          <ElDescriptionsItem v-if="currentDetail.demandLabel" label="描述" :span="2">{{
-            currentDetail.demandLabel
-          }}</ElDescriptionsItem>
           <ElDescriptionsItem label="锁条数">{{ currentDetail.lockCount }}</ElDescriptionsItem>
           <ElDescriptionsItem label="锁定量">
             <span v-if="currentDetail.status === 'ACTIVE'" class="qty-active">
@@ -677,37 +685,35 @@ onMounted(refresh)
             </span>
             <span v-else>{{ currentDetail.lockedQty }}</span>
           </ElDescriptionsItem>
-          <ElDescriptionsItem v-if="currentDetail.sourcePlanVersionId" label="来源计划版本">
-            {{ currentDetail.sourcePlanVersionId }}
-          </ElDescriptionsItem>
-          <ElDescriptionsItem label="创建">
-            {{ currentDetail.createdBy }} ·
+          <ElDescriptionsItem label="锁定时间">
             {{ dayjs(currentDetail.createdAt).format('YYYY-MM-DD HH:mm') }}
           </ElDescriptionsItem>
+          <ElDescriptionsItem label="锁定来源">{{ currentDetail.createdBy }}</ElDescriptionsItem>
         </ElDescriptions>
 
-        <!-- Lock 明细（只读） -->
+        <!-- 锁明细（只读） -->
         <div class="lock-details">
-          <h4 class="section-title">锁明细（{{ currentDetail.lockDetails.length }} 条）</h4>
+          <h4 class="section-title">供给明细（{{ currentDetail.lockDetails.length }} 条）</h4>
           <ElTable :data="currentDetail.lockDetails" size="small" border stripe style="width: 100%">
-            <ElTableColumn label="锁 ID" prop="lockId" width="100" align="center" />
-            <ElTableColumn label="供给类型" width="120" align="center">
+            <ElTableColumn label="供给类型" width="110" align="center">
               <template #default="{ row }">
                 <ElTag size="small">
-                  {{ HARD_LOCK_SUPPLY_TYPE_LABELS[row.supplyType] }}
+                  {{ HARD_LOCK_SUPPLY_TYPE_LABELS[row.supplyType] ?? row.supplyType }}
                 </ElTag>
               </template>
             </ElTableColumn>
-            <ElTableColumn label="供给稳定键" min-width="220">
+            <ElTableColumn label="供给单号" min-width="240">
               <template #default="{ row }">
-                <span class="code-tag">{{ row.supplyKey }}</span>
+                <ElTooltip :content="row.supplyKey" placement="top">
+                  <span class="code-tag">{{ row.supplyKey }}</span>
+                </ElTooltip>
               </template>
             </ElTableColumn>
             <ElTableColumn label="锁定量" prop="lockedQty" width="90" align="right" />
             <ElTableColumn label="状态" width="90" align="center">
               <template #default="{ row }">
                 <ElTag :type="SUPPLY_STATUS_TAG[row.status]" size="small">
-                  {{ HARD_LOCK_STATUS_LABELS[row.status] }}
+                  {{ LOCK_STATUS_LABEL[row.status] }}
                 </ElTag>
               </template>
             </ElTableColumn>
@@ -718,10 +724,10 @@ onMounted(refresh)
         <div v-if="canRelease(currentDetail)" class="release-form">
           <h4 class="section-title">释放操作</h4>
           <ElAlert type="warning" :closable="false" show-icon class="confirm-hint">
-            <template #title>整条释放（Full Release）</template>
+            <template #title>整条释放</template>
             <span>
-              将释放该需求下全部
-              <strong>{{ currentDetail.lockCount }}</strong> 条 Lock（共
+              将释放该需求下的全部
+              <strong>{{ currentDetail.lockCount }}</strong> 条供给明细（共
               <strong>{{ currentDetail.lockedQty }}</strong>
               数量），释放后对应供给回到可分配池，且不可撤销。
             </span>
@@ -775,7 +781,7 @@ onMounted(refresh)
           <template #title>释放范围</template>
           <div class="batch-summary-grid">
             <div class="batch-summary-item">
-              <div class="batch-summary-label">需求数</div>
+              <div class="batch-summary-label">需求条数</div>
               <div class="batch-summary-value">{{ batchSummary.demandCount }}</div>
             </div>
             <div class="batch-summary-item">
@@ -839,20 +845,7 @@ onMounted(refresh)
   padding: 16px;
   background: #f5f7fa;
   flex-direction: column;
-  gap: 16px;
-}
-
-.page-header {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-
-  .page-title {
-    margin: 0;
-    font-size: 20px;
-    font-weight: 600;
-    color: #1e293b;
-  }
+  gap: 12px;
 }
 
 .panel {
@@ -863,9 +856,7 @@ onMounted(refresh)
   display: flex;
   justify-content: space-between;
   align-items: center;
-  font-size: 14px;
-  font-weight: 600;
-  color: #1e293b;
+  gap: 12px;
 
   .hint-text {
     font-size: 12px;
@@ -874,8 +865,37 @@ onMounted(refresh)
   }
 }
 
+.panel-title {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-size: 14px;
+  font-weight: 600;
+  color: #1e293b;
+}
+
+.panel-actions {
+  display: flex;
+  gap: 8px;
+}
+
 .panel-empty {
   padding: 20px 0;
+}
+
+.panel-loading {
+  padding: 32px 0;
+  font-size: 13px;
+  color: #94a3b8;
+  text-align: center;
+}
+
+.empty-hint {
+  max-width: 520px;
+  margin: 0 auto;
+  font-size: 12px;
+  line-height: 1.7;
+  color: #94a3b8;
 }
 
 .muted {
@@ -888,6 +908,7 @@ onMounted(refresh)
 
 .code-tag {
   padding: 1px 6px;
+  margin-left: 4px;
   font-family: 'Courier New', monospace;
   font-size: 11px;
   background: #f1f5f9;
@@ -902,28 +923,23 @@ onMounted(refresh)
 /* 筛选条 */
 .filter-row {
   display: flex;
-  align-items: flex-end;
-  flex-wrap: wrap;
-  gap: 14px;
-}
-
-.filter-item {
-  display: flex;
   align-items: center;
-  flex-direction: column;
-  gap: 4px;
-
-  label {
-    font-size: 12px;
-    font-weight: 600;
-    color: #64748b;
-  }
+  flex-wrap: wrap;
+  gap: 10px;
 }
 
-.filter-actions {
-  display: flex;
-  margin-left: auto;
-  gap: 8px;
+.filter-input {
+  width: 260px;
+}
+
+.filter-select {
+  width: 150px;
+}
+
+.filter-applied {
+  margin-top: 10px;
+  font-size: 12px;
+  color: #64748b;
 }
 
 /* Drawer */

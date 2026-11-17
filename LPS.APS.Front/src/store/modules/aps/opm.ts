@@ -26,6 +26,7 @@ import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
 import {
   opmApi,
+  departmentLookupApi,
   ApiError,
   type RoutingOperationDto,
   type OperationPlanningMode,
@@ -41,6 +42,10 @@ export const useOpmStore = defineStore('aps.opm', () => {
   const loading = ref(false)
   const saving = ref(false)
   const error = ref<string | null>(null)
+  /** 生产部门 Id → 部门名称（**兜底**用：行内 productionDepartmentName 取不到时才拉 5号位 名称表） */
+  const departmentNames = ref<Record<number, string>>({})
+  /** 名称表是否已尝试加载（成功或失败都算，避免每次列表都重复请求） */
+  let departmentNamesLoaded = false
 
   // ===== auth =====
   const apsAuth = useApsAuthStore()
@@ -86,6 +91,10 @@ export const useOpmStore = defineStore('aps.opm', () => {
       // 服务端列表按工序号升序（UI 稳定）；前端再排一遍防后端未稳定排序
       list.value = [...next].sort((a, b) => a.operationCode.localeCompare(b.operationCode))
       currentMaterialId.value = materialId
+      // 行内没带部门名（后端未部署 3号位 2026-11-16 新字段，或该行部门缺失）⇒ 兜底拉一次名称表
+      if (next.some((op) => !op.productionDepartmentName)) {
+        void ensureDepartmentNames()
+      }
     } catch (err) {
       handleError(err)
       list.value = []
@@ -133,6 +142,37 @@ export const useOpmStore = defineStore('aps.opm', () => {
     error.value = null
   }
 
+  /** 载入生产部门名称表（Id → 名称）——**兜底用**
+   *  - 数据源：GET /api/production-departments（5号位；含 deptName）
+   *  - 仅当行内 productionDepartmentName 取不到时才拉（后端已随行带名 ⇒ 一次请求都不用发）
+   *  - 失败不抛错：取不到就留空表，页面退化为显示 Id（诚实降级，不造假数据）
+   *  - ⚠️ 该端点挂 aps.resource_calendar.view，本页路由是 aps.rule.view ⇒ 只持 rule.* 的角色 403，
+   *    此时靠行内字段出名字；两者都拿不到才显示 Id
+   */
+  async function ensureDepartmentNames(): Promise<void> {
+    if (departmentNamesLoaded) return
+    departmentNamesLoaded = true
+    try {
+      const rows = await departmentLookupApi.listProductionDepartmentsOrThrow()
+      const map: Record<number, string> = {}
+      rows.forEach((d) => {
+        if (d.deptName) map[d.id] = d.deptName
+      })
+      departmentNames.value = map
+    } catch {
+      departmentNames.value = {}
+    }
+  }
+
+  /** 部门显示名：行内字段优先 → 5号位 名称表 → 回退显示 Id（不丢行、不造假） */
+  function departmentNameOf(row: RoutingOperationDto): string {
+    return (
+      row.productionDepartmentName ||
+      departmentNames.value[row.productionDepartmentId] ||
+      String(row.productionDepartmentId)
+    )
+  }
+
   // ===== helpers =====
 
   function handleError(err: unknown): void {
@@ -152,6 +192,7 @@ export const useOpmStore = defineStore('aps.opm', () => {
     loading,
     saving,
     error,
+    departmentNames,
     // getters
     canView,
     canEdit,
@@ -159,7 +200,10 @@ export const useOpmStore = defineStore('aps.opm', () => {
     // actions
     load,
     updatePlanningMode,
+    ensureDepartmentNames,
     reset,
-    handleError
+    handleError,
+    // getters
+    departmentNameOf
   }
 })

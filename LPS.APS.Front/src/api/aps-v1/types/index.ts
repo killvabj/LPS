@@ -27,6 +27,7 @@
  *  - productionWorkCalendar.ts 工厂/部门上级工作日历 DTO（v1.4 专项 G1 候选 + 5号位 2026-10-13 对接函）
  *  - material.ts         物料主数据查询 DTO（lookup 端点；Opm.vue / Domain.vue 等页面用）
  *  - taskSplitRuleConfig.ts 执行批拆分规则 / Batch Policy 批量策略 DTO（3号位 2026-10-07 v1.0 契约）
+ *  - stage.ts             大工艺阶段字典（StageDict，冻结 §1.9 29 码 → 中文阶段名）
  *  - backend-aligned.ts 后端 Core DTO 类型对齐（只读参考）
  */
 
@@ -55,4 +56,5 @@ export * from './resourceCalendar'
 export * from './productionWorkCalendar'
 export * from './material'
 export * from './taskSplitRuleConfig'
+export * from './stage'
 export * from './backend-aligned'

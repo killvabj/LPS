@@ -1395,6 +1395,17 @@ internal class PhaseOneConstraintBuilder
             context.CrossMaterialHasCycle = true;
             context.CrossMaterialOrder = ordered;
             context.CrossMaterialLayers = layers;
+
+            // 2026-11-14：记下**卡在环上**的需求键（Kahn 之后入度仍 > 0）。
+            //   Phase2 据此只把这些需求记未排，**其余照排** —— 不再整域技术失败。
+            foreach (var key in allDemandKeys)
+            {
+                if (inDegree.TryGetValue(key, out var degree) && degree > 0)
+                {
+                    context.CrossMaterialCycleKeys.Add(key);
+                }
+            }
+
             return;
         }
 
@@ -2404,15 +2415,36 @@ internal class ConstraintContext
     public Dictionary<string, DateTime> DemandEarliestStart { get; set; } = new();
 
     /// <summary>
+    /// 本域**已落定**需求的「跨物料子件下界」（需求键 → 该需求父件首道不得早于的时刻）。
+    /// 2026-11-16（FAMILY_CYL 整域归零真因）：只在 Phase2 外层需求循环**落定排程前**写入
+    ///   （= `GetDynamicMaterialFloor` 结果 + 同 PI 连续份额修正后的终值），候选试排期间**只读**。
+    ///   用途 = Stage 合批守卫：`TryMergeDemandIntoStageBatch` 重跑锚点批时，必须取
+    ///   `max(锚点下界, 被并入需求下界)`，否则被并入需求的下界更早时会把锚点首道
+    ///   拉到锚点子件完工之前 ⇒ Phase5 `下游.start &lt; 上游.end + lag` 越序、整域作废。
+    ///   <c>ShallowCloneForTrial</c> 走 <c>MemberwiseClone</c> 共享本字典引用 ⇒ 主循环写入、
+    ///   试排只读，与 <see cref="DemandEarliestStart"/> 同一隔离纪律。
+    /// </summary>
+    public Dictionary<string, DateTime> DemandMaterialFloor { get; set; } = new();
+
+    /// <summary>
     /// P1-12：父 → (父, 子) 边界的滞后时间（分钟）。键为 (父 LogicalDemandKey, 子 LogicalDemandKey)。
     /// 供 Phase2/Phase4 的 GetDynamicMaterialFloor 在子件完成时间上累加滞后。
     /// </summary>
     public Dictionary<(string, string), decimal> CrossMaterialLagMinutes { get; set; } = new();
 
     /// <summary>
-    /// 跨物料 BOM 依赖存在环（技术失败标记）。
+    /// 跨物料 BOM 依赖存在环。
+    /// ⚠ 2026-11-14：**不再是「整域技术失败」的同义词** —— 环只让**环上那几个需求**未排，
+    ///   其余需求照排（口径见 `PhaseTwoInitialScheduler` 环处理段）。
+    ///   本标志仍保留，供诊断与「环覆盖全部需求」的极端情形判定。
     /// </summary>
     public bool CrossMaterialHasCycle { get; set; } = false;
+
+    /// <summary>
+    /// 2026-11-14：跨物料 DAG 里**卡在环上**的需求键（Kahn 结束后入度仍 &gt; 0 的那些）。
+    /// 用途：Phase2 只把这些需求记未排并留技术因，**不再整域放弃**。
+    /// </summary>
+    public HashSet<string> CrossMaterialCycleKeys { get; set; } = new(StringComparer.Ordinal);
 
     /// <summary>
     /// B-1（0号位 2026-09-29 裁决 §二）落实：StageSeq 全序链冲突的 MaterialId 集合。

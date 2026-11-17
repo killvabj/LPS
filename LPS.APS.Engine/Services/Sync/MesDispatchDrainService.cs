@@ -44,27 +44,45 @@ public class MesDispatchDrainService : IMesDispatchDrainService
         var adapter = _adapters.FirstOrDefault();
         var adapterMissing = adapter is null;
 
-        // ① 取待发组合（粒度 = (PI, Stage, PV)）
-        //   `Quantity` 取 MAX：同组合各行是"同 PV 定容"载体量、逐行同值；**不得 SUM**（会按行数放大）。
+        // ① 取待发组合（粒度 = (PI, Stage, PV) ＝ 11-05 终稿 §2.1 的「单次下发波」）
+        //   **组量 = 组内各批批量之和**：11-05 终稿 §三「组Σ数量(净合格)」；5号位 2026-11-12 §二.4
+        //   对本 PI 的期望值即 `266.6666 + 266.6666 + 266.6668 = 800.0000`。
+        //   ⚠ 两条都不能碰：
+        //     · **不得按行求和**——每批的各工序行都冗余携带同一整批量，按行 SUM 会放大「工序行数」倍；
+        //     · **不得取 MAX**——一个组合可含多批（TaskNo），MAX 只会送出其中一批的量。
+        //       2026-11-12 12:2x 实测 PENDING 段 150 组合／204 批：Σ各批 = 797,276.6668，
+        //       MAX 合计 = 776,076.6666 ⇒ 少发 21,200.0002；最大单组 PI 17094977×TJ_CAST
+        //       69 行 = 23 批 × 3 工序，MAX 送 400、应送 9,200（少 8,800）。
+        //   ⇒ 用 `OpRank=1` 每批只取一行再 SUM：既不按行放大，也不丢批。
         var groups = (await _connectionManager.QueryAsync<DispatchGroupRow>(
-            @"SELECT TOP (@Max) d.ProductionInstructionNo AS PI,
-                     d.StageCode                      AS StageCode,
-                     d.SourcePlanVersionId            AS Pv,
-                     MIN(d.MaterialCode)              AS MaterialCode,
-                     MAX(d.Quantity)                  AS Quantity,
-                     MIN(d.UOM)                       AS Uom,
-                     MIN(d.FactoryId)                 AS FactoryId,
+            @"SELECT TOP (@Max) x.ProductionInstructionNo AS PI,
+                     x.StageCode                      AS StageCode,
+                     x.SourcePlanVersionId            AS Pv,
+                     MIN(x.MaterialCode)              AS MaterialCode,
+                     SUM(CASE WHEN x.OpRank = 1 THEN x.Quantity END) AS Quantity,
+                     MIN(x.UOM)                       AS Uom,
+                     MIN(x.FactoryId)                 AS FactoryId,
+                     MIN(x.ResourceCode)              AS ResourceCode,
                      COUNT(*)                         AS RowCnt,
-                     MIN(d.PlannedStartTime)          AS PlannedStartTime,
-                     MAX(d.PlannedEndTime)            AS PlannedEndTime
-              FROM   TaskDispatch d
-              INNER JOIN PlanVersion pv ON pv.Id = d.SourcePlanVersionId
-              WHERE  d.DispatchStatus = @Pending
-                AND  d.SourcePlanVersionId IS NOT NULL
-                AND  pv.SourceScheduleRunId = @Run
-                AND  ISNULL(d.ProductionInstructionNo, N'') <> ''
-              GROUP BY d.ProductionInstructionNo, d.StageCode, d.SourcePlanVersionId
-              ORDER BY MIN(d.Id)",
+                     MIN(x.PlannedStartTime)          AS PlannedStartTime,
+                     MAX(x.PlannedEndTime)            AS PlannedEndTime,
+                     -- 2026-11-12 会签（5号位 §四）：只加这两列；组内应同值，取 MIN 兜底
+                     MIN(NULLIF(x.InstructionType, N'')) AS InstructionType,
+                     MIN(NULLIF(x.WorkOrderType, N''))   AS WorkOrderType
+              FROM   (SELECT d.*,
+                             ROW_NUMBER() OVER (PARTITION BY d.SourcePlanVersionId,
+                                                              d.ProductionInstructionNo,
+                                                              ISNULL(d.StageCode, N''),
+                                                              ISNULL(d.TaskNo, CONCAT(N'T#', CONVERT(nvarchar(20), d.SourceTaskId)))
+                                                ORDER BY d.Id) AS OpRank
+                      FROM   TaskDispatch d
+                      INNER JOIN PlanVersion pv ON pv.Id = d.SourcePlanVersionId
+                      WHERE  d.DispatchStatus = @Pending
+                        AND  d.SourcePlanVersionId IS NOT NULL
+                        AND  pv.SourceScheduleRunId = @Run
+                        AND  ISNULL(d.ProductionInstructionNo, N'') <> '') x
+              GROUP BY x.ProductionInstructionNo, x.StageCode, x.SourcePlanVersionId
+              ORDER BY MIN(x.Id)",
             new { Max = maxGroups, Pending = StatusPending, Run = scheduleRunId },
             db: DatabaseId.APS, commandTimeout: 300)).ToList();
 
@@ -77,11 +95,45 @@ public class MesDispatchDrainService : IMesDispatchDrainService
 
         int accepted = 0, rejected = 0, unknown = 0, rowsCreated = 0, rowsFailed = 0, rowsPending = 0;
 
+        // 2026-11-12（`O77`）：`FactoryId → Factory.Code`（附录 A 的 `factoryCode` 必填）。
+        //   为什么在此之前一直是空串：`TaskDispatch.FactoryId` 落库侧**从未写过**（实测 89,261 行全 NULL，
+        //   见 `PeggingOrchestrator` 同日补写）⇒ 组查询 `MIN(d.FactoryId)` 恒 NULL ⇒ 组令里只能塞 `string.Empty`。
+        //   现在落库侧已补写，这里把 Id 换成码；**换不到就不发**（见下面跳过分支）。
+        var factoryIds = groups
+            .Select(g => g.FactoryId)
+            .Where(id => id is > 0)
+            .Select(id => id!.Value)
+            .Distinct()
+            .ToList();
+        var factoryCodeById = factoryIds.Count == 0
+            ? new Dictionary<int, string>()
+            : (await _connectionManager.QueryAsync<FactoryCodeRow>(
+                "SELECT Id, Code FROM Factory WHERE Id IN @Ids",
+                new { Ids = factoryIds }, db: DatabaseId.APS, commandTimeout: 120))
+              .ToDictionary(r => r.Id, r => r.Code);
+
+        int skippedMissing = 0;
+
         foreach (var g in groups)
         {
             ct.ThrowIfCancellationRequested();
             var pi = g.PI ?? string.Empty;
             var stage = g.StageCode ?? string.Empty;
+
+            // ── 附录 A 必填字段闸（2026-11-12，`O77`）────────────────────────────────
+            //   `factoryCode` 与 `materialCode` 都是必填。缺一个就**不发**：送出去只能拿到 MES 拒收，
+            //   而且我方分不清是「我方数据缺」还是「接口不接受」。
+            //   **保持 `PENDING`**（在抢占之前 `continue`），落库侧补齐后下一轮自然重试 —— 不落 `FAILED`。
+            var factoryCode = g.FactoryId is int fid && factoryCodeById.TryGetValue(fid, out var fc) ? fc : string.Empty;
+            if (factoryCode.Length == 0 || string.IsNullOrWhiteSpace(g.MaterialCode))
+            {
+                skippedMissing++;
+                _logger.LogWarning(
+                    "[MesDispatch] 组合 PI={Pi} Stage={Stage} PV={Pv} 缺附录 A 必填字段" +
+                    "（factoryCode='{Factory}'／materialCode='{Material}'）⇒ 本轮跳过，保持 PENDING",
+                    pi, stage, g.Pv, factoryCode, g.MaterialCode ?? "(NULL)");
+                continue;
+            }
 
             // ② 抢占：PENDING → PROCESSING（乐观并发；抢不到说明已被别的执行体领走）
             var claimed = await _connectionManager.ExecuteAsync(
@@ -121,8 +173,11 @@ public class MesDispatchDrainService : IMesDispatchDrainService
 
                     var command = new MesDispatchCommand(
                         referenceNo, pi, stage, g.Pv, g.MaterialCode ?? string.Empty,
-                        g.Quantity, g.Uom ?? string.Empty, string.Empty, null,
-                        g.PlannedStartTime ?? DateTime.Now, g.PlannedEndTime ?? DateTime.Now, taskIds);
+                        g.Quantity, g.Uom ?? string.Empty,
+                        factoryCode,
+                        string.IsNullOrWhiteSpace(g.ResourceCode) ? null : g.ResourceCode,
+                        g.PlannedStartTime ?? DateTime.Now, g.PlannedEndTime ?? DateTime.Now, taskIds,
+                        g.InstructionType, g.WorkOrderType);
 
                     result = await adapter.CreateWorkOrderAsync(command, ct);
                 }
@@ -195,8 +250,10 @@ public class MesDispatchDrainService : IMesDispatchDrainService
         }
 
         _logger.LogInformation(
-            "[MesDispatch] Run={Run} 消费完成：组合 {Seen}（Accepted {A} / Rejected {R} / Unknown {U}）；行 Accepted {RowsA} / Failed {RowsF} / 回 PENDING {RowsP}；适配器{AdapterState}",
-            scheduleRunId, groups.Count, accepted, rejected, unknown, rowsCreated, rowsFailed, rowsPending,
+            "[MesDispatch] Run={Run} 消费完成：组合 {Seen}（Accepted {A} / Rejected {R} / Unknown {U} / 缺必填跳过 {Skip}）；" +
+            "行 Accepted {RowsA} / Failed {RowsF} / 回 PENDING {RowsP}；适配器{AdapterState}",
+            scheduleRunId, groups.Count, accepted, rejected, unknown, skippedMissing,
+            rowsCreated, rowsFailed, rowsPending,
             adapterMissing ? "未注册（NOT_CONFIGURED）" : "已注册");
 
         return new MesDispatchDrainResult
@@ -208,6 +265,7 @@ public class MesDispatchDrainService : IMesDispatchDrainService
             RowsCreated = rowsCreated,
             RowsFailed = rowsFailed,
             RowsBackToPending = rowsPending,
+            GroupsSkippedMissingField = skippedMissing,
             AdapterMissing = adapterMissing
         };
     }
@@ -221,8 +279,19 @@ public class MesDispatchDrainService : IMesDispatchDrainService
         public decimal Quantity { get; set; }
         public string? Uom { get; set; }
         public int? FactoryId { get; set; }
+        public string? ResourceCode { get; set; }
         public int RowCnt { get; set; }
         public DateTime? PlannedStartTime { get; set; }
         public DateTime? PlannedEndTime { get; set; }
+        /// <summary>2026-11-12 会签（5号位 §四）：`InstructionType`／`WorkOrderType` 两列。</summary>
+        public string? InstructionType { get; set; }
+        public string? WorkOrderType { get; set; }
+    }
+
+    /// <summary>`Factory.Id → Code` 反查行（2026-11-12，`O77`：附录 A 的 `factoryCode` 必填，不能再送空串）。</summary>
+    private sealed class FactoryCodeRow
+    {
+        public int Id { get; set; }
+        public string Code { get; set; } = string.Empty;
     }
 }

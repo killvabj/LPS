@@ -9,11 +9,13 @@
  *  - impactedOrderCount 超阈值仅 Warning，不表示截断（U15）
  *  - 跨 Domain 时显示链式 WHATIF（V1 仅汇总展示）
  *
- * Mock 设计：
- *  - M-001 (≤100) → 按期，全部 FACT
- *  - M-003 → 单 Domain 延期（CAPACITY + ESTIMATED）
- *  - M-005 → 跨 Domain 链式（INJECTION→ASSEMBLY→TEST，超阈值）
- *  - 其它 → 默认 DUE_DATE_RISK 场景
+ * 2026-11-14 工厂视角改版：
+ *  - 物料下拉改**远程搜索**：后端不带 search 时 LIMIT 200 ⇒ 200 条之外的物料在下拉里根本选不到
+ *  - 工厂下拉只放 5 个真业务码（后端主数据混着 44 条 TF_* 测试夹具）
+ *  - 后端 501（试算能力未接入）翻成大白话，不把内部归属说明甩给用户
+ *  - 评估时间用**真实评估时刻**（不是渲染时刻）
+ *  - 加「复制结论」：工厂用户要把结论直接发给客户
+ *  - 撤页头大标题页头（2026-10-16 定调），标题进卡片头
  */
 
 import { computed, onMounted, reactive, ref } from 'vue'
@@ -26,6 +28,7 @@ import { domainApi } from '@/api/aps-v1/domain'
 import { materialLookupApi } from '@/api/aps-v1/materialLookup'
 import type { MaterialLookupItem } from '@/api/aps-v1/types'
 import {
+  BIZ_ISSUE_FACTORY_CODES,
   ESTIMATED_BADGE_TEXT,
   reasonLabelOf,
   type CtpInput,
@@ -50,7 +53,8 @@ import {
 } from 'element-plus'
 
 const ctpStore = useCtpStore()
-const { result, history, loading, error, hasResult, isOverThreshold } = storeToRefs(ctpStore)
+const { result, history, loading, error, errorCode, errorTraceId, evaluatedAt, hasResult, isOverThreshold } =
+  storeToRefs(ctpStore)
 
 const domainStore = useDomainStore()
 function humanLabel(domainKey: string | undefined | null): string {
@@ -62,34 +66,8 @@ const resultNN = computed(() => result.value!)
 
 /** 下拉数据源加载失败提示（不伪造选项，如实告诉用户） */
 const optionLoadError = ref<string | null>(null)
-
-/** P1-08 入口：Gantt/Workbench 可带 ?purpose=INSERT_IMPACT_ANALYSIS 跳转；Ctp 在挂载时读取并覆盖默认值 */
-const route = useRoute()
-onMounted(() => {
-  if (route.query.purpose === 'INSERT_IMPACT_ANALYSIS') {
-    form.purpose = 'INSERT_IMPACT_ANALYSIS'
-  }
-  // 工厂 / 物料下拉**只展示后端真实数据**。拉取失败时给空下拉 + 红色提示，绝不回退硬编码值 ——
-  // 假选项会让用户选到实库里不存在的工厂/物料，提交后才被后端 400（订单页 OD05 同类整改）。
-  domainApi
-    .listFactories()
-    .then((list: FactorySummaryDto[]) => {
-      FACTORY_OPTIONS.value = list
-    })
-    .catch((err) => {
-      FACTORY_OPTIONS.value = []
-      optionLoadError.value = `工厂列表加载失败，请刷新重试（${(err as Error)?.message ?? '未知错误'}）`
-    })
-  materialLookupApi
-    .listActiveMaterials()
-    .then((list: MaterialLookupItem[]) => {
-      MATERIAL_OPTIONS.value = list
-    })
-    .catch((err) => {
-      MATERIAL_OPTIONS.value = []
-      optionLoadError.value = `物料列表加载失败，请刷新重试（${(err as Error)?.message ?? '未知错误'}）`
-    })
-})
+/** 物料下拉提示（没搜到 / 查询失败） */
+const materialNotice = ref<string | null>(null)
 
 /* ===== 表单本地副本（输入体验用，提交时再写回 store）===== */
 const form = reactive({
@@ -103,18 +81,88 @@ const form = reactive({
   purpose: 'CTP' as 'CTP' | 'INSERT_IMPACT_ANALYSIS'
 })
 
-/** 物料下拉数据源（real API，2026-09-30 接入）
- *  - 端点：GET /api/governance/lookups/materials?activeOnly=true（materialLookupApi.listActiveMaterials）
- *  - 后端 SQL：WHERE @ActiveOnly=1 → 仅 IsActive=1；LIMIT 200；ORDER BY MaterialCode
- *  - 失败/为空兜底：硬编码 7 条（前端演示用），保证离线场景下 UI 可用
- */
-const MATERIAL_OPTIONS = ref<MaterialLookupItem[]>([])
-/** 工厂下拉数据源（real API，2026-09-30 接入）
+/** 工厂下拉数据源（real API）
  *  - 端点：GET /api/governance/factories（domainApi.listFactories，3号位 落地）
  *  - 返回 FactorySummaryDto[]：id + code + name（后端已 IsActive 过滤）
- *  - 失败兜底：前端硬编码 2 条，保证离线场景下 UI 可用
+ *  - ⚠️ 该表混着 44 条测试夹具（`TF_*` / "Test Factory…" / "S1~S4 Factory…"，且 IsActive=1）
+ *    ⇒ 铺全表会把测试厂推给用户；按 5号位 11-11 复函 §二 的真业务码白名单过滤
+ *    （与异常解释页同一份 BIZ_ISSUE_FACTORY_CODES，`CN6课` 就是正式码，别改写）。
+ *  - 失败：空下拉 + 如实提示，**不硬编码兜底**。
  */
 const FACTORY_OPTIONS = ref<FactorySummaryDto[]>([])
+
+/** 物料下拉数据源（远程搜索）
+ *  - 端点：GET /api/governance/lookups/materials（search=片段 / activeOnly=true）
+ *  - ⚠️ 不带 search 时后端 LIMIT 200 ⇒ 200 条之外的物料用下拉根本选不到
+ *    ⇒ 改远程搜索：用户敲编码/名称片段，后端 LIKE 查。
+ *  - ⚠️ ElSelect 远程模式（filterable + remote）下 Element Plus 会跳过本地过滤，
+ *    收窄只能由后端 search 参数完成（前端不再自己 filter）。
+ */
+const MATERIAL_OPTIONS = ref<MaterialLookupItem[]>([])
+const materialLoading = ref(false)
+/** 当前选中的物料（远程搜索换了列表后，ElSelect 找不到原选项就只显示编码） */
+const selectedMaterial = ref<MaterialLookupItem | null>(null)
+let materialSeq = 0
+
+/** 把已选物料并回选项列表，保证下拉里显示的是「编码 名称」而不是裸编码 */
+function withSelectedMaterial(list: MaterialLookupItem[]): MaterialLookupItem[] {
+  const sel = selectedMaterial.value
+  if (!sel || list.some((o) => o.code === sel.code)) return list
+  return [sel, ...list]
+}
+
+async function loadMaterials(query: string): Promise<void> {
+  const seq = ++materialSeq
+  const q = String(query ?? '').trim()
+  materialLoading.value = true
+  try {
+    const list = q
+      ? await materialLookupApi.searchMaterialsOrThrow(q)
+      : await materialLookupApi.listActiveMaterialsOrThrow()
+    if (seq !== materialSeq) return
+    MATERIAL_OPTIONS.value = withSelectedMaterial(list)
+    materialNotice.value = q && !list.length ? `没有编码或名称里带「${q}」的物料` : null
+  } catch (err) {
+    if (seq !== materialSeq) return
+    MATERIAL_OPTIONS.value = []
+    materialNotice.value = `物料查询失败，请稍后重试（${(err as Error)?.message ?? '未知错误'}）`
+  } finally {
+    if (seq === materialSeq) materialLoading.value = false
+  }
+}
+
+function onMaterialSearch(query: string): void {
+  void loadMaterials(query)
+}
+
+function onMaterialChange(code: string): void {
+  selectedMaterial.value = MATERIAL_OPTIONS.value.find((o) => o.code === code) ?? null
+  materialNotice.value = null
+}
+
+/** P1-08 入口：Gantt/Workbench 可带 ?purpose=INSERT_IMPACT_ANALYSIS 跳转；Ctp 在挂载时读取并覆盖默认值 */
+const route = useRoute()
+onMounted(() => {
+  if (route.query.purpose === 'INSERT_IMPACT_ANALYSIS') {
+    form.purpose = 'INSERT_IMPACT_ANALYSIS'
+  }
+  // 工厂 / 物料下拉**只展示后端真实数据**。拉取失败时给空下拉 + 红色提示，绝不回退硬编码值 ——
+  // 假选项会让用户选到实库里不存在的工厂/物料，提交后才被后端 400（订单页 OD05 同类整改）。
+  domainApi
+    .listFactories()
+    .then((list: FactorySummaryDto[]) => {
+      const allow = new Set<string>(BIZ_ISSUE_FACTORY_CODES)
+      FACTORY_OPTIONS.value = list.filter((f) => allow.has((f.code ?? '').trim()))
+      if (!FACTORY_OPTIONS.value.length) {
+        optionLoadError.value = '没有可用的工厂，请联系管理员检查工厂主数据'
+      }
+    })
+    .catch((err) => {
+      FACTORY_OPTIONS.value = []
+      optionLoadError.value = `工厂列表加载失败，请刷新重试（${(err as Error)?.message ?? '未知错误'}）`
+    })
+  void loadMaterials('')
+})
 
 /* ===== 字典 =====
  * 根因码复用冻结 `07 v5.1.13 §八.1` 权威 15 码（与甘特 / Explanation 页同一份
@@ -152,8 +200,8 @@ const PURPOSE_TITLE: Record<'CTP' | 'INSERT_IMPACT_ANALYSIS', string> = {
   INSERT_IMPACT_ANALYSIS: '插单影响分析'
 }
 const PURPOSE_SUB: Record<'CTP' | 'INSERT_IMPACT_ANALYSIS', string> = {
-  CTP: '输入插单参数 → 立即获得按期/延期判定、根因、影响订单数',
-  INSERT_IMPACT_ANALYSIS: '输入插单参数 → 内部评估对其它订单/资源的影响（仅试算，不会改为正式计划）'
+  CTP: '填物料、数量、工厂和客户交期，判断这单能不能按期做完',
+  INSERT_IMPACT_ANALYSIS: '评估这单插进来对其它订单/资源的影响（仅试算，不会改为正式计划）'
 }
 const PURPOSE_HISTORY_TAG: Record<'CTP' | 'INSERT_IMPACT_ANALYSIS', 'primary' | 'info'> = {
   CTP: 'primary',
@@ -184,6 +232,55 @@ const filteredHistory = computed(() =>
   history.value.filter((h) => h.input.purpose === form.purpose)
 )
 
+/* ===== 错误 → 工厂用户看得懂的话 =====
+ *  - 501：试算核心能力后端未接入（报文里带内部归属说明，不上屏）
+ *  - 400 且提到 DomainKey：物料/工厂落不到同一个排程域
+ *  - 其它：原样透出正文（traceId 放次要位置，不进标题）
+ */
+const friendlyError = computed(() => {
+  const raw = error.value
+  if (!raw) return null
+  if (errorCode.value === 501) {
+    return '交期试算服务还没开通，现在算不出结论。开通后这里会直接给出按期/延期判断。'
+  }
+  if (/domainkey/i.test(raw)) {
+    return '这个物料在这个工厂下找不到对应的排程域，换个物料或工厂再试。'
+  }
+  return raw
+})
+
+/* ===== 结论复制（工厂用户要把结论直接发给客户/销售）===== */
+const verdictText = computed(() => {
+  const r = result.value
+  if (!r) return ''
+  const factoryName =
+    FACTORY_OPTIONS.value.find((f) => f.code === form.factoryCode)?.name ?? form.factoryCode
+  const materialName = selectedMaterial.value?.name
+  return [
+    `插单评估结论（${PURPOSE_LABEL[form.purpose]}）`,
+    `物料：${materialName ? `${materialName}（${form.materialCode}）` : form.materialCode} × ${form.quantity}`,
+    `工厂：${factoryName}`,
+    `客户请求交期：${form.requestedDueDate}`,
+    `判定：${r.meetsRequestedDueDate ? '可按期完成' : '无法按期完成'}`,
+    `最早完成日期：${dayjs(r.earliestCompletion).format('YYYY-MM-DD')}${
+      r.meetsRequestedDueDate ? '' : `（延期 ${delayDays} 天）`
+    }`,
+    `主要瓶颈：${r.mainBottleneck}`,
+    `受影响订单：${r.impactedOrderCount} 个`
+  ].join('\n')
+})
+
+async function copyVerdict(): Promise<void> {
+  const text = verdictText.value
+  if (!text) return
+  try {
+    await navigator.clipboard.writeText(text)
+    ElMessage.success('结论已复制，可直接发给客户')
+  } catch {
+    ElMessage.warning('复制失败，请手动选中结论文字复制')
+  }
+}
+
 /* ===== 操作 ===== */
 async function onSubmit(): Promise<void> {
   // 兜底：必填校验防止 422（撤下拉后用户不再被「请选择事业部」卡住，会直接点评估）
@@ -192,7 +289,9 @@ async function onSubmit(): Promise<void> {
     return
   }
   await ctpStore.evaluate({
-    orderCanonicalId: form.orderCanonicalId || `PO-${Date.now()}`,
+    // 订单号可留空：生成一个**人能读**的本次评估编号（原来的 PO-<时间戳> 看不出是哪天）
+    orderCanonicalId:
+      form.orderCanonicalId || `PO-${dayjs().format('YYYYMMDD-HHmm')}`,
     materialCode: form.materialCode,
     quantity: form.quantity,
     factoryCode: form.factoryCode,
@@ -209,6 +308,8 @@ function onReset(): void {
     requestedDueDate: new Date(Date.now() + 10 * 86400_000).toISOString().slice(0, 10),
     purpose: 'CTP'
   })
+  selectedMaterial.value = null
+  materialNotice.value = null
   ctpStore.reset()
 }
 function onLoadHistory(entryId: number): void {
@@ -219,34 +320,32 @@ function onLoadHistory(entryId: number): void {
   const { domainKey: _drop, ...rest } = entry.input as CtpInput & { domainKey?: string }
   void _drop
   Object.assign(form, rest)
+  // 历史里的物料可能不在当前选项列表里（远程搜索后列表会被替换）⇒ 找回来，否则下拉只显示裸编码
+  selectedMaterial.value =
+    MATERIAL_OPTIONS.value.find((o) => o.code === form.materialCode) ?? null
 }
 </script>
 
 <template>
   <div class="aps-ctp">
-    <!-- ===== 顶部 ===== -->
-    <div class="page-header">
-      <div>
-        <h2 class="page-title">
-          {{ PURPOSE_TITLE[form.purpose] }}
-          <ElTag
-            v-if="form.purpose === 'INSERT_IMPACT_ANALYSIS'"
-            size="small"
-            effect="dark"
-            type="info"
-            style="margin-left: 8px; vertical-align: middle"
-          >
-            试算
-          </ElTag>
-        </h2>
-        <p class="page-sub">{{ PURPOSE_SUB[form.purpose] }}</p>
-      </div>
-    </div>
-
-    <!-- ===== 输入表单 ===== -->
+    <!-- ===== 输入表单（2026-11-14：撤页头大标题页头，标题进卡片头）===== -->
     <ElCard class="panel">
       <template #header>
-        <span>评估输入</span>
+        <div class="panel-header">
+          <span>
+            {{ PURPOSE_TITLE[form.purpose] }}
+            <ElTag
+              v-if="form.purpose === 'INSERT_IMPACT_ANALYSIS'"
+              size="small"
+              effect="dark"
+              type="info"
+              style="margin-left: 6px"
+            >
+              试算
+            </ElTag>
+          </span>
+          <span class="muted-tag">{{ PURPOSE_SUB[form.purpose] }}</span>
+        </div>
       </template>
       <ElAlert
         v-if="optionLoadError"
@@ -256,50 +355,86 @@ function onLoadHistory(entryId: number): void {
         :title="optionLoadError"
         class="option-error"
       />
+      <ElAlert
+        v-if="materialNotice"
+        type="warning"
+        :closable="false"
+        show-icon
+        :title="materialNotice"
+        class="option-error"
+      />
       <div class="input-form">
         <div class="input-field">
           <span class="field-label">订单号</span>
           <ElInput
             v-model="form.orderCanonicalId"
-            placeholder="可空，留空将自动生成"
+            placeholder="可空，留空自动生成"
             size="default"
             class="field-input"
           />
         </div>
         <div class="input-field">
-          <span class="field-label">物料</span>
-          <ElSelect v-model="form.materialCode" placeholder="选择物料" class="field-input">
+          <span class="field-label">
+            物料<span class="required-mark">*</span>
+          </span>
+          <ElSelect
+            v-model="form.materialCode"
+            filterable
+            remote
+            clearable
+            reserve-keyword
+            :remote-method="onMaterialSearch"
+            :loading="materialLoading"
+            placeholder="输入物料编码或名称"
+            class="field-input"
+            @change="onMaterialChange"
+          >
             <ElOption
               v-for="opt in MATERIAL_OPTIONS"
-              :key="opt.code"
-              :label="`${opt.code} - ${opt.name}`"
+              :key="opt.masterId"
+              :label="`${opt.code} ${opt.name}`"
               :value="opt.code"
             />
+            <template #empty>
+              <span class="opt-empty">{{ materialLoading ? '查询中…' : '没有匹配的物料' }}</span>
+            </template>
           </ElSelect>
         </div>
         <div class="input-field">
-          <span class="field-label">数量</span>
+          <span class="field-label">
+            数量<span class="required-mark">*</span>
+          </span>
           <ElInputNumber
             v-model="form.quantity"
             :min="1"
             :max="9999"
             :step="10"
+            controls-position="right"
             class="field-input"
           />
         </div>
         <div class="input-field">
-          <span class="field-label">工厂</span>
-          <ElSelect v-model="form.factoryCode" placeholder="选择工厂" class="field-input">
+          <span class="field-label">
+            工厂<span class="required-mark">*</span>
+          </span>
+          <ElSelect
+            v-model="form.factoryCode"
+            filterable
+            placeholder="选择工厂"
+            class="field-input"
+          >
             <ElOption
               v-for="opt in FACTORY_OPTIONS"
               :key="opt.code"
-              :label="opt.name"
+              :label="`${opt.name}（${opt.code}）`"
               :value="opt.code"
             />
           </ElSelect>
         </div>
         <div class="input-field">
-          <span class="field-label">客户请求交期</span>
+          <span class="field-label">
+            客户请求交期<span class="required-mark">*</span>
+          </span>
           <ElDatePicker
             v-model="form.requestedDueDate"
             type="date"
@@ -316,24 +451,47 @@ function onLoadHistory(entryId: number): void {
           </ElSelect>
         </div>
         <div class="input-actions">
-          <ElButton
-            type="primary"
-            :loading="loading"
-            :disabled="!form.materialCode || !form.factoryCode || !form.requestedDueDate"
-            @click="onSubmit"
-          >
-            <Icon icon="vi-ep:circle-check" /> 评估
-          </ElButton>
-          <ElButton @click="onReset">重置</ElButton>
+          <span class="input-hint">物料、工厂、客户请求交期必填；订单号留空会自动生成</span>
+          <div class="input-btns">
+            <ElButton
+              type="primary"
+              :loading="loading"
+              :disabled="!form.materialCode || !form.factoryCode || !form.requestedDueDate"
+              @click="onSubmit"
+            >
+              <Icon icon="vi-ep:circle-check" /> 评估
+            </ElButton>
+            <ElButton @click="onReset">重置</ElButton>
+          </div>
         </div>
       </div>
     </ElCard>
 
-    <!-- ===== 错误条 ===== -->
-    <ElAlert v-if="error" type="error" :closable="false" show-icon :title="`评估失败：${error}`" />
+    <!-- ===== 错误条（后端报文翻成大白话；内部编号/traceId 只放次要位置）===== -->
+    <ElAlert
+      v-if="friendlyError"
+      type="error"
+      :closable="false"
+      show-icon
+      :title="friendlyError"
+      class="eval-error"
+    >
+      <span v-if="errorCode" class="err-detail">
+        技术信息：{{ errorCode }}{{ errorTraceId ? ' / ' + errorTraceId : '' }}
+      </span>
+    </ElAlert>
 
     <!-- ===== 结果区 ===== -->
     <div v-if="hasResult" class="result-area">
+      <!-- 结果工具条：把结论复制走（工厂用户要直接发给客户/销售） -->
+      <div class="result-toolbar">
+        <span class="muted-tag">
+          评估时刻：{{ evaluatedAt ? dayjs(evaluatedAt).format('YYYY-MM-DD HH:mm') : '-' }}
+        </span>
+        <ElButton size="small" @click="copyVerdict">
+          <Icon icon="vi-ep:copy-document" /> 复制结论
+        </ElButton>
+      </div>
       <!-- 顶部判定卡 -->
       <div class="verdict-row">
         <div class="verdict-card" :class="resultNN.meetsRequestedDueDate ? 'pass' : 'fail'">
@@ -357,8 +515,11 @@ function onLoadHistory(entryId: number): void {
               </template>
             </div>
             <div class="verdict-sub">
-              评估时间：{{ dayjs().format('YYYY-MM-DD HH:mm') }} ·
-              {{ form.purpose === 'CTP' ? '当前生效版本' : '仅试算，不改为正式计划' }}
+              {{
+                form.purpose === 'CTP'
+                  ? '按当前生效版本试算，不改动正式计划'
+                  : '仅试算，不改为正式计划'
+              }}
             </div>
           </div>
         </div>
@@ -617,7 +778,7 @@ function onLoadHistory(entryId: number): void {
 
     <!-- ===== 空态 ===== -->
     <ElCard v-else class="empty-card">
-      <ElEmpty description="请填写左侧插单参数后点击「评估」">
+      <ElEmpty description="填好上面的物料、数量、工厂和客户交期，点「评估」出结论">
         <template #image>
           <Icon style="font-size: 48px; color: #cbd5e1" icon="vi-mdi:target" />
         </template>
@@ -634,21 +795,6 @@ function onLoadHistory(entryId: number): void {
   background: #f5f7fa;
   flex-direction: column;
   gap: 16px;
-}
-
-.page-header {
-  .page-title {
-    margin: 0;
-    font-size: 20px;
-    font-weight: 600;
-    color: #1e293b;
-  }
-
-  .page-sub {
-    margin: 4px 0 0;
-    font-size: 12px;
-    color: #94a3b8;
-  }
 }
 
 .panel {
@@ -715,8 +861,40 @@ function onLoadHistory(entryId: number): void {
   margin-top: 4px;
   border-top: 1px dashed #e2e8f0;
   grid-column: 1 / -1;
-  justify-content: flex-end;
+  align-items: center;
+  justify-content: space-between;
   gap: 8px;
+
+  .input-hint {
+    font-size: 12px;
+    color: #94a3b8;
+  }
+
+  .input-btns {
+    display: flex;
+    gap: 8px;
+  }
+}
+
+.opt-empty {
+  padding: 8px 12px;
+  font-size: 12px;
+  color: #94a3b8;
+}
+
+.eval-error {
+  .err-detail {
+    font-size: 11px;
+    color: #94a3b8;
+  }
+}
+
+/* 结果工具条 */
+.result-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 2px;
 }
 
 /* Verdict 判定 */

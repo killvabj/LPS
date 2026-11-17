@@ -4,6 +4,15 @@ VITE_NODE_ENV=production
 # 接口前缀
 VITE_API_BASE_PATH=
 
+# APS 后端 baseURL（生产环境）
+#  - 11-12 4号位 落库：此前只由 scripts/build-delivery.mjs 在构建时注入，漏注入时产物会
+#    **静默**回落到 http://localhost:5163（src/api/aps-v1/http.ts:30 的 fallback）——
+#    构建照样成功、包看着正常，PM 打开就是"打不通"。写进本文件＝不再依赖记不记得带参数。
+#  - scripts/build-delivery.mjs 的默认基址**从本文件读**（单一真相源）；--api 仍可临时覆盖
+#    （vite loadEnv 里 process.env 优先于文件值）。
+#  - dev 走 .env.dev（https://localhost:7044），两者互不影响。
+VITE_APS_API_BASE_URL="http://10.116.2.75:8081"
+
 # 打包路径
 VITE_BASE_PATH=/
 

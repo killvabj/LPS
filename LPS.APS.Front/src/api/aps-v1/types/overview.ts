@@ -153,6 +153,18 @@ export interface RunDomainStatusItem {
   status: RunDomainStatus | string
   /** FAILED = 失败信息；BLOCKED = 被阻断说明；其余可为空 */
   reason?: string | null
+  /**
+   * 稳定失败原因码（3号位 2026-11-12 R3 落码）
+   *  - `DOMAIN_CALC_FAILED` = 该域计算失败（**根因**）
+   *  - `BLOCKED_BY_UPSTREAM_DOMAIN` = 上游域失败，本次未生成计划版本（**被拖累**）
+   *  - 未落码/非失败域为空 ⇒ 前端不据此下结论
+   */
+  reasonCode?: string | null
+  /** 该域本次计划版本的计划区间（3号位 2026-11-12 R1 落码；未生成时为空） */
+  planHorizonStart?: IsoDateTime | null
+  planHorizonEnd?: IsoDateTime | null
+  /** 该域本次计划版本的任务数（3号位 2026-11-12 R2 落码；未生成时为空） */
+  totalTasks?: number | null
   planVersionId?: number | null
   planVersionCode?: string | null
   startedAt: IsoDateTime

@@ -22,7 +22,7 @@
  *   - 登录一次即可（dev 登录限流 5 次/分钟）
  */
 import { spawn, execFileSync } from 'node:child_process'
-import { existsSync, mkdirSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import os from 'node:os'
@@ -76,7 +76,14 @@ const chrome = spawn(CHROME, [
 ], { stdio: 'ignore' })
 
 function killChrome() {
-  try { execFileSync('taskkill', ['/pid', String(chrome.pid), '/T', '/F'], { stdio: 'ignore' }) } catch {}
+  try {
+    execFileSync('taskkill', ['/pid', String(chrome.pid), '/T', '/F'], { stdio: 'ignore' })
+  } catch {}
+  // 2026-11-13: 顺手删掉本轮 Chrome 临时 profile —— 以前只杀进程不删目录，
+  // 每跑一次实看就在 C:\Users\...\Temp 留 ~0.2 GB，攒几十次就把 C 盘撑爆了。
+  try {
+    rmSync(profileDir, { recursive: true, force: true })
+  } catch {}
 }
 const watchdog = setTimeout(() => { console.error('WATCHDOG 超时'); killChrome(); process.exit(2) }, 300000)
 

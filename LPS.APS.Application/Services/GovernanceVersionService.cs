@@ -686,8 +686,8 @@ public class GovernanceVersionService : IGovernanceVersionService
                 ExtractBlockJson(sourceVersion.ContentSnapshotJson, "DemandPriority"),
                 ExtractBlockJson(targetVersion.ContentSnapshotJson, "DemandPriority")),
             CompareSetupTransitionRules(sourceVersion, targetVersion),
-            CompareField("EffectiveFrom", "生效起始", sourceVersion.EffectiveFrom?.ToString("yyyy-MM-dd HH:mm:ss"), targetVersion.EffectiveFrom?.ToString("yyyy-MM-dd HH:mm:ss")),
-            CompareField("EffectiveTo", "生效截止", sourceVersion.EffectiveTo?.ToString("yyyy-MM-dd HH:mm:ss"), targetVersion.EffectiveTo?.ToString("yyyy-MM-dd HH:mm:ss")),
+            CompareField("EffectiveFrom", "生效起", sourceVersion.EffectiveFrom?.ToString("yyyy-MM-dd HH:mm:ss"), targetVersion.EffectiveFrom?.ToString("yyyy-MM-dd HH:mm:ss")),
+            CompareField("EffectiveTo", "生效止", sourceVersion.EffectiveTo?.ToString("yyyy-MM-dd HH:mm:ss"), targetVersion.EffectiveTo?.ToString("yyyy-MM-dd HH:mm:ss")),
             CompareField("PublishedAt", "发布时间", sourceVersion.PublishedAt?.ToString("yyyy-MM-dd HH:mm:ss"), targetVersion.PublishedAt?.ToString("yyyy-MM-dd HH:mm:ss")),
             CompareField("PublishedBy", "发布人", sourceVersion.PublishedBy, targetVersion.PublishedBy),
             CompareField("Remarks", "备注", sourceVersion.Remarks, targetVersion.Remarks)
@@ -737,8 +737,8 @@ public class GovernanceVersionService : IGovernanceVersionService
             CompareField("CandidateGuardrail", "Candidate技术Guardrail配置",
                 ExtractBlockJson(sourceVersion.ContentSnapshotJson, "CandidateGuardrail"),
                 ExtractBlockJson(targetVersion.ContentSnapshotJson, "CandidateGuardrail")),
-            CompareField("EffectiveFrom", "生效起始", sourceVersion.EffectiveFrom?.ToString("yyyy-MM-dd HH:mm:ss"), targetVersion.EffectiveFrom?.ToString("yyyy-MM-dd HH:mm:ss")),
-            CompareField("EffectiveTo", "生效截止", sourceVersion.EffectiveTo?.ToString("yyyy-MM-dd HH:mm:ss"), targetVersion.EffectiveTo?.ToString("yyyy-MM-dd HH:mm:ss")),
+            CompareField("EffectiveFrom", "生效起", sourceVersion.EffectiveFrom?.ToString("yyyy-MM-dd HH:mm:ss"), targetVersion.EffectiveFrom?.ToString("yyyy-MM-dd HH:mm:ss")),
+            CompareField("EffectiveTo", "生效止", sourceVersion.EffectiveTo?.ToString("yyyy-MM-dd HH:mm:ss"), targetVersion.EffectiveTo?.ToString("yyyy-MM-dd HH:mm:ss")),
             CompareField("PublishedAt", "发布时间", sourceVersion.PublishedAt?.ToString("yyyy-MM-dd HH:mm:ss"), targetVersion.PublishedAt?.ToString("yyyy-MM-dd HH:mm:ss")),
             CompareField("PublishedBy", "发布人", sourceVersion.PublishedBy, targetVersion.PublishedBy),
             CompareField("Remarks", "备注", sourceVersion.Remarks, targetVersion.Remarks)
@@ -856,8 +856,8 @@ public class GovernanceVersionService : IGovernanceVersionService
             CompareField("RuleSetVersionId", "引用的规则集版本", sourceVersion.RuleSetVersionId.ToString(), targetVersion.RuleSetVersionId.ToString()),
             CompareField("ParameterSetVersionId", "引用的参数集版本", sourceVersion.ParameterSetVersionId.ToString(), targetVersion.ParameterSetVersionId.ToString()),
             CompareField("IsDefault", "默认版本", sourceVersion.IsDefault.ToString(), targetVersion.IsDefault.ToString()),
-            CompareField("EffectiveFrom", "生效起始", sourceVersion.EffectiveFrom?.ToString("yyyy-MM-dd HH:mm:ss"), targetVersion.EffectiveFrom?.ToString("yyyy-MM-dd HH:mm:ss")),
-            CompareField("EffectiveTo", "生效截止", sourceVersion.EffectiveTo?.ToString("yyyy-MM-dd HH:mm:ss"), targetVersion.EffectiveTo?.ToString("yyyy-MM-dd HH:mm:ss")),
+            CompareField("EffectiveFrom", "生效起", sourceVersion.EffectiveFrom?.ToString("yyyy-MM-dd HH:mm:ss"), targetVersion.EffectiveFrom?.ToString("yyyy-MM-dd HH:mm:ss")),
+            CompareField("EffectiveTo", "生效止", sourceVersion.EffectiveTo?.ToString("yyyy-MM-dd HH:mm:ss"), targetVersion.EffectiveTo?.ToString("yyyy-MM-dd HH:mm:ss")),
             CompareField("PublishedAt", "发布时间", sourceVersion.PublishedAt?.ToString("yyyy-MM-dd HH:mm:ss"), targetVersion.PublishedAt?.ToString("yyyy-MM-dd HH:mm:ss")),
             CompareField("PublishedBy", "发布人", sourceVersion.PublishedBy, targetVersion.PublishedBy)
         };
@@ -1212,6 +1212,10 @@ public class GovernanceVersionService : IGovernanceVersionService
         // 缺配置（键缺失/为空/null）→ 不阻断（H-3：无源不阻断全 36 对、不默认填充），仅内容出现时才进入六项校验
         ValidateStageHandoffWaitRulesJson(ExtractBlockJson(version.ContentSnapshotJson, SolverStrategyValidator.StageHandoffWaitRulesBlockName), result);
 
+        // 跨厂LT 标准参数（准入 C-1~C-3，0号位 2026-11-16 准）：顶层 $.CrossFactoryLeadTimeRules 纯 JSON 校验接入发布链
+        // 缺配置（键缺失/为空/null）→ 不阻断（C-2 缺块=无规则=跨厂LT缺失、不建链）；键在零行 `[]` → fail-closed（C9 同裁）
+        ValidateCrossFactoryLeadTimeRulesJson(ExtractBlockJson(version.ContentSnapshotJson, SolverStrategyValidator.CrossFactoryLeadTimeRulesBlockName), result);
+
         // 0号位 裁决5：无效仓库引用校验（INVALID_WAREHOUSE_REF）——使用现有 APS 权威仓库事实源只读校验
         await ValidateWarehouseReferencesAsync(version.ContentSnapshotJson, result);
 
@@ -1523,6 +1527,45 @@ public class GovernanceVersionService : IGovernanceVersionService
         catch (System.Text.Json.JsonException ex)
         {
             result.Errors.Add(new ValidationError { Code = "INVALID_JSON", Message = "StageHandoffWaitRules 格式无效", FieldName = SolverStrategyValidator.StageHandoffWaitRulesBlockName, Details = ex.Message });
+        }
+    }
+
+    /// <summary>
+    /// 校验顶层跨厂LT 标准参数子块（准入 C-1~C-3，0号位 2026-11-16 准；镜像
+    /// <see cref="ValidateStageHandoffWaitRulesJson"/>）。键缺失/为空/null = 缺配置 → 不阻断（C-2：缺块=无规则=跨厂LT缺失、不建链）；
+    /// 键在零行 <c>[]</c> = 「配了但零行」非法形态 → fail-closed（C9 同裁）；仅内容出现时进入逐条校验（含工厂对重复键）。
+    /// </summary>
+    internal static void ValidateCrossFactoryLeadTimeRulesJson(string? json, PublishValidationResult result)
+    {
+        if (string.IsNullOrWhiteSpace(json))
+        {
+            return; // 缺配置：C-2 缺块=无规则=跨厂LT缺失（不建链），不阻断
+        }
+
+        try
+        {
+            var rules = System.Text.Json.JsonSerializer.Deserialize<List<CrossFactoryLeadTimeRule>>(json);
+            if (rules == null)
+            {
+                result.Errors.Add(new ValidationError { Code = "INVALID_JSON", Message = "CrossFactoryLeadTimeRules 反序列化结果为空", FieldName = SolverStrategyValidator.CrossFactoryLeadTimeRulesBlockName });
+                return;
+            }
+
+            // C9「键存在但零行 `[]`」= 配置形态非法：发布期 fail-closed，把错卡在发布而非运行（与装载侧同词表）。
+            if (rules.Count == 0)
+            {
+                result.Errors.Add(new ValidationError { Code = "CROSS_FACTORY_LT_BLOCK_EMPTY", Message = "CrossFactoryLeadTimeRules 键存在但零行（配置形态非法：如不用该块应删除该键，不得留空数组）", FieldName = SolverStrategyValidator.CrossFactoryLeadTimeRulesBlockName });
+                return;
+            }
+
+            foreach (var err in SolverStrategyValidator.ValidateCrossFactoryLeadTimeRules(rules))
+            {
+                result.Errors.Add(new ValidationError { Code = "INVALID_CROSS_FACTORY_LT", Message = err, FieldName = SolverStrategyValidator.CrossFactoryLeadTimeRulesBlockName });
+            }
+        }
+        catch (System.Text.Json.JsonException ex)
+        {
+            result.Errors.Add(new ValidationError { Code = "INVALID_JSON", Message = "CrossFactoryLeadTimeRules 格式无效", FieldName = SolverStrategyValidator.CrossFactoryLeadTimeRulesBlockName, Details = ex.Message });
         }
     }
 

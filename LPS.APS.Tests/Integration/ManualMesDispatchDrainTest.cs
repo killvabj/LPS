@@ -1,6 +1,7 @@
 using System;
 using System.Threading;
 using System.Threading.Tasks;
+using LPS.APS.BusinessRules.Extensions;
 using LPS.APS.Engine.Extensions;
 using LPS.APS.Engine.Services.Sync;
 using Microsoft.Extensions.Configuration;
@@ -37,6 +38,9 @@ public class ManualMesDispatchDrainTest
             .Build();
         services.AddSingleton<IConfiguration>(configuration);
         services.AddDatabaseServices(configuration);
+        // IMesDispatchAdapter 的实现在 BusinessRules（5号位），只有走过本扫描的组合根才拿得到；
+        // 缺这一行时手工联调恒报「适配器未注册(NOT_CONFIGURED)」（5号位 2026-11-12 §三注册点核查）。
+        services.AddBusinessRuleServices();
         services.AddLogging(b => b.SetMinimumLevel(LogLevel.Information));
         return services.BuildServiceProvider();
     }

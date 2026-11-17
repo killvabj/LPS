@@ -1,25 +1,35 @@
 <script setup lang="ts">
 /**
- * APS V1 4号位 — PI 位置（`/api/pi-position`）
+ * APS V1 4号位 — 生产指示位置（`/api/pi-position`）
  *
- * 2026-10-17 重做。原先本页整体建立在一份**手写 8 条 PI** 的假数据上（`PI-2026-0001`…`0008`），
- * 页面上 13 个字段（ERP 剩余 / 位置合计 / 差异 / 主位置 / 未分配数量 / 采购占位 / 供给数 / MES 资格 …）
- * 后端一个都没有，且 `mesEligible` 是前端按「无 UNLOCATED + 无占位 = 可下发」推断出来的。
- * 按 5号位 2026-10-17 回执整块重做：
- *  - 页面只回答一个问题：**这个 PI 的剩余量现在在哪些位置上**
- *  - 供给构成（9 类 SupplyType）整块下线 —— 冻结 `07:4123` 明令禁止把 INTERPLANT_TRANSIT 当 Supply 身份，
- *    且真实供给在 `SupplyFact_Pipeline`、不在本页
- *  - MES 资格只保留 U16（`positionType === 'UNLOCATED'` → 不可下发），判据取后端字段本身，不推断；
- *    U17（无 PI 规划任务）/ U18（采购占位）在本页**没有承载字段，不显示**
+ * 2026-11-12 工厂用户视角改版（菜单名同步改：PI位置 → 生产指示位置）
+ *  - 菜单名去掉字母「PI」：中文名取冻结 01:567「生产指示位置计算」/ 01:786「生产指示位置可能事实包」
+ *  - 版本默认值不再取 versions[0]（最新一条常常是失败测试版、位置数为 0 ⇒ 一进页面像系统坏了）
+ *    → 复用订单页的 `pickDefaultVersion()`（已生效 → 算完待确认 → 其它非失败 → 兜底第一条）
+ *  - 位置类型分布卡改成**可点分类**（点一下只看那一类，再点取消）；位置类型筛选下拉撤掉
+ *    （两个入口说同一件事反而乱）
+ *  - 当前阶段改下拉（中文名「BJ机加（BJ_MACH）」），工厂用户不用背阶段码
+ *  - 筛选口径澄清：生产指示号 / 物料编码 后端是**包含匹配**（dev 实测），旧文案「精确匹配」是错的
+ *  - 表格瘦身：去掉「快照时间」「操作」两列（点生产指示号即开明细）；明细抽屉补上快照时间
+ *  - 抽屉里的「计划版本」不再显示内部 Id，改显示版本码
+ *  - 空态分三态：未选版本 / 这个版本没有位置数据 / 当前筛选没有匹配
+ *  - 指标条提到页面**最上面**（在筛选栏之上）：先看概况、再选版本看明细
+ *  - 修时区错位：位置快照时间原用 `formatUtcDateTime`（把无时区字面值当 UTC ⇒ 整体 +8 小时，
+ *    dev 上 13:25 落库会显示成 21:25 = 未来的时间）。`ProductionInstructionPositionSnapshot.CreatedAt`
+ *    的 DDL 默认值是 `GETDATE()`（服务器本地墙钟）⇒ 改走 `formatLocalDateTime` 本地直显。
  *
- * 计划版本必填且由用户显式选择（5号位 2026-10-17 回执 §五）：默认取 `/api/schedule/versions` 第一条（最新）。
+ * 口径纪律（2026-10-17 重做时定的，勿推翻）：
+ *  - 供给构成整块下线；MES 资格只用 U16（`positionType === 'UNLOCATED'`）数据驱动判据
+ *  - 位置问题码**原值展示**（冻结无值域 ⇒ 不自造中文词典，已出函 5号位要词典）
+ *  - `sourceKey` 不渲染（5号位 10-17 更正：它是兜底过程标记，不是源单据键）
  */
 
 import { computed, onMounted } from 'vue'
 import { storeToRefs } from 'pinia'
 import { usePiStore } from '@/store/modules/aps/pi'
-import { formatUtcDateTime } from '@/utils/datetime'
-import { PI_POSITION_TYPES, PLAN_VERSION_STATUS_LABELS } from '@/api/aps-v1'
+import { formatLocalDateTime } from '@/utils/datetime'
+import { PLAN_VERSION_STATUS_LABELS } from '@/api/aps-v1'
+import { STAGE_DICT, stageLabelOf } from '@/api/aps-v1/types/stage'
 
 import {
   ElAlert,
@@ -65,38 +75,41 @@ const {
 
 /* ===== 位置类型字典 =====
  * 6 值全预留（0号位 裁决中）。未知值降级显示原值、不报错 —— 后端随时可能出现第 7 个值。
+ * hint = 一句话大白话（工厂用户看标签未必懂），走悬停提示。
  */
 const POSITION_META: Record<
   string,
-  { label: string; tag: 'success' | 'warning' | 'info' | 'primary' | 'danger' }
+  {
+    label: string
+    hint: string
+    tag: 'success' | 'warning' | 'info' | 'primary' | 'danger'
+  }
 > = {
-  STAGE_WAITING: { label: 'Stage 在制', tag: 'success' },
+  STAGE_WAITING: { label: '在制中', hint: '已经在车间里做着的货', tag: 'success' },
   // 冻结名，与 STAGE_WAITING 同概念（纯名称漂移），后端改回冻结名后本行即生效
-  STAGE_WIP: { label: 'Stage 在制（冻结名）', tag: 'success' },
-  FIRST_STAGE_PENDING: { label: '首工序待开始', tag: 'primary' },
-  XC: { label: '线边仓', tag: 'info' },
-  INTERPLANT_TRANSIT: { label: '跨厂在途', tag: 'primary' },
-  UNLOCATED: { label: '无法定位', tag: 'danger' },
+  STAGE_WIP: { label: '在制中（冻结名）', hint: '已经在车间里做着的货', tag: 'success' },
+  FIRST_STAGE_PENDING: { label: '首工序待开始', hint: '还没开工，等着上线', tag: 'primary' },
+  XC: { label: '线边仓', hint: '工位旁边的小仓', tag: 'info' },
+  INTERPLANT_TRANSIT: { label: '跨厂在途', hint: '从一个厂运到另一个厂的路上的货', tag: 'primary' },
+  UNLOCATED: { label: '无法定位', hint: '找不到具体位置，这批货不能下发车间', tag: 'danger' },
   // 冻结有、后端未实现；实库 0 行，V1 可能恒不出现
-  WAITING_INBOUND: { label: '等待入库', tag: 'warning' }
+  WAITING_INBOUND: { label: '等待入库', hint: '货已经到了，还没入库', tag: 'warning' }
 }
 
 function positionLabel(t: string): string {
   return POSITION_META[t]?.label ?? t
 }
+function positionHint(t: string): string {
+  return POSITION_META[t]?.hint ?? ''
+}
 function positionTag(t: string): 'success' | 'warning' | 'info' | 'primary' | 'danger' {
   return POSITION_META[t]?.tag ?? 'info'
 }
 
-const POSITION_OPTIONS: Array<{ value: string; label: string }> = PI_POSITION_TYPES.map((v) => ({
-  value: v,
-  label: POSITION_META[v].label
-}))
-
 const STATUS_LABEL = PLAN_VERSION_STATUS_LABELS
 function versionLabel(id: number): string {
   const v = versions.value.find((x) => x.id === id)
-  return v ? `${v.versionCode}（${STATUS_LABEL[v.status]}）` : String(id)
+  return v ? `${v.versionCode}（${STATUS_LABEL[v.status] ?? v.status}）` : String(id)
 }
 
 /* ===== U16：无法定位不可下发 MES =====
@@ -108,25 +121,67 @@ function isUnlocated(t: string): boolean {
 }
 
 /* ===== 展示口径 ===== */
-const hasPositions = computed(() => (summary.value?.positionTypeCounts?.length ?? 0) > 0)
+/** 这个版本到底有没有位置数据（0 条 = 选错了版本，不是页面坏了） */
+const hasPositions = computed(() => (summary.value?.totalPositions ?? 0) > 0)
 const piCount = computed(() => summary.value?.piCount ?? 0)
+/** 当前选中版本的版本码（抽屉里显示版本码，不显示内部 Id） */
+const currentVersionLabel = computed(() => {
+  const v = versions.value.find((x) => x.id === planVersionId.value)
+  return v ? v.versionCode : '—'
+})
+/** 选中版本是不是失败版（失败版没有位置数据 ⇒ 空态要说清原因） */
+const currentVersionFailed = computed(() => {
+  const v = versions.value.find((x) => x.id === planVersionId.value)
+  return v?.status === 'FAILED'
+})
+/** 指标条显示条件：已选版本，且（该版本有位置数据 或 还在加载）
+ *  与原「指标条排在明细之前」时的渲染条件一致，只是位置提到了页面最上面。 */
+const showKpi = computed(
+  () => planVersionId.value != null && (hasPositions.value || listLoading.value)
+)
 
 /** 单 PI 位置数量合计（详情抽屉用） */
 const detailTotalQty = computed(() => detailRows.value.reduce((s, r) => s + (r.quantity ?? 0), 0))
+
+/* ===== 阶段下拉 =====
+ * 权威字典 = 冻结 07 §1.9 阶段字典（前端内置 29 条，与后端 StageDict 同源），
+ * 再并上**当前页真实出现**的阶段码（数据驱动，不臆造中文名）。
+ */
+const stageOptions = computed(() => {
+  const codes = new Set(Object.keys(STAGE_DICT))
+  for (const r of list.value) {
+    if (r.currentStageCode) codes.add(r.currentStageCode)
+  }
+  return Array.from(codes)
+    .map((code) => ({ value: code, label: stageOptionLabel(code) }))
+    .sort((a, b) => a.label.localeCompare(b.label, 'zh-CN'))
+})
+function stageOptionLabel(code: string): string {
+  const name = stageLabelOf(code)
+  return name === code ? code : `${name}（${code}）`
+}
 
 /* ===== 操作 ===== */
 function onVersionChange(id: number): void {
   piStore.setPlanVersion(id)
 }
-function onFilterChange(
-  patch: Partial<{
-    productionInstructionNo: string
-    materialCode: string
-    positionType: string
-    stageCode: string
-  }>
-): void {
-  piStore.setFilter(patch)
+function onPiNoChange(v: string | undefined): void {
+  piStore.setFilter({ productionInstructionNo: v ?? '' })
+  void piStore.loadList()
+}
+function onMaterialChange(v: string | undefined): void {
+  piStore.setFilter({ materialCode: v ?? '' })
+  void piStore.loadList()
+}
+function onStageChange(v: string | undefined): void {
+  piStore.setFilter({ stageCode: v ?? '' })
+  void piStore.loadList()
+}
+/** 点位置类型分布卡：只看那一类；再点同一张卡 = 取消该分类 */
+function onPositionTypeClick(positionType: string): void {
+  piStore.setFilter({
+    positionType: filter.value.positionType === positionType ? '' : positionType
+  })
   void piStore.loadList()
 }
 function resetFilters(): void {
@@ -147,7 +202,27 @@ onMounted(async () => {
   <div class="aps-pi">
     <ElAlert v-if="error" type="error" :closable="false" show-icon :title="error" />
 
-    <!-- ===== 版本与筛选 ===== -->
+    <!-- ===== 指标条（全部来自 /summary 服务端聚合，不是当前页条数）===== -->
+    <div v-if="showKpi" class="kpi-strip">
+      <div class="kpi-pill">
+        <span class="pill-label">生产指示</span>
+        <span class="pill-val">{{ piCount.toLocaleString() }}</span>
+      </div>
+      <button
+        type="button"
+        class="kpi-pill clickable"
+        :class="{ active: filter.positionType === UNLOCATED }"
+        @click="onPositionTypeClick(UNLOCATED)"
+      >
+        <span class="pill-label">无法定位（条 / 数量）</span>
+        <span class="pill-val"
+          >{{ unlocatedCount.toLocaleString() }} / {{ unlocatedQty.toLocaleString() }}</span
+        >
+      </button>
+      <span class="kpi-caption">数字按所选版本统计；点「无法定位」只看定位不到的那批。</span>
+    </div>
+
+    <!-- ===== 版本与筛选（变更即生效）===== -->
     <ElCard class="panel">
       <div class="filter-row">
         <div class="filter-item">
@@ -156,63 +231,37 @@ onMounted(async () => {
             :model-value="planVersionId ?? undefined"
             placeholder="选择版本"
             filterable
-            style="width: 300px"
+            style="width: 320px"
             :loading="versionsLoading"
             @change="onVersionChange"
           >
             <ElOption v-for="v in versions" :key="v.id" :label="versionLabel(v.id)" :value="v.id" />
           </ElSelect>
-          <ElTooltip content="三个 PI 位置端点都按版本分区，切换版本会重新取数" placement="top">
-            <span class="muted hint">按版本分区</span>
-          </ElTooltip>
         </div>
-        <div class="filter-item">
-          <span class="filter-label">生产指示号</span>
-          <ElInput
-            :model-value="filter.productionInstructionNo"
-            placeholder="精确匹配"
-            clearable
-            style="width: 150px"
-            @change="onFilterChange({ productionInstructionNo: $event })"
-          />
-        </div>
-        <div class="filter-item">
-          <span class="filter-label">物料编码</span>
-          <ElInput
-            :model-value="filter.materialCode"
-            placeholder="物料编码"
-            clearable
-            style="width: 190px"
-            @change="onFilterChange({ materialCode: $event })"
-          />
-        </div>
-        <div class="filter-item">
-          <span class="filter-label">位置类型</span>
-          <ElSelect
-            :model-value="filter.positionType"
-            placeholder="全部"
-            clearable
-            style="width: 170px"
-            @change="onFilterChange({ positionType: $event })"
-          >
-            <ElOption
-              v-for="opt in POSITION_OPTIONS"
-              :key="opt.value"
-              :label="opt.label"
-              :value="opt.value"
-            />
-          </ElSelect>
-        </div>
-        <div class="filter-item">
-          <span class="filter-label">当前阶段</span>
-          <ElInput
-            :model-value="filter.stageCode"
-            placeholder="如 BJ_MACH"
-            clearable
-            style="width: 140px"
-            @change="onFilterChange({ stageCode: $event })"
-          />
-        </div>
+        <ElInput
+          :model-value="filter.productionInstructionNo"
+          placeholder="生产指示号（支持部分匹配）"
+          clearable
+          style="width: 200px"
+          @change="onPiNoChange"
+        />
+        <ElInput
+          :model-value="filter.materialCode"
+          placeholder="物料编码（支持部分匹配）"
+          clearable
+          style="width: 210px"
+          @change="onMaterialChange"
+        />
+        <ElSelect
+          :model-value="filter.stageCode"
+          placeholder="全部阶段"
+          clearable
+          filterable
+          style="width: 190px"
+          @change="onStageChange"
+        >
+          <ElOption v-for="s in stageOptions" :key="s.value" :label="s.label" :value="s.value" />
+        </ElSelect>
         <ElButton @click="resetFilters"> <Icon icon="vi-ep:refresh-left" /> 重置 </ElButton>
         <ElButton :loading="listLoading" @click="refreshAll">
           <Icon icon="vi-ep:refresh" /> 刷新
@@ -225,38 +274,37 @@ onMounted(async () => {
       <ElEmpty description="请先选择一个计划版本" />
     </ElCard>
 
-    <template v-else>
-      <!-- ===== KPI（全部来自 /summary 服务端聚合，不是当前页条数）===== -->
-      <div class="kpi-strip">
-        <div class="kpi-pill">
-          <span class="pill-label">生产指示数</span>
-          <span class="pill-val">{{ piCount.toLocaleString() }}</span>
-        </div>
-        <div class="kpi-pill">
-          <span class="pill-label">位置条数</span>
-          <span class="pill-val">{{ totalPositions.toLocaleString() }}</span>
-        </div>
-        <div class="kpi-pill danger">
-          <span class="pill-label">无法定位（条 / 数量）</span>
-          <span class="pill-val"
-            >{{ unlocatedCount.toLocaleString() }} / {{ unlocatedQty.toLocaleString() }}</span
-          >
-        </div>
-      </div>
+    <!-- ===== 这个版本没有位置数据 ===== -->
+    <ElCard v-else-if="!hasPositions && !listLoading" class="panel">
+      <ElEmpty
+        :description="
+          currentVersionFailed
+            ? '这个计划版本排产失败，没有位置数据，换个版本看看'
+            : '这个计划版本还没有位置数据，换个版本看看'
+        "
+      />
+    </ElCard>
 
-      <!-- ===== 位置类型分布（服务端聚合）===== -->
+    <template v-else>
+      <!-- ===== 位置类型分布（服务端聚合 · 可点分类）===== -->
       <ElCard v-if="hasPositions" class="panel">
-        <template #header>
-          <span class="panel-title">位置类型分布（全版本口径）</span>
-        </template>
         <div class="position-grid">
-          <div v-for="t in summary!.positionTypeCounts" :key="t.positionType" class="position-cell">
-            <ElTag :type="positionTag(t.positionType)" effect="dark" size="small">
-              {{ positionLabel(t.positionType) }}
-            </ElTag>
+          <button
+            v-for="t in summary!.positionTypeCounts"
+            :key="t.positionType"
+            type="button"
+            class="position-cell"
+            :class="{ active: filter.positionType === t.positionType }"
+            @click="onPositionTypeClick(t.positionType)"
+          >
+            <ElTooltip :content="positionHint(t.positionType)" placement="top">
+              <ElTag :type="positionTag(t.positionType)" effect="dark" size="small">
+                {{ positionLabel(t.positionType) }}
+              </ElTag>
+            </ElTooltip>
             <span class="position-count">{{ t.count.toLocaleString() }}</span>
             <span class="position-qty">数量 {{ t.totalQuantity.toLocaleString() }}</span>
-          </div>
+          </button>
         </div>
       </ElCard>
 
@@ -265,9 +313,6 @@ onMounted(async () => {
         <template #header>
           <div class="panel-header">
             <span>位置明细</span>
-            <ElTag size="small" effect="plain">
-              本页 {{ list.length }} 条 / 共 {{ totalPositions.toLocaleString() }} 条
-            </ElTag>
             <ElTag v-if="hasFilter" size="small" type="warning" effect="plain"
               >筛选后「共 N 条」仍是全版本口径</ElTag
             >
@@ -276,7 +321,14 @@ onMounted(async () => {
             </ElTag>
           </div>
         </template>
-        <ElTable v-loading="listLoading" :data="list" size="small" border stripe>
+
+        <div v-if="!list.length && !listLoading" class="panel-empty">
+          <ElEmpty :description="hasFilter ? '当前筛选没有匹配的位置行' : '这个版本没有位置行'">
+            <ElButton v-if="hasFilter" @click="resetFilters">清除筛选</ElButton>
+          </ElEmpty>
+        </div>
+
+        <ElTable v-else v-loading="listLoading" :data="list" size="small" border stripe>
           <ElTableColumn label="生产指示号" width="150">
             <template #default="{ row }">
               <ElButton
@@ -294,7 +346,7 @@ onMounted(async () => {
             min-width="200"
             show-overflow-tooltip
           />
-          <ElTableColumn label="位置类型" width="180">
+          <ElTableColumn label="位置类型" width="170">
             <template #default="{ row }">
               <ElTag :type="positionTag(row.positionType)" effect="dark" size="small">
                 {{ positionLabel(row.positionType) }}
@@ -304,10 +356,12 @@ onMounted(async () => {
               </ElTag>
             </template>
           </ElTableColumn>
-          <ElTableColumn prop="quantity" label="位置数量" width="130" align="right" />
-          <ElTableColumn label="当前阶段" width="120">
+          <ElTableColumn label="位置数量" width="120" align="right">
+            <template #default="{ row }">{{ (row.quantity ?? 0).toLocaleString() }}</template>
+          </ElTableColumn>
+          <ElTableColumn label="当前阶段" width="140">
             <template #default="{ row }">
-              <span v-if="row.currentStageCode" class="code-tag">{{ row.currentStageCode }}</span>
+              <span v-if="row.currentStageCode">{{ stageLabelOf(row.currentStageCode) }}</span>
               <span v-else class="muted">—</span>
             </template>
           </ElTableColumn>
@@ -317,23 +371,6 @@ onMounted(async () => {
                 {{ row.issueCode }}
               </ElTag>
               <span v-else class="muted">—</span>
-            </template>
-          </ElTableColumn>
-          <ElTableColumn label="快照时间" width="150">
-            <template #default="{ row }">
-              <span class="muted">{{ formatUtcDateTime(row.createdAt) }}</span>
-            </template>
-          </ElTableColumn>
-          <ElTableColumn label="操作" width="90" align="center" fixed="right">
-            <template #default="{ row }">
-              <ElButton
-                size="small"
-                link
-                type="primary"
-                @click="piStore.openDetail(row.productionInstructionNo)"
-              >
-                <Icon icon="vi-ep:view" /> 位置明细
-              </ElButton>
             </template>
           </ElTableColumn>
         </ElTable>
@@ -376,7 +413,7 @@ onMounted(async () => {
       </ElCard>
     </template>
 
-    <!-- ===== 单 PI 位置明细 Drawer ===== -->
+    <!-- ===== 单个生产指示的全部位置行 Drawer ===== -->
     <ElDrawer
       :model-value="detailOpen"
       direction="rtl"
@@ -407,7 +444,7 @@ onMounted(async () => {
             <ElDescriptionsItem label="数量合计">{{
               detailTotalQty.toLocaleString()
             }}</ElDescriptionsItem>
-            <ElDescriptionsItem label="计划版本">{{ planVersionId }}</ElDescriptionsItem>
+            <ElDescriptionsItem label="计划版本">{{ currentVersionLabel }}</ElDescriptionsItem>
           </ElDescriptions>
 
           <ElTable v-loading="detailLoading" :data="detailRows" size="small" border>
@@ -418,10 +455,12 @@ onMounted(async () => {
                 </ElTag>
               </template>
             </ElTableColumn>
-            <ElTableColumn prop="quantity" label="位置数量" width="120" align="right" />
-            <ElTableColumn label="当前阶段" width="110">
+            <ElTableColumn label="位置数量" width="120" align="right">
+              <template #default="{ row }">{{ (row.quantity ?? 0).toLocaleString() }}</template>
+            </ElTableColumn>
+            <ElTableColumn label="当前阶段" width="130">
               <template #default="{ row }">
-                <span v-if="row.currentStageCode" class="code-tag">{{ row.currentStageCode }}</span>
+                <span v-if="row.currentStageCode">{{ stageLabelOf(row.currentStageCode) }}</span>
                 <span v-else class="muted">—</span>
               </template>
             </ElTableColumn>
@@ -438,9 +477,9 @@ onMounted(async () => {
                 <span class="code-tag">{{ row.materialCode }}</span>
               </template>
             </ElTableColumn>
-            <ElTableColumn label="快照时间" width="150">
+            <ElTableColumn label="位置快照时间" width="150">
               <template #default="{ row }">
-                <span class="muted">{{ formatUtcDateTime(row.createdAt) }}</span>
+                <span class="muted">{{ formatLocalDateTime(row.createdAt) }}</span>
               </template>
             </ElTableColumn>
           </ElTable>
@@ -479,12 +518,12 @@ onMounted(async () => {
   color: #1e293b;
 }
 
-.muted {
-  color: #94a3b8;
+.panel-empty {
+  padding: 20px 0;
 }
 
-.hint {
-  font-size: 12px;
+.muted {
+  color: #94a3b8;
 }
 
 .code-tag {
@@ -521,6 +560,7 @@ onMounted(async () => {
   display: flex;
   gap: 10px;
   flex-wrap: wrap;
+  align-items: center;
 }
 
 .kpi-pill {
@@ -532,10 +572,6 @@ onMounted(async () => {
   align-items: center;
   gap: 6px;
 
-  &.danger {
-    background: #fee2e2;
-  }
-
   .pill-label {
     color: #64748b;
   }
@@ -544,22 +580,55 @@ onMounted(async () => {
     font-weight: 600;
     color: #1e293b;
   }
+
+  /* 可点的分类入口（无法定位） */
+  &.clickable {
+    cursor: pointer;
+    border: 1px solid transparent;
+
+    &:hover {
+      border-color: #cbd5e1;
+    }
+
+    &.active {
+      background: #fee2e2;
+      border-color: #f87171;
+    }
+  }
+}
+
+.kpi-caption {
+  font-size: 12px;
+  color: #94a3b8;
 }
 
 /* 位置类型分布 */
 .position-grid {
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
   gap: 12px;
 }
 
 .position-cell {
   display: flex;
   padding: 10px 14px;
+  font-size: 12px;
+  text-align: left;
   background: #f8fafc;
+  cursor: pointer;
+  border: 1px solid transparent;
   border-radius: 6px;
   align-items: center;
   gap: 10px;
+
+  &:hover {
+    border-color: #cbd5e1;
+  }
+
+  &.active {
+    background: #eff6ff;
+    border-color: #3b82f6;
+  }
 
   .position-count {
     margin-left: auto;

@@ -57,6 +57,7 @@ import {
   ElMessage,
   ElOption,
   ElSelect,
+  ElSwitch,
   ElTag,
   ElTooltip
 } from 'element-plus'
@@ -115,7 +116,9 @@ const form = reactive({
   resourceCodes: [] as string[],
   fromMaterialCode: '',
   toMaterialCode: '',
-  setupMinutes: 30
+  setupMinutes: 30,
+  /** 规则启停（#67）：新建默认启用；编辑按原值回填 */
+  isActive: true
 })
 
 /**
@@ -435,6 +438,7 @@ watch(
       form.fromMaterialCode = props.rule.fromMaterialCode ?? ''
       form.toMaterialCode = props.rule.toMaterialCode ?? ''
       form.setupMinutes = props.rule.setupMinutes
+      form.isActive = props.rule.isActive ?? true
     } else {
       form.ruleSetVersionId = exactStore.selectedRuleSetVersionId ?? 0
       form.departmentCode = props.prefill?.departmentCode ?? ''
@@ -518,7 +522,9 @@ async function handleSubmit() {
     resourceId,
     fromMaterialId,
     toMaterialId,
-    setupMinutes: form.setupMinutes
+    setupMinutes: form.setupMinutes,
+    // #67：必须回传，否则后端按默认 true 把停用规则复活
+    isActive: form.isActive
   })
 
   if (props.mode === 'edit' && props.rule) {
@@ -748,6 +754,11 @@ const dialogTitle = computed(() =>
         />
         <span class="unit-label">分钟</span>
         <div v-if="form.setupMinutes <= 0" class="redline-hint"> 换型分钟数必须大于 0 </div>
+      </ElFormItem>
+
+      <ElFormItem label="启用">
+        <ElSwitch v-model="form.isActive" active-text="启用" inactive-text="停用" />
+        <span class="unit-label">停用的规则不参与换型匹配</span>
       </ElFormItem>
     </ElForm>
 

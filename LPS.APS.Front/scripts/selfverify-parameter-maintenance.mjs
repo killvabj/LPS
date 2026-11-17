@@ -116,13 +116,15 @@ const cases = [
   {
     id: 'PM09',
     file: CATALOG,
-    from: "hint: '客户等级英文码：VIP 或 GENERAL；按精确匹配判定，大小写要一致'",
+    from:
+      "hint: '客户等级英文码：VIP 或 GENERAL；按精确匹配判定，大小写要一致（可下拉选，也可手填）'",
     to: "hint: '开启「保护 VIP 客户」时填写'"
   },
   {
     id: 'PM09',
     file: CATALOG,
-    from: "hint: '每行一个订单类型英文码：SALES_ORDER（客户订单）或 PRODUCTION_INSTRUCTION（生产指示）'",
+    from:
+      "hint: '订单类型多选：SALES_ORDER（客户订单）/ PRODUCTION_INSTRUCTION（生产指示）；只能从清单里选，填错永远不命中'",
     to: "hint: '每行一个订单类型（如 SO / WO）'"
   },
   /* PM10 R1 台账 K1~K12 与目录逐项一致 */
@@ -155,10 +157,13 @@ const cases = [
       "note: '该参数暂未生效：排产运行期还没读取它，配置后不会改变排产结果；后端接入后自动生效，不用重配。'"
   },
   {
+    // 把「待开放」旧口径写回缺省标注（K1 的旧文案原句）⇒ PM11 的「旧口径不得残留」判红
     id: 'PM11',
     file: CATALOG,
-    from: '等这一项正式开放并接入后自动生效，不用重配。',
-    to: '等后端接入后自动生效，不用重配。'
+    from:
+      "note: '排产运行期还没读取它，配置后不会改变排产结果；后端接入后自动生效，不用重配。'",
+    to:
+      "note: '排产运行期还没读取它，配置后不会改变排产结果；等这一项正式开放并接入后自动生效，不用重配。'"
   },
   {
     id: 'PM11',

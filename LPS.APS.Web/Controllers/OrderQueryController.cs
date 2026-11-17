@@ -60,6 +60,9 @@ public class OrderQueryController : ControllerBase
         [FromQuery] string? productFamilyCode = null,
         [FromQuery] DateTime? dueDateFrom = null,
         [FromQuery] DateTime? dueDateTo = null,
+        [FromQuery] string? riskLevel = null,
+        [FromQuery] string? sortBy = null,
+        [FromQuery] string? sortDir = null,
         [FromQuery] int skip = 0,
         [FromQuery] int take = 50,
         [FromQuery] int pageIndex = 0,
@@ -94,6 +97,7 @@ public class OrderQueryController : ControllerBase
                 planVersionId, orderNo, materialCode, customerName,
                 factoryCode, domainKey, delayStatus, status,
                 productionInstructionNo, productFamilyCode, dueDateFrom, dueDateTo,
+                riskLevel, sortBy, sortDir,
                 skip, take, cancellationToken,
                 allowedFactories, allowedDomains);
 
@@ -139,21 +143,44 @@ public class OrderQueryController : ControllerBase
     }
 
     /// <summary>
-    /// 查询订单状态汇总（按 DelayStatus 聚合，供 Order.vue 顶部 KPI）
+    /// 查询订单汇总 KPI（供 Order.vue 顶部；R3，11-12 4号位件：**接受与列表同名同义的全部筛选参数**，
+    /// 谓词与列表类级单源 ⇒ KPI 与列表 total 同口径；**不传筛选=与旧行为逐字一致**，总览页共用不受影响）。
     /// </summary>
     [HttpGet("summary")]
     public async Task<ApiResponse<OrderSummaryDto>> GetSummary(
         [FromQuery] int planVersionId,
+        [FromQuery] string? orderNo = null,
+        [FromQuery] string? materialCode = null,
+        [FromQuery] string? customerName = null,
+        [FromQuery] string? factoryCode = null,
+        [FromQuery] string? domainKey = null,
+        [FromQuery] string? delayStatus = null,
+        [FromQuery] string? status = null,
+        [FromQuery] string? productionInstructionNo = null,
+        [FromQuery] string? productFamilyCode = null,
+        [FromQuery] DateTime? dueDateFrom = null,
+        [FromQuery] DateTime? dueDateTo = null,
+        [FromQuery] string? riskLevel = null,
         CancellationToken cancellationToken = default)
     {
         try
         {
             var scope = await _dataScopeService.ResolveScopeAsync(GetCurrentUserId(), cancellationToken);
+
+            // 与列表同款越权校验（筛选参数同样不得越界）。
+            if (!string.IsNullOrEmpty(factoryCode) && !scope.Allows(DataScopeTypes.Factory, factoryCode))
+                return ApiResponse<OrderSummaryDto>.Fail(403, "Factory 范围越界");
+            if (!string.IsNullOrEmpty(domainKey) && !scope.Allows(DataScopeTypes.Domain, domainKey))
+                return ApiResponse<OrderSummaryDto>.Fail(403, "Domain 范围越界");
+
             var allowedFactories = scope.GetValues(DataScopeTypes.Factory);
             var allowedDomains = scope.GetValues(DataScopeTypes.Domain);
 
             var result = await _service.GetSummaryAsync(
-                planVersionId, allowedFactories, allowedDomains, cancellationToken);
+                planVersionId, orderNo, materialCode, customerName,
+                factoryCode, domainKey, delayStatus, status,
+                productionInstructionNo, productFamilyCode, dueDateFrom, dueDateTo,
+                riskLevel, allowedFactories, allowedDomains, cancellationToken);
 
             return ApiResponse<OrderSummaryDto>.Success(result);
         }
@@ -165,6 +192,58 @@ public class OrderQueryController : ControllerBase
         {
             _logger.LogError(ex, "Failed to get order summary");
             return ApiResponse<OrderSummaryDto>.Fail(500, $"Query failed: {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// 订单口径可选值+条数（R4，11-12 新增）：`GET /api/order-query/facets?planVersionId=…`，
+    /// 与列表同筛选参数（不含排序）+同范围收窄；六维各 {value,count} 按 count 降序截 200。
+    /// 工厂/产品族中文名请继续用 3号位 governance 端点，本端点只出订单口径的编码+条数。
+    /// </summary>
+    [HttpGet("facets")]
+    public async Task<ApiResponse<OrderFacetsDto>> GetFacets(
+        [FromQuery] int planVersionId,
+        [FromQuery] string? orderNo = null,
+        [FromQuery] string? materialCode = null,
+        [FromQuery] string? customerName = null,
+        [FromQuery] string? factoryCode = null,
+        [FromQuery] string? domainKey = null,
+        [FromQuery] string? delayStatus = null,
+        [FromQuery] string? status = null,
+        [FromQuery] string? productionInstructionNo = null,
+        [FromQuery] string? productFamilyCode = null,
+        [FromQuery] DateTime? dueDateFrom = null,
+        [FromQuery] DateTime? dueDateTo = null,
+        [FromQuery] string? riskLevel = null,
+        CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            var scope = await _dataScopeService.ResolveScopeAsync(GetCurrentUserId(), cancellationToken);
+            if (!string.IsNullOrEmpty(factoryCode) && !scope.Allows(DataScopeTypes.Factory, factoryCode))
+                return ApiResponse<OrderFacetsDto>.Fail(403, "Factory 范围越界");
+            if (!string.IsNullOrEmpty(domainKey) && !scope.Allows(DataScopeTypes.Domain, domainKey))
+                return ApiResponse<OrderFacetsDto>.Fail(403, "Domain 范围越界");
+
+            var allowedFactories = scope.GetValues(DataScopeTypes.Factory);
+            var allowedDomains = scope.GetValues(DataScopeTypes.Domain);
+
+            var result = await _service.GetFacetsAsync(
+                planVersionId, orderNo, materialCode, customerName,
+                factoryCode, domainKey, delayStatus, status,
+                productionInstructionNo, productFamilyCode, dueDateFrom, dueDateTo,
+                riskLevel, allowedFactories, allowedDomains, cancellationToken);
+
+            return ApiResponse<OrderFacetsDto>.Success(result);
+        }
+        catch (ArgumentException ex)
+        {
+            return ApiResponse<OrderFacetsDto>.Fail(400, ex.Message);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to get order facets");
+            return ApiResponse<OrderFacetsDto>.Fail(500, $"Query failed: {ex.Message}");
         }
     }
 }

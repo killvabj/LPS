@@ -41,7 +41,6 @@ import {
   ElAlert,
   ElButton,
   ElCard,
-  ElEmpty,
   ElForm,
   ElFormItem,
   ElInput,
@@ -146,15 +145,25 @@ function runOptionLabel(r: ScheduleRunGovDto): string {
   return `${formatLocalMonthDayHM(r.startedAt)} · ${RUN_STATUS_LABEL[r.status] ?? r.status} · #${r.id}`
 }
 
-/** 默认批次 = 最近一次**跑完**的批次。
+/** 默认批次 = 最近一次**完全成功**的批次。
  *  本页读的是批次跑完后落库的统计行：运行中的批次还没算完（10-29 dev 实测 #999310 运行中 → total=0），
- *  拿它当默认会一进页就空表。50 条内没有跑完的批次才回退到最近一次（不编造）。 */
+ *  拿它当默认会一进页就空表。部分成功（PARTIAL_SUCCESS）的批次统计可能不完整 ⇒ 只在没有完全成功批次时才退而求其次，
+ *  由页面上方的黄色提示条明确告知（2026-11-09）。 */
 function pickDefaultRun(): ScheduleRunGovDto | undefined {
   return (
-    runOptions.value.find((r) => r.status === 'COMPLETED' || r.status === 'PARTIAL_SUCCESS') ??
+    runOptions.value.find((r) => r.status === 'COMPLETED') ??
+    runOptions.value.find((r) => r.status === 'PARTIAL_SUCCESS') ??
     runOptions.value[0]
   )
 }
+
+/** 当前选中批次的非「完全成功」提示（空串 = 不提示） */
+const currentRun = computed(() => runOptions.value.find((r) => r.id === queryForm.runId))
+const runStatusHint = computed<string>(() => {
+  const r = currentRun.value
+  if (!r || r.status === 'COMPLETED') return ''
+  return `当前批次状态：${RUN_STATUS_LABEL[r.status] ?? r.status}，统计结果可能不完整（建议选「已完成」的批次核对）`
+})
 
 // ===== 下拉源（后端主数据 lookup） =====
 // 10-15 4号位：下拉改远程搜索。后端 lookups/{departments,resources,materials} 的 SQL 都是
@@ -278,11 +287,34 @@ async function loadStats() {
   await fetchPage()
 }
 
-/** 重置：清空查询结果，页码同步归位 */
+/**
+ * 重置：清空四个筛选条件（部门 / 工序 / 设备 / 产品），**保留批次**，并立即按「只带批次」重查一次。
+ *
+ * 2026-11-09 用户实测反馈：原来只清结果、不清条件，清完页面停在空表并显示
+ * 「所有转换均已命中…」⇒ 用户会误以为这批换型规则全配好了。现在清完直接重查，
+ * 屏幕上的数字永远对应当前可见的筛选条件。
+ */
 function handleReset(): void {
   page.value = 1
+  queryForm.departmentId = undefined
+  queryForm.operationCode = undefined
+  queryForm.resourceId = undefined
+  queryForm.materialId = undefined
+  departmentQuery.value = ''
+  resourceQuery.value = ''
+  materialQuery.value = ''
   uncoveredStore.reset()
+  void loadStats()
 }
+
+/** 是否带了筛选条件（空态文案要区分「查了没有」和「这批全配好了」） */
+const hasFilters = computed(
+  () =>
+    queryForm.departmentId != null ||
+    queryForm.resourceId != null ||
+    queryForm.materialId != null ||
+    !!(queryForm.operationCode ?? '').trim()
+)
 
 onMounted(async () => {
   void masterData.loadAll()
@@ -318,6 +350,13 @@ function goToDefault(row: (typeof stats.value)[number]) {
     operationCode: row.operationCode,
     resourceCode: row.resourceCode
   }
+  // Id 一起带走（11-11）：后端 lookups 只返字母序前 200 条，统计行里的部门/设备
+  // 常常落在截断之外 ⇒ 只带 Code 时 Dialog 解析不出写输入要的 Id，保存被拦
+  // 「无法解析设备 Id」。统计行的 Id 与 lookup 的 masterId 同源（dev 实测 8700 → 13543），
+  // 可直接采信。
+  const ids: Record<string, string> = {}
+  if (row.departmentId) ids.departmentId = String(row.departmentId)
+  if (row.resourceId) ids.resourceId = String(row.resourceId)
   // 补规则 = 写 ⑦ ⇒ 必须持 aps.setup.edit；没有就直接说清，不做无效跳转
   if (!apsAuth.has('aps.setup.edit')) {
     ElMessage.warning('当前账号没有换型规则编辑权限（需权限码 aps.setup.edit），补不了规则')
@@ -326,10 +365,10 @@ function goToDefault(row: (typeof stats.value)[number]) {
   const canOpenRules =
     apsAuth.has('aps.rule.view') || apsAuth.has('aps.rule.edit') || apsAuth.has('aps.rule.publish')
   if (!canOpenRules) {
-    void router.push({ path: '/aps/setup/default', query: prefill })
+    void router.push({ path: '/aps/setup/default', query: { ...prefill, ...ids } })
     return
   }
-  const query: Record<string, string> = { tab: 'setup', ...prefill }
+  const query: Record<string, string> = { tab: 'setup', ...prefill, ...ids }
   const code =
     row.ruleSetVersionId != null
       ? ruleSetCodeByVersionId.value.get(row.ruleSetVersionId)
@@ -392,6 +431,7 @@ async function handleExportCsv(): Promise<void> {
             filterable
             :loading="runLoading"
             style="width: 260px"
+            @change="loadStats"
           >
             <ElOption
               v-for="r in runOptions"
@@ -476,6 +516,17 @@ async function handleExportCsv(): Promise<void> {
       </ElForm>
     </ElCard>
 
+    <!-- 非「完全成功」批次的提示：部分成功的统计可能偏少，别让用户据此下结论 -->
+    <ElAlert
+      v-if="runStatusHint"
+      type="warning"
+      :closable="false"
+      show-icon
+      class="run-status-alert"
+    >
+      {{ runStatusHint }}
+    </ElAlert>
+
     <!-- 统计列表 -->
     <ElCard class="table-card" shadow="never">
       <template #header>
@@ -499,7 +550,11 @@ async function handleExportCsv(): Promise<void> {
         :data="stats"
         border
         stripe
-        empty-text="无未覆盖的产品转换对（所有转换均已命中明确产品转换规则或默认换型规则）"
+        :empty-text="
+          hasFilters
+            ? '当前筛选条件下没有未覆盖的产品转换'
+            : '无未覆盖的产品转换对（所有转换均已命中明确产品转换规则或默认换型规则）'
+        "
       >
         <ElTableColumn type="index" label="#" width="50" :index="rowIndex" />
         <ElTableColumn prop="departmentCode" label="部门" width="120" />
@@ -558,7 +613,8 @@ async function handleExportCsv(): Promise<void> {
         @size-change="onSizeChange"
       />
 
-      <ElEmpty v-if="!listLoading && total === 0" description="无未覆盖的产品转换对" />
+      <!-- 空态只用表格的 empty-text（带解释）；此前这里还有一张 ElEmpty 插图，
+           同一句话显示两遍，已撤（2026-11-09）。 -->
     </ElCard>
   </div>
 </template>
@@ -589,6 +645,10 @@ async function handleExportCsv(): Promise<void> {
 }
 
 .error-alert {
+  margin-bottom: 16px;
+}
+
+.run-status-alert {
   margin-bottom: 16px;
 }
 

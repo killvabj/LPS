@@ -10,7 +10,7 @@
  * 端点契约（5号位 落码）：
  *   GET /api/explanation?planVersionId=  - 列表查询（filter: objectType/reasonCode/severity/skip/take）
  *   GET /api/explanation/summary?planVersionId=  - 汇总（含 items[] + 按 ReasonCode 分组）
- *   GET /api/business-fact-issues?source=&materialCode=&factoryCode=...  - 业务事实问题（独立聚合）
+ *   GET /api/business-fact-issues?source=&materialCode=&factoryCode=&issueType=&keyword=...  - 业务事实问题（独立聚合）
  *
  * 10-09 改造：
  *  - R1 ReasonCode 字典对齐 v5.1.10 §八.1 15 码全集（@see types/explanation.ts REASON_CODES）
@@ -59,6 +59,7 @@
 import { apsHttp, APS_USE_MOCK } from './http'
 import type {
   BusinessFactIssue,
+  ExplanationEvidence,
   ExplanationViewDto,
   ReasonCodeCount,
   ReasonCodeValue,
@@ -318,6 +319,10 @@ interface ScheduleExplanationFactRawDto {
   scheduleRunId?: number
   objectType: string
   orderId?: number
+  /** 订单号（**后端列表端点直返**；2026-11-10 实测 996/998 有值） */
+  orderNo?: string
+  /** 物料编码（后端列表端点直返） */
+  materialCode?: string
   taskId?: number
   resourceId?: number
   stageCode?: string
@@ -347,6 +352,72 @@ function evidenceStr(evidence: Record<string, unknown>, key: string): string {
   return typeof v === 'string' && v.trim() ? v.trim() : ''
 }
 
+/** 证据里取数值键（同上两种大小写都认；非法值 → undefined） */
+function evidenceNum(evidence: Record<string, unknown>, key: string): number | undefined {
+  const lower = key.charAt(0).toLowerCase() + key.slice(1)
+  const upper = key.charAt(0).toUpperCase() + key.slice(1)
+  const v = evidence[lower] ?? evidence[upper]
+  if (typeof v === 'number' && Number.isFinite(v)) return v
+  if (typeof v === 'string' && v.trim() && Number.isFinite(Number(v))) return Number(v)
+  return undefined
+}
+
+/** 证据里取字符串数组键（大小写两种写法都认；非数组 / 空 → undefined） */
+function evidenceStrList(evidence: Record<string, unknown>, key: string): string[] | undefined {
+  const lower = key.charAt(0).toLowerCase() + key.slice(1)
+  const upper = key.charAt(0).toUpperCase() + key.slice(1)
+  const v = evidence[lower] ?? evidence[upper]
+  if (!Array.isArray(v)) return undefined
+  const out = v.filter((x): x is string => typeof x === 'string' && !!x.trim())
+  return out.length ? out : undefined
+}
+
+/** 证据 JSON → 页面要用的业务字段（只取认识的键） */
+function toExplanationEvidence(e: Record<string, unknown>): ExplanationEvidence {
+  return {
+    allocationSequence: evidenceNum(e, 'allocationSequence'),
+    domainKey: evidenceStr(e, 'domainKey') || undefined,
+    materialId: evidenceNum(e, 'materialId'),
+    netOutputQty: evidenceNum(e, 'netOutputQty'),
+    scheduledShareQty: evidenceNum(e, 'scheduledShareQty'),
+    unscheduledQty: evidenceNum(e, 'unscheduledQty'),
+    upstreamReasonCode: evidenceStr(e, 'upstreamReasonCode') || undefined,
+    unscheduledSource: evidenceStr(e, 'unscheduledSource') || undefined,
+    evidenceType: evidenceStr(e, 'evidenceType') || undefined,
+    demandCount: evidenceNum(e, 'demandCount'),
+    scheduledDemandCount: evidenceNum(e, 'scheduledDemandCount'),
+    unscheduledDemandCount: evidenceNum(e, 'unscheduledDemandCount'),
+    missingDemandCount: evidenceNum(e, 'missingDemandCount'),
+    underScheduledDemandCount: evidenceNum(e, 'underScheduledDemandCount'),
+    demandNetQtyTotal: evidenceNum(e, 'demandNetQtyTotal'),
+    unscheduledQtyTotal: evidenceNum(e, 'unscheduledQtyTotal'),
+    planningYieldMissingCount: evidenceNum(e, 'planningYieldMissingCount'),
+    planningYieldOutOfRangeCount: evidenceNum(e, 'planningYieldOutOfRangeCount'),
+    planningYieldDuplicateKeyCount: evidenceNum(e, 'planningYieldDuplicateKeyCount'),
+    unreportedRemainderQty: evidenceNum(e, 'unreportedRemainderQty'),
+    factCount: evidenceNum(e, 'factCount'),
+    certainTrueCount: evidenceNum(e, 'certainTrueCount'),
+    certainFalseCount: evidenceNum(e, 'certainFalseCount'),
+    certainNullCount: evidenceNum(e, 'certainNullCount'),
+    stageTimingSegmentCount: evidenceNum(e, 'stageTimingSegmentCount'),
+    missingStageLeadTimeSegmentCount: evidenceNum(e, 'missingStageLeadTimeSegmentCount'),
+    productionInstructionNo: evidenceStr(e, 'productionInstructionNo') || undefined,
+    quantity: evidenceNum(e, 'quantity'),
+    continuationQty: evidenceNum(e, 'continuationQty'),
+    excessQty: evidenceNum(e, 'excessQty'),
+    kind: evidenceStr(e, 'kind') || undefined,
+    scheduledQtyTotal: evidenceNum(e, 'scheduledQtyTotal'),
+    unscheduledQtyClosedTotal: evidenceNum(e, 'unscheduledQtyClosedTotal'),
+    deltaQty: evidenceNum(e, 'deltaQty'),
+    unmatchedScheduledCount: evidenceNum(e, 'unmatchedScheduledCount'),
+    planningYieldQueriedCount: evidenceNum(e, 'planningYieldQueriedCount'),
+    planningYieldMissingSamples: evidenceStrList(e, 'planningYieldMissingSamples'),
+    uncertainSamples: evidenceStrList(e, 'uncertainSamples'),
+    gate: evidenceStr(e, 'gate') || undefined,
+    notATask: evidenceStr(e, 'notATask') || undefined
+  }
+}
+
 /**
  * `objectRef` 派生（后端没这列，前端自己算一个**人能看懂**的标签）。
  *
@@ -361,8 +432,12 @@ function deriveObjectRef(
 ): string {
   const demandKey = evidenceStr(evidence, 'LogicalDemandKey')
   const domainKey = evidenceStr(evidence, 'DomainKey')
+  const seq = evidenceNum(evidence, 'allocationSequence')
   switch (raw.objectType) {
     case 'ORDER':
+      // 2026-11-10：`LogicalDemandKey` 实为 `{PlanVersionId}_{AllocationSequence}`，
+      // 前半段对用户无意义（同一页每行都一样）⇒ 只露"需求片 #N"
+      if (seq != null) return `需求片 #${seq}`
       return demandKey ? `需求 ${demandKey}` : raw.orderId ? `需求 ${raw.orderId}` : '订单'
     case 'TASK':
       return raw.taskId ? `任务 ${raw.taskId}` : '任务'
@@ -394,9 +469,14 @@ function toScheduleExplanationFact(r: ScheduleExplanationFactRawDto): ScheduleEx
     evidenceSummary: summary || undefined,
     occurredAt: r.createdAt,
     orderId: r.orderId,
+    orderNo: r.orderNo || undefined,
+    materialCode: r.materialCode || undefined,
     taskId: r.taskId,
     resourceId: r.resourceId,
-    stageCode: r.stageCode
+    stageCode: r.stageCode,
+    evidence: toExplanationEvidence(evidence),
+    domainKey: evidenceStr(evidence, 'DomainKey') || undefined,
+    allocationSequence: evidenceNum(evidence, 'AllocationSequence')
   }
 }
 
@@ -513,13 +593,51 @@ export const explanationApi = {
    * 业务事实问题分页查询（10-10 新增；store loadMore 用）
    *  - 后端返 BusinessFactIssueResponsePage{page} 包装（5号位 10-10 已落地，字段 page/total/pageSize/items）
    *  - 数据按设计跨版本（不带 planVersionId 参数）
+   *
+   * 2026-11-10 增三个**后端已支持**的筛选（工厂用户不想一页页翻）：
+   *  - severity / source / materialCode ⇒ 后端等值筛选
+   *    （@see lps/LPS.APS.Web/Controllers/BusinessFactIssueController.cs:62-69 QueryAll 形参）
+   *  - dev 实测：severity=ERROR 4,261 / WARN 98,376 / INFO 5,102；source=BOM_WORKSET 41,143
+   *    / MATERIAL_STAGE_CONTEXT 66,596；materialCode 为**精确匹配**（Parent/Child 任一相等即命中）
+   *
+   * 2026-11-12 增三个（5号位 11-11 复函 §一/§二，后端已落码，dev 11-12 实测可用）：
+   *  - issueType：等值（BOM 源与 MSC 源各自 `IssueType=@`；空/不传 = 不过滤）
+   *  - keyword：BOM 源打 `Detail`/`BOMNO`/`Parent·ChildMaterialCode` 四列 LIKE；
+   *    **MSC 源无单据号列**，只打 `Detail`/`MaterialCode`（两源各查各的、源内先过滤再取 top）
+   *  - factoryCode：等值（BOM `COALESCE(ExpectedFactory,ActualFactory)=@`；MSC `pc.FactoryCode=@`）
+   *    ⚠️ 此前后端**收而不用**（参数收下、403 校验也在，但值没下推到两源查询与计数）⇒
+   *       传了等于没传；5号位 11-11 已一并修复，并让 `CountAllAsync` 参数集与列表对齐
+   *       （旧版缺 factoryCode/issueType/keyword 三参 ⇒ 上筛选后 total 会与列表分叉）。
+   *    ⚠️ 跨厂行（`COALESCE` 为 NULL）**无单厂归属** ⇒ 选了工厂就看不到它们（31-0 Q5 既有裁决）。
+   *  - dev 11-12 实测：全量 82,658 / issueType=CROSS_FACTORY_STAGE_MISSING 6,811
+   *    / keyword=worksetid 6,811 / factoryCode=BJ 27,439
    */
   async listBusinessFactIssues(opts: {
     pageIndex: number
     pageSize: number
+    severity?: string
+    source?: string
+    materialCode?: string
+    issueType?: string
+    keyword?: string
+    factoryCode?: string
   }): Promise<{ items: BusinessFactIssue[]; total: number; page: number; pageSize: number }> {
     if (APS_USE_MOCK) {
-      const all = mockBusinessIssues()
+      let all = mockBusinessIssues()
+      if (opts.severity) all = all.filter((i) => i.severity === opts.severity)
+      if (opts.source) all = all.filter((i) => i.source === opts.source)
+      if (opts.materialCode) all = all.filter((i) => i.materialCode === opts.materialCode)
+      if (opts.issueType) all = all.filter((i) => i.issueType === opts.issueType)
+      if (opts.factoryCode) all = all.filter((i) => i.factoryCode === opts.factoryCode)
+      if (opts.keyword) {
+        const k = opts.keyword.toLowerCase()
+        all = all.filter(
+          (i) =>
+            (i.detail ?? '').toLowerCase().includes(k) ||
+            (i.documentNo ?? '').toLowerCase().includes(k) ||
+            (i.materialCode ?? '').toLowerCase().includes(k)
+        )
+      }
       const start = (opts.pageIndex - 1) * opts.pageSize
       const items = all.slice(start, start + opts.pageSize)
       return {
@@ -529,9 +647,19 @@ export const explanationApi = {
         pageSize: opts.pageSize
       }
     }
+    const params: Record<string, string | number> = {
+      pageIndex: opts.pageIndex,
+      pageSize: opts.pageSize
+    }
+    if (opts.severity) params.severity = opts.severity
+    if (opts.source) params.source = opts.source
+    if (opts.materialCode) params.materialCode = opts.materialCode
+    if (opts.issueType) params.issueType = opts.issueType
+    if (opts.keyword) params.keyword = opts.keyword
+    if (opts.factoryCode) params.factoryCode = opts.factoryCode
     const raw = await apsHttp.get<BusinessFactIssueResponsePage>({
       url: '/api/business-fact-issues',
-      params: { pageIndex: opts.pageIndex, pageSize: opts.pageSize }
+      params
     })
     return {
       items: raw.items.map(toBusinessFactIssue),

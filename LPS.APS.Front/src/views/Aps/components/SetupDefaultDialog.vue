@@ -35,6 +35,12 @@
     加一条 → 整列写回的 read-modify-write，并发必丢规则）；部分失败如实报、不吞。
   - DEFAULT 无 eligibility 交集可用（§19.2 默认规则段未定义资格过滤），
     故设备 label 只追加后端真实给的所属部门，**不据此收窄**（后端不校验 dept↔设备部门一致）。
+
+  11-11 修「无法解析设备 Id」（缺失规则查询 → 去补默认换型规则）：
+  后端 lookups 写死 `SELECT TOP(200) ... ORDER BY [Code]`，预填的设备/部门常在截断之外
+  ⇒ 只带 Code 时解析不出写输入要的 Id，保存被拦。
+  ① 预填带 Id（跳转源统计行本身就带 departmentId/resourceId，与 lookup masterId 同源）；
+  ② 打开时按编码补搜一次（让预填项进下拉）；③ 提交时解析不到再补搜一次兜底。
 -->
 
 <script setup lang="ts">
@@ -49,6 +55,7 @@ import {
   ElMessage,
   ElOption,
   ElSelect,
+  ElSwitch,
   ElTooltip
 } from 'element-plus'
 import type { SetupDialogPrefill, SetupRuleDto, SetupRuleDefaultInput } from '@/api/aps-v1'
@@ -99,7 +106,9 @@ const form = reactive({
   operationCode: '',
   /** 选中的设备编码；create 可多值，edit 恒为单元素数组 */
   resourceCodes: [] as string[],
-  setupMinutes: 30
+  setupMinutes: 30,
+  /** 规则启停（#67）：新建默认启用；编辑按原值回填 */
+  isActive: true
 })
 
 /**
@@ -253,11 +262,14 @@ async function loadOperations() {
 }
 
 /** Code→Id 解析（Id-口径 v1.1：写输入提交 productionDepartmentId/resourceId）
- *  编辑态优先取 DTO 双返回 Id（权威）；新建态查后端主数据 lookup。 */
+ *  编辑态优先取 DTO 双返回 Id（权威）；新建态优先取预填带回来的 Id（跳转源那一行
+ *  本就是后端给的、与 lookup masterId 同源）；都取不到再查后端主数据 lookup。 */
 function resolveDepartmentId(code: string): number | undefined {
   if (props.mode === 'edit' && props.rule && props.rule.departmentCode === code) {
     return props.rule.productionDepartmentId
   }
+  const pf = props.prefill
+  if (pf?.departmentId != null && pf.departmentCode === code) return pf.departmentId
   return masterData.departmentIdByCode(code)
 }
 
@@ -265,7 +277,25 @@ function resolveResourceId(code: string): number | undefined {
   if (props.mode === 'edit' && props.rule && props.rule.resourceCode === code) {
     return props.rule.resourceId
   }
+  const pf = props.prefill
+  if (pf?.resourceId != null && pf.resourceCode === code) return pf.resourceId
   return masterData.resourceIdByCode(code)
+}
+
+/**
+ * 预填的部门/设备若不在首屏那一批（后端 lookup 写死 TOP 200，按 Code 字母序），
+ * 按编码补搜一次 —— search 参数不走 TOP 200，dev 实测设备 8700 → masterId 13543。
+ * 目的有二：让预填项在下拉里有标签（不是裸编码）、让 Code→Id 能解析出来。
+ */
+async function ensurePrefillLookups(): Promise<void> {
+  const pf = props.prefill
+  if (!pf) return
+  if (pf.departmentCode && masterData.departmentIdByCode(pf.departmentCode) == null) {
+    await masterData.searchDepartments(pf.departmentCode)
+  }
+  if (pf.resourceCode && masterData.resourceIdByCode(pf.resourceCode) == null) {
+    await masterData.searchResources(pf.resourceCode)
+  }
 }
 
 // ===== 红线拦截 =====
@@ -299,6 +329,7 @@ watch(
       form.operationCode = props.rule.operationCode
       form.resourceCodes = props.rule.resourceCode ? [props.rule.resourceCode] : []
       form.setupMinutes = props.rule.setupMinutes
+      form.isActive = props.rule.isActive ?? true
     } else {
       form.ruleSetVersionId = defaultStore.selectedRuleSetVersionId ?? 0
       form.departmentCode = props.prefill?.departmentCode ?? ''
@@ -308,6 +339,9 @@ watch(
       form.setupMinutes = 30
     }
     await masterData.loadAll()
+    // 预填的部门/设备可能落在后端 TOP 200 之外（lookup 按 Code 字母序写死截断）
+    // ⇒ 按编码补搜一次，把它拉进下拉；否则用户看到的是没有标签的裸编码
+    await ensurePrefillLookups()
     // 大工艺：部门已定但因主数据晚到才拿到 stageCode 时补带一次
     if (form.departmentCode && !form.stageCode) {
       form.stageCode = masterData.stageOfDepartment(form.departmentCode) ?? ''
@@ -333,21 +367,32 @@ async function handleSubmit() {
   if (!valid) return
 
   // Id-口径转换（v1.1：请求提交 Id；解析失败 = 主数据缺口，禁止发 Code 伪载荷）
-  const productionDepartmentId = resolveDepartmentId(form.departmentCode)
+  let productionDepartmentId = resolveDepartmentId(form.departmentCode)
   if (productionDepartmentId == null) {
-    ElMessage.error('无法解析部门 Id，请检查部门输入')
+    // 后端 lookups 写死 TOP 200 截断 ⇒ 部门可能不在首屏那一批，按编码补搜一次
+    await masterData.searchDepartments(form.departmentCode)
+    productionDepartmentId = masterData.departmentIdByCode(form.departmentCode)
+  }
+  if (productionDepartmentId == null) {
+    ElMessage.error('主数据里查不到这个部门，请确认部门编码是否正确')
     return
   }
   const resourceIds: number[] = []
   const unresolved: string[] = []
   for (const code of form.resourceCodes) {
-    const id = resolveResourceId(code)
+    let id = resolveResourceId(code)
+    if (id == null) {
+      // 11-11：设备常落在 lookups 的 TOP 200 之外（按 Code 字母序截断），
+      // 按编码向后端补拉一次（search 不受截断限制），别让用户自己去搜。
+      await masterData.searchResources(code)
+      id = masterData.resourceIdByCode(code)
+    }
     if (id == null) unresolved.push(code)
     else resourceIds.push(id)
   }
   if (unresolved.length) {
-    // 设备在列表里但主数据查不到 Id —— 多半是 lookups 的 TOP 200 截断
-    ElMessage.error(`无法解析设备 Id：${unresolved.join('、')}。请换个关键词重新搜索该设备后再保存`)
+    // 已按编码向后端补拉过仍查不到 ⇒ 主数据里确实没有这台设备
+    ElMessage.error(`主数据里查不到设备 ${unresolved.join('、')}，请确认设备编码是否正确`)
     return
   }
 
@@ -358,7 +403,9 @@ async function handleSubmit() {
     stageCode: form.stageCode,
     operationCode: form.operationCode,
     resourceId,
-    setupMinutes: form.setupMinutes
+    setupMinutes: form.setupMinutes,
+    // #67：必须回传，否则后端按默认 true 把停用规则复活
+    isActive: form.isActive
   })
 
   if (props.mode === 'edit' && props.rule) {
@@ -525,6 +572,11 @@ const dialogTitle = computed(() =>
         />
         <span class="unit-label">分钟</span>
         <div v-if="form.setupMinutes <= 0" class="redline-hint"> 换型分钟数必须大于 0 </div>
+      </ElFormItem>
+
+      <ElFormItem label="启用">
+        <ElSwitch v-model="form.isActive" active-text="启用" inactive-text="停用" />
+        <span class="unit-label">停用的规则不参与换型匹配</span>
       </ElFormItem>
     </ElForm>
 

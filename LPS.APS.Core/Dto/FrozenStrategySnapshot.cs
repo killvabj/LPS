@@ -36,6 +36,42 @@ public sealed class FrozenStrategySnapshot
     /// 触发根因：整体批完成后/下游开工前算一次等待（R05-V-03），不建物流 Task、不乘数量、不借 <c>StageLeadTimeParam</c> 单 Stage 提前期。
     /// </summary>
     public List<StageHandoffWaitRule> StageHandoffWaitRules { get; set; } = [];
+
+    /// <summary>
+    /// 跨厂LT 标准参数（CrossFactoryLeadTimeRules）独立顶层子块（准入 C-1~C-3，0号位 2026-11-16 准）。
+    ///
+    /// **唯一物理路径 = 顶层**：<c>$.CrossFactoryLeadTimeRules</c>（与 <c>$.Procurement</c>、<c>$.Lock</c>、<c>$.SolverStrategy</c>
+    /// 顶层并列），**非** <c>$.SolverStrategy.CrossFactoryLeadTimeRules</c>——镜像 <c>$.StageHandoffWaitRules</c> 同构先例。
+    /// 随参数集发布、per-run 冻结；**缺块 = 无规则 = 跨厂LT 缺失（不建链）**，不是装载失败（C-2）。
+    /// 粒度 = 工厂对主键 + 可选产品族；**无全局默认层**（07:4217 禁统一默认）；两者皆缺 ⇒ LT 缺失。
+    /// 1/2 号位 只读 <c>$.CrossFactoryLeadTimeRules</c> 单一位置，杜绝双路径来源分裂。
+    /// </summary>
+    public List<CrossFactoryLeadTimeRule> CrossFactoryLeadTimeRules { get; set; } = [];
+}
+
+/// <summary>
+/// 跨厂LT 标准参数（准入 C-1~C-3，0号位 2026-11-16 准）。字段=业务键 + 单值小时，不含审计字段。
+/// 粒度 = 工厂对（FromFactoryCode→ToFactoryCode）主键 ＋ ProductFamilyCode（可选）细化；**禁全局默认**。
+/// 形态 = 单值 <see cref="CrossFactoryLeadTimeHours"/>（INT 小时），装载 ×60 → LagMinutes（分钟）；
+/// 取代死 DTO <c>CrossFactoryLeadTime</c>（CrossFactoryPeggingHandler.cs:81-86，三元组零生产消费，束线不采纳；
+/// 与冻结 <c>TransportLeadTimeHours</c>（真实物流事实）区分——本参数为「标准参数默认」）。
+/// </summary>
+public sealed class CrossFactoryLeadTimeRule
+{
+    /// <summary>源工厂编码（必填；工厂对 From→To 主键的左端）</summary>
+    public string FromFactoryCode { get; set; } = "";
+
+    /// <summary>目标工厂编码（必填；工厂对 From→To 主键的右端）</summary>
+    public string ToFactoryCode { get; set; } = "";
+
+    /// <summary>产品族编码（可选）：缺省 = 该工厂对全产品族通用；与 From/To 工厂对构成细化键。</summary>
+    public string? ProductFamilyCode { get; set; }
+
+    /// <summary>跨厂LT（小时，INT）：标准参数默认；装载 ×60 → LagMinutes（分钟）。值 ≥ 0。</summary>
+    public int CrossFactoryLeadTimeHours { get; set; }
+
+    /// <summary>是否有效（可空缺省 false）；仅 IsActive=true 参与重复键判定与消费匹配。</summary>
+    public bool? IsActive { get; set; }
 }
 
 /// <summary>

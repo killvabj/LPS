@@ -96,7 +96,13 @@ export interface CommitmentStatusCountDto {
 /** `GET /api/pegging-trace/summary` */
 export interface PeggingTraceSummaryDto {
   planVersionId: number
-  /** 该版本 Pegging 分配总条数（**全量口径，不随筛选变化**） */
+  /**
+   * 该版本 Pegging 分配总条数。
+   *
+   * ⚠️ 口径（2026-11-14 5号位 R2.4 裁定）：**收进用户数据范围**（同列表的
+   *   `TraceScopePredicate`）⇒ 受限账号读到的是**本账号可见**的笔数，不再是全厂数。
+   *   但**仍不随列表筛选变化**（summary 不带六个筛选谓词）⇒ 它是「本版本、本账号可见」的总数。
+   */
   totalAllocations: number
   supplyTypeCounts: SupplyTypeCountDto[]
   commitmentStatusCounts: CommitmentStatusCountDto[]
@@ -107,13 +113,28 @@ export interface PeggingTraceSummaryDto {
   items: PeggingTraceDto[]
 }
 
+/**
+ * `GET /api/pegging-trace/count`（5号位 2026-11-14 落码，形状 B）
+ *
+ * - 参数与列表端点**完全相同**（planVersionId + 六个筛选谓词，不带 skip/take）。
+ * - WHERE 文本与列表**同源单源**（`TraceWhereCore` + `TraceScopePredicate`）
+ *   ⇒ total 对受限账号也是真的（dev 实测 pmc 17,181 ＝ 其列表真实行数）。
+ * - 沿用统一 `ApiResponse` 信封，`data` 只有 `total` 一个字段。
+ */
+export interface PeggingTraceCountDto {
+  total: number
+}
+
 /** 列表查询（`skip` 从 0 起；`take` 后端 >500 或 <=0 时静默回落 100 ⇒ 前端自夹 ≤200） */
 export interface PeggingTraceQuery {
   planVersionId: number
   materialCode?: string
   supplyType?: string
   commitmentStatus?: string
+  /** 订单号模糊（后端 LIKE 命中 `RootOrderNo` / `CurrentOrderNo`） */
   orderNo?: string
+  /** 根订单 Id 精确（后端 `RootOrderId = @RootOrderId`；实测 100% 非空） */
+  rootOrderId?: number
   supplyDocumentNo?: string
   skip?: number
   take?: number

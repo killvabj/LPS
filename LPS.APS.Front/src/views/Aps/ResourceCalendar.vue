@@ -45,6 +45,22 @@
    - 且本页从不读 gantt / summary，切版本只是触发一次本页用不上的取数；留着会误导用户
      以为资源日历按计划版本分版本（上级工作日历同为基础数据，两页口径现已一致）
    - 冻结 v1.4 §「4号位：资源能力维护页面Owner」只列 3 项维护对象，未要求计划版本锚点
+
+  2026-11-16 工厂视角改版（零后端改动）：
+   - **加日期范围筛选**（设备侧 + 人工槽侧）：一台设备一年 360 段窗口，原来只能一页页翻。
+     后端 `GET /api/resource-calendar/{resourceId}` 与 `GET /api/manual-capacity/calendar/{manualSlotId}`
+     本来就支持 from/to（语义＝窗口完整落在区间内，ResourceCalendarService.cs:202-206），前端此前一直没传。
+     快捷：本周 / 本月 / 近 30 天 / 全部；不选＝看全部（不藏数据）。
+   - **表格去内部 Id / 去冗余列**：撤「窗口编号（Id）」「资源编码」「资源名称」（同一台设备每行都一样，顶部已有），
+     换成「日期（今天带红标）」「时段（08:00 ~ 17:00）」两列；Tab2 撤「人工槽编号（Id）」，Tab3 同理。
+   - **提示文案去内部 Id**：删除确认由「删除设备窗口 #1827430」改成「删除 2026-09-29（周二）08:00~17:00 这一段」；
+     新增/铺窗成功提示不再回显行号。
+   - **术语**：Tab2「软删」→「停用」（工厂用户不认识"软删"）；撤顶栏副标题（与页签重复）；灰按钮加悬停禁用原因。
+   - **徽标防误报**：带日期筛选时 res.total 只是区间内条数 ⇒ 「日历 已配/未配」改用资源主表的 hasCalendar
+     （全量判定），空态提示区分「本级没登记」与「这段日期里没有」。
+   - 每页条数 20 → 50（360 段窗口翻页太碎）。
+   - 已知缺口（未做，需后端）：窗口「可用/禁用」只能看不能单条切换 —— 后端只有批量覆盖/单条追加/物理删三个写端点，
+     没有 update 端点；工厂最常见的「某天停机」目前只能删了重铺或用批量铺窗整段覆盖。
 -->
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
@@ -54,6 +70,7 @@ import {
   ElAlert,
   ElButton,
   ElCard,
+  ElDatePicker,
   ElDropdown,
   ElDropdownItem,
   ElDropdownMenu,
@@ -99,10 +116,11 @@ const {
   resourcesLoading,
   currentResourceId,
   deviceWindowItems,
-  deviceWindowsLoaded,
   deviceWindowTotal,
   deviceWindowPage,
   deviceWindowPageSize,
+  deviceWindowFrom,
+  deviceWindowTo,
   deviceCalendarStatus,
   resolvePreview,
   resolveLoading,
@@ -119,6 +137,8 @@ const {
   slotWindowTotal,
   slotWindowPage,
   slotWindowPageSize,
+  slotWindowFrom,
+  slotWindowTo,
   currentSlot,
   loading,
   saving,
@@ -135,6 +155,75 @@ const {
 type TabName = 'device' | 'manual' | 'manual-calendar'
 const activeTab = ref<TabName>('device')
 const loadedTabs = ref<Set<TabName>>(new Set())
+
+/* ===== 日期筛选 + 日期显示（设备侧 / 人工槽侧共用） =====
+ *  工厂用户痛点：一台设备一年 360 段窗口，靠翻页找某天。
+ *  后端 GET /api/resource-calendar/{id} 与 GET /api/manual-capacity/calendar/{id}
+ *  本来就支持 from/to（语义＝**窗口完整落在区间内**），前端此前一直没传 ⇒ 本次接上。
+ */
+const WEEKDAY_CN = ['周日', '周一', '周二', '周三', '周四', '周五', '周六']
+
+/** 本地墙钟日期（治理域 DateTime.Now 口径，见 memory 后端两套时区） */
+function pad2(n: number): string {
+  return String(n).padStart(2, '0')
+}
+function ymd(d: Date): string {
+  return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`
+}
+function todayYmd(): string {
+  return ymd(new Date())
+}
+/** 本周一（周一为一周之始） */
+function thisWeekStartYmd(): string {
+  const d = new Date()
+  const dow = d.getDay()
+  d.setDate(d.getDate() - (dow === 0 ? 6 : dow - 1))
+  return ymd(d)
+}
+function thisMonthStartYmd(): string {
+  const d = new Date()
+  return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-01`
+}
+function daysAgoYmd(n: number): string {
+  const d = new Date()
+  d.setDate(d.getDate() - n)
+  return ymd(d)
+}
+
+/** ISO 时间 → 日期段（YYYY-MM-DD） */
+function dateOf(iso?: string): string {
+  return iso ? iso.slice(0, 10) : ''
+}
+/** ISO 时间 → 时段段（HH:mm） */
+function timeOf(iso?: string): string {
+  return iso ? iso.slice(11, 16) : ''
+}
+function weekdayOf(dateStr: string): string {
+  if (!dateStr) return ''
+  return WEEKDAY_CN[new Date(`${dateStr}T00:00:00`).getDay()] ?? ''
+}
+/** 表格日期列：`2026-09-29（周二）` */
+function fmtDayLabel(iso?: string): string {
+  const d = dateOf(iso)
+  if (!d) return '—'
+  return `${d}（${weekdayOf(d)}）`
+}
+/** 是否今天的行（工厂用户最关心今天） */
+function isTodayRow(iso?: string): boolean {
+  return dateOf(iso) === todayYmd()
+}
+
+/** 区间 → 后端 from/to（后端 to 是「窗口结束时间 ≤ to」，必须带当天 23:59:59） */
+function rangeQuery(v: [string, string] | undefined): { from?: string; to?: string } {
+  if (!v || v.length !== 2 || !v[0] || !v[1]) return {}
+  return { from: `${v[0]}T00:00:00`, to: `${v[1]}T23:59:59` }
+}
+
+/** 区间文字（状态行用） */
+function rangeText(v: [string, string] | undefined | null): string {
+  if (!v || v.length !== 2 || !v[0] || !v[1]) return ''
+  return `${v[0]} ~ ${v[1]}`
+}
 
 async function onTabChange(name: TabName): Promise<void> {
   if (loadedTabs.value.has(name)) return
@@ -189,6 +278,46 @@ async function pickResource(resourceId: number): Promise<void> {
   await store.loadDeviceWindows(resourceId)
   await loadResolvePreview()
 }
+
+/* ===== Tab1：设备窗口的日期筛选 =====
+ *  一台设备一年 360 段窗口，不筛日期只能一页页翻 ⇒ 接后端 from/to（本来就支持）
+ */
+const deviceRange = ref<[string, string] | undefined>(undefined)
+
+async function applyDeviceRange(v: [string, string] | undefined | null): Promise<void> {
+  const id = currentResourceId.value
+  if (id == null) return
+  if (!v || v.length !== 2 || !v[0] || !v[1]) {
+    await store.loadDeviceWindows(id, { clearRange: true, nextPageIndex: 1 })
+    return
+  }
+  const q = rangeQuery(v)
+  await store.loadDeviceWindows(id, { from: q.from, to: q.to, nextPageIndex: 1 })
+}
+
+/** 快捷区间：本周 / 本月 / 近 30 天 / 全部 */
+async function applyDevicePreset(kind: 'week' | 'month' | 'd30' | 'all'): Promise<void> {
+  const today = todayYmd()
+  let v: [string, string] | undefined
+  if (kind === 'week') v = [thisWeekStartYmd(), today]
+  else if (kind === 'month') v = [thisMonthStartYmd(), today]
+  else if (kind === 'd30') v = [daysAgoYmd(29), today]
+  else v = undefined
+  deviceRange.value = v
+  await applyDeviceRange(v)
+}
+
+/** 是否正在按日期筛选 */
+const deviceRangeActive = computed<boolean>(
+  () => !!deviceWindowFrom.value || !!deviceWindowTo.value
+)
+
+/** 按钮禁用原因（悬停可见，别让用户对着灰按钮猜） */
+const deviceActionHint = computed<string>(() => {
+  if (currentResourceId.value == null) return '请先在上面选择一台设备'
+  if (!canEditDevice.value) return '当前账号没有设备日历编辑权限'
+  return ''
+})
 
 /* ===== 三级合并后可排时段（5号位 resolve-preview，只读） =====
  *  冻结 13 v1.8:31 要求「明确显示『继承上级 / 本级明确工作 / 本级明确不工作』及来源授权」。
@@ -262,7 +391,9 @@ async function submitDeviceBulk(draft: BulkWindowDraft): Promise<void> {
     remark: draft.remark
   })
   if (inserted != null) {
-    ElMessage.success(`已生成 ${inserted} 条设备窗口`)
+    ElMessage.success(
+      `已按 ${draft.startTime.slice(0, 5)}~${draft.endTime.slice(0, 5)} 生成 ${inserted} 天窗口（${draft.startDate} 起 ${draft.days} 天）`
+    )
     deviceDialogVisible.value = false
     await loadResolvePreview()
   }
@@ -291,7 +422,9 @@ async function submitDeviceSingle(payload: {
     ...payload
   })
   if (id != null) {
-    ElMessage.success(`已新增一段设备时段（编号 ${id}）`)
+    ElMessage.success(
+      `已新增 ${fmtDayLabel(payload.startTime)} ${timeOf(payload.startTime)}~${timeOf(payload.endTime)} 这一段`
+    )
     deviceSingleDialogVisible.value = false
     await loadResolvePreview()
   }
@@ -299,9 +432,9 @@ async function submitDeviceSingle(payload: {
 
 async function removeDeviceWindow(row: ResourceCalendarEntryDto): Promise<void> {
   const ok = await ElMessageBox.confirm(
-    `将物理删除设备窗口 #${row.id}（${fmt(row.startTime)} ~ ${fmt(row.endTime)}）。\n` +
-      '物理删除后行消失、不可恢复，排产追溯将不再含该窗口。确认删除？',
-    '删除设备窗口',
+    `将删除 ${fmtDayLabel(row.startTime)} ${timeOf(row.startTime)}~${timeOf(row.endTime)} 这一段窗口。\n` +
+      '删除后不可恢复，排产追溯将不再含该窗口。确认删除？',
+    '删除这一段窗口',
     { type: 'warning', confirmButtonText: '确认删除', cancelButtonText: '取消' }
   ).catch(() => false)
   if (!ok) return
@@ -413,9 +546,9 @@ async function viewSlotWindows(row: ManualCapacitySlotDto): Promise<void> {
 
 async function disableSlot(row: ManualCapacitySlotDto): Promise<void> {
   const ok = await ElMessageBox.confirm(
-    `将软删人工能力槽「${row.slotCode}」（${row.operationName}）：停用后行保留、查询默认不含。\n\n` +
+    `将停用人工能力槽「${row.slotCode}」（${row.operationName}）：停用后行保留、查询默认不含。\n\n` +
       '影响：该能力槽不再参与排产；已有日历窗口不会自动清除，如需清理请到「人工槽日历」页签删除。',
-    '软删人工能力槽',
+    '停用人工能力槽',
     { type: 'warning', confirmButtonText: '确认停用', cancelButtonText: '取消' }
   ).catch(() => false)
   if (!ok) return
@@ -437,6 +570,43 @@ async function bulkForSlot(row: ManualCapacitySlotDto): Promise<void> {
 
 /* ===== Tab3：人工槽日历 ===== */
 const slotBulkDialogVisible = ref(false)
+
+/* 人工槽窗口的日期筛选（与设备侧同一套：后端 from/to 早就支持） */
+const slotRange = ref<[string, string] | undefined>(undefined)
+
+async function applySlotRange(v: [string, string] | undefined | null): Promise<void> {
+  const id = currentSlotId.value
+  if (id == null) return
+  if (!v || v.length !== 2 || !v[0] || !v[1]) {
+    await store.loadSlotWindows(id, { clearRange: true, nextPageIndex: 1 })
+    return
+  }
+  const q = rangeQuery(v)
+  await store.loadSlotWindows(id, { from: q.from, to: q.to, nextPageIndex: 1 })
+}
+
+/** 快捷区间：本周 / 本月 / 近 30 天 / 全部 */
+async function applySlotPreset(kind: 'week' | 'month' | 'd30' | 'all'): Promise<void> {
+  const today = todayYmd()
+  let v: [string, string] | undefined
+  if (kind === 'week') v = [thisWeekStartYmd(), today]
+  else if (kind === 'month') v = [thisMonthStartYmd(), today]
+  else if (kind === 'd30') v = [daysAgoYmd(29), today]
+  else v = undefined
+  slotRange.value = v
+  await applySlotRange(v)
+}
+
+/** 是否正在按日期筛选 */
+const slotRangeActive = computed<boolean>(() => !!slotWindowFrom.value || !!slotWindowTo.value)
+
+/** 按钮禁用原因（悬停可见） */
+const slotActionHint = computed<string>(() => {
+  if (currentSlotId.value == null) return '请先在「人工能力槽」里选一个工位'
+  if (currentSlot.value && !currentSlot.value.isActive) return '该工位已停用，不能铺窗'
+  if (!canEditManual.value) return '当前账号没有人工能力槽编辑权限'
+  return ''
+})
 
 /** Tab3 顶部「刷新」：本级窗口 + 三级合成结果一起重取（两者口径必须同步） */
 async function refreshSlotWindows(): Promise<void> {
@@ -468,7 +638,9 @@ async function submitSlotBulk(draft: BulkWindowDraft): Promise<void> {
     remark: draft.remark
   })
   if (inserted != null) {
-    ElMessage.success(`已生成 ${inserted} 条人工槽窗口`)
+    ElMessage.success(
+      `已按 ${draft.startTime.slice(0, 5)}~${draft.endTime.slice(0, 5)} 生成 ${inserted} 天窗口（${draft.startDate} 起 ${draft.days} 天）`
+    )
     slotBulkDialogVisible.value = false
     await loadManualResolvePreview()
   }
@@ -496,7 +668,9 @@ async function submitSlotSingle(payload: {
   if (id == null) return
   const newId = await store.appendSlotWindow({ manualSlotId: id, ...payload })
   if (newId != null) {
-    ElMessage.success(`已新增一段人工槽时段（编号 ${newId}）`)
+    ElMessage.success(
+      `已新增 ${fmtDayLabel(payload.startTime)} ${timeOf(payload.startTime)}~${timeOf(payload.endTime)} 这一段`
+    )
     slotSingleDialogVisible.value = false
     await loadManualResolvePreview()
   }
@@ -504,8 +678,9 @@ async function submitSlotSingle(payload: {
 
 async function removeSlotWindow(row: ManualSlotCalendarDto): Promise<void> {
   const ok = await ElMessageBox.confirm(
-    `将物理删除人工槽窗口 #${row.id}（${fmt(row.startTime)} ~ ${fmt(row.endTime)}）。确认删除？`,
-    '删除人工槽窗口',
+    `将删除 ${fmtDayLabel(row.startTime)} ${timeOf(row.startTime)}~${timeOf(row.endTime)} 这一段窗口。\n` +
+      '删除后不可恢复。确认删除？',
+    '删除这一段窗口',
     { type: 'warning', confirmButtonText: '确认删除', cancelButtonText: '取消' }
   ).catch(() => false)
   if (!ok) return
@@ -537,16 +712,22 @@ const currentSlotWindowStatus = computed(() =>
 )
 
 /* ===== 公共 ===== */
-/** ISO 时间 → "YYYY-MM-DD HH:mm" */
-function fmt(iso?: string): string {
-  if (!iso) return '—'
-  return iso.replace('T', ' ').slice(0, 16)
-}
 
-/** 窗口条数显示**服务端总数**（分页后当前页条数不等于总数） */
-function windowCountLabel(total: number): string {
-  return `${total} 条`
-}
+/** 设备侧状态行：窗口条数（有筛选 → 明说"本区间"） */
+const deviceWindowCountText = computed<string>(() => {
+  if (deviceRangeActive.value) {
+    return `本区间（${rangeText(deviceRange.value)}）${deviceWindowTotal.value} 条`
+  }
+  return `窗口：${deviceWindowTotal.value} 条`
+})
+
+/** 人工槽侧状态行：同上 */
+const slotWindowCountText = computed<string>(() => {
+  if (slotRangeActive.value) {
+    return `本区间（${rangeText(slotRange.value)}）${slotWindowTotal.value} 条`
+  }
+  return `窗口：${slotWindowTotal.value} 条`
+})
 
 /* ===== mock 角色切换器（仅 mock 模式显示；与甘特图页同一范式） =====
  * 真实绑定已落地（3号位 脚本 APS_Auth_resource_calendar_role_binding_20260924.sql）：
@@ -597,7 +778,6 @@ onBeforeUnmount(() => {
     <div class="rc-intro">
       <div class="intro-header">
         <span class="intro-title">资源日历维护</span>
-        <span class="intro-sub">设备资源日历 / 人工能力槽 / 人工槽日历</span>
         <ElTooltip placement="bottom-start" effect="light" :show-after="150">
           <span class="intro-help" tabindex="0">?</span>
           <template #content>
@@ -693,6 +873,7 @@ onBeforeUnmount(() => {
             <ElFormItem>
               <ElButton
                 :disabled="currentResourceId == null || !canEditDevice"
+                :title="deviceActionHint"
                 @click="openDeviceSingleDialog"
               >
                 新增一段
@@ -700,6 +881,7 @@ onBeforeUnmount(() => {
               <ElButton
                 type="primary"
                 :disabled="currentResourceId == null || !canEditDevice"
+                :title="deviceActionHint"
                 @click="openDeviceDialog"
               >
                 批量铺窗
@@ -726,7 +908,7 @@ onBeforeUnmount(() => {
             <span class="rc-hint">{{
               CALENDAR_CONFIG_META[deviceCalendarStatus].description
             }}</span>
-            <span class="rc-hint">窗口：{{ windowCountLabel(deviceWindowTotal) }}</span>
+            <span class="rc-hint">{{ deviceWindowCountText }}</span>
           </div>
 
           <ElEmpty
@@ -734,8 +916,42 @@ onBeforeUnmount(() => {
             description="请先在上方资源下拉中选中目标设备"
           />
           <template v-else>
+            <!-- 日期筛选：一台设备一年几百段窗口，靠翻页找某天不现实 -->
+            <div class="rc-filter-row">
+              <span class="rc-status-label">日期范围：</span>
+              <ElDatePicker
+                v-model="deviceRange"
+                type="daterange"
+                value-format="YYYY-MM-DD"
+                range-separator="至"
+                start-placeholder="开始日期"
+                end-placeholder="结束日期"
+                style="width: 250px"
+                @change="applyDeviceRange"
+              />
+              <ElButton size="small" plain @click="applyDevicePreset('week')">本周</ElButton>
+              <ElButton size="small" plain @click="applyDevicePreset('month')">本月</ElButton>
+              <ElButton size="small" plain @click="applyDevicePreset('d30')">近 30 天</ElButton>
+              <ElButton size="small" plain @click="applyDevicePreset('all')">全部</ElButton>
+              <span class="rc-hint">不选＝看全部；选了就只看这段日期</span>
+            </div>
+
             <ElAlert
-              v-if="deviceWindowsLoaded && deviceWindowTotal === 0"
+              v-if="deviceRangeActive && deviceWindowTotal === 0"
+              type="info"
+              :closable="false"
+              show-icon
+              class="rc-alert"
+              title="这段日期里没有登记时段"
+            >
+              {{
+                deviceCalendarStatus === 'NOT_CONFIGURED'
+                  ? '这台设备本级就没有登记过任何时段。'
+                  : '这台设备在别的日期可能还有窗口。点「全部」看全部，或换一个日期范围。'
+              }}
+            </ElAlert>
+            <ElAlert
+              v-else-if="deviceCalendarStatus === 'NOT_CONFIGURED'"
               type="warning"
               :closable="false"
               show-icon
@@ -756,14 +972,24 @@ onBeforeUnmount(() => {
               size="small"
               style="width: 100%"
             >
-              <ElTableColumn prop="id" label="窗口编号" width="120" fixed="left" />
-              <ElTableColumn prop="resourceCode" label="资源编码" width="120" />
-              <ElTableColumn prop="resourceName" label="资源名称" width="150" />
-              <ElTableColumn label="开始时间" min-width="170">
-                <template #default="{ row }">{{ fmt(row.startTime) }}</template>
+              <ElTableColumn label="日期" min-width="160" fixed="left">
+                <template #default="{ row }">
+                  <span>{{ fmtDayLabel(row.startTime) }}</span>
+                  <ElTag
+                    v-if="isTodayRow(row.startTime)"
+                    size="small"
+                    type="danger"
+                    effect="plain"
+                    class="today-tag"
+                  >
+                    今天
+                  </ElTag>
+                </template>
               </ElTableColumn>
-              <ElTableColumn label="结束时间" min-width="170">
-                <template #default="{ row }">{{ fmt(row.endTime) }}</template>
+              <ElTableColumn label="时段" width="150">
+                <template #default="{ row }">
+                  {{ timeOf(row.startTime) }} ~ {{ timeOf(row.endTime) }}
+                </template>
               </ElTableColumn>
               <ElTableColumn label="可用" width="90" align="center">
                 <template #default="{ row }">
@@ -773,7 +999,7 @@ onBeforeUnmount(() => {
                 </template>
               </ElTableColumn>
               <ElTableColumn prop="remark" label="备注" min-width="160" show-overflow-tooltip />
-              <ElTableColumn label="操作" width="110" fixed="right" v-if="canDeleteDevice">
+              <ElTableColumn label="操作" width="100" fixed="right" v-if="canDeleteDevice">
                 <template #default="{ row }">
                   <ElButton
                     type="danger"
@@ -879,8 +1105,7 @@ onBeforeUnmount(() => {
             :row-class-name="({ row }) => (!row.isActive ? 'rc-row-disabled' : '')"
             style="width: 100%"
           >
-            <ElTableColumn prop="manualSlotId" label="人工槽编号" width="130" fixed="left" />
-            <ElTableColumn prop="departmentName" label="生产部门" width="150">
+            <ElTableColumn prop="departmentName" label="生产部门" width="150" fixed="left">
               <template #default="{ row }">
                 {{ row.departmentName ?? '未知部门' }}
               </template>
@@ -923,7 +1148,7 @@ onBeforeUnmount(() => {
                   :loading="saving"
                   @click="disableSlot(row)"
                 >
-                  软删
+                  停用
                 </ElButton>
               </template>
             </ElTableColumn>
@@ -964,7 +1189,7 @@ onBeforeUnmount(() => {
               <span class="rc-hint">{{
                 CALENDAR_CONFIG_META[currentSlotWindowStatus].description
               }}</span>
-              <span class="rc-hint">窗口：{{ windowCountLabel(slotWindowTotal) }}</span>
+              <span class="rc-hint">{{ slotWindowCountText }}</span>
               <ElButton
                 class="rc-btn-gap"
                 size="small"
@@ -976,6 +1201,7 @@ onBeforeUnmount(() => {
               <ElButton
                 size="small"
                 :disabled="!canEditManual || (currentSlot ? !currentSlot.isActive : true)"
+                :title="slotActionHint"
                 @click="openSlotSingleDialog"
               >
                 新增一段
@@ -984,6 +1210,7 @@ onBeforeUnmount(() => {
                 type="primary"
                 size="small"
                 :disabled="!canEditManual || (currentSlot ? !currentSlot.isActive : true)"
+                :title="slotActionHint"
                 @click="openSlotBulkDialog"
               >
                 批量铺窗
@@ -1001,8 +1228,42 @@ onBeforeUnmount(() => {
               停用后不再参与排产；窗口保留，不会被自动清理。
             </ElAlert>
 
+            <!-- 日期筛选（同设备侧：后端 from/to 早就支持） -->
+            <div class="rc-filter-row">
+              <span class="rc-status-label">日期范围：</span>
+              <ElDatePicker
+                v-model="slotRange"
+                type="daterange"
+                value-format="YYYY-MM-DD"
+                range-separator="至"
+                start-placeholder="开始日期"
+                end-placeholder="结束日期"
+                style="width: 250px"
+                @change="applySlotRange"
+              />
+              <ElButton size="small" plain @click="applySlotPreset('week')">本周</ElButton>
+              <ElButton size="small" plain @click="applySlotPreset('month')">本月</ElButton>
+              <ElButton size="small" plain @click="applySlotPreset('d30')">近 30 天</ElButton>
+              <ElButton size="small" plain @click="applySlotPreset('all')">全部</ElButton>
+              <span class="rc-hint">不选＝看全部；选了就只看这段日期</span>
+            </div>
+
             <ElAlert
-              v-if="slotWindowTotal === 0"
+              v-if="slotRangeActive && slotWindowTotal === 0"
+              type="info"
+              :closable="false"
+              show-icon
+              class="rc-alert"
+              title="这段日期里没有登记时段"
+            >
+              {{
+                currentSlotWindowStatus === 'NOT_CONFIGURED'
+                  ? '这个工位本级就没有登记过任何时段。'
+                  : '这个工位在别的日期可能还有窗口。点「全部」看全部，或换一个日期范围。'
+              }}
+            </ElAlert>
+            <ElAlert
+              v-else-if="currentSlotWindowStatus === 'NOT_CONFIGURED'"
               type="warning"
               :closable="false"
               show-icon
@@ -1023,13 +1284,24 @@ onBeforeUnmount(() => {
               size="small"
               style="width: 100%"
             >
-              <ElTableColumn prop="id" label="窗口编号" width="130" fixed="left" />
-              <ElTableColumn prop="manualSlotId" label="人工槽编号" width="130" />
-              <ElTableColumn label="开始时间" min-width="170">
-                <template #default="{ row }">{{ fmt(row.startTime) }}</template>
+              <ElTableColumn label="日期" min-width="160" fixed="left">
+                <template #default="{ row }">
+                  <span>{{ fmtDayLabel(row.startTime) }}</span>
+                  <ElTag
+                    v-if="isTodayRow(row.startTime)"
+                    size="small"
+                    type="danger"
+                    effect="plain"
+                    class="today-tag"
+                  >
+                    今天
+                  </ElTag>
+                </template>
               </ElTableColumn>
-              <ElTableColumn label="结束时间" min-width="170">
-                <template #default="{ row }">{{ fmt(row.endTime) }}</template>
+              <ElTableColumn label="时段" width="150">
+                <template #default="{ row }">
+                  {{ timeOf(row.startTime) }} ~ {{ timeOf(row.endTime) }}
+                </template>
               </ElTableColumn>
               <ElTableColumn label="可用" width="90" align="center">
                 <template #default="{ row }">
@@ -1039,7 +1311,7 @@ onBeforeUnmount(() => {
                 </template>
               </ElTableColumn>
               <ElTableColumn prop="remark" label="备注" min-width="160" show-overflow-tooltip />
-              <ElTableColumn label="操作" width="110" fixed="right" v-if="canDeleteManual">
+              <ElTableColumn label="操作" width="100" fixed="right" v-if="canDeleteManual">
                 <template #default="{ row }">
                   <ElButton
                     type="danger"
@@ -1157,9 +1429,17 @@ onBeforeUnmount(() => {
   font-weight: 600;
   font-size: 15px;
 }
-.intro-sub {
-  color: var(--el-text-color-secondary);
-  font-size: 12px;
+/* 日期筛选行（设备侧 / 人工槽侧各一行） */
+.rc-filter-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 0 0 10px;
+  font-size: 13px;
+}
+.today-tag {
+  margin-left: 6px;
 }
 .intro-help {
   display: inline-flex;

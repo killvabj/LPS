@@ -162,6 +162,13 @@ export interface SetupRuleDto {
   toMaterialId?: number | null
   /** 换型分钟数（> 0） */
   setupMinutes: number
+  /**
+   * 规则启停（工作簿 #67）。
+   *
+   * 后端 2026-11-07 已扩契约：读 DTO 回带真实值、写输入接受该字段（不再硬置 true）。
+   * **编辑时必须原样回传** —— 后端入参默认 `true`，漏传＝把已停用的规则悄悄复活。
+   */
+  isActive: boolean
   status: SetupRuleStatus
   createdAt: IsoDateTime
   createdBy?: string | null
@@ -196,6 +203,10 @@ export interface SetupRuleExactInput {
   /** 后产品主键（Material.Id） */
   toMaterialId: number
   setupMinutes: number
+  /**
+   * 规则启停（工作簿 #67）。**必传**：后端入参默认 `true`，编辑时漏传会让停用规则复活。
+   */
+  isActive: boolean
 }
 
 /* ==================== DEFAULT 规则输入 ==================== */
@@ -218,6 +229,10 @@ export interface SetupRuleDefaultInput {
   /** 当前设备主键（Id） */
   resourceId: number
   setupMinutes: number
+  /**
+   * 规则启停（工作簿 #67）。**必传**：后端入参默认 `true`，编辑时漏传会让停用规则复活。
+   */
+  isActive: boolean
 }
 
 /* ==================== 0 分钟兜底统计 ==================== */
@@ -445,19 +460,27 @@ export interface SetupRuleSetVersionDto {
   createdAt: IsoDateTime
 }
 
-/* ==================== Dialog 预填（Code 形态，页面 2.3 跳转用） ==================== */
+/* ==================== Dialog 预填（Code + Id 形态，页面 2.3 跳转用） ==================== */
 
 /**
- * Setup Dialog 预填字段（「缺失规则查询」跳转路由 query 带入，Code 形态）
+ * Setup Dialog 预填字段（「缺失规则查询」跳转路由 query 带入）
  *
- * 注：写输入已改 Id-口径（v1.1），但跳转源（0 分钟兜底统计行）只有 Code；
- * Dialog 内部做 Code→Id 解析（编辑态双返回 / mock 映射；真实模式待主数据端点，P0 缺口）。
+ * Code 是展示口径、Id 是写入口径（v1.1），两者要一起带。
+ * ⚠️ Id 不能省（11-11 实测）：后端 lookups 是 `SELECT TOP(200) ... ORDER BY [Code]`
+ * 写死截断，跳转源那一行的部门/设备常常排在 200 名之外 ⇒ 只带 Code 时 Dialog 解析不出 Id，
+ * 保存被拦下报「无法解析设备 Id」（实测设备 8700 / 部门 BJ_ASSY_制造3课751HL）。
+ * 0 分钟兜底统计行本身就带 Id（departmentId / resourceId），且与 lookup 的 masterId 同源
+ * （dev 实测 8700 → 13543 两边一致）⇒ 直接采信，不再二次解析。
  */
 export interface SetupDialogPrefill {
   departmentCode?: string
+  /** 部门内部主键 Id（= 写输入 productionDepartmentId） */
+  departmentId?: number
   stageCode?: string
   operationCode?: string
   resourceCode?: string
+  /** 设备内部主键 Id（= 写输入 resourceId） */
+  resourceId?: number
   fromMaterialCode?: string
   toMaterialCode?: string
 }

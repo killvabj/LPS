@@ -18,8 +18,29 @@ public class OrderQueryService
         _repository = repository ?? throw new ArgumentNullException(nameof(repository));
     }
 
+    /// <summary>R1（11-12 4号位件）：sortBy 白名单（OrdinalIgnoreCase；空=缺省排序原样）。</summary>
+    private static readonly HashSet<string> SortByWhitelist = new(StringComparer.OrdinalIgnoreCase)
+        { "dueDate", "priority", "orderNo", "riskLevel", "quantity" };
+
+    /// <summary>R2：riskLevel 筛选域——07 §八.2 三值 + 'UNSCHEDULED'（仅筛选名：列表缺键行的显式写法，响应值永不含）。</summary>
+    private static readonly HashSet<string> RiskLevelFilterWhitelist = new(StringComparer.Ordinal)
+        { "ON_TRACK", "DELAYED", "AT_RISK", "UNSCHEDULED" };
+
+    /// <summary>非法值一律 400（ArgumentException→控制器映射），**绝不静默忽略**（4号位 R2 实测教训：假参数返回全量）。</summary>
+    private static void ValidateSortAndRisk(string? riskLevel, string? sortBy, string? sortDir)
+    {
+        if (!string.IsNullOrWhiteSpace(riskLevel) && !RiskLevelFilterWhitelist.Contains(riskLevel))
+            throw new ArgumentException($"非法 riskLevel：{riskLevel}（允许：ON_TRACK/DELAYED/AT_RISK/UNSCHEDULED 或不传；AT_RISK 当前无源恒 0 行）");
+        if (!string.IsNullOrWhiteSpace(sortBy) && !SortByWhitelist.Contains(sortBy))
+            throw new ArgumentException($"非法 sortBy：{sortBy}（允许：dueDate/priority/orderNo/riskLevel/quantity 或不传=缺省排序）");
+        if (!string.IsNullOrWhiteSpace(sortDir)
+            && !sortDir.Equals("asc", StringComparison.OrdinalIgnoreCase)
+            && !sortDir.Equals("desc", StringComparison.OrdinalIgnoreCase))
+            throw new ArgumentException($"非法 sortDir：{sortDir}（允许：asc/desc 或不传=asc）");
+    }
+
     /// <summary>
-    /// 查询订单列表
+    /// 查询订单列表（R1/R2，11-12：+sortBy/sortDir/riskLevel 三参；缺省排序与现行为逐字一致）
     /// </summary>
     public async Task<PageResult<OrderListItemDto>> QueryOrdersAsync(
         int planVersionId,
@@ -34,6 +55,9 @@ public class OrderQueryService
         string? productFamilyCode = null,
         DateTime? dueDateFrom = null,
         DateTime? dueDateTo = null,
+        string? riskLevel = null,
+        string? sortBy = null,
+        string? sortDir = null,
         int skip = 0,
         int take = 50,
         CancellationToken ct = default,
@@ -45,11 +69,13 @@ public class OrderQueryService
         // 非正数 → 默认 50；超上限 → 夹到 200。
         if (take <= 0) take = 50;
         if (take > 200) take = 200;
+        ValidateSortAndRisk(riskLevel, sortBy, sortDir);
 
         return await _repository.QueryOrdersAsync(
             planVersionId, orderNo, materialCode, customerName,
             factoryCode, domainKey, delayStatus, status,
             productionInstructionNo, productFamilyCode, dueDateFrom, dueDateTo,
+            riskLevel, sortBy, sortDir,
             skip, take, ct, allowedFactories, allowedDomains);
     }
 
@@ -68,16 +94,68 @@ public class OrderQueryService
     }
 
     /// <summary>
-    /// 查询订单状态汇总（按 DelayStatus 聚合）
+    /// 查询订单汇总（R3，11-12）：与列表同名同义筛选参数+同 riskLevel 判定；
+    /// **全部筛选不传=与旧行为逐字一致**（总览页共用本端点，兼容基线 999472=0/0/970、999464=10,917/50,950/47,554 已预跑对照）。
     /// </summary>
     public async Task<OrderSummaryDto> GetSummaryAsync(
         int planVersionId,
+        string? orderNo = null,
+        string? materialCode = null,
+        string? customerName = null,
+        string? factoryCode = null,
+        string? domainKey = null,
+        string? delayStatus = null,
+        string? status = null,
+        string? productionInstructionNo = null,
+        string? productFamilyCode = null,
+        DateTime? dueDateFrom = null,
+        DateTime? dueDateTo = null,
+        string? riskLevel = null,
         IReadOnlySet<string>? allowedFactories = null,
         IReadOnlySet<string>? allowedDomains = null,
         CancellationToken ct = default)
     {
         if (planVersionId <= 0) throw new ArgumentException("planVersionId is required");
+        if (!string.IsNullOrWhiteSpace(riskLevel) && !RiskLevelFilterWhitelist.Contains(riskLevel))
+            throw new ArgumentException($"非法 riskLevel：{riskLevel}（允许：ON_TRACK/DELAYED/AT_RISK/UNSCHEDULED 或不传）");
 
-        return await _repository.GetSummaryAsync(planVersionId, allowedFactories, allowedDomains, ct);
+        return await _repository.GetSummaryAsync(
+            planVersionId, orderNo, materialCode, customerName,
+            factoryCode, domainKey, delayStatus, status,
+            productionInstructionNo, productFamilyCode, dueDateFrom, dueDateTo,
+            riskLevel, allowedFactories, allowedDomains, ct);
+    }
+
+    /// <summary>
+    /// 订单口径可选值+条数（R4，11-12 新增只读端点）：与列表同筛选同范围；
+    /// 六维（customerName/factoryCode/productFamilyCode/status/delayStatus/riskLevel）各按条数降序、截 200。
+    /// </summary>
+    public async Task<OrderFacetsDto> GetFacetsAsync(
+        int planVersionId,
+        string? orderNo = null,
+        string? materialCode = null,
+        string? customerName = null,
+        string? factoryCode = null,
+        string? domainKey = null,
+        string? delayStatus = null,
+        string? status = null,
+        string? productionInstructionNo = null,
+        string? productFamilyCode = null,
+        DateTime? dueDateFrom = null,
+        DateTime? dueDateTo = null,
+        string? riskLevel = null,
+        IReadOnlySet<string>? allowedFactories = null,
+        IReadOnlySet<string>? allowedDomains = null,
+        CancellationToken ct = default)
+    {
+        if (planVersionId <= 0) throw new ArgumentException("planVersionId is required");
+        if (!string.IsNullOrWhiteSpace(riskLevel) && !RiskLevelFilterWhitelist.Contains(riskLevel))
+            throw new ArgumentException($"非法 riskLevel：{riskLevel}");
+
+        return await _repository.GetFacetsAsync(
+            planVersionId, orderNo, materialCode, customerName,
+            factoryCode, domainKey, delayStatus, status,
+            productionInstructionNo, productFamilyCode, dueDateFrom, dueDateTo,
+            riskLevel, allowedFactories, allowedDomains, ct);
     }
 }

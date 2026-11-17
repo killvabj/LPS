@@ -83,6 +83,98 @@ export interface RuleSetSummaryDto {
 }
 
 /**
+ * 后端 `RuleSetVersionRowDto`（`GET /api/governance/rule-sets/versions` 的一行）
+ *
+ * ⚠️ 2026-11-11（3号位 契约变更协调件 v1.0）新增端点，**主子表联查·一版一行**：
+ *   每主表 N 个 RuleSetVersion ⇒ N 行，各版本状态独立可读、互不覆盖。
+ *   旧 `GET /rule-sets`（一主表带最新概要）把 `Status` 取「最新创建版本」
+ *   （`OUTER APPLY TOP1 ORDER BY Id DESC`）⇒ 同族有生效 PUBLISHED 又新加 DRAFT 时
+ *   整个列表被标成「草稿」，且详情默认展示草稿内容 ⇒ **看不到当前生效版本的内容**。
+ *   本 DTO 每行自带版本真实状态与版本 Id，页面一行即可渲染、可直接按 versionId 进详情。
+ *
+ * 排序：主表 Id DESC；每主表内版本 Id ASC。
+ * ⚠️ 可空字段（description / effectiveFrom / effectiveTo / publishedAt / publishedBy /
+ *   createdAt / ruleSetCreatedAt）在后端 `Program.cs:94` 设了 `WhenWritingNull`
+ *   ⇒ 为空时**整个 key 消失**（不是 null），前端按「缺失即空」处理。
+ */
+export interface RuleSetVersionRowDto {
+  /** 主表 Id */
+  ruleSetId: number
+  /** 主表编码 */
+  ruleSetCode: string
+  /** 主表名称 */
+  ruleSetName: string
+  /** 主表说明 */
+  description?: string | null
+  /** 主表启停（与版本状态是两件事） */
+  isActive: boolean
+  /** 主表建档时间 */
+  ruleSetCreatedAt?: string | null
+  /** 版本 Id（发布 / 停用 / 校验 / 保存段位端点的键） */
+  versionId: number
+  /** 版本码（如 `DOMAIN001-V1`） */
+  versionCode: string
+  /** **版本真实状态**（DRAFT/SUBMITTED/APPROVED/PUBLISHED/DISABLED/ARCHIVED） */
+  status: string
+  /** 生效起（发布时后端写入的发布时间；未发布 = 空） */
+  effectiveFrom?: string | null
+  /** 生效止（停用时后端写入的停用时刻；已发布未停用 = 空） */
+  effectiveTo?: string | null
+  /** 发布时间 */
+  publishedAt?: string | null
+  /** 发布人 */
+  publishedBy?: string | null
+  /** 版本建档时间 */
+  createdAt?: string | null
+}
+
+/**
+ * 前端规则集**列表行**（一版一行）
+ *
+ * 行有两种：
+ *  - **版本行**（来自新端点 `GET /rule-sets/versions`）：`hasVersion=true`，
+ *    带 `versionId` / `versionCode` / `versionStatus`（该版本真实状态）。
+ *  - **无版本主表行**（来自旧端点 `GET /rule-sets` 里一条版本都没有的主表）：
+ *    `hasVersion=false`，无版本字段 ⇒ 页面上显示「未配版本」并给「删除规则集」入口。
+ *
+ * ⚠️ 为什么要保留第二种行：新端点是主表 INNER JOIN 版本，**一条版本都没有的主表
+ *   不会出现在它里面**（dev 实测 905 个主表里 894 个无版本）。若纯切新端点，
+ *   这些主表连同「未配版本」筛选与删除入口会一起从列表消失 ⇒ 功能回退。
+ *   故列表 = 新端点版本行 + 旧端点「无版本主表」行。
+ */
+export interface RuleSetListRowDto {
+  /** 行唯一键：版本行 = `v{versionId}`；无版本主表行 = `n{ruleSetId}` */
+  rowKey: string
+  ruleSetId: number
+  ruleSetCode: string
+  ruleSetName: string
+  /** 主表说明 */
+  description?: string
+  /** 主表启停 */
+  isActive: boolean
+  /** 建档时间（主表或版本，取可得的那个） */
+  createdAt: string
+  /** 适用 Domain（恒为 'ALL'：后端 RuleSet 表无 Domain 外键，不编造） */
+  domainKey: DomainKey
+  /** 该行是否有版本 */
+  hasVersion: boolean
+  /** 版本 Id（仅版本行） */
+  versionId?: number
+  /** 版本码（仅版本行） */
+  versionCode?: string
+  /** 版本真实状态（仅版本行） */
+  versionStatus?: RuleStatus
+  /** 本规则集「最新已发布」版本码（主表级副信息） */
+  currentVersionCode?: string
+  /** 本规则集当前草稿版本码（主表级副信息） */
+  draftVersionCode?: string
+  /** 最近变更（主表级；来自版本备注） */
+  lastChangeReason?: string
+  /** 发布时间（版本行 = 该版本发布时间；无版本行 = 主表最近一次发布时间） */
+  publishedAt?: string
+}
+
+/**
  * RuleSet 详情
  *
  * ⚠️ 2026-10-22 更正：原先这里挂 `parameterSet` / `strategyProfile` 两个**前端自造**的占位对象
@@ -90,6 +182,13 @@ export interface RuleSetSummaryDto {
  * StrategyProfileVersion 上），恒为假值。现已整条删除。
  */
 export interface RuleSetDetailDto {
+  /**
+   * 摘要
+   *
+   * ⚠️ 2026-11-11：`summary.status` = **本页展示的那一版的真实状态**
+   *   （不再「有草稿就一律 DRAFT」）。列表改一版一行后，用户点哪一行就看到哪一版的状态，
+   *   页面上的「发布 / 停用 / 校验」按钮据此决定作用在哪个版本上。
+   */
   summary: RuleSetSummaryDto
   domainKey: DomainKey
   /** 需求优先级段位（自需求优先级块解析；后端不提供段码/说明，故这两项可空） */
@@ -135,9 +234,9 @@ export interface RuleVersionHistoryDto {
   /** 是否为「最新已发布」版本（Id 最大的那条 PUBLISHED）。
    *  ⚠️ 不等于「当前有效」——后者按生效期窗口判定，由 published-version 端点给出。 */
   isLatestPublished: boolean
-  /** 生效起（后端 `effectiveFrom`） */
+  /** 生效起（后端 `effectiveFrom`；发布时写入的发布时间，未发布为空） */
   effectiveFrom?: IsoDateTime
-  /** 生效止（后端 `effectiveTo`；空 = 一直有效） */
+  /** 生效止（后端 `effectiveTo`；停用时写入的停用时刻，已发布未停用为空） */
   effectiveTo?: IsoDateTime
 }
 
@@ -160,10 +259,30 @@ export interface PrioritySegmentDto {
   competitionRound?: number
   /** 命中条件（AND 关系） */
   matchConditions: SegmentMatchConditionDto[]
+  /**
+   * 命中条件组（DNF：**组内 AND、组间 OR**）
+   *
+   * ⚠️ 与 `matchConditions` **互斥**（后端 `DemandPriorityValidator` 对「同一段两者都填」直接报错）：
+   *   非空即以组为准、平铺列表被忽略 ⇒ 属歧义配置。本前端两种模式互斥产出：
+   *   有组 ⇒ 只写组；无组 ⇒ 只写平铺。
+   * 空数组 / 未定义 = 存量平铺模式。
+   */
+  matchConditionGroups?: SegmentConditionGroupDto[]
   /** 段内排序键（依次生效） */
   sortFields: SegmentSortFieldDto[]
   /** 稳定排序键（并列时兜底，保证结果确定） */
   stableTieBreakFields: string[]
+}
+
+/**
+ * 一条 AND 条件组（后端 `SegmentConditionGroup` / `PriorityConditionGroup`）
+ *
+ * 语义：**组内条件全部满足**才本组成立，**组与组之间取或**。
+ * 例「1 并 2 并（3 或 4）」＝ 组A{1,2,3}、组B{1,2,4}。
+ */
+export interface SegmentConditionGroupDto {
+  /** 组内条件（AND 关系） */
+  conditions: SegmentMatchConditionDto[]
 }
 
 /** 命中条件一项（后端 `SegmentMatchCondition`：Field/Operator 是**枚举数字**，Value 是标量或数组） */

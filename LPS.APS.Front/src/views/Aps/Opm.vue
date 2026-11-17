@@ -21,6 +21,19 @@
   RBAC（v1.2 §23.1）：
     - 路由级 aps.rule.edit（与 Rules.vue 同码，3号位 端点 [Authorize(Policy=RuleMaintain)])
     - 按钮级 canView（aps.rule.view）/ canEdit（aps.rule.edit）
+
+  2026-11-14 物料编码输入改版（工厂视角）：
+    - 形态定为「可手打的远程搜索 + 候选下拉」——不是二选一
+    - 手打完整编码 → 精确命中自动选中 → 直接回车 / 点「加载工序」即可加载
+      （改前必须点下拉选中，否则只弹一句「请先选择物料编码」）
+    - 搜不到 / 查失败分开提示（改前 searchMaterials 把 403/500 吞成空列表，
+      用户会以为厂里没这个料）
+    - 精确命中项排候选首位并打「完全匹配」标；输入框下方显示已选物料编码 + 名称
+
+  2026-11-16 部门名称改读行内字段（3号位 2026-11-16 回执已落码）：
+    - 部门列优先用 row.productionDepartmentName（后端 LEFT JOIN ProductionDepartment.DeptName，零 DDL）
+    - 行内取不到才拉 5号位 /api/production-departments 兜底（兜底时才发这一次请求）
+    - 两者都取不到才回退显示 Id（不丢行、不造假）
 -->
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
@@ -52,12 +65,23 @@ import {
 import { useOpmStore } from '@/store/modules/aps/opm'
 
 const store = useOpmStore()
-const { list, currentMaterialId, loading, saving, error, canView, canEdit, modeCounts } =
-  storeToRefs(store)
+const { list, loading, saving, error, canView, canEdit, modeCounts } = storeToRefs(store)
 
-/* ===== 物料编码输入（用户用编码查，自动补全 → 选中 → 取 masterId 调业务端点） ===== */
+/* ===== 物料编码输入 ===== *
+ * 形态（2026-11-14 改版）：**可手打的远程搜索 + 候选下拉**，两者不是二选一。
+ * 工厂用户里有「记得住完整编码」的，也有「只记得产品名/规格」的，所以：
+ *  - 手打编码片段 / 名称 / 规格 → 250ms 防抖 → 后端模糊搜索 → 候选下拉
+ *  - 手打**完整编码** → 精确命中自动选中 ⇒ 直接回车或点「加载工序」都能加载，不必去点下拉
+ *  - 搜不到 ≠ 查失败：走严格版 API（失败抛错），两句话分开说，别让用户以为厂里没这个料
+ */
 const materialCodeInput = ref<string>('')
 const selectedMaterial = ref<MaterialLookupItem | null>(null)
+/** 最近一次搜索结果中「编码与输入完全相等」的那条（手打完整编码时自动选中用） */
+const exactHit = ref<MaterialLookupItem | null>(null)
+/** 搜索失败提示（与「没搜到」区分开） */
+const materialSearchError = ref<string | null>(null)
+/** 请求序号（丢弃过期响应，避免慢请求覆盖新结果） */
+let searchSeq = 0
 /** 防抖定时器句柄（避免每次按键都发请求） */
 let searchDebounceHandle: ReturnType<typeof setTimeout> | null = null
 
@@ -71,21 +95,80 @@ function fetchMaterialSuggestions(
   callback: (items: MaterialLookupItem[]) => void
 ): void {
   if (searchDebounceHandle) clearTimeout(searchDebounceHandle)
+  const q = String(queryString ?? '').trim()
+  const seq = ++searchSeq
   searchDebounceHandle = setTimeout(async () => {
-    const items = await materialLookupApi.searchMaterials(queryString)
-    callback(items)
+    if (!q) {
+      exactHit.value = null
+      materialSearchError.value = null
+      callback([])
+      return
+    }
+    try {
+      const items = await materialLookupApi.searchMaterialsOrThrow(q)
+      if (seq !== searchSeq) return
+      materialSearchError.value = null
+      const hit =
+        items.find(
+          (o: MaterialLookupItem) => (o.code ?? '').trim().toLowerCase() === q.toLowerCase()
+        ) ?? null
+      exactHit.value = hit
+      // 精确命中排最前：记编码的用户一眼看到，不用在候选里翻
+      callback(hit ? [hit, ...items.filter((o: MaterialLookupItem) => o !== hit)] : items)
+    } catch (err) {
+      if (seq !== searchSeq) return
+      exactHit.value = null
+      materialSearchError.value = `物料查询失败，请稍后重试（${(err as Error)?.message ?? '未知错误'}）`
+      callback([])
+    }
   }, 250)
+}
+
+/** 候选是否与输入完全一致（模板上打「完全匹配」标） */
+function isExactHit(item: { code?: string }): boolean {
+  const q = materialCodeInput.value.trim().toLowerCase()
+  return q.length > 0 && (item.code ?? '').trim().toLowerCase() === q
 }
 
 /** 选中候选：写 selectedMaterial + 同步显示编码（防 ElAutocomplete 因 value-key 替换字符串） */
 function onMaterialSelect(item: MaterialLookupItem): void {
   selectedMaterial.value = item
+  exactHit.value = item
   materialCodeInput.value = item.code
+  materialSearchError.value = null
+}
+
+/** 用户改了输入内容：已选物料作废（除非改完仍与已选编码一致） */
+function onMaterialInput(value: string): void {
+  const v = String(value ?? '').trim()
+  if (selectedMaterial.value && v !== (selectedMaterial.value.code ?? '').trim()) {
+    selectedMaterial.value = null
+  }
+}
+
+/** 清空输入 */
+function onMaterialClear(): void {
+  selectedMaterial.value = null
+  exactHit.value = null
+  materialSearchError.value = null
+}
+
+/** 失焦：输入的是完整编码且已精确命中 → 自动选中（点「加载工序」按钮时不触发回车） */
+function onMaterialBlur(): void {
+  if (!selectedMaterial.value && exactHit.value) {
+    selectedMaterial.value = exactHit.value
+  }
 }
 
 async function onLoad(): Promise<void> {
+  // 手打完整编码但没点下拉时，精确命中项即为所选
+  if (!selectedMaterial.value && exactHit.value) {
+    selectedMaterial.value = exactHit.value
+  }
   if (!selectedMaterial.value || selectedMaterial.value.masterId <= 0) {
-    ElMessage.warning('请先在上方选择物料编码（自动补全下拉）')
+    ElMessage.warning(
+      materialSearchError.value ?? '没有找到匹配的物料，请换个关键字（可搜编码片段、名称或规格）'
+    )
     return
   }
   await store.load(selectedMaterial.value.masterId)
@@ -188,27 +271,44 @@ onBeforeUnmount(() => {
     <!-- 顶部：物料编码输入 + 加载按钮 -->
     <ElCard class="opm-toolbar" shadow="never">
       <ElForm inline label-position="right" label-width="80px">
-        <ElFormItem label="物料编码" required>
-          <ElAutocomplete
-            v-model="materialCodeInput"
-            :fetch-suggestions="fetchMaterialSuggestions"
-            value-key="code"
-            placeholder="请输入或选择物料编码"
-            style="width: 320px"
-            clearable
-            :trigger-on-focus="true"
-            highlight-first-item
-            @select="onMaterialSelect"
-            @keyup.enter="onLoad"
-          >
-            <template #default="{ item }">
-              <span class="material-suggestion">
-                <span class="material-code">{{ item.code }}</span>
-                <span class="material-name">{{ item.name }}</span>
-                <span class="material-spec">{{ item.spec }} / {{ item.uom }}</span>
-              </span>
-            </template>
-          </ElAutocomplete>
+        <ElFormItem label="物料编码" required class="material-field">
+          <div class="material-input-wrap">
+            <ElAutocomplete
+              v-model="materialCodeInput"
+              :fetch-suggestions="fetchMaterialSuggestions"
+              :debounce="0"
+              value-key="code"
+              placeholder="输入编码片段 / 名称 / 规格"
+              style="width: 320px"
+              clearable
+              :trigger-on-focus="true"
+              highlight-first-item
+              @select="onMaterialSelect"
+              @input="onMaterialInput"
+              @clear="onMaterialClear"
+              @blur="onMaterialBlur"
+              @keyup.enter="onLoad"
+            >
+              <template #default="{ item }">
+                <span class="material-suggestion">
+                  <span class="material-code">{{ item.code }}</span>
+                  <span class="material-name">{{ item.name }}</span>
+                  <span class="material-spec">{{ item.spec }} / {{ item.uom }}</span>
+                  <span v-if="isExactHit(item)" class="material-exact">完全匹配</span>
+                </span>
+              </template>
+            </ElAutocomplete>
+            <div v-if="selectedMaterial" class="material-hint picked">
+              已选：{{ selectedMaterial.code
+              }}<template v-if="selectedMaterial.name">（{{ selectedMaterial.name }}）</template>
+            </div>
+            <div v-else-if="materialSearchError" class="material-hint error">
+              {{ materialSearchError }}
+            </div>
+            <div v-else class="material-hint">
+              手打完整编码可直接回车加载；只记得名称或规格时，先输入关键字再从候选里选。
+            </div>
+          </div>
         </ElFormItem>
         <ElFormItem>
           <ElButton type="primary" :loading="loading" @click="onLoad">加载工序</ElButton>
@@ -235,10 +335,6 @@ onBeforeUnmount(() => {
       <template #header>
         <div class="table-header">
           <span class="table-title">工序工艺规划模式列表</span>
-          <span v-if="currentMaterialId !== null" class="table-subtitle">
-            物料 ID = <strong>{{ currentMaterialId }}</strong> · 共
-            <strong>{{ list.length }}</strong> 条
-          </span>
         </div>
       </template>
 
@@ -262,8 +358,11 @@ onBeforeUnmount(() => {
         <ElTableColumn prop="processType" label="工艺类型" width="120" />
         <ElTableColumn prop="stageCode" label="阶段码" width="100" />
         <ElTableColumn prop="routeCode" label="路径代号" width="120" />
-        <ElTableColumn prop="pathId" label="路径 ID" width="90" />
-        <ElTableColumn prop="productionDepartmentId" label="部门 ID" width="100" />
+        <ElTableColumn label="部门" width="160">
+          <template #default="{ row }: { row: RoutingOperationDto }">
+            {{ store.departmentNameOf(row) }}
+          </template>
+        </ElTableColumn>
         <ElTableColumn label="当前模式" width="160">
           <template #default="{ row }: { row: RoutingOperationDto }">
             <ElTag :type="OPM_META[row.operationPlanningMode].tagType" effect="light">
@@ -375,6 +474,37 @@ onBeforeUnmount(() => {
 .material-spec {
   color: var(--el-text-color-secondary);
   font-size: 12px;
+}
+.material-exact {
+  color: var(--el-color-success);
+  font-size: 12px;
+  border: 1px solid var(--el-color-success-light-5);
+  border-radius: 3px;
+  padding: 0 4px;
+  line-height: 16px;
+}
+/* 输入框 + 提示：提示排在输入框正下方，标签与输入框首行对齐 */
+.material-input-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.material-field :deep(.el-form-item__content) {
+  align-items: flex-start;
+}
+.material-field :deep(.el-form-item__label) {
+  line-height: 32px;
+}
+.material-hint {
+  font-size: 12px;
+  line-height: 16px;
+  color: var(--el-text-color-secondary);
+}
+.material-hint.picked {
+  color: var(--el-color-success);
+}
+.material-hint.error {
+  color: var(--el-color-danger);
 }
 .table-header {
   display: flex;

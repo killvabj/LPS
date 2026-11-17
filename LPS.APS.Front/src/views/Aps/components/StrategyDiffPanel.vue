@@ -14,6 +14,7 @@ import { computed } from 'vue'
 import { ElEmpty, ElTable, ElTableColumn, ElTag } from 'element-plus'
 import type { StrategyVersionDiffDto } from '@/api/aps-v1'
 import { formatUtcDateTimeSec } from '@/utils/datetime'
+import { diffFieldDisplayName } from '@/utils/effectiveWindow'
 
 const props = defineProps<{
   diff: StrategyVersionDiffDto | null
@@ -50,7 +51,9 @@ const changedCount = computed<number>(
       <ElTable :data="diff.fieldDiffs" size="small" border>
         <ElTableColumn label="字段" min-width="140">
           <template #default="{ row }: { row: StrategyVersionDiffDto['fieldDiffs'][number] }">
-            <span class="strat-diff-name">{{ row.fieldDisplayName }}</span>
+            <span class="strat-diff-name">{{
+              diffFieldDisplayName(row.fieldName, row.fieldDisplayName)
+            }}</span>
             <code class="code-tag">{{ row.fieldName }}</code>
           </template>
         </ElTableColumn>

@@ -34,6 +34,7 @@ import {
   ElOption,
   ElRow,
   ElSelect,
+  ElSwitch,
   ElTable,
   ElTableColumn,
   ElTag,
@@ -261,6 +262,14 @@ const editDisabledReason = computed<string>(() => {
   if (!canEdit.value) return '只能编辑草稿（DRAFT）状态的版本'
   return ''
 })
+
+/** 切换规则启停（工作簿 #67）：store 用该行完整回传，成功后自动重载列表 */
+async function onToggleActive(rule: SetupRuleDto, active: boolean): Promise<void> {
+  if (!canWrite.value || !canEdit.value) return
+  const ok = await exactStore.setRuleActive(rule, active)
+  if (ok) ElMessage.success(active ? '规则已启用' : '规则已停用')
+  else if (exactStore.error) ElMessage.error(exactStore.error)
+}
 </script>
 
 <template>
@@ -424,6 +433,16 @@ const editDisabledReason = computed<string>(() => {
             <ElTag :type="getStatusTag(row.status).tag" size="small">
               {{ getStatusTag(row.status).label }}
             </ElTag>
+          </template>
+        </ElTableColumn>
+        <ElTableColumn label="启用" width="80" align="center">
+          <template #default="{ row }">
+            <ElSwitch
+              :model-value="row.isActive !== false"
+              size="small"
+              :disabled="!!editDisabledReason"
+              @change="(v) => onToggleActive(row, v === true)"
+            />
           </template>
         </ElTableColumn>
         <!-- 09-20 交付回执偏差 #1：remark 字段撤除（备注列移除） -->

@@ -184,4 +184,56 @@ public sealed class SolverStrategyValidator
 
         return errors;
     }
+
+    /// <summary>跨厂LT 标准参数顶层子块名（准入 C-1~C-3，0号位 2026-11-16 准；唯一物理路径 <c>$.CrossFactoryLeadTimeRules</c>）。</summary>
+    public const string CrossFactoryLeadTimeRulesBlockName = "CrossFactoryLeadTimeRules";
+
+    /// <summary>
+    /// 跨厂LT 标准参数校验（准入 C-1~C-3；纯 JSON 内容校验下限，镜像 <see cref="ValidateStageHandoffWaitRules"/>）。
+    /// 无状态纯校验、**不注入 DB 访问**（工厂存在性/日期/日历资格交装载/消费上下文判定）。
+    /// 校验项：①必填（From/ToFactoryCode；ProductFamilyCode/IsActive 可空）；
+    /// ②From≠To（跨厂LT 是厂到厂，非同厂）；③CrossFactoryLeadTimeHours ≥ 0（整数）；
+    /// ④重复键（From,To,ProductFamily）每有效版本仅一条（仅 IsActive=true 参与去重；ProductFamilyCode 空视为键的一部分，空与不空是不同的细化键）。
+    /// 无「全局默认」层（07:4217 禁统一默认）——不校验默认行，因为本就禁止配置默认。
+    /// </summary>
+    public static IReadOnlyList<string> ValidateCrossFactoryLeadTimeRules(IReadOnlyList<CrossFactoryLeadTimeRule> rules)
+    {
+        var errors = new List<string>();
+
+        var activeKeys = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var rule in rules)
+        {
+            var keyDesc = $"CrossFactoryLeadTimeRules[{rule.FromFactoryCode}→{rule.ToFactoryCode}{(string.IsNullOrWhiteSpace(rule.ProductFamilyCode) ? "" : "/" + rule.ProductFamilyCode)}]";
+            if (string.IsNullOrWhiteSpace(rule.FromFactoryCode))
+            {
+                errors.Add($"{keyDesc}: FromFactoryCode 不能为空");
+            }
+            if (string.IsNullOrWhiteSpace(rule.ToFactoryCode))
+            {
+                errors.Add($"{keyDesc}: ToFactoryCode 不能为空");
+            }
+            if (!string.IsNullOrWhiteSpace(rule.FromFactoryCode)
+                && !string.IsNullOrWhiteSpace(rule.ToFactoryCode)
+                && string.Equals(rule.FromFactoryCode, rule.ToFactoryCode, StringComparison.Ordinal))
+            {
+                errors.Add($"{keyDesc}: FromFactoryCode 必须 ≠ ToFactoryCode（跨厂LT 是厂到厂，非同厂）");
+            }
+            if (rule.CrossFactoryLeadTimeHours < 0)
+            {
+                errors.Add($"{keyDesc}: CrossFactoryLeadTimeHours 不能为负（当前：{rule.CrossFactoryLeadTimeHours}）");
+            }
+        }
+
+        // 重复键 (From,To,ProductFamily)：仅 IsActive=true 参与；ProductFamilyCode 空视为键的一部分（空与不空是两条拆分键）
+        foreach (var rule in rules.Where(r => r.IsActive == true))
+        {
+            var effKey = $"{rule.FromFactoryCode}|{rule.ToFactoryCode}|{rule.ProductFamilyCode ?? ""}";
+            if (!activeKeys.Add(effKey))
+            {
+                errors.Add($"CrossFactoryLeadTimeRules 重复键：同一有效参数版本内 (From={rule.FromFactoryCode}, To={rule.ToFactoryCode}, ProductFamily={(string.IsNullOrWhiteSpace(rule.ProductFamilyCode) ? "(全族)" : rule.ProductFamilyCode)}) 最多一条有效规则");
+            }
+        }
+
+        return errors;
+    }
 }

@@ -26,6 +26,8 @@ import type {
   VersionDiffResultDto,
   RuleSetDetailDto,
   RuleSetSummaryDto,
+  RuleSetListRowDto,
+  RuleSetVersionRowDto,
   RuleVersionHistoryDto,
   RoleKey,
   RuleSetVersion,
@@ -91,6 +93,75 @@ export function buildForkContentSnapshot(
 
 /* ===== Rule Set List ===== */
 
+/**
+ * 把「新端点版本行」与「旧端点无版本主表行」合并成前端列表行（**一版一行**）
+ *
+ * ⚠️ 2026-11-11（3号位 契约变更协调件 v1.0）：
+ *   新端点 `GET /rule-sets/versions` 是主表 INNER JOIN 版本 ⇒ **一条版本都没有的主表
+ *   不会出现在它里面**（dev 实测 905 个主表里 894 个无版本）。纯切新端点会让这些主表
+ *   连同页面的「未配版本」筛选与「删除规则集」入口一起消失 ⇒ 功能回退。
+ *   故列表 = 新端点版本行（主表有版本时全部版本各占一行）+ 旧端点的「无版本主表」行。
+ *
+ *  - 版本行：`versionStatus` = 该版本**真实状态**（不再被同族新草稿覆盖）
+ *  - 主表级副信息（最新已发布版本码 / 草稿版本码）从版本行派生，版本 Id 大者为准
+ */
+export function mergeRuleSetListRows(
+  versionRows: RuleSetVersionRowDto[],
+  mains: RuleSetSummaryDto[]
+): RuleSetListRowDto[] {
+  const latestPublished = new Map<number, { id: number; code: string }>()
+  const latestDraft = new Map<number, { id: number; code: string }>()
+  for (const r of versionRows) {
+    const st = normalizeRuleStatus(r.status)
+    const bucket = st === 'PUBLISHED' ? latestPublished : st === 'DRAFT' ? latestDraft : null
+    if (!bucket) continue
+    const cur = bucket.get(r.ruleSetId)
+    if (!cur || r.versionId > cur.id)
+      bucket.set(r.ruleSetId, { id: r.versionId, code: r.versionCode })
+  }
+
+  const rows: RuleSetListRowDto[] = versionRows.map((r) => {
+    const versionStatus = normalizeRuleStatus(r.status)
+    return {
+      rowKey: `v${r.versionId}`,
+      ruleSetId: r.ruleSetId,
+      ruleSetCode: r.ruleSetCode,
+      ruleSetName: r.ruleSetName,
+      description: r.description ?? undefined,
+      isActive: r.isActive !== false,
+      createdAt: r.createdAt ?? r.ruleSetCreatedAt ?? '',
+      domainKey: 'ALL' as RuleSetListRowDto['domainKey'],
+      hasVersion: true,
+      versionId: r.versionId,
+      versionCode: r.versionCode,
+      versionStatus,
+      currentVersionCode: latestPublished.get(r.ruleSetId)?.code,
+      draftVersionCode: latestDraft.get(r.ruleSetId)?.code,
+      publishedAt: r.publishedAt ?? undefined
+    }
+  })
+
+  // 旧端点里「一条版本都没有」的主表 ⇒ 补一行「未配版本」（主表自身信息取旧端点）
+  const withVersion = new Set(versionRows.map((r) => r.ruleSetId))
+  for (const m of mains) {
+    if (m.hasVersion || withVersion.has(m.ruleSetId)) continue
+    rows.push({
+      rowKey: `n${m.ruleSetId}`,
+      ruleSetId: m.ruleSetId,
+      ruleSetCode: m.ruleSetCode,
+      ruleSetName: m.ruleSetName,
+      description: m.description,
+      isActive: m.isActive !== false,
+      createdAt: m.createdAt ?? '',
+      domainKey: 'ALL' as RuleSetListRowDto['domainKey'],
+      hasVersion: false,
+      lastChangeReason: m.lastChangeReason,
+      publishedAt: m.publishedAt
+    })
+  }
+  return rows
+}
+
 export const ruleApi = {
   /** RuleSet 列表（页面 8 入口）
    *  v1.4 §二十：3号位 GovernanceController 列表走 /api/governance/rule-sets
@@ -150,6 +221,35 @@ export const ruleApi = {
     })
   },
 
+  /**
+   * 规则集列表（新端点·**主子表联查一版一行**）
+   *
+   * ⚠️ 2026-11-11（3号位 契约变更协调件 v1.0）：`GET /api/governance/rule-sets/versions`
+   *   - 权限 aps.rule.view；入参 activeOnly（三态）/ keyword / page / pageSize
+   *     —— 本方法**不传 page/pageSize** ⇒ 后端 `ResolvePaging` 返回 (null,null) ⇒ 全量
+   *   - 每主表 N 个版本 ⇒ N 行，`status` 是**版本真实状态**，不再被同族新草稿覆盖
+   *   - 排序：主表 Id DESC；每主表内版本 Id ASC
+   */
+  async listRuleSetVersionRows(): Promise<RuleSetVersionRowDto[]> {
+    return apsHttp.get<RuleSetVersionRowDto[]>({
+      url: '/api/governance/rule-sets/versions'
+    })
+  },
+
+  /**
+   * 规则集列表（前端列表源）：新端点版本行 + 旧端点「无版本主表」行
+   *
+   * 见 `mergeRuleSetListRows` 的注释（为什么不能纯切新端点）。
+   * 旧端点 `GET /rule-sets` 保留用途：策略包 DRAFT 下拉（`strategyProfile.ts` 自带一份）不变。
+   */
+  async listRuleSetRows(): Promise<RuleSetListRowDto[]> {
+    const [versionRows, mains] = await Promise.all([
+      this.listRuleSetVersionRows(),
+      this.listRuleSets()
+    ])
+    return mergeRuleSetListRows(versionRows, mains)
+  },
+
   /** 规则集版本列表（GET /api/governance/rule-set/{ruleSetId}/versions）
    *  权限 aps.rule.view；返回裸 RuleSetVersion[]（含 demandPriorityJson 投影）
    */
@@ -178,8 +278,12 @@ export const ruleApi = {
    *      GET /api/governance/rule-set/{id}/versions   → 版本摘要列表（历史 + 当前/草稿版本）
    *      GET /api/governance/rule-set/version/{vid}   → 版本内容（需求优先级 / 换型规则）
    *    规则集**代码/名称**只存在于主表列表，故 summary 留空，由 store 用列表行回填。
+   *
+   * ⚠️ 2026-11-11（列表改一版一行）：新增 `versionId` 参数 ——
+   *   列表点哪一行就展示哪一版的内容，`summary.status` 取**该版真实状态**。
+   *   不传 versionId 时保持旧默认（草稿优先 → 已发布 → 第一条），供内部调用使用。
    */
-  async getRuleSet(ruleSetId: number): Promise<RuleSetDetailDto> {
+  async getRuleSet(ruleSetId: number, versionId?: number): Promise<RuleSetDetailDto> {
     const versions = await this.listRuleSetVersions(ruleSetId)
     if (!Array.isArray(versions) || versions.length === 0) {
       // 列表说有版本、点进来却一条都没有（两次请求之间数据被改）。
@@ -204,13 +308,15 @@ export const ruleApi = {
       effectiveTo: v.effectiveTo ?? undefined
     }))
     /**
-     * 内容取「草稿版本」优先，没有草稿才取已发布版本。
-     *
-     * ⚠️ 2026-10-22 更正：原先恒取已发布版本 ⇒ 一个规则集同时有「已发布 + 草稿」时，
-     *   页面显示的是**旧内容**、状态却是草稿（可点发布）—— 会出现「发布的不是我看到的」。
-     *   现按「待发布的草稿优先」取，并回传 `contentVersionCode` 让页面标明是哪一版。
+     * 内容版本：
+     *  - 传了 versionId（列表点某一行的版本）⇒ 就展示那一版；找不到（版本刚被删）才回落默认
+     *  - 没传 ⇒ 草稿优先 → 已发布 → 第一条（保持旧默认，供内部调用）
      */
-    const contentSource = draft ?? published ?? versions[0]
+    const contentSource =
+      (versionId != null ? versions.find((v) => v.id === versionId) : undefined) ??
+      draft ??
+      published ??
+      versions[0]
     const full = await this.getRuleSetVersion(contentSource.id)
     return {
       summary: {
@@ -220,8 +326,9 @@ export const ruleApi = {
         domainKey: 'ALL' as RuleSetSummaryDto['domainKey'],
         currentVersionCode: published?.versionCode ?? undefined,
         draftVersionCode: draft?.versionCode ?? undefined,
-        // 有草稿 ⇒ 页面处在「草稿待发布」状态（发布按钮据此点亮）
-        status: draft ? 'DRAFT' : normalizeRuleStatus(contentSource.status),
+        // 本页展示的那一版的**真实状态**（不再「有草稿就一律 DRAFT」——
+        // 那样会把已发布生效的那一版错标成草稿，用户点发布时才发现版本不对）
+        status: normalizeRuleStatus(contentSource.status),
         hasVersion: true,
         createdAt: contentSource.createdAt ?? '',
         publishedAt: published?.publishedAt ?? undefined
@@ -239,11 +346,20 @@ export const ruleApi = {
   /** Rule Diff（发布前预览）
    *  v1.4 §二十：3号位 后端走 /api/governance/rule-set/version/diff?sourceVersionId=&targetVersionId=
    *  不需要 ruleSetId（versionId 全局唯一）
+   *
+   * ⚠️ 2026-11-11：后端这个端点有个**会 400 的数据坑** ——
+   *   `SetupTransitionRuleProjector.CompareBusinessContent` 用 `ToDictionary(BuildBusinessKey)`
+   *   建业务键索引；同一版本里若有**两条换型规则业务键完全相同**（DEPT|Stage|Op|Resource|From|To 全同，
+   *   如 key `E|0||0||` = 部门 0 / 资源 0 / 工序与物料为空），.NET 直接抛
+   *   "An item with the same key has already been added." ⇒ 整个 diff 请求 400。
+   *   那是后端数据/实现问题，前端绕不过 ⇒ 这里 **silent**（不弹全局英文 toast），
+   *   由页面在「版本对比」页签内用大白话说明。
    */
   async diffVersions(base: number, target: number): Promise<VersionDiffResultDto> {
     return apsHttp.get<VersionDiffResultDto>({
       url: '/api/governance/rule-set/version/diff',
-      params: { sourceVersionId: base, targetVersionId: target }
+      params: { sourceVersionId: base, targetVersionId: target },
+      silent: true
     })
   },
 

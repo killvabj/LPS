@@ -69,7 +69,13 @@ public class PeggingLedgerEntry
     public PeggingStrategyType Strategy { get; set; }
 
     /// <summary>
-    /// 供应可用时间
+    /// 供应可用时间。
+    ///
+    /// <para><b>2026-11-13 改为可空</b>（0号位 实施回复 §4、1号位 五问答复）：本字段位于**审计账本**
+    /// （`voucher.LedgerEntries`），**不是 Solver 输入**（Solver 读 `voucher.SupplyAllocations`）。
+    /// 原写法 `supply.AvailableAt ?? DateTime.Now` 把「时间未知」硬写成「现在」，
+    /// 是 0号位 明令要删的错误。改为原样透传：未知即 <c>null</c>，
+    /// **不得**用当前时刻、`CreatedAt` 或订单交期顶替。</para>
     /// </summary>
-    public DateTime AvailableAt { get; set; }
+    public DateTime? AvailableAt { get; set; }
 }

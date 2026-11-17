@@ -7,20 +7,48 @@
  *  - 接口：4号位 → 5号位（ProcurementManualEtaController）
  *  - 不计算：有效到货时间（Effective ETA）/ 最终可用时间（AvailableTime）
  *
- * 页面分区：
- *  - 顶部筛选（PO 多选 / 物料多选 / ActiveOnly）
- *  - KPI 卡（总数 / Active / Cancelled）
- *  - 主表格 + 行操作（编辑 / 取消）
- *  - ElDrawer 复用于新增 + 编辑 + 取消确认
+ * 11-12 工厂视角改版（站在计划员角度：一眼看清「多少条 / 哪些晚了 / 这周哪些到」）
+ *  - 撤页头大标题（2026-10-16 定调：页面不要大标题页头）⇒ 刷新/新增收进列表卡头部
+ *  - 指标条改一行紧凑（沿用订单页 .kpi-row 样式）：全部记录 / 生效中 / 已取消 / 已过期 / 7 天内到期
+ *    - 5 个数字全部来自后端 COUNT（同一组筛选 + 同一 WHERE 语义）⇒ 与列表永远对得上
+ *    - 5 个可点分类（点数字即筛列表）；「已取消」在 11-13 接了后端 cancelledOnly 后也可点
+ *  - 筛选即生效（不再有「筛选」按钮）：采购订单 / 物料 / 收货仓库
+ *  - 物料显示中文名称（物料主数据解析），不再只给一串编码
+ *  - 到货时间给相对口径：「剩 N 天 / 今天到货 / 已晚 N 天」（本地日历天比较）
+ *  - 空态两态：一条都没有 vs 筛出来没有
+ *  - 取消按钮按 aps.manual_eta.cancel 单独门控（此前误用 edit 码 ⇒ 有 edit 无 cancel 的账号会撞 403）
+ *  - 修时区错位：Drawer 原 value-format 带字面量 [Z] ⇒ 存进去的是 UTC 串，
+ *    回读按本地解析会整体偏 8 小时；改为不带 Z 的本地墙钟串
+ *
+ * 11-13 接 5号位 2026-11-12 复函（R1～R5 全部落码）：
+ *  - 指标条五个数改 1 个 `/summary` 请求（旧口径 5 个请求凑数）
+ *  - 「已取消」变可点分类（后端补了 `cancelledOnly`）
+ *  - 筛选栏加「排序」下拉（后端补了 sortBy/sortDir 白名单；缺省不动后端原排序）
+ *  - 下拉候选改走 `/facets`（旧口径靠 200 条全量扫描自己派生 ⇒ 超 200 条选不到）
+ *  - 列表物料名改用**行内 materialName**（后端 LEFT JOIN Material 投影）⇒ 表格不再依赖物料主数据端点
+ *  - 11-14 抽屉「选物料」改**远程搜索**（旧口径拉前 200 条再本地过滤 ⇒ 第 200 条之外的物料列不出来）；
+ *    搜索口径由 3号位 11-13 书面确认（编码/名称/规格模糊、编码升序）。
+ *    11-14 乙端点已落码（5号位 r14206～r14208，GET /api/procurement-manual-eta/materials，
+ *    挂本域 aps.manual_eta.view）⇒ 抽屉改走该端点：**策略域权限依赖已解**
+ *    （不再需要 aps.setup.view），并支持按采购订单号 / 行号收窄候选（附问一已闭环）。
+ *
+ * 11-14 接 5号位 v2.0 回执（R1 落码 r14214～r14218 / R2 取乙）：
+ *  - 抽屉「按采购订单收窄」档改走 **`GET /api/procurement-manual-eta/supply-combos`**：
+ *    一行 = 供给事实里一条 **(物料 × 存储地点)** 组合，**成对**给出。
+ *    Why 必须成对：人工到货时间是**对供给事实的覆盖**——覆盖键
+ *    `(PONo, LineNo, MaterialId, ReceivingWarehouse)` ≡ 供给事实
+ *    `(SourceDocumentNo, SourceDocumentLineNo, MaterialId, StorageCode)`
+ *    （@see AvailableTimeCalculator.cs:63-73,105-107）；旧口径下「物料」与「仓库」
+ *    是两个互不相干的池子（物料无仓库维度 / 仓库是 258 条全集）⇒ 拼出来的组合
+ *    大概率命不中 ⇒ 这条到货时间**静默不生效**（不报错、不提示）。
+ *    现在选中候选 ⇒ 物料与仓库一起带出（仓库按 storageCode 原样写入）。
+ *  - 列表/详情接 `isMatched` 标注（5号位 v2.0 R2 取乙：允许保存 + 计算式标注，零 DDL）：
+ *    true=会参与排产 / false=命不中（静默不生效）/ null=未判定（**不得当未命中显示**）。
  *
  * RBAC（@see 审核报告 P1-14/15）：
- *  - VIEWER：禁用 新增 / 保存 / 取消 ETA 按钮
- *  - PMC+：可写
- *
- * ❌ 2026-09-15 撤销 DepartmentCode 维度（@see 4号位-2026-09-13-裁定回退清单.md）：
- *  - 9月13日 `未命名的Markdown文件.md` 实际是 0号位 出的业务裁决（程序有效）
- *  - DepartmentCode 整条撤销：storeToRefs / selectedDepartmentCodes / filter UI / table 列 / drawer audit 全部删除
- *  - 当前状态：与 9月13日 撤销状态一致
+ *  - aps.manual_eta.view：只读
+ *  - aps.manual_eta.edit：新增 / 编辑
+ *  - aps.manual_eta.cancel：取消
  */
 
 import { computed, onMounted, ref, watch } from 'vue'
@@ -29,13 +57,15 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import { storeToRefs } from 'pinia'
 import { useManualEtaStore } from '@/store/modules/aps/manualEta'
 import { useApsAuthStore } from '@/store/modules/aps/auth'
-import { materialLookupApi } from '@/api/aps-v1/materialLookup'
 import { manualEtaApi } from '@/api/aps-v1/manualEta'
 import type {
+  ManualEtaBucket,
   ManualEtaDto,
-  ManualEtaListFilter,
+  ManualEtaSortBy,
+  ManualEtaSupplyCombo,
   ManualEtaUpsertInput,
   MaterialLookupItem,
+  SupplyFactTraceRow,
   WarehouseOption
 } from '@/api/aps-v1'
 
@@ -54,7 +84,6 @@ import {
   ElOption,
   ElPagination,
   ElSelect,
-  ElSwitch,
   ElTable,
   ElTableColumn,
   ElTag,
@@ -69,69 +98,199 @@ const {
   loading,
   saving,
   error,
-  lastFilter,
-  distinctPoNos,
-  distinctMaterialCodes,
+  counts,
+  poNoOptions,
+  materialFilterOptions,
+  facetsTruncated,
   pageIndex,
   pageSize,
-  total,
-  // 10-12 ME13：KPI 三卡读累计值（cumulative），不再读 list.length（翻页会跳）
-  totalActive,
-  totalCancelled
+  total
 } = storeToRefs(store)
 
 /* ===== 权限门控（v1.2 §23.1 权限码门控）=====
- *  - aps.manual_eta.edit：dev seed 下 aps.planner + aps.admin.system 持有
+ *  - aps.manual_eta.edit   → 新增 / 编辑（后端 POST 挂 ManualEtaMaintain）
+ *  - aps.manual_eta.cancel → 取消（后端 DELETE 挂 ManualEtaCancel，是**另一个码**）
  *  - 不用角色判断的原因：与 3号位后端二次校验用同一码；前端显隐 = 后端能写
  */
 const canWrite = computed(() => apsAuth.has('aps.manual_eta.edit'))
+const canCancel = computed(() => apsAuth.has('aps.manual_eta.cancel'))
 
-/* ===== 筛选本地 state（变更后点 [筛选] 才生效，避免每次下拉都重查） ===== */
-const filterDraft = ref<ManualEtaListFilter>({})
-const activeOnlyDraft = ref(false)
+/* ===== 筛选（变更即生效，不再有「筛选」按钮）===== */
 const selectedPoNos = ref<string[]>([])
 const selectedMaterialCodes = ref<string[]>([])
+const selectedWarehouses = ref<string[]>([])
+/** 指标条当前分类（决定列表取哪一批） */
+const bucket = ref<ManualEtaBucket>('all')
 
-function syncFilterDraft(): void {
-  filterDraft.value = {
+/* ===== 排序（11-13：5号位补 sortBy/sortDir）=====
+ *  - 一个下拉直接给「排什么 + 往哪排」，用户不用理解两个参数
+ *  - 缺省「默认排序」= 不传任何排序参数 ⇒ 后端保持原排序（UpdatedAt DESC, PONo, LineNo）逐字不变
+ *  - ⚠️ 排序字段白名单外的值后端真 400 ⇒ 这里只允许白名单值
+ */
+const SORT_OPTIONS: {
+  value: string
+  label: string
+  sortBy: ManualEtaSortBy
+  sortDir: 'asc' | 'desc'
+}[] = [
+  { value: '', label: '默认排序', sortBy: 'manualEta', sortDir: 'asc' },
+  { value: 'manualEta|asc', label: '到货时间：近的在前', sortBy: 'manualEta', sortDir: 'asc' },
+  { value: 'manualEta|desc', label: '到货时间：远的在前', sortBy: 'manualEta', sortDir: 'desc' },
+  { value: 'updatedAt|desc', label: '最近更新的在前', sortBy: 'updatedAt', sortDir: 'desc' },
+  { value: 'poNo|asc', label: '采购订单号', sortBy: 'poNo', sortDir: 'asc' },
+  { value: 'materialCode|asc', label: '物料编码', sortBy: 'materialCode', sortDir: 'asc' }
+]
+const sortKey = ref('')
+/** 当前排序参数（空 = 不传，走后端默认排序） */
+function currentSort(): { sortBy?: ManualEtaSortBy; sortDir?: 'asc' | 'desc' } {
+  const hit = SORT_OPTIONS.find((o) => o.value === sortKey.value)
+  if (!hit || !hit.value) return {}
+  return { sortBy: hit.sortBy, sortDir: hit.sortDir }
+}
+
+/** 基础筛选（不含分类）→ 交给 store 拼后端条件 */
+function baseFilter(): {
+  poNos?: string[]
+  materialCodes?: string[]
+  receivingWarehouses?: string[]
+} {
+  return {
     poNos: selectedPoNos.value.length ? [...selectedPoNos.value] : undefined,
-    materialIds: undefined, // 物料编码路径：UI 用 code 选 → 后端 materialCodes 筛（10-07 ME10）
     materialCodes: selectedMaterialCodes.value.length
       ? [...selectedMaterialCodes.value]
       : undefined,
-    activeOnly: activeOnlyDraft.value
+    receivingWarehouses: selectedWarehouses.value.length ? [...selectedWarehouses.value] : undefined
   }
 }
 
-async function applyFilter(): Promise<void> {
-  syncFilterDraft()
-  // 筛选条件变化 → 重置到第 1 页（避免留在第 N 页时筛选无交集导致空态错觉）
-  await store.load({ ...filterDraft.value, pageIndex: 1 })
+/** 是否处在「筛过」的状态（用于空态两态区分） */
+const hasFilter = computed(
+  () =>
+    selectedPoNos.value.length > 0 ||
+    selectedMaterialCodes.value.length > 0 ||
+    selectedWarehouses.value.length > 0 ||
+    bucket.value !== 'all'
+)
+
+async function reload(resetPage = false): Promise<void> {
+  await store.load(
+    baseFilter(),
+    bucket.value,
+    {
+      pageIndex: resetPage ? 1 : pageIndex.value,
+      pageSize: pageSize.value
+    },
+    currentSort()
+  )
+}
+
+/** 任一筛选变更 → 立即重查（回到第 1 页，避免停在旧页号出现空列表错觉） */
+async function onFilterChange(): Promise<void> {
+  await reload(true)
+}
+
+/** 排序变更 → 重查（同样回到第 1 页） */
+async function onSortChange(): Promise<void> {
+  await reload(true)
 }
 
 function resetFilters(): void {
   selectedPoNos.value = []
   selectedMaterialCodes.value = []
-  activeOnlyDraft.value = false
+  selectedWarehouses.value = []
+  bucket.value = 'all'
+  sortKey.value = ''
+  void reload(true)
+}
+
+/** 点指标条数字 → 切分类（同一分类再点一次＝回到全部） */
+async function onBucketChange(key: ManualEtaBucket): Promise<void> {
+  bucket.value = bucket.value === key ? 'all' : key
+  await reload(true)
+}
+
+/** 指标条点击入口（模板里不做类型断言） */
+async function onKpiClick(k: KpiItem): Promise<void> {
+  if (!k.clickable) return
+  await onBucketChange(k.key)
 }
 
 async function refresh(): Promise<void> {
-  await store.load()
+  await reload()
+  await store.loadCandidates()
 }
 
-/** 分页：当前页切换 */
+/* ===== 指标条 ===== */
+interface KpiItem {
+  key: ManualEtaBucket
+  label: string
+  value: number
+  color: string
+  hint: string
+  clickable: boolean
+}
+
+const kpiItems = computed<KpiItem[]>(() => [
+  {
+    key: 'all',
+    label: '全部记录',
+    value: counts.value.all,
+    color: '#3b82f6',
+    hint: '含已取消',
+    clickable: true
+  },
+  {
+    key: 'active',
+    label: '生效中',
+    value: counts.value.active,
+    color: '#059669',
+    hint: '当前仍在用',
+    clickable: true
+  },
+  {
+    key: 'cancelled',
+    label: '已取消',
+    value: counts.value.cancelled,
+    color: '#94a3b8',
+    hint: '保留备查',
+    clickable: true
+  },
+  {
+    key: 'overdue',
+    label: '已过期',
+    value: counts.value.overdue,
+    color: '#dc2626',
+    hint: '已过到货日',
+    clickable: true
+  },
+  {
+    key: 'dueSoon',
+    label: '7 天内到期',
+    value: counts.value.dueSoon,
+    color: '#d97706',
+    hint: '本周内到货',
+    clickable: true
+  }
+])
+
+/* ===== 分页：当前页切换 ===== */
 async function onPageChange(p: number): Promise<void> {
-  await store.load({ ...store.lastFilter, pageIndex: p })
+  await store.load(
+    baseFilter(),
+    bucket.value,
+    { pageIndex: p, pageSize: pageSize.value },
+    currentSort()
+  )
 }
 
 /** 分页：每页条数切换 → 回到第 1 页 */
 async function onSizeChange(s: number): Promise<void> {
-  await store.load({ ...store.lastFilter, pageIndex: 1, pageSize: s })
+  await store.load(baseFilter(), bucket.value, { pageIndex: 1, pageSize: s }, currentSort())
 }
 
 /* ===== 状态映射 ===== */
 const STATUS_LABEL: Record<'ACTIVE' | 'CANCELLED', string> = {
-  ACTIVE: '启用',
+  ACTIVE: '生效中',
   CANCELLED: '已取消'
 }
 const STATUS_TAG: Record<'ACTIVE' | 'CANCELLED', 'success' | 'info'> = {
@@ -143,9 +302,36 @@ function statusOf(dto: ManualEtaDto): 'ACTIVE' | 'CANCELLED' {
   return dto.isActive ? 'ACTIVE' : 'CANCELLED'
 }
 
-/** 是否已过期（仅用于 UI 高亮，不参与业务判定） */
-function isExpired(iso: string): boolean {
-  return new Date(iso).getTime() < Date.now()
+/** 后端 ManualEta 落库是**本地墙钟**（无时区）
+ *  - 串尾若带 Z（历史脏数据），按 UTC 解析会整体偏 8 小时 ⇒ 统一剥掉 Z 按本地解析
+ */
+function parseLocal(iso: string): Date {
+  const s = iso && iso.endsWith('Z') ? iso.slice(0, -1) : iso
+  return new Date(s)
+}
+
+function fmtDateTime(iso: string): string {
+  if (!iso) return '-'
+  return dayjs(parseLocal(iso)).format('YYYY-MM-DD HH:mm')
+}
+
+function fmtDate(iso: string): string {
+  if (!iso) return '-'
+  return dayjs(parseLocal(iso)).format('YYYY-MM-DD')
+}
+
+/** 到货时间的相对口径（本地日历天比较；工厂用户最关心「还剩几天 / 已经晚了几天」） */
+function etaRelative(iso: string): { text: string; overdue: boolean } {
+  const t = parseLocal(iso)
+  if (Number.isNaN(t.getTime())) return { text: '', overdue: false }
+  const today = new Date()
+  today.setHours(0, 0, 0, 0)
+  const eta = new Date(t)
+  eta.setHours(0, 0, 0, 0)
+  const days = Math.round((eta.getTime() - today.getTime()) / 86400000)
+  if (days < 0) return { text: `已晚 ${-days} 天`, overdue: true }
+  if (days === 0) return { text: '今天到货', overdue: false }
+  return { text: `剩 ${days} 天`, overdue: false }
 }
 
 /* ===== Drawer 状态 ===== */
@@ -156,9 +342,22 @@ const formRef = ref<{
   resetFields: () => void
 } | null>(null)
 
+/** 默认到货时间：今天 +7 天（本地墙钟串，**不带 Z**）
+ *  - 后端 ManualEta 落库即本地墙钟 ⇒ 前端也必须送本地墙钟串；
+ *    带 Z 会被 ASP.NET 当 UTC，整体偏 8 小时（11-12 已修此坑）。
+ */
+function defaultManualEta(): string {
+  const d = new Date()
+  d.setDate(d.getDate() + 7)
+  const p = (n: number) => String(n).padStart(2, '0')
+  return (
+    `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}` +
+    `T${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`
+  )
+}
+
 /** Drawer 表单（新增 + 编辑 共用）
  *  - materialId / receivingWarehouse 后端必填（@see lps/LPS.APS.Core/Dto/ProcurementManualEtaOverride.cs）
- *  - 编辑时由 dto 回填；新增时由"取上一行"或 manualEtaApi.getByPoLine 预填
  *  - materialKey：物料下拉选中的 masterId（number）；watch 同步 → materialId + materialCode
  */
 const form = ref({
@@ -168,22 +367,403 @@ const form = ref({
   materialCode: '',
   materialKey: null as number | null,
   receivingWarehouse: '',
-  manualEta: new Date(Date.now() + 7 * 86400_000).toISOString(),
+  manualEta: defaultManualEta(),
   remark: ''
 })
 
-/** 物料下拉数据源（real API，10-07 接入）
- *  - 端点：GET /api/governance/lookups/materials?activeOnly=true
- *  - 复用 materialLookupApi.listActiveMaterials（与 CTP 同源）
- *  - 失败兜底：空数组（下拉空态提示「暂无物料主数据」）
+/** 抽屉「选物料」候选：**远程搜索 + 按采购订单收窄**
+ *  - 收窄档（订单+行号 / 订单）：`GET /api/procurement-manual-eta/supply-combos?poNo=&lineNo=&limit=`
+ *    （5号位 11-14 落码 r14214～r14218，挂**本域** aps.manual_eta.view）
+ *    ⇒ 一行 = 供给事实里一条 **(物料 × 存储地点)** 组合，**成对**给出
+ *  - 兜底档（只按关键字）：`GET /api/procurement-manual-eta/materials?search=&limit=`
+ *    ⇒ 只有物料、**没有仓库依据** ⇒ 选它时仓库仍要手工选（页面会如实提示可能不生效）
+ *
+ * ⚠️ 旧口径（11-14 上午）两个池子各选各的：物料候选无仓库维度（/materials 按 materialId 去重）、
+ *   仓库候选是 258 条全集（/warehouses）⇒ 用户能拼出永远匹配不上的 (物料, 仓库)
+ *   ⇒ 这条到货时间**静默不生效**（不报错、不提示）。故收窄档改走 supply-combos。
  */
-const materialOptions = ref<MaterialLookupItem[]>([])
-async function loadMaterialOptions(): Promise<void> {
-  try {
-    materialOptions.value = await materialLookupApi.listActiveMaterials()
-  } catch {
-    materialOptions.value = []
+/** 每次搜索最多取多少条（端点 limit；命中数等于它就说明可能被截断，页面要如实说） */
+const MATERIAL_SEARCH_LIMIT = 50
+
+/**
+ * 抽屉候选（两种来源统一成一个形状）
+ *  - 有 `storageCode` = 来自 supply-combos（物料与仓库**成对**，来自同一条供给事实）
+ *  - 无 `storageCode` = 来自 /materials 关键字档（只有物料，没有仓库依据）
+ */
+interface MaterialCandidate {
+  masterId: number
+  code: string
+  name: string
+  spec: string
+  uom: string
+  /** 存储地点（= 供给事实 StorageCode，须原样写入表单「收货仓库」） */
+  storageCode?: string
+  /** 存储地点名（视图无此码 ⇒ 空） */
+  storageName?: string
+  /**
+   * 该组合所属的订单行（供给事实 SourceDocumentLineNo）
+   *  - 组合是**某一行的**事实 ⇒ 选中它就等于说「我要覆盖这一行」
+   *  - ⇒ 选中时把表单行号对齐过去（否则行号与组合对不上 ⇒ 覆盖键命不中 ⇒ 静默不生效）
+   */
+  lineNo?: number
+}
+
+const materialOptions = ref<MaterialCandidate[]>([])
+/** 正在搜索（ElSelect 的 loading 态） */
+const materialSearching = ref(false)
+/** 最近一次已发起搜索的关键字（空 = 还没搜过）⇒ 用于区分「没搜」与「搜了没结果」 */
+const materialQuery = ref('')
+/** 取候选失败（端点 403 / 网络）⇒ 必须说话，否则用户只看到空下拉 */
+const materialSearchError = ref('')
+/** 当前选中的候选项（选中后锁定，不受后续搜索替换候选列表影响） */
+const materialSelected = ref<MaterialCandidate | null>(null)
+/**
+ * 候选口径的大白话说明（空 = 无需说明）。
+ * 说明「你现在看到的是不是本订单的物料」——不说明就会让用户选错料。
+ */
+const materialScopeNote = ref('')
+/** 仓库是否已由「物料 × 存储地点」组合带出（成对口径 ⇒ 不让用户再另选一个不配套的仓库） */
+const warehouseLockedByCombo = ref(false)
+/** 请求序号：只认最后一次搜索结果（先发的慢请求后到会盖掉新结果） */
+let materialSearchSeq = 0
+let materialSearchTimer: ReturnType<typeof setTimeout> | null = null
+
+/** supply-combos 一行 → 候选 */
+function comboToCandidate(c: ManualEtaSupplyCombo): MaterialCandidate {
+  return {
+    masterId: c.materialId,
+    code: c.materialCode ?? '',
+    name: c.materialName ?? '',
+    spec: c.spec ?? '',
+    uom: c.uom ?? '',
+    storageCode: c.storageCode,
+    storageName: c.storageName ?? undefined,
+    lineNo: Number(c.lineNo) || undefined
   }
+}
+
+/** /materials 一行 → 候选（无仓库依据） */
+function lookupToCandidate(m: MaterialLookupItem): MaterialCandidate {
+  return { masterId: m.masterId, code: m.code, name: m.name, spec: m.spec, uom: m.uom }
+}
+
+/** 组合档没有关键字参数 ⇒ 本地按 编码/名称/规格 过滤（候选 ≤ limit 条，本地过滤足够） */
+function comboMatchesKeyword(c: MaterialCandidate, kw: string): boolean {
+  if (!kw) return true
+  const k = kw.toLowerCase()
+  return (
+    c.code.toLowerCase().includes(k) ||
+    c.name.toLowerCase().includes(k) ||
+    c.spec.toLowerCase().includes(k)
+  )
+}
+
+/**
+ * 取物料候选：**逐级放宽**，收窄不阻断录入。
+ *
+ * 顺序：① 订单 + 行号 → ② 只按订单 → ③ 只按关键字（全库）。
+ * Why 逐级放宽：端点查无返空集合（200 + 0 行）——PO 事实未同步、或用户行号填错时
+ *   收窄结果就是空；若就此卡住，用户录不进去还以为是系统坏了。
+ *   每退一级都在提示里说明口径（不能让人把全库物料误当成本订单的物料）。
+ *
+ * ❌ 11-14 撤掉的第四档「本表已登记」（曾按本表真实行给候选，已回退）：
+ *   人工到货时间是**对供给事实的覆盖**——后端按 (PONo, LineNo, MaterialId, ReceivingWarehouse)
+ *   精确匹配供给事实的 (SourceDocumentNo, SourceDocumentLineNo, MaterialId, StorageCode)
+ *   （@see lps/LPS.APS.Application/Services/AvailableTimeCalculator.cs:63-73,105-107），
+ *   匹配不上 ⇒ 这条到货时间**静默不生效**（不报错、不提示）。
+ *   dev 实测：本表 10 个 (物料, 仓库) 组合在供给事实里**一个都不存在** ⇒ 兜底档给的候选
+ *   同样命不中 ⇒ 用户录进去的还是不生效的记录，只是「看起来能录」⇒ 撤掉更诚实。
+ */
+/** 收窄档（supply-combos）是否取不到（端点未部署 / 权限 / 网络）——用于如实提示，不静默降级 */
+const comboTierFailed = ref(false)
+/** 本次候选是否**成对**（带真实存储地点）
+ *  false = 退到了「无仓库依据」档：物料是真的，但**取不到存储地点**
+ *          ⇒ 仓库仍要用户自己选（选错 ⇒ 这条到货时间静默不生效） */
+const comboPaired = ref(false)
+/** 成对来源是否为**过渡档**（供货事实追溯）⇒ 提示要说明「受可见工厂范围限制，可能不全」 */
+const comboFromTrace = ref(false)
+
+/**
+ * 排产侧装载资格谓词（`TimedSupplyFactLoader.cs:53-60`）：
+ *  有效 + 数量>0 + 五类采购在途 —— 与追溯行逐字对齐，否则会配出**排产侧不认**的组合。
+ */
+const SUPPLY_QUALIFY_TYPES = [
+  'PURCHASE_IN_TRANSIT',
+  'OPEN_PO_REMAINING',
+  'ARRIVED_NOT_RECEIVED',
+  'VMI_ONSITE',
+  'INTERPLANT_IN_TRANSIT'
+]
+
+/**
+ * 过渡配对：把追溯行按「物料 × 存储地点」成对取出
+ *  - 只取 `SUPPLY_PIPELINE` 段（`RECEIVED` 段是 ERP 收货视图，**不是**排产侧的装载来源，且行号为空）
+ *  - 资格谓词与排产侧装载器一致（有效 + 数量>0 + 五类采购在途）
+ *  - 行号必须能解析成整数（覆盖键要求整数行号）
+ */
+function traceRowsToCombos(
+  rows: SupplyFactTraceRow[],
+  lineNo?: number
+): Array<{ materialId: number; materialCode: string; storageCode: string; lineNo: number }> {
+  const out: Array<{
+    materialId: number
+    materialCode: string
+    storageCode: string
+    lineNo: number
+  }> = []
+  const seen = new Set<string>()
+  for (const r of rows) {
+    if (String(r.sourceType ?? '') !== 'SUPPLY_PIPELINE') continue
+    if (r.isActive !== true) continue
+    if (!((r.quantity ?? 0) > 0)) continue
+    if (!SUPPLY_QUALIFY_TYPES.includes(String(r.supplyType ?? ''))) continue
+    const mid = Number(r.materialId ?? 0)
+    const wh = String(r.warehouseCode ?? '').trim()
+    if (!mid || !wh) continue
+    const ln = Number.parseInt(String(r.sourceDocumentLineNo ?? ''), 10)
+    if (!Number.isFinite(ln)) continue
+    if (lineNo && ln !== lineNo) continue
+    const key = `${ln}|${mid}|${wh}`
+    if (seen.has(key)) continue
+    seen.add(key)
+    out.push({
+      materialId: mid,
+      materialCode: String(r.materialCode ?? ''),
+      storageCode: wh,
+      lineNo: ln
+    })
+  }
+  return out
+}
+
+/**
+ * 该订单行的**成对**候选（物料 × 存储地点）
+ *  - 首选：正式端点 `supply-combos`
+ *  - 过渡：`supply-fact-trace`（同表同 StorageCode；跨域权限 + 可见工厂范围 ⇒ 可能不全）
+ *  - 都取不到 ⇒ 返 null（调用方退到「无仓库依据」档）
+ */
+async function fetchPairedCandidates(
+  q: string,
+  t: { poNo?: string; lineNo?: number }
+): Promise<MaterialCandidate[] | null> {
+  try {
+    const combos = await manualEtaApi.searchSupplyCombos(
+      t.poNo ?? '',
+      t.lineNo,
+      MATERIAL_SEARCH_LIMIT
+    )
+    const rows = combos.map(comboToCandidate).filter((c) => comboMatchesKeyword(c, q))
+    if (rows.length) {
+      comboPaired.value = true
+      comboFromTrace.value = false
+      return rows
+    }
+    return null
+  } catch {
+    // 正式端点未部署（dev 实测 404）⇒ 记一笔，页面如实提示
+    comboTierFailed.value = true
+  }
+  try {
+    const trace = await manualEtaApi.searchSupplyCombosFromTrace(t.poNo ?? '', t.lineNo)
+    const combos = traceRowsToCombos(trace, t.lineNo)
+    if (!combos.length) return null
+    // 名称/规格从乙端点补齐（追溯 DTO 没有名称）
+    const mats = await manualEtaApi.searchMaterials(q, MATERIAL_SEARCH_LIMIT, {
+      poNo: t.poNo,
+      lineNo: t.lineNo
+    })
+    const byId = new Map(mats.map((m) => [m.masterId, m]))
+    const rows = combos.map((c) => {
+      const m = byId.get(c.materialId)
+      return {
+        masterId: c.materialId,
+        code: c.materialCode || m?.code || '',
+        name: m?.name ?? '',
+        spec: m?.spec ?? '',
+        uom: m?.uom ?? '',
+        storageCode: c.storageCode,
+        lineNo: c.lineNo
+      }
+    })
+    comboPaired.value = true
+    comboFromTrace.value = true
+    return rows
+  } catch {
+    return null
+  }
+}
+
+async function fetchMaterialCandidates(
+  q: string,
+  poNo: string,
+  lineNo: number
+): Promise<{ rows: MaterialCandidate[]; scope: 'line' | 'po' | 'all' }> {
+  const tries: Array<{ scope: 'line' | 'po' | 'all'; poNo?: string; lineNo?: number }> = []
+  if (poNo) {
+    tries.push({ scope: 'line', poNo, lineNo })
+    tries.push({ scope: 'po', poNo })
+  }
+  tries.push({ scope: 'all' })
+  for (const t of tries) {
+    let rows: MaterialCandidate[] = []
+    if (t.scope === 'all') {
+      rows = (await manualEtaApi.searchMaterials(q, MATERIAL_SEARCH_LIMIT)).map(lookupToCandidate)
+    } else {
+      const paired = await fetchPairedCandidates(q, t)
+      if (paired && paired.length) {
+        rows = paired
+      } else {
+        // 无仓库依据档：物料是真的，但取不到存储地点 ⇒ 仓库要用户自己选
+        try {
+          rows = (
+            await manualEtaApi.searchMaterials(q, MATERIAL_SEARCH_LIMIT, {
+              poNo: t.poNo,
+              lineNo: t.lineNo
+            })
+          ).map(lookupToCandidate)
+        } catch {
+          continue
+        }
+      }
+    }
+    if (rows.length) return { rows, scope: t.scope }
+  }
+  return { rows: [], scope: 'all' }
+}
+
+async function searchMaterialOptions(query: string): Promise<void> {
+  const q = (query ?? '').trim()
+  const seq = ++materialSearchSeq
+  const poNo = form.value.poNo.trim()
+  const lineNo = Number(form.value.lineNo)
+  if (!q && !poNo) {
+    // 既没关键字也没采购订单号 ⇒ 不去要全库物料（那会把几百上千条物料拉回来列全）
+    materialOptions.value = []
+    materialQuery.value = ''
+    materialSearchError.value = ''
+    materialScopeNote.value = ''
+    materialSearching.value = false
+    return
+  }
+  materialSearching.value = true
+  comboTierFailed.value = false
+  comboPaired.value = false
+  comboFromTrace.value = false
+  try {
+    const { rows, scope } = await fetchMaterialCandidates(q, poNo, lineNo)
+    if (seq !== materialSearchSeq) return
+    // 已选中的那一项始终留在候选里（否则新结果把它顶掉 ⇒ 下拉框显示成一把裸键码）
+    const picked = materialSelected.value
+    const merged =
+      picked && !rows.some((r) => pickKeyOf(r) === pickKeyOf(picked)) ? [picked, ...rows] : rows
+    materialOptions.value = merged
+    materialQuery.value = q
+    materialSearchError.value = ''
+    materialScopeNote.value = materialScopeNoteOf(
+      scope,
+      poNo,
+      lineNo,
+      rows.length,
+      comboPaired.value,
+      comboFromTrace.value,
+      comboTierFailed.value
+    )
+  } catch {
+    if (seq !== materialSearchSeq) return
+    materialOptions.value = []
+    materialQuery.value = q
+    materialSearchError.value =
+      '取不到物料候选：请确认账号有「人工到货时间」查看权限，或联系管理员。'
+  } finally {
+    if (seq === materialSearchSeq) materialSearching.value = false
+  }
+}
+
+/** 候选口径说明（大白话，一行说完；不编造任何端点没给的事实） */
+function materialScopeNoteOf(
+  scope: 'line' | 'po' | 'all',
+  poNo: string,
+  lineNo: number,
+  count: number,
+  paired = false,
+  fromTrace = false,
+  comboFailed = false
+): string {
+  const pairedTail = fromTrace
+    ? '仓库取自供货事实追溯，受账号可见工厂范围限制，可能不全。'
+    : '仓库取自该订单行的实际存储地点。'
+  if (scope === 'line') {
+    return paired
+      ? `已按采购订单 ${poNo} 第 ${lineNo} 行收窄，共 ${count} 种物料（选中后仓库自动带出）。${pairedTail}`
+      : `已按采购订单 ${poNo} 第 ${lineNo} 行收窄，共 ${count} 种物料；取不到实际存储地点，仓库要自己选（要与实际存储地点一致，否则不生效）。`
+  }
+  if (scope === 'po') {
+    return paired
+      ? `采购订单 ${poNo} 共 ${count} 种物料（选中后仓库自动带出）。${pairedTail}`
+      : `采购订单 ${poNo} 共 ${count} 种物料；取不到实际存储地点，仓库要自己选（要与实际存储地点一致，否则不生效）。`
+  }
+  const failed = comboFailed
+    ? '（按订单收窄的供货组合接口暂不可用，后端还没部署新版本）'
+    : ''
+  if (poNo)
+    return `采购订单 ${poNo} 没取到物料，下面是按关键字搜到的 ${count} 种，请确认是本订单的物料；这类候选没有仓库依据，仓库要自己选，可能不生效。${failed}`
+  return '按关键字搜到的候选没有该订单的供货依据，仓库要自己选，可能不生效。'
+}
+
+/** ElSelect 远程搜索入口（防抖 300ms，避免每敲一个键就打一次后端） */
+function onMaterialSearch(query: string): void {
+  if (materialSearchTimer) clearTimeout(materialSearchTimer)
+  materialSearchTimer = setTimeout(() => {
+    void searchMaterialOptions(query)
+  }, 300)
+}
+
+/**
+ * 采购订单号 / 行号改了 ⇒ 重新取候选（收窄口径变了，旧的候选已经不对）
+ *  - 新增态才需要（编辑态物料不可改，下拉是禁用的）
+ *  - 沿用最近一次关键字（用户搜过就保留），没有关键字就按订单直接列
+ *  - ⚠️ 顺带**清掉已选物料**：组合档的物料+仓库是**按该订单行**带出来的，
+ *    换了订单号还留着上一单的组合 ⇒ 存进去必然命不中（静默不生效）。
+ */
+watch(
+  () => [form.value.poNo, form.value.lineNo] as const,
+  () => {
+    if (drawerMode.value === 'edit') return
+    materialSelected.value = null
+    form.value.materialKey = null
+    form.value.materialId = 0
+    form.value.materialCode = ''
+    if (warehouseLockedByCombo.value) {
+      form.value.receivingWarehouse = ''
+      warehouseLockedByCombo.value = false
+    }
+    if (materialSearchTimer) clearTimeout(materialSearchTimer)
+    materialSearchTimer = setTimeout(() => {
+      void searchMaterialOptions(materialQuery.value)
+    }, 300)
+  }
+)
+
+/** 下拉项文案：名称（编码）· 规格；没有名称就只给编码（不编造名称）
+ *  ⚠️ 规格要露出来（3号位 2026-11-13 附问二：search 命中「编码 / 名称 / 规格」三路）：
+ *  用户按规格搜到的候选若只显示「名称（编码）」，看不出自己命中的是哪条规格 ⇒ 会以为搜不准。
+ *  - 有存储地点的候选（来自 supply-combos）把**仓库也写进选项**：用户一眼能看出
+ *    「这个物料配这个仓库」，也才知道选它之后仓库会被带成什么。
+ */
+function materialOptionText(m: MaterialCandidate): string {
+  const base = m.name ? `${m.name}（${m.code}）` : m.code
+  const spec = m.spec ? ` · ${m.spec}` : ''
+  // 行号与当前表单不一致时才显示（否则用户会把别的行的组合当本行用）
+  const line = m.lineNo && m.lineNo !== form.value.lineNo ? ` · 第 ${m.lineNo} 行` : ''
+  if (!m.storageCode) return `${base}${spec}${line}`
+  const wh = m.storageName ? `${m.storageName}（${m.storageCode}）` : m.storageCode
+  return `${base}${spec}${line} · 仓库 ${wh}`
+}
+
+/** 选中候选的复合键：物料 ID + 存储地点 + 行号
+ *  - 同一物料可能对应多个存储地点、同一物料可能在多行出现 ⇒ 三者齐全才唯一 */
+function pickKeyOf(c: MaterialCandidate): string {
+  return `${c.masterId}@${c.storageCode ?? ''}@${c.lineNo ?? ''}`
 }
 
 /** 收货仓库下拉数据源（5号位 2026-10-08 落地）
@@ -210,16 +790,60 @@ const warehouseNameMap = computed(() => {
   return m
 })
 
-/** 物料下拉 watch：选中 masterId → 同步 materialId + materialCode */
+/** 物料 ID → 中文名称（物料主数据解析）
+ *  - 11-13：列表行的物料名改由后端行内 `materialName` 直接给（5号位 R5 落码）
+ *  - 11-14：抽屉下拉改远程搜索 ⇒ 这份映射只剩「行内没带 materialName 时」的兜底作用
+ */
+const materialNameMap = computed(() => {
+  const m = new Map<number, string>()
+  for (const x of materialOptions.value) m.set(x.masterId, x.name)
+  return m
+})
+
+/** 物料编码 → 中文名称（从**列表行**带回来的 materialName 归集；解析不到就只给编码）
+ *  - 数据源 = 后端行内字段（不额外请求、不依赖物料主数据端点）
+ */
+const materialCodeNameMap = computed(() => {
+  const m = new Map<string, string>()
+  for (const row of list.value) {
+    if (row.materialCode && row.materialName && !m.has(row.materialCode)) {
+      m.set(row.materialCode, row.materialName)
+    }
+  }
+  return m
+})
+
+/** 列表行物料展示：名称（编码）
+ *  - 优先用后端行内 materialName（R5）；行内没有时回退主数据映射；再没有就只给编码（不编造名称）
+ */
+function materialText(row: ManualEtaDto): string {
+  const name = row.materialName ?? materialNameMap.value.get(row.materialId)
+  return name ? `${name}（${row.materialCode}）` : row.materialCode
+}
+
+/** 筛选下拉物料展示：名称（编码）；解析不到只给编码 */
+function materialOptionLabel(code: string): string {
+  const name = materialCodeNameMap.value.get(code)
+  return name ? `${name}（${code}）` : code
+}
+
+/** 物料下拉 watch：选中 masterId → 同步 materialId + materialCode
+ *  - 远程搜索后候选列表会被新的搜索结果替换 ⇒ 选中项另存一份（materialSelected），
+ *    免得「选完又搜一次」把选中项冲掉、提交时 materialId 变成 0
+ */
 watch(
   () => form.value.materialKey,
   (key) => {
     if (key == null) {
+      materialSelected.value = null
       form.value.materialId = 0
       form.value.materialCode = ''
       return
     }
-    const found = materialOptions.value.find((m) => m.masterId === key)
+    const found =
+      materialSelected.value?.masterId === key
+        ? materialSelected.value
+        : materialOptions.value.find((m) => m.masterId === key)
     if (found) {
       form.value.materialId = found.masterId
       form.value.materialCode = found.code
@@ -227,25 +851,39 @@ watch(
   }
 )
 
-/** 兜底 watch：options 异步加载完后，若 materialKey 还是 null 但 materialId 有值（编辑态），反查填回 */
-watch(
-  () => materialOptions.value,
-  (opts) => {
-    if (form.value.materialKey == null && form.value.materialId > 0) {
-      const found = opts.find((m) => m.masterId === form.value.materialId)
-      if (found) form.value.materialKey = found.masterId
-    }
-  }
-)
-
-/** 物料下拉 v-model 包装：null ↔ undefined 转换（ElSelect 类型不允许 null，但 form 内部用 null 区分"未选"）
- *  - getter：form.materialKey ?? undefined
- *  - setter：v → form.materialKey = v ?? null
+/** 物料下拉 v-model 包装（**复合键 = 物料 ID + 存储地点**）
+ *  - getter：当前选中候选的复合键（null = 未选）
+ *  - setter：选中即同步 materialId / materialCode；候选带存储地点时，
+ *    **仓库按供给事实原样带出**（成对口径 ⇒ 选完就能命中，不给用户拼错的机会）
  */
-const materialKeyModel = computed<number | undefined>({
-  get: () => form.value.materialKey ?? undefined,
+const materialKeyModel = computed<string | undefined>({
+  get: () => (materialSelected.value ? pickKeyOf(materialSelected.value) : undefined),
   set: (v) => {
-    form.value.materialKey = v ?? null
+    if (v == null) {
+      materialSelected.value = null
+      form.value.materialKey = null
+      form.value.materialId = 0
+      form.value.materialCode = ''
+      if (warehouseLockedByCombo.value) {
+        form.value.receivingWarehouse = ''
+        warehouseLockedByCombo.value = false
+      }
+      return
+    }
+    const found = materialOptions.value.find((m) => pickKeyOf(m) === v) ?? null
+    materialSelected.value = found
+    if (!found) return
+    form.value.materialKey = found.masterId
+    form.value.materialId = found.masterId
+    form.value.materialCode = found.code
+    // 组合是**某一行的**事实 ⇒ 行号对齐过去（行号对不上 ⇒ 覆盖键命不中 ⇒ 静默不生效）
+    if (found.lineNo && found.lineNo !== form.value.lineNo) {
+      form.value.lineNo = found.lineNo
+    }
+    if (found.storageCode) {
+      form.value.receivingWarehouse = found.storageCode
+      warehouseLockedByCombo.value = true
+    }
   }
 })
 
@@ -271,6 +909,12 @@ const formRules = {
 
 function openCreate(): void {
   drawerMode.value = 'new'
+  // 物料候选不再预拉（远程搜索）⇒ 新增态从空开始，等用户输入关键字
+  materialOptions.value = []
+  materialQuery.value = ''
+  materialSearchError.value = ''
+  materialSelected.value = null
+  warehouseLockedByCombo.value = false
   form.value = {
     poNo: '',
     lineNo: 1,
@@ -278,7 +922,7 @@ function openCreate(): void {
     materialCode: '',
     materialKey: null,
     receivingWarehouse: '',
-    manualEta: new Date(Date.now() + 7 * 86400_000).toISOString(),
+    manualEta: defaultManualEta(),
     remark: ''
   }
   store.openDetail(null)
@@ -287,14 +931,31 @@ function openCreate(): void {
 
 function openEdit(dto: ManualEtaDto): void {
   drawerMode.value = 'edit'
-  // 编辑态：优先用 materialId 反查 materialKey；若 options 还没加载完（异步），留 null 由 watch 兜底回填
-  const found = materialOptions.value.find((m) => m.masterId === dto.materialId)
+  // 编辑态的物料**不可改**（MaterialId 是复合主键的一部分）⇒ 候选用该行自带的物料信息占位，
+  // 不再靠「先拉 200 条主数据再反查」；materialName 由后端行内给出（5号位 R5 投影），
+  // 解析不到就只显示编码（不编造名称）。
+  materialOptions.value = dto.materialId
+    ? [
+        {
+          masterId: dto.materialId,
+          code: dto.materialCode ?? '',
+          name: dto.materialName ?? '',
+          spec: '',
+          uom: ''
+        }
+      ]
+    : []
+  materialSelected.value = materialOptions.value[0] ?? null
+  materialQuery.value = ''
+  materialSearchError.value = ''
+  // 编辑态仓库照抄该行原值（编辑态只能改到货时间/备注；物料与仓库是复合主键的一部分）
+  warehouseLockedByCombo.value = false
   form.value = {
     poNo: dto.poNo,
     lineNo: dto.lineNo,
     materialId: dto.materialId,
     materialCode: dto.materialCode ?? '',
-    materialKey: found ? found.masterId : null,
+    materialKey: dto.materialId || null,
     receivingWarehouse: dto.receivingWarehouse ?? '',
     manualEta: dto.manualEta,
     remark: dto.remark ?? ''
@@ -337,6 +998,8 @@ async function submitDrawer(): Promise<void> {
       `${drawerMode.value === 'new' ? '新增' : '更新'}人工到货时间成功：${input.poNo} / Line ${input.lineNo}`
     )
     closeDrawer()
+    // 指标条数字来自后端 COUNT ⇒ 写完必须重查，否则指标与列表对不上
+    await reload()
   } catch {
     ElMessage.error('保存失败，请检查表单或网络')
   }
@@ -369,84 +1032,64 @@ async function handleCancel(dto: ManualEtaDto): Promise<void> {
       actor
     })
     ElMessage.success(`已取消 ${dto.poNo} / Line ${dto.lineNo}`)
+    await reload()
   } catch {
     ElMessage.error('取消失败')
   }
 }
 
 onMounted(() => {
-  refresh()
-  loadMaterialOptions()
-  loadWarehouseOptions()
+  void reload()
+  void store.loadCandidates()
+  void loadWarehouseOptions()
 })
 </script>
 
 <template>
   <div class="aps-manual-eta">
-    <!-- ===== 顶部 ===== -->
-    <div class="page-header">
-      <div>
-        <h2 class="page-title">人工到货时间</h2>
-        <p class="page-sub">仅人工值；有效到货时间由系统计算</p>
-      </div>
-      <ElButton :loading="loading" @click="refresh">
-        <Icon icon="vi-ep:refresh" />
-        刷新
-      </ElButton>
-    </div>
-
     <!-- ===== 错误条 ===== -->
     <ElAlert v-if="error" type="error" :closable="false" show-icon :title="`加载失败：${error}`" />
 
-    <!-- ===== KPI ===== -->
-    <!-- 10-12 ME13 收：KPI 三卡读累计值（cumulative），翻页不跳 -->
+    <!-- ===== 指标条（一行紧凑；数字即分类入口）===== -->
     <div class="kpi-row">
-      <div class="kpi-card" style="border-top-color: #3b82f6">
-        <div class="kpi-label">总记录数</div>
-        <div class="kpi-value" style="color: #3b82f6">{{ total }}</div>
-        <div class="kpi-ratio">最近一次筛选（后端 total 全集）</div>
-      </div>
-      <div class="kpi-card" style="border-top-color: #059669">
-        <div class="kpi-label">启用</div>
-        <div class="kpi-value" style="color: #059669">{{ totalActive }}</div>
-        <div class="kpi-ratio">cumulative（翻页不跳）</div>
-      </div>
-      <div class="kpi-card" style="border-top-color: #94a3b8">
-        <div class="kpi-label">已取消</div>
-        <div class="kpi-value" style="color: #94a3b8">{{ totalCancelled }}</div>
-        <div class="kpi-ratio">cumulative（翻页不跳）</div>
-      </div>
+      <button
+        v-for="k in kpiItems"
+        :key="k.key"
+        type="button"
+        class="kpi-item"
+        :class="{
+          'is-active': k.clickable && bucket === k.key,
+          'is-static': !k.clickable
+        }"
+        :disabled="!k.clickable"
+        @click="onKpiClick(k)"
+      >
+        <span class="kpi-bar" :style="{ background: k.color }"></span>
+        <span class="kpi-label">{{ k.label }}</span>
+        <span class="kpi-value" :style="{ color: k.color }">{{ k.value }}</span>
+        <span class="kpi-ratio">{{ k.hint }}</span>
+      </button>
+      <span class="kpi-caption">数字与下方列表同一口径（当前筛选）；点一下可只看那一类。</span>
     </div>
 
-    <!-- ===== 筛选 + 操作 ===== -->
-    <ElCard class="panel">
-      <template #header>
-        <div class="panel-header">
-          <span>筛选条件</span>
-          <span class="hint-text">
-            <span v-if="lastFilter.activeOnly">仅看生效中</span>
-            <span v-if="lastFilter.poNos?.length"> · PO: {{ lastFilter.poNos.length }} 个</span>
-            <span v-if="!lastFilter.activeOnly && !lastFilter.poNos?.length">全部</span>
-          </span>
-        </div>
-      </template>
+    <!-- ===== 筛选（变更即生效）===== -->
+    <ElCard class="filter-bar">
       <div class="filter-row">
         <div class="filter-item">
-          <label>采购订单</label>
           <ElSelect
             v-model="selectedPoNos"
             multiple
             filterable
             clearable
             collapse-tags
-            placeholder="全部 PO"
-            style="width: 240px"
+            placeholder="全部采购订单"
+            style="width: 220px"
+            @change="onFilterChange"
           >
-            <ElOption v-for="p in distinctPoNos" :key="p" :label="p" :value="p" />
+            <ElOption v-for="p in poNoOptions" :key="p" :label="p" :value="p" />
           </ElSelect>
         </div>
         <div class="filter-item">
-          <label>物料</label>
           <ElSelect
             v-model="selectedMaterialCodes"
             multiple
@@ -455,35 +1098,86 @@ onMounted(() => {
             collapse-tags
             placeholder="全部物料"
             style="width: 240px"
+            @change="onFilterChange"
           >
-            <ElOption v-for="m in distinctMaterialCodes" :key="m" :label="m" :value="m" />
+            <ElOption
+              v-for="m in materialFilterOptions"
+              :key="m"
+              :label="materialOptionLabel(m)"
+              :value="m"
+            />
           </ElSelect>
         </div>
         <div class="filter-item">
-          <label>仅看生效中</label>
-          <ElSwitch v-model="activeOnlyDraft" />
+          <ElSelect
+            v-model="selectedWarehouses"
+            multiple
+            filterable
+            clearable
+            collapse-tags
+            placeholder="全部收货仓库"
+            style="width: 240px"
+            @change="onFilterChange"
+          >
+            <ElOption
+              v-for="w in warehouseOptions"
+              :key="w.code"
+              :label="`${w.name}（${w.code}）`"
+              :value="w.code"
+            />
+          </ElSelect>
         </div>
         <div class="filter-actions">
+          <ElSelect
+            v-model="sortKey"
+            style="width: 190px"
+            placeholder="默认排序"
+            @change="onSortChange"
+          >
+            <ElOption
+              v-for="o in SORT_OPTIONS"
+              :key="o.value || 'default'"
+              :label="o.label"
+              :value="o.value"
+            />
+          </ElSelect>
           <ElButton @click="resetFilters">重置</ElButton>
-          <ElButton type="primary" :loading="loading" @click="applyFilter">筛选</ElButton>
-          <ElButton type="success" plain :disabled="!canWrite" @click="openCreate">
-            <Icon icon="vi-mdi:plus" />
-            新增人工到货时间
-          </ElButton>
         </div>
       </div>
+      <span v-if="facetsTruncated" class="muted small">
+        候选太多，采购订单 / 物料下拉只列了前 500 条（可输入关键字在其中筛选）。
+      </span>
     </ElCard>
 
     <!-- ===== 主表格 ===== -->
     <ElCard class="panel">
       <template #header>
         <div class="panel-header">
-          <span>人工到货时间列表（{{ list.length }} 条 / 共 {{ total }} 条）</span>
-          <span class="hint-text">点击行可编辑 / 取消</span>
+          <span
+            >人工到货时间<span class="muted">（共 {{ total }} 条）</span></span
+          >
+          <div class="panel-actions">
+            <ElButton size="small" :loading="loading" @click="refresh">
+              <Icon icon="vi-ep:refresh" />
+              刷新
+            </ElButton>
+            <ElButton size="small" type="primary" :disabled="!canWrite" @click="openCreate">
+              <Icon icon="vi-mdi:plus" />
+              新增
+            </ElButton>
+          </div>
         </div>
       </template>
-      <div v-if="!list.length" class="panel-empty">
-        <ElEmpty description="无人工到货时间数据" />
+      <!-- ⚠️ 加载中不要显示空态：初次进页面时 list 还是空数组，
+             若直接渲染「还没有人工到货时间记录」⇒ 用户会以为库里真的一条都没有（假空态） -->
+      <div v-if="loading && !list.length" class="panel-loading">
+        <span class="muted">正在加载人工到货时间…</span>
+      </div>
+      <div v-else-if="!list.length" class="panel-empty">
+        <ElEmpty v-if="hasFilter" description="当前筛选没有匹配的记录">
+          <ElButton @click="resetFilters">清除筛选</ElButton>
+        </ElEmpty>
+        <ElEmpty v-else description="还没有人工到货时间记录，点右上角「新增」录入" />
       </div>
       <ElTable
         v-else
@@ -494,15 +1188,14 @@ onMounted(() => {
         row-class-name="row-clickable"
         style="width: 100%"
       >
-        <ElTableColumn label="采购订单" prop="poNo" width="140" />
-        <ElTableColumn label="行号" prop="lineNo" width="70" align="center" />
-        <ElTableColumn label="物料" min-width="160">
+        <ElTableColumn label="采购订单" prop="poNo" width="130" />
+        <ElTableColumn label="行号" prop="lineNo" width="64" align="center" />
+        <ElTableColumn label="物料" min-width="200">
           <template #default="{ row }">
-            <span>{{ row?.materialCode ?? '-' }}</span>
-            <span v-if="row?.materialName" class="muted small"> · {{ row.materialName }}</span>
+            <span>{{ materialText(row) }}</span>
           </template>
         </ElTableColumn>
-        <ElTableColumn label="收货仓库" min-width="160">
+        <ElTableColumn label="收货仓库" min-width="180">
           <template #default="{ row }">
             <span v-if="row?.receivingWarehouse">{{ row.receivingWarehouse }}</span>
             <span v-else class="muted">-</span>
@@ -514,27 +1207,45 @@ onMounted(() => {
             </span>
           </template>
         </ElTableColumn>
-        <ElTableColumn label="到货时间" width="150">
+        <ElTableColumn label="到货时间" width="176">
           <template #default="{ row }">
-            <span :class="{ expired: isExpired(row.manualEta) && row.isActive }">
-              {{ dayjs(row.manualEta).format('YYYY-MM-DD') }}
+            <span :class="{ expired: row.isActive && etaRelative(row.manualEta).overdue }">
+              {{ fmtDate(row.manualEta) }}
+            </span>
+            <span
+              v-if="etaRelative(row.manualEta).text"
+              class="muted small"
+              :class="{ expired: row.isActive && etaRelative(row.manualEta).overdue }"
+            >
+              · {{ etaRelative(row.manualEta).text }}
             </span>
           </template>
         </ElTableColumn>
-        <ElTableColumn label="状态" width="80" align="center">
+        <ElTableColumn label="状态" width="84" align="center">
           <template #default="{ row }">
             <ElTag :type="STATUS_TAG[statusOf(row)]" size="small">
               {{ STATUS_LABEL[statusOf(row)] }}
             </ElTag>
           </template>
         </ElTableColumn>
-        <ElTableColumn label="更新人 / 更新时间" min-width="180">
+        <!-- 是否参与排产（5号位 v2.0 R2 取乙：计算式标注，true/false/null 三态）
+             ⚠️ null = 未判定（后端取数失败），**不得显示成「未命中」** -->
+        <ElTableColumn label="是否参与排产" width="168" align="center">
           <template #default="{ row }">
-            <span class="muted code-tag">{{ row.updatedBy }}</span>
-            <span class="muted small"> · {{ dayjs(row.updatedAt).format('MM-DD HH:mm') }}</span>
+            <ElTooltip
+              v-if="row.isMatched === false"
+              content="这条到货时间没命中该订单行当前的供货事实（物料或仓库对不上），不会参与排产。"
+              placement="top"
+            >
+              <ElTag type="danger" size="small">未命中供货事实</ElTag>
+            </ElTooltip>
+            <ElTag v-else-if="row.isMatched === true" type="success" size="small">
+              会参与排产
+            </ElTag>
+            <span v-else class="muted">-</span>
           </template>
         </ElTableColumn>
-        <ElTableColumn label="备注" min-width="160">
+        <ElTableColumn label="备注" min-width="150">
           <template #default="{ row }">
             <ElTooltip v-if="row.remark" :content="row.remark" placement="top">
               <span class="remark-cell">{{ row.remark }}</span>
@@ -542,7 +1253,13 @@ onMounted(() => {
             <span v-else class="muted">-</span>
           </template>
         </ElTableColumn>
-        <ElTableColumn label="操作" width="220" fixed="right" align="center">
+        <ElTableColumn label="更新人 / 更新时间" min-width="170">
+          <template #default="{ row }">
+            <span class="muted code-tag">{{ row.updatedBy }}</span>
+            <span class="muted small"> · {{ fmtDateTime(row.updatedAt) }}</span>
+          </template>
+        </ElTableColumn>
+        <ElTableColumn label="操作" width="170" fixed="right" align="center">
           <template #default="{ row }">
             <ElButton size="small" plain :disabled="!canWrite" @click="openEdit(row)">
               <Icon icon="vi-mdi:pencil" />
@@ -552,7 +1269,7 @@ onMounted(() => {
               size="small"
               type="danger"
               plain
-              :disabled="!canWrite || !row.isActive"
+              :disabled="!canCancel || !row.isActive"
               @click="handleCancel(row)"
             >
               <Icon icon="vi-mdi:cancel" />
@@ -613,21 +1330,59 @@ onMounted(() => {
             <ElSelect
               v-model="materialKeyModel"
               :disabled="drawerMode === 'edit'"
-              placeholder="选择物料"
+              placeholder="输入物料编码、名称或规格搜索"
               filterable
+              remote
+              :remote-method="onMaterialSearch"
+              :loading="materialSearching"
               clearable
               style="width: 100%"
             >
               <ElOption
                 v-for="m in materialOptions"
-                :key="m.masterId"
-                :label="`${m.code} / ${m.name}`"
-                :value="m.masterId"
+                :key="pickKeyOf(m)"
+                :label="materialOptionText(m)"
+                :value="pickKeyOf(m)"
               />
             </ElSelect>
+            <!-- 空态要分得开：还没搜 / 搜了没结果 / 取不到（权限或网络）——用户分不出来就会以为系统坏了 -->
+            <span v-if="materialSearchError" class="muted small">{{ materialSearchError }}</span>
+            <span
+              v-else-if="drawerMode === 'new' && !materialQuery && !form.poNo.trim()"
+              class="muted small"
+            >
+              输入物料编码、名称或规格的关键字即可搜索；填了采购订单号会直接列出该订单实际供货的物料和仓库。
+            </span>
+            <span v-else-if="!materialOptions.length" class="muted small">
+              <template v-if="comboTierFailed">
+                按订单收窄的供货组合接口暂时取不到（后端可能还没部署新版本）；请核对采购订单号与行号，或清空采购订单号按关键字搜索。
+              </template>
+              <template v-else>
+                没查到物料：该采购订单在供货数据里没有对应的物料，请核对采购订单号与行号；也可清空采购订单号，按关键字搜索全部物料。
+              </template>
+            </span>
+            <span
+              v-else-if="materialScopeNote || materialOptions.length >= MATERIAL_SEARCH_LIMIT"
+              class="muted small"
+            >
+              {{ materialScopeNote }}
+              <template v-if="materialOptions.length >= MATERIAL_SEARCH_LIMIT">
+                只列了前 {{ MATERIAL_SEARCH_LIMIT }} 条，继续输入关键字可缩小范围。
+              </template>
+            </span>
           </ElFormItem>
           <ElFormItem label="收货仓库" prop="receivingWarehouse">
+            <!-- 成对口径（11-14）：选了带存储地点的候选 ⇒ 仓库由该供货事实带出并锁定，
+                 用户要换仓库只能换物料（换回不配套的组合，这条到货时间就静默不生效） -->
+            <div v-if="warehouseLockedByCombo" class="warehouse-locked">
+              <span class="code-tag">{{ form.receivingWarehouse }}</span>
+              <span v-if="materialSelected?.storageName" class="muted small">
+                · {{ materialSelected.storageName }}
+              </span>
+              <span class="muted small">已按该订单行的实际存储地点带出（来自同一条供货事实）。</span>
+            </div>
             <ElSelect
+              v-else
               v-model="form.receivingWarehouse"
               placeholder="请选择收货仓库"
               filterable
@@ -637,16 +1392,22 @@ onMounted(() => {
               <ElOption
                 v-for="w in warehouseOptions"
                 :key="w.code"
-                :label="`${w.code} / ${w.name}`"
+                :label="`${w.name}（${w.code}）`"
                 :value="w.code"
               />
             </ElSelect>
+            <!-- 仓库是覆盖键的一半：必须与该订单行的实际存储地点一致，否则这条到货时间不参与排产
+                 （后端按 (PONo, LineNo, MaterialId, ReceivingWarehouse) 精确匹配供给事实的 StorageCode） -->
+            <span v-if="!warehouseLockedByCombo" class="muted small">
+              仓库须与该订单行的实际存储地点一致，否则这条到货时间不会参与排产。
+            </span>
           </ElFormItem>
           <ElFormItem label="到货时间" prop="manualEta">
+            <!-- 11-12 修：原 value-format 带字面量 [Z] ⇒ 存的是 UTC 串、回读按本地解析偏 8 小时 -->
             <ElDatePicker
               v-model="form.manualEta"
               type="datetime"
-              value-format="YYYY-MM-DDTHH:mm:ss[Z]"
+              value-format="YYYY-MM-DDTHH:mm:ss"
               placeholder="选择到货预期时间"
               style="width: 100%"
             />
@@ -667,15 +1428,17 @@ onMounted(() => {
           <ElDescriptions :column="1" size="small" title="审计字段（只读）" border>
             <ElDescriptionsItem label="创建人">
               {{ currentDetail.createdBy ?? '-' }} ·
-              {{
-                currentDetail.createdAt
-                  ? dayjs(currentDetail.createdAt).format('YYYY-MM-DD HH:mm')
-                  : '-'
-              }}
+              {{ currentDetail.createdAt ? fmtDateTime(currentDetail.createdAt) : '-' }}
             </ElDescriptionsItem>
             <ElDescriptionsItem label="最后更新">
-              {{ currentDetail.updatedBy }} ·
-              {{ dayjs(currentDetail.updatedAt).format('YYYY-MM-DD HH:mm') }}
+              {{ currentDetail.updatedBy }} · {{ fmtDateTime(currentDetail.updatedAt) }}
+            </ElDescriptionsItem>
+            <ElDescriptionsItem label="是否参与排产">
+              <span v-if="currentDetail.isMatched === true">会参与排产</span>
+              <span v-else-if="currentDetail.isMatched === false" class="expired">
+                未命中当前供货事实（暂不生效）
+              </span>
+              <span v-else class="muted">未判定</span>
             </ElDescriptionsItem>
           </ElDescriptions>
         </div>
@@ -699,70 +1462,86 @@ onMounted(() => {
   padding: 16px;
   background: #f5f7fa;
   flex-direction: column;
-  gap: 16px;
-}
-
-.page-header {
-  display: flex;
-  justify-content: space-between;
-  align-items: flex-end;
-
-  .page-title {
-    margin: 0;
-    font-size: 20px;
-    font-weight: 600;
-    color: #1e293b;
-  }
-
-  .page-sub {
-    margin: 4px 0 0;
-    font-size: 12px;
-    color: #94a3b8;
-  }
-}
-
-.hint-bar {
-  :deep(.el-alert__title) {
-    font-weight: 600;
-  }
-
-  .hint-text {
-    margin-left: 8px;
-    font-size: 13px;
-    color: #475569;
-  }
-}
-
-.kpi-row {
-  display: grid;
-  grid-template-columns: repeat(3, 1fr);
   gap: 12px;
 }
 
-.kpi-card {
-  padding: 14px 16px;
-  background: #fff;
-  border-top: 3px solid #94a3b8;
+/* KPI：一行紧凑指标条（沿用订单页样式；数字即分类入口） */
+.kpi-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  padding: 6px 14px;
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
   border-radius: 8px;
-  box-shadow: 0 1px 4px rgb(0 0 0 / 6%);
+}
 
-  .kpi-label {
-    font-size: 12px;
-    color: #94a3b8;
+.kpi-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 16px;
+  border: none;
+  border-right: 1px solid #e2e8f0;
+  background: none;
+  font: inherit;
+  color: inherit;
+  text-align: left;
+
+  &:last-of-type {
+    border-right: none;
   }
 
-  .kpi-value {
-    margin-top: 4px;
-    font-size: 22px;
-    font-weight: 600;
-    color: #1e293b;
+  &:not(.is-static) {
+    cursor: pointer;
+    border-radius: 4px;
+
+    &:hover {
+      background: #eef2f7;
+    }
   }
 
-  .kpi-ratio {
-    margin-top: 2px;
-    font-size: 11px;
-    color: #cbd5e1;
+  &.is-static {
+    cursor: default;
+    opacity: 1;
   }
+
+  &.is-active {
+    background: #e6f0ff;
+  }
+}
+
+.kpi-bar {
+  width: 3px;
+  height: 12px;
+  border-radius: 2px;
+}
+
+.kpi-label {
+  font-size: 12px;
+  color: #64748b;
+}
+
+.kpi-value {
+  font-size: 17px;
+  font-weight: 600;
+  line-height: 1.2;
+}
+
+.kpi-ratio {
+  font-size: 11px;
+  color: #94a3b8;
+}
+
+.kpi-caption {
+  margin-left: auto;
+  padding-left: 16px;
+  font-size: 12px;
+  color: #94a3b8;
+}
+
+.filter-bar {
+  border-radius: 8px;
 }
 
 .panel {
@@ -776,16 +1555,20 @@ onMounted(() => {
   font-size: 14px;
   font-weight: 600;
   color: #1e293b;
+}
 
-  .hint-text {
-    font-size: 12px;
-    font-weight: 400;
-    color: #94a3b8;
-  }
+.panel-actions {
+  display: flex;
+  gap: 8px;
 }
 
 .panel-empty {
   padding: 20px 0;
+}
+
+.panel-loading {
+  padding: 24px 0;
+  text-align: center;
 }
 
 .pagination-bar {
@@ -817,7 +1600,7 @@ onMounted(() => {
 
 .remark-cell {
   display: block;
-  max-width: 160px;
+  max-width: 150px;
   overflow: hidden;
   font-size: 12px;
   text-overflow: ellipsis;
@@ -835,14 +1618,7 @@ onMounted(() => {
 .filter-item {
   display: flex;
   align-items: center;
-  flex-direction: column;
   gap: 4px;
-
-  label {
-    font-size: 12px;
-    font-weight: 600;
-    color: #64748b;
-  }
 }
 
 .filter-actions {

@@ -31,8 +31,29 @@ public interface IProcurementManualEtaRepository
         DateTime? etaAfter = null,
         DateTime? updatedAfter = null,
         bool activeOnly = true,
+        bool cancelledOnly = false,
+        string? sortBy = null,
+        string? sortDir = null,
+        string? bucket = null,
         int pageIndex = 1,
         int pageSize = 20,
+        bool withMatched = false,
+        CancellationToken ct = default);
+
+    /// <summary>指标条五数一批（R3，11-12：与列表同 WHERE 单源；overdue/dueSoon 按服务器墙钟日界半开）。</summary>
+    Task<ProcurementManualEtaSummaryDto> GetSummaryAsync(
+        List<int>? materialIds = null,
+        List<string>? materialCodes = null,
+        List<string>? poNos = null,
+        List<string>? receivingWarehouses = null,
+        DateTime? etaBefore = null,
+        DateTime? etaAfter = null,
+        DateTime? updatedAfter = null,
+        CancellationToken ct = default);
+
+    /// <summary>本表 distinct 候选（R4，11-12：含已取消行；search 两维同打；每维顶 500+Truncated）。</summary>
+    Task<ProcurementManualEtaFacetsDto> GetFacetsAsync(
+        string? search = null,
         CancellationToken ct = default);
 
     /// <summary>
@@ -81,5 +102,26 @@ public interface IProcurementManualEtaRepository
         int materialId,
         string receivingWarehouse,
         string updatedBy,
+        CancellationToken ct = default);
+
+    /// <summary>
+    /// 乙端点（11-14）：本页域内物料候选；传 poNo[/lineNo] 收窄到该采购订单行物料集合
+    /// （供给事实同键取数、不按工厂范围裁剪、PO 查无=空集不报错）。
+    /// </summary>
+    Task<List<LPS.APS.Core.DTOs.Setup.MaterialLookupItem>> GetMaterialCandidatesAsync(
+        string? search = null,
+        string? poNo = null,
+        int? lineNo = null,
+        int limit = 200,
+        CancellationToken ct = default);
+
+    /// <summary>
+    /// 订单行供货组合（11-14 v2.0 R1）：按 PO(+行号) 返回 **(物料 × 存储地点)** 组合，
+    /// 物料与仓库成对取自同一条**能生效的**供给事实；不按工厂范围裁剪、行号非整数的组合不返、查无=空集。
+    /// </summary>
+    Task<List<ProcurementManualEtaSupplyComboDto>> GetSupplyCombosAsync(
+        string poNo,
+        int? lineNo = null,
+        int limit = 200,
         CancellationToken ct = default);
 }

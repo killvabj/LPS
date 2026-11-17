@@ -31,6 +31,8 @@ internal class PhaseFourLocalRepair
 
         // 构建已排程任务的资源占用图（P0-06修复：包含ExternalDomain ResourceBlocks）
         var resourceOccupancy = BuildResourceOccupancy(scheduleResult.ScheduledTasks, constraints);
+        // 2026-11-16 取证（只读，`APS_P4_OVERLAP_DIAG=1` 才工作）：记 Phase4 入口的 Task 身份集合。
+        PhaseFourOverlapDiag.CaptureEntry(scheduleResult.ScheduledTasks);
 
         // ═══════════════════════════════════════════════
         // P9完整实现：Candidate影响传播（§十三 Candidate局部重排）
@@ -52,12 +54,16 @@ internal class PhaseFourLocalRepair
         if ((request.CandidateContext?.ChangeSeedKeys != null && request.CandidateContext.ChangeSeedKeys.Count > 0) || hasTaskTargets || hasChangedResources)
         {
             // Candidate模式：影响传播
-            return RepairWithPropagation(request, scheduleResult, diagnostics, constraints, resourceOccupancy, cancellationToken);
+            var propagationResult = RepairWithPropagation(request, scheduleResult, diagnostics, constraints, resourceOccupancy, cancellationToken);
+            PhaseFourOverlapDiag.DumpExit("P4_EXIT_PROP", scheduleResult.ScheduledTasks, propagationResult.RepairedTasks);
+            return propagationResult;
         }
         else
         {
             // Base/FULL模式：传统修复未排程需求
-            return RepairUnscheduledDemands(request, scheduleResult, constraints, resourceOccupancy);
+            var unschedResult = RepairUnscheduledDemands(request, scheduleResult, constraints, resourceOccupancy);
+            PhaseFourOverlapDiag.DumpExit("P4_EXIT_UNSCHED", scheduleResult.ScheduledTasks, unschedResult.RepairedTasks);
+            return unschedResult;
         }
     }
 
@@ -446,7 +452,7 @@ internal class PhaseFourLocalRepair
                         {
                             resourceOccupancy[ridRep] = new List<TimeWindow>();
                         }
-                        resourceOccupancy[ridRep].Add(found!.Value.Slot);
+                        AddOccupancyWindowSorted(resourceOccupancy, ridRep, found!.Value.Slot);
                         constraints.ProductTimeline.Place(ridRep, newEnd, task.MaterialId);
                     }
                 }
@@ -461,7 +467,7 @@ internal class PhaseFourLocalRepair
                             resourceOccupancy[ridKeep] = new List<TimeWindow>();
                         }
                         // P0-02修复：占用窗口含Setup
-                        resourceOccupancy[ridKeep].Add(new TimeWindow(taskOccupancyStart, task.PlannedEndTime));
+                        AddOccupancyWindowSorted(resourceOccupancy, ridKeep, new TimeWindow(taskOccupancyStart, task.PlannedEndTime));
                         constraints.ProductTimeline.Place(ridKeep, task.PlannedEndTime, task.MaterialId);
                     }
                 }
@@ -851,8 +857,11 @@ internal class PhaseFourLocalRepair
                     // P0-02 口径：Task 占用从 Setup 起点算起（与 BuildResourceOccupancy 及移除口径一致）。
                     // 旧写法用 PlannedStartTime（加工起点）会漏登 Setup 那一段，导致后续 Task 被排进本 Task 的 Setup 窗口。
                     var occStart = task.PlannedStartTime.AddMinutes(-(double)task.SetupTime);
-                    resourceOccupancy[ridRep].Add(new TimeWindow(occStart, task.PlannedEndTime));
+                    AddOccupancyWindowSorted(resourceOccupancy, ridRep, new TimeWindow(occStart, task.PlannedEndTime));
                 }
+
+                PhaseFourOverlapDiag.Check("P4_PROP_UNIT", resourceOccupancy, repairedTasks,
+                    $"demand={demandKey} unit={unitBatchKey}");
             }
 
             // ── P0-03（0号位 2026-10-08 §六 / §十一-2）：需求级成功条件 = **所有未落定批全部修复成功** ──
@@ -1098,8 +1107,11 @@ internal class PhaseFourLocalRepair
                     // P0-02 口径：Task 占用从 Setup 起点算起（与 BuildResourceOccupancy 及移除口径一致）。
                     // 旧写法用 PlannedStartTime（加工起点）会漏登 Setup 那一段，导致后续 Task 被排进本 Task 的 Setup 窗口。
                     var occStart = task.PlannedStartTime.AddMinutes(-(double)task.SetupTime);
-                    resourceOccupancy[ridRep].Add(new TimeWindow(occStart, task.PlannedEndTime));
+                    AddOccupancyWindowSorted(resourceOccupancy, ridRep, new TimeWindow(occStart, task.PlannedEndTime));
                 }
+
+                PhaseFourOverlapDiag.Check("P4_UNSCHED_UNIT", resourceOccupancy, repairedTasks,
+                    $"demand={demandKey} unit={unitBatchKey}");
 
                 // 待办（原 TODO P6，描述已按 v1.2 更新）：本修复路径的 Setup 邻接关系重算。
                 // 现状：Setup 由 TryResourceSwitch → FindSlotWithDynamicSetup 在放置时解析（含时间线邻接前产品的规则命中）；
@@ -1206,6 +1218,18 @@ internal class PhaseFourLocalRepair
 
             // 第4轮Setup修复：PlannedStartTime是加工开始时间（Setup之后），资源占用需从Setup开始
             var occupancyStart = task.PlannedStartTime.AddMinutes(-(double)task.SetupTime);
+
+            // ── 2026-11-16（PV 999507 根因）：**零时长窗不得进占用表** ──────────────────
+            //   现场：Phase2 交付里 `999507_870296` 是零时长（14:51:14→14:51:14），
+            //   与 `999507_848726`（14:51:14→15:36:14）**同起点**。两条都进表后，
+            //   该资源的 `End` 序列变成 `…14:51:14, 15:36:14, 14:51:14…` ⇒ **End 单调被打破**
+            //   ⇒ `FindFirstAvailableSlot` 的「二分 + 靠 End 回退」会停在零时长窗上，
+            //     把前面那个真正挡住时间的 45 分钟窗整个跳过
+            //   ⇒ Phase4 把新任务排进 45 分钟窗内部（实测 14:52:36→14:59:46）
+            //   ⇒ Phase5 硬校验判同资源冲突，整份 FinalTask 清空（Success=False）。
+            //   零时长 Task 不消耗任何时间，对占用表零贡献；Phase5 校验本身也排除零时长窗。
+            if (task.PlannedEndTime <= occupancyStart) continue;
+
             occupancy[ridOcc].Add(
                 new TimeWindow(occupancyStart, task.PlannedEndTime));
         }
@@ -1225,7 +1249,45 @@ internal class PhaseFourLocalRepair
             }
         }
 
+        // ── 2026-11-16：**统一排序一次**，恢复「按 `Start` 升序」不变式 ──────────────
+        //   为什么要补这一步：`PhaseTwoInitialScheduler.FindFirstAvailableSlot` 的**二分跳段**
+        //   依赖该不变式（见 `AddOccupancyWindow` 注释「列表按 Start 升序」）。
+        //   而本方法是**按 `tasks` 列表顺序**追加的，任务顺序不保证按开工时间 ⇒ 表可能乱序
+        //   ⇒ 二分跳段会**跳过实际冲突的窗** ⇒ 排出同资源重叠。
+        //   （PV 999507 固定输入实测：Phase2 输出 0 重叠；Phase4 之后 1 重叠；Phase5 压实前后不变。
+        //     差异就在本方法 + 下方 Phase4 增量写入这两条裸 `.Add()` 路径。）
+        //   用一次 `Sort` 而不是逐条有序插入：O(W log W) << O(W²)，且本方法每次 Run 只调一次。
+        foreach (var windows in occupancy.Values)
+        {
+            windows.Sort(static (x, y) => x.Start.CompareTo(y.Start));
+        }
+
         return occupancy;
+    }
+
+    /// <summary>
+    /// 2026-11-16：占用表**有序写入**（复用 Phase2 的唯一有序写入点 <c>AddOccupancyWindow</c>）。
+    ///
+    /// <para><b>零时长窗一律不登记</b>：零时长 Task 不消耗时间，进表反而会打破「<c>End</c> 单调」，
+    /// 让 <c>FindFirstAvailableSlot</c> 的二分回退停在它上面、把前面真正挡住时间的窗整个跳过
+    /// （PV 999507 现场根因，见 <see cref="BuildResourceOccupancy"/> 处注释与
+    /// <c>PhaseFourZeroLengthOccupancyTests</c>）。</para>
+    ///
+    /// <para>本方法**只保证有序与不含零时长窗**，不改任何判定与时间取值。</para>
+    /// </summary>
+    private static void AddOccupancyWindowSorted(
+        Dictionary<int, List<TimeWindow>> occupancy,
+        int resourceId,
+        TimeWindow window)
+    {
+        if (!occupancy.ContainsKey(resourceId))
+        {
+            occupancy[resourceId] = new List<TimeWindow>();
+        }
+
+        if (window.End <= window.Start) return;
+
+        PhaseTwoInitialScheduler.AddOccupancyWindow(occupancy, null, resourceId, window);
     }
 
     /// <summary>
@@ -1468,12 +1530,8 @@ internal class PhaseFourLocalRepair
                     var taskSetupSource = SetupOptimizer.SetupOutcomeToSource(setupResolution.Outcome);
                     scheduledTask = CreateTask(demand, operation, resourceId, taskStart, occSlot.End, adjustedDuration, setupMinutes, constraints, batchDraftKey, taskSetupSource);
 
-                    // 临时占用：从Setup开始
-                    if (!resourceOccupancy.ContainsKey(resourceId))
-                    {
-                        resourceOccupancy[resourceId] = new List<TimeWindow>();
-                    }
-                    resourceOccupancy[resourceId].Add(occSlot);
+                    // 临时占用：从Setup开始（2026-11-16：改走有序写入，零时长窗不入表）
+                    AddOccupancyWindowSorted(resourceOccupancy, resourceId, occSlot);
                     constraints.ProductTimeline.Place(resourceId, occSlot.End, demand.MaterialId);
 
                     // R11：靠 TopN 之外的资源才落下 ⇒ 记「TopN 配小了」的证据（不阻断、不回滚）。
@@ -2098,7 +2156,19 @@ internal class PhaseFourLocalRepair
         }
 
         var start = lo;
-        while (start > 0 && occupied[start - 1].End > windowStart) start--;
+
+        // ── 2026-11-16（PV 999507 根因·第二道防线）：回退**跳过零时长窗** ──
+        //   原条件只看 `End > windowStart`，默认「窗互不重叠 ⇒ End 单调」。
+        //   零时长窗 `[X, X]` 与真实窗 `[X, X+45m]` 同起点时，End 序列变成 `…X, X+45m, X…`，
+        //   回退一步就停在零时长窗上（其 End 不大于 windowStart）⇒ 真实窗被整个跳过。
+        //   写入侧已不再登记零时长窗（见 `AddOccupancyWindowSorted`），这里是**防御性**第二道：
+        //   即便占用表由别处塞进零时长窗（历史快照、外部阻挡、锁定继承），回退也不会漏掉真实窗。
+        while (start > 0
+               && (occupied[start - 1].End > windowStart
+                   || occupied[start - 1].End <= occupied[start - 1].Start))
+        {
+            start--;
+        }
 
         var cursor = windowStart;
 
@@ -2438,4 +2508,248 @@ internal class TaskSnapshot
     public DateTime PlannedStartTime { get; set; }
     public DateTime PlannedEndTime { get; set; }
     public decimal Quantity { get; set; }
+}
+
+/// <summary>
+/// **2026-11-16｜Phase4 同资源重叠取证探针（1号位，只读、一次问清）**。
+///
+/// <para><b>为什么要它</b>：PV 999507 固定输入重放实测 —— `AFTER_PHASE2` 目标资源 0 重叠，
+/// `AFTER_PHASE4` 同一资源出现 1 处重叠（45 分钟 Task 与 7.17 分钟 Task 相交），
+/// Phase5 压实前后完全不变 ⇒ 重叠是 **Phase4 造出来的**。前一轮怀疑「裸 `.Add()` 破坏有序」，
+/// 但 `FindForwardSlot` 本就有 `IsAscendingByStart` 自检并**原地重排**，该机理不成立。</para>
+///
+/// <para><b>一次问清的四件事</b>：
+/// ① `OVERLAP` —— 第一条重叠出现在**哪个修复单元**（带 demandKey／批键），两条 Task 各是什么、是不是 Phase2 原有；
+/// ② `UNREGISTERED` —— Task 放出去了、占用窗却没登记（后续 Task 根本看不见它）；
+/// ③ `DUPKEY` —— 同一需求同一工序出现两个 Task（重复排产）；
+/// ④ `ENTRY/EXIT/MOVED` —— 目标资源全部 Task 的入口／出口快照，谁被挪动、挪到哪。</para>
+///
+/// <para><b>零行为变化</b>：仅当 `APS_P4_OVERLAP_DIAG=1` 时工作，不设时所有方法第一行返回。
+/// 目标资源由 `APS_P4_DIAG_RES` 指定（默认 1000025577），输出由 `APS_P4_DIAG_OUT` 指定文件
+/// （同时打 stderr）；入口／出口快照写到 `<Out>.entry` / `<Out>.exit`。
+/// 不写任何业务结果、不新增字段、不改判定。</para>
+/// </summary>
+internal static class PhaseFourOverlapDiag
+{
+    private static readonly bool Enabled =
+        Environment.GetEnvironmentVariable("APS_P4_OVERLAP_DIAG") == "1";
+
+    private static readonly int TargetRes =
+        int.TryParse(Environment.GetEnvironmentVariable("APS_P4_DIAG_RES"), out var r) && r != 0
+            ? r
+            : 1000025577;
+
+    private static readonly string? OutPath =
+        Environment.GetEnvironmentVariable("APS_P4_DIAG_OUT");
+
+    private static readonly HashSet<string> Reported = new(StringComparer.Ordinal);
+    private static readonly object Gate = new();
+    private static List<FinalTaskDraft>? _phase2Tasks;
+    private static Dictionary<string, (DateTime OccStart, DateTime End)>? _entryWindows;
+    private static int _checks;
+
+    internal static void CaptureEntry(IReadOnlyList<FinalTaskDraft>? scheduled)
+    {
+        if (!Enabled) return;
+
+        _phase2Tasks = new List<FinalTaskDraft>();
+        _entryWindows = new Dictionary<string, (DateTime OccStart, DateTime End)>(StringComparer.Ordinal);
+        var rows = new List<string> { "FinalDraftId|SourceDraftId|Stage|Op|Setup|OccStart|End" };
+
+        if (scheduled is not null)
+        {
+            foreach (var t in scheduled)
+            {
+                if (t is null) continue;
+                _phase2Tasks.Add(t);
+                if (t.ResourceId != TargetRes) continue;
+                var occ = t.PlannedStartTime.AddMinutes(-(double)t.SetupTime);
+                _entryWindows[t.FinalDraftId ?? string.Empty] = (occ, t.PlannedEndTime);
+                rows.Add(Row(t));
+            }
+        }
+
+        WriteSide(".entry", rows);
+        Report($"[P4DIAG] ENTRY scheduled={_phase2Tasks.Count} targetRes={TargetRes} entryRows={rows.Count - 1}");
+    }
+
+    /// <summary>扫目标资源占用窗：先报「未登记」，再报第一条重叠。同一条只报一次。</summary>
+    internal static void Check(
+        string tag,
+        Dictionary<int, List<TimeWindow>>? occupancy,
+        IReadOnlyList<FinalTaskDraft>? extraTasks,
+        string? context)
+    {
+        if (!Enabled) return;
+        _checks++;
+        if (occupancy is null || !occupancy.TryGetValue(TargetRes, out var windows) || windows.Count < 2) return;
+
+        var sorted = new List<TimeWindow>(windows);
+        sorted.Sort(static (a, b) => a.Start.CompareTo(b.Start));
+
+        // ① 「已放置但未登记」：Task 在结果里、窗口却不在占用表 ⇒ 后续 Task 根本看不见它。
+        if (extraTasks is not null)
+        {
+            foreach (var t in extraTasks)
+            {
+                if (t is null || t.ResourceId != TargetRes) continue;
+                var ws = t.PlannedStartTime.AddMinutes(-(double)t.SetupTime);
+                var found = false;
+                for (var i = 0; i < windows.Count; i++)
+                {
+                    if (windows[i].Start == ws && windows[i].End == t.PlannedEndTime) { found = true; break; }
+                }
+
+                if (found) continue;
+                if (Reported.Add("UNREG|" + t.FinalDraftId))
+                {
+                    Report($"[P4DIAG] UNREGISTERED tag={tag} ctx={context} task={Describe(t)} occStart={ws:O} end={t.PlannedEndTime:O}");
+                }
+
+                break;
+            }
+        }
+
+        // ② 第一条重叠（登记了但相交）
+        for (var i = 1; i < sorted.Count; i++)
+        {
+            var prev = sorted[i - 1];
+            var cur = sorted[i];
+            if (cur.Start >= prev.End) continue;
+
+            var key = $"{prev.Start:O}|{prev.End:O}|{cur.Start:O}|{cur.End:O}";
+            if (!Reported.Add(key)) return;
+
+            Report($"[P4DIAG] OVERLAP tag={tag} checks={_checks} ctx={context} windows={windows.Count}" +
+                   $"\n         A {Resolve(prev)}" +
+                   $"\n         B {Resolve(cur)}");
+            return;
+        }
+    }
+
+    /// <summary>Phase4 出口：全扫 + 重复键 + 挪动清单 + 出口快照。</summary>
+    internal static void DumpExit(
+        string tag,
+        IReadOnlyList<FinalTaskDraft>? scheduled,
+        IReadOnlyList<FinalTaskDraft>? repaired)
+    {
+        if (!Enabled) return;
+
+        var all = new List<FinalTaskDraft>();
+        if (scheduled is not null) foreach (var t in scheduled) if (t is not null) all.Add(t);
+        if (repaired is not null) foreach (var t in repaired) if (t is not null) all.Add(t);
+
+        Check(tag, BuildOcc(all), null, "exit");
+
+        // ③ 重复键：同一需求同一工序出现两个 Task
+        var seen = new Dictionary<string, FinalTaskDraft>(StringComparer.Ordinal);
+        var dup = 0;
+        foreach (var t in all)
+        {
+            var k = $"{t.SourceDraftId}|{t.StageCode}|{t.OperationCode}";
+            if (seen.TryAdd(k, t)) continue;
+            dup++;
+            if (dup <= 5)
+            {
+                var p0 = seen[k];
+                Report($"[P4DIAG] DUPKEY {k}\n         A {Describe(p0)}\n         B {Describe(t)}");
+            }
+        }
+
+        // ④ 出口快照 + 挪动清单
+        var rows = new List<string> { "FinalDraftId|SourceDraftId|Stage|Op|Setup|OccStart|End" };
+        var moved = 0;
+        foreach (var t in all)
+        {
+            if (t.ResourceId != TargetRes) continue;
+            rows.Add(Row(t));
+            var occ = t.PlannedStartTime.AddMinutes(-(double)t.SetupTime);
+            if (_entryWindows is not null
+                && _entryWindows.TryGetValue(t.FinalDraftId ?? string.Empty, out var e)
+                && (e.OccStart != occ || e.End != t.PlannedEndTime))
+            {
+                moved++;
+                if (moved <= 40)
+                {
+                    Report($"[P4DIAG] MOVED {Describe(t)} from {e.OccStart:O}..{e.End:O} to {occ:O}..{t.PlannedEndTime:O}");
+                }
+            }
+        }
+
+        WriteSide(".exit", rows);
+        Report($"[P4DIAG] EXIT tag={tag} dupKeys={dup} moved={moved} scheduled={scheduled?.Count ?? 0} repaired={repaired?.Count ?? 0} exitRows={rows.Count - 1}");
+    }
+
+    private static Dictionary<int, List<TimeWindow>> BuildOcc(List<FinalTaskDraft> all)
+    {
+        var occ = new Dictionary<int, List<TimeWindow>>();
+        foreach (var t in all)
+        {
+            if (t.ResourceId is not int rid) continue;
+            if (!occ.TryGetValue(rid, out var list)) { list = new List<TimeWindow>(); occ[rid] = list; }
+            list.Add(new TimeWindow(t.PlannedStartTime.AddMinutes(-(double)t.SetupTime), t.PlannedEndTime));
+        }
+
+        return occ;
+    }
+
+    private static string Row(FinalTaskDraft t)
+        => $"{t.FinalDraftId}|{t.SourceDraftId}|{t.StageCode}|{t.OperationCode}|{t.SetupTime}|" +
+           $"{t.PlannedStartTime.AddMinutes(-(double)t.SetupTime):O}|{t.PlannedEndTime:O}";
+
+    private static string Describe(FinalTaskDraft t)
+    {
+        var inPhase2 = _phase2Tasks is not null && _phase2Tasks.Exists(x => x.FinalDraftId == t.FinalDraftId);
+        return $"[{t.FinalDraftId} src={t.SourceDraftId} {t.StageCode}/{t.OperationCode} qty={t.Quantity} " +
+               $"setup={t.SetupTime} occ={t.PlannedStartTime.AddMinutes(-(double)t.SetupTime):O}..{t.PlannedEndTime:O} " +
+               $"inPhase2={inPhase2}]";
+    }
+
+    private static string Resolve(TimeWindow w)
+    {
+        if (_phase2Tasks is not null)
+        {
+            foreach (var t in _phase2Tasks)
+            {
+                if (t.ResourceId != TargetRes) continue;
+                if (t.PlannedEndTime == w.End && t.PlannedStartTime.AddMinutes(-(double)t.SetupTime) == w.Start)
+                    return Describe(t);
+            }
+        }
+
+        return $"[未在 Phase2 快照中找到] {w.Start:O}..{w.End:O}";
+    }
+
+    private static void WriteSide(string suffix, List<string> rows)
+    {
+        if (string.IsNullOrEmpty(OutPath)) return;
+        try
+        {
+            File.WriteAllLines(OutPath + suffix, rows);
+        }
+        catch
+        {
+            // 诊断写盘失败不得影响求解
+        }
+    }
+
+    private static void Report(string line)
+    {
+        lock (Gate)
+        {
+            try
+            {
+                if (!string.IsNullOrEmpty(OutPath))
+                {
+                    File.AppendAllText(OutPath, line + Environment.NewLine);
+                }
+            }
+            catch
+            {
+                // 诊断写盘失败不得影响求解
+            }
+
+            Console.Error.WriteLine(line);
+        }
+    }
 }

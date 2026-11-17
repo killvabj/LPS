@@ -184,3 +184,29 @@ public sealed class OrderTaskDto
     public bool IsLocked { get; init; }
     public string? MTS_InstructionNo { get; init; }
 }
+
+/// <summary>
+/// 订单口径可选值（facets）——**R4，11-12 4号位《订单需求计划页改版》件**：
+/// 与列表同一套筛选参数+同一范围收窄，返回各维「可选值→命中条数」，供下拉显示「北京工厂（4,081）」。
+/// 编码↔中文名不在本端点职责（工厂/产品族用 3号位 governance 既有端点，避免两处真相）。
+/// </summary>
+public sealed class OrderFacetsDto
+{
+    public int PlanVersionId { get; init; }
+    public List<OrderFacetItemDto> CustomerNames { get; init; } = new();
+    public List<OrderFacetItemDto> FactoryCodes { get; init; } = new();
+    public List<OrderFacetItemDto> ProductFamilyCodes { get; init; } = new();
+    /// <summary>[Order].Status 六值（07:3611）。</summary>
+    public List<OrderFacetItemDto> Statuses { get; init; } = new();
+    /// <summary>ERP 交付维度（07:2688）——**非**计划派生 riskLevel（01 §64）。</summary>
+    public List<OrderFacetItemDto> DelayStatuses { get; init; } = new();
+    /// <summary>计划派生桶：ON_TRACK/DELAYED/UNSCHEDULED（UNSCHEDULED=列表缺键行的筛选名，响应永不自称该值）。</summary>
+    public List<OrderFacetItemDto> RiskLevels { get; init; } = new();
+}
+
+/// <summary>facets 单值项。</summary>
+public sealed class OrderFacetItemDto
+{
+    public string Value { get; init; } = string.Empty;
+    public int Count { get; init; }
+}

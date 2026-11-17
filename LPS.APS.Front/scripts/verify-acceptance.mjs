@@ -164,6 +164,11 @@
  *              B-03 任务详情提示里硬编码的「默认 95%」良率已撤（权威口径待 1/2/5 确认）
  *              C-01 订单列表补「APS 预计完成时间」主列（原先只在详情抽屉里有）
  *              D-02 候选影响摘要「新增延期」→「新增延期任务」（后端 newDelayCount = Task 数）
+ *  - 降级动作列段：GROUP=degrade node scripts/verify-acceptance.mjs（DG01-DG06 静态，不登录）：
+ *              P08 业务事实问题表新增「降级动作」列（数据本来就返，5号位 11-09 回执行 7）；
+ *              中文标签走 `degradeActionLabelOf` 单一出口，码表 = 冻结 07:857 六码 + 08 DDL `USE_MAX_BOMNO`；
+ *              **未知值原样显示**（dev 实测 MSC 源 66,596 行是中文自由文本，加前缀会变怪字符串）；
+ *              不新增 `reviewedBy`/`reviewedAt`/`affectedQuantity` 三列（0 值 / 硬编码 NULL ⇒ 空列）
  *  - Windows Git Bash：env 前缀可用；或直接改脚本末尾 GROUP 默认值
  */
 
@@ -177,7 +182,7 @@ import { setTimeout as sleep } from 'node:timers/promises'
 process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0'
 
 const API_BASE = process.env.API_BASE || 'https://localhost:7044'
-const GROUP = process.env.GROUP || 'all' // all | interfaces | rbac-negate | current-user | static | business-rules | j-10a | m-10a1 | v14-additions | parameter-set-drafts | o-opm | r-resource-calendar | d-domain | domain-permission | a-ctp-domainkey | me-eta | t-tsrc | dp-freeze | dplive | e-freeze | setup | setup-unc | setup-unc-live | pwc | menu | overview | candidate | run | gantt | pi | pi-static | order | order-static | rules | governance-delete | reason-code | icons | publish-concept | delivery | parameter-maintenance
+const GROUP = process.env.GROUP || 'all' // all | interfaces | rbac-negate | current-user | static | business-rules | j-10a | m-10a1 | v14-additions | parameter-set-drafts | o-opm | r-resource-calendar | d-domain | domain-permission | a-ctp-domainkey | me-eta | t-tsrc | dp-freeze | dplive | e-freeze | explanation-factory | setup | setup-unc | setup-unc-live | pwc | menu | overview | candidate | run | gantt | pi | pi-static | order | order-static | rules | version-rows | governance-delete | reason-code | icons | publish-concept | delivery | parameter-maintenance
 const ADMIN_CODE = 'admin'
 const ADMIN_PWD = 'Admin@123456'
 
@@ -1762,7 +1767,7 @@ function runP01P05Static() {
     missingParamActions.length === 0 ? '参数集动作齐备' : `缺失：${missingParamActions.join(', ')}`
   )
 
-  const p03RulesGetters = ['actions', 'forkPermission', 'canWrite', 'canPublishAction', 'noVersionCount']
+  const p03RulesGetters = ['actions', 'forkPermission', 'canWrite', 'canPublishAction', 'tabCounts']
   const missingRulesGetters = p03RulesGetters.filter(
     (n) => !staticScanDtoHasField('store/modules/aps/rules.ts', n)
   )
@@ -1876,14 +1881,25 @@ function runP01P05Static() {
   const p08NoVersionConst =
     /export\s+const\s+NO_VERSION\s*=\s*'NO_VERSION'/.test(readSrc('api/aps-v1/types/common.ts')) &&
     /export\s+const\s+NO_VERSION_LABEL\s*=\s*'未配版本'/.test(readSrc('api/aps-v1/types/common.ts'))
+  // ⚠️ 2026-11-11（撤 KPI 横条、计数落页签）：「未配版本」计数由独立 getter noVersionCount
+  //   改为页签计数 tabCounts 里的 NO_VERSION 桶（随关键词/主表状态筛选实时变）。
   const p08StoreCounts =
-    /const\s+noVersionCount\s*=\s*computed/.test(rulesStoreSrc) &&
+    /const\s+tabCounts\s*=\s*computed/.test(rulesStoreSrc) &&
+    /c\.NO_VERSION\s*\+=\s*1/.test(rulesStoreSrc) &&
     /arr\s*=\s*arr\.filter\(\(r\)\s*=>\s*!r\.hasVersion\)/.test(rulesStoreSrc)
+  // ⚠️ 2026-11-11（规则集列表改「主子表联查·一版一行」）：行模型从「一主表一行」变成
+  //   「一版一行」⇒ 状态取**版本真实状态** `row.versionStatus`（不再是主表级 `r.status`），
+  //   「未配版本」判断也从 `!ruleSet.hasVersion` 变成 `!row.hasVersion || row.versionId == null`。
+  //   判据同步换成新形状，但**语义不变**（无版本 ⇒ 显示「未配版本」+ 点开走空态，不报错不外露 Id）。
   const p08ViewShowsLabel =
     rulesVueSrc.includes('NO_VERSION_LABEL') &&
-    /r\.hasVersion\s*\?\s*RULE_STATUS_LABELS\[r\.status\]\s*:\s*NO_VERSION_LABEL/.test(rulesVueSrc)
+    /function\s+rowStatusLabel\([\s\S]{0,400}?!\w+\.hasVersion[\s\S]{0,400}?NO_VERSION_LABEL/.test(
+      rulesVueSrc
+    ) &&
+    /RULE_STATUS_LABELS\[\w+\.versionStatus\]/.test(rulesVueSrc)
   const p08ViewGuardsClick =
-    /if\s*\(!ruleSet\.hasVersion\)\s*\{/.test(rulesVueSrc) && rulesVueSrc.includes('noVersionPicked')
+    /if\s*\(!\w+\.hasVersion\s*\|\|\s*\w+\.versionId\s*==\s*null\)\s*\{/.test(rulesVueSrc) &&
+    rulesVueSrc.includes('noVersionPicked')
   const p08NoInternalIdError = !/无可用版本/.test(rulesVueSrc) && !/RuleSet\s#\$\{/.test(ruleApiSrc)
   const p08All =
     p08UsesBackendStatus &&
@@ -2179,19 +2195,21 @@ function runP01P05Static() {
     commonHasSixStates ? '6 态冻结契约保留' : '6 态被删或顺序错'
   )
 
+  // ⚠️ 2026-11-11（用户拍板：撤 KPI 横条、计数落页签）：Rules.vue 已无 KPI 横条，
+  //   状态页签（带计数）是唯一遍历状态的地方 ⇒ 这里只断言「页签用 3 态、且全页只有这一处遍历」。
   const rulesVueKpiLoopUi3 = /v-for="key in RULE_STATUSES_UI"/.test(readSrc('views/Aps/Rules.vue'))
   assert(
-    'P07.3 Rules.vue KPI 横条 v-for 用 RULE_STATUSES_UI（不再用 6 态）',
+    'P07.3 Rules.vue 状态页签 v-for 用 RULE_STATUSES_UI（不再用 6 态）',
     rulesVueKpiLoopUi3,
-    rulesVueKpiLoopUi3 ? 'KPI 已切 3 态' : 'KPI 仍遍历 6 态'
+    rulesVueKpiLoopUi3 ? '页签已切 3 态' : '页签仍遍历 6 态'
   )
 
   const rulesVueTabLoopUi3 = readSrc('views/Aps/Rules.vue').match(/v-for="key in (RULE_STATUSES|RULE_STATUSES_UI)"/g) ?? []
-  const tabsAllUi = rulesVueTabLoopUi3.length === 2 && rulesVueTabLoopUi3.every((s) => s.includes('RULE_STATUSES_UI'))
+  const tabsAllUi = rulesVueTabLoopUi3.length === 1 && rulesVueTabLoopUi3.every((s) => s.includes('RULE_STATUSES_UI'))
   assert(
-    'P07.4 Rules.vue Tab + KPI 两处 v-for 都用 RULE_STATUSES_UI',
+    'P07.4 Rules.vue 只有状态页签一处 v-for 遍历状态，且用 RULE_STATUSES_UI',
     tabsAllUi,
-    tabsAllUi ? '两处一致切 3 态' : `命中 ${rulesVueTabLoopUi3.length} 处：${rulesVueTabLoopUi3.join(' | ')}`
+    tabsAllUi ? '唯一一处且为 3 态' : `命中 ${rulesVueTabLoopUi3.length} 处：${rulesVueTabLoopUi3.join(' | ')}`
   )
 
   const rulesVueSixTabGone = !/<ElRadioButton[^>]*v-for="key in RULE_STATUSES"/.test(readSrc('views/Aps/Rules.vue')) &&
@@ -2701,23 +2719,30 @@ function runParameterSetUxStatic() {
   )
 
   /* -------- P34 有专属编辑器的空块必须留引导行 --------
-   * 供应 / 采购两块有仓库引用专属编辑器，ElEmpty 被 `!hasWarehouseEditor` 挡掉 ⇒
-   * 空块只剩「采购仓库优先级」一块表单，用户不知道上方的普通参数（如逾期修正比例）从哪加。
-   * 三条缺一不可：① 引导行按「空 + 有专属编辑器」渲染 ② 例子取自字段目录 ③ 新增按钮不是文字链接 */
-  const p34Gate = /v-if="rowsGrouped\[blockKey\]\.length === 0 && hasWarehouseEditor\(blockKey\)"/.test(
-    page
-  )
+   * 供应 / 采购两块有专属编辑器，ElEmpty 被 `!hasWarehouseEditor` 挡掉 ⇒
+   * 空块只剩「采购仓库优先级 / 采购良率」几块表单，用户不知道上方的普通参数从哪加。
+   * 四条缺一不可：
+   *   ① 引导行按「空 + 有专属编辑器 + **还有可新增字段**」渲染
+   *      （2026-11-09：采购块的标量字段按工作簿口径全下架 ⇒ 没得新增时不能教用户去点）
+   *   ② 例子取自字段目录 ③ 新增按钮不是文字链接
+   *   ④ 没有可新增字段时按钮置灰（`hasAddableFields` 参与 disabled） */
+  const p34Gate =
+    /v-if="\s*rowsGrouped\[blockKey\]\.length === 0 &&\s*hasWarehouseEditor\(blockKey\) &&\s*hasAddableFields\(blockKey\)\s*"/.test(
+      page
+    )
   const p34Example = /addFieldExamples\(blockKey\)/.test(page)
   const p34FromCatalog = /listBlockFields\(blockKey\)[\s\S]{0,120}\.map\(\(f\) => f\.label\)/.test(page)
-  const addBtnTag = page.match(/<ElButton[\s\S]{0,240}class="block-add-btn"/)
+  // 截到标签结束 `>`：`:disabled` 排在 class 之后，只截到 class 会漏判
+  const addBtnTag = page.match(/<ElButton[\s\S]{0,600}?class="block-add-btn"[\s\S]{0,400}?>/)
   const p34BtnVisible = !!addBtnTag && !/\blink\b/.test(addBtnTag[0])
-  const p34Ok = p34Gate && p34Example && p34FromCatalog && p34BtnVisible
+  const p34BtnGated = !!addBtnTag && /!hasAddableFields\(blockKey\)/.test(addBtnTag[0])
+  const p34Ok = p34Gate && p34Example && p34FromCatalog && p34BtnVisible && p34BtnGated
   assert(
-    'P34 静态：供应 / 采购空块显示「新增字段」引导行（例子取自字段目录），且新增按钮是实心按钮不是文字链接',
+    'P34 静态：有专属编辑器的空块在「还有可新增字段」时才显示引导行；无字段可加时按钮置灰',
     p34Ok,
     p34Ok
-      ? '引导行 + 目录例子 + 可见按钮'
-      : `引导行${p34Gate ? '有' : '缺'} / 例子${p34Example ? '有' : '缺'} / 目录取${p34FromCatalog ? '是' : '否'} / 按钮${p34BtnVisible ? '可见' : '仍是文字链接'}`
+      ? '引导行 + 目录例子 + 可见按钮 + 空清单置灰'
+      : `引导行${p34Gate ? '有' : '缺'} / 例子${p34Example ? '有' : '缺'} / 目录取${p34FromCatalog ? '是' : '否'} / 按钮${p34BtnVisible ? '可见' : '仍是文字链接'} / 置灰${p34BtnGated ? '有' : '缺'}`
   )
 
   /* -------- P35-P38 运行期无消费者字段标「暂未生效」（2026-10-27）--------
@@ -3145,11 +3170,19 @@ function runWarehouseRefStatic() {
       : `${p22FixtureHit.length} 个文件里出现硬编码夹具码`
   )
 
-  /* -------- P23 采购三处落点各有编辑器 + 四个 store 写动作 --------
-   * 3号位 2026-11-06 v1.1 改判：Supply.Inventory.WarehousePriority 专属编辑器隐藏（P39 锁不渲染）；
-   * 底层读写与 store 动作保留，供载荷原样回写与既有数据能力，不作为维护面入口。 */
-  const p23Kinds = ['procurement-priority', 'purchase-lt', 'arrival-offset']
-  const p23MissingKinds = p23Kinds.filter((k) => !psView.includes(`kind="${k}"`))
+  /* -------- P23 采购落点编辑器：只留工作簿收录的两项 + 四个 store 写动作 --------
+   * 2026-11-09 用户定「以 0号位 11-04 工作簿为标准」：
+   *   工作簿只收 Procurement.WarehousePriority（#17）与 PlanningYields（#18~#20）；
+   *   DefaultPurchaseLt / ArrivalToUsableOffsets **工作簿未收录** ⇒ 页面撤除编辑器，
+   *   但载荷必须原样回写，故四个 store 写动作与读写口径一律保留。
+   * 判据先剥 HTML 注释：注释里提到的旧块不算渲染。 */
+  const p23VisiblePage = psView.replace(/<!--[\s\S]*?-->/g, '')
+  const p23KeepRendered = ['procurement-priority'].every((k) =>
+    p23VisiblePage.includes(`kind="${k}"`)
+  )
+  const p23RemovedKinds = ['purchase-lt', 'arrival-offset'].filter((k) =>
+    p23VisiblePage.includes(`kind="${k}"`)
+  )
   const p23Actions = [
     'setSupplyWarehousePriority',
     'setProcurementWarehousePriority',
@@ -3163,13 +3196,16 @@ function runWarehouseRefStatic() {
     /buffer\.value\.dirty\[block\]\s*=\s*true/.test(psStore) &&
     /buffer\.value\.dirty\.procurement\s*=\s*true/.test(psStore)
   const p23Ok =
-    p23MissingKinds.length === 0 && p23MissingActions.length === 0 && p23Writes
+    p23KeepRendered &&
+    p23RemovedKinds.length === 0 &&
+    p23MissingActions.length === 0 &&
+    p23Writes
   assert(
-    'P23 静态：采购三处落点各有专属编辑器 + 四个 store 写动作（供应落点按 v1.1 隐藏）',
+    'P23 静态：采购只渲染工作簿收录的「采购仓库优先级」；提前期/到货偏移编辑器已撤，四个写动作与载荷回写保留',
     p23Ok,
     p23Ok
-      ? '三个可见编辑器 + 四个写动作齐备'
-      : `缺编辑器[${p23MissingKinds.join(' / ')}] 缺动作[${p23MissingActions.join(' / ')}] 写入/置脏${p23Writes ? '齐' : '缺'}`
+      ? '保留 1 个编辑器 + 撤 2 个 + 四个写动作齐备'
+      : `保留项${p23KeepRendered ? '在' : '缺'} 仍渲染[${p23RemovedKinds.join(' / ')}] 缺动作[${p23MissingActions.join(' / ')}] 写入/置脏${p23Writes ? '齐' : '缺'}`
   )
 
   /* -------- P24 仓库码只能从字典里选（不得自由文本录入） -------- */
@@ -3589,10 +3625,12 @@ function runParameterSetFieldsStatic() {
   }
   const pf04Entries = pf04HitIdx.length
   const pf04Title = psPage.includes('新增字段')
+  // 只要求边上带 `:disabled="!actions.canEdit`（后面可能还接 `|| !hasAddableFields(...)`，
+  //   那条由 P34 单独锁；这里不能再写成整串相等，否则加条件就误红）
   const pf04Gate =
     pf04Entries >= 2 &&
     pf04HitIdx.every((i) =>
-      psPage.slice(Math.max(0, i - 500), i).includes(':disabled="!actions.canEdit"')
+      psPage.slice(Math.max(0, i - 500), i).includes(':disabled="!actions.canEdit')
     )
   const pf04Dialog = /v-model="addFieldDialog"/.test(psPage) && /onAddField\(\)/.test(psPage)
   const pf04Ok = pf04Entries >= 2 && pf04Title && pf04Gate && pf04Dialog
@@ -3693,7 +3731,7 @@ function runParameterSetFieldsStatic() {
  * ⚠️ `supply.Inventory.WarehousePriority`（原 H 类第 4 项）经 3号位 2026-11-06 v1.1 复核后
  *    改判**隐藏**：专属编辑器不渲染，值仍原样回写（不在通用目录，分类清单不变）。
  *
- *   PM01 字段目录登记 26 项分类，逐条与来函清单一致（C10/D6/E4/F3/H3，目录内）
+ *   PM01 字段目录登记 27 项分类，逐条与来函清单一致（C10/D6/E4/F4/H3，目录内）
  *   PM02 flattenBlocks 输出 hidden / fixed，且 hidden|fixed 一律 editable=false
  *   PM03 rowsGrouped 过滤 hidden（页面看不到隐藏行）
  *   PM04 「新增字段」候选清单排除隐藏分类（不能从下拉加回来）
@@ -3778,7 +3816,9 @@ function runParameterMaintenanceStatic() {
     lock: {
       'Sticky.RequireReleaseRecord': 'D',
       'Sticky.ProtectUntilCompletion': 'H',
-      'Sticky.ProtectUntilSupplyInvalid': 'H'
+      'Sticky.ProtectUntilSupplyInvalid': 'H',
+      // 0号位 终裁（2026-11-10）：#7「允许 PMC 人工强保护」整体移 V1.1、V1 不做 ⇒ F 类隐藏
+      'Trigger.AllowPmcManualProtection': 'F'
     }
   }
   const classOf = (path) => {
@@ -3806,12 +3846,12 @@ function runParameterMaintenanceStatic() {
       catSrc
     )
   const pm01Ok =
-    pm01Total === 26 && pm01Bad.length === 0 && pm01Annotated === 26 && pm01NoAB && pm01Types
+    pm01Total === 27 && pm01Bad.length === 0 && pm01Annotated === 27 && pm01NoAB && pm01Types
   assert(
-    'PM01 静态：字段目录登记 26 项维护责任分类，逐条与来函清单一致，A/B 不标注',
+    'PM01 静态：字段目录登记 27 项维护责任分类，逐条与来函清单一致，A/B 不标注',
     pm01Ok,
     pm01Ok
-      ? 'C10/D6/E4/F3/H3 全部命中，无 A/B 误标'
+      ? 'C10/D6/E4/F4/H3 全部命中，无 A/B 误标'
       : `条目=${pm01Total} 标注数=${pm01Annotated} 类型=${pm01Types ? '有' : '缺'} ` +
         `A/B误标=${pm01NoAB ? '无' : '有'} 不符=${pm01Bad.slice(0, 5).join('; ') || '无'}`
   )
@@ -4061,13 +4101,21 @@ function runParameterMaintenanceStatic() {
   /* -------- PM11 「暂未生效」标注文案不得是假承诺（2026-11-07 3号位回执 §五 K8）--------
    * 起因：页面原话「排产运行期还没读取它…后端接入后自动生效，不用重配」对 **K8 受控废弃**
    *   是假承诺（`AvailableTimeCalculator.cs:28` 写明「0号位 已同意后续受控废弃」，
-   *   不会再接入）；对 **K1** 也不够准（还得业务上先决定开不开放）；对 **D 类固定项** 同样不准。
+   *   不会再接入）；对 **D 类固定项** 同样不准。
+   *
+   * 2026-11-10 改口径（0号位 终裁，3号位 11-10 通知函）：**K1（#7 允许 PMC 人工强保护）
+   *   整体移 V1.1、V1 不做** ⇒ 不再是「开放＋排程接线中」，而是**整个字段从维护面撤掉**：
+   *   目录标 F 类（隐藏）⇒ 参数表不渲染、「新增字段」候选里也没有；
+   *   但**载荷原样保留回写**（现网快照里的 `true` 不动，V1 自动需求保护维持 G4 基线）。
    * 判据：
    *   ① K8（`OverdueMargin.MinimumExtraDays`）标注含「受控废弃」且**不含**「接入后自动生效」
-   *   ② K1（`Trigger.AllowPmcManualProtection`）标注含「正式开放」
+   *   ② **K1 已无任何页面标注**（`INERT_ANNOTATIONS` 里查无此项）且目录分类为 F（隐藏）
    *   ③ D 类三项标注**不含**「接入后自动生效」
    *   ④ 页面不再硬编码那句话（改走 `inertAnnotationOf`）
-   * 反向破坏自证：把 K8 的标注改回含「接入后自动生效」/ 去掉「正式开放」/ 页面写死文案 ⇒ PM11 转红。
+   *   ⑤ 旧口径（「待 0号位 配置」「等这一项正式开放并接入后自动生效」「正式开放」「接线中」）
+   *      不得残留在源码里
+   * 反向破坏自证：把 K8 的标注改回含「接入后自动生效」/ 把 K1 的 `maintenance` 去掉（变回可编辑）
+   *   / 把 K1 标注写回 / 把旧口径写回 treatment / 页面写死文案 ⇒ PM11 转红。
    */
   const annLit = literalOf(catSrc, 'const INERT_ANNOTATIONS')
   const annOf = (path) => {
@@ -4084,17 +4132,144 @@ function runParameterMaintenanceStatic() {
     'Split.LimitMandatorySplit'
   ].map((p) => annOf(p))
   const pm11K8Ok = !!annK8 && annK8.tag.includes('受控废弃') && !annK8.note.includes('接入后自动生效')
-  const pm11K1Ok = !!annK1 && annK1.note.includes('正式开放')
+  // K1：字段已撤出维护面 ⇒ 既没有徽标文案，目录分类也必须是 F（隐藏）
+  const pm11K1Ok = annK1 === null && classOf('Trigger.AllowPmcManualProtection') === 'F'
   const pm11DOk = annD.every((a) => !!a && !a.note.includes('接入后自动生效'))
   const pm11ViewOk =
     /inertAnnotationOf\(/.test(psPage) && !/该参数暂未生效：排产运行期还没读取它/.test(psPage)
-  const pm11Ok = pm11K8Ok && pm11K1Ok && pm11DOk && pm11ViewOk
+  const pm11LegacyOk =
+    !catSrc.includes('待 0号位 配置') &&
+    !catSrc.includes('正式开放') &&
+    !catSrc.includes('接线中') &&
+    !catSrc.includes('完成后自动生效')
+  const pm11Ok = pm11K8Ok && pm11K1Ok && pm11DOk && pm11ViewOk && pm11LegacyOk
   assert(
-    'PM11 静态：「暂未生效」标注按字段分文案，受控废弃/待开放/固定项不写「接入后自动生效」（假承诺）',
+    'PM11 静态：「暂未生效」标注按字段分文案不写假承诺；K1（#7）已整体撤出维护面（无徽标 + 目录 F 类隐藏）',
     pm11Ok,
     pm11Ok
-      ? 'K8=受控废弃 · K1=待开放 · D 类=固定项 · 页面走统一标注'
-      : `K8=${pm11K8Ok ? 'OK' : `错[${annK8 ? `${annK8.tag}|${annK8.note}` : '缺'}]`} K1=${pm11K1Ok ? 'OK' : '错'} D类=${pm11DOk ? 'OK' : '错'} 页面=${pm11ViewOk ? 'OK' : '仍写死文案'}`
+      ? 'K8=受控废弃 · K1=已撤出维护面（无标注 + F 类隐藏） · D 类=固定项 · 页面走统一标注 · 旧口径已清'
+      : `K8=${pm11K8Ok ? 'OK' : `错[${annK8 ? `${annK8.tag}|${annK8.note}` : '缺'}]`} K1=${pm11K1Ok ? 'OK' : `错[标注=${annK1 ? `${annK1.tag}|${annK1.note}` : '无'} 目录分类=${classOf('Trigger.AllowPmcManualProtection') || '无'}]`} D类=${pm11DOk ? 'OK' : '错'} 页面=${pm11ViewOk ? 'OK' : '仍写死文案'} 旧口径残留=${pm11LegacyOk ? '无' : '有'}`
+  )
+
+  /* -------- PM12 值域字段走下拉（不靠自由文本框挡错值）--------
+   * 起因：dev 上 `Trigger.ProtectedOrderTypes` 存着中文「振荡」——
+   *   后端只在**运行期**按 Ordinal 比对（`DemandProtectionTriggerEvaluator.cs:184` 订单类型集合包含
+   *   / `:170` 客户等级等值 / `:197` 成熟度集合包含），**发布校验不拦** ⇒ 错值既不报错也不命中
+   *   （配了等于没配，页面还看不出来）。自由文本框挡不住 ⇒ 值域字段一律给下拉。
+   * 值域真源：`parameterSetEnums.ts` 的字符串值域表（与数字枚举分开）。
+   * 判据：
+   *   ① 值域表含三组真实码（SALES_ORDER/PRODUCTION_INSTRUCTION、VIP/GENERAL、PRE_CONFIRMED/FORECAST）
+   *      且**不含**旧别名 SO / WO（那两个永不命中）
+   *   ② 参数行挂上 stringDomain（数组分支 + 标量分支都挂）
+   *   ③ 参数表里值域多选走 ElSelect multiple，且**排在**自由文本清单分支之前
+   *      （自由文本清单仍保留给没有值域的字段）
+   *   ④ 「新增字段」对话框同样只给下拉（单选 / 多选）
+   * 反向破坏自证：改坏值域表 / 把页面分支换回 textarea / 摘掉行上的 stringDomain ⇒ PM12 转红。
+   */
+  const enumsSrc = stripComments(readSrc('api/aps-v1/parameterSetEnums.ts'))
+  const pm12DomainOk =
+    /value: 'SALES_ORDER'/.test(enumsSrc) &&
+    /value: 'PRODUCTION_INSTRUCTION'/.test(enumsSrc) &&
+    /value: 'VIP'/.test(enumsSrc) &&
+    /value: 'GENERAL'/.test(enumsSrc) &&
+    /value: 'PRE_CONFIRMED'/.test(enumsSrc) &&
+    /value: 'FORECAST'/.test(enumsSrc) &&
+    !/value: 'SO'/.test(enumsSrc) &&
+    !/value: 'WO'/.test(enumsSrc)
+  const pm12RowOk =
+    (dbSrc.match(/stringDomain: lookupParameterStringDomain\(block, path\)/g) || []).length >= 2
+  const pm12MultiAt = psPage.indexOf(
+    'v-else-if="row.stringDomain && row.type === \'TEXT_LIST\'"'
+  )
+  const pm12TextAt = psPage.indexOf('v-else-if="row.type === \'TEXT_LIST\'"')
+  const pm12PageOk =
+    pm12MultiAt >= 0 &&
+    pm12TextAt >= 0 &&
+    pm12MultiAt < pm12TextAt &&
+    /v-else-if="row\.stringDomain && row\.type === 'TEXT_LIST'"[\s\S]{0,400}?multiple/.test(psPage) &&
+    /v-else-if="row\.stringDomain"/.test(psPage) &&
+    /v-else-if="addFieldDef\.kind === 'TEXT_LIST' && addFieldStringDomain"/.test(psPage) &&
+    /v-else-if="addFieldDef\.kind === 'TEXT' && addFieldStringDomain"/.test(psPage)
+  const pm12PathsOk = [
+    'Trigger.VipTierValue',
+    'Trigger.ProtectedOrderTypes',
+    'Trigger.MaturityStatusValues'
+  ].every((p) => catSrc.includes(`path: '${p}'`))
+  const pm12Ok = pm12DomainOk && pm12RowOk && pm12PageOk && pm12PathsOk
+  assert(
+    'PM12 静态：订单类型 / 客户等级 / 需求成熟度走下拉（只能选值域内的码），不给自由文本',
+    pm12Ok,
+    pm12Ok
+      ? '值域表三组真实码（无 SO/WO）· 行上挂 stringDomain · 表内与新增字段都是下拉'
+      : `值域表=${pm12DomainOk ? 'OK' : '错'} 行挂载=${pm12RowOk ? 'OK' : '缺'} 页面=${pm12PageOk ? 'OK' : `错(多选位=${pm12MultiAt} 文本位=${pm12TextAt})`} 目录路径=${pm12PathsOk ? 'OK' : '缺'}`
+  )
+
+  /* -------- PM13 工作簿未收录字段：维护面隐藏、载荷原样保留 --------
+   * 0号位 2026-11-04 工作簿 = 参数集维护面的唯一范围标准（用户 2026-11-09 拍板）。
+   * 工作簿 7 个 sheet 全文 `OverdueMargin` / `MaturityStatus` / `DefaultPurchaseLt` /
+   * `ArrivalToUsable` 零命中 ⇒ 这 4 个标量路径 + 2 个专属编辑器不上维护面。
+   * 判据：
+   *   ① `NOT_IN_WORKBOOK_FIELDS` 恰含这 4 个路径（缺一个就漏显示）
+   *   ② `isHiddenBlockField` 真的接上该清单（否则行照旧渲染、候选清单照旧出现）
+   *   ③ 该清单**不得渗进载荷路径**（store 的 buildPutBody 里出现即红）——
+   *      隐藏只影响 UI，值必须原样回写
+   * 反向破坏自证：从清单删一项 / 让 isHiddenBlockField 忽略它 / 把清单写进 store ⇒ PM13 转红。
+   */
+  const pm13Paths = [
+    'Trigger.ProtectMaturityStatus',
+    'Trigger.MaturityStatusValues',
+    'OverdueMargin.MarginPercent',
+    'OverdueMargin.MinimumExtraDays'
+  ]
+  // 只看清单块本身：路径在目录里也出现过，直接全文 includes 会假绿（删了清单项仍命中目录行）
+  const pm13ListSrc = (catSrc.match(/NOT_IN_WORKBOOK_FIELDS[\s\S]*?\n\}/) || [''])[0]
+  const pm13ListOk =
+    pm13ListSrc.length > 0 && pm13Paths.every((p) => pm13ListSrc.includes(`'${p}'`))
+  const pm13WiredOk = /export function isHiddenBlockField[\s\S]{0,400}?isNotInWorkbookField\(block, path\)/.test(
+    catSrc
+  )
+  const pm13PayloadClean = !/NOT_IN_WORKBOOK_FIELDS|isNotInWorkbookField/.test(psStore)
+  const pm13Ok = pm13ListOk && pm13WiredOk && pm13PayloadClean
+  assert(
+    'PM13 静态：工作簿未收录的 4 个标量字段不上维护面（隐藏），但载荷原样保留回写',
+    pm13Ok,
+    pm13Ok
+      ? '清单 4 项齐 · isHiddenBlockField 已接入 · store 载荷路径未污染'
+      : `清单=${pm13ListOk ? '齐' : '缺项'} 接线=${pm13WiredOk ? 'OK' : '断'} 载荷路径=${pm13PayloadClean ? '干净' : '被污染'}`
+  )
+
+  /* -------- PM14 #7「允许 PMC 人工强保护」已整体撤出维护面（2026-11-10 0号位终裁）--------
+   * 0号位 终裁：#7 整体移 V1.1、V1 不做 ⇒ 用户拍板「直接在页面中去掉这个即可」。
+   * 落地口径（三处缺一不可）：
+   *   ① 字段目录标 **F 类**（V1 不使用 ⇒ 隐藏）：参数表不渲染、也不进「新增字段」候选；
+   *   ② 台账 K1 同步改 F（PM10 要求目录分类与台账分类相等）；
+   *   ③ 徽标文案整条撤除（字段都不显示了，再挂「暂未生效」是死代码）。
+   * **载荷不删**：现网 13 个参数集版本里该值仍为 `true`，V1 自动需求保护维持 2026-10-29 G4 基线
+   *   ⇒ `buildPutBody` 原样回写（PM06 已锁），本条只管「不上维护面」。
+   * 判据：
+   *   ① 目录分类 = F
+   *   ② 台账 K1 cls = F
+   *   ③ `INERT_ANNOTATIONS` 里查无该字段
+   *   ④ 用户可见教学文档不再出现旧口径「开放＋排程接线中」，且写明「V1.1」
+   * 反向破坏自证：去掉目录里的 `maintenance: 'F'` / 把台账 cls 改回 A / 把徽标写回 ⇒ PM14 转红。
+   */
+  const pm14Path = 'Trigger.AllowPmcManualProtection'
+  const pm14ClsOk = classOf(pm14Path) === 'F'
+  const pm14Ledger = ledgerEntries.find((e) => e.path === pm14Path)
+  const pm14LedgerOk = !!pm14Ledger && pm14Ledger.k === 'K1' && pm14Ledger.cls === 'F'
+  const pm14AnnGone = annOf(pm14Path) === null
+  const pm14Guide = readFileSync(
+    join(__dirname, '..', 'docs', 'APS排产系统_规则集与参数集维护_用户操作教学_v1.1_20261022.md'),
+    'utf-8'
+  )
+  const pm14GuideOk = !pm14Guide.includes('开放＋排程接线中') && pm14Guide.includes('V1.1')
+  const pm14Ok = pm14ClsOk && pm14LedgerOk && pm14AnnGone && pm14GuideOk
+  assert(
+    'PM14 静态：#7「允许 PMC 人工强保护」已整体撤出维护面（目录 F 类隐藏 + 台账 F + 无徽标 + 文档旧口径已清）',
+    pm14Ok,
+    pm14Ok
+      ? '目录 F · 台账 K1=F · 徽标已撤 · 教学文档写明 V1.1'
+      : `目录分类=${classOf(pm14Path) || '无'} 台账=${pm14Ledger ? `${pm14Ledger.k}/${pm14Ledger.cls}` : '缺'} 徽标=${pm14AnnGone ? '已撤' : '仍在'} 文档=${pm14GuideOk ? 'OK' : pm14Guide.includes('开放＋排程接线中') ? '仍有旧口径' : '未写明 V1.1'}`
   )
 }
 
@@ -4689,9 +4864,12 @@ async function verifyCtpDomainKey(token) {
         : '仍含 FACTORY_FALLBACK / F-SUZ-01 / F-CDG-02 假值'
   )
 
-  // A09 静态：Ctp.vue 物料下拉调 materialLookupApi.listActiveMaterials()（real API）+ 兜底
-  //   - 端点：GET /api/governance/lookups/materials?activeOnly=true（无 search 全量）
+  // A09 静态：Ctp.vue 物料下拉走真实 API（初载 listActiveMaterials* + 远程搜索 searchMaterials*）+ 无假兜底
+  //   - 端点：GET /api/governance/lookups/materials?activeOnly=true（初载）/ ?search=片段（远程搜索）
   //   - 后端 SetupRuleController.cs:333 已含 activeOnly 参数，按既有契约适配
+  //   - ⚠️ 2026-11-14 改版：物料改**远程搜索**（后端不带 search 时 LIMIT 200 ⇒ 200 条外的物料下拉里选不到），
+  //     初载调用被收进 loadMaterials() 辅助函数 ⇒ 判据从「onMounted 块内出现 listActiveMaterials()」
+  //     放宽为「文件内出现 listActiveMaterials* + searchMaterials* 两次真实调用」。
   const materialImportMatch =
     /import\s*\{[^}]*\bmaterialLookupApi\b[^}]*\}\s*from\s*['"]@\/api\/aps-v1\/materialLookup['"]/.test(
       ctpVueContent
@@ -4702,9 +4880,11 @@ async function verifyCtpDomainKey(token) {
     )
   const materialNoHardcodedArray =
     !/^\s*const\s+MATERIAL_OPTIONS\s*=\s*\[[\s\S]*?\bcode\s*:\s*'M-001'/.test(ctpVueContent)
-  const callsListActiveMaterials = /\bmaterialLookupApi\s*\.\s*listActiveMaterials\s*\(\s*\)/.test(
-    onMountedBlock
-  )
+  const callsListActiveMaterials =
+    /\bmaterialLookupApi\s*\.\s*listActiveMaterials(OrThrow)?\s*\(\s*\)/.test(ctpVueContent)
+  // 远程搜索：按片段查（后端 LIKE），否则 200 条之外的物料选不到
+  const callsSearchMaterials =
+    /\bmaterialLookupApi\s*\.\s*searchMaterials(OrThrow)?\s*\(/.test(ctpVueContent)
   // 同 A08：不得有假物料兜底（M-001 ~ M-007 在 dev 实库零重合）
   const noMaterialFallback =
     !/MATERIAL_FALLBACK/.test(ctpVueContent) && !/'M-001'/.test(ctpVueContent)
@@ -4713,9 +4893,10 @@ async function verifyCtpDomainKey(token) {
     materialRefMatch &&
     materialNoHardcodedArray &&
     callsListActiveMaterials &&
+    callsSearchMaterials &&
     noMaterialFallback
   assert(
-    'A09 静态：Ctp.vue 物料下拉调 materialLookupApi.listActiveMaterials()，且无硬编码物料兜底',
+    'A09 静态：Ctp.vue 物料下拉走真实 API（初载 + 远程搜索），且无硬编码物料兜底',
     a09,
     a09
       ? '已接 API 且无假值'
@@ -4724,8 +4905,10 @@ async function verifyCtpDomainKey(token) {
         : !materialRefMatch
           ? 'MATERIAL_OPTIONS 未声明为 ref<MaterialLookupItem[]>([])'
           : !callsListActiveMaterials
-            ? 'onMounted 未调 listActiveMaterials()'
-            : '仍含 MATERIAL_FALLBACK / M-001 假值'
+            ? '未调 materialLookupApi.listActiveMaterials*()'
+            : !callsSearchMaterials
+              ? '未调 materialLookupApi.searchMaterials*()（远程搜索缺）'
+              : '仍含 MATERIAL_FALLBACK / M-001 假值'
   )
 
   // A10 静态：工厂/物料拉取失败时**如实提示**（optionLoadError），而不是静默给空下拉
@@ -4765,6 +4948,91 @@ async function verifyCtpDomainKey(token) {
     'A11 静态：CTP 根因码复用冻结 15 码 + 未知码降级（走共享 reasonLabelOf / 不自拟码表 / 不裸索引）',
     a11,
     `类型=${ctpReasonTyped} 自拟码残留=${ctpSelfInvented} 共用字典=${ctpSharedDict} 降级=${ctpDegrade} 无裸索引=${ctpNoBareIndex}`
+  )
+
+  /* -------- A12-A17 静态（2026-11-14 工厂视角改版）--------
+   * 改版内容：物料远程搜索 / 工厂只放真业务码 / 501 翻大白话 / 评估时刻用真值 / 复制结论 / 失败清旧结论。
+   * 每条都可用反向破坏证伪（见 scripts/selfverify-ctp-1114.mjs）。
+   */
+  const ctpApiContent = readSrc('api/aps-v1/ctp.ts')
+
+  // A12 静态：物料下拉是**远程搜索**组件（remote + remote-method），且不在前端自己做本地过滤
+  //   - 反例：去掉 `remote` 属性 → 转红（后端 LIMIT 200 ⇒ 200 条外的物料选不到）
+  const materialRemoteSelect =
+    /<ElSelect\b[^>]*\sremote\s[^>]*:remote-method\s*=\s*["']onMaterialSearch["']/.test(
+      ctpVueContent
+    )
+  const materialNoLocalFilter = !/filter-method\s*=/.test(ctpVueContent)
+  const a12 = materialRemoteSelect && materialNoLocalFilter
+  assert(
+    'A12 静态：CTP 物料下拉为远程搜索（remote + onMaterialSearch），前端不做本地过滤',
+    a12,
+    `远程下拉=${materialRemoteSelect} 无本地过滤=${materialNoLocalFilter}`
+  )
+
+  // A13 静态：工厂下拉只放真业务码白名单（后端主数据混着 44 条 TF_* 测试夹具）
+  //   - 反例：去掉白名单过滤（铺全表）→ 转红
+  const factoryWhitelistImport = /BIZ_ISSUE_FACTORY_CODES/.test(ctpVueContent)
+  const factoryWhitelistFilter = /\.filter\(\(f\) => allow\.has\(/.test(ctpVueContent)
+  const a13 = factoryWhitelistImport && factoryWhitelistFilter
+  assert(
+    'A13 静态：CTP 工厂下拉按真业务码白名单过滤（不铺 TF_* 测试夹具）',
+    a13,
+    `引用白名单=${factoryWhitelistImport} 白名单过滤=${factoryWhitelistFilter}`
+  )
+
+  // A14 静态：后端 501（试算未接入）翻成大白话，且 api 层静音不弹内部报文
+  //   - 反例：把 501 判断改掉 / 去掉 silent → 转红
+  const friendly501 = /errorCode\.value === 501/.test(ctpVueContent)
+  const friendlyUsed = /v-if="friendlyError"/.test(ctpVueContent)
+  const evalSilent = /url:\s*['"]\/api\/ctp\/evaluate['"][\s\S]{0,200}?silent:\s*true/.test(
+    ctpApiContent
+  )
+  const a14 = friendly501 && friendlyUsed && evalSilent
+  assert(
+    'A14 静态：CTP 501 翻大白话展示（friendlyError）+ api 层静音不弹内部报文',
+    a14,
+    `501分支=${friendly501} 模板用friendlyError=${friendlyUsed} api静音=${evalSilent}`
+  )
+
+  // A15 静态：评估时刻用**真实评估时刻**（store.evaluatedAt），不是渲染时刻 dayjs()
+  //   - 反例：verdict-sub 改回 `评估时间：{{ dayjs().format('YYYY-MM-DD HH:mm') }}` → 转红
+  //   - ⚠️ 判据只锁「评估时刻」这一处：自动生成的评估编号 `PO-${dayjs().format('YYYYMMDD-HHmm')}` 不算渲染时刻
+  const evaluatedAtUsed = /evaluatedAt\s*\?\s*dayjs\(evaluatedAt\)/.test(ctpVueContent)
+  const noRenderTime = !/dayjs\(\)\.format\('YYYY-MM-DD HH:mm'\)/.test(ctpVueContent)
+  const a15 = evaluatedAtUsed && noRenderTime
+  assert(
+    'A15 静态：CTP 评估时刻用 store.evaluatedAt（真实评估时刻），不用渲染时刻',
+    a15,
+    `用evaluatedAt=${evaluatedAtUsed} 无渲染时刻=${noRenderTime}`
+  )
+
+  // A16 静态：结论可复制（工厂用户要把结论发给客户）
+  //   - 反例：删掉 copyVerdict → 转红
+  const copyFn = /function\s+copyVerdict\s*\(/.test(ctpVueContent)
+  const copyApi = /navigator\.clipboard\.writeText/.test(ctpVueContent)
+  const copyBtn = /复制结论/.test(ctpVueContent)
+  const a16 = copyFn && copyApi && copyBtn
+  assert(
+    'A16 静态：CTP 结果区有「复制结论」（写剪贴板 + 按钮）',
+    a16,
+    `函数=${copyFn} 剪贴板=${copyApi} 按钮=${copyBtn}`
+  )
+
+  // A17 静态：评估失败时清掉旧结论（避免把上一轮结论当这次的答案）
+  //   - 反例：删掉 catch 里的 result.value = null → 转红
+  const evaluateBody = (() => {
+    const m = ctpStoreContent.match(/async\s+function\s+evaluate[\s\S]*?\n  \}/)
+    return m ? m[0] : ''
+  })()
+  const catchClearsResult = /catch\s*\([^)]*\)\s*\{[\s\S]*?result\.value = null/.test(
+    evaluateBody
+  )
+  const a17 = evaluateBody.length > 0 && catchClearsResult
+  assert(
+    'A17 静态：CTP 评估失败清空旧结论（catch 里 result = null）',
+    a17,
+    catchClearsResult ? '已清空' : '未清空旧结论'
   )
 
   /* -------- C01/C02 静态（lps/ C 路径契约层，3号位 09-30 落码）--------
@@ -5026,28 +5294,48 @@ async function verifyManualEta(token) {
    * 依据：
    *  - 5号位 SetupRuleController L333 已提供 /api/governance/lookups/materials?activeOnly= 端点
    *  - 4号位 复用 materialLookupApi.listActiveMaterials()（与 CTP 同源）
-   * 验收口径：
-   *  - ManualEta.vue 引入 materialLookupApi + MaterialLookupItem 类型
-   *  - 含 materialOptions ref + loadMaterialOptions() 异步加载 + onMounted 调用
+   * 验收口径（2026-11-14 改：物料候选由「预拉前 200 条」改为**远程搜索**）：
+   *  - ManualEta.vue 含 MaterialLookupItem 类型
+   *  - 含 materialOptions ref
+   *  - 物料候选走 manualEtaApi.searchMaterials()（远程按关键字搜，不再开抽屉拉全量）
+   *  - ElSelect 远程模式（remote + :remote-method="onMaterialSearch"）
+   *  - 已撤 loadMaterialOptions（不再预拉）
    *  - 含 materialKey → materialId + materialCode 同步 watch
    *  - 含 ElSelect v-model="form.materialKey"（替代原两个 ElInput）
    *  - 编辑态反例：不应再出现 ElInput v-model="form.materialId" 或 v-model="form.materialCode"
    */
   const me09Vue = readSrc('views/Aps/ManualEta.vue')
-  const me09a = /import\s+\{[^}]*materialLookupApi[^}]*\}\s+from\s+['"]\@\/api\/aps-v1\/materialLookup['"]/.test(me09Vue)
-  assert('ME09a 静态：ManualEta.vue 引入 materialLookupApi', me09a, me09a ? '已引入' : '缺导入')
+  const me09a =
+    !/materialLookupApi\.listActiveMaterials\s*\(/.test(me09Vue) && /manualEtaApi\.searchMaterials\s*\(/.test(me09Vue)
+  assert(
+    'ME09a 静态：ManualEta.vue 物料候选走 manualEtaApi.searchMaterials（远程搜索，不再拉前 200 条全量）',
+    me09a,
+    me09a ? '已改远程搜索' : '未走 searchMaterials（或仍在调 listActiveMaterials）'
+  )
 
   const me09b = /MaterialLookupItem/.test(me09Vue)
   assert('ME09b 静态：ManualEta.vue 含 MaterialLookupItem 类型', me09b, me09b ? '已含' : '缺类型')
 
-  const me09c = /materialOptions\s*=\s*ref<MaterialLookupItem\[\]>/.test(me09Vue)
-  assert('ME09c 静态：ManualEta.vue materialOptions ref<MaterialLookupItem[]>', me09c, me09c ? '已含' : '缺 ref')
+  // 11-14：候选类型扩成 MaterialCandidate（两种来源统一：supply-combos 的组合 / materials 的纯物料）
+  const me09c = /materialOptions\s*=\s*ref<(MaterialLookupItem|MaterialCandidate)\[\]>/.test(me09Vue)
+  assert('ME09c 静态：ManualEta.vue materialOptions ref<候选数组>', me09c, me09c ? '已含' : '缺 ref')
 
-  const me09d = /materialLookupApi\.listActiveMaterials\s*\(/.test(me09Vue)
-  assert('ME09d 静态：ManualEta.vue loadMaterialOptions 调 listActiveMaterials()', me09d, me09d ? '已调' : '缺调用')
+  const me09d =
+    /<ElSelect\b[^>]*remote/.test(me09Vue) &&
+    /:remote-method="onMaterialSearch"/.test(me09Vue) &&
+    /function\s+onMaterialSearch\s*\(/.test(me09Vue)
+  assert(
+    'ME09d 静态：ManualEta.vue 物料下拉是远程模式（ElSelect remote + :remote-method="onMaterialSearch"）',
+    me09d,
+    me09d ? '已是远程模式' : '缺 remote / remote-method'
+  )
 
-  const me09e = /onMounted\s*\(\s*\(\s*\)\s*=>\s*\{[\s\S]*?loadMaterialOptions\s*\(\s*\)/.test(me09Vue)
-  assert('ME09e 静态：ManualEta.vue onMounted 含 loadMaterialOptions()', me09e, me09e ? '已挂载' : '缺 onMounted')
+  const me09e = !/loadMaterialOptions/.test(me09Vue)
+  assert(
+    'ME09e 静态：ManualEta.vue 不再预拉物料候选（已撤 loadMaterialOptions）',
+    me09e,
+    me09e ? '已撤' : '仍在预拉'
+  )
 
   const me09f = /watch\s*\(\s*\(\s*\)\s*=>\s*form\.value\.materialKey[\s\S]*?materialId\s*=\s*found\.masterId[\s\S]*?materialCode\s*=\s*found\.code/.test(me09Vue)
   assert('ME09f 静态：ManualEta.vue watch 同步 materialKey → materialId + materialCode', me09f, me09f ? '已同步' : '缺 watch 同步')
@@ -5094,8 +5382,13 @@ async function verifyManualEta(token) {
     /if\s*\(\s*filter\s*\?\s*\.\s*materialCodes\s*\?\s*\.\s*length\s*\)\s*out\.materialCodes\s*=/.test(me10Api)
   assert('ME10b 静态：manualEtaApi.serializeFilter 序列化 materialCodes 为逗号分隔', me10b, me10b ? '已序列化' : '缺序列化分支')
 
-  const me10c = /syncFilterDraft[\s\S]*?materialCodes\s*:\s*selectedMaterialCodes\.value\.length/.test(me09Vue)
-  assert('ME10c 静态：ManualEta.vue syncFilterDraft 把 selectedMaterialCodes 透传给 materialCodes', me10c, me10c ? '已透传' : '仍硬编码 undefined')
+  const me10c =
+    /baseFilter\s*\(\)[\s\S]*?materialCodes\s*:\s*selectedMaterialCodes\.value\.length/.test(me09Vue)
+  assert(
+    'ME10c 静态：ManualEta.vue baseFilter 把 selectedMaterialCodes 透传给 materialCodes',
+    me10c,
+    me10c ? '已透传' : '仍硬编码 undefined'
+  )
 
   const me10d = !/materialIds\s*:\s*undefined,\s*\/\/\s*DTO\s+是\s+materialIds/.test(me09Vue) ||
     /UI\s+用\s+code\s+选/.test(me09Vue)
@@ -5166,11 +5459,26 @@ async function verifyManualEta(token) {
 
   const me12e =
     /async\s+function\s+onPageChange[\s\S]*?store\s*\.\s*load\s*\(/.test(me09Vue) &&
-    /async\s+function\s+onSizeChange[\s\S]*?store\s*\.\s*load\s*\(\s*\{[\s\S]*?pageIndex\s*:\s*1/.test(me09Vue)
+    /async\s+function\s+onSizeChange[\s\S]*?store\s*\.\s*load\s*\(\s*baseFilter\(\)\s*,\s*bucket\.value\s*,\s*\{[\s\S]*?pageIndex\s*:\s*1/.test(
+      me09Vue
+    )
   assert('ME12e 静态：ManualEta.vue onPageChange / onSizeChange 调 store.load（改页长 → 跳回第 1 页）', me12e, me12e ? '已闭环' : '缺回调函数体')
 
-  const me12f = /applyFilter[\s\S]*?pageIndex\s*:\s*1/.test(me09Vue)
-  assert('ME12f 静态：ManualEta.vue applyFilter 重置 pageIndex=1（避免筛选无交集时空态错觉）', me12f, me12f ? '已重置' : '筛选未重置分页')
+  // 11-12 改版：筛选不再是「点按钮才生效」，而是 @change 即时重查（onFilterChange → reload(true)），
+  //   分页重置由 reload(resetPage) 统一负责 ⇒ 判据从「applyFilter 重置 pageIndex」改为
+  //   「onFilterChange → reload(true) → pageIndex 取 1」。
+  const me12f =
+    /async\s+function\s+onFilterChange\s*\(\s*\)\s*:\s*Promise<void>\s*\{[\s\S]*?reload\(\s*true\s*\)/.test(
+      me09Vue
+    ) &&
+    /async\s+function\s+reload\s*\(\s*resetPage\s*=\s*false\s*\)[\s\S]*?pageIndex\s*:\s*resetPage\s*\?\s*1\s*:/.test(
+      me09Vue
+    )
+  assert(
+    'ME12f 静态：ManualEta.vue 筛选变更走 reload(true) → pageIndex 重置为 1（避免筛选无交集时空态错觉）',
+    me12f,
+    me12f ? '已重置' : '筛选未重置分页'
+  )
 
   /* -------- ME13 静态：收货仓库列展示 name（10-09 加列名映射）--------
    *  - ManualEta.vue 含 warehouseNameMap computed（基于 warehouseOptions 派生 code → name）
@@ -5203,54 +5511,651 @@ async function verifyManualEta(token) {
     /\(a\.receivingWarehouse\s*\?\?\s*''\)\s*===\s*\(b\.receivingWarehouse\s*\?\?\s*''\)/.test(me14Store)
   assert('ME14c 静态：sameBusinessKey 含 materialId + receivingWarehouse（4 键完整）', me14c, me14c ? '4 键齐备' : '缺 materialId / receivingWarehouse 对齐')
 
-  /* -------- ME15 静态：KPI 三卡改读累计值（10-12 ME13 收）--------
-   *  - 触发：5号位 10-12 函三函都已落地（ManualETA 10-08 / business-fact-issues 10-10 / manual-capacity 10-12）
-   *  - 5号位 未落 summary 聚合端点 → store 端维护 cumulative KPI（active + cancelled）
-   *  - KPI 三卡：总记录数 = backend `total`（全集）/ 启用 = totalActive / 已取消 = totalCancelled
-   *  - 不再读 list.length / activeCount / cancelledCount（per-page 会跳）
+  /* -------- ME15 静态：指标条改读后端真实计数（11-12 工厂视角改版）--------
+   *  - 旧口径（10-12 ME13）：store 端「翻页累加」近似 totalActive / totalCancelled
+   *    ⇒ 问题一：累加只覆盖**访问过的页**，没翻到的页永远算不进来
+   *    ⇒ 问题二：三个数字（total / totalActive / totalCancelled）互相不闭合
+   *    ⇒ 问题三：与后端 total 对不上时，页面无法解释「为什么总数和列表不一样」
+   *  - 新口径：counts { all, active, cancelled, overdue, dueSoon } 全部来自后端 COUNT
+   *    （同一组筛选 + 同一 WHERE 语义）⇒ 指标与列表永远一致
    *  - 反向探针自证可失败：
-   *     - 删 totalActive/totalCancelled → ME15a 由绿转红
-   *     - KPI 卡回退读 list.length → ME15b 由绿转红
-   *     - 删 cumulative reset → ME15c 由绿转红
+   *     - counts 少一个字段 → ME15a 红
+   *     - 恢复 cumulative 累加痕迹 → ME15b 红
+   *     - kpiItems 某项不再读 counts.value.<key> → ME15c 红
+   *     - cancelled 不再由 all − active 得出 → ME15d 红
    */
   const me15Store = readSrc('store/modules/aps/manualEta.ts')
   const me15View = readSrc('views/Aps/ManualEta.vue')
-  // a. store 增 totalActive + totalCancelled 两个 ref
-  const me15aStoreHasRefs =
-    /const\s+totalActive\s*=\s*ref(?:<number>)?\s*\(0\)/.test(me15Store) &&
-    /const\s+totalCancelled\s*=\s*ref(?:<number>)?\s*\(0\)/.test(me15Store)
-  // b. KPI 三卡不读 list.length / activeCount / cancelledCount
-  const me15bKpiNotListLength =
-    !/kpi-value[^>]*>\s*\{\{\s*list\.length\s*\}\}/.test(me15View) &&
-    !/kpi-value[^>]*>\s*\{\{\s*activeCount\s*\}\}/.test(me15View) &&
-    !/kpi-value[^>]*>\s*\{\{\s*cancelledCount\s*\}\}/.test(me15View)
-  // KPI 三卡读 total / totalActive / totalCancelled
-  const me15bKpiUseTotal =
-    /kpi-value[^>]*>\s*\{\{\s*total\s*\}\}/.test(me15View) &&
-    /kpi-value[^>]*>\s*\{\{\s*totalActive\s*\}\}/.test(me15View) &&
-    /kpi-value[^>]*>\s*\{\{\s*totalCancelled\s*\}\}/.test(me15View)
-  const me15b = me15bKpiNotListLength && me15bKpiUseTotal
-  // c. store 维护 cumulative：resetKpiAggregate + accumulateKpi + load 内调用 + upsert/cancel 同步翻转
-  const me15cReset =
-    /function\s+resetKpiAggregate\(\):\s*void\s*\{[\s\S]{0,200}?totalActive\.value\s*=\s*0/.test(me15Store) &&
-    /function\s+resetKpiAggregate\(\):\s*void\s*\{[\s\S]{0,200}?totalCancelled\.value\s*=\s*0/.test(me15Store)
-  const me15cAccumulate =
-    /function\s+accumulateKpi\([\s\S]{0,300}?if\s*\(item\.isActive\)\s*totalActive\.value\s*\+=\s*1/.test(me15Store) &&
-    /function\s+accumulateKpi\([\s\S]{0,300}?else\s*totalCancelled\.value\s*\+=\s*1/.test(me15Store)
-  const me15cLoadCalls =
-    /accumulateKpi\(\s*currentPage\s*\)/.test(me15Store) ||
-    /accumulateKpi\(\s*pageIndex\.value\s*\)/.test(me15Store)
-  const me15c = me15cReset && me15cAccumulate && me15cLoadCalls
-  // d. view 暴露 totalActive / totalCancelled（storeToRefs 解构）
-  const me15dViewExposes =
-    /totalActive[\s\S]{0,40}?totalCancelled[\s\S]{0,80}?=\s*storeToRefs\(/.test(me15View)
-  const me15All = me15aStoreHasRefs && me15b && me15c && me15dViewExposes
+  // 本地切片工具：避免整文件 includes 造成假绿（同名调用多处时只判目标片段）
+  const meSlice = (code, from, to) => {
+    const i = code.indexOf(from)
+    if (i < 0) return ''
+    const j = to ? code.indexOf(to, i + from.length) : code.length
+    return code.slice(i, j < 0 ? code.length : j)
+  }
+  // a. store 的 counts 赋值块含 5 个字段
+  const me15CountsBlock = meSlice(me15Store, 'counts.value = {', 'lastFilter.value')
+  const me15aCounts =
+    me15CountsBlock.length > 0 &&
+    ['all', 'active', 'cancelled', 'overdue', 'dueSoon'].every((k) =>
+      new RegExp('\\b' + k + '\\b').test(me15CountsBlock)
+    )
   assert(
-    'ME15 静态：KPI 三卡改读累计值（store totalActive/totalCancelled + cumulative 维护 + view 三卡不读 list.length）',
-    me15All,
-    me15All
-      ? '全齐'
-      : `storeRefs=${me15aStoreHasRefs} kpiUseTotal=${me15bKpiUseTotal} kpiNotPage=${me15bKpiNotListLength} reset=${me15cReset} accumulate=${me15cAccumulate} loadCalls=${me15cLoadCalls} viewExposes=${me15dViewExposes}`
+    'ME15a 静态：store counts 赋值块含全部/生效中/已取消/已过期/7 天内到期 五项（后端真实计数）',
+    me15aCounts,
+    me15aCounts ? '五项齐备' : 'counts 块=' + JSON.stringify(me15CountsBlock).slice(0, 160)
+  )
+  // b. 旧 cumulative 累加痕迹必须彻底消失
+  //    ⚠️ 必须先剥注释：store 的历史说明里写着「旧口径：翻页累加近似 totalActive / totalCancelled」，
+  //    不剥会把这段**说明**判成残留 ⇒ 假红（ME15b 踩过）。
+  const me15StoreCode = stripComments(me15Store)
+  const me15bNoCumulative =
+    !/resetKpiAggregate/.test(me15StoreCode) &&
+    !/accumulateKpi/.test(me15StoreCode) &&
+    !/visitedPages/.test(me15StoreCode) &&
+    !/totalActive/.test(me15StoreCode) &&
+    !/totalCancelled/.test(me15StoreCode)
+  assert(
+    'ME15b 静态：store 不含「翻页累加」痕迹（resetKpiAggregate / accumulateKpi / visitedPages / totalActive / totalCancelled）',
+    me15bNoCumulative,
+    me15bNoCumulative ? '已清除' : '仍有累计近似值残留'
+  )
+  // c. view 的 kpiItems 块 5 项分别读 counts.value.<key>
+  const me15KpiBlock = meSlice(me15View, 'const kpiItems = computed<KpiItem[]>(', '])')
+  const me15cKpi =
+    me15KpiBlock.length > 0 &&
+    ['all', 'active', 'cancelled', 'overdue', 'dueSoon'].every((k) =>
+      new RegExp('counts\\.value\\.' + k + '\\b').test(me15KpiBlock)
+    )
+  assert(
+    'ME15c 静态：view 指标条 5 项分别读 counts.value.all/active/cancelled/overdue/dueSoon',
+    me15cKpi,
+    me15cKpi ? '五项均读 counts' : 'kpiItems 块=' + JSON.stringify(me15KpiBlock).slice(0, 200)
+  )
+  // d. 已取消 = 后端 summary 的 cancelledCount
+  //   ⚠️ 口径反转（11-13，5号位 2026-11-12 已补 cancelledOnly 参数 + summary 桶）：
+  //      旧口径「全部 − 生效中」是前端近似值；现在直接取后端真值。
+  const me15dCancelled = /cancelled:\s*sum\?\.cancelledCount\s*\?\?\s*0/.test(me15Store)
+  assert(
+    'ME15d 静态：store 的已取消数取后端 summary 的 cancelledCount（不再用「全部 − 生效中」近似）',
+    me15dCancelled,
+    me15dCancelled ? '取后端真值' : 'cancelled 不是 summary.cancelledCount'
+  )
+
+  /* -------- ME16 静态：撤页头大标题（2026-10-16 定调：页面不要大标题页头）--------
+   *  - 旧版有 .page-header（h2.page-title + p.page-sub）+ 独立刷新按钮
+   *  - 新版：刷新/新增收进列表卡头部（.panel-actions），页面顶部直接是指标条
+   */
+  const me16a =
+    !/class="page-header"/.test(me15View) &&
+    !/class="page-title"/.test(me15View) &&
+    !/class="page-sub"/.test(me15View)
+  assert(
+    'ME16a 静态：ManualEta.vue 不含页头大标题（page-header / page-title / page-sub）',
+    me16a,
+    me16a ? '已撤' : '仍有页头大标题'
+  )
+  const me16b = /class="panel-actions"/.test(me15View) && /vi-ep:refresh/.test(me15View)
+  assert(
+    'ME16b 静态：刷新/新增按钮收进列表卡头部（panel-actions）',
+    me16b,
+    me16b ? '已收进卡片头' : '未找到 panel-actions'
+  )
+
+  /* -------- ME17 静态：紧凑指标条（一行 5 项 + 口径说明同一行）--------
+   *  - 沿用订单页 .kpi-row / .kpi-item / .kpi-bar / .kpi-caption 样式（跨页一致）
+   *  - 5 个分类标签：全部记录 / 生效中 / 已取消 / 已过期 / 7 天内到期
+   */
+  const me17a =
+    /class="kpi-row"/.test(me15View) &&
+    /class="kpi-item"/.test(me15View) &&
+    /class="kpi-bar"/.test(me15View) &&
+    /class="kpi-caption"/.test(me15View)
+  assert(
+    'ME17a 静态：指标条用紧凑一行样式（kpi-row / kpi-item / kpi-bar / kpi-caption）',
+    me17a,
+    me17a ? '已是紧凑行' : '缺紧凑指标条样式'
+  )
+  const me17b =
+    ["'全部记录'", "'生效中'", "'已取消'", "'已过期'", "'7 天内到期'"].every((s) =>
+      me15View.includes(s)
+    )
+  assert(
+    'ME17b 静态：指标条 5 个分类标签齐备（全部记录 / 生效中 / 已取消 / 已过期 / 7 天内到期）',
+    me17b,
+    me17b ? '五项齐备' : '分类标签缺失'
+  )
+
+  /* -------- ME18 静态：筛选即生效（不再有「筛选」按钮）--------
+   *  - 旧版：下拉改完要点「筛选」才查，用户常忘点 ⇒ 看到的还是旧数据
+   *  - 新版：三个下拉 @change 即重查（并回到第 1 页）；只剩「重置」
+   */
+  const me18a = !/>\s*筛选\s*</.test(me15View)
+  assert(
+    'ME18a 静态：ManualEta.vue 不含「筛选」按钮（筛选变更即生效）',
+    me18a,
+    me18a ? '已撤' : '仍有「筛选」按钮'
+  )
+  const me18b =
+    (me15View.match(/@change="onFilterChange"/g) || []).length >= 3 &&
+    /async function onFilterChange\(\): Promise<void> \{[\s\S]{0,200}?reload\(true\)/.test(
+      me15View
+    )
+  assert(
+    'ME18b 静态：三个筛选下拉都绑 @change="onFilterChange" 且回调重查并回到第 1 页',
+    me18b,
+    me18b ? '即生效闭环' : '下拉未绑即生效回调'
+  )
+
+  /* -------- ME19 静态：收货仓库筛选真正落参数（后端早就支持，前端一直没用）--------
+   *  - 后端 ?receivingWarehouses= 逗号分隔（ProcurementManualEtaController.cs:50）
+   *  - 前端三处：api serializeFilter / store buildQuery / view 下拉
+   */
+  const me19a =
+    /out\.receivingWarehouses\s*=\s*filter\.receivingWarehouses\.join\(\s*','\s*\)/.test(
+      serializeFnBlock
+    )
+  const me19b = /receivingWarehouses:\s*base\.receivingWarehouses\?\.length/.test(me15Store)
+  const me19c = /v-model="selectedWarehouses"/.test(me15View)
+  const me19All = me19a && me19b && me19c
+  assert(
+    'ME19 静态：收货仓库筛选贯通（api serializeFilter / store buildQuery / view 下拉）',
+    me19All,
+    me19All ? '三处贯通' : 'api=' + me19a + ' store=' + me19b + ' view=' + me19c
+  )
+
+  /* -------- ME20 静态：物料显示中文名称（列表行后端不带 materialName）--------
+   *  - 后端 ManualEtaDto 无 materialName 字段 ⇒ 名称只能前端用物料主数据解析
+   *  - 解析不到（主数据 200 条上限）时回退显示编码，**不编造名称**
+   */
+  const me20a =
+    /materialNameMap\s*=\s*computed/.test(me15View) &&
+    /for\s*\(\s*const\s+x\s+of\s+materialOptions\.value\s*\)\s*m\.set\(x\.masterId,\s*x\.name\)/.test(
+      me15View
+    )
+  assert(
+    'ME20a 静态：view 含 materialNameMap（物料 ID → 中文名，主数据解析）',
+    me20a,
+    me20a ? '已含' : '缺物料名映射'
+  )
+  const me20b = /function materialText\(row: ManualEtaDto\): string/.test(me15View)
+  assert(
+    'ME20b 静态：列表物料列用 materialText（名称（编码））',
+    me20b,
+    me20b ? '已用' : '未用 materialText'
+  )
+
+  /* -------- ME21 静态：到货时间给相对口径（剩 N 天 / 今天到货 / 已晚 N 天）--------
+   *  - 工厂用户最关心「还剩几天」而不是一个日期
+   *  - 按**本地日历天**比较（后端 ManualEta 落库即本地墙钟）
+   */
+  const me21a =
+    /function etaRelative\(iso: string\)/.test(me15View) &&
+    /剩\s*\$\{days\}\s*天/.test(me15View) &&
+    /今天到货/.test(me15View) &&
+    /已晚\s*\$\{-days\}\s*天/.test(me15View)
+  assert(
+    'ME21 静态：到货时间带相对口径（剩 N 天 / 今天到货 / 已晚 N 天）',
+    me21a,
+    me21a ? '已含' : '缺相对口径'
+  )
+
+  /* -------- ME22 静态：空态两态（一条都没有 vs 筛出来没有）--------
+   *  - 旧版只有一句「无人工到货时间数据」⇒ 用户分不清是没数据还是筛没了
+   */
+  const me22a =
+    /当前筛选没有匹配的记录/.test(me15View) &&
+    /还没有人工到货时间记录/.test(me15View) &&
+    /const hasFilter = computed/.test(me15View)
+  assert(
+    'ME22 静态：空态分两态（还没录入 vs 筛出来没有）',
+    me22a,
+    me22a ? '两态齐备' : '空态未分两态'
+  )
+
+  /* -------- ME23 静态：取消按钮按 aps.manual_eta.cancel 单独门控 --------
+   *  - 后端 DELETE 挂 PermissionCodes.ManualEtaCancel = "aps.manual_eta.cancel"（独立码）
+   *  - 旧版用 aps.manual_eta.edit 门控 ⇒ 有 edit 无 cancel 的账号点取消会撞 403
+   */
+  const me23a =
+    /const canCancel = computed\(\(\) => apsAuth\.has\('aps\.manual_eta\.cancel'\)\)/.test(
+      me15View
+    )
+  const me23b = /:disabled="!canCancel \|\| !row\.isActive"/.test(me15View)
+  const me23All = me23a && me23b
+  assert(
+    'ME23 静态：取消按钮用 aps.manual_eta.cancel 门控（不再误用 edit 码）',
+    me23All,
+    me23All ? '门控正确' : 'canCancel=' + me23a + ' disabled=' + me23b
+  )
+
+  /* -------- ME24 静态：Drawer 到货时间不带 Z（本地墙钟，后端落库即墙钟）--------
+   *  - 旧版 value-format="YYYY-MM-DDTHH:mm:ss[Z]" ⇒ 字面量 Z ⇒ 后端按 UTC 解释
+   *    ⇒ 新录的行回读按本地解析整体偏 8 小时
+   */
+  const me24a =
+    !/value-format="YYYY-MM-DDTHH:mm:ss\[Z\]"/.test(me15View) &&
+    /value-format="YYYY-MM-DDTHH:mm:ss"/.test(me15View)
+  assert(
+    'ME24 静态：Drawer 到货时间 value-format 不带 [Z]（本地墙钟串）',
+    me24a,
+    me24a ? '已修' : '仍带 [Z] 或缺 value-format'
+  )
+
+  /* -------- ME26 静态：加载中不显示空态（假空态）--------
+   *  - 实看发现（11-12 headless）：初次进页面时 list 还是空数组 ⇒ 页面直接渲染
+   *    「还没有人工到货时间记录，点右上角「新增」录入」⇒ 用户以为库里真的一条都没有
+   *  - 修法：loading && list 为空 ⇒ 渲染「正在加载…」，不渲染空态
+   */
+  const me26a =
+    /v-if="loading\s*&&\s*!list\.length"[\s\S]{0,200}?panel-loading/.test(me15View) &&
+    /v-else-if="!list\.length"[\s\S]{0,120}?panel-empty/.test(me15View)
+  assert(
+    'ME26 静态：加载中显示「正在加载…」而不是空态（避免假空态）',
+    me26a,
+    me26a ? '已区分' : '加载中仍渲染空态文案'
+  )
+
+  /* -------- ME27 静态：筛选栏去掉三个独立标签（11-12 用户要求）--------
+   *  - 旧形态：标签在上 + 下拉在下的两行结构，标签文字（采购订单 / 物料 / 收货仓库）
+   *    与表格列名重复，还把筛选条撑成两行
+   *  - 新形态：删掉三个 <label>，只留下拉自身的 placeholder（全部采购订单 / 全部物料 / 全部收货仓库）
+   *  - 反向破坏：把 <label> 加回去 ⇒ 本条必须转红
+   */
+  const me27Block = meSlice(me15View, 'class="filter-bar"', '<!-- ===== 主表格')
+  const me27a =
+    me27Block.length > 0 &&
+    !/<label>/.test(me27Block) &&
+    /placeholder="全部采购订单"/.test(me27Block) &&
+    /placeholder="全部物料"/.test(me27Block) &&
+    /placeholder="全部收货仓库"/.test(me27Block)
+  assert(
+    'ME27 静态：筛选栏无独立标签，改由下拉 placeholder 自带说明（全部采购订单 / 全部物料 / 全部收货仓库）',
+    me27a,
+    me27a ? '已去标签' : '仍有 label 或缺 placeholder'
+  )
+
+  /* -------- ME25 静态：分类 → 后端条件映射（buildQuery）--------
+   *  - 11-14：改传后端时间桶参数 `bucket`（5号位 R6，SVN r14208）
+   *    日界与判定式都在后端一处（GETDATE() 日界 + 类级常量 OverdueExpr/DueSoonExpr）
+   *    ⇒ 指标条数字与列表行数必然相等
+   *    （旧口径是前端用本机墙钟算日界下发 etaAfter/etaBefore，与后端严格小于/半开区间不一致 ⇒ 边界行差 1）
+   *  - active：activeOnly=true
+   *  - overdue：activeOnly=true + bucket='overdue'
+   *  - dueSoon：activeOnly=true + bucket='dueSoon'
+   *  - 分类函数体内**不得**再出现 etaBefore / etaAfter / localDayStart / localDayEnd
+   */
+  const me25Build = meSlice(me15Store, 'function buildQuery(', '// ===== actions')
+  const me25Active = meSlice(me25Build, "case 'active':", "case 'overdue':")
+  const me25Overdue = meSlice(me25Build, "case 'overdue':", "case 'dueSoon':")
+  const me25DueSoon = meSlice(me25Build, "case 'dueSoon':", 'default:')
+  const me25a =
+    /f\.activeOnly\s*=\s*true/.test(me25Active) &&
+    /f\.activeOnly\s*=\s*true/.test(me25Overdue) &&
+    /f\.bucket\s*=\s*'overdue'/.test(me25Overdue) &&
+    /f\.activeOnly\s*=\s*true/.test(me25DueSoon) &&
+    /f\.bucket\s*=\s*'dueSoon'/.test(me25DueSoon) &&
+    !/etaBefore|etaAfter|localDayStart|localDayEnd/.test(me25Build)
+  assert(
+    'ME25 静态：分类→后端条件映射正确（active / overdue=bucket / dueSoon=bucket，不自算日界）',
+    me25a,
+    me25a ? '映射正确' : '分类映射不全或仍在自算日界'
+  )
+  /* -------- ME25b 静态：api 层下发 bucket（前端不再自算日界）--------
+   *  - serializeFilter 必须把 filter.bucket 序列化成 ?bucket=
+   *  - types 必须声明 bucket?: ManualEtaTimeBucket（白名单只有 overdue / dueSoon 两个值）
+   */
+  const me25b =
+    /if\s*\(\s*filter\?\.bucket\s*\)\s*out\.bucket\s*=\s*filter\.bucket/.test(
+      manualEtaApiContent
+    ) && /bucket\?:\s*ManualEtaTimeBucket/.test(me10Types)
+  assert(
+    'ME25b 静态：api 层把 bucket 序列化下发（types 含 bucket?: ManualEtaTimeBucket）',
+    me25b,
+    me25b ? '已下发' : 'bucket 未序列化或类型未声明'
+  )
+  /* -------- ME25c 静态：store 不再自算到货时间日界 --------
+   *  - 日界必须只由后端 GETDATE() 说了算（前端算 ⇒ 浏览器与服务器「今天」可能不是同一天）
+   */
+  const me25cSrc = stripComments(me15Store)
+  const me25c =
+    !/localDayStart|localDayEnd|fmtLocalWallClock/.test(me25cSrc) &&
+    !/f\.etaBefore\s*=/.test(me25cSrc) &&
+    !/f\.etaAfter\s*=/.test(me25cSrc)
+  assert(
+    'ME25c 静态：前端不再自算日界（store 无 localDayStart/localDayEnd/etaBefore 赋值）',
+    me25c,
+    me25c ? '日界只由后端说了算' : 'store 仍在自算日界'
+  )
+
+  /* -------- ME28~ME32 静态：5号位 R1~R5 落码后的前端五处改动（11-13）--------
+   *  R1 排序白名单 / R2 cancelledOnly / R3 /summary 五数 / R4 /facets 候选 / R5 行内 materialName
+   *  反向探针自证可失败：见 scripts/selfverify-manual-eta-1112.mjs（ME28~ME32 各一条）
+   */
+  const me28Api = manualEtaApiContent
+  const me28StoreCode = stripComments(me15Store)
+  // a. api 层有 summary 方法（GET /api/procurement-manual-eta/summary）
+  const me28a =
+    /async\s+summary\s*\(\s*filter\?:\s*ManualEtaListFilter\s*\)\s*:\s*Promise<ManualEtaSummary>/.test(
+      me28Api
+    ) && /url:\s*'\/api\/procurement-manual-eta\/summary'/.test(me28Api)
+  // b. store 的 counts 五个字段全部来自 summary 真值
+  const me28b =
+    /all:\s*sum\?\.allCount/.test(me15Store) &&
+    /active:\s*sum\?\.activeCount/.test(me15Store) &&
+    /cancelled:\s*sum\?\.cancelledCount/.test(me15Store) &&
+    /overdue:\s*sum\?\.overdueCount/.test(me15Store) &&
+    /dueSoon:\s*sum\?\.dueSoonCount/.test(me15Store)
+  // c. 旧的 countOnly / listAll 已撤（注释里提到不算）
+  const me28c = !/countOnly|listAll/.test(me28StoreCode)
+  // d. summary 调用只传基础筛选（不传 activeOnly / cancelledOnly —— 后端会短路状态开关）
+  const me28SumCall = meSlice(me15Store, 'manualEtaApi.summary(', '])')
+  const me28d = me28SumCall.length > 0 && !/activeOnly|cancelledOnly/.test(me28SumCall)
+  assert(
+    'ME28 静态：指标条五数改走一次 /summary（不传状态开关、旧 countOnly 已撤）',
+    me28a && me28b && me28c && me28d,
+    `api=${me28a} counts=${me28b} 无旧接口=${me28c} 无状态开关=${me28d}`
+  )
+
+  // a. bucket 类型含 cancelled
+  const me29a =
+    /export\s+type\s+ManualEtaBucket\s*=\s*'all'\s*\|\s*'active'\s*\|\s*'cancelled'/.test(me10Types)
+  // b. store buildQuery 的 cancelled 分支：activeOnly=false + cancelledOnly=true
+  const me29Build = meSlice(me15Store, 'function buildQuery(', '// ===== actions')
+  const me29Cancelled = meSlice(me29Build, "case 'cancelled':", "case 'overdue':")
+  const me29b =
+    me29Cancelled.length > 0 &&
+    /f\.cancelledOnly\s*=\s*true/.test(me29Cancelled) &&
+    /f\.activeOnly\s*=\s*false/.test(me29Cancelled)
+  // c. api 序列化 cancelledOnly
+  const me29c =
+    /if\s*\(\s*filter\?\.cancelledOnly\s*\)\s*out\.cancelledOnly\s*=\s*true/.test(me28Api)
+  // d. 视图「已取消」可点
+  const me29Kpi = meSlice(me15View, "key: 'cancelled'", 'clickable: true')
+  const me29d = me29Kpi.length > 0 && /label:\s*'已取消'/.test(me29Kpi)
+  assert(
+    'ME29 静态：「已取消」可点 → cancelledOnly=true（不再是只读数字）',
+    me29a && me29b && me29c && me29d,
+    `bucket类型=${me29a} store映射=${me29b} api序列化=${me29c} 视图可点=${me29d}`
+  )
+
+  // a. 排序字段白名单（types）
+  const me30a =
+    /export\s+type\s+ManualEtaSortBy\s*=\s*'manualEta'\s*\|\s*'updatedAt'\s*\|\s*'poNo'\s*\|\s*'materialCode'/.test(
+      me10Types
+    )
+  // b. 筛选参数含 sortBy / sortDir
+  const me30b =
+    /sortBy\?:\s*ManualEtaSortBy/.test(me10Types) &&
+    /sortDir\?:\s*'asc'\s*\|\s*'desc'/.test(me10Types)
+  // c. api 序列化排序参数
+  const me30c =
+    /out\.sortBy\s*=\s*filter\.sortBy/.test(me28Api) &&
+    /out\.sortDir\s*=\s*filter\.sortDir/.test(me28Api)
+  // d. store 把排序透传到列表查询
+  const me30d =
+    /listQuery\.sortBy\s*=\s*sort\.sortBy/.test(me15Store) &&
+    /listQuery\.sortDir\s*=\s*sort\.sortDir/.test(me15Store)
+  // e. 视图有排序下拉并把 currentSort() 交给 store.load
+  const me30e =
+    /v-model="sortKey"/.test(me15View) &&
+    /function\s+currentSort\s*\(/.test(me15View) &&
+    /store\.load\([\s\S]{0,400}?currentSort\(\)/.test(me15View)
+  assert(
+    'ME30 静态：排序参数端到端打通（白名单 → api → store → 视图下拉）',
+    me30a && me30b && me30c && me30d && me30e,
+    `白名单=${me30a} 参数=${me30b} api=${me30c} store=${me30d} 视图=${me30e}`
+  )
+
+  // a. api 层有 facets 方法（GET /api/procurement-manual-eta/facets）
+  const me31a =
+    /async\s+facets\s*\(\s*search\?:\s*string\s*\)\s*:\s*Promise<ManualEtaFacets>/.test(me28Api) &&
+    /url:\s*'\/api\/procurement-manual-eta\/facets'/.test(me28Api)
+  // b. store 候选改走 facets
+  const me31b = /manualEtaApi\.facets\(\)/.test(me15Store)
+  // c. 旧的「pageSize=200 全量扫描自己派生」已撤
+  const me31c = !/pageSize:\s*200/.test(me28StoreCode) && !/pageSize:\s*200/.test(me28Api)
+  // d. 候选是编码串数组（facets 返回形态），不是主数据对象
+  const me31d =
+    /poNoOptions\.value\s*=\s*\[\s*\.\.\.\(f\?\.poNos\s*\?\?\s*\[\]\)\s*\]\.sort\(\)/.test(me15Store) &&
+    /materialFilterOptions\.value\s*=\s*\[\s*\.\.\.\(f\?\.materialCodes\s*\?\?\s*\[\]\)\s*\]\.sort\(\)/.test(
+      me15Store
+    )
+  assert(
+    'ME31 静态：筛选候选改走后端 /facets（不再拉 200 条自己派生）',
+    me31a && me31b && me31c && me31d,
+    `api=${me31a} store=${me31b} 无全量扫描=${me31c} 候选形态=${me31d}`
+  )
+
+  // a. 表格物料名优先取行内 materialName（R5 的 LEFT JOIN 投影）
+  const me32Text = meSlice(me15View, 'function materialText(', 'function materialOptionLabel')
+  const me32a = me32Text.length > 0 && /row\.materialName/.test(me32Text)
+  // b. 编码→名称映射由列表行的 materialName 构成（不依赖主数据反查）
+  const me32b =
+    /materialCodeNameMap\s*=\s*computed/.test(me15View) &&
+    /row\.materialCode\s*&&\s*row\.materialName/.test(me15View)
+  // c. DTO 有 materialName 可选字段
+  const me32c = /materialName\?:\s*string/.test(me10Types)
+  assert(
+    'ME32 静态：表格物料名取行内 materialName（后端 R5 投影，不靠主数据反查）',
+    me32a && me32b && me32c,
+    `行内优先=${me32a} 映射来源=${me32b} DTO字段=${me32c}`
+  )
+
+  /* -------- ME33 静态（11-14 抽屉物料候选改「远程搜索」）--------
+   *  触发：5号位 2026-11-12 复函 + 3号位 11-13 附问二授权 ⇒ 抽屉「选物料」不再预拉前 200 条
+   *  理由：/api/governance/lookups/materials 是 TOP(@Limit) ⇒ 活跃物料 >limit 时第 200 条之外根本列不出来
+   *  验收口径（11-14 乙端点落码后重写）：
+   *  - api 层有 searchMaterials(search, limit, scope?) → GET /api/procurement-manual-eta/materials
+   *    （5号位 11-14 落码 r14206~r14208，挂**本域** aps.manual_eta.view ⇒ 不再依赖 aps.setup.view）
+   *  - 视图 ElSelect 远程模式（remote + :remote-method）+ 300ms 防抖
+   *  - 视图有请求序号守卫（materialSearchSeq）⇒ 先发后到的旧结果不覆盖新结果
+   *  - 视图已撤 loadMaterialOptions / materialLookupApi.listActiveMaterials
+   *  - 视图保留 materialKey → materialId + materialCode 同步（编辑态靠 materialSelected 兜底）
+   *  反向探针自证可失败：见 scripts/selfverify-manual-eta-1112.mjs（ME33 一条）
+   */
+  const me33a =
+    /async\s+searchMaterials\s*\(\s*search:\s*string\s*,\s*limit\s*=\s*\d+\s*,\s*scope\?:/.test(
+      me28Api
+    ) &&
+    /url:\s*'\/api\/procurement-manual-eta\/materials'/.test(me28Api) &&
+    /params\.poNo\s*=\s*poNo/.test(me28Api) &&
+    /params\.lineNo\s*=\s*lineNo/.test(me28Api) &&
+    !/url:\s*'\/api\/governance\/lookups\/materials'/.test(me28Api)
+  const me33b =
+    /<ElSelect\b[^>]*\bremote\b/.test(me15View) &&
+    /:remote-method="onMaterialSearch"/.test(me15View) &&
+    /function\s+onMaterialSearch\s*\([\s\S]{0,400}?setTimeout/.test(me15View)
+  const me33c =
+    /materialSearchSeq/.test(me15View) &&
+    /seq\s*!==\s*materialSearchSeq/.test(me15View) &&
+    /if\s*\(seq\s*===\s*materialSearchSeq\)\s*materialSearching\.value\s*=\s*false/.test(me15View)
+  const me33d =
+    !/loadMaterialOptions/.test(me15View) && !/materialLookupApi\.listActiveMaterials\s*\(/.test(me15View)
+  const me33e = /materialSelected/.test(me15View) && /materialId\s*=\s*found\.masterId/.test(me15View)
+  assert(
+    'ME33 静态：抽屉物料候选改远程搜索（api searchMaterials + ElSelect remote + 请求序号守卫）',
+    me33a && me33b && me33c && me33d && me33e,
+    `api=${me33a} 远程模式=${me33b} 序号守卫=${me33c} 撤预拉=${me33d} 选中回填=${me33e}`
+  )
+
+  /* -------- ME34 静态（11-14 抽屉物料候选切**乙端点** + 按采购订单收窄）--------
+   *  触发：5号位 2026-11-14 复函（乙端点已落码，SVN r14206~r14208）
+   *  理由：① 权限 —— 旧端点挂策略域 aps.setup.view，本页挂 aps.manual_eta.*
+   *        ⇒ 只持人工到货时间权限的角色选不到物料；乙端点在本域，耦合已解。
+   *        ② 收窄 —— 附问一「该 PO 行的物料集合」已由后端按 poNo/lineNo 落地
+   *        （供给事实 ∪ ERP 收货视图，按 materialId 去重，**不按工厂范围裁剪**）。
+   *  dev 11-14 实测：`?search=&poNo=CC44390` → 6 行；`&lineNo=3` → 1 行；
+   *                  `?poNo=P01`（种子）→ 200 + 0 行（不报错）；`?search=铝&poNo=CC44390` → 5 行。
+   *  验收口径：
+   *  - ME34a api 层打乙端点 + 支持 poNo/lineNo 可选收窄 + 「无关键字且无 poNo」时不请求全量
+   *  - ME34b 视图按采购订单号 / 行号收窄（表单变化即重取候选）
+   *  - ME34c 收窄取不到时**逐级放宽**（行 → 订单 → 全库关键字）⇒ 收窄不阻断录入
+   *  - ME34d 候选口径如实说明（行级 / 订单级 / 全库），不让用户把全库物料误当本订单物料
+   *  - ME34e 候选来源**不得**取本表列表：人工到货时间是「对供给事实的覆盖」，
+   *    本表的 (物料, 仓库) 对在供给事实里一个都不存在 ⇒ 兜底档（11-14 曾加、已撤）已锁死
+   *  反向探针自证可失败：见 scripts/selfverify-manual-eta-1112.mjs（ME34 五条）
+   */
+  const me34a =
+    /url:\s*'\/api\/procurement-manual-eta\/materials'/.test(me28Api) &&
+    /scope\?:\s*\{\s*poNo\?:\s*string;\s*lineNo\?:\s*number\s*\}/.test(me28Api) &&
+    /params\.poNo\s*=\s*poNo/.test(me28Api) &&
+    /params\.lineNo\s*=\s*lineNo/.test(me28Api) &&
+    /if\s*\(!q\s*&&\s*!poNo\)\s*return \[\]/.test(me28Api) &&
+    !/url:\s*'\/api\/governance\/lookups\/materials'/.test(me28Api)
+  assert(
+    'ME34a 静态：api 层打乙端点 /api/procurement-manual-eta/materials（可选 poNo/lineNo 收窄，无关键字无 poNo 不请求全量）',
+    me34a,
+    `端点=${/url:\s*'\/api\/procurement-manual-eta\/materials'/.test(me28Api)} 收窄参数=${/params\.poNo\s*=\s*poNo/.test(me28Api) && /params\.lineNo\s*=\s*lineNo/.test(me28Api)} 不请求全量=${/if\s*\(!q\s*&&\s*!poNo\)\s*return \[\]/.test(me28Api)} 不再用策略域端点=${!/url:\s*'\/api\/governance\/lookups\/materials'/.test(me28Api)}`
+  )
+
+  // 11-14 v2.0：收窄档改走 **supply-combos**（物料 × 存储地点**成对**）——
+  //   旧判据锁的是「searchMaterials(q, LIMIT, {poNo, lineNo})」，那是**无仓库维度**的物料集合，
+  //   与仓库下拉（258 条全集）各选各的 ⇒ 拼出来的组合命不中 ⇒ 到货时间静默不生效。
+  const me34b =
+    /manualEtaApi\.searchSupplyCombos\(\s*t\.poNo\s*\?\?\s*''/.test(me15View) &&
+    /t\.lineNo/.test(me15View) &&
+    /=>\s*\[\s*form\.value\.poNo\s*,\s*form\.value\.lineNo\s*\]\s*as const/.test(me15View)
+  assert(
+    'ME34b 静态：抽屉按采购订单号 / 行号收窄物料候选（表单变化即重取；11-14 v2.0 起走 supply-combos）',
+    me34b,
+    `调supply-combos并带PO=${/manualEtaApi\.searchSupplyCombos\(\s*t\.poNo\s*\?\?\s*''/.test(me15View)} 传行号=${/t\.lineNo/.test(me15View)} watch订单行号=${/=>\s*\[\s*form\.value\.poNo\s*,\s*form\.value\.lineNo\s*\]\s*as const/.test(me15View)}`
+  )
+
+  const me34cCode = stripComments(me15View)
+  const me34Idx = (re) => {
+    const m = me34cCode.match(re)
+    return m ? m.index : -1
+  }
+  const me34Line = me34Idx(/tries\.push\(\{\s*scope:\s*'line'/)
+  const me34Po = me34Idx(/tries\.push\(\{\s*scope:\s*'po'/)
+  const me34All = me34Idx(/tries\.push\(\{\s*scope:\s*'all'\s*\}\)/)
+  const me34c =
+    me34Line >= 0 &&
+    me34Po > me34Line &&
+    me34All > me34Po &&
+    /if\s*\(rows\.length\)\s*return\s*\{\s*rows\s*,\s*scope:\s*t\.scope\s*\}/.test(me34cCode)
+  assert(
+    'ME34c 静态：收窄取不到时逐级放宽（行 → 订单 → 全库关键字），不阻断录入',
+    me34c,
+    `行级=${me34Line >= 0} 订单级=${me34Po > me34Line} 兜底全库=${me34All > me34Po} 有命中即用=${/if\s*\(rows\.length\)\s*return\s*\{\s*rows\s*,\s*scope:\s*t\.scope\s*\}/.test(me34cCode)}`
+  )
+
+  const me34d =
+    /\{\{\s*materialScopeNote\s*\}\}/.test(me15View) &&
+    /已按采购订单/.test(me15View) &&
+    /没取到物料/.test(me15View) &&
+    /请确认是本订单的物料/.test(me15View)
+  assert(
+    'ME34d 静态：候选口径如实说明（行级 / 订单级 / 全库），不让用户把全库物料误当本订单物料',
+    me34d,
+    `模板展示=${/\{\{\s*materialScopeNote\s*\}\}/.test(me15View)} 行级说明=${/已按采购订单/.test(me15View)} 订单级说明=${/没取到物料/.test(me15View)} 全库提醒=${/请确认是本订单的物料/.test(me15View)}`
+  )
+
+  /* -------- ME34e 兜底档已撤（11-14）--------
+   *  Why 撤：人工到货时间是**对供给事实的覆盖**——后端按
+   *    (PONo, LineNo, MaterialId, ReceivingWarehouse) 精确匹配供给事实的
+   *    (SourceDocumentNo, SourceDocumentLineNo, MaterialId, StorageCode)
+   *    （@see AvailableTimeCalculator.cs:63-73,105-107），匹配不上 ⇒ 静默不生效。
+   *    dev 实测：本表 10 个 (物料, 仓库) 组合在供给事实里**一个都不存在**
+   *    ⇒ 「本表已登记」兜底档给的候选同样命不中 ⇒ 用户录进去的还是不生效的记录。
+   *  判据：候选来源**不得**取本表列表（manualEtaApi.list）。
+   *  反向破坏：把兜底档加回来 ⇒ 本条转红。
+   */
+  const me34e = !/manualEtaApi\.list\(/.test(me34cCode)
+  assert(
+    'ME34e 静态：抽屉物料候选不得取本表列表（本表的 (物料,仓库) 对命不中供给事实 ⇒ 兜底档已撤）',
+    me34e,
+    `候选取本表=${/manualEtaApi\.list\(/.test(me34cCode)}（应为 false）`
+  )
+
+  /* -------- ME36 静态（11-14 接 5号位 v2.0 回执：R1 落码 r14214~r14218 / R2 取乙）--------
+   *  R1：抽屉「按订单收窄」改走 `GET /api/procurement-manual-eta/supply-combos`
+   *      —— 一行 = 供给事实里一条 **(物料 × 存储地点)** 组合，**成对**给出。
+   *      Why 必须成对：人工到货时间是**对供给事实的覆盖**——覆盖键
+   *      `(PONo, LineNo, MaterialId, ReceivingWarehouse)` ≡ 供给事实
+   *      `(SourceDocumentNo, SourceDocumentLineNo, MaterialId, StorageCode)`
+   *      （AvailableTimeCalculator.cs:63-73,105-107）；旧口径下「物料」（无仓库维度）与
+   *      「仓库」（258 条全集）各选各的 ⇒ 拼出来的组合命不中 ⇒ 到货时间**静默不生效**。
+   *  R2：列表 / 详情接 `isMatched` 标注（true=会参与排产 / false=命不中静默不生效 / null=未判定）。
+   *  验收口径：
+   *  - ME36a api 层打 supply-combos 端点 + poNo 空不请求（后端缺 poNo 会 400）+ 带 poNo/lineNo
+   *  - ME36b 视图：选中带 storageCode 的候选 ⇒ 仓库按供给事实**原样带出**（成对，不再另选）
+   *  - ME36c 列表请求带 withMatched=true（后端默认 false ⇒ 不显式开就没有标注）
+   *  - ME36d 标注三态：false 才标「未命中」；null / 缺省**不得**显示成未命中
+   *  反向破坏：把仓库带出改成不写 storageCode / 把 withMatched 去掉 ⇒ 对应条转红。
+   */
+  const me36ApiCode = stripComments(manualEtaApiContent)
+  const me36ViewCode = stripComments(me15View)
+  const me36a =
+    /url:\s*'\/api\/procurement-manual-eta\/supply-combos'/.test(me36ApiCode) &&
+    /async\s+searchSupplyCombos\s*\(/.test(me36ApiCode) &&
+    /if\s*\(!po\)\s*return \[\]/.test(me36ApiCode) &&
+    /params\.poNo\s*=\s*po/.test(me36ApiCode) &&
+    /params\.lineNo\s*=\s*ln/.test(me36ApiCode)
+  assert(
+    'ME36a 静态：api 层打 supply-combos 端点（poNo 必填守卫 + 带 poNo/lineNo）',
+    me36a,
+    `端点=${/url:\s*'\/api\/procurement-manual-eta\/supply-combos'/.test(me36ApiCode)} poNo守卫=${/if\s*\(!po\)\s*return \[\]/.test(me36ApiCode)}`
+  )
+
+  const me36b =
+    /form\.value\.receivingWarehouse\s*=\s*found\.storageCode/.test(me36ViewCode) &&
+    /warehouseLockedByCombo/.test(me36ViewCode)
+  assert(
+    'ME36b 静态：抽屉选中成对候选 ⇒ 仓库按供给事实 storageCode 原样带出（不再让用户拼不配套的仓库）',
+    me36b,
+    `带出仓库=${/form\.value\.receivingWarehouse\s*=\s*found\.storageCode/.test(me36ViewCode)} 锁定态=${/warehouseLockedByCombo/.test(me36ViewCode)}`
+  )
+
+  const me36c =
+    /withMatched:\s*true/.test(me15Store) && /out\.withMatched\s*=\s*true/.test(me36ApiCode)
+  assert(
+    'ME36c 静态：列表请求带 withMatched=true（后端默认 false ⇒ 不显式开就没有 isMatched 标注）',
+    me36c,
+    `store=${/withMatched:\s*true/.test(me15Store)} api=${/out\.withMatched\s*=\s*true/.test(me36ApiCode)}`
+  )
+
+  const me36d =
+    /row\.isMatched\s*===\s*false/.test(me36ViewCode) &&
+    /row\.isMatched\s*===\s*true/.test(me36ViewCode) &&
+    /currentDetail\.isMatched\s*===\s*false/.test(me36ViewCode) &&
+    /v-else\s+class="muted">-<\/span>/.test(me36ViewCode)
+  assert(
+    'ME36d 静态：isMatched 三态如实展示（false 才标未命中；null/缺省显示「-」，不误报未命中）',
+    me36d,
+    `列表false=${/row\.isMatched\s*===\s*false/.test(me36ViewCode)} 列表true=${/row\.isMatched\s*===\s*true/.test(me36ViewCode)} 抽屉false=${/currentDetail\.isMatched\s*===\s*false/.test(me36ViewCode)} 未判定兜底=${/v-else\s+class="muted">-<\/span>/.test(me36ViewCode)}`
+  )
+
+  /* -------- ME36e 静态（11-14 过渡配对源：supply-combos 未部署时用供货事实追溯配对）--------
+   *  Why 需要这一档：dev 实测 `GET /api/procurement-manual-eta/supply-combos` 返 **404**
+   *    （正式端点 r14214~r14218 尚未部署）⇒ 只走正式端点时，页面**成对带不出仓库**。
+   *  过渡办法：追溯查询第一段 `SELECT … StorageCode AS WarehouseCode FROM SupplyFact_Pipeline`
+   *    （`SupplyFactTraceRepository.cs:39-45`）⇒ warehouseCode **就是**供给事实的存储地点，
+   *    与排产侧装载器（`TimedSupplyFactLoader`）同表同列 ⇒ 配出来的组合口径与正式端点一致。
+   *  验收口径：
+   *  - ME36e api 层打 /api/supply-fact-trace（过渡档专用）+ 带 sourceDocumentNo
+   *  - ME36e 视图：只用 SUPPLY_PIPELINE 段 + 排产侧五类在途 + 数量>0 + 有效（资格谓词逐字对齐）
+   *  - ME36e 视图：配出的候选带 storageCode ⇒ 选中后仓库自动带出（同 ME36b 口径）
+   *  ⚠️ 这一档是**临时**的：正式端点部署后应删除；页面提示必须说明「受账号可见工厂范围限制，可能不全」。
+   *  反向破坏：撤掉五类在途白名单 / 撤掉 SUPPLY_PIPELINE 过滤 ⇒ 本条转红。
+   */
+  const me36eApi =
+    /url:\s*'\/api\/supply-fact-trace'/.test(me36ApiCode) &&
+    /async\s+searchSupplyCombosFromTrace\s*\(/.test(me36ApiCode) &&
+    /sourceDocumentNo:\s*po\b/.test(me36ApiCode) &&
+    /activeOnly:\s*true/.test(me36ApiCode)
+  const me36eView =
+    /SUPPLY_QUALIFY_TYPES\.includes\(/.test(me36ViewCode) &&
+    /'PURCHASE_IN_TRANSIT'/.test(me36ViewCode) &&
+    /'INTERPLANT_IN_TRANSIT'/.test(me36ViewCode) &&
+    /sourceType\s*\?\?\s*''\)\s*!==\s*'SUPPLY_PIPELINE'/.test(me36ViewCode) &&
+    /searchSupplyCombosFromTrace\(/.test(me36ViewCode) &&
+    /storageCode:\s*c\.storageCode/.test(me36ViewCode)
+  assert(
+    'ME36e 静态：过渡配对源（supply-fact-trace）只取 SUPPLY_PIPELINE 段 + 排产侧五类在途 + 数量>0 + 有效，配出的候选带 storageCode',
+    me36eApi && me36eView,
+    `api=${me36eApi} 五类在途=${/'PURCHASE_IN_TRANSIT'/.test(me36ViewCode) && /'INTERPLANT_IN_TRANSIT'/.test(me36ViewCode)} 只取PIPELINE段=${/sourceType\s*\?\?\s*''\)\s*!==\s*'SUPPLY_PIPELINE'/.test(me36ViewCode)} 带storageCode=${/storageCode:\s*c\.storageCode/.test(me36ViewCode)}`
   )
 
   /* -------- ME15 动态：dev 联调 GET /api/procurement-manual-eta pageIndex/pageSize 返 PageResult --------
@@ -8470,6 +9375,14 @@ function verifySetupUncoveredStatic() {
    * 默认口径：最近一次**跑完**（COMPLETED / PARTIAL_SUCCESS）的批次 —— 运行中批次还没落统计
    * （10-29 dev 实测 #999310 运行中 total=0），拿它当默认会一进页面就空表；50 条内没有跑完的才回退最近一次。
    * 反向锁：改回手填、下拉不绑 runId、标签丢状态、排序反了、默认写死 1、默认换成「第一个」→ 红。 */
+  // ⚠️ 2026-11-09（默认批次口径改「完全成功优先、部分成功次选」）：源码从
+  //   「一个 `||` 谓词」改成两段 `find(...) ?? find(...)` ⇒ 旧字面量判据失效，
+  //   但**行为本身是对的**（仍优先选跑完的批次，部分成功只在没有完全成功时兜底）。
+  //   判据改成「两种写法都认」，语义不变；反向锁（改回手填/写死 Run=1/默认取第一个）仍在。
+  const unc16FinishedFirst =
+    /r\.status === 'COMPLETED' \|\| r\.status === 'PARTIAL_SUCCESS'/.test(viewSrc) ||
+    (/\.find\(\(r\) => r\.status === 'COMPLETED'\)/.test(viewSrc) &&
+      /\.find\(\(r\) => r\.status === 'PARTIAL_SUCCESS'\)/.test(viewSrc))
   const unc16 =
     /import \{[^}]*runApi[^}]*\} from '@\/api\/aps-v1'/.test(viewSrc) &&
     /runApi\.listRuns\(/.test(viewSrc) &&
@@ -8482,7 +9395,7 @@ function verifySetupUncoveredStatic() {
     /new Date\(b\.startedAt\)\.getTime\(\) - new Date\(a\.startedAt\)\.getTime\(\)/.test(viewSrc) &&
     // 默认 = 最近一次跑完（COMPLETED / PARTIAL_SUCCESS）的批次 → 回退最近一次；
     // 运行中批次还没落统计（10-29 dev 实测 total=0），拿它当默认就是一进页面空表
-    /r\.status === 'COMPLETED' \|\| r\.status === 'PARTIAL_SUCCESS'/.test(viewSrc) &&
+    unc16FinishedFirst &&
     /queryForm\.runId\s*=\s*def\.id/.test(viewSrc) &&
     /runId:\s*0/.test(viewSrc)
   assert(
@@ -8490,7 +9403,7 @@ function verifySetupUncoveredStatic() {
     unc16,
     unc16
       ? '下拉 + 默认最近一次'
-      : `api=${/runApi\.listRuns\(/.test(viewSrc)} noInputNumber=${!/ElInputNumber/.test(viewSrc)} bind=${/v-model="queryForm\.runId"/.test(viewSrc)} status=${/RUN_STATUS_LABEL\[r\.status\]/.test(viewSrc)} localFmt=${/formatLocalMonthDayHM\(r\.startedAt\)/.test(viewSrc)} sort=${/new Date\(b\.startedAt\)\.getTime\(\) - new Date\(a\.startedAt\)\.getTime\(\)/.test(viewSrc)} default=${/queryForm\.runId\s*=\s*def\.id/.test(viewSrc)} finishedFirst=${/r\.status === 'COMPLETED' \|\| r\.status === 'PARTIAL_SUCCESS'/.test(viewSrc)} init=${/runId:\s*0/.test(viewSrc)}`
+      : `api=${/runApi\.listRuns\(/.test(viewSrc)} noInputNumber=${!/ElInputNumber/.test(viewSrc)} bind=${/v-model="queryForm\.runId"/.test(viewSrc)} status=${/RUN_STATUS_LABEL\[r\.status\]/.test(viewSrc)} localFmt=${/formatLocalMonthDayHM\(r\.startedAt\)/.test(viewSrc)} sort=${/new Date\(b\.startedAt\)\.getTime\(\) - new Date\(a\.startedAt\)\.getTime\(\)/.test(viewSrc)} default=${/queryForm\.runId\s*=\s*def\.id/.test(viewSrc)} finishedFirst=${unc16FinishedFirst} init=${/runId:\s*0/.test(viewSrc)}`
   )
 }
 
@@ -8897,11 +9810,13 @@ async function verifyProductionWorkCalendar(token) {
 
   // PWC15 静态：业务用户不接触 sourceSystem/sourceReference（@see feedback_no_internal_notices_in_ui）
   //  - 弹窗里不能有 label="数据来源" 或 label="数据来源系统" 的 ElFormItem
-  //  - exception 弹窗的 sourceReference 必须 v-if="isAuthorizedOverride"（override 才显示）
+  //  - exception 弹窗的 sourceReference（加班依据）只在「要工作」（补班/授权加班）时显示
+  //    ⚠️ 11-16：原判据挂在 isAuthorizedOverride 开关上，而该开关是恒 1 的无效控件 ⇒ 已撤；
+  //      改挂状态（workState==='WORK'），语义不变（只有补班/授权加班才需要加班凭据）
   //  - weeklyDraft / exceptionDraft 默认 sourceSystem='MANUAL'（前端常驻）
   const noSourceSystemLabel = !/label="数据来源"/.test(pwcVue)
   const exceptionOverrideVIf =
-    /<ElFormItem\s+v-if="exceptionDraft\.isAuthorizedOverride"\s+label="加班依据/.test(pwcVue)
+    /<ElFormItem\s+v-if="exceptionDraft\.workState\s*===\s*'WORK'"\s+label="加班依据/.test(pwcVue)
   const weeklySourceSystemManual =
     /const\s+weeklyDraft\s*=\s*ref[\s\S]{0,800}?sourceSystem:\s*['"]MANUAL['"]/.test(pwcVue)
   const exceptionSourceSystemManual =
@@ -8912,10 +9827,10 @@ async function verifyProductionWorkCalendar(token) {
     weeklySourceSystemManual &&
     exceptionSourceSystemManual
   assert(
-    'PWC15 静态：业务用户不接触数据来源（sourceSystem 前端常驻 MANUAL + sourceReference 仅 override 显示）',
+    'PWC15 静态：业务用户不接触数据来源（sourceSystem 前端常驻 MANUAL + 加班依据仅补班态显示）',
     pwc15AllOk,
     pwc15AllOk
-      ? '无 label="数据来源" + override-v-if + 双 MANUAL 默认'
+      ? '无 label="数据来源" + 补班态才显示加班依据 + 双 MANUAL 默认'
       : `noLabel=${noSourceSystemLabel} overrideVIf=${exceptionOverrideVIf} weeklyMANUAL=${weeklySourceSystemManual} exceptionMANUAL=${exceptionSourceSystemManual}`
   )
 
@@ -8949,26 +9864,43 @@ async function verifyProductionWorkCalendar(token) {
 
   // PWC17 静态：列表不渲染来源字段（sourceSystem / sourceReference）
   //  - 与弹窗口径一致（@see feedback_no_internal_notices_in_ui：业务用户不接触内部协调字段）
-  //  - 加班授权列必须保留（AllowLowerOverride / IsAuthorizedOverride 是 v1.4 §四 三授权旗核心业务语义）
   //  - 文案按冻结文档 v1.12 基线「授权加班必须有真实可追溯覆盖」用中文，不用 Alo/Aao 字段名
+  //  ⚠️ 11-16 两轮改：
+  //    ① 两旗在部署库里被 CK_PWCS_FlagConst 锁死恒 1（11-04「部门自主模式」裁决），
+  //       页面上的两个开关是**无效控件**（勾不勾都恒 1，显式 false 还被后端 400 拒）⇒ 控件已撤。
+  //    ② 整列「加班授权」也撤：两个旗位恒 1 ⇒ 列内容 100% 可由「周/日期 + 状态」推出
+  //       （OFF 行一律「下级可加班」；WORK 例外行一律「已授权加班」），横向复读还占 170px。
+  //    ⇒ 只保留唯一有审计意义的那条：日期例外的补班行在「状态」列挂「授权加班」标识
+  //       （与解析侧 ResourceCalendarDtos.cs:167 WorkDate 例外行 + IsAuthorizedOverride=1 + WORK 同口径）
   const noSourceColumn = !/label="来源"/.test(pwcVue)
   const noSourceSystemRender = !/row\.sourceSystem/.test(pwcVue)
   const noSourceReferenceRender = !/row\.sourceReference\s*\}/.test(pwcVue)
-  const authFlagsKept =
-    /label="加班授权"/.test(pwcVue) &&
-    /允许下级加班/.test(pwcVue) &&
-    /本行是授权加班/.test(pwcVue) &&
-    /row\.allowLowerOverride/.test(pwcVue) &&
-    /row\.isAuthorizedOverride/.test(pwcVue)
+  // 无「加班授权」列，且状态列里带「授权加班」标识
+  const noOvertimeColumn = !/label="加班授权"/.test(pwcVue)
+  const authTagInState =
+    /label="状态"/.test(pwcVue) &&
+    /授权加班/.test(pwcVue) &&
+    /row\.workState\s*===\s*'WORK'\s*&&\s*row\.isAuthorizedOverride\s*&&\s*!!row\.workDate/.test(
+      pwcVue
+    )
+  // 恒 1 旗位不得再有页面控件/文案（无效开关已撤；也不再按行渲染旗位标签）
+  const noDeadAuthSwitch =
+    !/允许下级加班/.test(pwcVue) && !/本行是授权加班/.test(pwcVue) && !/下级可加班/.test(pwcVue)
   const noFieldNameLeak = !/label="Alo=1"/.test(pwcVue) && !/label="Aao=1"/.test(pwcVue)
   const pwc17AllOk =
-    noSourceColumn && noSourceSystemRender && noSourceReferenceRender && authFlagsKept && noFieldNameLeak
+    noSourceColumn &&
+    noSourceSystemRender &&
+    noSourceReferenceRender &&
+    noOvertimeColumn &&
+    authTagInState &&
+    noDeadAuthSwitch &&
+    noFieldNameLeak
   assert(
-    'PWC17 静态：列表隐藏来源列 + 加班授权列中文文案（Alo/Aao 不露字段名）',
+    'PWC17 静态：列表隐藏来源列 + 无「加班授权」列（状态列内挂「授权加班」标识）',
     pwc17AllOk,
     pwc17AllOk
-      ? '无来源列 + 加班授权（允许下级加班 / 本行是授权加班）'
-      : `noCol=${noSourceColumn} noSys=${noSourceSystemRender} noRef=${noSourceReferenceRender} authFlags=${authFlagsKept} noLeak=${noFieldNameLeak}`
+      ? '无来源列 + 无加班授权列 + 状态列挂「授权加班」'
+      : `noCol=${noSourceColumn} noSys=${noSourceSystemRender} noRef=${noSourceReferenceRender} noOvertimeCol=${noOvertimeColumn} authTag=${authTagInState} noDeadSwitch=${noDeadAuthSwitch} noLeak=${noFieldNameLeak}`
   )
 
   // PWC18 静态：筛选区不暴露 includeInactive 开关（后端无路径产生 IsActive=0 行）
@@ -9198,28 +10130,38 @@ async function verifyProductionWorkCalendar(token) {
     pwc33 ? '已移除' : '仍存在当前页口径的计数 getter'
   )
 
-  // PWC34 静态：互斥标记随状态归一 + 提交前清洗 + 部门下拉不回退全量（10-23 用户实测无解报错）
+  // PWC34 静态：恒 1 旗位无控件无字段 + 提交前时间清洗 + 部门下拉不回退全量
+  //  11-16 改版：后端「部门自主模式」两旗恒 1（CK_PWCS_FlagConst + Service 写死 1 + 显式 false 直接 400）
+  //  ⇒ 页面上的「允许下级加班 / 本行是授权加班」是**无效控件**，已撤（连同归一 watch 一起删）。
+  //     提交时也不发这两个字段（缺省 null ⇒ 后端按 1 落库）。
   const pwc34a =
-    /function\s+normalizeExceptionDraft\s*\(/.test(pwcVueCode) &&
-    /watch\(\s*\(\)\s*=>\s*exceptionDraft\.value\.workState\s*,\s*normalizeExceptionDraft\s*\)/.test(
-      pwcVueCode
-    ) &&
-    /workState\s*===\s*'WORK'[\s\S]{0,200}allowLowerOverride\s*=\s*false/.test(pwcVueCode) &&
-    /isAuthorizedOverride\s*=\s*false/.test(pwcVueCode)
+    !/允许下级加班/.test(pwcVueCode) &&
+    !/本行是授权加班/.test(pwcVueCode) &&
+    !/exceptionDraft\.value\.allowLowerOverride/.test(pwcVueCode) &&
+    !/exceptionDraft\.value\.isAuthorizedOverride/.test(pwcVueCode) &&
+    !/allowLowerOverride\s*:\s*(true|false)/.test(pwcVueCode) &&
+    !/isAuthorizedOverride\s*:\s*(true|false)/.test(pwcVueCode)
   assert(
-    'PWC34a 静态：例外弹窗切「要工作」即清「允许下级加班」、切「不工作」即清「本行是授权加班」',
+    'PWC34a 静态：两弹窗无「允许下级加班 / 本行是授权加班」无效开关，提交不发恒 1 旗位',
     pwc34a,
-    pwc34a ? '状态归一已挂 watch' : '缺归一逻辑（隐藏开关残留 ⇒ 提交被无解拦截）'
+    pwc34a ? '无开关 + 不发旗位字段' : '恒 1 旗位仍有控件/字段（后端只收 null 或 1，显式 0 必 400）'
   )
 
+  //  提交前时间清洗（后端 TimeSpan? 收不了空串 ⇒ 空串会让整个请求体绑定失败 422）
   const pwc34b =
-    /workState\s*===\s*'OFF'\s*&&\s*exceptionDraft\.value\.allowLowerOverride/.test(pwcVueCode) &&
-    /workState\s*===\s*'WORK'\s*&&\s*exceptionDraft\.value\.isAuthorizedOverride/.test(pwcVueCode) &&
-    /e\.workState\s*===\s*'OFF'\s*&&\s*e\.allowLowerOverride/.test(pwcVueCode)
+    /function\s+normalizeTimeInput\s*\(/.test(pwcVueCode) &&
+    /normalizeTimeInput\(e\.startAt\)/.test(pwcVueCode) &&
+    /normalizeTimeInput\(e\.endAt\)/.test(pwcVueCode) &&
+    /normalizeTimeInput\(exceptionDraft\.value\.startAt\)/.test(pwcVueCode) &&
+    /normalizeTimeInput\(exceptionDraft\.value\.endAt\)/.test(pwcVueCode) &&
+    /start\s*>=\s*end/.test(pwcVueCode) &&
+    /\.\.\.\(start\s*&&\s*end\s*\?\s*\{\s*startAt:\s*start,\s*endAt:\s*end\s*\}\s*:\s*\{\}\)/.test(
+      pwcVueCode
+    )
   assert(
-    'PWC34b 静态：例外/周基准提交前按状态清洗（不把后端必拒组合发出去）',
+    'PWC34b 静态：例外/周基准提交前归一时间并校验 start<end（不发空串时间）',
     pwc34b,
-    pwc34b ? '例外 + 周基准双处已清洗' : '提交前未按状态清洗'
+    pwc34b ? '双处已清洗（空时间省略字段）' : '提交前未归一时间/未校验先后'
   )
 
   const pwc34c =
@@ -9573,6 +10515,696 @@ async function verifyDemandProtectionLive() {
  *  - E10 静态：view 撤「排程域失败」面板（5号位 关键纠正 3）
  *  - E11-12 skip：R2 isOnCriticalPath + R3 failureSeverity 跨号位（@see dp-freeze DP06/07 模式）
  */
+/** GROUP=explanation-factory：异常与原因解释页「工厂视角」改版静态断言（2026-11-10）
+ *
+ * 背景（用户原话）：「站在工厂角度，用户能用才行」。
+ * dev 实测（planVersionId=999472 / NIGHTLY_20261107_FAMILY_XC）：
+ *  - 998 条事实里 996 条 ORDER、2 条 DOMAIN；顶层 reasonCode 998/998 全空串
+ *  - 上游原因 4 种形态：Phase 失败 831 / BATCH_POLICY_MISSING 155 /
+ *    MISSING_PRODUCTION_DEPARTMENT_CONTEXT 5 / BATCH_POLICY_CONFLICT 2
+ *    + evidenceType=PI_FREE_OVER_COMMIT 3
+ *  - 列表端点**直返** orderNo / materialCode（996/996 有值）⇒ 不必逐条查订单详情
+ *
+ * 本组断言锁的是「改造后的页面结构」，防止以后被改回旧的内部键/流水账版式。
+ * 动态断言（真浏览器实看）在 scripts/check-explanation-1110.mjs。
+ */
+function verifyExplanationFactoryView() {
+  console.log('\n=== [EX] Explanation 页面工厂视角改版（explanation-factory — 2026-11-10）===')
+
+  const vVue = readSrc('views/Aps/Explanation.vue')
+  const vTypes = readSrc('api/aps-v1/types/explanation.ts')
+  const vApi = readSrc('api/aps-v1/explanation.ts')
+  const vStore = readSrc('store/modules/aps/explanation.ts')
+
+  // EX02 原因归并：8 个分类，每类都要有中文标签 + 大白话提示
+  //   2026-11-12：5号位 R2 复函（全库恰 6 个 UpstreamReasonCode 值）补第 4 个配置缺口码
+  //   CALENDAR_COVERAGE_INSUFFICIENT（1,967 行，此前前端字典漏收 ⇒ 落进「未归类」）
+  const ex02Keys = [
+    'BATCH_POLICY_MISSING',
+    'BATCH_POLICY_CONFLICT',
+    'MISSING_PRODUCTION_DEPARTMENT_CONTEXT',
+    'CALENDAR_COVERAGE_INSUFFICIENT',
+    'ENGINE',
+    'PI_OVER_COMMIT',
+    'DECISION',
+    'OTHER'
+  ]
+  const metaBlock = vTypes.match(/EXPLANATION_REASON_META[\s\S]{0,4000}?\n\}/)?.[0] ?? ''
+  const ex02 = ex02Keys.every((k) => new RegExp(`\\b${k}:\\s*\\{`).test(metaBlock))
+  const ex02Hints = (metaBlock.match(/hint:\s*'/g) ?? []).length >= ex02Keys.length
+  assert(
+    'EX02 静态：原因归并字典 = 8 类（BATCH_POLICY_MISSING/CONFLICT、MISSING_PRODUCTION_DEPARTMENT_CONTEXT、CALENDAR_COVERAGE_INSUFFICIENT、ENGINE、PI_OVER_COMMIT、DECISION、OTHER）',
+    ex02,
+    ex02 ? '8 类齐全' : '缺：' + ex02Keys.filter((k) => !new RegExp(`\\b${k}:\\s*\\{`).test(metaBlock)).join(',')
+  )
+  assert(
+    'EX02b 静态：每个原因分类都带「要人做什么」的大白话提示（hint）',
+    ex02 && ex02Hints,
+    `hint 条数=${(metaBlock.match(/hint:\s*'/g) ?? []).length}`
+  )
+
+  // EX03 分类卡：点卡片即筛选
+  const ex03 =
+    /class="class-cards"/.test(vVue) &&
+    /class="class-card"/.test(vVue) &&
+    /class="class-card-count"/.test(vVue) &&
+    /class="class-card-hint"/.test(vVue) &&
+    /@click="toggleClass\(c\.key\)"/.test(vVue)
+  assert('EX03 静态：分类卡（中文名 + 条数 + 提示，点一下即筛选清单）', ex03, ex03 ? '齐全' : '缺 class-cards / class-card-* / toggleClass')
+
+  // EX04 订单号直取，不再逐条调订单详情解析（那是误判：列表端点已直返 orderNo）
+  const ex04HasDirect = /const orderNo = \(f\.orderNo \?\? ''\)\.trim\(\)/.test(vVue)
+  const ex04NoPerRowFetch = !/order-query\/\$\{/.test(vVue) && !/resolveOrderRef/.test(vVue)
+  assert(
+    'EX04 静态：订单号直接取后端直返字段（不再逐条解析订单详情）',
+    ex04HasDirect && ex04NoPerRowFetch,
+    `直取=${ex04HasDirect} 无逐条解析=${ex04NoPerRowFetch}`
+  )
+  assert(
+    'EX04b 静态：DTO 映射带 orderNo / materialCode',
+    /orderNo: r\.orderNo \|\| undefined/.test(vApi) && /materialCode: r\.materialCode \|\| undefined/.test(vApi),
+    'api/aps-v1/explanation.ts 映射两字段'
+  )
+
+  // EX05 清单列：订单号 / 物料编码 / 交期 / 数量 / 卡住阶段 / 问题 / 处理入口
+  const ex05Cols = [
+    '订单号',
+    '物料编码',
+    '交期',
+    '数量（需求 / 已排 / 未排，单位：件）',
+    '卡住阶段',
+    '问题',
+    '处理入口'
+  ]
+  const ex05Miss = ex05Cols.filter((c) => !vVue.includes(`label="${c}"`))
+  assert(
+    'EX05 静态：未排需求清单 7 列齐全（订单号/物料编码/交期/数量/卡住阶段/问题/处理入口）',
+    ex05Miss.length === 0,
+    ex05Miss.length === 0 ? '7 列齐全' : '缺列：' + ex05Miss.join(',')
+  )
+
+  // EX06 排序：默认按未排数量倒序；另有按交期排序
+  const ex06 =
+    /const sortBy = ref<'qty' \| 'due'>\('qty'\)/.test(vVue) &&
+    /const byQty = \(a: FactRow, b: FactRow\) =>/.test(vVue) &&
+    /\(b\.unscheduled \?\? 0\) - \(a\.unscheduled \?\? 0\)/.test(vVue)
+  assert('EX06 静态：清单默认按未排数量从多到少（可切按交期）', ex06, ex06 ? 'qty 倒序 + due 可选' : '排序实现被改')
+
+  // EX07 筛选：关键词（订单号/物料）+ 级别 + 分类
+  const ex07 =
+    /const keyword = ref\(''\)/.test(vVue) &&
+    /const filterClass = ref<ExplanationReasonClassKey \| ''>\(''\)/.test(vVue) &&
+    /const filterSeverity = ref<ExplanationSeverity \| ''>\(''\)/.test(vVue) &&
+    /placeholder="订单号 \/ 物料编码"/.test(vVue)
+  assert('EX07 静态：清单可按关键词/级别/原因分类筛选', ex07, ex07 ? '三类筛选齐全' : '筛选被改')
+
+  // EX08 分域体检：数量对账 + 完工时间确定性，且**必须是表格**（2026-11-10 用户口径"这块儿乱，改表格"）
+  const ex08 =
+    /DOMAIN_QUANTITY_RECONCILIATION:\s*'数量对账'/.test(vVue) &&
+    /DEMAND_COMPLETION_TIME:\s*'完工时间确定性'/.test(vVue) &&
+    /class="domain-health"/.test(vVue) &&
+    /class="health-table"/.test(vVue) &&
+    !/class="health-card"/.test(vVue)
+  assert(
+    'EX08 静态：分域块是体检表格（数量对账 / 完工时间确定性，非卡片）',
+    ex08,
+    ex08 ? '体检表齐全' : '分域块被改回卡片/流水账'
+  )
+
+  // EX19 「按对象分组」必须排在订单清单面板之前（2026-11-10 用户口径：这条放页面最上面）
+  const ex19 =
+    vVue.indexOf('class="group-summary"') > -1 &&
+    vVue.indexOf('class="group-summary"') < vVue.indexOf('<!-- ===== 排程解释事实')
+  assert(
+    'EX19 静态：「按对象分组」提到页面最上方（排在订单清单面板之前）',
+    ex19,
+    ex19 ? '分组条在最上' : '分组条又掉回面板里面'
+  )
+
+  // EX20 任务 / 资源 / 工段级事实按层级分别列开（2026-11-10 用户口径"有就分别列出来"）
+  const ex20 =
+    /const OTHER_LEVEL_GROUPS = \[/.test(vVue) &&
+    /\{ key: 'TASK', label: '任务级事实' \}/.test(vVue) &&
+    /\{ key: 'RESOURCE', label: '资源级事实' \}/.test(vVue) &&
+    /\{ key: 'STAGE', label: '工段级事实' \}/.test(vVue) &&
+    /v-for="g in otherLevelGroups"/.test(vVue)
+  assert(
+    'EX20 静态：任务/资源/工段级事实分三块分别列出',
+    ex20,
+    ex20 ? '三类分块渲染' : '层级分组被改回混排'
+  )
+
+  // EX21 体检表不挂长悬停 + 口径原文彻底不在用户可见区
+  //   2026-11-11 用户口径：「两个表格中的这些 tip 去掉，看上去乱乱的，字也长，我都不想看，别说工人人员了」
+  //   ⇒ 体检表的「指标 / 结论」两列不再挂 ElTooltip；口径原文（healthNoteOf / plainNotes / rawNotes）一并撤掉，
+  //     内部引用（如「0号位 §9.2」）既不进表格正文、也不留在任何悬停里。
+  const ex21HealthTableStart = vVue.indexOf('class="health-table"')
+  const ex21HealthTableEnd =
+    ex21HealthTableStart >= 0 ? vVue.indexOf('</ElTable>', ex21HealthTableStart) : -1
+  const ex21HealthTableBlock =
+    ex21HealthTableStart >= 0 && ex21HealthTableEnd > ex21HealthTableStart
+      ? vVue.slice(ex21HealthTableStart, ex21HealthTableEnd)
+      : ''
+  const ex21 =
+    ex21HealthTableBlock.length > 0 &&
+    !ex21HealthTableBlock.includes('<ElTooltip') &&
+    !/healthNoteOf|plainNotes|rawNotes/.test(vVue)
+  assert(
+    'EX21 静态：体检表不挂长悬停，口径原文（内部引用）既不进正文也不留在悬停里',
+    ex21,
+    ex21
+      ? '体检表无悬停，口径原文已彻底撤除'
+      : `悬停=${ex21HealthTableBlock.includes('<ElTooltip')} 残留口径=${/healthNoteOf|plainNotes|rawNotes/.test(vVue)}`
+  )
+
+  // EX22 体检「指标」列只留能指路的数（2026-11-10 用户口径：「阶段时间节点 772 段 用户看这个有用吗」→ 没用）
+  //   ①「阶段时间节点」＝按工段提前期推算的时间刻度，既不能派工、也不对应任何动作
+  //     ⇒ 不得再占指标位（2026-11-11 起连悬停说明一并撤掉，改由「要办的事」指路）；
+  //   ②「完工时间确定性」行必须给出「要办的事」（原来这行没有 todo，页面上等于没有下一步）；
+  //   ③ 指标 label 走白名单 —— 白名单外的任何 label 都算回归（防止中间量复活）。
+  const ex22BlockStart = vVue.indexOf('const domainHealth = computed<DomainHealth[]>')
+  // 2026-11-10：块尾标记随「自拟 6 分类字典」一起撤掉 ⇒ 改用下一段的函数名做标记
+  const ex22BlockEnd = vVue.indexOf('function bizSeverityLabel', ex22BlockStart)
+  const ex22BlockRaw =
+    ex22BlockStart > -1 && ex22BlockEnd > ex22BlockStart
+      ? vVue.slice(ex22BlockStart, ex22BlockEnd)
+      : ''
+  const ex22Block = ex22BlockRaw
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/^[ \t]*\/\/.*$/gm, '')
+  const ex22Labels = [...ex22Block.matchAll(/label:\s*'([^']+)'/g)].map((m) => m[1])
+  const ex22Whitelist = [
+    '需求',
+    '已排',
+    '未排',
+    '对不上的差额',
+    '缺失需求',
+    '缺良率',
+    '完工时间可信',
+    '完工时间不可信',
+    '缺工段提前期'
+  ]
+  const ex22BadLabels = ex22Labels.filter((l) => !ex22Whitelist.includes(l))
+  // 完工时间确定性分支单独切出来（另一个分支也有 todo =，混在一起判会假强）
+  const ex22CompStart = ex22Block.indexOf("const total = n('factCount')")
+  const ex22CompEnd = ex22Block.indexOf('return {', ex22CompStart)
+  const ex22CompBlock =
+    ex22CompStart > -1 && ex22CompEnd > ex22CompStart
+      ? ex22Block.slice(ex22CompStart, ex22CompEnd)
+      : ''
+  const ex22 =
+    ex22Block.length > 0 &&
+    ex22Labels.length > 0 &&
+    ex22BadLabels.length === 0 &&
+    !ex22Block.includes('阶段时间节点') &&
+    !ex22Block.includes('没标注') &&
+    ex22CompBlock.length > 0 &&
+    /todo =/.test(ex22CompBlock)
+  assert(
+    'EX22 静态：体检指标列只留能指路的数（中间量不得占指标位；完工时间行必须有「要办的事」）',
+    ex22,
+    ex22
+      ? `指标 label 全在白名单内（${ex22Labels.length} 个）+ 无中间量 + 完工时间行有要办的事`
+      : `越界 label=${ex22BadLabels.join(',') || '无'} 阶段时间节点=${ex22Block.includes('阶段时间节点')} 没标注=${ex22Block.includes('没标注')} todo=${/todo =/.test(ex22CompBlock)}`
+  )
+
+  // EX09 内部键不许出现在页面上（模板里不得直出内部键 / 旧黑话）
+  //   只查"去掉注释后"的源码：注释里可以写"以前显示 需求 999472_1"这类历史说明
+  const vVueNoComment = vVue
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/<!--[\s\S]*?-->/g, '')
+    .replace(/^[ \t]*\/\/.*$/gm, '')
+  /** 模板文案判据用：prettier 会把长句子折行 ⇒ 先把空白压成单空格再比对 */
+  const vVueFlat = vVue.replace(/\s+/g, ' ')
+  const ex09Bad = ['需求 999472', '需求片 #', '未标注原因码']
+  const ex09Hit = ex09Bad.filter((s) => vVueNoComment.includes(s))
+  assert(
+    'EX09 静态：页面文案里没有内部键 / 旧黑话（需求 999472_N、需求片 #N、未标注原因码）',
+    ex09Hit.length === 0,
+    ex09Hit.length === 0 ? '干净（注释除外）' : '仍出现：' + ex09Hit.join(',')
+  )
+
+  // EX10 「处理入口」有真实路由落点
+  const ex10 =
+    /BATCH_POLICY_MISSING: \{ text: '前往批策略维护', to: '\/aps\/task-split-rule-config' \}/.test(vVue) &&
+    /ENGINE: \{ text: '查看排产运行记录', to: '\/aps\/run' \}/.test(vVue) &&
+    /function goReasonAction/.test(vVue)
+  assert(
+    'EX10 静态：「处理入口」按钮有真实路由落点（批策略维护 / 排产运行记录）',
+    ex10,
+    ex10 ? '两条路由齐全' : '路由映射被改'
+  )
+
+  // EX11 原始原因码不进用户可见区
+  //   2026-11-11 起连悬停提示一并撤掉 ⇒ 原始原因码（Phase/BATCH_POLICY_* 等）在页面上彻底不出现。
+  const templatePart = vVue.slice(vVue.indexOf('<template>'))
+  const ex11 = !/rawReason/.test(templatePart)
+  assert(
+    'EX11 静态：原始原因码（Phase/BATCH_POLICY_* 等）不进用户可见区（表格正文与悬停都不出现）',
+    ex11,
+    ex11 ? '模板里没有 rawReason 直出' : '模板里直出了 rawReason'
+  )
+
+  // EX12 数量千分位（大数量要能一眼读出量级）
+  const ex12 = /intPart\.replace\(\/\\B\(\?=\(\\d\{3\}\)\+\$\)\/g, ','\)/.test(vVue)
+  assert('EX12 静态：大数量带千分位（1,685,413 而不是 1685413）', ex12, ex12 ? 'fmtQty 已加千分位' : 'fmtQty 缺千分位')
+
+  // EX13 阶段码必须翻成中文阶段名（2026-11-10 用户口径：名字要正式、用户看得懂）
+  //   冻结 §1.9 阶段字典 = 29 条（BJ型材押出 / BJ表面处理 / BJ机加 / BJ组立 …）
+  //   后端暂无阶段字典端点（实测 404）⇒ 前端按冻结文档内置一份，查不到时原样显示阶段码
+  const vStage = readSrc('api/aps-v1/types/stage.ts')
+  const stageRows = vStage.match(/^\s*[A-Z0-9]+_[A-Z0-9]+:\s*'/gm) ?? []
+  const ex13 =
+    /export function stageLabelOf/.test(vStage) &&
+    /BJ_EXTRU:\s*'BJ型材押出'/.test(vStage) &&
+    /BJ_SURF:\s*'BJ表面处理'/.test(vStage) &&
+    stageRows.length === 29 &&
+    /v-if="row\.stageCode">{{ stageLabelOf\(row\.stageCode\) }}<\/div>/.test(vVue) &&
+    !/\{\{\s*row\.stageCode\s*\}\}/.test(vVue)
+  assert(
+    'EX13 静态：阶段码走阶段字典翻成中文阶段名（冻结 §1.9 29 码），页面不直出裸码',
+    ex13,
+    ex13
+      ? `字典 ${stageRows.length} 条 + 页面走 stageLabelOf`
+      : `字典条数=${stageRows.length}（应 29）/ 表格未走 stageLabelOf=${/v-if="row\.stageCode">{{ stageLabelOf\(row\.stageCode\) }}<\/div>/.test(vVue)}`
+  )
+
+  // EX14 名称正式化：卡片标题 / 列名不得用口语（用户原话「这样看起来太随意了」）
+  const vTypesNoComment = vTypes
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/^[ \t]*\/\/.*$/gm, '')
+  const ex14Bad = [
+    '批策略互相打架',
+    '物料没有生产部门',
+    '没配批策略',
+    '引擎没排出',
+    '排程引擎没排出结果',
+    '原因未填',
+    '卡在哪',
+    '去哪修',
+    '要人工处理'
+  ]
+  const ex14Hit = ex14Bad.filter((s) => vVueNoComment.includes(s) || vTypesNoComment.includes(s))
+  assert(
+    'EX14 静态：卡片标题 / 列名用正式名称（不得出现「打架 / 没排出 / 卡在哪 / 去哪修」等口语）',
+    ex14Hit.length === 0,
+    ex14Hit.length === 0 ? '无口语残留' : '仍出现：' + ex14Hit.join(',')
+  )
+
+  // EX15 单位口径分离（2026-11-10 用户原话「这个数量和件分别是啥意思」）
+  //   需求**条数**＝「条」；需求**数量**＝「件」。两者同屏出现，混用「张」必然看错。
+  const ex15Bad = [/\}\s*张/, /张需求/, /张没排/, /一张/, /张生产指令/]
+  const ex15Hit = ex15Bad.filter((re) => re.test(vVueNoComment)).map((re) => String(re))
+  const ex15Ok =
+    ex15Hit.length === 0 &&
+    vVue.includes('共 {{ filteredRows.length }} 条需求 · 未排合计') &&
+    vVue.includes("label=\"数量（需求 / 已排 / 未排，单位：件）\"")
+  assert(
+    'EX15 静态：条数用「条」、数量用「件」，页面不混用「张」（清单/域体检全站一致）',
+    ex15Ok,
+    ex15Ok ? '条/件分离，统计行为「条…件」' : '残留：' + ex15Hit.join(',') + ' / 统计行未用「条」'
+  )
+
+  // EX16 未排需求清单不挂长悬停（2026-11-11 用户口径：提示太长太乱，工人看不下去）
+  //   原先靠行悬停补「需求 X 件 / 已排 Y 件 / 未排 Z 件」的单位 ⇒ 现在单位改由列头承担。
+  const ex16FactTableStart = vVue.indexOf('class="fact-table"')
+  const ex16FactTableEnd =
+    ex16FactTableStart >= 0 ? vVue.indexOf('</ElTable>', ex16FactTableStart) : -1
+  const ex16FactTableBlock =
+    ex16FactTableStart >= 0 && ex16FactTableEnd > ex16FactTableStart
+      ? vVue.slice(ex16FactTableStart, ex16FactTableEnd)
+      : ''
+  const ex16 =
+    ex16FactTableBlock.length > 0 &&
+    !ex16FactTableBlock.includes('<ElTooltip') &&
+    !vVue.includes('factRowTooltip') &&
+    vVue.includes('label="数量（需求 / 已排 / 未排，单位：件）"')
+  assert(
+    'EX16 静态：未排需求清单不挂长悬停（数量单位由列头承担）',
+    ex16,
+    ex16
+      ? '清单表无悬停，单位在列头'
+      : `悬停=${ex16FactTableBlock.includes('<ElTooltip')} factRowTooltip=${vVue.includes('factRowTooltip')} 列头单位=${vVue.includes('label="数量（需求 / 已排 / 未排，单位：件）"')}`
+  )
+
+  // EX18 顶部结论条 / KPI 卡 / 名词解释块已按用户要求移除（2026-11-10 用户截图圈改）
+  const ex18Gone =
+    !vVue.includes('class="fact-conclusion"') &&
+    !vVue.includes('class="kpi-row"') &&
+    !vVue.includes('class="fact-legend"') &&
+    !vVue.includes('const factConclusion = computed') &&
+    !vVue.includes('const kpiItems = computed')
+  assert(
+    'EX18 静态：顶部一句话结论 / KPI 卡 / 名词解释块已移除（页面直接进「排程解释事实」）',
+    ex18Gone,
+    ex18Gone
+      ? '三块均已移除'
+      : '仍在：' +
+          [
+            vVue.includes('class="fact-conclusion"') ? '结论条' : '',
+            vVue.includes('class="kpi-row"') ? 'KPI 卡' : '',
+            vVue.includes('class="fact-legend"') ? '名词解释块' : '',
+            vVue.includes('const factConclusion = computed') ? 'factConclusion' : '',
+            vVue.includes('const kpiItems = computed') ? 'kpiItems' : ''
+          ]
+            .filter(Boolean)
+            .join(',')
+  )
+
+  /* ================================================================
+   * 2026-11-10 第六轮：业务事实问题 + 原因代码分布 改「工厂视角」
+   * 用户原话：「业务事实问题和原因代码分布 这两部分分别站在工厂用户的角度来修改，
+   *           他们需要什么信息对排产有帮助来修改，表格是否需要添加筛选，
+   *           这样一页一页的翻看也不是很友好。」
+   * dev 实测（2026-11-10，跨 16 页抽样 3,139 条 + 全量计数）：
+   *   - 总量 107,739 条；severity ERROR 4,261 / WARN 98,376 / INFO 5,102
+   *   - source BOM_WORKSET 41,143 / MATERIAL_STAGE_CONTEXT 66,596
+   *   - issueType 真码 8 个（此前 4号位 自拟 6 码后端一个都不产出 ⇒ 页面 100% 裸英文码）
+   *   - reviewStatus 抽样 3,139 条 **100% PENDING**，且页面无复核动作 ⇒ 复核列零信息量
+   *   - reasonCodeCounts（dev planVersionId=999333）：空串 516 条 + RESOURCE_CAPACITY_WAIT 11 条
+   *     ⇒ 原「原因代码分布」一屏只有一个「未填原因码」标签，且自写「不用看这里的原始码」
+   * ================================================================ */
+
+  // EX23 静态：业务事实问题表按工厂视角改列
+  //   ① 补「严重度」列 —— 后端一直返、页面一直没显示（最该先看的一维）
+  //   ② 「类型」改中文（此前 100% 裸英文码）
+  //   ③ 「来源」不再单独占一列（问题类型下面一行小字），腾出宽度给物料/工段
+  //   ④ 撤「复核」列（dev 100% 待复核 + 页面无复核动作）
+  const ex23Cols = [
+    '严重度',
+    '问题类型',
+    '物料编码',
+    '工段 / 工厂',
+    '单据号',
+    '问题说明',
+    '降级动作',
+    '发生时间'
+  ]
+  const ex23ColMiss = ex23Cols.filter((c) => !vVue.includes(`label="${c}"`))
+  const ex23 =
+    ex23ColMiss.length === 0 &&
+    vVue.includes('bizSeverityLabel(row.severity)') &&
+    vVue.includes('bizIssueTypeLabelOf(row.issueType)') &&
+    vVue.includes('bizSourceLabelOf(row.source)') &&
+    !vVue.includes('label="复核"') &&
+    !/\{\{\s*row\.issueType\s*\}\}/.test(vVue) &&
+    !/\{\{\s*row\.source\s*\}\}/.test(vVue)
+  assert(
+    'EX23 静态：业务事实问题表改列（补严重度 / 类型来源走中文 / 撤复核列 / 不裸出英文码）',
+    ex23,
+    ex23
+      ? '8 列齐全 + 三处走中文映射 + 无复核列'
+      : `缺列=${ex23ColMiss.join(',') || '无'} 严重度映射=${vVue.includes('bizSeverityLabel(row.severity)')} 类型映射=${vVue.includes('bizIssueTypeLabelOf(row.issueType)')} 来源映射=${vVue.includes('bizSourceLabelOf(row.source)')} 复核列=${vVue.includes('label="复核"')}`
+  )
+
+  // EX24 静态：六个筛选参数在 api 层贯通（后端已支持的参数）
+  //   后端形参：@see lps/LPS.APS.Web/Controllers/BusinessFactIssueController.cs:62-69
+  //   2026-11-12 增 issueType / keyword / factoryCode（5号位 11-11 复函 §一/§二，已落码）
+  const ex24ApiParams = ['severity', 'source', 'materialCode', 'issueType', 'keyword', 'factoryCode']
+  const ex24ApiMiss = ex24ApiParams.filter(
+    (p) =>
+      !new RegExp(`${p}\\?:\\s*string`).test(vApi) || !new RegExp(`params\\.${p}\\s*=\\s*opts\\.${p}`).test(vApi)
+  )
+  assert(
+    'EX24 静态：api 层 listBusinessFactIssues 支持 severity / source / materialCode / issueType / keyword / factoryCode 六个后端筛选参数',
+    ex24ApiMiss.length === 0,
+    ex24ApiMiss.length === 0 ? '六个参数都进 params' : '未贯通：' + ex24ApiMiss.join(',')
+  )
+
+  // EX25 静态：筛选贯通 store → view，且任一筛选变化都回第 1 页
+  //   ⚠️ 逐个 handler 切块判「回第 1 页」：整文件扫会假强（onMounted 里也有一处 fetchBizPage）
+  //   2026-11-12 增三个筛选（问题类型 / 关键词 / 工厂）⇒ handler 从 4 个扩到 8 个
+  const ex25HandlerNames = [
+    'onBizSeverityChange',
+    'onBizSourceChange',
+    'onBizMaterialSearch',
+    'onBizMaterialClear',
+    'onBizIssueTypeChange',
+    'onBizKeywordSearch',
+    'onBizKeywordClear',
+    'onBizFactoryChange'
+  ]
+  const ex25HandlerBodies = ex25HandlerNames.map((fn) => {
+    const i = vVue.indexOf(`function ${fn}(`)
+    if (i < 0) return ''
+    const j = vVue.indexOf('\n}', i)
+    return j > i ? vVue.slice(i, j) : ''
+  })
+  const ex25Store =
+    /const bizSeverity = ref<string>\(''\)/.test(vStore) &&
+    /const bizSource = ref<string>\(''\)/.test(vStore) &&
+    /const bizMaterialCode = ref<string>\(''\)/.test(vStore) &&
+    /const bizIssueType = ref<string>\(''\)/.test(vStore) &&
+    /const bizKeyword = ref<string>\(''\)/.test(vStore) &&
+    /const bizFactoryCode = ref<string>\(''\)/.test(vStore) &&
+    /function setBizFilters/.test(vStore)
+  // ⚠️ 筛选透传要**只看 fetchBizPage 的函数体**：refreshBizIssues 里也有一份同样的几行，
+  //    整文件扫会假强（改坏 fetchBizPage 也不转红）。
+  const ex25FetchBody = (() => {
+    const i = vStore.indexOf('async function fetchBizPage(')
+    if (i < 0) return ''
+    const j = vStore.indexOf('\n  }', i)
+    return j > i ? vStore.slice(i, j) : ''
+  })()
+  const ex25StorePass =
+    ex25FetchBody.length > 0 &&
+    /severity: bizSeverity\.value \|\| undefined/.test(ex25FetchBody) &&
+    /source: bizSource\.value \|\| undefined/.test(ex25FetchBody) &&
+    /materialCode: bizMaterialCode\.value \|\| undefined/.test(ex25FetchBody) &&
+    /issueType: bizIssueType\.value \|\| undefined/.test(ex25FetchBody) &&
+    /keyword: bizKeyword\.value \|\| undefined/.test(ex25FetchBody) &&
+    /factoryCode: bizFactoryCode\.value \|\| undefined/.test(ex25FetchBody)
+  const ex25View =
+    /class="biz-filters"/.test(vVue) &&
+    /@change="onBizSeverityChange"/.test(vVue) &&
+    /@change="onBizSourceChange"/.test(vVue) &&
+    /@keyup\.enter="onBizMaterialSearch"/.test(vVue) &&
+    /@change="onBizIssueTypeChange"/.test(vVue) &&
+    /@keyup\.enter="onBizKeywordSearch"/.test(vVue) &&
+    /@change="onBizFactoryChange"/.test(vVue) &&
+    ex25HandlerBodies.length === 8 &&
+    ex25HandlerBodies.every((b) => b.length > 0 && /fetchBizPage\(1,/.test(b))
+  assert(
+    'EX25 静态：筛选贯通 store → view（严重度 / 来源 / 物料编码 / 问题类型 / 关键词 / 工厂），任一变化都回第 1 页',
+    ex25Store && ex25StorePass && ex25View,
+    `store=${ex25Store} 透传=${ex25StorePass} view=${ex25View} handler块=${ex25HandlerBodies.map((b) => (b.length ? (/fetchBizPage\(1,/.test(b) ? 'OK' : '缺回第1页') : 'MISSING')).join(',')}`
+  )
+
+  // EX26 静态：「排产决策原因」小表格（替换原「原因代码分布」标签块）
+  //   ① 只列写了原因码的（空串单独一行说明「另有 N 条没写明原因」）
+  //   ② 不显示影响小时数（后端 ImpactHours 量纲不可信：单条 14,312.84「小时」≈ 597 天）
+  //   ③ 卡片显示条件必须含 unlabeledReasonCount：dev ACTIVE 版本（NIGHTLY_20261107_FAMILY_XC）
+  //      998 条事实原因码**全是空串** ⇒ 只按 decisionReasonRows.length 显示的话整块消失，
+  //      用户以为功能坏了。空的时候给一句大白话（ElEmpty），不许藏。
+  const ex26 =
+    vVue.includes('排产决策原因') &&
+    vVue.includes('class="decision-reason-table"') &&
+    !vVueNoComment.includes('原因代码分布') &&
+    !/totalImpactHours/.test(vVue) &&
+    /v-if="decisionReasonRows\.length \|\| unlabeledReasonCount > 0"/.test(vVue) &&
+    /另有 \{\{ unlabeledReasonCount \}\} 条记录没写明原因，看不出属于哪一类取舍/.test(vVueFlat)
+  assert(
+    'EX26 静态：「排产决策原因」是小表格（原因 + 条数），不再显示影响小时数',
+    ex26,
+    `标题=${vVue.includes('排产决策原因')} 表格=${vVue.includes('class="decision-reason-table"')} 旧块=${vVueNoComment.includes('原因代码分布')} 影响小时=${/totalImpactHours/.test(vVue)} 卡片条件=${/v-if="decisionReasonRows\.length \|\| unlabeledReasonCount > 0"/.test(vVue)} 未写原因码说明=${/另有 \{\{ unlabeledReasonCount \}\} 条记录没写明原因，看不出属于哪一类取舍/.test(vVueFlat)}`
+  )
+
+  // EX27 静态：issueType / source 真码都有中文名（页面不裸奔英文码）
+  //   10 个 issueType 全部来自 dev 全量扫描（2026-11-11：ERROR 4,261 + WARN 98,054 + INFO 5,102 三段全量遍历）
+  const ex27IssueTypes = [
+    'BOMNO_MISSING_PRODUCTION',
+    'BOM_ENTRY_NOT_FOUND',
+    'MULTI_BOMNO_UNRESOLVED',
+    'CROSS_FACTORY_STAGE_MISSING',
+    'FACTORY_MISMATCH',
+    'FACTORY_MISMATCH_MULTI',
+    'LEAF',
+    'MISSING_DEPT_FOR_BOM_STAGE',
+    'MULTI_DEPT_CONFLICT_FOR_STAGE',
+    'MISSING_DEPT_IN_ERP'
+  ]
+  const ex27LabelsStart = vTypes.indexOf('export const BIZ_ISSUE_TYPE_LABELS')
+  const ex27LabelsBlock =
+    ex27LabelsStart < 0 ? '' : vTypes.slice(ex27LabelsStart, vTypes.indexOf('}', ex27LabelsStart))
+  // 每个真码都要有**中文**标签（值里必须有汉字；值 = 裸码即算回归）
+  const ex27Bad = ex27IssueTypes.filter((c) => {
+    const m = ex27LabelsBlock.match(new RegExp(`${c}:\\s*'([^']*)'`))
+    return !m || !/[一-龥]/.test(m[1])
+  })
+  const ex27 =
+    ex27Bad.length === 0 &&
+    /export function bizIssueTypeLabelOf/.test(vTypes) &&
+    /export function bizSourceLabelOf/.test(vTypes) &&
+    /MATERIAL_STAGE_CONTEXT:/.test(vTypes) &&
+    !vTypes.includes('EQUIPMENT_FAILURE:') &&
+    !vVue.includes('BIZ_ISSUE_TYPE_LABEL')
+  assert(
+    'EX27 静态：issueType / source 真码都有中文映射（10 个实测 issueType 齐全；自拟 6 码已撤）',
+    ex27,
+    ex27
+      ? '10 码齐全 + 中文标签 + 共享映射函数 + 自拟码已撤'
+      : `无中文标签的码=${ex27Bad.join(',') || '无'} 有自拟码=${vTypes.includes('EQUIPMENT_FAILURE:')} 页面仍有本地字典=${vVue.includes('BIZ_ISSUE_TYPE_LABEL')}`
+  )
+
+  // EX28 静态：业务事实问题首屏要真的拉数据
+  //   后端 Summary 端点**不返** businessFactIssues（dev 实测响应只有 7 个字段）
+  //   ⇒ 页面必须在 onMounted 里单独拉一次，否则这张表永远是空的
+  // ⚠️ 首拉判据要**只看 onMounted 函数体**：4 个筛选 handler 里也有同一串
+  //    `void fetchBizPage(1, ...)`，整文件扫会假强（删掉 onMounted 那句也不转红）。
+  const ex28MountBody = (() => {
+    const i = vVue.indexOf('onMounted(async () => {')
+    if (i < 0) return ''
+    const j = vVue.indexOf('\n})', i)
+    return j > i ? vVue.slice(i, j) : ''
+  })()
+  const ex28 =
+    /fetchBizPage\(1,\s*businessFactIssuesPageSize\.value\)/.test(ex28MountBody) &&
+    /if \(data\.value\.businessFactIssues\?\.length\)/.test(vStore)
+  assert(
+    'EX28 静态：业务事实问题首屏单独拉一次（Summary 端点不返这张表，不拉就是空表）',
+    ex28,
+    `onMounted 首拉=${/fetchBizPage\(1,\s*businessFactIssuesPageSize\.value\)/.test(ex28MountBody)} store 不覆盖=${/if \(data\.value\.businessFactIssues\?\.length\)/.test(vStore)}`
+  )
+
+  // EX29 静态：配置缺口码**数据驱动**（0号位 裁了自动生效），三处口径一致
+  //   ① types 有集中注册表 CONFIG_GAP_REASON_CODES（4 码齐全，含 5号位 R2 补的日历码）
+  //   ② 判定函数按注册表查（不是写死的 if 串联）
+  //   ③ 分类判定**先认缺口码、后认冻结 15 码**（缺口码不会被误判成「排产决策取舍」）
+  //   ④ 「排产决策原因」小表剔除缺口码（缺口由分类卡 + 处理入口表达，不重复显示）
+  //   ⑤ 页面分类顺序与处理入口覆盖 4 个缺口码
+  const ex29GapCodes = [
+    'BATCH_POLICY_MISSING',
+    'BATCH_POLICY_CONFLICT',
+    'MISSING_PRODUCTION_DEPARTMENT_CONTEXT',
+    'CALENDAR_COVERAGE_INSUFFICIENT'
+  ]
+  const ex29Registry =
+    vTypes.match(/export const CONFIG_GAP_REASON_CODES\s*=\s*\[([\s\S]*?)\]\s*as const/)?.[1] ?? ''
+  const ex29RegistryOk = ex29GapCodes.every((c) => new RegExp(`['"]${c}['"]`).test(ex29Registry))
+  const ex29JudgeFn =
+    /export function isConfigGapReasonCode/.test(vTypes) &&
+    /CONFIG_GAP_REASON_CODES as readonly string\[\]\)\.includes/.test(vTypes)
+  // ⚠️ 取函数体不能按 '\n}' 切：形参跨行时 `}): ExplanationReasonMeta {` 也会命中
+  //    ⇒ 改用「整行只有 } 」的收口（\n}\r?\n），内层缩进的 `  }` 不受影响
+  const ex29ClassifyBody =
+    (vTypes.match(/export function classifyExplanationReason[\s\S]*?\n\}\r?\n/) ?? [''])[0]
+  const ex29GapIdx = ex29ClassifyBody.indexOf('CONFIG_GAP_REASON_CODES.find')
+  const ex29DecisionIdx = ex29ClassifyBody.indexOf('EXPLANATION_REASON_META.DECISION')
+  const ex29GapFirst = ex29GapIdx > -1 && ex29DecisionIdx > -1 && ex29GapIdx < ex29DecisionIdx
+  const ex29RowsFiltered =
+    /\.filter\(\(c: ReasonCodeCount\) => !isConfigGapReasonCode\(c\.reasonCode\)\)/.test(vVue)
+  const ex29OrderBlock = (() => {
+    const i = vVue.indexOf('const REASON_CLASS_ORDER')
+    if (i < 0) return ''
+    const j = vVue.indexOf('\n]', i)
+    return j > i ? vVue.slice(i, j) : ''
+  })()
+  const ex29OrderOk = ex29GapCodes.every((c) => ex29OrderBlock.includes(`'${c}'`))
+  const ex29ActionNew =
+    /CALENDAR_COVERAGE_INSUFFICIENT:\s*\{ text: '前往资源日历维护', to: '\/aps\/resource-calendar' \}/.test(
+      vVue
+    )
+  const ex29 =
+    ex29RegistryOk &&
+    ex29JudgeFn &&
+    ex29GapFirst &&
+    ex29RowsFiltered &&
+    ex29OrderOk &&
+    ex29ActionNew
+  assert(
+    'EX29 静态：配置缺口码数据驱动（注册表 + 判定函数），且先于冻结 15 码判定；「排产决策原因」小表剔除缺口码',
+    ex29,
+    `注册表4码=${ex29RegistryOk} 判定函数=${ex29JudgeFn} 缺口先判=${ex29GapFirst} 小表过滤=${ex29RowsFiltered} 分类顺序覆盖=${ex29OrderOk} 日历码处理入口=${ex29ActionNew}`
+  )
+
+  /* ===== EX30 静态：三个新筛选（问题类型 / 关键词 / 工厂）+ 工厂下拉白名单
+   * 2026-11-12，按 5号位 11-11 复函 §一（issueType / keyword 已落码）与 §二（factoryCode 缺参一并修复）：
+   *  - §一：issueType = 封闭 10 码；keyword = 模糊（两源各打各的列）
+   *  - §二：factoryCode 真业务五码（CN/BJ/TJ/CN6课/SH）；Factory 主数据表另有 **44 条测试夹具**
+   *    ⇒ 工厂下拉必须按白名单过滤，不能把 `TF_*` 测试厂铺给用户
+   * 拆成 EX30a~EX30f 独立断言（条件合并会假强：拆开才能定位是哪一条坏了）。 ===== */
+  const ex30FactoryCodes =
+    vTypes.match(/export const BIZ_ISSUE_FACTORY_CODES\s*=\s*\[([\s\S]*?)\]\s*as const/)?.[1] ?? ''
+  const ex30WhitelistOk =
+    ['CN', 'BJ', 'TJ', 'CN6课', 'SH'].every((c) =>
+      new RegExp(`['"]${c}['"]`).test(ex30FactoryCodes)
+    ) && !/TF_|S1|S2|S3|S4/.test(ex30FactoryCodes)
+  assert(
+    'EX30a 静态：真业务工厂白名单 = 5 码（CN/BJ/TJ/CN6课/SH），不含后端 44 条测试夹具',
+    ex30WhitelistOk,
+    ex30WhitelistOk
+      ? '白名单 5 码齐全且无夹具码'
+      : `白名单块=${ex30FactoryCodes.replace(/\s+/g, ' ').trim() || '未找到'}`
+  )
+
+  // 过滤动作必须落在 loadFactoryOptions 函数体内（整文件扫会假强：同名字面量在别处也有）
+  const ex30LoadFactoryBody = (() => {
+    const i = vVue.indexOf('async function loadFactoryOptions(')
+    if (i < 0) return ''
+    const j = vVue.indexOf('\n}', i)
+    return j > i ? vVue.slice(i, j) : ''
+  })()
+  const ex30FactoryFilterOk =
+    ex30LoadFactoryBody.length > 0 &&
+    /new Set<string>\(BIZ_ISSUE_FACTORY_CODES\)/.test(ex30LoadFactoryBody) &&
+    /\.filter\(\(f\) => allow\.has\(/.test(ex30LoadFactoryBody) &&
+    /v-for="f in factoryOptions"/.test(vVue)
+  assert(
+    'EX30b 静态：工厂下拉按白名单过滤后渲染（不把后端全表铺给用户）',
+    ex30FactoryFilterOk,
+    `函数体=${ex30LoadFactoryBody.length > 0} 白名单过滤=${/new Set<string>\(BIZ_ISSUE_FACTORY_CODES\)/.test(ex30LoadFactoryBody)} 模板取 factoryOptions=${/v-for="f in factoryOptions"/.test(vVue)}`
+  )
+
+  const ex30FailSafeOk =
+    /factoryOptions\.value = \[\]/.test(ex30LoadFactoryBody) &&
+    /factoryOptionsError\.value = /.test(ex30LoadFactoryBody) &&
+    /v-if="factoryOptionsError"/.test(vVue) &&
+    // 失败时不得回退硬编码工厂清单（假选项会让用户选到实库里不存在的工厂）
+    !ex30LoadFactoryBody.includes("'BJ'")
+  assert(
+    'EX30c 静态：工厂下拉拉取失败 ⇒ 空下拉 + 如实报错，不硬编码兜底',
+    ex30FailSafeOk,
+    `置空=${/factoryOptions\.value = \[\]/.test(ex30LoadFactoryBody)} 报错=${/factoryOptionsError\.value = /.test(ex30LoadFactoryBody)} 模板提示=${/v-if="factoryOptionsError"/.test(vVue)} 硬编码兜底=${ex30LoadFactoryBody.includes("'BJ'")}`
+  )
+
+  const ex30ColumnOk =
+    /factoryLabel\(row\.factoryCode\)/.test(vVue) &&
+    !/\{\{\s*row\.factoryCode\s*\}\}/.test(vVue) &&
+    /function factoryLabel\(/.test(vVue)
+  assert(
+    'EX30d 静态：「工段 / 工厂」列显示中文名，不直出裸工厂码',
+    ex30ColumnOk,
+    `走 factoryLabel=${/factoryLabel\(row\.factoryCode\)/.test(vVue)} 裸码残留=${/\{\{\s*row\.factoryCode\s*\}\}/.test(vVue)} 映射函数=${/function factoryLabel\(/.test(vVue)}`
+  )
+
+  // 跨厂口径提示：锚到模板元素（脚本注释里也有一份「跨厂」字样，锚注释会被顶替）
+  const ex30NoteIdx = vVue.indexOf('v-if="bizFactoryCode"')
+  const ex30NoteBlock = ex30NoteIdx < 0 ? '' : vVue.slice(ex30NoteIdx, ex30NoteIdx + 300)
+  const ex30HintOk =
+    ex30NoteBlock.includes('biz-filter-note') && ex30NoteBlock.includes('跨厂')
+  assert(
+    'EX30e 静态：选中工厂时给一句跨厂口径提示（跨厂问题不归单一工厂）',
+    ex30HintOk,
+    `提示块=${ex30NoteBlock.includes('biz-filter-note')} 含跨厂说明=${ex30NoteBlock.includes('跨厂')}`
+  )
+
+  const ex30TypeCodesBlock =
+    vTypes.match(/export const BIZ_ISSUE_TYPE_CODES\s*=\s*\[([\s\S]*?)\]\s*as const/)?.[1] ?? ''
+  const ex30TypeList = (ex30TypeCodesBlock.match(/['"][A-Z0-9_]+['"]/g) ?? []).map((s) =>
+    s.slice(1, -1)
+  )
+  const ex30TypeOk =
+    ex30TypeList.length === 10 &&
+    ex27IssueTypes.every((c) => ex30TypeList.includes(c)) &&
+    /v-for="t in BIZ_ISSUE_TYPE_CODES"/.test(vVue) &&
+    /bizIssueTypeLabelOf\(t\)/.test(vVue)
+  assert(
+    'EX30f 静态：问题类型下拉走封闭 10 码常量（页面不另抄一份值域）',
+    ex30TypeOk,
+    `码数=${ex30TypeList.length} 缺码=${ex27IssueTypes.filter((c) => !ex30TypeList.includes(c)).join(',') || '无'} 模板取常量=${/v-for="t in BIZ_ISSUE_TYPE_CODES"/.test(vVue)} 走中文映射=${/bizIssueTypeLabelOf\(t\)/.test(vVue)}`
+  )
+}
+
 async function verifyExplanationFreeze(adminToken) {
   console.log('\n=== [E] Explanation 页面冻结一致性（e-freeze — 10-09 5号位 函件 R1/R2/R3 一致性核查回执）===')
 
@@ -9709,14 +11341,24 @@ async function verifyExplanationFreeze(adminToken) {
   // E09 静态：view 排程解释事实展示 reasonCode 徽章（v5.1.10 15 码）
   //   - 2026-10-31：标签改走全站唯一口径 `reasonLabelOf`（本页原自写
   //     `REASON_CODE_LABELS[code] ?? code`，空串时返回空串 ⇒ 空白标签；实库 95% 原因为空串）
-  //   - 同时展示 severity + objectRef + reasonCode 3 列
+  //   - 2026-11-10 工厂视角改版：清单行变量由 `f` 改为 `row`（FactRow），
+  //     徽章改为「有 reasonCode 才显示」（空串不显示，避免又出现空白标签）
+  //   - 2026-11-12：标签文本改在脚本侧统一算好（`decisionCodeLabel`）：
+  //     配置缺口码不显示（由分类标签表达）⇒ 顶层 reasonCode 被 0号位 回写成缺口码时页面不露裸英文码
   const e09HasReasonLabel = /reasonLabelOf\s*\(/.test(eVue)
   const e09HasReasonTagInTemplate =
-    /\{\{\s*reasonLabelOf\((f|c)\.reasonCode\)\s*\}\}/.test(eVue)
+    /\{\{\s*reasonLabelOf\((f|c|row)\.reasonCode\)\s*\}\}/.test(eVue) ||
+    /\{\{\s*row\.decisionCodeLabel\s*\}\}/.test(eVue)
+  const e09DecisionLabelComputed =
+    /decisionCodeLabel:\s*reasonCode && !isConfigGapReasonCode\(reasonCode\)\s*\?\s*reasonLabelOf\(reasonCode\)\s*:\s*''/.test(
+      eVue
+    )
   assert(
     'E09 静态：Explanation.vue 排程解释事实展示 reasonCode 徽章（走共享 reasonLabelOf）',
-    e09HasReasonLabel && e09HasReasonTagInTemplate,
-    e09HasReasonLabel && e09HasReasonTagInTemplate ? '已加 reasonCode 徽章列' : '排程解释事实未展示 reasonCode'
+    e09HasReasonLabel && e09HasReasonTagInTemplate && e09DecisionLabelComputed,
+    e09HasReasonLabel && e09HasReasonTagInTemplate && e09DecisionLabelComputed
+      ? '已加 reasonCode 徽章列（脚本侧统一算标签，缺口码不显示）'
+      : `reasonLabelOf=${e09HasReasonLabel} 模板标签=${e09HasReasonTagInTemplate} 脚本侧计算=${e09DecisionLabelComputed}`
   )
 
   // E10 静态：view 撤「排程域失败」面板（5号位 关键纠正 3）
@@ -9908,7 +11550,11 @@ async function verifyExplanationFreeze(adminToken) {
     !/EQUIP_TYPE_LABEL|EQUIP_TAG_TYPE|\.equip-list|\.equip-item|\.equip-head|\.equip-code|\.equip-meta|\.equip-field|\.equip-icon|\.u20-alert/.test(
       eVue
     )
-  const e20ViewNoElTooltip = !/<ElTooltip\b/.test(eVue)
+  // 2026-11-11 用户口径：「两个表格中的这些 tip 去掉，看上去乱乱的，字也长，我都不想看，别说工人人员了」
+  //   ⇒ 清单表 / 体检表两处曾临时挂上的长悬停提示全部撤掉，
+  //      E20 回到 10-10 option A 的原始口径：**整个 view 不许再出现 ElTooltip**，
+  //      保留"已撤的设备故障/重排建议两块不许借 tooltip 复活"的本意。
+  const e20ViewNoElTooltip = !eVue.includes('<ElTooltip')
   const e20All =
     e20NoRecDto &&
     e20NoEquipDto &&
@@ -9952,27 +11598,22 @@ async function verifyExplanationFreeze(adminToken) {
   }
 
   // E22 探针：10-10 样式简洁整齐（修 dev 浏览器 KPI 卡片"100%"换行 + 排程解释事实 grid 2 列硬截）
-  //   - 修前症状：KPI 卡 `100%` 文本换行到第二行；`.fact-grid` 硬截 `repeat(2, 1fr)` 在窄屏溢出
-  //   - 修后契约：`.kpi-card { min-width: 0 }` + `.kpi-label/.kpi-ratio { white-space: nowrap }` + `.fact-grid { repeat(auto-fit, minmax(320px, 1fr)) }`
-  //   - 反向探针自证可失败：删 `min-width: 0` 或 `white-space: nowrap` 或 `auto-fit, minmax` 会让 E22 变红
-  const e22KpiCardMinWidth = /\.kpi-card\s*\{[^}]*min-width\s*:\s*0\b/.test(eVue)
-  const e22KpiLabelNowrap = /\.kpi-label[^{]*\{[^}]*white-space\s*:\s*nowrap/.test(eVue)
-  const e22KpiRatioNowrap = /\.kpi-ratio[^{]*\{[^}]*white-space\s*:\s*nowrap/.test(eVue)
-  const e22FactGridAutoFit = /\.fact-grid\s*\{[^}]*repeat\(\s*auto-fit\s*,\s*minmax\(\s*320px\s*,\s*1fr\s*\)\s*\)/.test(eVue)
+  //   - 修前症状：`.fact-grid` 硬截 `repeat(2, 1fr)` 在窄屏溢出
+  //   - 修后契约：卡片栅格 `repeat(auto-fit, minmax(...))` + 内容行单列
+  //   - 2026-11-10 工厂视角改版：`.fact-grid`（旧事实清单栅格）已换成 `.class-cards`（原因分类卡栅格），
+  //     契约里的栅格名同步改成 `.class-cards`（auto-fit 意图不变）
+  //   - 2026-11-10 用户圈改：顶部 KPI 卡整块移除 ⇒ KPI 相关 CSS 契约（min-width/nowrap）随之作废
+  //   - 反向探针自证可失败：删 `auto-fit, minmax` 或把 content-row 改成多列 会让 E22 变红
+  const e22FactGridAutoFit = /\.class-cards\s*\{[^}]*repeat\(\s*auto-fit\s*,\s*minmax\(\s*220px\s*,\s*1fr\s*\)\s*\)/.test(eVue)
   const e22ContentRowSingleCol =
     /\.content-row\s*\{[^}]*grid-template-columns\s*:\s*1fr\b/.test(eVue)
-  const e22All =
-    e22KpiCardMinWidth &&
-    e22KpiLabelNowrap &&
-    e22KpiRatioNowrap &&
-    e22FactGridAutoFit &&
-    e22ContentRowSingleCol
+  const e22All = e22FactGridAutoFit && e22ContentRowSingleCol
   assert(
-    'E22 静态：Explanation.vue 样式简洁整齐（KPI 卡 min-width:0 + label/ratio nowrap + fact-grid auto-fit minmax(320px,1fr) + content-row 单列）',
+    'E22 静态：Explanation.vue 样式简洁整齐（分类卡栅格 class-cards auto-fit minmax(220px,1fr) + content-row 单列）',
     e22All,
     e22All
-      ? 'KPI 防溢出 + fact-grid 响应式 + 单列布局 齐全'
-      : `kpiMinW=${e22KpiCardMinWidth} labelNowrap=${e22KpiLabelNowrap} ratioNowrap=${e22KpiRatioNowrap} factGridAutoFit=${e22FactGridAutoFit} contentRow1col=${e22ContentRowSingleCol}`
+      ? 'class-cards 响应式 + 单列布局 齐全'
+      : `factGridAutoFit=${e22FactGridAutoFit} contentRow1col=${e22ContentRowSingleCol}`
   )
 
   // E23 探针：10-10 business-fact-issues 分页 + total + severity 排序兜底契约锁
@@ -10012,7 +11653,8 @@ async function verifyExplanationFreeze(adminToken) {
   const e23ViewHasElPagination = /<ElPagination\b/.test(eVue)
   const e23ViewPaginationLayout =
     /layout="total,\s*sizes,\s*prev,\s*pager,\s*next,\s*jumper"/.test(eVue)
-  const e23ViewPaginationPageSizes = /:page-sizes="\[10,\s*20,\s*50\]"/.test(eVue)
+  // 2026-11-10：业务事实问题改成可筛选 + 每页条数提到 [20,50,100,200]（用户嫌一页页翻不友好）
+  const e23ViewPaginationPageSizes = /:page-sizes="\[20,\s*50,\s*100,\s*200\]"/.test(eVue)
   const e23ViewPaginationVModel =
     /v-model:current-page="businessFactIssuesPage"/.test(eVue) &&
     /v-model:page-size="businessFactIssuesPageSize"/.test(eVue)
@@ -10025,7 +11667,8 @@ async function verifyExplanationFreeze(adminToken) {
   const e23BizPanelRegion = (() => {
     const start = eVue.indexOf('<span> 业务事实问题 </span>')
     if (start < 0) return ''
-    const end = eVue.indexOf('原因代码分布', start)
+    // 2026-11-10：块尾标题由「原因代码分布」改成「排产决策原因」
+    const end = eVue.indexOf('排产决策原因', start)
     return eVue.slice(start, end < 0 ? undefined : end)
   })()
   const e23ViewNoLoadMoreBtn =
@@ -10070,7 +11713,7 @@ async function verifyExplanationFreeze(adminToken) {
     e23ViewUsesPageField &&
     e23TypesDtoFields
   assert(
-    'E23 静态：business-fact-issues 分页契约（PageResult + 后端字段 page + 缓存 + 替换式 fetchBizPage + 排序兜底 + DTO 3 字段 page + 标准 ElPagination + v-model + [10,20,50]）',
+    'E23 静态：business-fact-issues 分页契约（PageResult + 后端字段 page + 缓存 + 替换式 fetchBizPage + 排序兜底 + DTO 3 字段 page + 标准 ElPagination + v-model + [20,50,100,200]）',
     e23All,
     e23All
       ? '全齐'
@@ -10225,7 +11868,9 @@ async function verifyExplanationFreeze(adminToken) {
    *     ⇒ 「对象」格恒空、时间恒 `Invalid Date`、`:key` 恒 undefined。
    */
 
-  // E27 静态：KPI 百分比分母 = 后端权威总数（Summary.totalCount），不是已加载条数
+  // E27 静态：总数 = 后端权威总数（Summary.totalCount），不是已加载条数
+  //   2026-11-10 用户圈改：顶部 KPI 卡（含百分比与合计卡）整块移除 ⇒
+  //   view 侧改看面板计数行「共 N 条 · 已显示 M 条」是否用 totalFacts（后端总数）
   const e27DtoTotalCount =
     /export\s+interface\s+ExplanationViewDto\s*\{[\s\S]*?totalCount\s*:\s*number\b/.test(eTypes)
   const e27StoreTotalFromBackend = /const\s+totalFacts\s*=\s*computed\(\(\)\s*=>\s*data\.value\?\.totalCount/.test(
@@ -10235,24 +11880,15 @@ async function verifyExplanationFreeze(adminToken) {
     !/const\s+totalFacts\s*=\s*computed\(\(\)\s*=>\s*data\.value\?\.scheduleExplanationFacts/.test(
       eStore
     )
-  const e27ViewUsesTotalFacts =
-    /totalFacts\s*>\s*0\s*\?\s*Math\.round\(\(item\.count\s*\/\s*totalFacts\)\s*\*\s*100\)/.test(
-      eVue
-    )
-  const e27ViewTotalCardUsesTotal =
-    /kpi-label">解释事实合计<[\s\S]{0,200}?kpi-value">\{\{\s*totalFacts\s*\}\}/.test(eVue)
+  const e27ViewUsesTotalFacts = /共\s*\{\{\s*totalFacts\s*\}\}\s*条/.test(eVue)
   const e27All =
-    e27DtoTotalCount &&
-    e27StoreTotalFromBackend &&
-    e27StoreNotLoadedLen &&
-    e27ViewUsesTotalFacts &&
-    e27ViewTotalCardUsesTotal
+    e27DtoTotalCount && e27StoreTotalFromBackend && e27StoreNotLoadedLen && e27ViewUsesTotalFacts
   assert(
-    'E27 静态：KPI 百分比分母用后端权威总数 totalCount（DTO 有该字段 + store totalFacts 读 totalCount + 不再读已加载条数 + view 百分比与合计卡都用 totalFacts）',
+    'E27 静态：总数用后端权威 totalCount（DTO 有该字段 + store totalFacts 读 totalCount + 不再读已加载条数 + 面板计数行显示 totalFacts）',
     e27All,
     e27All
-      ? '分母已是后端总数'
-      : `dtoTotal=${e27DtoTotalCount} storeFromBackend=${e27StoreTotalFromBackend} notLoadedLen=${e27StoreNotLoadedLen} viewPct=${e27ViewUsesTotalFacts} viewCard=${e27ViewTotalCardUsesTotal}`
+      ? '总数已是后端总数'
+      : `dtoTotal=${e27DtoTotalCount} storeFromBackend=${e27StoreTotalFromBackend} notLoadedLen=${e27StoreNotLoadedLen} viewTotal=${e27ViewUsesTotalFacts}`
   )
 
   // E28 静态：排程解释事实改走**列表端点**分页加载（不再用 Summary.items 的 50 条 ERROR）
@@ -14992,15 +16628,18 @@ function verifyPeggingTraceStatic() {
     `路由块已定位=${ptRoute.length > 0} 名称=${/ApsPeggingTrace/.test(ptRoute)} 权限=${/apsRequiredPermissions:\s*\['aps\.plan\.view'\]/.test(ptRoute)}`
   )
 
-  // PT02 API：三个真实端点 + 无 mock 分支
+  // PT02 API：真实端点 + 无 mock 分支
+  //   2026-11-13 改版：订单查询也走**列表端点**（`orderNo` / `rootOrderId` 参数）——
+  //   专用端点 `GET /api/pegging-trace/order/{id}` 只认订单 Id、不带其它筛选条件，
+  //   「按订单查 + 按物料筛」就得发两次请求再在前端合并，口径容易打架；
+  //   列表端点的一条 WHERE 同时吃下所有筛选条件 ⇒ 一次请求取全该订单的行。
   //   反向自证：删掉任一端点 URL → 转红
   const pt02 =
     /url:\s*'\/api\/pegging-trace'/.test(apiSrc) &&
-    /\/api\/pegging-trace\/order\/\$\{orderId\}/.test(apiSrc) &&
     /url:\s*'\/api\/pegging-trace\/summary'/.test(apiSrc) &&
     !/APS_USE_MOCK/.test(apiSrc)
   assert(
-    'PT02 静态：API 打三个真实端点且无 mock 分支（列表/按订单/汇总）',
+    'PT02 静态：API 打真实端点且无 mock 分支（列表/汇总）',
     pt02,
     `列表=${/url:\s*'\/api\/pegging-trace'/.test(apiSrc)} 汇总=${/url:\s*'\/api\/pegging-trace\/summary'/.test(apiSrc)} 无mock=${!/APS_USE_MOCK/.test(apiSrc)}`
   )
@@ -15008,8 +16647,13 @@ function verifyPeggingTraceStatic() {
   // PT03 筛选项从 summary 的真实分布取，不套用别处枚举
   //   实测 supplyType 值域（INVENTORY/PIPELINE/WIP/INTER_FACTORY_ORDER）与
   //   `types/common.ts` 的 SUPPLY_TYPES（文档第 13 节来源分类）不是同一集合，硬套会筛出空结果。
+  //   2026-11-13：候选改在 store 里派生（页面拿 `supplyTypeOptions` / `commitmentOptions`），
+  //   页面不再直接读 summary ⇒ 断言跟着挪到 store。
   //   反向自证：把 supplyTypeOptions 改成硬编码数组 → 转红
-  const pt03 = /supplyTypeCounts\s*/.test(vueSrc) && /summary\.value\?\.supplyTypeCounts/.test(vueSrc)
+  const pt03 =
+    /supplyTypeCounts\s*/.test(storeSrc) &&
+    /summary\.value\?\.supplyTypeCounts/.test(storeSrc) &&
+    /commitmentStatusCounts/.test(storeSrc)
   assert(
     'PT03 静态：供给类型/承诺状态筛选项来自 summary 的真实分布（不硬套枚举）',
     pt03,
@@ -15024,26 +16668,276 @@ function verifyPeggingTraceStatic() {
   //   ⚠️ 断言的是「**没有**这一句过滤」，不是「有某一句正向写法」——
   //   正向写法有多���种（去重/排序/改标签），写死一种会把合法演进判成红。
   //   反向自证：把 `.filter((s) => s.commitmentStatus !== 'UNKNOWN')` 加回去 → 转红。
-  const pt03b = !/commitmentStatus\s*!==\s*'UNKNOWN'/.test(vueSrc)
+  const pt03b = !/commitmentStatus\s*!==\s*'UNKNOWN'/.test(vueSrc + storeSrc)
   assert(
     'PT03b 静态：承诺状态 UNKNOWN 已回到下拉（后端筛选已真生效，别再摘掉）',
     pt03b,
     pt03b ? '无剔除' : '仍在剔除 UNKNOWN（= 假筛选项复活）'
   )
 
-  // PT04 分页：列表端点无 total ⇒ 必须用 hasMore，不得显示假总页数
-  //   反向自证：把 hasMore 改成写死 total → 转红
-  const pt04 =
-    /hasMore\s*\.\s*value\s*=\s*rows\.length\s*===\s*take/.test(storeSrc) &&
-    /rows\.length\s*===\s*take/.test(storeSrc) &&
-    !/totalPages|Math\.ceil\(\s*total\s*\//.test(vueSrc + storeSrc)
+  // ===== PT04 分页：总页数只在**算得准时**才显示（2026-11-14 count 端点落码后重写）=====
+  //
+  // 2026-11-13 的旧口径（已作废）：列表端点返**裸数组、不带 total** ⇒ 筛选后的条数
+  //   前端拿不到；summary 的 `totalAllocations` 不过用户数据范围 ⇒ 当时的口径是
+  //   「能算准才显示」：无筛选时拿 summary 顶替，筛选后干脆不显示总页数。
+  //
+  // 2026-11-14 5号位落了 `GET /api/pegging-trace/count`（形状 B），口径换成真值：
+  //  - count 与列表**同一条 WHERE 文本单源**（`TraceWhereCore` 六个筛选谓词
+  //    + `TraceScopePredicate` 数据范围谓词）⇒ ① 筛选后也有真值；
+  //    ② 受限账号读到的是**自己可见**的条数，不是全厂数。
+  //  - R2.4 裁定：summary 也**收进数据范围**（但仍不随筛选变化）。
+  //  - dev 2026-11-14 实测（计划版本 999512）：
+  //      admin count 73,375 ＝ admin summary 73,375
+  //      pmc   count 17,181 ＝ pmc   summary 17,181（pmc + supplyType=WIP = 4,469）
+  //  ⇒ 「翻到末页才确知可见条数」那套（reachableTotal / reachablePages）**已撤**。
+  //
+  // 反向自证：把 totalPages 改回取 summary 的 totalAllocations → PT04b 红；
+  //           复活 reachableTotal 推算口径 → PT04c 红；
+  //           去掉模板的 totalPages 守卫 → PT04d 红；
+  //           去掉空页自动退回 → PT04e 红。
+
+  // PT04a 分页底座仍是 hasMore（不写死总数）
+  const pt04a = /hasMore\.value\s*=\s*rows\.length\s*===\s*take/.test(storeSrc)
   assert(
-    'PT04 静态：列表无 total ⇒ 用 hasMore 分页（不伪造总页数）',
-    pt04,
-    `hasMore=${/hasMore/.test(storeSrc)} 无假总页=${!/totalPages/.test(vueSrc + storeSrc)}`
+    'PT04a 静态：分页底座仍是 hasMore（列表端点无 total，不写死总数）',
+    pt04a,
+    `hasMore=rows.length===take → ${pt04a}`
   )
 
-  // PT05 未知值降级：supplyType / commitmentStatus 查不到中文就原样显示
+  // PT04b 总页数取自 **count 端点的筛选后总条数**（不拿 summary 的全版总数冒充）
+  const storeComputedBlock = (name) => {
+    const i = storeSrc.indexOf(name)
+    if (i < 0) return ''
+    const slice = storeSrc.slice(i)
+    const end = slice.indexOf('\n  const ', 10)
+    return end > 0 ? slice.slice(0, end) : slice.slice(0, 900)
+  }
+  const totalPagesBlock = storeComputedBlock('const totalPages = computed')
+  const pt04b =
+    totalPagesBlock.length > 0 &&
+    /filteredTotal\.value/.test(totalPagesBlock) &&
+    /Math\.ceil/.test(totalPagesBlock) &&
+    !/list\.value/.test(totalPagesBlock) &&
+    !/totalAllocations/.test(totalPagesBlock)
+  assert(
+    'PT04b 静态：总页数取自 count 端点（筛选后总条数），不拿 summary 的全版总数冒充',
+    pt04b,
+    `块=${totalPagesBlock.length > 0} 取自filteredTotal=${/filteredTotal\.value/.test(totalPagesBlock)} 换算=${/Math\.ceil/.test(totalPagesBlock)} 不用当页行数=${!/list\.value/.test(totalPagesBlock)} 不顶替summary=${!/totalAllocations/.test(totalPagesBlock)}`
+  )
+
+  // PT04c 旧口径「翻到末页才确知可见条数」**已撤**（count 给的是真值）
+  const pt04c =
+    !/const reachableTotal = computed/.test(storeSrc) &&
+    !/const reachablePages = computed/.test(storeSrc) &&
+    !/reachableTotal/.test(vueSrc) &&
+    !/reachablePages/.test(vueSrc)
+  assert(
+    'PT04c 静态：旧的「翻到末页才确知可见条数」口径已撤（reachableTotal/reachablePages 不复存在）',
+    pt04c,
+    `store无reachableTotal=${!/const reachableTotal = computed/.test(storeSrc)} store无reachablePages=${!/const reachablePages = computed/.test(storeSrc)} 页面无旧口径=${!/reachableTotal/.test(vueSrc) && !/reachablePages/.test(vueSrc)}`
+  )
+
+  // PT04d 模板里总页数**必须被 totalPages 守卫**（算不准就不显示），且只出现一次、模板内不现算
+  const tpCount = (vueSrc.match(/\{\{ totalPages \}\}/g) || []).length
+  const tpIdx = vueSrc.indexOf('{{ totalPages }}')
+  const guardWindow = tpIdx > 0 ? vueSrc.slice(Math.max(0, tpIdx - 400), tpIdx) : ''
+  const lastGuard =
+    (guardWindow.match(/<template\s+(?:v-if|v-else-if|v-else)="[^"]*"/g) || []).pop() || ''
+  const pt04d =
+    tpCount === 1 && /totalPages\s*!==\s*null/.test(lastGuard) && !/Math\.ceil/.test(vueSrc)
+  assert(
+    'PT04d 静态：总页数只在 totalPages 非空时显示（模板内不许现算页数）',
+    pt04d,
+    `出现${tpCount}次 守卫=${lastGuard.replace(/\s+/g, ' ').slice(0, 70)} 模板内不现算=${!/Math\.ceil/.test(vueSrc)}`
+  )
+
+  // PT04e 末页刚好满页时不翻出空页（空页会被读成「没有符合筛选条件的记录」＝不实情）
+  const loadListBlock = (() => {
+    const i = storeSrc.indexOf('async function loadList')
+    if (i < 0) return ''
+    const slice = storeSrc.slice(i)
+    const end = slice.indexOf('\n  async function', 10)
+    return end > 0 ? slice.slice(0, end) : slice.slice(0, 2400)
+  })()
+  const pt04e =
+    /rows\.length\s*===\s*0\s*&&\s*pageIndex\.value\s*>\s*1/.test(loadListBlock) &&
+    /pageIndex\.value\s*-=\s*1/.test(loadListBlock)
+  assert(
+    'PT04e 静态：翻到空页自动退回上一页（不显示假的「没有记录」）',
+    pt04e,
+    `空页判定=${/rows\.length\s*===\s*0\s*&&\s*pageIndex\.value\s*>\s*1/.test(loadListBlock)} 退页=${/pageIndex\.value\s*-=\s*1/.test(loadListBlock)}`
+  )
+
+  // ===== PT18 并发列表请求只认最后一次（2026-11-14 实看发现的真缺陷）=====
+  //
+  // 现象（headless 实看 2026-11-14）：点供给来源卡片后卡片选中态变了（active），
+  //   但**表格行数没变**（仍是未筛选的 50 行）⇒ 用户以为筛选没生效。
+  // 取证（`.tmp/probe-card-click.mjs`）：
+  //   - `DOMDebugger.getEventListeners` 证明按钮上**确实**挂了 Vue 的 click 监听器
+  //     （不是「没绑事件」）；
+  //   - `dispatchEvent(new MouseEvent('click'))` 点击 ⇒ 行数变 18（筛选生效）；
+  //   - `el.click()` 点击 ⇒ 行数停在 50（筛选被覆盖）⇒ 差别只在**点击时机**。
+  // 根因：列表查询慢（admin 一次 3.5s），「刚进页面就点卡片」时先发的未筛选请求
+  //   **后到**，把后发的筛选结果盖掉 ⇒ 并发请求互相覆盖。
+  // 修法：请求序号 `listReqSeq`，每次发请求自增，写回前比对「我是不是最后一次」。
+  // 反向自证：删掉写回前的序号守卫 → PT18 红。
+  // 强判据：**每一次**写回列表行之前，都必须先判定「我是不是最后一次请求」
+  //   （要么是 `seq !== listReqSeq` 守卫，要么自己 `listReqSeq += 1` 把在途请求作废）。
+  //   逐行回看 3 行找判定 ⇒ 少一处守卫即转红（比数个数更贴「漏一处就出并发 bug」）。
+  const pt18Unguarded = (() => {
+    const lines = loadListBlock.split('\n')
+    const bad = []
+    lines.forEach((l, idx) => {
+      if (!/list\.value\s*=/.test(l)) return
+      const ctx = lines.slice(Math.max(0, idx - 3), idx).join('\n')
+      if (!/seq\s*!==\s*listReqSeq|\+\+\s*listReqSeq|listReqSeq\s*\+=/.test(ctx)) bad.push(idx + 1)
+    })
+    return bad
+  })()
+  const listWriteCount = (loadListBlock.match(/list\.value\s*=/g) || []).length
+  const pt18 =
+    /let\s+listReqSeq\s*=\s*0/.test(storeSrc) &&
+    /\+\+\s*listReqSeq/.test(loadListBlock) &&
+    listWriteCount >= 4 &&
+    pt18Unguarded.length === 0 &&
+    /if\s*\(\s*seq\s*===\s*listReqSeq\s*\)\s*loading\.value\s*=\s*false/.test(loadListBlock)
+  assert(
+    'PT18 静态：并发列表请求只认最后一次（先发的未筛选请求不覆盖后发的筛选结果）',
+    pt18,
+    `声明=${/let\s+listReqSeq\s*=\s*0/.test(storeSrc)} 自增=${/\+\+\s*listReqSeq/.test(loadListBlock)} 写回${listWriteCount}处/无守卫${pt18Unguarded.length}处(需0) loading守卫=${/if\s*\(\s*seq\s*===\s*listReqSeq\s*\)\s*loading\.value\s*=\s*false/.test(loadListBlock)}`
+  )
+
+  // ===== PT19 筛选栏去掉那行字段名标签（2026-11-14 用户要求）=====
+  //
+  //  - 旧形态：标签在上 + 输入框在下的两行结构，字段名（订单号 / 订单 ID / 物料编码 /
+  //    来源单据号 / 承诺状态）与下面表格的列名重复，还把筛选条撑成两行；
+  //  - 新形态：筛选条内**无 <label>**，字段名改由各自 placeholder 自带说明
+  //    （同人工到货时间页 ME27 的做法）。
+  //  - 11-14 再加一条：订单 ID 输入框**整个去掉** —— 工厂用户手上是订单号、不是内部 Id，
+  //    摆一个「订单 ID（数字）」在页面上只会让人卡住（store 侧 rootOrderId 能力保留，
+  //    页面不再给入口）。
+  // 反向自证：把 <label> 加回去 / 把订单 ID 输入框加回去 ⇒ 本条必须转红。
+  const filterBarBlock = (() => {
+    const i = vueSrc.indexOf('class="filter-row"')
+    if (i < 0) return ''
+    const slice = vueSrc.slice(i)
+    const end = slice.indexOf('</ElCard>')
+    return end > 0 ? slice.slice(0, end) : slice.slice(0, 1400)
+  })()
+  const pt19 =
+    filterBarBlock.length > 0 &&
+    !/<label>/.test(filterBarBlock) &&
+    !/rootOrderId/.test(filterBarBlock) &&
+    /placeholder="订单号/.test(filterBarBlock) &&
+    /placeholder="物料编码"/.test(filterBarBlock) &&
+    /placeholder="来源单据号"/.test(filterBarBlock) &&
+    /placeholder="全部承诺状态"/.test(filterBarBlock)
+  assert(
+    'PT19 静态：筛选栏无字段名标签行、无订单 ID 输入框（字段名由 placeholder 自带说明）',
+    pt19,
+    `无label=${!/<label>/.test(filterBarBlock)} 无订单ID=${!/rootOrderId/.test(filterBarBlock)} 订单号=${/placeholder="订单号/.test(filterBarBlock)} 物料=${/placeholder="物料编码"/.test(filterBarBlock)} 单据=${/placeholder="来源单据号"/.test(filterBarBlock)} 承诺=${/placeholder="全部承诺状态"/.test(filterBarBlock)}`
+  )
+
+  // ===== PT20 跨厂判定按**供给类型**（2026-11-14 用户实看发现）=====
+  //
+  //  用户看到跨厂订单行的「需求工厂 → 供给工厂」只有「TJ」一个码。
+  //  根因（后端源码 + dev 实测）：peging 落库时 `DemandFactoryCode` 与 `SupplyFactoryCode`
+  //  写的是**同一个值**（`PeggingOrchestrator` 两处都取 `a.FactoryCode`），跨厂出荷指示
+  //  入池时取的又是**目标厂**（= 需求厂）⇒ 两码恒等；旧判据「两码不同才算跨厂」是**死逻辑**
+  //  ⇒ 箭头与「跨厂」标签从未出现过（dev 实测 PV 999512 前 500 行「两码不同」0 例）。
+  //  新的真信号＝**供给类型**（跨厂订单 INTER_FACTORY_ORDER）。
+  //  供给侧工厂代码后端**未提供** ⇒ 页面不编：显示「跨厂」标记，且不重复显示需求厂码。
+  // 反向自证：把判定改回「两码不同」/ 把齐套表改回打印全部供给厂码 ⇒ 本条必须转红。
+  const pt20 =
+    /const\s+CROSS_SUPPLY_TYPE\s*=\s*'INTER_FACTORY_ORDER'/.test(storeSrc) &&
+    /supplyTypes\.some\(\(s\)\s*=>\s*s\.supplyType\s*===\s*CROSS_SUPPLY_TYPE\)/.test(storeSrc) &&
+    /otherSupplyFactoryCodes\s*=\s*g\.supplyFactoryCodes\.filter/.test(storeSrc) &&
+    /isCrossSupply\s*=\s*\(row:\s*PeggingTraceDto\)[\s\S]{0,120}?row\.supplyType\s*===\s*'INTER_FACTORY_ORDER'/.test(
+      vueSrc
+    ) &&
+    /v-if="isCrossSupply\(row\)"/.test(vueSrc) &&
+    /row\.otherSupplyFactoryCodes\.length/.test(vueSrc) &&
+    !/row\.supplyFactoryCodes\.join/.test(vueSrc) &&
+    /跨厂（对方工厂未提供）/.test(vueSrc)
+  assert(
+    'PT20 静态：跨厂按供给类型判定（不再比两个厂码），跨厂行显示「跨厂」标记且不重复需求厂码',
+    pt20,
+    `常量=${/const\s+CROSS_SUPPLY_TYPE\s*=\s*'INTER_FACTORY_ORDER'/.test(storeSrc)} store按类型=${/supplyTypes\.some\(\(s\)\s*=>\s*s\.supplyType\s*===\s*CROSS_SUPPLY_TYPE\)/.test(storeSrc)} 异厂码位=${/otherSupplyFactoryCodes\s*=\s*g\.supplyFactoryCodes\.filter/.test(storeSrc)} 页面判定=${/isCrossSupply\s*=\s*\(row:\s*PeggingTraceDto\)[\s\S]{0,120}?row\.supplyType\s*===\s*'INTER_FACTORY_ORDER'/.test(vueSrc)} 明细分支=${/v-if="isCrossSupply\(row\)"/.test(vueSrc)} 齐套异厂码=${/row\.otherSupplyFactoryCodes\.length/.test(vueSrc)} 不重复厂码=${!/row\.supplyFactoryCodes\.join/.test(vueSrc)} 抽屉说明=${/跨厂（对方工厂未提供）/.test(vueSrc)}`
+  )
+
+  // ===== PT21 总条数改走 count 端点（2026-11-14 5号位落码，形状 B）=====
+  //
+  // 背景：列表端点返**裸数组、不带 total** ⇒ 11-13 的旧口径是「无筛选时拿 summary 顶替、
+  //   筛选后不显示总页数」。5号位 11-14 落了 `GET /api/pegging-trace/count`，
+  //   WHERE 与列表**同源单源**（六个筛选谓词 + 数据范围谓词）⇒ 筛选后也有真值，
+  //   且受限账号读到的是**自己可见**的条数（R2.4：summary 也收进数据范围）。
+  // dev 2026-11-14 实测（计划版本 999512）：admin 73,375 / pmc 17,181（pmc+WIP 4,469）。
+  //
+  // 反向自证：把 count 的 URL 改错 / 把 skip、take 传给 count / 把筛选参数漏掉
+  //           / 把计数失败改成编一个假数 ⇒ 逐条转红。
+
+  // PT21a api 层：打真实 count 端点、删掉翻页参数、返回 total
+  const countApiBlock = (() => {
+    const i = apiSrc.indexOf('async count(')
+    if (i < 0) return ''
+    const slice = apiSrc.slice(i)
+    const end = slice.indexOf('\n  },', 10)
+    return end > 0 ? slice.slice(0, end) : slice.slice(0, 900)
+  })()
+  const pt21a =
+    /url:\s*'\/api\/pegging-trace\/count'/.test(countApiBlock) &&
+    /delete filters\.skip/.test(countApiBlock) &&
+    /delete filters\.take/.test(countApiBlock) &&
+    /r\?\.total\s*\?\?\s*0/.test(countApiBlock)
+  assert(
+    'PT21a 静态：api 层有 count() 打 /api/pegging-trace/count（不带翻页参数，返回 total）',
+    pt21a,
+    `块=${countApiBlock.length > 0} URL=${/url:\s*'\/api\/pegging-trace\/count'/.test(countApiBlock)} 去skip=${/delete filters\.skip/.test(countApiBlock)} 去take=${/delete filters\.take/.test(countApiBlock)} 取total=${/r\?\.total\s*\?\?\s*0/.test(countApiBlock)}`
+  )
+
+  // PT21b store 层：count 与列表**共用同一组筛选参数**（同一 base），结果落 filteredTotal
+  const countCallBlock = (() => {
+    const i = storeSrc.indexOf('.count({')
+    if (i < 0) return ''
+    return storeSrc.slice(i, i + 220)
+  })()
+  const pt21b =
+    /const base = currentFilterParams\(id\)/.test(storeSrc) &&
+    /function currentFilterParams\(id: number\): PeggingTraceQuery/.test(storeSrc) &&
+    /\.\.\.base/.test(countCallBlock) &&
+    /orderNo:\s*orderNo\s*\|\|\s*undefined/.test(countCallBlock) &&
+    /rootOrderId:\s*orderId\s*\?\?\s*undefined/.test(countCallBlock) &&
+    !/skip:/.test(countCallBlock) &&
+    !/take:/.test(countCallBlock) &&
+    /const filteredTotal = ref<number \| null>\(null\)/.test(storeSrc) &&
+    /filteredTotal\.value\s*=\s*total/.test(storeSrc)
+  assert(
+    'PT21b 静态：store 用与列表同一组筛选参数调 count，结果落 filteredTotal（计数不带翻页参数）',
+    pt21b,
+    `共用base=${/const base = currentFilterParams\(id\)/.test(storeSrc)} 参数助手=${/function currentFilterParams\(id: number\): PeggingTraceQuery/.test(storeSrc)} 透传base=${/\.\.\.base/.test(countCallBlock)} 带orderNo=${/orderNo:\s*orderNo\s*\|\|\s*undefined/.test(countCallBlock)} 带rootOrderId=${/rootOrderId:\s*orderId\s*\?\?\s*undefined/.test(countCallBlock)} 不传翻页=${!/skip:/.test(countCallBlock) && !/take:/.test(countCallBlock)} 落filteredTotal=${/filteredTotal\.value\s*=\s*total/.test(storeSrc)}`
+  )
+
+  // PT21c 计数取不到**不编数**（计数失败不阻断列表，页面改说「总条数暂不可用」）
+  const pt21c =
+    /\.count\(\{[\s\S]{0,240}?\.catch\(\(\)\s*=>\s*null\)/.test(storeSrc) &&
+    /filteredTotal\.value\s*=\s*null/.test(storeSrc)
+  assert(
+    'PT21c 静态：计数失败不编数（catch 成 null，列表照常出）',
+    pt21c,
+    `计数失败落null=${/\.count\(\{[\s\S]{0,240}?\.catch\(\(\)\s*=>\s*null\)/.test(storeSrc)} 兜底置null=${/filteredTotal\.value\s*=\s*null/.test(storeSrc)}`
+  )
+
+  // PT21d 视图：有计数显示真总数，取不到就明说不可用（不拿当页行数冒充总数）
+  const pt21d =
+    /filteredTotal !== null/.test(vueSrc) &&
+    /共 \{\{ num\(filteredTotal\) \}\} 笔/.test(vueSrc) &&
+    /总条数暂不可用/.test(vueSrc)
+  assert(
+    'PT21d 静态：页面显示 count 真总数，取不到时明说「总条数暂不可用」（不编数）',
+    pt21d,
+    `判空守卫=${/filteredTotal !== null/.test(vueSrc)} 显示真总数=${/共 \{\{ num\(filteredTotal\) \}\} 笔/.test(vueSrc)} 不可用文案=${/总条数暂不可用/.test(vueSrc)}`
+  )
+
   //   反向自证：把 `?? v` 改成 `?? '-'` → 转红
   const pt05 =
     /SUPPLY_TYPE_LABELS\[v\]\s*\?\?\s*v/.test(vueSrc) &&
@@ -15073,6 +16967,135 @@ function verifyPeggingTraceStatic() {
     pvBlock.length > 0 && pt07Missing.length === 0,
     pt07Missing.length === 0 ? '四键齐全' : `缺：${pt07Missing.join(',')}`
   )
+
+  /* ===== 2026-11-13 工厂视角改版（PT08～PT17）=====
+   * 改版前的老毛病（dev 实测）：
+   *  - 默认版本取「最新那条」= FAILED 测试版 ⇒ 打开页面 0 行 / 分布全无，像系统坏了
+   *  - 筛选要额外点一次「筛选」，改完不点看不到新数据
+   *  - 表格 13 列，其中 ETA / 当前需求 / 供给单据 / 分配时间 四列在真实数据里几乎恒空
+   *  - 没有订单号入口（只有内部「根订单 ID」），工厂用户手上是订单号不是 ID
+   *  - 「齐没齐」这件事页面上完全看不出来（缺口真实存在：跨厂 30.8%、在制 16.0%、在途 10.4%）
+   */
+
+  // PT08 默认版本：已生效优先（复用订单页 `pickDefaultVersion`），不取最新那条
+  const pt08 =
+    /pickDefaultVersion\(versions\.value\)/.test(storeSrc) &&
+    !/versions\.value\[0\]\?\.id/.test(storeSrc)
+  assert(
+    'PT08 静态：默认计划版本按「已生效优先」挑（不取最新那条 FAILED 测试版）',
+    pt08,
+    `pickDefaultVersion=${/pickDefaultVersion\(versions\.value\)/.test(storeSrc)} 未退回versions[0]=${!/versions\.value\[0\]\?\.id/.test(storeSrc)}`
+  )
+
+  // PT09 供给来源卡片：点一下即按来源筛（走后端 supplyType 参数，不在前端过滤）
+  const pt09 =
+    /store\.toggleSupplyType\(/.test(vueSrc) &&
+    /filter\.value\.supplyType = filter\.value\.supplyType === supplyType \? '' : supplyType/.test(
+      storeSrc
+    ) &&
+    /supplyType: filter\.value\.supplyType \|\| undefined/.test(storeSrc)
+  assert(
+    'PT09 静态：供给来源卡片可点且走后端 supplyType 筛选（不在前端过滤）',
+    pt09,
+    `卡片点击=${/store\.toggleSupplyType\(/.test(vueSrc)} 切回传参=${/supplyType: filter\.value\.supplyType \|\| undefined/.test(storeSrc)}`
+  )
+
+  // PT10 订单口径：订单号 / 根订单 ID 都走列表端点，一次取满（后端 take 上限 500）
+  //   ⚠️ 必须**框在订单口径那个 list 调用块里**再判：11-14 起 count 调用也带
+  //   `orderNo / rootOrderId`（同一组筛选参数）⇒ 整文件搜这两个字面量会被
+  //   count 调用顶替 ⇒ 列表调用漏传了也照样判绿（首版实测假绿）。
+  const orderScopeListBlock = (() => {
+    const i = storeSrc.indexOf('if (orderNo || orderId != null) {')
+    if (i < 0) return ''
+    return storeSrc.slice(i, i + 700)
+  })()
+  const pt10 =
+    orderScopeListBlock.length > 0 &&
+    /orderNo: orderNo \|\| undefined/.test(orderScopeListBlock) &&
+    /rootOrderId: orderId \?\? undefined/.test(orderScopeListBlock) &&
+    /take: ORDER_SCOPE_TAKE/.test(orderScopeListBlock) &&
+    /const ORDER_SCOPE_TAKE = 500/.test(storeSrc)
+  assert(
+    'PT10 静态：订单口径走列表端点一次取全（orderNo / rootOrderId 同一条 WHERE，take=500）',
+    pt10,
+    `块=${orderScopeListBlock.length > 0} orderNo=${/orderNo: orderNo \|\| undefined/.test(orderScopeListBlock)} rootOrderId=${/rootOrderId: orderId \?\? undefined/.test(orderScopeListBlock)} take=${/take: ORDER_SCOPE_TAKE/.test(orderScopeListBlock)}`
+  )
+
+  // PT11 缺口只在订单口径给：分页浏览时跨页的订单会被切碎，缺口会算错 ⇒ 明细表里不得出现
+  const ptDetailTable = (() => {
+    const i = vueSrc.indexOf('<!-- 分配明细 -->')
+    if (i < 0) return ''
+    const j = vueSrc.indexOf('</ElTable>', i)
+    return j > 0 ? vueSrc.slice(i, j) : vueSrc.slice(i, i + 5000)
+  })()
+  const pt11 =
+    /v-if="isOrderScope"/.test(vueSrc) &&
+    /row\.shortage > 0/.test(vueSrc) &&
+    ptDetailTable.length > 0 &&
+    !/shortage/.test(ptDetailTable)
+  assert(
+    'PT11 静态：缺口只在「订单齐套」视图给（分页明细视图不算缺口，避免跨页算错）',
+    pt11,
+    `订单视图=${/v-if="isOrderScope"/.test(vueSrc)} 明细表无缺口=${!/shortage/.test(ptDetailTable)}`
+  )
+
+  // PT12 筛选改了就生效：不再设「筛选」按钮（用户改完不点 → 以为没生效）
+  const pt12 =
+    /watch\(/.test(vueSrc) &&
+    /scheduleApply\(/.test(vueSrc) &&
+    !/>筛选</.test(vueSrc) &&
+    !/点 \[筛选\] 才生效/.test(vueSrc)
+  assert(
+    'PT12 静态：筛选改完自动生效（无「筛选」按钮 / 无「点筛选才生效」提示）',
+    pt12,
+    `watch=${/watch\(/.test(vueSrc)} 无筛选按钮=${!/>筛选</.test(vueSrc)}`
+  )
+
+  // PT13 订单口径取满 500 行 ⇒ 如实提示可能未取全（不假装完整）
+  const pt13 =
+    /rows\.length >= ORDER_SCOPE_TAKE/.test(storeSrc) &&
+    /orderScopeTruncated/.test(storeSrc) &&
+    /orderScopeTruncated/.test(vueSrc)
+  assert(
+    'PT13 静态：订单口径取满 500 行时提示「可能未取全」',
+    pt13,
+    `store=${/rows\.length >= ORDER_SCOPE_TAKE/.test(storeSrc)} 页面=${/orderScopeTruncated/.test(vueSrc)}`
+  )
+
+  // PT14 空态说人话：告诉用户「为什么空、下一步怎么办」
+  const pt14 =
+    /ElEmpty/.test(vueSrc) &&
+    /换一版/.test(vueSrc) &&
+    /没有符合当前筛选条件/.test(vueSrc)
+  assert(
+    'PT14 静态：空态说清「为什么空 / 下一步怎么办」（换一版 / 改条件）',
+    pt14,
+    `ElEmpty=${/ElEmpty/.test(vueSrc)} 提示文案=${/换一版/.test(vueSrc) && /没有符合当前筛选条件/.test(vueSrc)}`
+  )
+
+  // PT15 齐套表三列齐全：需求量 / 已分配 / 缺口（缺一列就答不了「齐没齐」）
+  const pt15 =
+    /label="需求量"/.test(vueSrc) && /label="已分配"/.test(vueSrc) && /label="缺口"/.test(vueSrc)
+  assert(
+    'PT15 静态：订单齐套表有「需求量 / 已分配 / 缺口」三列',
+    pt15,
+    `需求量=${/label="需求量"/.test(vueSrc)} 已分配=${/label="已分配"/.test(vueSrc)} 缺口=${/label="缺口"/.test(vueSrc)}`
+  )
+
+  // PT16 明细表不占位恒空列（dev 实测 ETA / 分配时间 / 供给单据 大量缺键）
+  const pt16 =
+    ptDetailTable.length > 0 &&
+    !/label="ETA"/.test(ptDetailTable) &&
+    !/label="分配时间"/.test(ptDetailTable)
+  assert(
+    'PT16 静态：分配明细表不占位恒空列（ETA / 分配时间）',
+    pt16,
+    `无ETA=${!/label="ETA"/.test(ptDetailTable)} 无分配时间=${!/label="分配时间"/.test(ptDetailTable)}`
+  )
+
+  // PT17 无页头大标题（2026-10-16 定调：页面不要大标题页头）
+  const pt17 = !/page-title|page-header/.test(vueSrc)
+  assert('PT17 静态：页面无大标题页头', pt17, pt17 ? '无' : '出现 page-title/page-header')
 }
 
 /* ==================== [PI] PI 位置页（/aps/pi）====================
@@ -15227,13 +17250,14 @@ function verifyPiStatic() {
     !sourceKeyRendered && !traceClaim ? '兜底标记未泄漏到视图' : `渲染=${sourceKeyRendered} 宣称=${traceClaim}`
   )
 
-  // PI13 页面名 = 冻结术语「PI位置」，旧自拟名不得出现在活代码里
-  const titleOk = /title:\s*'PI位置'/.test(routerCode)
+  // PI13 页面名 = 冻结中文术语「生产指示位置」（11-12 去掉字母 PI），旧自拟名不得出现在活代码里
+  const titleOk = /title:\s*'生产指示位置'/.test(routerCode)
   const oldName = /供给来源追溯/.test(routerCode + vueCode + storeCode + apiCode + typesCode)
+  const latinName = /title:\s*'PI位置'/.test(routerCode)
   assert(
-    'PI13 静态：菜单名 =「PI位置」，活代码无旧自拟名',
-    titleOk && !oldName,
-    `新名=${titleOk} 旧名残留=${oldName}`
+    'PI13 静态：菜单名 =「生产指示位置」，活代码无旧自拟名、无字母名',
+    titleOk && !oldName && !latinName,
+    `新名=${titleOk} 旧名残留=${oldName} 字母名残留=${latinName}`
   )
 
   // PI14 DTO 字段集与冻结 07:4042-4062 一一对应，不多不少
@@ -15258,6 +17282,120 @@ function verifyPiStatic() {
     'PI16 静态：单 PI 详情 404 归空态（不把「查无记录」说成加载失败）',
     pi16NotFound && pi16EmptyText,
     `判404=${pi16NotFound} 空态文案=${pi16EmptyText}`
+  )
+
+  /* ==================== [PI23-PI30] 11-12 工厂用户视角改版 ====================
+   * 每条都对应本轮改版里一个「不做就会坑到工厂用户」的点，逐条反向破坏自证过。
+   */
+  // PI23 位置类型分布卡可点（点一下只看那一类；再点取消）
+  const pi23Fn = /function onPositionTypeClick\(positionType: string\)/.test(vueCode)
+  const pi23Bind = /@click="onPositionTypeClick\(t\.positionType\)"/.test(vueCode)
+  const pi23Set = /setFilter\(\{\s*positionType:/.test(vueCode)
+  // 再点同一张卡要能取消该分类（只切进去、出不来的话用户会被困住）
+  const pi23Toggle = /\? '' : positionType/.test(vueCode)
+  assert(
+    'PI23 静态：位置类型分布卡可点分类（点卡片 = 按该类型筛选，再点取消）',
+    pi23Fn && pi23Bind && pi23Set && pi23Toggle,
+    `函数=${pi23Fn} 卡片绑定=${pi23Bind} 写筛选=${pi23Set} 可取消=${pi23Toggle}`
+  )
+
+  // PI24 默认版本不再取 versions[0]（最新一条常是我们自己的失败测试版、位置数为 0）
+  const pi24Pick = /pickDefaultVersion\(versions\.value\)\?\.id/.test(storeCode)
+  const pi24First = /versions\.value\[0\]\?\.id/.test(storeCode)
+  assert(
+    'PI24 静态：默认计划版本走 pickDefaultVersion（不取 versions[0]）',
+    pi24Pick && !pi24First,
+    `pick=${pi24Pick} 取第一条=${pi24First}`
+  )
+
+  // PI25 当前阶段显示中文名（工厂用户不认 BJ_MACH 这种阶段码）
+  const pi25Use = /stageLabelOf\(row\.currentStageCode\)/.test(vueCode)
+  const pi25Dict = /stageOptionLabel/.test(vueCode)
+  assert(
+    'PI25 静态：当前阶段走 stageLabelOf 中文名（不再裸阶段码）',
+    pi25Use && pi25Dict,
+    `表格中文名=${pi25Use} 下拉中文名=${pi25Dict}`
+  )
+
+  // PI26 筛选口径文案必须是「部分匹配」——dev 实测后端是包含匹配（LIKE），
+  //        旧文案「精确匹配」与实际行为相反，会让用户以为输入要一字不差。
+  const pi26Partial = (vueCode.match(/支持部分匹配/g) ?? []).length >= 2
+  const pi26Exact = /精确匹配/.test(vueCode)
+  assert(
+    'PI26 静态：生产指示号/物料编码提示「支持部分匹配」（后端实测是包含匹配）',
+    pi26Partial && !pi26Exact,
+    `部分匹配提示=${pi26Partial} 仍写精确匹配=${pi26Exact}`
+  )
+
+  // PI27 不给用户看内部 Id（计划版本显示版本码）
+  const pi27RawId = /\{\{\s*planVersionId\s*\}\}/.test(vueCode)
+  const pi27Label = /currentVersionLabel/.test(vueCode)
+  assert(
+    'PI27 静态：不显示内部计划版本 Id（抽屉显示版本码）',
+    !pi27RawId && pi27Label,
+    `裸Id=${pi27RawId} 版本码=${pi27Label}`
+  )
+
+  // PI28 空态分三态（未选版本 / 这个版本没位置数据 / 当前筛选没匹配）
+  const pi28a = /请先选择一个计划版本/.test(vueCode)
+  const pi28b = /还没有位置数据/.test(vueCode)
+  const pi28c = /当前筛选没有匹配的位置行/.test(vueCode) && /清除筛选/.test(vueCode)
+  assert(
+    'PI28 静态：空态分三态（未选版本 / 版本无位置数据 / 筛选无匹配）',
+    pi28a && pi28b && pi28c,
+    `未选版本=${pi28a} 版本无数据=${pi28b} 筛选无匹配=${pi28c}`
+  )
+
+  // PI29 表格瘦身：快照时间移进抽屉（明细追溯时才需要）、「操作」列撤掉（点生产指示号即开明细）
+  const pi29Snap = /label="快照时间"/.test(vueCode)
+  const pi29Act = /label="操作"/.test(vueCode)
+  const pi29Drawer = /label="位置快照时间"/.test(vueCode)
+  assert(
+    'PI29 静态：表格去掉「快照时间」「操作」两列（快照时间移到抽屉）',
+    !pi29Snap && !pi29Act && pi29Drawer,
+    `表格快照时间=${pi29Snap} 操作列=${pi29Act} 抽屉快照时间=${pi29Drawer}`
+  )
+
+  // PI30 筛选栏不留独立标签（与人工到货时间页一致）：靠 placeholder 自带说明
+  const pi30Label = /<label>/.test(vueCode)
+  const pi30Stage = /placeholder="全部阶段"/.test(vueCode)
+  assert(
+    'PI30 静态：筛选栏无独立标签（placeholder 自带说明）',
+    !pi30Label && pi30Stage,
+    `仍有 label=${pi30Label} 阶段 placeholder=${pi30Stage}`
+  )
+
+  // PI31 位置快照时间走本地直显（修 +8 小时错位）
+  //   `ProductionInstructionPositionSnapshot.CreatedAt` 的 DDL 默认值是 `GETDATE()`
+  //   （服务器本地墙钟，无时区）⇒ 用 formatUtcDateTime 会把它当 UTC 再转本地 ⇒ 整体 +8h，
+  //   dev 上 13:25 落库会显示成 21:25（比"现在"还晚，看着像系统出错）。
+  const pi31Local = /formatLocalDateTime\(row\.createdAt\)/.test(vueCode)
+  const pi31Utc = /formatUtcDateTime\(row\.createdAt\)/.test(vueCode)
+  assert(
+    'PI31 静态：位置快照时间走本地直显（DDL DEFAULT GETDATE() = 本地墙钟，不做 UTC 位移）',
+    pi31Local && !pi31Utc,
+    `本地直显=${pi31Local} 仍用 UTC 工具=${pi31Utc}`
+  )
+
+  // PI32 指标条不放「位置条数」（11-12 用户圈掉）
+  //   总数没丢：四张分布卡的条数之和 = /summary.totalPositions，分页器也自带总数。
+  const pi32TotalPill = /pill-label">位置条数/.test(vueCode)
+  const pi32Cards = /positionTypeCounts/.test(vueCode)
+  assert(
+    'PI32 静态：指标条不放「位置条数」（总数由分布卡之和与分页器承担）',
+    !pi32TotalPill && pi32Cards,
+    `仍有位置条数=${pi32TotalPill} 分布卡取数=${pi32Cards}`
+  )
+
+  // PI33 指标条提到页面最上面（11-12 用户要求：先看概况、再选版本看明细）
+  //   指标条在源码里必须排在筛选栏（filter-row）之前，否则用户一进来先看到的是筛选控件。
+  const pi33KpiAt = vueCode.indexOf('class="kpi-strip"')
+  const pi33FilterAt = vueCode.indexOf('class="filter-row"')
+  const pi33ShowKpi = /showKpi/.test(vueCode)
+  assert(
+    'PI33 静态：指标条排在筛选栏之上（页面最上面先看概况）',
+    pi33KpiAt > 0 && pi33FilterAt > 0 && pi33KpiAt < pi33FilterAt && pi33ShowKpi,
+    `指标条位置=${pi33KpiAt} 筛选栏位置=${pi33FilterAt} showKpi=${pi33ShowKpi}`
   )
 }
 
@@ -15353,6 +17491,15 @@ async function verifyPi(token) {
     `positionType=BOGUS_TYPE_X 返回 ${bogusLen} 条`
   )
 }
+
+/**
+ * GROUP=order-page：订单/需求计划页「工厂用户视角改版」静态断言（ODP01-ODP15，不登录）
+ *
+ * 2026-11-12 按用户「站在工厂用户角度把这页弄好用」改版后新增。改的是**页面用法**：
+ * 默认计划版本（已生效优先）、交期快捷区间（五个一键档）、工厂/产品族走主数据下拉、
+ * 文本筛选防抖、表格瘦身、KPI 口径标注、版本状态大白话。
+ * 数字真伪由 headless 实走（scripts/check-order-page-1112.mjs）兑现，本组只锁路径。
+ */
 
 /**
  * GROUP=order-static：订单/需求计划页静态契约与反造假（OD01-OD10，不登录）
@@ -15759,6 +17906,222 @@ function verifyOrderStatic() {
   )
 }
 
+/**
+ * GROUP=order-page：订单/需求计划页「工厂用户视角改版」静态断言（2026-11-12）
+ *
+ * 本轮改的是**页面用法**（默认计划版本、默认交期窗口、下拉来源、表格瘦身、KPI 口径），
+ * 不是契约字段 ⇒ 静态探针只锁「这条路径真的被接上了」，
+ * 数字真伪（窗口里有没有老单、区间有没有真落库）由 `scripts/check-order-page-1112.mjs`
+ * （headless 走真实登录 + 真实点区间）兑现。
+ *
+ * 每条判据都在 `scripts/selfverify-order-page-1112.mjs` 里逐条反向破坏过（必须能转红）。
+ */
+function verifyOrderPageRedesign() {
+  log('\n[ORDER-PAGE] 订单页「工厂用户视角改版」静态断言')
+
+  // 断言打在**代码**上：Order.vue 头注释大量描述「原先长什么样」，不剥注释会把整改说明当实现
+  const strip = (s) => s.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '')
+  const vueCode = strip(readSrc('views/Aps/Order.vue'))
+  const storeCode = strip(readSrc('store/modules/aps/order.ts'))
+
+  // 取「起点 → 终点」之间的正文，避免整文件 includes 造成的假绿（同名声明多处时必须切片）
+  const sliceBetween = (code, from, to) => {
+    const i = code.indexOf(from)
+    if (i < 0) return ''
+    const j = to ? code.indexOf(to, i + from.length) : code.length
+    return code.slice(i, j < 0 ? code.length : j)
+  }
+
+  // ===== ODP01 默认计划版本：已生效优先（不再取「最新一条」= FAILED 测试版）=====
+  const pickFn = storeCode.match(/export function pickDefaultVersion[\s\S]*?\n\}/)?.[0] ?? ''
+  const pickOrder = /byStatus\('ACTIVE'\)[\s\S]*?byStatus\('CANDIDATE'\)[\s\S]*?status !== 'FAILED'/.test(
+    pickFn
+  )
+  const loadVersionsBody = sliceBetween(storeCode, 'async function loadVersions(', 'async function loadList(')
+  const usesPick = /pickDefaultVersion\(versions\.value\)\?\.id/.test(loadVersionsBody)
+  const notFirst = !/versions\.value\[0\]/.test(loadVersionsBody)
+  assert(
+    'ODP01 静态：默认计划版本按「已生效 → 待确认 → 非失败 → 首条」挑（不再取最新一条=失败测试版）',
+    pickFn.length > 0 && pickOrder && usesPick && notFirst,
+    `有挑选函数=${pickFn.length > 0} 优先级序=${pickOrder} loadVersions用挑选=${usesPick} 未直取首条=${notFirst}`
+  )
+
+  // ===== ODP02 五个交货日期快捷区间 + 默认落在「近期订单」=====
+  const presetsBlock = vueCode.match(/const RANGE_PRESETS[\s\S]*?\n\]/)?.[0] ?? ''
+  const rangeLabels = ['近期订单', '已逾期', '4 周内到期', '13 周内到期', '全部']
+  const fiveRanges = rangeLabels.every((l) => presetsBlock.includes(`label: '${l}'`))
+  // 每档都要有大白话说明（工厂用户看不懂「交期范围/工作窗口」这类说法）
+  const eachHasDesc = (presetsBlock.match(/desc:\s*'[^']{6,}'/g) ?? []).length === 5
+  // 并且要把「当前是哪个日期区间」写成真实日期摆在栏上
+  const dateTextShown =
+    /const rangeDateText = computed\(/.test(vueCode) && /\{\{ rangeDateText \}\}/.test(vueCode)
+  const defaultWork = /const activeRange = ref<RangeKey>\('work'\)/.test(vueCode)
+  assert(
+    'ODP02 静态：交货日期快捷区间五个齐（近期订单/已逾期/4 周内到期/13 周内到期/全部），默认「近期订单」，每档有大白话说明并显示真实日期区间',
+    fiveRanges && eachHasDesc && dateTextShown && defaultWork,
+    `五档=${fiveRanges} 每档有说明=${eachHasDesc} 显示日期区间=${dateTextShown} 默认近期订单=${defaultWork}`
+  )
+
+  // ===== ODP03 区间真的落后端参数 dueDateFrom / dueDateTo（不是页面内过滤）=====
+  const setRangeBody = sliceBetween(vueCode, 'function setRangeFilter(', 'async function applyRange(')
+  const mapsParams = /setFilter\(\{ dueDateFrom: from, dueDateTo: to \}\)/.test(setRangeBody)
+  const boundsBody = sliceBetween(vueCode, 'function rangeBounds(', 'const activeRange')
+  const boundsCases = ['work', 'overdue', 'w4', 'w13', 'all'].every((k) =>
+    boundsBody.includes(`case '${k}':`)
+  )
+  const workWindowSpan = /dayOffset\(-30\)/.test(boundsBody) && /dayOffset\(28\)/.test(boundsBody)
+  assert(
+    'ODP03 静态：五个区间都映射到后端 dueDateFrom/dueDateTo（真参数，不是页面内假筛）',
+    mapsParams && boundsCases && workWindowSpan,
+    `落参数=${mapsParams} 五档case=${boundsCases} 工作窗口跨度=${workWindowSpan}`
+  )
+
+  // ===== ODP04 日期基准是 UTC（与「剩 N 天」显示同基准）=====
+  const dayBody = sliceBetween(vueCode, 'function dayOffset(', 'function rangeBounds(')
+  const utcBase = /setUTCDate/.test(dayBody) && /toISOString\(\)\.slice\(0, 10\)/.test(dayBody)
+  const notLocal = !/setDate\(/.test(dayBody)
+  assert(
+    'ODP04 静态：快捷区间用 UTC 日期基准（与「剩/逾期 N 天」显示同基准，不用本地日期）',
+    utcBase && notLocal,
+    `UTC=${utcBase} 未用本地日期=${notLocal}`
+  )
+
+  // ===== ODP05 工厂 / 产品族走主数据下拉（显示中文名、传编码）=====
+  const useFactoryDict = /domainApi\.listFactories\(\)/.test(vueCode)
+  const useFamilyDict = /domainApi\.listProductFamilies\(\)/.test(vueCode)
+  const optFactory = /v-for="f in visibleFactories"/.test(vueCode)
+  const optFamily = /v-for="f in familyOptions"/.test(vueCode)
+  const optShowsName = /:label="`\$\{f\.name\}（\$\{f\.code\}）`"/.test(vueCode)
+  assert(
+    'ODP05 静态：工厂/产品族下拉走主数据字典（中文名+编码，不再是让人手输编码的精确匹配文本框）',
+    useFactoryDict && useFamilyDict && optFactory && optFamily && optShowsName,
+    `工厂字典=${useFactoryDict} 产品族字典=${useFamilyDict} 工厂选项=${optFactory} 产品族选项=${optFamily} 显示中文名=${optShowsName}`
+  )
+
+  // ===== ODP06 工厂下拉按业务范围收窄（范围外的工厂点一下就撞后端 403）=====
+  const visBody = vueCode.match(/const visibleFactories = computed[\s\S]*?\n\}/)?.[0] ?? ''
+  const scopeAware =
+    /apsAuth\.isGlobalScope/.test(visBody) && /dataScope\.factoryCodes/.test(visBody)
+  assert(
+    'ODP06 静态：工厂下拉按授权范围收窄（后端对越界 factoryCode 直接 403「Factory 范围越界」）',
+    scopeAware,
+    `全局判断=${/apsAuth\.isGlobalScope/.test(visBody)} 工厂范围=${/dataScope\.factoryCodes/.test(visBody)}`
+  )
+
+  // ===== ODP07 文本筛选 400ms 防抖（不再每敲一个字打一次后端）=====
+  const debounceConst = /const TEXT_FILTER_DEBOUNCE_MS = 400/.test(vueCode)
+  const watchBody = sliceBetween(vueCode, 'watch([orderNoInput', 'onUnmounted(')
+  const timerOk =
+    /clearTimeout\(textTimer\)/.test(watchBody) &&
+    /setTimeout\(/.test(watchBody) &&
+    /loadList\(true\)/.test(watchBody)
+  assert(
+    'ODP07 静态：文本筛选 400ms 防抖（每敲一个字打一次后端的旧写法已废）',
+    debounceConst && timerOk,
+    `400ms常量=${debounceConst} 定时器=${timerOk}`
+  )
+
+  // ===== ODP08 KPI 口径说明 + 表头两个口径的计数 =====
+  const caption = /class="kpi-caption"/.test(vueCode) && /不随下面的筛选变化/.test(vueCode)
+  const dualCount =
+    /当前筛选/.test(vueCode) &&
+    /该版本共/.test(vueCode) &&
+    /class="header-total"/.test(vueCode) &&
+    /\{\{ listCountLabel \}\}/.test(vueCode)
+  assert(
+    'ODP08 静态：KPI 写明口径（summary 不收筛选 ⇒ 恒为全版本）+ 表头给「当前筛选 / 该版本共」两个计数',
+    caption && dualCount,
+    `口径说明=${caption} 双计数=${dualCount}`
+  )
+
+  // ===== ODP09 版本状态大白话提示 =====
+  const noticeTexts = ['这一版排产失败', '还在计算中', '还没发令', '已经被更新的版本顶替']
+  const notices = noticeTexts.every((t) => vueCode.includes(t))
+  const unschedNotice = /这一版的订单都还没有排产任务/.test(vueCode)
+  assert(
+    'ODP09 静态：版本状态有大白话提示（失败/计算中/未发令/被顶替 + 全版本未排产）',
+    notices && unschedNotice,
+    `四态=${notices} 全未排产=${unschedNotice}`
+  )
+
+  // ===== ODP10 表格瘦身（延期原因并入交付状态、生产指示号并进订单号）=====
+  // ⚠️ 必须只看**主订单表**：抽屉里另有 Pegging / 任务 / 资源三张表，
+  //    以及一个合法的 ElDescriptionsItem「延期原因」（抽屉详情，不是列表列）
+  const mainTable = sliceBetween(vueCode, 'ref="tableRef"', '</ElTable>')
+  const noReasonCol = !/label="延期原因"/.test(mainTable)
+  const hasStatusCol = /label="交付状态"/.test(mainTable)
+  const mtsInOrderNo = /label="订单号"[\s\S]{0,400}?row\.mtS_InstructionNo/.test(mainTable)
+  const colCount = (mainTable.match(/<ElTableColumn/g) ?? []).length
+  assert(
+    'ODP10 静态：主订单表瘦身（无独立「延期原因」列、生产指示号并进订单号、列数 ≤13）',
+    noReasonCol && hasStatusCol && mtsInOrderNo && colCount <= 13,
+    `无延期原因列=${noReasonCol} 有交付状态=${hasStatusCol} 指示号并进订单号=${mtsInOrderNo} 列数=${colCount}`
+  )
+
+  // ===== ODP11 本页自己加载排程域字典（此前只有异常解释页加载过 ⇒ 直接进本页域下拉是空的）=====
+  const loadsDomain = /domainStore\.load\(\)/.test(vueCode) && /domainStore\.loadedAt/.test(vueCode)
+  assert(
+    'ODP11 静态：本页会加载排程域字典（直接进本页时域下拉不再是空的）',
+    loadsDomain,
+    `load调用=${/domainStore\.load\(\)/.test(vueCode)} 已加载守卫=${/domainStore\.loadedAt/.test(vueCode)}`
+  )
+
+  // ===== ODP12 空态分两态（这版没订单 / 筛选太窄）=====
+  const emptyTwo = /这一版没有订单/.test(vueCode) && /当前筛选条件下没有订单/.test(vueCode)
+  assert('ODP12 静态：空态区分「这版没订单」与「筛选太窄」', emptyTwo, `两态=${emptyTwo}`)
+
+  // ===== ODP13 切版本后交期区间跟着版本走（store 切版本会清空筛选）=====
+  const verBody = sliceBetween(vueCode, 'async function onVersionChange(', 'async function onResetSearch(')
+  const keepsRange = /applyRange\(activeRange\.value\)/.test(verBody)
+  assert(
+    'ODP13 静态：切计划版本后交期区间重新落上（store 切版本会清空全部筛选）',
+    keepsRange,
+    `区间跟随=${keepsRange}`
+  )
+
+  // ===== ODP14 重置回默认工作窗口 =====
+  const resetBody = sliceBetween(vueCode, 'async function onResetSearch(', '// ===== 版本下拉标签 =====')
+  const backToWork = /applyRange\('work'\)/.test(resetBody)
+  assert('ODP14 静态：重置回到默认「工作窗口」', backToWork, `回默认=${backToWork}`)
+
+  // ===== ODP15 区间按钮是真入口（渲染出来 + 点击即落库重查）=====
+  const rendersChips = /v-for="r in RANGE_PRESETS"/.test(vueCode)
+  const chipsClickable = /@click="applyRange\(r\.key\)"/.test(vueCode)
+  const applyReloads = /async function applyRange[\s\S]{0,200}?loadList\(true\)/.test(vueCode)
+  assert(
+    'ODP15 静态：交期区间按钮是真入口（渲染 + 点击即落参数并重查列表）',
+    rendersChips && chipsClickable && applyReloads,
+    `渲染=${rendersChips} 可点=${chipsClickable} 点击重查=${applyReloads}`
+  )
+
+  // ===== ODP16 撤「排程域」筛选（2026-11-12 用户拍板；同 GT104 甘特页 2026-11-04 同一理由）====
+  // 依据：① 订单页永远只看一个版本（planVersionId 必填）；② 一版一域
+  //   （dev 实测 30/30 版本带 domainKey，版本内订单 100% 同域，0 不一致 / 0 多域）。
+  //   ⇒ 该筛选只有两种结果：选对该域 = 与不筛完全一样；选别的域 = 直接 0 条（用户误以为「这版没订单」）。
+  //   业务范围收窄本就由后端强制（@HasDomains/AllowedDomains），不靠这个下拉。
+  // 保留：域信息仍在**版本摘要**里显示（不丢信息）。
+  const odp16NoDomainSelect = !/placeholder="排程域"/.test(vueCode)
+  const odp16NoDomainState = !/\bdomainCode\b/.test(vueCode) && !/onDomainChange/.test(vueCode)
+  const odp16NoDomainParam = !/setFilter\(\{[^}]*domainKey/.test(vueCode)
+  // 域信息必须还在**版本摘要**里（撤筛选不能连域一起撤）
+  const odp16VerLabelBody = sliceBetween(
+    vueCode,
+    'const currentVersionLabel = computed(',
+    'const versionNotice = computed'
+  )
+  const odp16DomainStillShown = /v\.domainKey/.test(odp16VerLabelBody)
+  const odp16AdvanceDomainFromRow = /const advanceDefaultDomain[\s\S]{0,300}?selectedOrders/.test(vueCode)
+  assert(
+    'ODP16 静态：撤「排程域」筛选（一版一域 ⇒ 该筛选只能空转或把列表清空；域信息改在版本摘要里看）',
+    odp16NoDomainSelect &&
+      odp16NoDomainState &&
+      odp16NoDomainParam &&
+      odp16DomainStillShown &&
+      odp16AdvanceDomainFromRow,
+    `无域下拉=${odp16NoDomainSelect} 无域状态=${odp16NoDomainState} 不发domainKey=${odp16NoDomainParam} 版本仍显示域=${odp16DomainStillShown} 弹窗默认域取自选中行=${odp16AdvanceDomainFromRow}`
+  )
+}
+
 /** GROUP=order：订单端点实测（OD11-OD16） */
 async function verifyOrder(token) {
   log('\n[ORDER] 订单端点实测')
@@ -16049,8 +18412,11 @@ function verifyRulesSplit() {
       psView.includes('lastValidation.isValid'),
     '后端返回 PublishValidationResult{isValid,errors,warnings,validatedAt}')
 
-  const draftFirst = /const contentSource = draft \?\? published \?\? versions\[0\]/
-  assert('R11 静态：两族详情内容都按「草稿优先」取版（发布前看到的就是要发布的）',
+  // ⚠️ 2026-11-11（列表改一版一行）：规则集侧的内容取版改成了
+  //   `指定 versionId ?? 草稿 ?? 已发布 ?? 第一条` ⇒ 「草稿优先」的**默认**仍在，
+  //   但不再是一行字面量，故判据改成「顺序表达式」而不是整行字面量。
+  const draftFirst = /draft\s*\?\?\s*published\s*\?\?\s*versions\[0\]/
+  assert('R11 静态：两族详情内容默认仍按「草稿优先」取版（发布前看到的就是要发布的）；规则集侧另支持按 versionId 精确取版（RP28c）',
     draftFirst.test(ruleApiSrc) && draftFirst.test(psApiSrc),
     `规则集=${draftFirst.test(ruleApiSrc)} 参数集=${draftFirst.test(psApiSrc)}`)
 
@@ -16263,28 +18629,43 @@ function verifyRulesSplit() {
       /actions\.canDisable/.test(rulesView),
     `参数集停用开关=${/editParameterSetForm\.isActive\b/.test(psView)} 策略包停用开关=${/editProfileForm\.isActive\b/.test(spView)} 规则集停用=${/openDisableDialog/.test(rulesView)}/${/actions\.canDisable/.test(rulesView)}`)
 
-  /* -------- R45-R47：治理三族「停用行」默认折叠 + 必须留开关（2026-10-30）--------
-   * 背景：建错的主表常常只能停用（已发布过的不可删），停用行堆在列表里干扰选择。
-   * 口径：**默认不显示**，但**必须留可见开关** —— 停用行是唯一的「重新启用」入口，藏死等于功能丢失。 */
-  assert('R45 静态：三族 store 都有 showInactive 开关且默认 false（默认折叠停用行）',
-    /const showInactive = ref\(false\)/.test(rulesStore) &&
-      /const showInactive = ref\(false\)/.test(psStore) &&
+  /* -------- R45-R47：治理三族「停用行」的可见性口径（2026-10-30 起，2026-11-11 规则集页 + 参数集页改口径）
+   * 背景：建错的主表常常只能停用（已发布过的不可删），停用行是唯一的「重新启用」入口。
+   * 口径演进：
+   *   · 2026-10-30：三族统一「默认折叠 + 必须留可见开关」；
+   *   · 2026-11-11（用户拍板）：**规则集页**撤掉「显示已停用」开关与 KPI 横条 ——
+   *     「全部」页签直接显示全部（含停用），改用「关键词 / 主表状态 / 排序」筛选条件；
+   *   · 2026-11-11（用户拍板，本轮扩围）：**参数集页**同样跟齐规则集页口径 ——
+   *     撤开关、撤 KPI 横条、计数落页签、补「关键词 / 主表状态 / 排序」；
+   *     策略包页**维持原口径**（开关保留、默认折叠）。 */
+  assert('R45 静态：规则集页/参数集页已撤 showInactive 开关（停用行默认可见）；策略包页仍保留开关且默认 false',
+    !/showInactive/.test(rulesStore) &&
+      !/showInactive/.test(psStore) &&
       /const showInactive = ref\(false\)/.test(spStore),
-    `规则集=${/const showInactive = ref\(false\)/.test(rulesStore)} 参数集=${/const showInactive = ref\(false\)/.test(psStore)} 策略包=${/const showInactive = ref\(false\)/.test(spStore)}`)
+    `规则集残留showInactive=${/showInactive/.test(rulesStore)} 参数集残留=${/showInactive/.test(psStore)} 策略包=${/const showInactive = ref\(false\)/.test(spStore)}`)
 
-  const rulesInactiveFilter = /if \(!showInactive\.value\) arr = arr\.filter\(\(r\) => r\.isActive !== false\)/.test(rulesStore)
-  const psInactiveFilter = /if \(!showInactive\.value\) arr = arr\.filter\(\(p\) => p\.isActive !== false\)/.test(psStore)
-  const spInactiveFilter = /showInactive\.value \? profiles\.value : profiles\.value\.filter\(\(p\) => p\.isActive !== false\)/.test(spStore)
-  assert('R46 静态：开关关闭时确实按 `isActive !== false` 过滤（不是只加了个摆设开关）',
+  // 规则集侧 + 参数集侧：停用行只在用户显式选「主表状态：停用」时才收窄，默认（含停用）全部可见
+  const rulesInactiveFilter =
+    !/showInactive/.test(rulesStore) &&
+    /listActiveFilter\.value === 'ACTIVE'/.test(rulesStore) &&
+    /listActiveFilter\.value === 'INACTIVE'/.test(rulesStore) &&
+    /arr = arr\.filter\(\(r\) => r\.isActive === false\)/.test(rulesStore)
+  const psInactiveFilter =
+    !/showInactive/.test(psStore) &&
+    /listActiveFilter\.value === 'ACTIVE'/.test(psStore) &&
+    /listActiveFilter\.value === 'INACTIVE'/.test(psStore) &&
+    /arr = arr\.filter\(\(r\) => r\.isActive === false\)/.test(psStore)
+  const spInactiveFilter = /showInactive\.value \? profileRows\.value : profileRows\.value\.filter\(\(r\) => r\.isActive !== false\)/.test(spStore)
+  assert('R46 静态：规则集/参数集侧改为「主表状态」显式筛选、默认不折叠停用行；策略包侧仍是开关折叠',
     rulesInactiveFilter && psInactiveFilter && spInactiveFilter,
     `规则集=${rulesInactiveFilter} 参数集=${psInactiveFilter} 策略包=${spInactiveFilter}`)
 
   const switchIn = (src) => /v-model="showInactive"/.test(src) && src.includes('显示已停用')
-  assert('R47 静态：三个页面都有「显示已停用（N）」开关；策略包页列表改用 visibleProfiles（防回退成全量直出）',
-    switchIn(rulesView) && switchIn(psView) && switchIn(spView) &&
-      /v-for="p in visibleProfiles"/.test(spView) &&
+  assert('R47 静态：规则集页/参数集页已无「显示已停用」开关（改「全部」页签含停用 + 筛选条件）；策略包页仍保留；策略包页列表用 visibleProfileRows（一版一行）',
+    !switchIn(rulesView) && !switchIn(psView) && switchIn(spView) &&
+      /v-for="p in visibleProfileRows"/.test(spView) &&
       !/v-for="p in profiles"/.test(spView),
-    `规则集=${switchIn(rulesView)} 参数集=${switchIn(psView)} 策略包=${switchIn(spView)} 用visibleProfiles=${/v-for="p in visibleProfiles"/.test(spView)} 残留全量=${/v-for="p in profiles"/.test(spView)}`)
+    `规则集残留开关=${switchIn(rulesView)} 参数集残留开关=${switchIn(psView)} 策略包=${switchIn(spView)} 用visibleProfileRows=${/v-for="p in visibleProfileRows"/.test(spView)} 残留全量=${/v-for="p in profiles"/.test(spView)}`)
 
   /* -------- R27-R31：段位编辑器（2026-10-22 新增；发布白名单要窄于展示字典） -------- */
   const editorSrc = stripComments(readSrc('api/aps-v1/prioritySegmentEditor.ts'))
@@ -16518,7 +18899,8 @@ function verifyRulesSplit() {
   const rp10 =
     /const setupEditable = computed/.test(rulesViewNoHtml) &&
     rulesViewNoHtml.includes('setupSummaryVersionId.value === setupDraftVersionId.value') &&
-    (rulesViewNoHtml.match(/:disabled="!setupEditable"/g)?.length ?? 0) === 6 &&
+    // 6 个写按钮（2 新增 + 2 编辑 + 2 删除）+ 2 个启停开关（#67）都得跟草稿态走
+    (rulesViewNoHtml.match(/:disabled="!setupEditable"/g)?.length ?? 0) === 8 &&
     startWriteBody.includes('当前没有草稿版本') &&
     startWriteBody.includes('syncSetupStores(versionId)') &&
     syncStoresBody.includes('exactStore.loadRuleSetVersions(') &&
@@ -16527,7 +18909,7 @@ function verifyRulesSplit() {
     syncStoresBody.includes('defaultStore.selectRuleSetVersion(') &&
     syncStoresBody.includes('exactStore.canEdit')
   assert(
-    'RP10 静态：⑦ 只改当前草稿（hasDraft+版本对齐 store），无草稿/无权限时 6 个写按钮全禁用并提示先新建草稿',
+    'RP10 静态：⑦ 只改当前草稿（hasDraft+版本对齐 store），无草稿/无权限时 6 个写按钮 + 2 个启停开关全禁用并提示先新建草稿',
     rp10,
     `disabled=${rulesViewNoHtml.match(/:disabled="!setupEditable"/g)?.length ?? 0} 草稿提示=${startWriteBody.includes('当前没有草稿版本')} store对齐=${syncStoresBody.includes('exactStore.loadRuleSetVersions(')}`
   )
@@ -16768,10 +19150,9 @@ function verifyRulesSplit() {
     !/'OnTrack'/.test(sug19) &&
     !/value:\s*'A'/.test(sug19) &&
     /:value="v\.value"/.test(psegViewRP19) &&
-    /:label="v\.label"/.test(psegViewRP19) &&
-    /no-data-text="没有预设值，直接输入后回车"/.test(psegViewRP19)
+    /:label="v\.label"/.test(psegViewRP19)
   assert(
-    'RP19 静态：段位文本字段候选值取自后端值域（客户等级/订单类型/客户区分/运输方式/销售类别/非在库出荷区分），延期状态候选已随字段撤除，旧错值绝迹且允许手填',
+    'RP19 静态：段位文本字段候选值取自后端值域（客户等级/订单类型/客户区分/运输方式/销售类别/非在库出荷区分），延期状态候选已随字段撤除，旧错值绝迹（能否手填见 RP26）',
     rp19,
     `字典切片=${sug19.length}字符 延期状态候选残留=${/'(ON_TIME|FIRST_DELAY|REPEATED_DELAY)'/.test(sug19)} 客户等级收敛=${/2:\s*\[[\s\S]{0,200}?'VIP'[\s\S]{0,200}?'GENERAL'/.test(sug19) && !/'KEY_ACCOUNT'/.test(sug19)} 新值域=${[8, 10, 11, 14].every((f) => sug19.includes(`${f}: [`))} 旧值残留=${/'(Delayed|OnTrack)'/.test(sug19)} 渲染=${/:value="v\.value"/.test(psegViewRP19) && /:label="v\.label"/.test(psegViewRP19)} 手填提示=${/no-data-text="没有预设值，直接输入后回车"/.test(psegViewRP19)}`
   )
@@ -16796,7 +19177,9 @@ function verifyRulesSplit() {
 
   const rp22 =
     (editorSrc.match(/allowContains:\s*true/g) || []).length === 1 &&
-    /{ value: 15, label: '物料编码', kind: 'TEXT', allowContains: true }/.test(editorSrc) &&
+    /value: 15, label: '物料编码', kind: 'TEXT', allowContains: true, allowCustom: true/.test(
+      editorSrc
+    ) &&
     /{ value: 13, label: '库存消耗日（天）', kind: 'NUMBER' }/.test(editorSrc) &&
     /{ value: 16, label: '数量', kind: 'NUMBER' }/.test(editorSrc) &&
     /def\.kind === 'DATE' \|\| def\.kind === 'NUMBER'/.test(editorSrc) &&
@@ -16818,7 +19201,7 @@ function verifyRulesSplit() {
     /export function isOffsetDaysText\(text: string\): boolean/.test(editorSrc) &&
     editorSrc.includes('的比较值应为整数天数（如 20 = 冻结日 +20 天）或具体日期 YYYY-MM-DD') &&
     /supportsRelativeOffset\(c\.field, c\.operator\)/.test(psegViewRP19) &&
-    /onConditionMode\(seg, ci, \$event\)/.test(psegViewRP19) &&
+    /onConditionMode\(seg, gi, ci, \$event\)/.test(psegViewRP19) &&
     // 必须锁到控件本身：页脚提示里也有「按天数偏移」四个字，只搜文本会被提示顶住（自证实测假绿）
     /<ElRadioButton value="offset">按天数偏移<\/ElRadioButton>/.test(psegViewRP19) &&
     /<ElRadioButton value="date">具体日期<\/ElRadioButton>/.test(psegViewRP19) &&
@@ -16846,17 +19229,19 @@ function verifyRulesSplit() {
   /* RP23（2026-11-07 撤标后修正）：成熟度两项已在目录里，但**不再标「暂未生效」**——
    * 需求保护消费链 2026-11-06/07 落 dev（`DemandProtectionTriggerEvaluator.cs:191/197` 真读这两项），
    * 与锁块其余 6 项 Trigger.* 一并撤标（22 → 12）。继续标「暂未生效」= 对真生效字段说谎。
-   * DNF 条件组（`TriggerConditionGroups` / `MatchConditionGroups`）运行侧未接线 ⇒ 仍不落地（负断言）。 */
+   *
+   * ⚠️ 2026-11-11 口径更新：规则集侧 DNF（`MatchConditionGroups`）后端执行器/投影层已接线，
+   *   3号位正式需求函要求前端落地 ⇒ 「规则集侧不落地」这条负断言**已撤**（改由 RP27 正面锁定）。
+   *   **参数集侧**（`TriggerConditionGroups`）不在本需求范围，仍是负断言。 */
   const rp23 =
     lockSrcRP23.includes("path: 'Trigger.ProtectMaturityStatus'") &&
     lockSrcRP23.includes("path: 'Trigger.MaturityStatusValues'") &&
     !inertSrcRP23.includes("'Trigger.ProtectMaturityStatus'") &&
     !inertSrcRP23.includes("'Trigger.MaturityStatusValues'") &&
-    !/TriggerConditionGroups/.test(blockFieldsSrcRP23 + editorSrc + psegViewRP19) &&
-    !/MatchConditionGroups/.test(editorSrc + psegViewRP19)
-  assert('RP23 静态：参数集锁定块含成熟度两项且已撤「暂未生效」标（已接线）；DNF 条件组编辑器未提前落地（负断言）',
+    !/TriggerConditionGroups/.test(blockFieldsSrcRP23 + editorSrc + psegViewRP19)
+  assert('RP23 静态：参数集锁定块含成熟度两项且已撤「暂未生效」标（已接线）；参数集侧 DNF 条件组仍不落地（负断言）',
     rp23,
-    `目录两项=${lockSrcRP23.includes("path: 'Trigger.ProtectMaturityStatus'") && lockSrcRP23.includes("path: 'Trigger.MaturityStatusValues'")} 已撤标=${!inertSrcRP23.includes("'Trigger.ProtectMaturityStatus'") && !inertSrcRP23.includes("'Trigger.MaturityStatusValues'")} 含 TriggerConditionGroups=${/TriggerConditionGroups/.test(blockFieldsSrcRP23 + editorSrc + psegViewRP19)} 含 MatchConditionGroups=${/MatchConditionGroups/.test(editorSrc + psegViewRP19)}`)
+    `目录两项=${lockSrcRP23.includes("path: 'Trigger.ProtectMaturityStatus'") && lockSrcRP23.includes("path: 'Trigger.MaturityStatusValues'")} 已撤标=${!inertSrcRP23.includes("'Trigger.ProtectMaturityStatus'") && !inertSrcRP23.includes("'Trigger.MaturityStatusValues'")} 含 TriggerConditionGroups=${/TriggerConditionGroups/.test(blockFieldsSrcRP23 + editorSrc + psegViewRP19)}`)
 
   const rp05 =
     rulesViewNoHtml.includes('发布规则集版本（整版）') &&
@@ -16895,11 +19280,708 @@ function verifyRulesSplit() {
     `disabled=${/:disabled="!canViewSetup"/.test(rulesViewNoHtml)} hint=${rulesViewNoHtml.includes('当前账号没有查看权限，条数不可见')}`
   )
 
+  /* -------- RP25 换型规则启停 #67（2026-11-09）--------
+   * 工作簿 #67 要求 0号位 能明确每条规则的启停。3号位 2026-11-07 已扩契约：
+   *   读 DTO 回带 `IsActive`、写输入接受 `IsActive`（服务端不再硬置 true）。
+   * 前端必做三件事，缺一即错：
+   *   ① 读 DTO / 两个写输入都带 `isActive`
+   *   ② 两个弹窗提交时**回传**原值（漏传 → 后端按默认 true 把停用规则复活）
+   *   ③ 三个列表页都给出启停开关，且走 store 的 `setRuleActive`（整行回传）
+   * 反向破坏自证：删掉弹窗里的 `isActive: form.isActive` / 去掉列表开关 ⇒ 转红。
+   */
+  const typesSetupRP25 = stripComments(readSrc('api/aps-v1/types/setup.ts'))
+  const exactDlgRP25 = stripComments(readSrc('views/Aps/components/SetupExactDialog.vue'))
+  const defaultDlgRP25 = stripComments(readSrc('views/Aps/components/SetupDefaultDialog.vue'))
+  const storeExactRP25 = stripComments(readSrc('store/modules/aps/setupExact.ts'))
+  const storeDefaultRP25 = stripComments(readSrc('store/modules/aps/setupDefault.ts'))
+  const setupExactViewRP25 = stripComments(readSrc('views/Aps/SetupExact.vue'))
+  const setupDefaultViewRP25 = stripComments(readSrc('views/Aps/SetupDefault.vue'))
+  const rp25Types = (typesSetupRP25.match(/isActive: boolean/g) || []).length >= 3
+  const rp25Dialogs =
+    exactDlgRP25.includes('isActive: form.isActive') &&
+    defaultDlgRP25.includes('isActive: form.isActive') &&
+    exactDlgRP25.includes('form.isActive = props.rule.isActive ?? true') &&
+    defaultDlgRP25.includes('form.isActive = props.rule.isActive ?? true')
+  const rp25Stores =
+    /async function setRuleActive\(rule: SetupRuleDto, active: boolean\)/.test(storeExactRP25) &&
+    /async function setRuleActive\(rule: SetupRuleDto, active: boolean\)/.test(storeDefaultRP25) &&
+    /isActive: active\b/.test(storeExactRP25) &&
+    /isActive: active\b/.test(storeDefaultRP25)
+  const rp25Toggles =
+    (rulesViewNoHtml.match(/:model-value="row\.isActive !== false"/g) || []).length === 2 &&
+    /onToggleSetupActive\('exact'/.test(rulesViewNoHtml) &&
+    /onToggleSetupActive\('default'/.test(rulesViewNoHtml) &&
+    (setupExactViewRP25.match(/:model-value="row\.isActive !== false"/g) || []).length === 1 &&
+    (setupDefaultViewRP25.match(/:model-value="row\.isActive !== false"/g) || []).length === 1 &&
+    /setRuleActive\(rule, active\)/.test(rulesViewNoHtml) &&
+    /setRuleActive\(rule, active\)/.test(setupExactViewRP25) &&
+    /setRuleActive\(rule, active\)/.test(setupDefaultViewRP25)
+  const rp25 = rp25Types && rp25Dialogs && rp25Stores && rp25Toggles
+  assert(
+    'RP25 静态：换型规则启停 #67 —— 读/写都带 isActive，弹窗回传原值（不漏传致复活），三页都有启停开关',
+    rp25,
+    rp25
+      ? '契约 3 处 + 弹窗回传 2 处 + 三页开关齐备'
+      : `契约=${rp25Types ? '齐' : '缺'} 弹窗=${rp25Dialogs ? '回传' : '漏传'} store=${rp25Stores ? '整行回传' : '缺'} 列表=${rp25Toggles ? '开关齐' : '缺开关'}`
+  )
+
+  /* -------- RP26 闭集字段不许手填（2026-11-09）--------
+   * 客户等级的候选已收敛 VIP/GENERAL，但**后端发布不校验**该字段的值
+   * （`DemandPriorityValidator.SupportedFieldValues` 未登记 CustomerTier），
+   * 运行期又按 Ordinal 比对 ⇒ 允许手填＝「能发布、永不命中、不报错」。
+   * 判据：① 有 `allowsCustomValue` 且语义＝显式 `allowCustom === true`
+   *      ② 视图两处取值控件都绑该函数，**不得**残留裸 `allow-create`
+   *      ③ 只有物料编码一个字段放开手填 */
+  const rp26Helper = /export function allowsCustomValue[\s\S]{0,240}?allowCustom === true/.test(
+    psegSrcRP19
+  )
+  const rp26View =
+    (psegViewRP19.match(/:allow-create="allowsCustomValue\(c\.field\)"/g) || []).length === 2 &&
+    !/\sallow-create(\s|>)/.test(psegViewRP19)
+  const rp26OnlyMaterial = (psegSrcRP19.match(/allowCustom: true/g) || []).length === 1
+  const rp26TierClosed = /value: 2,[^}]*allowCustom: false/.test(psegSrcRP19)
+  const rp26 = rp26Helper && rp26View && rp26OnlyMaterial && rp26TierClosed
+  assert(
+    'RP26 静态：命中条件闭集字段不许手填（客户等级等），只有物料编码保留手填',
+    rp26,
+    rp26
+      ? '绑定 2 处 + 无裸 allow-create + 仅物料编码放开'
+      : `助手=${rp26Helper ? '有' : '缺'} 视图=${rp26View ? '绑好' : `错（裸 allow-create=${/\sallow-create(\s|>)/.test(psegViewRP19)}）`} 放开字段数=${(psegSrcRP19.match(/allowCustom: true/g) || []).length} 客户等级关闭=${rp26TierClosed}`
+  )
+
+  /* -------- RP27 DNF 条件组：组内 AND、组间 OR（2026-11-11 3号位需求函）--------
+   * 需求函要求前端做「维护 + 展示」两件事：
+   *   维护 ⇒ 编辑器能加/删/排序条件组；两种模式（平铺 vs 多组）互斥；空组编辑期就拦
+   *   展示 ⇒ 只读面按组结构化呈现（组界可见、组内 AND、组间 OR），空组不得渲染成「无条件命中」
+   *
+   * 后端口径（`FrozenStrategySnapshot.cs` + `DemandPriorityValidator`）：
+   *   - `MatchConditionGroups` = `List<SegmentConditionGroup>{ Conditions: [...] }`
+   *   - 同段同时带 `MatchConditions` 与 `MatchConditionGroups` ⇒ 后端判歧义直接报错
+   *   - 空组 ⇒ 恒成立并吞掉其后所有段 ⇒ 后端发布校验拒绝
+   *   - 兜底段判定 = **平铺空 且 组空**（`ValidateFallbackSegment`）
+   *
+   * 六条独立判据，逐条可反向破坏自证（见 scripts/selfverify-dnf-priority.mjs）。 */
+  const psegApiRP27 = stripComments(readSrc('api/aps-v1/prioritySegment.ts'))
+  const psegEditorApiRP27 = stripComments(readSrc('api/aps-v1/prioritySegmentEditor.ts'))
+  const psegEditorViewRP27 = noHtml(stripComments(readSrc('views/Aps/components/PrioritySegmentEditor.vue')))
+  const rulesViewRP27 = noHtml(stripComments(readSrc('views/Aps/Rules.vue')))
+
+  // 切片：serializePrioritySegments 函数体（同名调用多处，必须切片函数体）
+  const serStartRP27 = psegEditorApiRP27.indexOf('export function serializePrioritySegments(')
+  const serEndRP27 = psegEditorApiRP27.indexOf('function isDateText(', serStartRP27)
+  const serSrcRP27 =
+    serStartRP27 >= 0 && serEndRP27 > serStartRP27
+      ? psegEditorApiRP27.slice(serStartRP27, serEndRP27)
+      : ''
+  // 切片：validatePrioritySegments 函数体
+  const valStartRP27 = psegEditorApiRP27.indexOf('export function validatePrioritySegments(')
+  const valEndRP27 = psegEditorApiRP27.indexOf('export function createEmptySortField(', valStartRP27)
+  const valSrcRP27 =
+    valStartRP27 >= 0 && valEndRP27 > valStartRP27
+      ? psegEditorApiRP27.slice(valStartRP27, valEndRP27)
+      : ''
+
+  // RP27-a 序列化互斥：有组只写 MatchConditionGroups、无组只写 MatchConditions
+  const rp27aSerialize =
+    /\.\.\.\(dnf\s*\?\s*\{[\s\S]{0,600}?MatchConditionGroups:[\s\S]{0,600}?\}\s*:\s*\{[\s\S]{0,600}?MatchConditions:/.test(
+      serSrcRP27
+    ) &&
+    serSrcRP27.includes('const dnf = groups.length > 0') &&
+    serSrcRP27.includes('Conditions: (g?.conditions ?? []).map')
+  assert(
+    'RP27a 静态：DNF 序列化与平铺互斥（有组只写 MatchConditionGroups，无组只写 MatchConditions）',
+    rp27aSerialize,
+    rp27aSerialize
+      ? '三元互斥 + 组内 Conditions 数组'
+      : `切片=${serSrcRP27.length}字符 三元互斥=${/\.\.\.\(dnf\s*\?\s*\{[\s\S]{0,600}?MatchConditionGroups:[\s\S]{0,600}?\}\s*:\s*\{[\s\S]{0,600}?MatchConditions:/.test(serSrcRP27)} dnf判定=${serSrcRP27.includes('const dnf = groups.length > 0')} 组内数组=${serSrcRP27.includes('Conditions: (g?.conditions ?? []).map')}`
+  )
+
+  // RP27-b 只读解析认 MatchConditionGroups（不解析就会把「带组」读成「无条件段」，再保存就把组抹掉）
+  const rp27bParse =
+    /MatchConditionGroups\?: RawConditionGroup\[\]/.test(psegApiRP27) &&
+    /interface RawConditionGroup\s*\{[\s\S]{0,200}?Conditions\?: RawMatchCondition\[\]/.test(psegApiRP27) &&
+    /matchConditionGroups: Array\.isArray\(s\?\.MatchConditionGroups\)/.test(psegApiRP27)
+  assert(
+    'RP27b 静态：只读解析认 MatchConditionGroups（条件组不得在解析环节被静默丢弃）',
+    rp27bParse,
+    `原始键=${/MatchConditionGroups\?: RawConditionGroup\[\]/.test(psegApiRP27)} 组结构=${/interface RawConditionGroup\s*\{[\s\S]{0,200}?Conditions\?: RawMatchCondition\[\]/.test(psegApiRP27)} 解析=${/matchConditionGroups: Array\.isArray\(s\?\.MatchConditionGroups\)/.test(psegApiRP27)}`
+  )
+
+  // RP27-c 编辑器 UI：组编辑入口 + 组内 AND / 组间 OR 文案
+  //   ⚠️ 不能用 `includes('+ 添加条件组（组间或）')` 判入口 —— 组件底部的说明文字里也引了同一句，
+  //   按钮被摘掉后 includes 仍为真（子串假绿）。改为**按按钮切片**：文案必须落在对应 @click 之后。
+  const btnSliceRP27 = (anchor, span = 220) => {
+    const i = psegEditorViewRP27.indexOf(anchor)
+    return i >= 0 ? psegEditorViewRP27.slice(i, i + span) : ''
+  }
+  const addGroupBtnRP27 = btnSliceRP27('@click="toDnfMode(seg)"')
+  const moreGroupBtnRP27 = btnSliceRP27('@click="addGroup(seg)"')
+  const flatBtnRP27 = btnSliceRP27('@click="toFlatMode(seg)"')
+  const rp27cEditor =
+    addGroupBtnRP27.includes('+ 添加条件组（组间或）') &&
+    moreGroupBtnRP27.includes('+ 再加一组（组间或）') &&
+    flatBtnRP27.includes('改回单组条件（去掉「或」）') &&
+    psegEditorViewRP27.includes('组内全部满足（且）') &&
+    psegEditorViewRP27.includes('或 —— 满足上面任意一组即命中本段') &&
+    /function addGroup\(/.test(psegEditorViewRP27) &&
+    /function removeGroup\(/.test(psegEditorViewRP27) &&
+    /function moveGroup\(/.test(psegEditorViewRP27) &&
+    /function toDnfMode\(/.test(psegEditorViewRP27) &&
+    /function toFlatMode\(/.test(psegEditorViewRP27)
+  assert(
+    'RP27c 静态：段位编辑器有条件组维护入口（加组/删组/上下移/双模式切换）且写明组内 AND、组间 OR',
+    rp27cEditor,
+    `加组按钮=${addGroupBtnRP27.includes('+ 添加条件组（组间或）')} 再加组按钮=${moreGroupBtnRP27.includes('+ 再加一组（组间或）')} 回平铺按钮=${flatBtnRP27.includes('改回单组条件（去掉「或」）')} 组内AND=${psegEditorViewRP27.includes('组内全部满足（且）')} 组间OR=${psegEditorViewRP27.includes('或 —— 满足上面任意一组即命中本段')} 缺函数=${['addGroup', 'removeGroup', 'moveGroup', 'toDnfMode', 'toFlatMode'].filter((f) => !new RegExp(`function ${f}\\(`).test(psegEditorViewRP27)).join(',') || '全有'}`
+  )
+
+  // RP27-d 空组 + 双模式同填：前端编辑期就拦（后端发布校验也会拒，前端提前拦省一轮往返）
+  const rp27dGuard =
+    valSrcRP27.includes('条件组不能为空') &&
+    valSrcRP27.includes('条件组与单组条件不能同时存在') &&
+    /conds\.length === 0/.test(valSrcRP27) &&
+    psegEditorViewRP27.includes('空组会恒成立')
+  assert(
+    'RP27d 静态：空条件组与「平铺+组同填」在前端编辑期即被拦截并给出大白话原因',
+    rp27dGuard,
+    `空组校验=${valSrcRP27.includes('条件组不能为空')} 同填校验=${valSrcRP27.includes('条件组与单组条件不能同时存在')} 空组判定=${/conds\.length === 0/.test(valSrcRP27)} 编辑器提示=${psegEditorViewRP27.includes('空组会恒成立')}`
+  )
+
+  // RP27-e 只读面结构化：组界可见 + 语义预览表达式 + 空组不得渲染成「无条件命中」
+  //   ⚠️ 分组分支同样不能用 `includes('row.matchConditionGroups?.length')` 判 ——
+  //   前缀成 `false && row.matchConditionGroups?.length` 时子串仍在 ⇒ 假绿。改为按 v-if 形态断言。
+  const rp27eView =
+    /<template v-if="row\.matchConditionGroups\?\.length">/.test(rulesViewRP27) &&
+    /v-for="\(g, gi\) in row\.matchConditionGroups"/.test(rulesViewRP27) &&
+    rulesViewRP27.includes('conditionGroupLabel(gi)') &&
+    rulesViewRP27.includes('segmentConditionView(row).expression') &&
+    rulesViewRP27.includes('（空组，不成立）') &&
+    rulesViewRP27.includes('组内全部满足（且）')
+  assert(
+    'RP27e 静态：规则集只读面按组结构化展示（组标签/组界/语义预览表达式），空组不塌成「无条件命中」',
+    rp27eView,
+    `分组分支=${/<template v-if="row\.matchConditionGroups\?\.length">/.test(rulesViewRP27)} 组遍历=${/v-for="\(g, gi\) in row\.matchConditionGroups"/.test(rulesViewRP27)} 组标签=${rulesViewRP27.includes('conditionGroupLabel(gi)')} 表达式=${rulesViewRP27.includes('segmentConditionView(row).expression')} 空组文案=${rulesViewRP27.includes('（空组，不成立）')} 组内AND=${rulesViewRP27.includes('组内全部满足（且）')}`
+  )
+
+  // RP27-f 兜底段判定与后端同口径（平铺空 **且** 组空）
+  const rp27fFallback =
+    /\(s\.matchConditions \?\? \[\]\)\.length === 0 && \(s\.matchConditionGroups \?\? \[\]\)\.length === 0/.test(
+      valSrcRP27
+    )
+  assert(
+    'RP27f 静态：兜底段判定与后端同口径（平铺空且组空才算兜底段，组非空的段不得被当兜底）',
+    rp27fFallback,
+    rp27fFallback
+      ? '平铺空 && 组空'
+      : `未匹配到同口径判据（切片=${valSrcRP27.length}字符）`
+  )
+
+  /* -------- RP28 规则集列表改「主子表联查·一版一行」（2026-11-11 3号位 契约变更协调件 v1.0）--------
+   * 协调件 §三 要求：规则集维护页列表源由 `GET /rule-sets` 切到新 `GET /rule-sets/versions`，
+   *   列表每版本一行、状态各自真实；点某行 → 依 `versionId` 取 `GET /rule-set/version/{versionId}`。
+   *
+   * 修的缺陷（协调件 §一）：旧列表 `Status/PublishedAt/RetiredAt` 取「最新创建版本」
+   *   （`OUTER APPLY TOP1 ORDER BY Id DESC`）⇒ 同族有生效 PUBLISHED 又新加 DRAFT 时
+   *   整族被标成 DRAFT，详情又默认展示草稿内容 ⇒ **看不到当前生效版本的内容**。
+   *
+   * ⚠️ 必须保留的一项：新端点是主表 INNER JOIN 版本 ⇒ **一条版本都没有的主表不在其中**
+   *   （dev 实测 905 个主表里 894 个无版本）⇒ 列表 = 新端点版本行 + 旧端点「无版本主表」行，
+   *   否则「未配版本」筛选与「删除规则集」入口会一起消失（功能回退）。
+   */
+  const ruleApiSrcRP28 = stripComments(readSrc('api/aps-v1/rule.ts'))
+  const ruleTypesSrcRP28 = stripComments(readSrc('api/aps-v1/types/rule.ts'))
+  const rulesStoreSrcRP28 = stripComments(readSrc('store/modules/aps/rules.ts'))
+  const rulesViewRP28 = noHtml(stripComments(readSrc('views/Aps/Rules.vue')))
+
+  // 切片：getRuleSet 函数体（同名调用多处，必须切片函数体再断言）
+  const gsStartRP28 = ruleApiSrcRP28.indexOf('async getRuleSet(')
+  const gsEndRP28 = ruleApiSrcRP28.indexOf('async diffVersions(', gsStartRP28)
+  const gsSrcRP28 =
+    gsStartRP28 >= 0 && gsEndRP28 > gsStartRP28
+      ? ruleApiSrcRP28.slice(gsStartRP28, gsEndRP28)
+      : ''
+  // 切片：loadList 函数体（判「列表源已切」必须看这个函数，不能全文件 includes）
+  const llStartRP28 = rulesStoreSrcRP28.indexOf('async function loadList(')
+  const llEndRP28 = rulesStoreSrcRP28.indexOf('function clearDiff(', llStartRP28)
+  const llSrcRP28 =
+    llStartRP28 >= 0 && llEndRP28 > llStartRP28
+      ? rulesStoreSrcRP28.slice(llStartRP28, llEndRP28)
+      : ''
+
+  // RP28a 列表源已切到新端点（store 的 loadList 不再直接调旧端点）
+  const rp28aSource =
+    ruleApiSrcRP28.includes("url: '/api/governance/rule-sets/versions'") &&
+    ruleApiSrcRP28.includes('async listRuleSetVersionRows(') &&
+    ruleApiSrcRP28.includes('async listRuleSetRows(') &&
+    llSrcRP28.includes('ruleApi.listRuleSetRows()') &&
+    !llSrcRP28.includes('ruleApi.listRuleSets()') &&
+    // 旧端点本身保留（合并用的「无版本主表」行 + 策略包 DRAFT 下拉）
+    ruleApiSrcRP28.includes('async listRuleSets()')
+  assert(
+    'RP28a 静态：规则集列表源已切到新端点 GET /rule-sets/versions（store 的 loadList 走合并后的 listRuleSetRows，旧端点保留不删）',
+    rp28aSource,
+    `新端点=${ruleApiSrcRP28.includes("url: '/api/governance/rule-sets/versions'")} 版本行方法=${ruleApiSrcRP28.includes('async listRuleSetVersionRows(')} 合并方法=${ruleApiSrcRP28.includes('async listRuleSetRows(')} loadList用合并=${llSrcRP28.includes('ruleApi.listRuleSetRows()')} loadList仍直调旧端点=${llSrcRP28.includes('ruleApi.listRuleSets()')} 旧端点保留=${ruleApiSrcRP28.includes('async listRuleSets()')}`
+  )
+
+  // RP28b 一版一行的数据结构（后端行 DTO + 前端列表行）
+  const rp28bRows =
+    /export interface RuleSetVersionRowDto\s*\{[\s\S]{0,1200}?versionId:\s*number[\s\S]{0,400}?versionCode:\s*string[\s\S]{0,400}?status:\s*string/.test(
+      ruleTypesSrcRP28
+    ) &&
+    /export interface RuleSetListRowDto\s*\{[\s\S]{0,1600}?hasVersion:\s*boolean[\s\S]{0,600}?versionId\?:\s*number[\s\S]{0,400}?versionCode\?:\s*string[\s\S]{0,400}?versionStatus\?:\s*RuleStatus/.test(
+      ruleTypesSrcRP28
+    ) &&
+    /export function mergeRuleSetListRows\(/.test(ruleApiSrcRP28) &&
+    /rowKey:\s*`v\$\{r\.versionId\}`/.test(ruleApiSrcRP28)
+  assert(
+    'RP28b 静态：列表行按「一版一行」建模（后端行 DTO 带 versionId/versionCode/status，前端行带 versionStatus，行键按 versionId 唯一）',
+    rp28bRows,
+    `后端行DTO=${/export interface RuleSetVersionRowDto\s*\{[\s\S]{0,1200}?versionId:\s*number[\s\S]{0,400}?versionCode:\s*string[\s\S]{0,400}?status:\s*string/.test(ruleTypesSrcRP28)} 前端行DTO=${/export interface RuleSetListRowDto\s*\{[\s\S]{0,1600}?hasVersion:\s*boolean[\s\S]{0,600}?versionId\?:\s*number[\s\S]{0,400}?versionCode\?:\s*string[\s\S]{0,400}?versionStatus\?:\s*RuleStatus/.test(ruleTypesSrcRP28)} 合并函数=${/export function mergeRuleSetListRows\(/.test(ruleApiSrcRP28)} 行键=${/rowKey:\s*`v\$\{r\.versionId\}`/.test(ruleApiSrcRP28)}`
+  )
+
+  // RP28c 详情按点击的版本取内容，状态取**该版真实状态**（缺陷修复的核心）
+  const rp28cDetail =
+    /async getRuleSet\(ruleSetId:\s*number,\s*versionId\?:\s*number\)/.test(gsSrcRP28) &&
+    /versions\.find\(\(v\) => v\.id === versionId\)/.test(gsSrcRP28) &&
+    gsSrcRP28.includes('status: normalizeRuleStatus(contentSource.status)') &&
+    // 旧口径「存在草稿就一律 DRAFT」必须已撤（那正是把已发布生效版错标成草稿的根因）
+    !/status:\s*draft\s*\?\s*'DRAFT'/.test(gsSrcRP28)
+  assert(
+    'RP28c 静态：详情依点击行的 versionId 取该版内容，且状态取该版真实状态（旧口径「有草稿就一律 DRAFT」已撤）',
+    rp28cDetail,
+    `签名带versionId=${/async getRuleSet\(ruleSetId:\s*number,\s*versionId\?:\s*number\)/.test(gsSrcRP28)} 按versionId定位=${/versions\.find\(\(v\) => v\.id === versionId\)/.test(gsSrcRP28)} 真实状态=${gsSrcRP28.includes('status: normalizeRuleStatus(contentSource.status)')} 旧口径残留=${/status:\s*draft\s*\?\s*'DRAFT'/.test(gsSrcRP28)}`
+  )
+
+  // RP28d 页面按版本渲染（行键唯一 / 显示版本码 / 状态取版本 / 选中按版本 / 点行传版本）
+  const rp28dView =
+    /:key="r\.rowKey"/.test(rulesViewRP28) &&
+    rulesViewRP28.includes('r.versionCode') &&
+    rulesViewRP28.includes('rowStatusLabel(r)') &&
+    rulesViewRP28.includes('rowStatusTag(r)') &&
+    rulesViewRP28.includes('detailNN?.contentVersionId === r.versionId') &&
+    rulesViewRP28.includes('loadDetail(row.ruleSetId, row.versionId)')
+  assert(
+    'RP28d 静态：规则集页面按版本渲染（行键唯一、显示版本码与版本状态、选中按 versionId、点行按 versionId 进详情）',
+    rp28dView,
+    `行键=${/:key="r\.rowKey"/.test(rulesViewRP28)} 版本码=${rulesViewRP28.includes('r.versionCode')} 状态标签=${rulesViewRP28.includes('rowStatusLabel(r)') && rulesViewRP28.includes('rowStatusTag(r)')} 选中判据=${rulesViewRP28.includes('detailNN?.contentVersionId === r.versionId')} 进详情带版本=${rulesViewRP28.includes('loadDetail(row.ruleSetId, row.versionId)')}`
+  )
+
+  // RP28e store 的状态口径跟着版本走（过滤/计数按版本状态；总数按主表去重）
+  // ⚠️ 2026-11-11（撤 KPI 横条、计数落页签）：计数字段由 statusCounts 改为 tabCounts
+  //   （页签计数：DRAFT/PUBLISHED/DISABLED 按版本真实状态，NO_VERSION 按无版本行）。
+  const rp28eStore =
+    rulesStoreSrcRP28.includes('r.versionStatus === statusFilter.value') &&
+    rulesStoreSrcRP28.includes('const tabCounts = computed') &&
+    rulesStoreSrcRP28.includes("r.versionStatus === 'DRAFT'") &&
+    rulesStoreSrcRP28.includes("r.versionStatus === 'PUBLISHED'") &&
+    rulesStoreSrcRP28.includes("r.versionStatus === 'DISABLED'") &&
+    rulesStoreSrcRP28.includes('c.NO_VERSION += 1') &&
+    rulesStoreSrcRP28.includes('new Set(ruleSets.value.map((r) => r.ruleSetId)).size')
+  assert(
+    'RP28e 静态：store 的状态过滤/页签计数按「版本真实状态」，规则集总数按主表去重（不再把行数当规则集数）',
+    rp28eStore,
+    `过滤按版本=${rulesStoreSrcRP28.includes('r.versionStatus === statusFilter.value')} 页签计数=${rulesStoreSrcRP28.includes('const tabCounts = computed')} 草稿=${rulesStoreSrcRP28.includes("r.versionStatus === 'DRAFT'")} 已发布=${rulesStoreSrcRP28.includes("r.versionStatus === 'PUBLISHED'")} 已停用=${rulesStoreSrcRP28.includes("r.versionStatus === 'DISABLED'")} 未配版本=${rulesStoreSrcRP28.includes('c.NO_VERSION += 1')} 主表去重=${rulesStoreSrcRP28.includes('new Set(ruleSets.value.map((r) => r.ruleSetId)).size')}`
+  )
+
+  // RP28f 「一条版本都没有」的主表仍在列表里（否则未配版本筛选与删除入口会消失）
+  const rp28fNoVersion =
+    /if \(m\.hasVersion \|\| withVersion\.has\(m\.ruleSetId\)\) continue/.test(ruleApiSrcRP28) &&
+    ruleApiSrcRP28.includes('hasVersion: false') &&
+    rulesViewRP28.includes('NO_VERSION_LABEL') &&
+    rulesViewRP28.includes('noVersionPicked')
+  assert(
+    'RP28f 静态：无任何版本的主表仍以「未配版本」行列在列表里（未配版本筛选与删除规则集入口不得消失）',
+    rp28fNoVersion,
+    `补行判据=${/if \(m\.hasVersion \|\| withVersion\.has\(m\.ruleSetId\)\) continue/.test(ruleApiSrcRP28)} 无版本标记=${ruleApiSrcRP28.includes('hasVersion: false')} 页面未配版本=${rulesViewRP28.includes('NO_VERSION_LABEL')} 空态=${rulesViewRP28.includes('noVersionPicked')}`
+  )
+
+  /* -------- RP29 规则集「版本对比」失败不再把后端英文异常糊到用户脸上（2026-11-11）--------
+   * 起因（用户实看截图）：点 RS_DEMO 卡片 → 顶部弹出红条
+   *   「An item with the same key has already been added. Key: E|0||0||」
+   *   面板显示 GET /api/governance/rule-set/version/diff?sourceVersionId=478&targetVersionId=3486 → 400。
+   * 根因（后端，3号位领域）：`SetupTransitionRuleProjector.CompareBusinessContent` 用
+   *   `ToDictionary(BuildBusinessKey)` 建业务键索引；同一版本内两条换型规则业务键全同
+   *   （key `E|0||0||` = 部门 0 / 资源 0 / 工序与物料为空）⇒ .NET 抛重复键异常 ⇒ 整个 diff 400。
+   *   ⇒ **前端绕不过**（不能改后端）；能做的是：① 不弹全局英文 toast ② 页签内给大白话说明
+   *      ③ 详情/历史版本/校验/发布一律不受影响。
+   *  - 反向破坏自证：见 scripts/selfverify-ruleset-versions.mjs（RP29a/b/c 三条）
+   */
+  const ruleApiSrcRP29 = stripComments(readSrc('api/aps-v1/rule.ts'))
+  const rulesStoreSrcRP29 = stripComments(readSrc('store/modules/aps/rules.ts'))
+  const rulesViewRP29 = noHtml(stripComments(readSrc('views/Aps/Rules.vue')))
+
+  // 切片：diffVersions 函数体（silent 必须在**这个请求**上，不能全文件 includes）
+  const dvStartRP29 = ruleApiSrcRP29.indexOf('async diffVersions(')
+  const dvEndRP29 = ruleApiSrcRP29.indexOf('async validateDraft(', dvStartRP29)
+  const dvSrcRP29 =
+    dvStartRP29 >= 0 && dvEndRP29 > dvStartRP29
+      ? ruleApiSrcRP29.slice(dvStartRP29, dvEndRP29)
+      : ''
+  // 切片：store 的 loadDiff 函数体
+  const ldStartRP29 = rulesStoreSrcRP29.indexOf('async function loadDiff(')
+  const ldEndRP29 = rulesStoreSrcRP29.indexOf('async function validateDraft(', ldStartRP29)
+  const ldSrcRP29 =
+    ldStartRP29 >= 0 && ldEndRP29 > ldStartRP29
+      ? rulesStoreSrcRP29.slice(ldStartRP29, ldEndRP29)
+      : ''
+
+  const rp29aSilent = /silent:\s*true/.test(dvSrcRP29)
+  assert(
+    'RP29a 静态：规则集 diff 请求走 silent（后端 400 的英文原文不再弹成全局红条）',
+    rp29aSilent,
+    `diffVersions带silent=${rp29aSilent}`
+  )
+
+  const rp29bStore =
+    ldSrcRP29 !== '' &&
+    !/handleError\(/.test(ldSrcRP29) &&
+    /diffError\.value\s*=/.test(ldSrcRP29) &&
+    /差异算不出来/.test(ldSrcRP29)
+  assert(
+    'RP29b 静态：diff 失败只落到页签内的大白话提示（不再写全局错误、不再弹英文异常）',
+    rp29bStore,
+    `loadDiff切片=${ldSrcRP29 !== ''} 不写全局error=${!/handleError\(/.test(ldSrcRP29)} 有页签提示=${/diffError\.value\s*=/.test(ldSrcRP29)} 中文文案=${/差异算不出来/.test(ldSrcRP29)}`
+  )
+
+  const rp29cView =
+    rulesViewRP29.includes('diffError') && /:title="diffError"/.test(rulesViewRP29)
+  assert(
+    'RP29c 静态：「版本对比」页签内渲染该提示（用户看得到发生了什么，而不是一片空白）',
+    rp29cView,
+    `页面含diffError=${rulesViewRP29.includes('diffError')} 提示绑定=${/:title="diffError"/.test(rulesViewRP29)}`
+  )
+
+  /* -------- RP30 规则集列表：撤 KPI 横条 + 计数落页签 + 全部含停用 + 筛选条件（2026-11-11）--------
+   * 用户拍板四条：
+   *   ① 顶部「规则集总数 / 草稿 / 已发布 / 已停用 / 未配版本」那一排撤掉；
+   *   ② 各自的数量直接显示在下面的状态页签上；
+   *   ③ 「全部」页签 = 显示全部（**含停用的**）⇒ 原「显示已停用」开关一并撤掉；
+   *   ④ 补筛选条件（关键词 / 主表状态 / 排序）。
+   *  - 反向破坏自证：见 scripts/selfverify-ruleset-versions.mjs（RP30a/b/c 三条）
+   */
+  const rulesStoreSrcRP30 = stripComments(readSrc('store/modules/aps/rules.ts'))
+  const rulesViewRP30 = noHtml(stripComments(readSrc('views/Aps/Rules.vue')))
+
+  // RP30a：KPI 横条已撤，计数落在页签上
+  const rp30aNoKpiStrip =
+    !rulesViewRP30.includes('kpi-strip') &&
+    !rulesViewRP30.includes('kpi-pill') &&
+    !rulesViewRP30.includes('pill-val')
+  const rp30aTabCount =
+    rulesViewRP30.includes('tab-count') &&
+    rulesViewRP30.includes('tabCounts.ALL') &&
+    rulesViewRP30.includes('tabCounts.NO_VERSION') &&
+    /v-for="key in RULE_STATUSES_UI"[\s\S]{0,200}?tabCounts\[key\]/.test(rulesViewRP30)
+  assert(
+    'RP30a 静态：顶部 KPI 横条已撤，各状态数量直接显示在状态页签上',
+    rp30aNoKpiStrip && rp30aTabCount,
+    `无KPI横条=${rp30aNoKpiStrip} 页签带计数=${rp30aTabCount}`
+  )
+
+  // RP30b：规则集页不再有「显示已停用」开关；store 不再按 isActive 默认折叠停用行
+  const rp30bNoSwitch =
+    !rulesViewRP30.includes('显示已停用') &&
+    !rulesViewRP30.includes('showInactive') &&
+    !rulesStoreSrcRP30.includes('showInactive')
+  const rp30bAllIncludesInactive =
+    /const tabCounts = computed/.test(rulesStoreSrcRP30) &&
+    /c\.ALL \+= 1/.test(rulesStoreSrcRP30) &&
+    !/if \(!showInactive/.test(rulesStoreSrcRP30)
+  assert(
+    'RP30b 静态：规则集页已撤「显示已停用」开关，停用行默认可见（「全部」页签含停用）',
+    rp30bNoSwitch && rp30bAllIncludesInactive,
+    `无开关=${rp30bNoSwitch} 全部页签含停用=${rp30bAllIncludesInactive}`
+  )
+
+  // RP30c：筛选条件齐备（关键词 / 主表状态 / 排序），且 store 真的按它过滤
+  const rp30cView =
+    rulesViewRP30.includes('搜索规则集编码 / 名称 / 版本码') &&
+    rulesViewRP30.includes('主表状态：启用') &&
+    rulesViewRP30.includes('主表状态：停用') &&
+    rulesViewRP30.includes('RULE_LIST_SORT_LABELS')
+  const rp30cStore =
+    /const listKeyword = ref\(''\)/.test(rulesStoreSrcRP30) &&
+    /const listActiveFilter = ref<'ALL' \| 'ACTIVE' \| 'INACTIVE'>\('ALL'\)/.test(rulesStoreSrcRP30) &&
+    /const listSort = ref<RuleListSort>\('DEFAULT'\)/.test(rulesStoreSrcRP30) &&
+    /listKeyword\.value\.trim\(\)\.toLowerCase\(\)/.test(rulesStoreSrcRP30) &&
+    /r\.ruleSetCode\.toLowerCase\(\)\.includes\(kw\)/.test(rulesStoreSrcRP30) &&
+    /r\.ruleSetName\.toLowerCase\(\)\.includes\(kw\)/.test(rulesStoreSrcRP30) &&
+    /\(r\.versionCode \?\? ''\)\.toLowerCase\(\)\.includes\(kw\)/.test(rulesStoreSrcRP30) &&
+    /arr = arr\.filter\(\(r\) => r\.isActive === false\)/.test(rulesStoreSrcRP30) &&
+    /case 'CODE_ASC':/.test(rulesStoreSrcRP30)
+  assert(
+    'RP30c 静态：筛选条件齐备（关键词 / 主表状态 / 排序），store 侧真的按它过滤与排序',
+    rp30cView && rp30cStore,
+    `页面控件=${rp30cView} store过滤与排序=${rp30cStore}`
+  )
+
+  /* ---------- RP31a：保存段位不再拦「值没填」，缺值改到「校验草稿」时提示（11-11 用户口径） ---------- */
+  // ⚠️ 切片函数体：`validatePrioritySegments` 在本文件出现多次（保存侧 / 校验侧），
+  //    直接 includes 会互相命中 ⇒ 必须按函数名切片。
+  const saveBodyRP31 = (/async function saveDraftSegments[\s\S]*?\n {2}\}/.exec(rulesStoreSrcRP30) || [])[0] || ''
+  const validateBodyRP31 = (/async function validateDraft[\s\S]*?\n {2}\}/.exec(rulesStoreSrcRP30) || [])[0] || ''
+  const rp31aSaveNotBlocked =
+    saveBodyRP31.length > 0 && !saveBodyRP31.includes('validatePrioritySegments')
+  const rp31aValidateTells =
+    validateBodyRP31.includes('validatePrioritySegments') &&
+    validateBodyRP31.includes('localErrors') &&
+    /lastValidation\.value = \{[\s\S]{0,200}?isValid: false/.test(validateBodyRP31)
+  assert(
+    'RP31a 静态：保存段位不再拦「值没填」（草稿能先存），缺值改在「校验草稿」时提示',
+    rp31aSaveNotBlocked && rp31aValidateTells,
+    `保存不拦内容=${rp31aSaveNotBlocked} 校验时提示=${rp31aValidateTells}`
+  )
+
   void rulesStore
 
   function validPick(src) {
     return src.includes('pickLatestPublished(') && !findFirst.test(src)
   }
+}
+
+/* ==================== GROUP=version-rows：参数集 / 策略包 列表改「主子表联查·一版一行」 ====================
+ *
+ * 依据：3号位《APS_V1_3号位致4号位_三族列表改主子表联查一版一行_新增三族versions契约变更协调件_扩围加函_v1.0_20261111.md》
+ *   —— 规则集族已落（探针见 GROUP=rules 的 RP28~RP31）；本组覆盖**扩围的两族**：参数集、策略包。
+ *
+ * 修的缺陷（协调件 §一）：旧列表的 Status / PublishedAt 取「最新创建版本」
+ *   （`OUTER APPLY TOP1 ORDER BY Id DESC`）⇒ 同族有生效 PUBLISHED 又新加 DRAFT 时，
+ *   整族被标成 DRAFT，详情又默认展示草稿内容 ⇒ **看不到当前生效版本的内容**。
+ *
+ * ⚠️ 必须保留：新端点是主表 INNER JOIN 版本 ⇒ **一条版本都没有的主表不在其中**
+ *   （dev 实测 892 个参数集主表里只有 16 个有版本）⇒ 列表 = 新端点版本行 + 旧端点「无版本主表」行，
+ *   否则「未配版本」筛选与「删除」入口会一起消失（功能回退）。
+ *
+ *  - 反向破坏自证：见 scripts/selfverify-version-rows.mjs（VR01~VR13 逐条改坏 ⇒ 必须全红）
+ */
+function verifyGovernanceVersionRows() {
+  const stripComments = (s) =>
+    s.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '').replace(/\s\/\/[^\n]*/g, '')
+  const noHtml = (s) => s.replace(/<!--[\s\S]*?-->/g, '')
+  /** 取两个标记之间的切片（同名调用多处时必须切片，不能全文 includes） */
+  const sliceBetween = (src, from, to) => {
+    const a = src.indexOf(from)
+    if (a < 0) return ''
+    const b = src.indexOf(to, a + from.length)
+    return b > a ? src.slice(a, b) : ''
+  }
+
+  log('\n[VR] 参数集 / 策略包 列表改「一版一行」（version-rows — 2026-11-11 3号位 扩围加函）')
+
+  const psApi = stripComments(readSrc('api/aps-v1/parameterSet.ts'))
+  const psTypes = stripComments(readSrc('api/aps-v1/types/parameterSet.ts'))
+  const psStore = stripComments(readSrc('store/modules/aps/parameterSets.ts'))
+  const psView = noHtml(stripComments(readSrc('views/Aps/ParameterSets.vue')))
+
+  const spApi = stripComments(readSrc('api/aps-v1/strategyProfile.ts'))
+  const spTypes = stripComments(readSrc('api/aps-v1/types/strategyProfile.ts'))
+  const spStore = stripComments(readSrc('store/modules/aps/strategyProfile.ts'))
+  const spView = noHtml(stripComments(readSrc('views/Aps/StrategyProfiles.vue')))
+
+  /* ---------- VR01 参数集族：列表源已切新端点 ---------- */
+  const psLoadList = sliceBetween(psStore, 'async function loadList(', 'async function loadDetail(')
+  const vr01 =
+    psApi.includes("url: '/api/governance/parameter-sets/versions'") &&
+    psApi.includes('async listParameterSetVersionRows(') &&
+    psApi.includes('async listParameterSetRows(') &&
+    psLoadList.includes('parameterSetApi.listParameterSetRows()') &&
+    !psLoadList.includes('parameterSetApi.listParameterSets()') &&
+    psApi.includes('async listParameterSets(')
+  assert(
+    'VR01 静态：参数集列表源已切到新端点 GET /parameter-sets/versions（store 的 loadList 走合并后的 listParameterSetRows，旧端点保留不删）',
+    vr01,
+    `新端点=${psApi.includes("url: '/api/governance/parameter-sets/versions'")} 版本行方法=${psApi.includes('async listParameterSetVersionRows(')} 合并方法=${psApi.includes('async listParameterSetRows(')} loadList用合并=${psLoadList.includes('parameterSetApi.listParameterSetRows()')} loadList仍直调旧端点=${psLoadList.includes('parameterSetApi.listParameterSets()')} 旧端点保留=${psApi.includes('async listParameterSets(')}`
+  )
+
+  /* ---------- VR02 参数集族：一版一行的建模 ---------- */
+  const vr02 =
+    /export interface ParameterSetVersionRowDto\s*\{[\s\S]{0,2000}?versionId:\s*number[\s\S]{0,800}?versionCode:\s*string[\s\S]{0,800}?status:\s*string/.test(
+      psTypes
+    ) &&
+    /export interface ParameterSetListRowDto\s*\{[\s\S]{0,2000}?hasVersion:\s*boolean[\s\S]{0,800}?versionId\?:\s*number[\s\S]{0,800}?versionCode\?:\s*string[\s\S]{0,800}?versionStatus\?:\s*RuleStatus/.test(
+      psTypes
+    ) &&
+    /export function mergeParameterSetListRows\(/.test(psApi) &&
+    /rowKey:\s*`v\$\{r\.versionId\}`/.test(psApi)
+  assert(
+    'VR02 静态：参数集列表行按「一版一行」建模（后端行 DTO 带 versionId/versionCode/status，前端行带 versionStatus，行键按 versionId 唯一）',
+    vr02,
+    `后端行DTO=${/export interface ParameterSetVersionRowDto\s*\{[\s\S]{0,2000}?versionId:\s*number[\s\S]{0,800}?versionCode:\s*string[\s\S]{0,800}?status:\s*string/.test(psTypes)} 前端行DTO=${/export interface ParameterSetListRowDto\s*\{[\s\S]{0,2000}?hasVersion:\s*boolean[\s\S]{0,800}?versionId\?:\s*number[\s\S]{0,800}?versionCode\?:\s*string[\s\S]{0,800}?versionStatus\?:\s*RuleStatus/.test(psTypes)} 合并函数=${/export function mergeParameterSetListRows\(/.test(psApi)} 行键=${/rowKey:\s*`v\$\{r\.versionId\}`/.test(psApi)}`
+  )
+
+  /* ---------- VR03 参数集族：详情按点击的版本取内容、状态取该版真实状态 ---------- */
+  const psGet = sliceBetween(psApi, 'async getParameterSet(', 'async diffVersions(')
+  const vr03 =
+    /async getParameterSet\(\s*parameterSetId:\s*number,\s*versionId\?:\s*number\s*\)/.test(psApi) &&
+    /versions\.find\(\(v\) => v\.id === versionId\)/.test(psGet) &&
+    psGet.includes('status: normalizeRuleStatus(contentSource.status)') &&
+    !/status:\s*draft\s*\?\s*'DRAFT'/.test(psGet)
+  assert(
+    'VR03 静态：参数集详情依点击行的 versionId 取该版内容，且状态取该版真实状态（旧口径「有草稿就一律 DRAFT」已撤）',
+    vr03,
+    `签名带versionId=${/async getParameterSet\(\s*parameterSetId:\s*number,\s*versionId\?:\s*number\s*\)/.test(psApi)} 按versionId定位=${/versions\.find\(\(v\) => v\.id === versionId\)/.test(psGet)} 真实状态=${psGet.includes('status: normalizeRuleStatus(contentSource.status)')} 旧口径残留=${/status:\s*draft\s*\?\s*'DRAFT'/.test(psGet)}`
+  )
+
+  /* ---------- VR04 参数集族：页面按版本渲染 ---------- */
+  const vr04 =
+    /:key="p\.rowKey"/.test(psView) &&
+    psView.includes('rowStatusLabel(p)') &&
+    psView.includes('rowStatusTag(p)') &&
+    psView.includes('detailNN?.version?.id === p.versionId') &&
+    psView.includes('loadDetail(row.parameterSetId, row.versionId)')
+  assert(
+    'VR04 静态：参数集页面按版本渲染（行键唯一、显示版本码与版本状态、选中按 versionId、点行按 versionId 进详情）',
+    vr04,
+    `行键=${/:key="p\.rowKey"/.test(psView)} 状态标签=${psView.includes('rowStatusLabel(p)') && psView.includes('rowStatusTag(p)')} 选中判据=${psView.includes('detailNN?.version?.id === p.versionId')} 进详情带版本=${psView.includes('loadDetail(row.parameterSetId, row.versionId)')}`
+  )
+
+  /* ---------- VR05 参数集族：store 的状态口径跟着版本走 ---------- */
+  const vr05 =
+    psStore.includes('r.versionStatus === statusFilter.value') &&
+    psStore.includes('const tabCounts = computed') &&
+    psStore.includes("r.versionStatus === 'DRAFT'") &&
+    psStore.includes("r.versionStatus === 'PUBLISHED'") &&
+    psStore.includes("r.versionStatus === 'DISABLED'") &&
+    psStore.includes('c.NO_VERSION += 1') &&
+    psStore.includes('new Set(parameterSets.value.map((r) => r.parameterSetId)).size')
+  assert(
+    'VR05 静态：参数集 store 的状态过滤/页签计数按「版本真实状态」，参数集总数按主表去重（不再把行数当参数集数）',
+    vr05,
+    `过滤按版本=${psStore.includes('r.versionStatus === statusFilter.value')} 页签计数=${psStore.includes('const tabCounts = computed')} 草稿=${psStore.includes("r.versionStatus === 'DRAFT'")} 已发布=${psStore.includes("r.versionStatus === 'PUBLISHED'")} 已停用=${psStore.includes("r.versionStatus === 'DISABLED'")} 未配版本=${psStore.includes('c.NO_VERSION += 1')} 主表去重=${psStore.includes('new Set(parameterSets.value.map((r) => r.parameterSetId)).size')}`
+  )
+
+  /* ---------- VR06 参数集族：「一条版本都没有」的主表仍在列表里 ---------- */
+  const vr06 =
+    /if \(m\.hasVersion \|\| withVersion\.has\(m\.parameterSetId\)\) continue/.test(psApi) &&
+    psApi.includes('hasVersion: false') &&
+    psView.includes('NO_VERSION_LABEL') &&
+    psView.includes('noVersionPicked')
+  assert(
+    'VR06 静态：无任何版本的参数集主表仍以「未配版本」行列在列表里（未配版本筛选与删除参数集入口不得消失）',
+    vr06,
+    `补行判据=${/if \(m\.hasVersion \|\| withVersion\.has\(m\.parameterSetId\)\) continue/.test(psApi)} 无版本标记=${psApi.includes('hasVersion: false')} 页面未配版本=${psView.includes('NO_VERSION_LABEL')} 空态=${psView.includes('noVersionPicked')}`
+  )
+
+  /* ---------- VR07 参数集族：发布 / 停用作用于「当前展示的那一版」 ---------- */
+  const psPublish = sliceBetween(psStore, 'async function publish(', 'async function disable(')
+  const psDisable = sliceBetween(psStore, 'async function disable(', 'async function forkDraft(')
+  const vr07 =
+    psStore.includes('function displayedDraftVersionId()') &&
+    psStore.includes('function displayedPublishedVersionId()') &&
+    psPublish.includes('displayedDraftVersionId()') &&
+    psDisable.includes('displayedPublishedVersionId()')
+  assert(
+    'VR07 静态：参数集的发布 / 停用作用于「当前展示的那一版」（不是历史里随便挑一条草稿 / 已发布）',
+    vr07,
+    `展示版解析器=${psStore.includes('function displayedDraftVersionId()') && psStore.includes('function displayedPublishedVersionId()')} 发布用展示版=${psPublish.includes('displayedDraftVersionId()')} 停用用展示版=${psDisable.includes('displayedPublishedVersionId()')}`
+  )
+
+  /* ---------- VR08 参数集页：与规则集页同口径（撤 KPI / 撤开关 / 计数落页签 / 补筛选） ---------- */
+  const vr08NoKpi =
+    !psView.includes('kpi-strip') && !psView.includes('kpi-pill') && !psView.includes('pill-val')
+  const vr08NoSwitch =
+    !psView.includes('显示已停用') &&
+    !psView.includes('showInactive') &&
+    !psStore.includes('showInactive')
+  const vr08Tab =
+    psView.includes('tab-count') &&
+    psView.includes('tabCounts.ALL') &&
+    psView.includes('tabCounts.NO_VERSION') &&
+    /v-for="key in RULE_STATUSES_UI"[\s\S]{0,300}?tabCounts\[key\]/.test(psView)
+  const vr08Filter =
+    psView.includes('filter-tools') &&
+    psView.includes('listKeyword') &&
+    psView.includes('listActiveFilter') &&
+    psView.includes('listSort') &&
+    psView.includes('PARAMETER_LIST_SORT_LABELS') &&
+    /const listKeyword = ref\(''\)/.test(psStore) &&
+    /const listActiveFilter = ref<'ALL' \| 'ACTIVE' \| 'INACTIVE'>\('ALL'\)/.test(psStore) &&
+    /const listSort = ref<ParameterListSort>\('DEFAULT'\)/.test(psStore) &&
+    /r\.parameterSetCode\.toLowerCase\(\)\.includes\(kw\)/.test(psStore) &&
+    /r\.parameterSetName\.toLowerCase\(\)\.includes\(kw\)/.test(psStore) &&
+    /\(r\.versionCode \?\? ''\)\.toLowerCase\(\)\.includes\(kw\)/.test(psStore) &&
+    /arr = arr\.filter\(\(r\) => r\.isActive === false\)/.test(psStore) &&
+    /case 'CODE_ASC':/.test(psStore)
+  assert(
+    'VR08 静态：参数集页与规则集页同口径（撤 KPI 横条、撤「显示已停用」开关、计数落页签、补关键词/主表状态/排序筛选）',
+    vr08NoKpi && vr08NoSwitch && vr08Tab && vr08Filter,
+    `无KPI横条=${vr08NoKpi} 无停用开关=${vr08NoSwitch} 页签带计数=${vr08Tab} 筛选条件齐备=${vr08Filter}`
+  )
+
+  /* ---------- VR09 策略包族：列表源已切新端点 ---------- */
+  const spLoadProfiles = sliceBetween(
+    spStore,
+    'async function loadProfiles(',
+    'async function selectProfileRow('
+  )
+  const vr09 =
+    spApi.includes("url: '/api/governance/strategy-profiles/versions'") &&
+    spApi.includes('async listProfileVersionRows(') &&
+    spApi.includes('async listProfileRows(') &&
+    /export function mergeStrategyProfileListRows\(/.test(spApi) &&
+    spLoadProfiles.includes('strategyProfileApi.listProfileVersionRows()') &&
+    spLoadProfiles.includes('mergeStrategyProfileListRows(rows, masters)')
+  assert(
+    'VR09 静态：策略包列表源已切到新端点 GET /strategy-profiles/versions（store 取主表 + 版本行后合并）',
+    vr09,
+    `新端点=${spApi.includes("url: '/api/governance/strategy-profiles/versions'")} 版本行方法=${spApi.includes('async listProfileVersionRows(')} 合并方法=${spApi.includes('async listProfileRows(')} store调版本行=${spLoadProfiles.includes('strategyProfileApi.listProfileVersionRows()')} store合并=${spLoadProfiles.includes('mergeStrategyProfileListRows(rows, masters)')}`
+  )
+
+  /* ---------- VR10 策略包族：一版一行的建模 ---------- */
+  const vr10 =
+    /export interface StrategyProfileVersionRowDto\s*\{[\s\S]{0,2000}?versionId:\s*number[\s\S]{0,800}?versionCode:\s*string[\s\S]{0,800}?status:\s*string/.test(
+      spTypes
+    ) &&
+    /export interface StrategyProfileListRowDto\s*\{[\s\S]{0,2000}?hasVersion:\s*boolean[\s\S]{0,800}?versionId\?:\s*number[\s\S]{0,800}?versionCode\?:\s*string[\s\S]{0,800}?versionStatus\?:\s*StrategyVersionStatus/.test(
+      spTypes
+    ) &&
+    /rowKey:\s*`v\$\{r\.versionId\}`/.test(spApi)
+  assert(
+    'VR10 静态：策略包列表行按「一版一行」建模（后端行 DTO 带 versionId/versionCode/status，前端行带 versionStatus，行键按 versionId 唯一）',
+    vr10,
+    `后端行DTO=${/export interface StrategyProfileVersionRowDto\s*\{[\s\S]{0,2000}?versionId:\s*number[\s\S]{0,800}?versionCode:\s*string[\s\S]{0,800}?status:\s*string/.test(spTypes)} 前端行DTO=${/export interface StrategyProfileListRowDto\s*\{[\s\S]{0,2000}?hasVersion:\s*boolean[\s\S]{0,800}?versionId\?:\s*number[\s\S]{0,800}?versionCode\?:\s*string[\s\S]{0,800}?versionStatus\?:\s*StrategyVersionStatus/.test(spTypes)} 行键=${/rowKey:\s*`v\$\{r\.versionId\}`/.test(spApi)}`
+  )
+
+  /* ---------- VR11 策略包族：点行同时选中策略包与该版本 ---------- */
+  const spSelectRow = sliceBetween(
+    spStore,
+    'async function selectProfileRow(',
+    'async function createProfile('
+  )
+  const vr11 =
+    spSelectRow.includes('selectProfile(row.strategyProfileId)') &&
+    spSelectRow.includes('loadVersions(row.strategyProfileId)') &&
+    spSelectRow.includes('selectVersion(row.versionId)') &&
+    /:key="p\.rowKey"/.test(spView) &&
+    spView.includes('@click="selectProfileRow(p)"') &&
+    spView.includes('p.versionId === currentVersion?.id')
+  assert(
+    'VR11 静态：策略包左栏点一行 = 同时选中该策略包与该版本（行键按 versionId 唯一、选中态按版本比对）',
+    vr11,
+    `选中主表=${spSelectRow.includes('selectProfile(row.strategyProfileId)')} 拉版本=${spSelectRow.includes('loadVersions(row.strategyProfileId)')} 选中版本=${spSelectRow.includes('selectVersion(row.versionId)')} 行键=${/:key="p\.rowKey"/.test(spView)} 点行=${spView.includes('@click="selectProfileRow(p)"')} 选中判据=${spView.includes('p.versionId === currentVersion?.id')}`
+  )
+
+  /* ---------- VR12 策略包族：「一条版本都没有」的主表仍在列表里 ---------- */
+  const vr12 =
+    /if \(withVersion\.has\(m\.id\)\) continue/.test(spApi) &&
+    spApi.includes('hasVersion: false') &&
+    spView.includes('NO_VERSION_LABEL')
+  assert(
+    'VR12 静态：无任何版本的策略包主表仍以「未配版本」行列在左栏（不得因切新端点而消失）',
+    vr12,
+    `补行判据=${/if \(withVersion\.has\(m\.id\)\) continue/.test(spApi)} 无版本标记=${spApi.includes('hasVersion: false')} 页面未配版本=${spView.includes('NO_VERSION_LABEL')}`
+  )
+
+  /* ---------- VR13 策略包页：左栏显示版本码与版本状态、右栏高亮当前版本 ---------- */
+  const vr13 =
+    spView.includes('statusTagType(p.versionStatus)') &&
+    spView.includes('p.versionCode') &&
+    spView.includes('row-key="id"') &&
+    spView.includes(':current-row-key="currentVersion?.id"')
+  assert(
+    'VR13 静态：策略包左栏显示版本码与版本真实状态，右栏版本表按 current-row-key 高亮当前版本',
+    vr13,
+    `左栏状态=${spView.includes('statusTagType(p.versionStatus)')} 左栏版本码=${spView.includes('p.versionCode')} 行键=${spView.includes('row-key="id"')} 高亮=${spView.includes(':current-row-key="currentVersion?.id"')}`
+  )
 }
 
 /**
@@ -17487,23 +20569,35 @@ function verifyPublishConcept() {
   )
 
   // PC05 「当前版本」文案已改为「最新已发布版本」
+  // ⚠️ 2026-11-11（规则集列表改一版一行）：规则集详情头改成三枚 muted-tag
+  //   （「版本 X」/「最新已发布 Y」/「草稿 Z」）⇒ 原「单枚 meta-key」形状不存在了。
+  // ⚠️ 2026-11-11（参数集列表改一版一行·本轮扩围）：参数集详情头同样改成三枚 muted-tag
+  //   （「版本 X」/「最新已发布 Y」/「草稿 Z」）⇒ 同样是「单枚 meta-key」形状不存在了。
+  //   判据放宽成「两页都存在『最新已发布』口径的展示」，
+  //   **「不得出现『当前版本』措辞」这一条不但不变、还收紧成全页不许出现**（术语红线守门）。
+  const rsMetaLatestPublished =
+    rsView.includes('<span class="meta-key">最新已发布版本</span>') ||
+    /<span class="muted-tag">\s*最新已发布\s/.test(rsView)
+  const psMetaLatestPublished =
+    psView.includes('<span class="meta-key">最新已发布版本</span>') ||
+    /<span class="muted-tag">\s*最新已发布\s/.test(psView)
   const pc05 =
-    psView.includes('<span class="meta-key">最新已发布版本</span>') &&
+    psMetaLatestPublished &&
     psView.includes('<ElDescriptionsItem label="最新已发布版本">') &&
-    rsView.includes('<span class="meta-key">最新已发布版本</span>') &&
+    rsMetaLatestPublished &&
     rsView.includes('<ElDescriptionsItem label="最新已发布版本">') &&
-    !psView.includes('<span class="meta-key">当前版本</span>') &&
-    !rsView.includes('<span class="meta-key">当前版本</span>')
+    !psView.includes('当前版本') &&
+    !rsView.includes('当前版本')
   assert(
-    'PC05 静态：两页的「当前版本」文案已改为「最新已发布版本」（meta-key + ElDescriptionsItem 各一处）',
+    'PC05 静态：两页的「当前版本」文案已改为「最新已发布版本」（详情头 + ElDescriptionsItem 各一处）',
     pc05,
     pc05
       ? '两页 4 处已改'
-      : `参数集meta=${psView.includes('<span class="meta-key">最新已发布版本</span>')} 参数集desc=${psView.includes(
+      : `参数集meta=${psMetaLatestPublished} 参数集desc=${psView.includes(
           '<ElDescriptionsItem label="最新已发布版本">'
-        )} 规则集meta=${rsView.includes('<span class="meta-key">最新已发布版本</span>')} 规则集desc=${rsView.includes(
+        )} 规则集meta=${rsMetaLatestPublished} 规则集desc=${rsView.includes(
           '<ElDescriptionsItem label="最新已发布版本">'
-        )}`
+        )} 参数集残留当前版本=${psView.includes('当前版本')} 规则集残留当前版本=${rsView.includes('当前版本')}`
   )
 
   info(
@@ -17998,6 +21092,111 @@ function verifyPrioritySegmentGroups() {
   )
 }
 
+/**
+ * GROUP=degrade —— P08「降级动作」列（2026-11-09，按 5号位 11-09 回执 执行 7）
+ *
+ * 背景：
+ *  - `GET /api/business-fact-issues` 本来就返 `degradeAction`（前端 api 层已映射），
+ *    只是页面没渲染 ⇒ 5号位 回执明确「前端可加列」。
+ *  - 值域**不止来函列的 3 码**：冻结 07:857 给 6 码（STAGE_NULL / FACTORY_FALLBACK /
+ *    QTY_DEFAULT_1 / PRODUCE_DEFAULT_1 / CYCLE_SKIP / BOMNO_SKIP），08 DDL `:5406/:6003`
+ *    实际写入 `USE_MAX_BOMNO` ⇒ 码表取 7 码。
+ *  - dev 实测：`BOM_WORKSET` 有值 30,085/34,346（88%，WARN=FACTORY_FALLBACK、INFO=STAGE_NULL，
+ *    ERROR 全 NULL）；`MATERIAL_STAGE_CONTEXT` 66,596 行是**中文自由文本**「跳过此条，不写 Context」
+ *    ⇒ 未知值必须原样显示。
+ */
+function verifyDegradeActionColumn() {
+  log('\n[DG] 降级动作列（degrade — 2026-11-09）')
+
+  const pageRaw = readSrc('views/Aps/Explanation.vue')
+  const page = stripComments(pageRaw)
+  const tpl = pageRaw.slice(pageRaw.indexOf('<template>'), pageRaw.lastIndexOf('</template>'))
+  const tplCode = tpl.replace(/<!--[\s\S]*?-->/g, '')
+  const typesRaw = readSrc('api/aps-v1/types/explanation.ts')
+  const types = stripComments(typesRaw)
+  const orderRaw = readSrc('api/aps-v1/types/order.ts')
+
+  /* ===== DG01：业务事实问题表有「降级动作」列，读的是 degradeAction ===== */
+  const dg01 =
+    /<ElTableColumn label="降级动作"/.test(tpl) &&
+    /row\.degradeAction/.test(tpl) &&
+    /degradeActionLabelOf\(row\.degradeAction\)/.test(tpl)
+  assert(
+    'DG01 静态：P08 业务事实问题表新增「降级动作」列，取值 = 接口本来就返的 degradeAction',
+    dg01,
+    `列=${/<ElTableColumn label="降级动作"/.test(tpl)} 取值=${/row\.degradeAction/.test(tpl)} 标签=${/degradeActionLabelOf\(row\.degradeAction\)/.test(tpl)}`
+  )
+
+  /* ===== DG02：标签走共享函数（页面不自写查表） ===== */
+  const dg02 =
+    /export function degradeActionLabelOf/.test(types) &&
+    /degradeActionLabelOf/.test(page) &&
+    !/DEGRADE_ACTION_LABELS\[/.test(page)
+  assert(
+    'DG02 静态：降级动作中文标签走共享函数 degradeActionLabelOf（页面不各写各的查表）',
+    dg02,
+    `函数存在=${/export function degradeActionLabelOf/.test(types)} 页面引用=${/degradeActionLabelOf/.test(page)} 页面裸查表=${/DEGRADE_ACTION_LABELS\[/.test(page)}`
+  )
+
+  /* ===== DG03：码表覆盖冻结 07:857 六码 + 08 DDL USE_MAX_BOMNO + dev 实测 CROSS_FACTORY_EDGE_SKIP（8 码） ===== */
+  const labelStart = types.indexOf('export const DEGRADE_ACTION_LABELS')
+  const labelBlock =
+    labelStart < 0 ? '' : types.slice(labelStart, types.indexOf('}', labelStart) + 1)
+  const labelCodes = (labelBlock.match(/^\s*[A-Z0-9_]+:/gm) || []).length
+  const frozenCodes = [
+    'STAGE_NULL',
+    'FACTORY_FALLBACK',
+    'QTY_DEFAULT_1',
+    'PRODUCE_DEFAULT_1',
+    'CYCLE_SKIP',
+    'BOMNO_SKIP',
+    'USE_MAX_BOMNO',
+    // 2026-11-10 dev 实测：跨厂工段缺失 200 条的 degradeAction 就是这个码
+    'CROSS_FACTORY_EDGE_SKIP'
+  ]
+  const dg03 = frozenCodes.every((c) => labelBlock.includes(c)) && labelCodes === frozenCodes.length
+  assert(
+    'DG03 静态：降级动作码表覆盖冻结 07:857 六码 + 08 DDL USE_MAX_BOMNO + CROSS_FACTORY_EDGE_SKIP（中文名不臆造）',
+    dg03,
+    `码数=${labelCodes} 缺=${frozenCodes.filter((c) => !labelBlock.includes(c)).join(',') || '无'}`
+  )
+
+  /* ===== DG04：未知值原样显示（不加「待核对·」前缀） ===== */
+  const fnStart = types.indexOf('export function degradeActionLabelOf')
+  const fnBlock = fnStart < 0 ? '' : types.slice(fnStart, types.indexOf('}', fnStart) + 1)
+  const dg04 = /DEGRADE_ACTION_LABELS\[raw\] \?\? raw/.test(fnBlock) && !/待核对/.test(fnBlock)
+  assert(
+    'DG04 静态：未知降级动作原样显示（dev 实测 MSC 源是中文自由文本，加前缀会变怪字符串）',
+    dg04,
+    `原样兜底=${/DEGRADE_ACTION_LABELS\[raw\] \?\? raw/.test(fnBlock)} 无待核对前缀=${!/待核对/.test(fnBlock)}`
+  )
+
+  /* ===== DG05：不新增 reviewedBy / reviewedAt / affectedQuantity 三列 ===== */
+  const dg05 =
+    !/row\.reviewedBy/.test(tpl) &&
+    !/row\.reviewedAt/.test(tpl) &&
+    !/row\.affectedQuantity/.test(tpl) &&
+    !/label="复核人"/.test(tpl) &&
+    !/label="影响数量"/.test(tpl)
+  assert(
+    'DG05 静态：不新增 reviewedBy / reviewedAt / affectedQuantity 三列（0 值与硬编码 NULL ⇒ 加了就是空列）',
+    dg05,
+    `复核人=${/row\.reviewedBy/.test(tpl)} 复核时间=${/row\.reviewedAt/.test(tpl)} 影响数量=${/row\.affectedQuantity/.test(tpl)}`
+  )
+
+  /* ===== DG06：需求成熟度注释口径已更正（不再写「永远不会有值」） ===== */
+  const dg06 =
+    !orderRaw.includes('永远不会有值') &&
+    !orderRaw.includes('V1 冻结严格 NULL') &&
+    orderRaw.includes('07 v5.1.16:266') &&
+    orderRaw.includes('禁止从任何字段临时推断')
+  assert(
+    'DG06 静态：订单 DTO 的需求成熟度注释口径已更正（禁令现行文本 07 v5.1.16:266，禁的是「推断」不是「永不会有值」）',
+    dg06,
+    `旧口径残留=${orderRaw.includes('永远不会有值') || orderRaw.includes('V1 冻结严格 NULL')} 新行号=${orderRaw.includes('07 v5.1.16:266')}`
+  )
+}
+
 async function main() {
   log(`\n========== APS V1 4号位 v1.4 §二十九 U23-U50 验收 ==========`)
   log(`API Base: ${API_BASE}`)
@@ -18014,6 +21213,7 @@ async function main() {
     'gantt',
     'pegging-trace',
     'rules',
+    'version-rows',
     'parameter-set-static',
     'parameter-set-warehouse',
     'parameter-set-anchor',
@@ -18035,7 +21235,11 @@ async function main() {
     'delivery',
     'capacity',
     'audit-ui',
-    'pseg'
+    'pseg',
+    'degrade',
+    // Explanation 工厂视角组全是静态断言（verifyExplanationFactoryView() 不接 token）
+    // ⇒ 免登录，避免反向破坏自证连跑时撞 dev 登录频控（5 次/分钟）
+    'explanation-factory'
   ])
   const adminToken = STATIC_ONLY_GROUPS.has(GROUP) ? '' : await loginAsAdmin()
 
@@ -18136,11 +21340,17 @@ async function main() {
   if (GROUP === 'all' || GROUP === 'e-freeze') {
     await verifyExplanationFreeze(adminToken)
   }
+  if (GROUP === 'all' || GROUP === 'explanation-factory') {
+    verifyExplanationFactoryView()
+  }
   if (GROUP === 'all' || GROUP === 'menu') {
     verifyMenuGroup()
   }
   if (GROUP === 'all' || GROUP === 'pseg') {
     verifyPrioritySegmentGroups()
+  }
+  if (GROUP === 'all' || GROUP === 'degrade') {
+    verifyDegradeActionColumn()
   }
   if (GROUP === 'all' || GROUP === 'overview') {
     await verifyOverview(adminToken)
@@ -18166,11 +21376,17 @@ async function main() {
   if (GROUP === 'all' || GROUP === 'order' || GROUP === 'order-static') {
     verifyOrderStatic()
   }
+  if (GROUP === 'all' || GROUP === 'order-page') {
+    verifyOrderPageRedesign()
+  }
   if (GROUP === 'all' || GROUP === 'order') {
     await verifyOrder(adminToken)
   }
   if (GROUP === 'all' || GROUP === 'rules') {
     verifyRulesSplit()
+  }
+  if (GROUP === 'all' || GROUP === 'version-rows') {
+    verifyGovernanceVersionRows()
   }
   if (GROUP === 'all' || GROUP === 'governance-delete') {
     await verifyGovernanceDelete(adminToken)

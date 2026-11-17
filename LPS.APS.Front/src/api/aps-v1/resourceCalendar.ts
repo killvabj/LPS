@@ -325,15 +325,19 @@ export const resourceCalendarApi = {
    *  - 2026-10-17：后端 10-14 已原地改 `PageResult`（`{items,total,page,pageSize}`）；
    *    此前前端按裸数组消费 ⇒ 列表被静默截断成 20 行、分页总数失真，现按服务端分页对接
    *  - `pageIndex`/`pageSize` **必传**：不传即只返回第 1 页
-   *  - `from`/`to` 为"窗口完整落在区间内"语义（发函 D3）→ V1 仍不传
+   *  - `from`/`to`（可选）：后端语义 = **窗口完整落在区间内**
+   *    （`rc.StartTime >= @From AND rc.EndTime <= @To`，见 ResourceCalendarService.cs:202-206）
+   *    ⇒ `to` 必须带当天 23:59:59，否则当天窗口（EndTime 17:00）会被整段排除
    */
   async getWindows(
     resourceId: number,
-    query: { pageIndex: number; pageSize: number }
+    query: { pageIndex: number; pageSize: number; from?: string; to?: string }
   ): Promise<CalendarWindowPageResult<ResourceCalendarEntryDto>> {
     if (APS_USE_MOCK) {
       await delay(200)
-      const all = MOCK_DEVICE_WINDOWS[resourceId] ?? []
+      const all = (MOCK_DEVICE_WINDOWS[resourceId] ?? []).filter((w) =>
+        inWindowRange(w.startTime, w.endTime, query.from, query.to)
+      )
       const start = (query.pageIndex - 1) * query.pageSize
       return {
         items: all.slice(start, start + query.pageSize),
@@ -344,7 +348,12 @@ export const resourceCalendarApi = {
     }
     return apsHttp.get<CalendarWindowPageResult<ResourceCalendarEntryDto>>({
       url: `/api/resource-calendar/${resourceId}`,
-      params: { pageIndex: query.pageIndex, pageSize: query.pageSize }
+      params: {
+        pageIndex: query.pageIndex,
+        pageSize: query.pageSize,
+        from: query.from,
+        to: query.to
+      }
     })
   },
 
@@ -582,14 +591,17 @@ export const resourceCalendarApi = {
   },
 
   /** 查询某人工槽的窗口页（GET /api/manual-capacity/calendar/{manualSlotId}）
-   *  2026-10-17：同设备端点，后端已改 PageResult（`from`/`to` 本次顺带补齐）；`pageIndex`/`pageSize` 必传 */
+   *  2026-10-17：同设备端点，后端已改 PageResult（`from`/`to` 本次顺带补齐）；`pageIndex`/`pageSize` 必传
+   *  `from`/`to` 语义与设备侧一致：窗口完整落在区间内（`to` 须带当天 23:59:59） */
   async getSlotWindows(
     manualSlotId: number,
-    query: { pageIndex: number; pageSize: number }
+    query: { pageIndex: number; pageSize: number; from?: string; to?: string }
   ): Promise<CalendarWindowPageResult<ManualSlotCalendarDto>> {
     if (APS_USE_MOCK) {
       await delay(200)
-      const all = MOCK_SLOT_WINDOWS[manualSlotId] ?? []
+      const all = (MOCK_SLOT_WINDOWS[manualSlotId] ?? []).filter((w) =>
+        inWindowRange(w.startTime, w.endTime, query.from, query.to)
+      )
       const start = (query.pageIndex - 1) * query.pageSize
       return {
         items: all.slice(start, start + query.pageSize),
@@ -600,7 +612,12 @@ export const resourceCalendarApi = {
     }
     return apsHttp.get<CalendarWindowPageResult<ManualSlotCalendarDto>>({
       url: `/api/manual-capacity/calendar/${manualSlotId}`,
-      params: { pageIndex: query.pageIndex, pageSize: query.pageSize }
+      params: {
+        pageIndex: query.pageIndex,
+        pageSize: query.pageSize,
+        from: query.from,
+        to: query.to
+      }
     })
   },
 
@@ -627,6 +644,14 @@ export const resourceCalendarApi = {
 }
 
 /* ==================== helpers ==================== */
+
+/** 窗口区间过滤（与后端「窗口完整落在区间内」同语义：StartTime >= from AND EndTime <= to）
+ *  入参为 ISO 串（`2026-11-01T00:00:00` / `2026-11-30T23:59:59`），同格式字典序比较即可 */
+function inWindowRange(startTime: string, endTime: string, from?: string, to?: string): boolean {
+  if (from && startTime < from) return false
+  if (to && endTime > to) return false
+  return true
+}
 
 /** mock 专用：日期串 +i 天（保留 YYYY-MM-DD） */
 function addDays(startDate: string, i: number): string {

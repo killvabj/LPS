@@ -11,12 +11,16 @@
       操作符不能有「不等于」
    2. 段的顺序由数组位置决定，保存时统一重排为 1..N（SegmentOrder 必须唯一正整数）
    3. 空条件段＝无条件命中，只能有 1 个且必须在最后（后端发布校验会拒）
-   4. 竞争轮次**每段必有一个**（1/2/3）：后端投影层对「部分声明」显式抛错，
+   4. **命中条件两种模式互斥**（DNF，2026-11-11 3号位正式需求函）：
+      存量平铺（`MatchConditions`，全部 AND）／条件组（`MatchConditionGroups`，
+      **组内 AND、组间 OR**）。同一段不会同时带两份载荷（后端按「非空即优先」判歧义并报错）。
+      空组＝恒成立并吞掉其后所有段 ⇒ 编辑期就拦住，不让用户带着空组去跑发布校验。
+   5. 竞争轮次**每段必有一个**（1/2/3）：后端投影层对「部分声明」显式抛错，
       对「整块不声明」按第 1 轮处理（`DefaultCompetitionRound=1`）——
       与显式写第 1 轮等价 ⇒ 编辑器统一显式写，不给「不声明」这个看不出归属的选项
-   5. 稳定排序键后端只有一个合法值 DEMANDKEY，且 0号位 2026-11-04 工作台第 56 条判为
+   6. 稳定排序键后端只有一个合法值 DEMANDKEY，且 0号位 2026-11-04 工作台第 56 条判为
       **D 类 V1 固定** ⇒ 页面只读展示，不给开关（可关 = 可写出不稳定排序，与 D 类相抵触）
-   6. 「出荷指示入物流日」的范围条件写整数 = 相对冻结日的天数（后端换算成具体日期），
+   7. 「出荷指示入物流日」的范围条件写整数 = 相对冻结日的天数（后端换算成具体日期），
       写 YYYY-MM-DD = 具体日期；控件按值的形态自动切「相对天数 / 具体日期」
 
   说明：本组件只产出表单模型；JSON 序列化与发布前拦截在
@@ -42,6 +46,7 @@ import {
   COMPETITION_ROUND_SHORT,
   EDITOR_DEMAND_FIELDS,
   FIXED_TIE_BREAK_FIELD,
+  allowsCustomValue,
   createEmptySegment,
   createEmptySortField,
   fieldKindOf,
@@ -52,8 +57,16 @@ import {
   supportsRelativeOffset,
   valueSuggestionsOf
 } from '@/api/aps-v1/prioritySegmentEditor'
+import { conditionGroupLabel } from '@/api/aps-v1/prioritySegment'
 
-type Row = PrioritySegmentDto & { _k: number }
+/**
+ * 编辑器内部把「命中条件」统一成**组数组**：
+ *  - 平铺模式（存量）：恰好 1 组、且 `_dnf=false` ⇒ 该组即 `MatchConditions`
+ *  - DNF 模式：`_dnf=true`、若干组 ⇒ 写入 `MatchConditionGroups`（组内 AND、组间 OR）
+ * 两种模式互斥产出（同段不会同时带平铺与组），与后端发布校验同口径。
+ */
+type EditGroup = { _gk: number; conditions: SegmentMatchConditionDto[] }
+type Row = PrioritySegmentDto & { _k: number; _dnf: boolean; _groups: EditGroup[] }
 
 const props = defineProps<{ modelValue: PrioritySegmentDto[] }>()
 const emit = defineEmits<{ (e: 'update:modelValue', value: PrioritySegmentDto[]): void }>()
@@ -61,27 +74,65 @@ const emit = defineEmits<{ (e: 'update:modelValue', value: PrioritySegmentDto[])
 let seq = 1
 
 function cloneRows(src: PrioritySegmentDto[] | undefined): Row[] {
-  return (src ?? []).map((s) => ({
-    _k: seq++,
-    orderInSegment: s.orderInSegment,
-    segmentName: s.segmentName,
-    isEnabled: s.isEnabled,
-    competitionRound: s.competitionRound,
-    matchConditions: (s.matchConditions ?? []).map((c) => ({ ...c })),
-    sortFields: (s.sortFields ?? []).map((f) => ({ ...f })),
-    stableTieBreakFields: [FIXED_TIE_BREAK_FIELD]
-  }))
+  return (src ?? []).map((s) => {
+    const rawGroups = s.matchConditionGroups ?? []
+    const dnf = rawGroups.length > 0
+    const groups: EditGroup[] = dnf
+      ? rawGroups.map((g) => ({
+          _gk: seq++,
+          conditions: (g?.conditions ?? []).map((c) => ({ ...c }))
+        }))
+      : [{ _gk: seq++, conditions: (s.matchConditions ?? []).map((c) => ({ ...c })) }]
+    return {
+      _k: seq++,
+      _dnf: dnf,
+      _groups: groups,
+      orderInSegment: s.orderInSegment,
+      segmentName: s.segmentName,
+      isEnabled: s.isEnabled,
+      competitionRound: s.competitionRound,
+      matchConditions: [],
+      matchConditionGroups: [],
+      sortFields: (s.sortFields ?? []).map((f) => ({ ...f })),
+      stableTieBreakFields: [FIXED_TIE_BREAK_FIELD]
+    }
+  })
 }
 
+/** 判等用的「纯内容」投影（父组件回灌时内容相同就不重建行，避免丢焦点） */
 function plain(list: PrioritySegmentDto[]) {
-  return list.map((s) => ({
-    order: s.orderInSegment,
-    name: s.segmentName,
-    enabled: s.isEnabled,
-    round: s.competitionRound ?? null,
-    conds: s.matchConditions.map((c) => [c.field, c.operator, c.value]),
-    sorts: s.sortFields.map((f) => [f.field, f.direction]),
-    tie: s.stableTieBreakFields
+  return list.map((s) => {
+    const groups = s.matchConditionGroups ?? []
+    return {
+      order: s.orderInSegment,
+      name: s.segmentName,
+      enabled: s.isEnabled,
+      round: s.competitionRound ?? null,
+      dnf: groups.length > 0,
+      groups: groups.map((g) => (g?.conditions ?? []).map((c) => [c.field, c.operator, c.value])),
+      conds: s.matchConditions.map((c) => [c.field, c.operator, c.value]),
+      sorts: s.sortFields.map((f) => [f.field, f.direction]),
+      tie: s.stableTieBreakFields
+    }
+  })
+}
+
+/** 行内结构的同口径投影（把 _dnf/_groups 摊成与 plain 相同的形状） */
+function plainRows() {
+  return rows.value.map((r) => ({
+    order: r.orderInSegment,
+    name: r.segmentName,
+    enabled: r.isEnabled,
+    round: r.competitionRound ?? null,
+    dnf: r._dnf,
+    groups: r._dnf
+      ? r._groups.map((g) => g.conditions.map((c) => [c.field, c.operator, c.value]))
+      : [],
+    conds: r._dnf
+      ? []
+      : (r._groups[0]?.conditions ?? []).map((c) => [c.field, c.operator, c.value]),
+    sorts: r.sortFields.map((f) => [f.field, f.direction]),
+    tie: r.stableTieBreakFields
   }))
 }
 
@@ -91,7 +142,7 @@ watch(
   () => props.modelValue,
   (v) => {
     // 父组件把我们 emit 的数组回灌时内容相同 —— 不要重建行（会丢焦点）
-    if (JSON.stringify(plain(v ?? [])) === JSON.stringify(plain(rows.value))) return
+    if (JSON.stringify(plain(v ?? [])) === JSON.stringify(plainRows())) return
     rows.value = cloneRows(v)
   },
   { immediate: true, deep: true }
@@ -124,9 +175,13 @@ function isStandardRound(round: number | null): boolean {
 function commit(): void {
   emit(
     'update:modelValue',
-    rows.value.map(({ _k, ...rest }) => ({
+    rows.value.map(({ _k, _dnf, _groups, ...rest }) => ({
       ...rest,
-      matchConditions: rest.matchConditions.map((c) => ({ ...c })),
+      // 两种模式互斥：有组只给组、无组只给平铺（同段不同时带两份载荷）
+      matchConditions: _dnf ? [] : (_groups[0]?.conditions ?? []).map((c) => ({ ...c })),
+      matchConditionGroups: _dnf
+        ? _groups.map((g) => ({ conditions: g.conditions.map((c) => ({ ...c })) }))
+        : [],
       sortFields: rest.sortFields.map((f) => ({ ...f })),
       stableTieBreakFields: [FIXED_TIE_BREAK_FIELD]
     }))
@@ -194,20 +249,20 @@ function moveToRound(seg: Row, round: number): void {
   commit()
 }
 
-function addCondition(seg: Row): void {
+function addCondition(seg: Row, gi: number): void {
   // 延期状态(1) 已归参数集、编辑器关闭 ⇒ 默认客户等级(2)
-  seg.matchConditions.push({ field: 2, operator: 0, value: '' })
+  seg._groups[gi].conditions.push({ field: 2, operator: 0, value: '' })
   commit()
 }
 
-function removeCondition(seg: Row, idx: number): void {
-  seg.matchConditions.splice(idx, 1)
+function removeCondition(seg: Row, gi: number, ci: number): void {
+  seg._groups[gi].conditions.splice(ci, 1)
   commit()
 }
 
 /** 换字段：操作符重置为该字段的第一个合法项，值按新类型清空 */
-function onConditionField(seg: Row, idx: number, field: number): void {
-  const c = seg.matchConditions[idx]
+function onConditionField(seg: Row, gi: number, ci: number, field: number): void {
+  const c = seg._groups[gi].conditions[ci]
   c.field = field
   c.operator = operatorsForField(field)[0]?.value ?? 0
   c.value = c.operator === 6 ? [] : ''
@@ -216,8 +271,8 @@ function onConditionField(seg: Row, idx: number, field: number): void {
 }
 
 /** 换操作符：等于 ↔ 属于 之间切换时重置值形态（字符串 / 数组） */
-function onConditionOperator(seg: Row, idx: number, operator: number): void {
-  const c = seg.matchConditions[idx]
+function onConditionOperator(seg: Row, gi: number, ci: number, operator: number): void {
+  const c = seg._groups[gi].conditions[ci]
   c.operator = operator
   if (operator === 6) {
     c.value = Array.isArray(c.value) ? c.value : []
@@ -229,14 +284,62 @@ function onConditionOperator(seg: Row, idx: number, operator: number): void {
   commit()
 }
 
-function onConditionValue(seg: Row, idx: number, value: unknown): void {
-  const c = seg.matchConditions[idx]
+function onConditionValue(seg: Row, gi: number, ci: number, value: unknown): void {
+  const c = seg._groups[gi].conditions[ci]
   // 数字控件回填的是 number：相对天数按契约存整数串（如 "20"），清空统一成 ''
   let next: unknown = value === null || value === undefined ? '' : value
   if (supportsRelativeOffset(c.field, c.operator) && typeof next === 'number') {
     next = String(next)
   }
   c.value = next as string | string[]
+  commit()
+}
+
+/* ───────────────── DNF 条件组（组内 AND、组间 OR）───────────────── */
+
+/** 平铺 → DNF：现有条件搬进组A，另起组B（用户接着填） */
+function toDnfMode(seg: Row): void {
+  if (seg._dnf) return
+  const flat = (seg._groups[0]?.conditions ?? []).map((c) => ({ ...c }))
+  seg._dnf = true
+  seg._groups = [
+    { _gk: seq++, conditions: flat },
+    { _gk: seq++, conditions: [{ field: 2, operator: 0, value: '' }] }
+  ]
+  commit()
+}
+
+/** DNF → 平铺：只保留组A 的条件（多组时先把多余的组删掉再点） */
+function toFlatMode(seg: Row): void {
+  if (!seg._dnf) return
+  const first = (seg._groups[0]?.conditions ?? []).map((c) => ({ ...c }))
+  seg._dnf = false
+  seg._groups = [{ _gk: seq++, conditions: first }]
+  commit()
+}
+
+/** 再加一组（组间 OR） */
+function addGroup(seg: Row): void {
+  seg._dnf = true
+  seg._groups.push({ _gk: seq++, conditions: [{ field: 2, operator: 0, value: '' }] })
+  commit()
+}
+
+function removeGroup(seg: Row, gi: number): void {
+  seg._groups.splice(gi, 1)
+  // 组删光 ⇒ 回到平铺模式（空平铺 = 无条件兜底段，与存量行为一致）
+  if (!seg._groups.length) {
+    seg._dnf = false
+    seg._groups.push({ _gk: seq++, conditions: [] })
+  }
+  commit()
+}
+
+function moveGroup(seg: Row, gi: number, delta: number): void {
+  const target = gi + delta
+  if (target < 0 || target >= seg._groups.length) return
+  const [g] = seg._groups.splice(gi, 1)
+  seg._groups.splice(target, 0, g)
   commit()
 }
 
@@ -251,8 +354,8 @@ function conditionMode(c: SegmentMatchConditionDto): RelativeMode {
 }
 
 /** 切模式会清空当前值（整数与日期两种写法不能互转），避免留下看不出来的非法残值。 */
-function onConditionMode(seg: Row, idx: number, mode: unknown): void {
-  const c = seg.matchConditions[idx]
+function onConditionMode(seg: Row, gi: number, ci: number, mode: unknown): void {
+  const c = seg._groups[gi].conditions[ci]
   conditionModes.set(c, mode === 'date' ? 'date' : 'offset')
   c.value = ''
   commit()
@@ -308,7 +411,8 @@ function numberValueOf(value: unknown): number | undefined {
 <template>
   <div class="pseg-editor">
     <p class="editor-intro">
-      每一轮内部按「段位 → 第一命中 → 段内排序」排：先按段的先后找第一条命中的段，命中后按这一段的排序键排。
+      每一轮内部按「段位 → 第一命中 →
+      段内排序」排：先按段的先后找第一条命中的段，命中后按这一段的排序键排。
       不同轮次不混池，供给池按轮次顺序消耗 —— 所以段是轮次里面的规则段，上移/下移只在本轮内有效。
     </p>
 
@@ -362,135 +466,204 @@ function numberValueOf(value: unknown): number | undefined {
               <ElButton size="small" :disabled="!canMove(seg, 1)" @click="moveSegment(seg, 1)">
                 下移
               </ElButton>
-              <ElButton size="small" type="danger" plain @click="removeSegment(seg)">删除段</ElButton>
+              <ElButton size="small" type="danger" plain @click="removeSegment(seg)"
+                >删除段</ElButton
+              >
             </div>
           </div>
 
           <div class="seg-section">
             <div class="seg-section-title">
-              命中条件（全部满足才命中本段）
-              <span v-if="!seg.matchConditions.length" class="muted">—— 无条件，命中全部</span>
+              命中条件
+              <ElTag v-if="seg._dnf" size="small" type="warning" effect="plain">
+                多组：组内全部满足，组与组之间满足任意一组
+              </ElTag>
+              <span v-else class="muted">—— 全部满足才命中本段</span>
             </div>
-            <div v-for="(c, ci) in seg.matchConditions" :key="ci" class="cond-row">
-              <ElSelect
-                :model-value="c.field"
-                class="c-field"
-                @update:model-value="onConditionField(seg, ci, Number($event))"
-              >
-                <ElOption
-                  v-for="f in EDITOR_DEMAND_FIELDS"
-                  :key="f.value"
-                  :value="f.value"
-                  :label="f.label"
-                />
-              </ElSelect>
-              <ElSelect
-                :model-value="c.operator"
-                class="c-op"
-                @update:model-value="onConditionOperator(seg, ci, Number($event))"
-              >
-                <ElOption
-                  v-for="o in operatorsForField(c.field)"
-                  :key="o.value"
-                  :value="o.value"
-                  :label="o.label"
-                />
-              </ElSelect>
 
-              <ElSelect
-                v-if="isIn(c.operator)"
-                :model-value="c.value as string[]"
-                class="c-value"
-                multiple
-                filterable
-                allow-create
-                default-first-option
-                placeholder="可填多个值（回车添加）"
-                no-data-text="没有预设值，直接输入后回车"
-                @update:model-value="onConditionValue(seg, ci, $event)"
-              >
-                <ElOption
-                  v-for="v in valueSuggestionsOf(c.field)"
-                  :key="v.value"
-                  :value="v.value"
-                  :label="v.label"
-                />
-              </ElSelect>
-              <div v-else-if="supportsRelativeOffset(c.field, c.operator)" class="c-value c-relative">
-                <ElRadioGroup
-                  :model-value="conditionMode(c)"
-                  size="small"
-                  @update:model-value="onConditionMode(seg, ci, $event)"
+            <div
+              v-for="(grp, gi) in seg._groups"
+              :key="grp._gk"
+              class="cond-group"
+              :class="{ 'is-flat': !seg._dnf }"
+            >
+              <div v-if="seg._dnf" class="cond-group-head">
+                <span class="cond-group-no">{{ conditionGroupLabel(gi) }}</span>
+                <span class="cond-group-rel">组内全部满足（且）</span>
+                <div class="cond-group-ops">
+                  <ElButton size="small" :disabled="gi === 0" @click="moveGroup(seg, gi, -1)">
+                    上移
+                  </ElButton>
+                  <ElButton
+                    size="small"
+                    :disabled="gi === seg._groups.length - 1"
+                    @click="moveGroup(seg, gi, 1)"
+                  >
+                    下移
+                  </ElButton>
+                  <ElButton size="small" type="danger" plain @click="removeGroup(seg, gi)">
+                    删除组
+                  </ElButton>
+                </div>
+              </div>
+
+              <div v-for="(c, ci) in grp.conditions" :key="ci" class="cond-row">
+                <ElSelect
+                  :model-value="c.field"
+                  class="c-field"
+                  @update:model-value="onConditionField(seg, gi, ci, Number($event))"
                 >
-                  <ElRadioButton value="offset">按天数偏移</ElRadioButton>
-                  <ElRadioButton value="date">具体日期</ElRadioButton>
-                </ElRadioGroup>
-                <ElInputNumber
-                  v-if="conditionMode(c) === 'offset'"
-                  :model-value="offsetValueOf(c.value)"
-                  :step="1"
-                  :precision="0"
-                  controls-position="right"
-                  placeholder="距冻结日天数，如 20"
-                  @update:model-value="onConditionValue(seg, ci, $event)"
-                />
+                  <ElOption
+                    v-for="f in EDITOR_DEMAND_FIELDS"
+                    :key="f.value"
+                    :value="f.value"
+                    :label="f.label"
+                  />
+                </ElSelect>
+                <ElSelect
+                  :model-value="c.operator"
+                  class="c-op"
+                  @update:model-value="onConditionOperator(seg, gi, ci, Number($event))"
+                >
+                  <ElOption
+                    v-for="o in operatorsForField(c.field)"
+                    :key="o.value"
+                    :value="o.value"
+                    :label="o.label"
+                  />
+                </ElSelect>
+
+                <ElSelect
+                  v-if="isIn(c.operator)"
+                  :model-value="c.value as string[]"
+                  class="c-value"
+                  multiple
+                  filterable
+                  :allow-create="allowsCustomValue(c.field)"
+                  default-first-option
+                  :placeholder="
+                    allowsCustomValue(c.field) ? '可填多个值（回车添加）' : '从候选里多选'
+                  "
+                  :no-data-text="
+                    allowsCustomValue(c.field) ? '没有预设值，直接输入后回车' : '没有可选值'
+                  "
+                  @update:model-value="onConditionValue(seg, gi, ci, $event)"
+                >
+                  <ElOption
+                    v-for="v in valueSuggestionsOf(c.field)"
+                    :key="v.value"
+                    :value="v.value"
+                    :label="v.label"
+                  />
+                </ElSelect>
+                <div
+                  v-else-if="supportsRelativeOffset(c.field, c.operator)"
+                  class="c-value c-relative"
+                >
+                  <ElRadioGroup
+                    :model-value="conditionMode(c)"
+                    size="small"
+                    @update:model-value="onConditionMode(seg, gi, ci, $event)"
+                  >
+                    <ElRadioButton value="offset">按天数偏移</ElRadioButton>
+                    <ElRadioButton value="date">具体日期</ElRadioButton>
+                  </ElRadioGroup>
+                  <ElInputNumber
+                    v-if="conditionMode(c) === 'offset'"
+                    :model-value="offsetValueOf(c.value)"
+                    :step="1"
+                    :precision="0"
+                    controls-position="right"
+                    placeholder="距冻结日天数，如 20"
+                    @update:model-value="onConditionValue(seg, gi, ci, $event)"
+                  />
+                  <ElDatePicker
+                    v-else
+                    :model-value="c.value as string"
+                    type="date"
+                    value-format="YYYY-MM-DD"
+                    placeholder="选择具体日期"
+                    @update:model-value="onConditionValue(seg, gi, ci, $event)"
+                  />
+                  <span class="muted offset-hint">
+                    {{
+                      conditionMode(c) === 'offset'
+                        ? '20 = 冻结日 +20 天（可填负数）'
+                        : '按固定日期比较'
+                    }}
+                  </span>
+                </div>
                 <ElDatePicker
-                  v-else
+                  v-else-if="fieldKindOf(c.field) === 'DATE'"
                   :model-value="c.value as string"
+                  class="c-value"
                   type="date"
                   value-format="YYYY-MM-DD"
-                  placeholder="选择具体日期"
-                  @update:model-value="onConditionValue(seg, ci, $event)"
+                  placeholder="选择日期"
+                  @update:model-value="onConditionValue(seg, gi, ci, $event)"
                 />
-                <span class="muted offset-hint">
-                  {{
-                    conditionMode(c) === 'offset' ? '20 = 冻结日 +20 天（可填负数）' : '按固定日期比较'
-                  }}
-                </span>
-              </div>
-              <ElDatePicker
-                v-else-if="fieldKindOf(c.field) === 'DATE'"
-                :model-value="c.value as string"
-                class="c-value"
-                type="date"
-                value-format="YYYY-MM-DD"
-                placeholder="选择日期"
-                @update:model-value="onConditionValue(seg, ci, $event)"
-              />
-              <ElInputNumber
-                v-else-if="fieldKindOf(c.field) === 'NUMBER'"
-                :model-value="numberValueOf(c.value)"
-                class="c-value"
-                :min="0"
-                :step="0.1"
-                controls-position="right"
-                placeholder="输入数值"
-                @update:model-value="onConditionValue(seg, ci, $event)"
-              />
-              <ElSelect
-                v-else
-                :model-value="c.value as string"
-                class="c-value"
-                filterable
-                allow-create
-                default-first-option
-                :placeholder="c.operator === 7 ? '前缀匹配，如 FINAL*' : `${fieldLabelOf(c.field)}的值`"
-                no-data-text="没有预设值，直接输入后回车"
-                @update:model-value="onConditionValue(seg, ci, $event)"
-              >
-                <ElOption
-                  v-for="v in valueSuggestionsOf(c.field)"
-                  :key="v.value"
-                  :value="v.value"
-                  :label="v.label"
+                <ElInputNumber
+                  v-else-if="fieldKindOf(c.field) === 'NUMBER'"
+                  :model-value="numberValueOf(c.value)"
+                  class="c-value"
+                  :min="0"
+                  :step="0.1"
+                  controls-position="right"
+                  placeholder="输入数值"
+                  @update:model-value="onConditionValue(seg, gi, ci, $event)"
                 />
-              </ElSelect>
+                <ElSelect
+                  v-else
+                  :model-value="c.value as string"
+                  class="c-value"
+                  filterable
+                  :allow-create="allowsCustomValue(c.field)"
+                  default-first-option
+                  :placeholder="
+                    c.operator === 7 ? '前缀匹配，如 FINAL*' : `选择${fieldLabelOf(c.field)}的值`
+                  "
+                  :no-data-text="
+                    allowsCustomValue(c.field) ? '没有预设值，直接输入后回车' : '没有可选值'
+                  "
+                  @update:model-value="onConditionValue(seg, gi, ci, $event)"
+                >
+                  <ElOption
+                    v-for="v in valueSuggestionsOf(c.field)"
+                    :key="v.value"
+                    :value="v.value"
+                    :label="v.label"
+                  />
+                </ElSelect>
 
-              <ElButton size="small" text type="danger" @click="removeCondition(seg, ci)">
-                移除
+                <ElButton size="small" text type="danger" @click="removeCondition(seg, gi, ci)">
+                  移除
+                </ElButton>
+              </div>
+
+              <p v-if="seg._dnf && !grp.conditions.length" class="cond-group-empty">
+                这一组还没有条件 —— 空组会恒成立并把后面的段全吞掉，请补条件或删掉这一组
+              </p>
+              <ElButton size="small" @click="addCondition(seg, gi)">+ 条件</ElButton>
+
+              <div v-if="seg._dnf && gi < seg._groups.length - 1" class="cond-or">
+                或 —— 满足上面任意一组即命中本段
+              </div>
+            </div>
+
+            <div class="cond-mode-ops">
+              <ElButton v-if="!seg._dnf" size="small" @click="toDnfMode(seg)">
+                + 添加条件组（组间或）
+              </ElButton>
+              <ElButton v-else size="small" @click="addGroup(seg)">+ 再加一组（组间或）</ElButton>
+              <ElButton
+                v-if="seg._dnf && seg._groups.length === 1"
+                size="small"
+                text
+                @click="toFlatMode(seg)"
+              >
+                改回单组条件（去掉「或」）
               </ElButton>
             </div>
-            <ElButton size="small" @click="addCondition(seg)">+ 条件</ElButton>
           </div>
 
           <div class="seg-section">
@@ -552,7 +725,9 @@ function numberValueOf(value: unknown): number | undefined {
       可选字段按后端已接线范围给出：交期类用日期框、数量类用数字框、枚举类可直接选英文码；
       「出荷指示入物流日」按天数偏移写整数（20 表示冻结日 +20 天，随 Run 日期滚动），
       也可切「具体日期」写固定日期；「包含」只用于物料编码，实际是前缀匹配 （填 FINAL* 表示以 FINAL
-      开头）。改完记得点「保存段位」。
+      开头）。命中条件默认是「全部满足」；要表达「1 且 2 且（3 或 4）」就点「+
+      添加条件组（组间或）」，
+      组内是「且」、组与组之间是「或」，每一组都要至少一条条件。改完记得点「保存段位」。
     </p>
   </div>
 </template>
@@ -691,6 +866,68 @@ function numberValueOf(value: unknown): number | undefined {
   display: flex;
   align-items: center;
   gap: 6px;
+  flex-wrap: wrap;
+}
+
+/* DNF 条件组（组内 AND、组间 OR） */
+.cond-group {
+  border: 1px solid #e2e8f0;
+  border-left: 3px solid #f59e0b;
+  border-radius: 4px;
+  padding: 8px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  background: #fffdf7;
+}
+
+.cond-group.is-flat {
+  border-left-color: #e2e8f0;
+  background: #fff;
+}
+
+.cond-group-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.cond-group-no {
+  font-size: 12px;
+  font-weight: 600;
+  color: #b45309;
+}
+
+.cond-group-rel {
+  font-size: 12px;
+  color: #64748b;
+}
+
+.cond-group-ops {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.cond-group-empty {
+  margin: 0;
+  font-size: 12px;
+  color: #b91c1c;
+  line-height: 1.6;
+}
+
+.cond-or {
+  font-size: 12px;
+  color: #b45309;
+  padding-left: 4px;
+}
+
+.cond-mode-ops {
+  display: flex;
+  align-items: center;
+  gap: 8px;
   flex-wrap: wrap;
 }
 

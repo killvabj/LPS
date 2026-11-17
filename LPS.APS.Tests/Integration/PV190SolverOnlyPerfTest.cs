@@ -210,6 +210,47 @@ public class PV190SolverOnlyPerfTest
             _output.WriteLine($"[S] ErrorMessage 首行={firstLine}");
         }
 
+        // ── 2026-11-14：**结果与失败原因落盘**（`APS_SOLVER_ONLY_RESULT_OUT` 未设 ⇒ 跳过）──
+        //   动因：xUnit 对**通过**的测试不显示 `ITestOutputHelper` 输出 ⇒ 跑 40 分钟只拿到
+        //   「FinalTask=0」，不知道被哪条校验否掉（本会话反复踩此坑）。纯观测，不影响求解。
+        try
+        {
+            var resultOut = Environment.GetEnvironmentVariable("APS_SOLVER_ONLY_RESULT_OUT");
+            if (!string.IsNullOrWhiteSpace(resultOut))
+            {
+                var sb = new System.Text.StringBuilder();
+                sb.AppendLine($"PlanVersionId = {planVersionId}");
+                sb.AppendLine($"时刻 = {DateTime.Now:O}");
+                sb.AppendLine($"Success = {result!.Success}");
+                sb.AppendLine($"FinalTasks = {result.FinalTasks.Count}");
+                sb.AppendLine($"UnscheduledTasks = {result.UnscheduledTasks.Count}");
+                sb.AppendLine($"ExplanationFacts = {result.ExplanationFacts.Count}");
+                sb.AppendLine($"SolveTraceNotes = {result.SolveTraceNotes.Count}");
+                sb.AppendLine($"墙钟秒 = {solveSw.Elapsed.TotalSeconds:F1}");
+                sb.AppendLine();
+                sb.AppendLine("================ ErrorMessage（全文）================");
+                sb.AppendLine(result.ErrorMessage ?? "(null)");
+                sb.AppendLine();
+                sb.AppendLine("================ Level=Error 的 TraceNote ================");
+                var errNotes = (result.SolveTraceNotes ?? Array.Empty<SolveTraceNote>())
+                    .Where(n => string.Equals(n.Level, "Error", StringComparison.Ordinal))
+                    .ToList();
+                sb.AppendLine($"(共 {errNotes.Count} 条)");
+                foreach (var n in errNotes.Take(200))
+                {
+                    sb.AppendLine($"--- Key={n.Key} ReasonCode={n.ReasonCode}");
+                    sb.AppendLine(n.Message ?? string.Empty);
+                }
+
+                System.IO.File.WriteAllText(resultOut, sb.ToString(), System.Text.Encoding.UTF8);
+                _output.WriteLine($"[S] 结果诊断已落盘：{resultOut}");
+            }
+        }
+        catch (Exception ex)
+        {
+            _output.WriteLine($"[S] 结果诊断落盘失败（已吞）：{ex.GetType().Name}: {ex.Message}");
+        }
+
         _output.WriteLine("");
         _output.WriteLine("[S] 本轮**未落库**：没有写 [Task] / PeggingDraft / AllocationTaskShare / "
             + "ScheduleExplanationFact / PI Position 任何一行。插库是 2号位 的段，不在本次测量内。");

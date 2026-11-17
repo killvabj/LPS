@@ -315,3 +315,93 @@ export interface ParameterSetVersionDto {
   publishedBy?: string | null
   createdAt: IsoDateTime
 }
+
+/* ==================== 主子表联查·一版一行（2026-11-11，3号位 扩围加函） ==================== */
+
+/**
+ * 策略包「主子表联查·一版一行」行（后端 `StrategyProfileVersionRowDto`）
+ *
+ * ⚠️ 2026-11-11（3号位《三族列表改主子表联查一版一行·新增三族 versions 契约变更协调件·扩围加函》）：
+ *   旧端点 `GET /strategy-profiles` 是**纯主表**（不含任何版本状态/绑定信息）⇒
+ *   前端看不出各版本状态。新端点 `GET /strategy-profiles/versions` 每主表 N 个版本 ⇒ N 行。
+ *   - RunType 取自**父表**（StrategyProfileVersion 无 RunType 列，P0-06 契约）
+ *   - 随行带 RuleSetVersionId / ParameterSetVersionId（策略包版本绑定两个已发布版本）
+ *   - 排序：主表 Id DESC；每主表内版本 Id ASC
+ */
+export interface StrategyProfileVersionRowDto {
+  /** 主表 Id */
+  strategyProfileId: number
+  /** 主表编码 */
+  strategyProfileCode: string
+  /** 主表名称 */
+  strategyProfileName: string
+  /** 主表说明 */
+  description?: string | null
+  /** 批次类型（取自父表） */
+  runType?: string | null
+  /** 主表启停（与版本状态是两件事） */
+  isActive?: boolean | null
+  /** 主表建档时间 */
+  strategyProfileCreatedAt?: string | null
+  /** 版本 Id（发布 / 退役 / 设为默认 的键） */
+  versionId: number
+  /** 版本码 */
+  versionCode: string
+  /** **版本真实状态**（DRAFT/PUBLISHED/DISABLED 等） */
+  status: string
+  /** 绑定的规则集版本 Id */
+  ruleSetVersionId: number
+  /** 绑定的参数集版本 Id */
+  parameterSetVersionId: number
+  /** 同族默认版本标记 */
+  isDefault?: boolean
+  /** 生效起（发布时后端写入的发布时间；未发布 = 空） */
+  effectiveFrom?: string | null
+  /** 生效止（停用时后端写入的停用时刻；已发布未停用 = 空） */
+  effectiveTo?: string | null
+  /** 发布时间 */
+  publishedAt?: string | null
+  /** 发布人 */
+  publishedBy?: string | null
+  /** 版本建档时间 */
+  createdAt?: string | null
+}
+
+/**
+ * 前端策略包列表行（**一版一行**）
+ *
+ * 行来源两处：① 新端点版本行（每版本一行，状态真实）② 旧端点里「一条版本都没有」的主表行。
+ * ②不可省：新端点是 INNER JOIN，**无版本的主表不会出现在其中** ⇒ 纯切新端点会让这些主表
+ * 连同「未配版本」的识别与删除入口一起消失 ⇒ 功能回退。
+ */
+export interface StrategyProfileListRowDto {
+  /** 行唯一键：版本行 = `v{versionId}`；无版本主表行 = `n{strategyProfileId}` */
+  rowKey: string
+  strategyProfileId: number
+  strategyProfileCode: string
+  strategyProfileName: string
+  /** 主表说明 */
+  description?: string
+  /** 批次类型（取自父表） */
+  runType?: string | null
+  /** 主表启停 */
+  isActive: boolean
+  /** 建档时间（主表或版本，取可得的那个） */
+  createdAt: string
+  /** 该行是否有版本 */
+  hasVersion: boolean
+  /** 版本 Id（仅版本行） */
+  versionId?: number
+  /** 版本码（仅版本行） */
+  versionCode?: string
+  /** 版本真实状态（仅版本行） */
+  versionStatus?: StrategyVersionStatus
+  /** 同族默认版本标记（仅版本行） */
+  isDefault?: boolean
+  /** 绑定的规则集版本 Id（仅版本行） */
+  ruleSetVersionId?: number
+  /** 绑定的参数集版本 Id（仅版本行） */
+  parameterSetVersionId?: number
+  /** 发布时间（版本行 = 该版本发布时间；无版本行 = 主表最近一次发布时间） */
+  publishedAt?: string
+}

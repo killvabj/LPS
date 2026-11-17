@@ -20,40 +20,15 @@ public class OrderQueryRepository : IOrderQueryRepository
         _connectionManager = connectionManager ?? throw new ArgumentNullException(nameof(connectionManager));
     }
 
-    public async Task<PageResult<OrderListItemDto>> QueryOrdersAsync(
-        int planVersionId,
-        string? orderNo = null,
-        string? materialCode = null,
-        string? customerName = null,
-        string? factoryCode = null,
-        string? domainKey = null,
-        string? delayStatus = null,
-        string? status = null,
-        string? productionInstructionNo = null,
-        string? productFamilyCode = null,
-        DateTime? dueDateFrom = null,
-        DateTime? dueDateTo = null,
-        int skip = 0,
-        int take = 50,
-        CancellationToken ct = default,
-        IReadOnlySet<string>? allowedFactories = null,
-        IReadOnlySet<string>? allowedDomains = null)
-    {
-        // Dapper 列表参数只能出现在 IN 内；@X IS NULL(标量) 会随 @X 一起扩成 (@p1,@p2) → "(@p1,@p2) IS NULL" 非法 SQL 4145。
-        // 用 Has 标志替代标量判空；空集 fail-closed 返空，避免空集传入 IN ()。
-        if (allowedFactories is { Count: 0 } || allowedDomains is { Count: 0 })
-            return new PageResult<OrderListItemDto> { Items = Array.Empty<OrderListItemDto>(), Total = 0, Page = 1, PageSize = take };
-        var hasFactories = allowedFactories is { Count: > 0 };
-        var hasDomains = allowedDomains is { Count: > 0 };
-
-        // 共用 FROM / WHERE：列表与 COUNT 的 FROM+WHERE 必须逐字一致，否则 total 与 items 对不上。
-        // （10-19 拆分：为「冻结 01:1908 三字段」加的 OUTER APPLY 只挂明细查询，不污染 COUNT 性能与行数语义。）
-        const string fromJoin = @"
+    // ── 11-12（4号位《订单需求计划页改版》R2/R3/R4）：FROM/WHERE/risk 判定 **类级单源** ──
+    // 列表、COUNT、summary、facets 四处必须逐字同一谓词文本（total/列表/KPI 分叉在源头堵死；
+    // 同「FROM+WHERE 逐字一致」10-19 纪律的跨方法延伸）。
+    private const string FromJoin = @"
 FROM [Order] o
 LEFT JOIN Factory f ON f.Id = o.FactoryId
 LEFT JOIN ProductFamily pf ON pf.Id = o.ProductFamilyId";
 
-        const string wherePart = @"
+    private const string WherePart = @"
 WHERE o.PlanVersionId = @PlanVersionId
     AND (@OrderNo IS NULL OR o.OrderNo LIKE '%' + @OrderNo + '%')
     AND (@MaterialCode IS NULL OR o.MaterialCode LIKE '%' + @MaterialCode + '%')
@@ -69,6 +44,48 @@ WHERE o.PlanVersionId = @PlanVersionId
     AND (@HasFactories = 0 OR f.Code IN @AllowedFactories)
     AND (@HasDomains = 0 OR o.DomainKey IN @AllowedDomains)";
 
+    /// <summary>
+    /// 计划派生交付判定（冻结 01 §64 / 07 §八.2）——与列表富化 C# 式逐语等价：
+    /// 无 Task 行 / MAX(PlannedEndTime) NULL / 无交期 ⇒ 'UNSCHEDULED'（**仅筛选域值**：响应里 riskLevel
+    /// 缺键省略纪律不变、永不回显该词）；日期口径与 DelayedOnDate/summary 三桶同族。
+    /// 仅当语句引用 #tc(tc.OrderId/tc.MaxEnd) 时使用；#tc 与 summary 同型两段式（11-07 计划退化教训）。
+    /// </summary>
+    private const string RiskCaseExpr = @"CASE WHEN tc.OrderId IS NULL OR tc.MaxEnd IS NULL OR o.CustomerDueDate IS NULL
+             THEN 'UNSCHEDULED'
+             WHEN CAST(tc.MaxEnd AS date) > o.CustomerDueDate THEN 'DELAYED'
+             ELSE 'ON_TRACK' END";
+
+    public async Task<PageResult<OrderListItemDto>> QueryOrdersAsync(
+        int planVersionId,
+        string? orderNo = null,
+        string? materialCode = null,
+        string? customerName = null,
+        string? factoryCode = null,
+        string? domainKey = null,
+        string? delayStatus = null,
+        string? status = null,
+        string? productionInstructionNo = null,
+        string? productFamilyCode = null,
+        DateTime? dueDateFrom = null,
+        DateTime? dueDateTo = null,
+        string? riskLevel = null,
+        string? sortBy = null,
+        string? sortDir = null,
+        int skip = 0,
+        int take = 50,
+        CancellationToken ct = default,
+        IReadOnlySet<string>? allowedFactories = null,
+        IReadOnlySet<string>? allowedDomains = null)
+    {
+        // Dapper 列表参数只能出现在 IN 内；@X IS NULL(标量) 会随 @X 一起扩成 (@p1,@p2) → "(@p1,@p2) IS NULL" 非法 SQL 4145。
+        // 用 Has 标志替代标量判空；空集 fail-closed 返空，避免空集传入 IN ()。
+        if (allowedFactories is { Count: 0 } || allowedDomains is { Count: 0 })
+            return new PageResult<OrderListItemDto> { Items = Array.Empty<OrderListItemDto>(), Total = 0, Page = 1, PageSize = take };
+        var hasFactories = allowedFactories is { Count: > 0 };
+        var hasDomains = allowedDomains is { Count: > 0 };
+
+        // FROM / WHERE 单源常量见类级（11-12 R3：列表/COUNT/summary/facets 同一文本）。
+
         // 冻结 01:1908 第 2 项：预计完成时间 / 延期时长 / 主要原因（后端算，前端不得自算）。
         // 延期判定走 Q1 日期口径。
         // ⚠️ PrimaryReasonCode 必须过 07:4937 冻结 15 码白名单（4号位 10-19 U2：v2 前200行 78/79 为非冻结码
@@ -83,7 +100,7 @@ WHERE o.PlanVersionId = @PlanVersionId
         // 均为无序并列，未新增 tiebreaker——4号位 R4 要求语义变化须回执，本处无变化）。
         // 15 码白名单见类级常量 DeliveryReasonWhitelist（以下富化查询引用）。
 
-        var dataSql = @"
+        const string selectCols = @"
 SELECT
     o.Id,
     o.PlanVersionId,
@@ -107,12 +124,39 @@ SELECT
     o.DelayStatus,
     o.DemandMaturityStatus,
     o.MTS_InstructionNo,
-    o.BOMNO"
-            + fromJoin + wherePart + @"
-ORDER BY o.Priority DESC, o.CustomerDueDate, o.Id   -- tiebreaker：分页确定性（4号位 10-19 §二；全链清扫 8 处之一）
-OFFSET @Skip ROWS FETCH NEXT @Take ROWS ONLY";
+    o.BOMNO";
 
-        var countSql = "SELECT COUNT(*)" + fromJoin + wherePart;
+        // R1（11-12 4号位件）：sortBy 白名单——**缺省排序逐字保留全链清扫原式**；每个自定义排序尾挂 o.Id 保分页确定性。
+        // dir 仅二值（service 已校验；仓储防御性二值化，杜绝注入）。非法 sortBy 抛 ArgumentException→400（不静默忽略，R2 教训）。
+        var dir = string.Equals(sortDir, "desc", StringComparison.OrdinalIgnoreCase) ? "DESC" : "ASC";
+        var orderBy = (sortBy ?? "") switch
+        {
+            ""           => "ORDER BY o.Priority DESC, o.CustomerDueDate, o.Id",   // 现排序原样（4号位 10-19 §二；全链清扫 8 处之一）
+            "dueDate"    => $"ORDER BY o.CustomerDueDate {dir}, o.Priority DESC, o.Id",
+            "priority"   => $"ORDER BY o.Priority {dir}, o.CustomerDueDate ASC, o.Id",
+            "orderNo"    => $"ORDER BY o.OrderNo {dir}, o.Id",
+            "quantity"   => $"ORDER BY o.Quantity {dir}, o.Id",
+            "riskLevel"  => $"ORDER BY CASE {RiskCaseExpr} WHEN 'DELAYED' THEN 0 WHEN 'ON_TRACK' THEN 1 ELSE 2 END {dir}, o.Id",
+            _            => throw new ArgumentException($"非法 sortBy：{sortBy}（允许：dueDate/priority/orderNo/riskLevel/quantity 或缺省）")
+        };
+
+        // R2：riskLevel 筛选/排序 ⇒ 引用 #tc，走与 summary 同型两段式（11-07 计划退化教训：Task 聚合先落临时表再关联）。
+        var needsRisk = !string.IsNullOrEmpty(riskLevel)
+                        || string.Equals(sortBy, "riskLevel", StringComparison.OrdinalIgnoreCase);
+        var tcJoin = needsRisk ? "\nLEFT JOIN #tc tc ON tc.OrderId = o.Id" : "";
+        var riskPred = needsRisk && !string.IsNullOrEmpty(riskLevel)
+            ? $"\n    AND ({RiskCaseExpr}) = @RiskLevel"
+            : "";
+        const string tcPreamble = @"SET NOCOUNT ON;
+CREATE TABLE #tc(OrderId bigint PRIMARY KEY, MaxEnd datetime2(7));
+INSERT #tc SELECT OrderId, MAX(PlannedEndTime) FROM [Task] WHERE PlanVersionId = @PlanVersionId GROUP BY OrderId;";
+
+        var dataSql = needsRisk
+            ? tcPreamble + selectCols + FromJoin + tcJoin + WherePart + riskPred + $"\n{orderBy}\nOFFSET @Skip ROWS FETCH NEXT @Take ROWS ONLY\nDROP TABLE #tc;"
+            : selectCols + FromJoin + tcJoin + WherePart + riskPred + $"\n{orderBy}\nOFFSET @Skip ROWS FETCH NEXT @Take ROWS ONLY";
+        var countSql = needsRisk
+            ? tcPreamble + "SELECT COUNT(*)" + FromJoin + tcJoin + WherePart + riskPred + "\nDROP TABLE #tc;"
+            : "SELECT COUNT(*)" + FromJoin + tcJoin + WherePart + riskPred;
 
         var parameters = new
         {
@@ -128,6 +172,7 @@ OFFSET @Skip ROWS FETCH NEXT @Take ROWS ONLY";
             ProductFamilyCode = productFamilyCode,
             DueDateFrom = dueDateFrom,
             DueDateTo = dueDateTo,
+            RiskLevel = string.IsNullOrWhiteSpace(riskLevel) ? null : riskLevel,
             HasFactories = hasFactories,
             HasDomains = hasDomains,
             AllowedFactories = allowedFactories,
@@ -305,8 +350,25 @@ ORDER BY t.OperationSeq";
         };
     }
 
+    /// <summary>
+    /// summary（R3，11-12 4号位件）：接受与列表**同名同义**的全部筛选参数 + riskLevel，
+    /// FROM/WHERE 用类级单源常量 ⇒ KPI 与列表 total 天然同口径。
+    /// **全部参数为空时行为与旧版逐字一致**（谓词全部短路；999472/999464 两版桶数已预跑对照）。
+    /// </summary>
     public async Task<OrderSummaryDto> GetSummaryAsync(
         int planVersionId,
+        string? orderNo = null,
+        string? materialCode = null,
+        string? customerName = null,
+        string? factoryCode = null,
+        string? domainKey = null,
+        string? delayStatus = null,
+        string? status = null,
+        string? productionInstructionNo = null,
+        string? productFamilyCode = null,
+        DateTime? dueDateFrom = null,
+        DateTime? dueDateTo = null,
+        string? riskLevel = null,
         IReadOnlySet<string>? allowedFactories = null,
         IReadOnlySet<string>? allowedDomains = null,
         CancellationToken ct = default)
@@ -350,18 +412,28 @@ SELECT
         AND s.RiskLevel IN ('AT_RISK', 'DELAYED')
         AND (@HasFactories = 0 OR f2.Code IN @AllowedFactories)
         AND (@HasDomains = 0 OR o2.DomainKey IN @AllowedDomains)) AS RiskCount,
-    SUM(CASE WHEN tc.OrderId IS NULL OR o.CustomerDueDate IS NULL THEN 1 ELSE 0 END) AS UnscheduledCount
-FROM [Order] o
-LEFT JOIN Factory f ON f.Id = o.FactoryId
-LEFT JOIN #tc tc ON tc.OrderId = o.Id
-WHERE o.PlanVersionId = @PlanVersionId
-    AND (@HasFactories = 0 OR f.Code IN @AllowedFactories)
-    AND (@HasDomains = 0 OR o.DomainKey IN @AllowedDomains);
+    SUM(CASE WHEN tc.OrderId IS NULL OR o.CustomerDueDate IS NULL THEN 1 ELSE 0 END) AS UnscheduledCount"
+            // R3：FROM/WHERE 接类级单源（与列表逐字同谓词）+ 可选 riskLevel（同 RiskCaseExpr 单源）。
+            + FromJoin + "\nLEFT JOIN #tc tc ON tc.OrderId = o.Id" + WherePart
+            + (string.IsNullOrWhiteSpace(riskLevel) ? "" : $"\n    AND ({RiskCaseExpr}) = @RiskLevel")
+            + @";
 DROP TABLE #tc;";
 
         var parameters = new
         {
             PlanVersionId = planVersionId,
+            OrderNo = orderNo,
+            MaterialCode = materialCode,
+            CustomerName = customerName,
+            FactoryCode = factoryCode,
+            DomainKey = domainKey,
+            DelayStatus = delayStatus,
+            Status = status,
+            ProductionInstructionNo = productionInstructionNo,
+            ProductFamilyCode = productFamilyCode,
+            DueDateFrom = dueDateFrom,
+            DueDateTo = dueDateTo,
+            RiskLevel = string.IsNullOrWhiteSpace(riskLevel) ? null : riskLevel,
             HasFactories = hasFactories,
             HasDomains = hasDomains,
             AllowedFactories = allowedFactories,
@@ -372,6 +444,109 @@ DROP TABLE #tc;";
             sql, parameters, CommandType.Text, DatabaseId.APS, commandTimeout: 10);
 
         return result ?? new OrderSummaryDto { PlanVersionId = planVersionId };
+    }
+
+    /// <summary>
+    /// R4（11-12 4号位件）：订单口径可选值+命中条数。**与列表同一 FROM/WHERE/同一范围收窄**（类级单源），
+    /// 六维一次 GROUPING SETS 扫描；riskLevel 维与三桶同式（RiskCaseExpr）。
+    /// Val=NULL 组（如 DelayStatus 空值行）不回显（前端无从按值过滤），仅计不进下拉。
+    /// 每维按条数降序截 200（超限维在回执中说明，当前 dev 最大客户数远小于）。
+    /// </summary>
+    public async Task<OrderFacetsDto> GetFacetsAsync(
+        int planVersionId,
+        string? orderNo = null,
+        string? materialCode = null,
+        string? customerName = null,
+        string? factoryCode = null,
+        string? domainKey = null,
+        string? delayStatus = null,
+        string? status = null,
+        string? productionInstructionNo = null,
+        string? productFamilyCode = null,
+        DateTime? dueDateFrom = null,
+        DateTime? dueDateTo = null,
+        string? riskLevel = null,
+        IReadOnlySet<string>? allowedFactories = null,
+        IReadOnlySet<string>? allowedDomains = null,
+        CancellationToken ct = default)
+    {
+        if (allowedFactories is { Count: 0 } || allowedDomains is { Count: 0 })
+            return new OrderFacetsDto { PlanVersionId = planVersionId };
+        var hasFactories = allowedFactories is { Count: > 0 };
+        var hasDomains = allowedDomains is { Count: > 0 };
+
+        var sql = @"SET NOCOUNT ON;
+CREATE TABLE #tc(OrderId bigint PRIMARY KEY, MaxEnd datetime2(7));
+INSERT #tc SELECT OrderId, MAX(PlannedEndTime) FROM [Task] WHERE PlanVersionId = @PlanVersionId GROUP BY OrderId;
+WITH base AS (
+    SELECT o.Id, o.CustomerName, f.Code AS FactoryCode, pf.Code AS ProductFamilyCode,
+           o.Status AS OrderStatus, o.DelayStatus,
+           " + RiskCaseExpr + @" AS RiskLevel"
+            + FromJoin + "\n    LEFT JOIN #tc tc ON tc.OrderId = o.Id" + WherePart
+            + (string.IsNullOrWhiteSpace(riskLevel) ? "" : $"\n    AND ({RiskCaseExpr}) = @RiskLevel")
+            + @")
+SELECT
+    CASE WHEN GROUPING(CustomerName)=0      THEN 'customerName'
+         WHEN GROUPING(FactoryCode)=0       THEN 'factoryCode'
+         WHEN GROUPING(ProductFamilyCode)=0 THEN 'productFamilyCode'
+         WHEN GROUPING(OrderStatus)=0       THEN 'status'
+         WHEN GROUPING(DelayStatus)=0       THEN 'delayStatus'
+         ELSE 'riskLevel' END AS Dim,
+    COALESCE(CustomerName, FactoryCode, ProductFamilyCode, OrderStatus, DelayStatus, RiskLevel) AS Val,
+    COUNT(*) AS Cnt
+FROM base
+GROUP BY GROUPING SETS ((CustomerName),(FactoryCode),(ProductFamilyCode),(OrderStatus),(DelayStatus),(RiskLevel))
+ORDER BY Dim, Cnt DESC;
+DROP TABLE #tc;";
+
+        var parameters = new
+        {
+            PlanVersionId = planVersionId,
+            OrderNo = orderNo,
+            MaterialCode = materialCode,
+            CustomerName = customerName,
+            FactoryCode = factoryCode,
+            DomainKey = domainKey,
+            DelayStatus = delayStatus,
+            Status = status,
+            ProductionInstructionNo = productionInstructionNo,
+            ProductFamilyCode = productFamilyCode,
+            DueDateFrom = dueDateFrom,
+            DueDateTo = dueDateTo,
+            RiskLevel = string.IsNullOrWhiteSpace(riskLevel) ? null : riskLevel,
+            HasFactories = hasFactories,
+            HasDomains = hasDomains,
+            AllowedFactories = allowedFactories,
+            AllowedDomains = allowedDomains
+        };
+
+        var rows = (await _connectionManager.QueryAsync<OrderFacetRow>(
+            sql, parameters, CommandType.Text, DatabaseId.APS, commandTimeout: 30)).ToList();
+
+        static List<OrderFacetItemDto> Pick(List<OrderFacetRow> all, string dim) =>
+            all.Where(r => r.Dim == dim && r.Val is not null)
+               .Select(r => new OrderFacetItemDto { Value = r.Val, Count = r.Cnt })
+               .Take(200)
+               .ToList();
+
+        return new OrderFacetsDto
+        {
+            PlanVersionId = planVersionId,
+            CustomerNames = Pick(rows, "customerName"),
+            FactoryCodes = Pick(rows, "factoryCode"),
+            ProductFamilyCodes = Pick(rows, "productFamilyCode"),
+            Statuses = Pick(rows, "status"),
+            DelayStatuses = Pick(rows, "delayStatus"),
+            RiskLevels = Pick(rows, "riskLevel"),
+        };
+    }
+
+    /// <summary>facets 行（非契约 DTO）。</summary>
+    private sealed class OrderFacetRow
+    {
+        public string Dim { get; set; } = string.Empty;
+        public string? Val { get; set; }
+        public int Cnt { get; set; }
     }
 
     /// <summary>

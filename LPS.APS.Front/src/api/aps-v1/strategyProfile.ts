@@ -44,8 +44,11 @@ import type {
   RuleSetDto,
   RuleSetVersionDto,
   ParameterSetDto,
-  ParameterSetVersionDto
+  ParameterSetVersionDto,
+  StrategyProfileVersionRowDto,
+  StrategyProfileListRowDto
 } from './types/strategyProfile'
+import { normalizeRuleStatus } from './types/common'
 
 /* ==================== Mock Fixtures（仅离线 UI 演示） ==================== */
 
@@ -274,6 +277,59 @@ const MOCK_PARAMETER_SET_VERSIONS: ParameterSetVersionDto[] = [
 const rejectMockWrite = (op: string): Promise<never> =>
   Promise.reject(new ApiError(`mock 模式禁止写策略（${op}）`, 503))
 
+/**
+ * 把「新端点版本行」与「旧端点纯主表行」合并成前端列表行（**一版一行**）
+ *
+ * ⚠️ 2026-11-11（3号位 扩围加函）：
+ *   新端点 `GET /strategy-profiles/versions` 是主表 INNER JOIN 版本 ⇒ **一条版本都没有的主表
+ *   不会出现在它里面**。纯切新端点会让这些主表（连同「未配版本」的识别与删除入口）消失
+ *   ⇒ 功能回退。故列表 = 新端点版本行 + 旧端点的「无版本主表」行。
+ *
+ *  - 版本行：`versionStatus` = 该版本**真实状态**
+ *  - 主表级字段（名称 / 说明 / 批次类型 / 启停）从版本行取（随行冗余）
+ */
+export function mergeStrategyProfileListRows(
+  versionRows: StrategyProfileVersionRowDto[],
+  masters: StrategyProfileDto[]
+): StrategyProfileListRowDto[] {
+  const rows: StrategyProfileListRowDto[] = versionRows.map((r) => ({
+    rowKey: `v${r.versionId}`,
+    strategyProfileId: r.strategyProfileId,
+    strategyProfileCode: r.strategyProfileCode,
+    strategyProfileName: r.strategyProfileName,
+    description: r.description ?? undefined,
+    runType: r.runType ?? null,
+    isActive: r.isActive !== false,
+    createdAt: r.createdAt ?? r.strategyProfileCreatedAt ?? '',
+    hasVersion: true,
+    versionId: r.versionId,
+    versionCode: r.versionCode,
+    versionStatus: normalizeRuleStatus(r.status),
+    isDefault: r.isDefault,
+    ruleSetVersionId: r.ruleSetVersionId,
+    parameterSetVersionId: r.parameterSetVersionId,
+    publishedAt: r.publishedAt ?? undefined
+  }))
+
+  // 旧端点里「一条版本都没有」的主表 ⇒ 补一行「未配版本」
+  const withVersion = new Set(versionRows.map((r) => r.strategyProfileId))
+  for (const m of masters) {
+    if (withVersion.has(m.id)) continue
+    rows.push({
+      rowKey: `n${m.id}`,
+      strategyProfileId: m.id,
+      strategyProfileCode: m.strategyProfileCode,
+      strategyProfileName: m.strategyProfileName,
+      description: m.description ?? undefined,
+      runType: m.runType ?? null,
+      isActive: m.isActive !== false,
+      createdAt: m.createdAt ?? '',
+      hasVersion: false
+    })
+  }
+  return rows
+}
+
 /* ==================== API ==================== */
 
 export const strategyProfileApi = {
@@ -301,6 +357,61 @@ export const strategyProfileApi = {
       url: '/api/governance/strategy-profiles',
       params
     })
+  },
+
+  /* ===== 1-b. 策略包列表（主子表联查·一版一行）=====
+   *
+   * ⚠️ 2026-11-11（3号位 扩围加函）：`GET /api/governance/strategy-profiles/versions`
+   *   - 权限 aps.strategy.view；入参 activeOnly / keyword / status / name / page / pageSize
+   *     —— 本方法**不传 page/pageSize** ⇒ 后端 `ResolvePaging` 返回 (null,null) ⇒ 全量
+   *   - 每主表 N 个版本 ⇒ N 行，`status` 是**版本真实状态**
+   *   - 排序：主表 Id DESC；每主表内版本 Id ASC
+   */
+  async listProfileVersionRows(): Promise<StrategyProfileVersionRowDto[]> {
+    if (APS_USE_MOCK) {
+      // mock 下没有新端点 ⇒ 用既有 fixture 拼出等价的版本行
+      return MOCK_PROFILES.flatMap((p) =>
+        MOCK_VERSIONS.filter((v) => v.strategyProfileId === p.id).map((v) => ({
+          strategyProfileId: p.id,
+          strategyProfileCode: p.strategyProfileCode,
+          strategyProfileName: p.strategyProfileName,
+          description: p.description ?? null,
+          runType: p.runType ?? null,
+          isActive: p.isActive,
+          strategyProfileCreatedAt: p.createdAt,
+          versionId: v.id,
+          versionCode: v.versionCode,
+          status: v.status,
+          ruleSetVersionId: v.ruleSetVersionId,
+          parameterSetVersionId: v.parameterSetVersionId,
+          isDefault: v.isDefault,
+          effectiveFrom: v.effectiveFrom ?? null,
+          effectiveTo: v.effectiveTo ?? null,
+          publishedAt: v.publishedAt ?? null,
+          publishedBy: v.publishedBy ?? null,
+          createdAt: v.createdAt
+        }))
+      )
+    }
+    return apsHttp.get<StrategyProfileVersionRowDto[]>({
+      url: '/api/governance/strategy-profiles/versions'
+    })
+  },
+
+  /**
+   * 策略包列表（前端列表源）：新端点版本行 + 旧端点「无版本主表」行
+   *
+   * 见 `mergeStrategyProfileListRows` 的注释（为什么不能纯切新端点）。
+   * 旧端点 `GET /strategy-profiles` 保留用途（主表级字段的唯一来源）。
+   *
+   * @param masters 已拉好的主表列表（传了就复用，不再重复请求）
+   */
+  async listProfileRows(masters?: StrategyProfileDto[]): Promise<StrategyProfileListRowDto[]> {
+    const [versionRows, ms] = await Promise.all([
+      this.listProfileVersionRows(),
+      masters ? Promise.resolve(masters) : this.listProfiles()
+    ])
+    return mergeStrategyProfileListRows(versionRows, ms)
   },
 
   /* ===== 1'. 新建策略包主表（POST /api/governance/strategy-profile） =====
@@ -457,8 +568,8 @@ export const strategyProfileApi = {
         { key: 'ruleSetVersionId', label: '引用的规则集版本' },
         { key: 'parameterSetVersionId', label: '引用的参数集版本' },
         { key: 'isDefault', label: '默认版本' },
-        { key: 'effectiveFrom', label: '生效起始' },
-        { key: 'effectiveTo', label: '生效截止' }
+        { key: 'effectiveFrom', label: '生效起' },
+        { key: 'effectiveTo', label: '生效止' }
       ]
       return {
         sourceVersionId,

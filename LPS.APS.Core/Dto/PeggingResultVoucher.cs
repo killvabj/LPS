@@ -11,6 +11,18 @@ public class PeggingResultVoucher : PeggingResult { }
 public class PeggingResult
 {
     /// <summary>
+    /// 跨厂分型血缘：`LogicalDemandKey` → 命中的跨厂边 `APS_BOM_CROSS_FACTORY_EDGE_RAW.Id`。
+    ///
+    /// <para>只登记**真命中跨厂边**的两种分型（`PiContinuation` / `ShFulfilment`）；顶层（`bomLevel=0`，
+    /// 跨厂性由 SH 订单自身证明）、`NotCrossFactory`、`Unknown`（含 `CROSS_FACTORY_EDGE_SKIP`）一律不入。</para>
+    ///
+    /// <para><b>为什么要它</b>：`PeggingSupplyAllocation.CrossFactoryEdgeId` 这个列**一直都在**（`bigint NULL`），
+    /// 但全仓从未赋值、实测 `999507` 的 760,246 行**全 NULL** ⇒ 分型结论只活在内存与一行计数日志里，
+    /// **事后无法回放「这条需求是哪条边判出来的」**。本表即该列的唯一来源。</para>
+    /// </summary>
+    public Dictionary<string, long> CrossFactoryEdgeIdByDemandKey { get; } = new(StringComparer.Ordinal);
+
+    /// <summary>
     /// 凭证ID（用于追踪和关联）
     /// </summary>
     public string VoucherId { get; set; } = Guid.NewGuid().ToString();
@@ -143,6 +155,25 @@ public class PeggingResult
     /// 警告信息列表
     /// </summary>
     public List<string> Warnings { get; set; } = new();
+
+    /// <summary>
+    /// 跨厂未闭合净缺口结果（CFV1-08，2026-11-13）。
+    ///
+    /// **这不是 Supply / Allocation**，也不是承诺交期 —— 只记录「本该有合法供给、但确实拿不到」的净量，
+    /// 供落库段整批写入 `APS_UnresolvedCrossFactorySupplyResult`（同 Run/PV 先删后插）。
+    ///
+    /// 终态写入保护（CF-04）：Round1 的 `AvailableAt=NULL` 只是运行中状态，**不得预写
+    /// `SH_TIME_UNCLOSED`**；只在唯一 Solver 失败／硬依赖无法闭合时才补该分类。
+    /// </summary>
+    public List<Core.Entities.APS.UnresolvedCrossFactorySupplyResult> UnresolvedCrossFactorySupplyResults { get; set; } = new();
+
+    /// <summary>
+    /// O92 第二步（冻结 CFV1-01～05）：跨厂「无 M 且无合法 SH」的净缺口，**不是供给、不是 LPD**。
+    /// <para>以 **0 量** MaterialAvailabilitySlice 挂到**父件**的 allocation 上，让 1号位
+    /// <c>GetMaterialEarliestTime</c> 的累计量不足 ⇒ <c>isSufficient=false</c>，父件不会把
+    /// 「没有子件生产任务」误当成「料已够」而排满额；同时不伪造 NEW_REQUIREMENT / 源厂 Demand / Task。</para>
+    /// </summary>
+    public List<MaterialAvailabilitySlice> ShortageMaterialConstraints { get; set; } = new();
 }
 
 /// <summary>
@@ -204,6 +235,23 @@ public class SupplyAllocationItem
     /// 现由供给池台账（`SupplyLedgerEntry.FactoryId`）直接透传，不再反解。
     /// </summary>
     public int FactoryId { get; set; }
+
+    /// <summary>
+    /// 跨厂 SH 的源厂 Id（`[Order].SourceFactoryId`）；仅 `INTER_FACTORY_ORDER` 有值。
+    /// </summary>
+    public int? SourceFactoryId { get; set; }
+
+    /// <summary>
+    /// 跨厂 SH 的源厂码（`Factory.Code`，由 `SourceFactoryId` 映射）；源厂未得为 null。
+    /// 用于 `PeggingSupplyAllocation.SupplyFactoryCode`＝供给方（发货厂）。
+    /// </summary>
+    public string? SourceFactoryCode { get; set; }
+
+    /// <summary>供给承诺度（COMMITTED/CONFIRMED/ESTIMATED/NOT_COMMITTED），从 SupplyLedgerEntry 透传；落 PSA.CommitmentStatus。</summary>
+    public string? Commitment { get; set; }
+
+    /// <summary>供给置信度（CONFIRMED/ESTIMATED），从 SupplyLedgerEntry 透传；供 MaterialAvailabilitySlice。</summary>
+    public string? Confidence { get; set; }
 
     public int BomLevel { get; set; }
 

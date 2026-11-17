@@ -73,6 +73,10 @@ export const useResourceCalendarStore = defineStore('aps.resourceCalendar', () =
   const deviceWindowItems = ref<ResourceCalendarEntryDto[]>([])
   const deviceWindowTotal = ref<number>(0)
   const deviceWindowTotals = ref<Record<number, number>>({})
+  /** 设备窗口的日期筛选（后端 from/to 语义＝窗口完整落在区间内；undefined = 全部）
+   *  存 state 而非只存页面：翻页 / 写操作后的重取都要沿用同一区间 */
+  const deviceWindowFrom = ref<string | undefined>(undefined)
+  const deviceWindowTo = ref<string | undefined>(undefined)
   /* 2026-10-17：三级合并解析预览（5号位 GET /api/resource-calendar/resolve-preview）
    *  - 只读；给页面一个"实际能不能排、这片是谁给的"的真话口
    *  - 10-26：人工槽版端点（GET /api/manual-capacity/resolve-preview）已上 dev ⇒ 补一路 */
@@ -97,8 +101,11 @@ export const useResourceCalendarStore = defineStore('aps.resourceCalendar', () =
   const slotWindowItems = ref<ManualSlotCalendarDto[]>([])
   const slotWindowTotal = ref<number>(0)
   const slotWindowPage = ref(1)
-  const slotWindowPageSize = ref(20)
+  const slotWindowPageSize = ref(50)
   const slotWindowTotals = ref<Record<number, number>>({})
+  /** 人工槽窗口的日期筛选（同设备侧语义） */
+  const slotWindowFrom = ref<string | undefined>(undefined)
+  const slotWindowTo = ref<string | undefined>(undefined)
 
   /* ===== 公共 UI 态 ===== */
   const loading = ref(false)
@@ -115,9 +122,10 @@ export const useResourceCalendarStore = defineStore('aps.resourceCalendar', () =
 
   /* ===== getters：数据 ===== */
 
-  /** 当前设备窗口的**当前页行**（分页由服务端给，前端不再切片） */
+  /** 当前设备窗口的**当前页行**（分页由服务端给，前端不再切片）
+   *  默认 50 条/页：一台设备一年 360 段窗口，20 条/页要翻 18 页，工厂用户翻不动 */
   const deviceWindowPage = ref(1)
-  const deviceWindowPageSize = ref(20)
+  const deviceWindowPageSize = ref(50)
 
   /** 当前设备窗口是否已查证（该设备的总数已知即算查过） */
   const deviceWindowsLoaded = computed<boolean>(() => {
@@ -125,15 +133,28 @@ export const useResourceCalendarStore = defineStore('aps.resourceCalendar', () =
     return id != null && deviceWindowTotals.value[id] !== undefined
   })
 
-  /** 当前设备的 Calendar 状态（v1.3 §九）—— 按服务端 total 判有无窗口 */
+  /** 当前设备的 Calendar 状态（v1.3 §九）—— 按服务端 total 判有无窗口
+   *  ⚠️ 有日期筛选时 res.total 只是**区间内**条数，不能代表"这台设备配没配日历"
+   *    ⇒ 改用资源主表的 hasCalendar（后端 EXISTS 任何窗口，全量判定） */
   const deviceCalendarStatus = computed<CalendarConfigStatus>(() => {
     const id = currentResourceId.value
     if (id == null) return 'UNKNOWN'
+    if (deviceWindowFrom.value || deviceWindowTo.value) {
+      const r = resources.value.find((x) => x.resourceId === id)
+      if (r?.hasCalendar === true) return 'CONFIGURED'
+      if (r?.hasCalendar === false) return 'NOT_CONFIGURED'
+    }
     return statusOf(deviceWindowTotals.value, id)
   })
 
-  /** 某人工槽的 Calendar 状态（列表行徽章用；UNKNOWN = 未查证）—— 按服务端 total 判有无窗口 */
+  /** 某人工槽的 Calendar 状态（列表行徽章用；UNKNOWN = 未查证）—— 按服务端 total 判有无窗口
+   *  同设备侧：有筛选时改用主档 hasCalendar（全量判定） */
   function slotCalendarStatus(manualSlotId: number): CalendarConfigStatus {
+    if (slotWindowFrom.value || slotWindowTo.value) {
+      const row = slots.value.find((s) => s.manualSlotId === manualSlotId)
+      if (row?.hasCalendar === true) return 'CONFIGURED'
+      if (row?.hasCalendar === false) return 'NOT_CONFIGURED'
+    }
     return statusOf(slotWindowTotals.value, manualSlotId)
   }
 
@@ -172,10 +193,18 @@ export const useResourceCalendarStore = defineStore('aps.resourceCalendar', () =
     }
   }
 
-  /** 查询某设备的窗口（写入缓存；重复查询覆盖） */
+  /** 查询某设备的窗口（写入缓存；重复查询覆盖）
+   *  - options.from / options.to：日期筛选（`YYYY-MM-DD`）；不传则沿用当前筛选，
+   *    `clearRange: true` 才清空（翻页 / 写操作后的重取必须沿用同一区间） */
   async function loadDeviceWindows(
     resourceId: number,
-    options: { nextPageIndex?: number; nextPageSize?: number } = {}
+    options: {
+      nextPageIndex?: number
+      nextPageSize?: number
+      from?: string
+      to?: string
+      clearRange?: boolean
+    } = {}
   ): Promise<void> {
     if (!Number.isFinite(resourceId) || resourceId <= 0) {
       handleError(new ApiError('资源 Id 必须为正整数', 400))
@@ -187,17 +216,30 @@ export const useResourceCalendarStore = defineStore('aps.resourceCalendar', () =
     currentResourceId.value = resourceId
     if (options.nextPageSize != null) deviceWindowPageSize.value = options.nextPageSize
     if (options.nextPageIndex != null) deviceWindowPage.value = options.nextPageIndex
+    if (options.clearRange) {
+      deviceWindowFrom.value = undefined
+      deviceWindowTo.value = undefined
+    } else if (options.from !== undefined || options.to !== undefined) {
+      deviceWindowFrom.value = options.from
+      deviceWindowTo.value = options.to
+    }
     try {
       const res = await resourceCalendarApi.getWindows(resourceId, {
         pageIndex: deviceWindowPage.value,
-        pageSize: deviceWindowPageSize.value
+        pageSize: deviceWindowPageSize.value,
+        from: deviceWindowFrom.value,
+        to: deviceWindowTo.value
       })
       const items = res.items ?? []
       deviceWindowItems.value = items
       deviceWindowTotal.value = res.total
       deviceWindowPage.value = res.page
       deviceWindowPageSize.value = res.pageSize
-      deviceWindowTotals.value = { ...deviceWindowTotals.value, [resourceId]: res.total }
+      // 带日期筛选时 res.total 只是**区间内**条数，不能代表"这台设备配没配日历"
+      //  ⇒ 只有未筛选的查询才更新全量计数（徽标 / 空态判据）
+      if (!deviceWindowFrom.value && !deviceWindowTo.value) {
+        deviceWindowTotals.value = { ...deviceWindowTotals.value, [resourceId]: res.total }
+      }
       // 删掉本页最后一条后当前页会越界 → 停在前一页（total>0 兜底，避免全删时空转）
       if (!items.length && res.page > 1 && res.total > 0) {
         return loadDeviceWindows(resourceId, { nextPageIndex: res.page - 1 })
@@ -406,10 +448,16 @@ export const useResourceCalendarStore = defineStore('aps.resourceCalendar', () =
     }
   }
 
-  /** 查询某人工槽的窗口页 */
+  /** 查询某人工槽的窗口页（日期筛选语义同设备侧） */
   async function loadSlotWindows(
     manualSlotId: number,
-    options: { nextPageIndex?: number; nextPageSize?: number } = {}
+    options: {
+      nextPageIndex?: number
+      nextPageSize?: number
+      from?: string
+      to?: string
+      clearRange?: boolean
+    } = {}
   ): Promise<void> {
     if (!Number.isFinite(manualSlotId) || manualSlotId <= 0) {
       handleError(new ApiError('人工槽 Id 必须为正整数', 400))
@@ -425,17 +473,29 @@ export const useResourceCalendarStore = defineStore('aps.resourceCalendar', () =
     currentSlotId.value = manualSlotId
     if (options.nextPageSize != null) slotWindowPageSize.value = options.nextPageSize
     if (options.nextPageIndex != null) slotWindowPage.value = options.nextPageIndex
+    if (options.clearRange) {
+      slotWindowFrom.value = undefined
+      slotWindowTo.value = undefined
+    } else if (options.from !== undefined || options.to !== undefined) {
+      slotWindowFrom.value = options.from
+      slotWindowTo.value = options.to
+    }
     try {
       const res = await resourceCalendarApi.getSlotWindows(manualSlotId, {
         pageIndex: slotWindowPage.value,
-        pageSize: slotWindowPageSize.value
+        pageSize: slotWindowPageSize.value,
+        from: slotWindowFrom.value,
+        to: slotWindowTo.value
       })
       const items = res.items ?? []
       slotWindowItems.value = items
       slotWindowTotal.value = res.total
       slotWindowPage.value = res.page
       slotWindowPageSize.value = res.pageSize
-      slotWindowTotals.value = { ...slotWindowTotals.value, [manualSlotId]: res.total }
+      // 同设备侧：带筛选时 res.total 只是区间内条数，不能覆盖全量计数
+      if (!slotWindowFrom.value && !slotWindowTo.value) {
+        slotWindowTotals.value = { ...slotWindowTotals.value, [manualSlotId]: res.total }
+      }
       // 同设备侧：删掉本页最后一条后回退一页
       if (!items.length && res.page > 1 && res.total > 0) {
         return loadSlotWindows(manualSlotId, { nextPageIndex: res.page - 1 })
@@ -519,6 +579,8 @@ export const useResourceCalendarStore = defineStore('aps.resourceCalendar', () =
     deviceWindowItems.value = []
     deviceWindowTotal.value = 0
     deviceWindowTotals.value = {}
+    deviceWindowFrom.value = undefined
+    deviceWindowTo.value = undefined
     resolvePreview.value = null
     manualResolvePreview.value = null
     slots.value = []
@@ -526,6 +588,8 @@ export const useResourceCalendarStore = defineStore('aps.resourceCalendar', () =
     currentSlotId.value = null
     slotWindowItems.value = []
     slotWindowTotal.value = 0
+    slotWindowFrom.value = undefined
+    slotWindowTo.value = undefined
     error.value = null
   }
 
@@ -555,6 +619,8 @@ export const useResourceCalendarStore = defineStore('aps.resourceCalendar', () =
     deviceWindowPage,
     deviceWindowPageSize,
     deviceWindowTotals,
+    deviceWindowFrom,
+    deviceWindowTo,
     resolvePreview,
     resolveLoading,
     manualResolvePreview,
@@ -572,6 +638,8 @@ export const useResourceCalendarStore = defineStore('aps.resourceCalendar', () =
     slotWindowPage,
     slotWindowPageSize,
     slotWindowTotals,
+    slotWindowFrom,
+    slotWindowTo,
     loading,
     saving,
     error,

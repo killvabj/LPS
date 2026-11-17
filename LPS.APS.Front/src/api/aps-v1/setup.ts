@@ -104,6 +104,7 @@ const MOCK_EXACT_RULES: SetupRuleDto[] = [
     fromMaterialId: 1,
     toMaterialId: 2,
     setupMinutes: 45,
+    isActive: true,
     status: 'DRAFT',
     createdAt: fixedDate(5),
     createdBy: 'admin'
@@ -123,6 +124,7 @@ const MOCK_EXACT_RULES: SetupRuleDto[] = [
     fromMaterialId: 2,
     toMaterialId: 3,
     setupMinutes: 30,
+    isActive: true,
     status: 'DRAFT',
     createdAt: fixedDate(4),
     createdBy: 'admin'
@@ -142,6 +144,7 @@ const MOCK_EXACT_RULES: SetupRuleDto[] = [
     fromMaterialId: 4,
     toMaterialId: 5,
     setupMinutes: 60,
+    isActive: true,
     status: 'DRAFT',
     createdAt: fixedDate(3),
     createdBy: 'admin'
@@ -161,6 +164,7 @@ const MOCK_DEFAULT_RULES: SetupRuleDto[] = [
     resourceId: 1,
     resourceCode: 'MC001',
     setupMinutes: 15,
+    isActive: true,
     status: 'DRAFT',
     createdAt: fixedDate(5),
     createdBy: 'admin'
@@ -176,6 +180,7 @@ const MOCK_DEFAULT_RULES: SetupRuleDto[] = [
     resourceId: 2,
     resourceCode: 'MC002',
     setupMinutes: 20,
+    isActive: true,
     status: 'DRAFT',
     createdAt: fixedDate(4),
     createdBy: 'admin'

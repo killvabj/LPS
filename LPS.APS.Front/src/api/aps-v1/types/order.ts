@@ -21,9 +21,16 @@
  *    整键省略 ⇒ `undefined`）。缺失源于 **ERP 源头**（`ERP_Order_Staging` 仅 45.8% 带客户名），非本链丢弃。
  *    ⚠️ 别按「列表前 N 行」抽样估覆盖率：列表 `ORDER BY Priority DESC, CustomerDueDate`，
  *    前 1000 行只有 40.7%（高优先级子集），均匀抽样 12 页 × 200 行得 60.9% —— 以全量 60% 为准。
- *  - `demandMaturityStatus`：**V1 冻结严格 NULL**（`07:244`「禁止从任何字段临时推断」）⇒ 永远不会有值
+ *  - `demandMaturityStatus`：**接口当前未投影**（实测 dev 2026-11-09 `/api/order-query` 单行最多 24 个键
+ *    —— DTO 27 属性中 `promisedDate` / `demandMaturityStatus` 恒为 null ⇒ 整键省略—— **没有**它）。
+ *    冻结禁令现行文本在 **`07 v5.1.16:266`**（旧版行位 07:244 已失效）：
+ *    「`DemandMaturityStatus` V1严格NULL：**禁止从任何字段临时推断**」——禁的是「拿别的字段猜」，
+ *    **不是「永不会有值」**；值由 `ERPOrderSyncService` 从 ERP 源头承接写入
+ *    （`Order_Canonical` 实测有值 1,185 行 = FORECAST 1,184 + PRE_CONFIRMED 1，最后更新 2026-11-07 13:56:46）。
+ *    ⇒ 口径：**待 5号位 投影后即可展示**，但**在此之前前端不建列**（键不存在 ⇒ 建列即恒空列）。
+ *    依据：5号位 2026-11-09 回执（frontNew/docs/5号位-2026-11-09-P01至P13业务事实与API映射回执…md）
  *  - `promisedDate`：冻结 `07:3608` 有定义（承诺交期，APS 计算产物），当前**无写入方** ⇒ 恒空
- *    ⇒ 前端不渲染这两项
+ *    ⇒ 前端不渲染这一项
  *  - 详情 `{order, pegging, tasks}` —— **没有 `reasons` 键**；v24 实测 pegging / tasks 均 0 行
  *  - 工厂/产品族/排程域在 v24 单一取值：`CN` / `CYL` / `FAMILY_X`
  *
@@ -103,11 +110,19 @@ export interface OrderListItemDto {
    */
   riskLevel?: OrderRiskLevel
   /**
-   * 需求成熟度 —— **V1 冻结严格 NULL**（`07:244`「禁止从任何字段临时推断」），
-   * 不是「还没填」而是「V1 不会有值」⇒ 前端不渲染，也不做任何推断。
+   * 需求成熟度 —— **接口当前未投影 ⇒ 该键不出现**（dev 2026-11-09 实测 `/api/order-query`
+   * 单行最多 24 个键，其中**没有**它）。
+   *
+   * 冻结禁令现行文本在 **`07 v5.1.16:266`**（旧版行位 `07:244` 已失效）：
+   * 「`DemandMaturityStatus` V1严格NULL：**禁止从任何字段临时推断**」——禁的是「拿别的字段猜」，
+   * **不是「永不会有值」**；值由 `ERPOrderSyncService` 从 ERP 源头承接写入
+   * （`Order_Canonical` 实测 1,185 行有值 = FORECAST 1,184 + PRE_CONFIRMED 1）。
+   *
+   * ⇒ 前端口径：**不渲染，也不做任何推断**（键不存在 ⇒ 建列即恒空列）；待 5号位 投影后再接。
+   * 中文译名（预测/预确认）待 0号位 定。依据 5号位 2026-11-09 回执。
    */
   demandMaturityStatus?: string
-  /** MTS 指令号；后端属性名 `MTS_InstructionNo`，JSON 键为 `mtS_InstructionNo`（CamelCase 只压首段） */
+  /** 生产指示号（PI 物理身份，冻结 07:2678）；后端属性名 `MTS_InstructionNo`，JSON 键为 `mtS_InstructionNo`（CamelCase 只压首段） */
   mtS_InstructionNo?: string
   bomno?: string
   /**

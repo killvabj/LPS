@@ -47,8 +47,15 @@ const emit = defineEmits<{
 
 const formRef = ref<InstanceType<typeof ElForm> | null>(null)
 
-const form = ref<ManualSlotDraft>({
-  productionDepartmentId: 0,
+/** 表单模型：部门未选时留空（不再用 0 占位——ElSelect 会把没有对应选项的 0 直接显示成 "0"） */
+interface SlotFormModel {
+  productionDepartmentId?: number
+  operationName: string
+  slotCode: string
+}
+
+const form = ref<SlotFormModel>({
+  productionDepartmentId: undefined,
   operationName: '',
   slotCode: ''
 })
@@ -82,7 +89,7 @@ watch(
   () => props.visible,
   (vis) => {
     if (!vis) return
-    form.value = { productionDepartmentId: 0, operationName: '', slotCode: '' }
+    form.value = { productionDepartmentId: undefined, operationName: '', slotCode: '' }
     formRef.value?.clearValidate()
   },
   { immediate: true }
@@ -134,7 +141,7 @@ async function onSubmit(): Promise<void> {
         </ElSelect>
         <ElInputNumber v-else v-model="form.productionDepartmentId" :min="1" :step="1" />
         <span class="field-hint">
-          {{ hasDeptOptions ? '下拉取自当前计划版本已出现的部门' : '候选为空，请手填部门 Id' }}
+          {{ hasDeptOptions ? '下拉取自资源主表已出现的部门' : '候选为空，请手填部门 Id' }}
         </span>
       </ElFormItem>
 

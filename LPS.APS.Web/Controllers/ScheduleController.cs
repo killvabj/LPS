@@ -39,7 +39,11 @@ public class ScheduleController : ControllerBase
     }
 
     /// <summary>
-    /// 获取计划版本列表（最新优先，默认 30 条，按当前用户业务范围过滤）
+    /// 获取计划版本列表（最新优先，默认 30 条，按当前用户业务范围过滤）。
+    /// R5（11-12 4号位件）两点增量、均不破坏现契约：
+    /// ① 行内 `isDefault`=该行是其**域内**当前生效版本（ACTIVE；UQ 保证每域≤1；无全局唯一默认，
+    ///    跨域页面默认请取 isDefault 行中 ActivatedAt 最新者）；
+    /// ② 响应头 `X-Total-Count`=同 WHERE 全量条数（TOP take 截断显式化；不改变响应体结构）。
     /// </summary>
     [Authorize(Policy = PermissionCodes.PlanView)]
     [HttpGet("versions")]
@@ -50,6 +54,7 @@ public class ScheduleController : ControllerBase
         if (take <= 0 || take > 200) take = 30;
 
         var list = await _queryService.GetVersionsAsync(GetCurrentUserId(), take, cancellationToken);
+        Response.Headers["X-Total-Count"] = (await _queryService.CountVersionsAsync(GetCurrentUserId(), cancellationToken)).ToString();
         return ApiResponse<IReadOnlyList<PlanVersionSummaryDto>>.Success(list);
     }
 

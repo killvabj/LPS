@@ -9,9 +9,25 @@
  *    `factoryCode` 且端点说明写明「不触发 2号位 排程」，是登记 stub；
  *    冻结 §十 要求的链路是 4号位 → 5号位 → 2号位，前端直调亦违反该链路
  *  - PARTIAL 三列拆解改为「排程域状态拆解」，数据来自 5号位 `GET /api/domain-status/{runId}`
+ *
+ * 2026-11-11 工厂用户视角改版（A1/A2/A4/A5/A6）：
+ *  - 主视图从「四张批次 KPI 卡」改成「最近一次排产」卡（批次号/时间/类型/触发来源/
+ *    域数/策略包版本码 + 域状态分布 + 域级失败警示条）；批次统计降级为一行小字
+ *  - 排程域状态由 4 组拆 5 组：异常 / 待我确认 / 进行中 / 已完成 / 未开始
+ *  - 域级失败给「看异常解释 →」；待确认给「去确认 →」（按权限码显隐）
+ *  - 删「最近状态摘要」卡：完成率（PARTIAL 不计完成）3/8=37% 会被当成质量指标误导
+ *  - 触发来源翻中文；策略包版本显示版本码（不再给内部 Id）；刷新按钮提到顶部
+ *
+ * 2026-11-12 接 3号位《运行与下发页改版四项落码…回执》：
+ *  - R1/R2/R3：域状态补「该域本次计划区间 / 任务数 / 稳定失败原因码」
+ *    （计划区间与任务数取不到显示「—」；原因码翻中文区分「根因 / 被拖累」，无码不下结论）
+ *  - R4：批次记录表接服务端分页端点 `GET /api/governance/runs/paged`（total 与列表同 where）；
+ *    该端点尚未部署 ⇒ 自动降级到数组端点，页面照常有数据、只是不显示翻页控件
+ *  - 主视图「最近一次排产」只跟第 1 页走（翻页不换主视图）
  */
 
 import { computed, onMounted } from 'vue'
+import { useRouter } from 'vue-router'
 import dayjs from 'dayjs'
 import { storeToRefs } from 'pinia'
 import { ElMessage, ElMessageBox } from 'element-plus'
@@ -39,6 +55,7 @@ import {
   ElDescriptions,
   ElDescriptionsItem,
   ElEmpty,
+  ElPagination,
   ElTag,
   ElTable,
   ElTableColumn,
@@ -48,6 +65,7 @@ import {
 const runStore = useRunStore()
 const apsAuth = useApsAuthStore()
 const domainStore = useDomainStore()
+const router = useRouter()
 
 function humanLabel(domainKey: string | undefined | null): string {
   if (!domainKey) return '—'
@@ -59,11 +77,18 @@ const {
   error,
   errors,
   visibleRuns,
+  latestRun,
+  runsTotal,
+  runsPage,
+  runsPageSize,
+  runsPagedAvailable,
   activeVersions,
   domainStatuses,
   domainStatusRunId,
   domainStatusHasDenominator,
   runStatusCounts,
+  strategyProfileVersionCodes,
+  strategyProfileVersionLookupOk,
   recovering
 } = storeToRefs(runStore)
 
@@ -88,6 +113,46 @@ function domainStatusTag(status: string): 'success' | 'primary' | 'warning' | 'i
   return RUN_DOMAIN_STATUS_TAG[status as RunDomainStatus] ?? 'info'
 }
 
+/* ===== 域级失败原因分类（3号位 2026-11-12 R3 落码：reasonCode）=====
+ * DOMAIN_CALC_FAILED = 该域计算失败（**根因**）
+ * BLOCKED_BY_UPSTREAM_DOMAIN = 上游域失败，本次未生成计划版本（**被拖累**）
+ * 未给码 / 未知码 ⇒ 不下结论（不猜根因），仍显示后端给的中文 reason 原文。
+ */
+const DOMAIN_REASON_KIND: Record<
+  string,
+  { label: string; hint: string; tag: 'danger' | 'warning' }
+> = {
+  DOMAIN_CALC_FAILED: {
+    label: '根因',
+    hint: '该排程域自身计算失败。',
+    tag: 'danger'
+  },
+  BLOCKED_BY_UPSTREAM_DOMAIN: {
+    label: '被拖累',
+    hint: '上游排程域失败，本次没有生成计划版本。',
+    tag: 'warning'
+  }
+}
+
+function domainReasonKind(d: {
+  reasonCode?: string | null
+}): { label: string; hint: string; tag: 'danger' | 'warning' } | null {
+  const code = d.reasonCode
+  if (!code) return null
+  return DOMAIN_REASON_KIND[code] ?? null
+}
+
+/* ===== 域级计划区间 / 任务数（3号位 2026-11-12 R1/R2 落码）=====
+ * 这两个字段来自该域本次的 PlanVersion（未生成时为空）⇒ 取不到就显示「—」，不拿别处的值顶替。
+ */
+function domainPlanHorizonText(d: {
+  planHorizonStart?: string | null
+  planHorizonEnd?: string | null
+}): string {
+  if (!d.planHorizonStart || !d.planHorizonEnd) return '—'
+  return `${dayjs(d.planHorizonStart).format('YYYY-MM-DD')} ~ ${dayjs(d.planHorizonEnd).format('YYYY-MM-DD')}`
+}
+
 /* ===== Run 持续时间（秒） ===== */
 function runDuration(r: { startedAt: string; completedAt?: string | null }): string {
   const end = r.completedAt ? new Date(r.completedAt).getTime() : Date.now()
@@ -97,37 +162,223 @@ function runDuration(r: { startedAt: string; completedAt?: string | null }): str
   return `${Math.floor(dur / 3600)} 时 ${Math.floor((dur % 3600) / 60)} 分`
 }
 
-/* ===== 顶部 KPI（冻结 07 §4.5 权威四值，不另造状态） ===== */
-const kpiItems = computed(() => {
-  const c = runStatusCounts.value
+/* ===== 触发来源：内部码翻中文 =====
+ * 后端 `ScheduleRunGovDto.TriggeredBy` 声明域：'Hangfire' / UserId / 'API' / 'Agent'
+ * ⇒ 除三个固定码外，其余取值都是**触发人标识**（自由文本，如 admin / 用户名 / 备注）。
+ */
+const TRIGGER_SOURCE_LABEL: Record<string, string> = {
+  Hangfire: '系统定时触发',
+  API: '接口触发',
+  Agent: '智能体触发'
+}
+
+function triggerSourceLabel(raw?: string | null): string {
+  const v = (raw ?? '').trim()
+  if (!v) return '—'
+  if (TRIGGER_SOURCE_LABEL[v]) return TRIGGER_SOURCE_LABEL[v]
+  if (v === 'UserId' || v.startsWith('UserId')) return '人工触发'
+  return `人工触发（${v}）`
+}
+
+/* ===== 策略包版本：Id → 版本码（数据面 ④） ===== */
+function strategyProfileVersionCode(id?: number | null): string | null {
+  if (!id) return null
+  return strategyProfileVersionCodes.value[id] ?? null
+}
+
+function strategyProfileVersionMissingHint(id: number): string {
+  return strategyProfileVersionLookupOk.value
+    ? `找不到版本 #${id} 对应的版本码`
+    : '策略包版本码取不到（接口失败或无权限），这里只能显示「—」'
+}
+
+/* ===== 主视图：最近一次排产 =====
+ * 主视图取的是**最近一次「可见」排产**（`latestRun` 来自服务端过滤后的列表，
+ * 3号位 2026-11-12 R4 追加要求：不取「全局最近批次」，受限账号不看无权看的批次）。
+ *
+ * 排程域数（F4，2026-11-12）：**只报「能看到进展的域数」，不回落到登记总数**。
+ * 旧写法 `domainStatuses.length || expectedDomainKeys.length`：域状态取不到（无权 / 未取到）时
+ * 会回落成登记总数 ⇒ 用户把「一个都看不到」误读成「就这 N 个域」。
+ * 现在：可见数 > 0 → 显示可见数（不足登记数时写「可见 N 个」+ 悬停说明）；可见数 = 0 → 「—」。
+ */
+const domainCountVisible = computed(() => domainStatuses.value.length)
+const domainCountRegistered = computed(() => latestRun.value?.expectedDomainKeys?.length ?? 0)
+
+const domainCountText = computed(() => {
+  const visible = domainCountVisible.value
+  if (visible > 0) {
+    return domainCountRegistered.value > visible ? `可见 ${visible} 个` : `${visible} 个`
+  }
+  return '—'
+})
+
+const domainCountHint = computed(() => {
+  const visible = domainCountVisible.value
+  const registered = domainCountRegistered.value
+  if (visible > 0) {
+    return registered > visible
+      ? `这次排产共登记 ${registered} 个排程域，当前只能看到其中 ${visible} 个的进展。`
+      : undefined
+  }
+  return registered > 0
+    ? `这次排产登记了 ${registered} 个排程域，但当前看不到它们的进展。`
+    : '这次排产没有登记排程域。'
+})
+
+/* ===== 业务范围标识（F2，2026-11-12）=====
+ * Global 判定一律取后端 `/api/auth/me` 的 `isGlobal`（apsAuth.isGlobalScope），
+ * 不再用「维度数组是否为空」推断 —— 那种推断把「全局」和「什么都没配」压成了同一种。
+ * 标签说的是**账号被配置的范围**；数据是否已按此收窄由后端口径决定，前端不替后端承诺。
+ */
+const scopeLabelText = computed(() =>
+  apsAuth.isGlobalScope ? '数据范围：全部' : '数据范围：我的范围'
+)
+
+const scopeLabelHint = computed(() => {
+  if (apsAuth.isGlobalScope) return '当前账号可以查看全部排产记录与排程域。'
+  const s = apsAuth.dataScope
+  const parts: string[] = []
+  if (s.domainKeys.length) {
+    const known = s.domainKeys.filter((k) => domainStore.byKey.has(k))
+    const unknown = s.domainKeys.length - known.length
+    if (known.length) parts.push(`排程域 ${known.map(humanLabel).join(' / ')}`)
+    if (unknown) parts.push(`另有 ${unknown} 个排程域未在排程域清单中登记`)
+  }
+  if (s.factoryCodes.length) parts.push(`工厂 ${s.factoryCodes.join(' / ')}`)
+  if (s.productFamilyCodes.length) parts.push(`产品族 ${s.productFamilyCodes.join(' / ')}`)
+  if (s.departmentCodes.length) parts.push(`部门 ${s.departmentCodes.length} 个`)
+  if (!parts.length) return '当前账号没有配置业务范围，请联系管理员。'
+  return `当前账号被限制在：${parts.join('；')}。`
+})
+
+/**
+ * 可见批次为空时的文案：区分「真没有」与「不在你的范围内」。
+ *
+ * 服务端按业务范围过滤后列表为空，对受限账号说「还没有排产记录」是**不实**的
+ * （记录存在，只是不在范围内）；说「当前业务范围内没有排产记录」既不误导、也不泄露范围外有多少。
+ * Global 判定仍取后端 `/api/auth/me` 的 `isGlobal`（与 F2 同一口径）。
+ */
+const emptyRunsText = computed(() =>
+  apsAuth.isGlobalScope ? '还没有排产记录' : '当前业务范围内没有排产记录'
+)
+
+interface HeroField {
+  label: string
+  value: string
+  hint?: string
+}
+
+const heroFields = computed<HeroField[]>(() => {
+  const r = latestRun.value
+  if (!r) return []
+  const spId = r.strategyProfileVersionId
+  const spCode = spId ? strategyProfileVersionCode(spId) : null
+  const spField: HeroField = !spId
+    ? { label: '策略包版本', value: '未指定' }
+    : spCode
+      ? { label: '策略包版本', value: spCode }
+      : { label: '策略包版本', value: '—', hint: strategyProfileVersionMissingHint(spId) }
   return [
-    { key: 'COMPLETED', label: '已完成', count: c.COMPLETED, color: '#059669' },
-    { key: 'PARTIAL_SUCCESS', label: '部分成功', count: c.PARTIAL_SUCCESS, color: '#f59e0b' },
-    { key: 'RUNNING', label: '运行中', count: c.RUNNING, color: '#3b82f6' },
-    { key: 'FAILED', label: '失败', count: c.FAILED, color: '#ef4444' }
+    { label: '批次号', value: `#${r.id}` },
+    { label: '开始时间', value: dayjs(r.startedAt).format('MM-DD HH:mm') },
+    { label: '数据截止', value: dayjs(r.dataCutoffTime).format('MM-DD HH:mm') },
+    { label: '批次类型', value: RUN_TYPE_LABEL[r.runType] ?? r.runType },
+    { label: '触发来源', value: triggerSourceLabel(r.triggeredBy) },
+    { label: '排程域', value: domainCountText.value, hint: domainCountHint.value },
+    spField,
+    { label: '耗时', value: runDuration(r) }
   ]
 })
 
-/* ===== 排程域状态拆解（5号位 /api/domain-status/{runId}，6 值分四组展示） ===== */
-const DOMAIN_STATUS_GROUPS: {
+/* ===== 排程域状态分组（5号位 /api/domain-status/{runId}，6 值分五组展示） =====
+ * 「待我确认」从「进行中 / 待确认」里单独拆出：它是**要用户点确认**的动作，
+ * 混在「进行中」里用户就找不到该干什么。
+ */
+interface DomainStatusGroup {
+  key: string
   label: string
+  short: string
   cls: string
+  chip: 'success' | 'primary' | 'warning' | 'info' | 'danger'
   statuses: readonly string[]
-}[] = [
-  { label: '已完成', cls: 'success', statuses: ['COMPLETED'] },
-  { label: '异常（失败 / 被阻断）', cls: 'failed', statuses: ['FAILED', 'BLOCKED'] },
-  { label: '进行中 / 待确认', cls: 'active', statuses: ['RUNNING', 'CANDIDATE'] },
-  { label: '未开始', cls: 'not-started', statuses: ['NOT_STARTED'] }
+}
+
+const DOMAIN_STATUS_GROUPS: DomainStatusGroup[] = [
+  {
+    key: 'issue',
+    label: '异常（失败 / 被阻断）',
+    short: '异常',
+    cls: 'failed',
+    chip: 'danger',
+    statuses: ['FAILED', 'BLOCKED']
+  },
+  {
+    key: 'candidate',
+    label: '待我确认',
+    short: '待我确认',
+    cls: 'candidate',
+    chip: 'warning',
+    statuses: ['CANDIDATE']
+  },
+  {
+    key: 'running',
+    label: '进行中',
+    short: '进行中',
+    cls: 'active',
+    chip: 'primary',
+    statuses: ['RUNNING']
+  },
+  {
+    key: 'done',
+    label: '已完成',
+    short: '已完成',
+    cls: 'success',
+    chip: 'success',
+    statuses: ['COMPLETED']
+  },
+  {
+    key: 'not-started',
+    label: '未开始',
+    short: '未开始',
+    cls: 'not-started',
+    chip: 'info',
+    statuses: ['NOT_STARTED']
+  }
 ]
 
 const domainStatusGroups = computed(() =>
   DOMAIN_STATUS_GROUPS.map((g) => ({
     ...g,
-    items: domainStatuses.value.filter((d) => g.statuses.includes(d.status))
+    items: domainStatuses.value
+      .filter((d) => g.statuses.includes(d.status))
+      // 预挂失败原因分类（R3 的 reasonCode），模板里直接取，不必反复判断
+      .map((d) => ({ ...d, reasonKind: domainReasonKind(d) }))
+  }))
+)
+
+/** 主视图上的域状态分布（短名 + 计数） */
+const domainStatusSummary = computed(() =>
+  DOMAIN_STATUS_GROUPS.map((g) => ({
+    key: g.key,
+    label: g.short,
+    cls: g.chip,
+    count: domainStatuses.value.filter((d) => g.statuses.includes(d.status)).length
   }))
 )
 
 const hasDomainStatuses = computed(() => domainStatuses.value.length > 0)
+
+/** 域级失败 / 被阻断 */
+const failedDomains = computed(() =>
+  domainStatuses.value.filter((d) => d.status === 'FAILED' || d.status === 'BLOCKED')
+)
+const failedDomainNames = computed(() =>
+  failedDomains.value.map((d) => humanLabel(d.domainKey)).join('、')
+)
+
+function isIssueStatus(status: string): boolean {
+  return status === 'FAILED' || status === 'BLOCKED'
+}
 
 /**
  * 域状态空态文案：三态，**不许把取不到说成「没登记」**。
@@ -150,37 +401,69 @@ const recentRunsSorted = computed(() =>
   )
 )
 
-/* ===== 最近状态摘要 ===== */
-function lastRunOf(status: RunStatus) {
-  const hits = visibleRuns.value.filter((r) => r.status === status)
+/* ===== 批次统计（降级为一行小字，不再做四张 KPI 卡） =====
+ * 服务端分页后，这里的计数只覆盖**当前页** ⇒ 文案必须说清楚是「共 N 次」还是「本页 N 次」，
+ * 不能拿本页计数冒充全量（3号位 2026-11-12 R4：total 是过滤后全量，列表是分页切片）。
+ */
+const batchSummaryText = computed(() => {
+  const runs = recentRunsSorted.value
+  if (!runs.length) return emptyRunsText.value
+  const c = runStatusCounts.value
+  const oldest = runs[runs.length - 1]
+  const newest = runs[0]
+  const range =
+    oldest.startedAt === newest.startedAt
+      ? dayjs(newest.startedAt).format('MM-DD')
+      : `${dayjs(oldest.startedAt).format('MM-DD')} ~ ${dayjs(newest.startedAt).format('MM-DD')}`
+  const head = runsPagedAvailable.value
+    ? `共 ${runsTotal.value} 次排产，本页 ${runs.length} 次（${range}）`
+    : `最近 ${runs.length} 次排产（${range}）`
   return (
-    hits.sort((a, b) => new Date(b.startedAt).getTime() - new Date(a.startedAt).getTime())[0] ??
-    null
+    `${head}：` +
+    `完成 ${c.COMPLETED} · 部分成功 ${c.PARTIAL_SUCCESS} · 失败 ${c.FAILED} · 运行中 ${c.RUNNING}`
   )
-}
-
-const lastCompletedRun = computed(() => lastRunOf('COMPLETED'))
-const lastFailedRun = computed(() => lastRunOf('FAILED'))
-const lastPartialRun = computed(() => lastRunOf('PARTIAL_SUCCESS'))
-
-/** 完成率 = COMPLETED / 总数（PARTIAL_SUCCESS 不计入完成） */
-const completionRate = computed(() => {
-  const total = visibleRuns.value.length
-  const done = runStatusCounts.value.COMPLETED
-  if (!total) return { pct: 0, label: '0%', count: 0, total: 0 }
-  return {
-    pct: Math.round((done / total) * 100),
-    label: `${Math.round((done / total) * 100)}%`,
-    count: done,
-    total
-  }
 })
+
+/** 最近一次失败（失败原因悬停看全文） */
+const lastFailedRun = computed(
+  () => recentRunsSorted.value.find((r) => r.status === 'FAILED') ?? null
+)
 
 /* ===== 加载 ===== */
 function refresh(): void {
   runStore.load()
 }
 onMounted(refresh)
+
+/* ===== 批次记录翻页（服务端分页，3号位 2026-11-12 R4）===== */
+function handlePageChange(page: number): void {
+  runStore.changePage(page)
+}
+function handlePageSizeChange(size: number): void {
+  runStore.changePage(1, size)
+}
+
+/* ===== 出口按钮 =====
+ * - 「看异常解释」→ /aps/explanation（只读诊断页，路由级无写权限码）
+ * - 「去确认」→ /aps/candidate（需 aps.candidate.confirm，无权限则不显示按钮）
+ */
+const canConfirmCandidate = computed(() => apsAuth.has('aps.candidate.confirm'))
+
+function goExplanation(): void {
+  router.push('/aps/explanation')
+}
+
+function goCandidate(planVersionId?: number | null): void {
+  // 候选版本确认页已支持 `candidatePlanVersionId` 入参（Candidate.vue:85）⇒ 直接落到那一版的对比
+  if (planVersionId) {
+    router.push({
+      path: '/aps/candidate',
+      query: { candidatePlanVersionId: String(planVersionId) }
+    })
+    return
+  }
+  router.push('/aps/candidate')
+}
 
 /* ===== U19：FAILED Run 人工恢复 =====
  * 4号位文档第 15 节：必须调用「新建 ScheduleRun」，不能把 FAILED 改回 RUNNING
@@ -214,7 +497,7 @@ async function handleRecoverFailedRun(row: {
         confirmButtonText: '确认恢复',
         cancelButtonText: '取消',
         inputType: 'textarea',
-        inputPlaceholder: '例如：PI 位置数据已补齐，重新触发排程',
+        inputPlaceholder: '例如：生产指示位置数据已补齐，重新触发排程',
         inputValidator: (val: string) => (val && val.trim().length >= 4 ? true : '至少 4 个字符'),
         inputErrorMessage: '至少 4 个字符'
       }
@@ -256,18 +539,75 @@ async function handleRecoverFailedRun(row: {
       :title="`${e.section}加载失败：${e.message}`"
     />
 
-    <!-- ===== Run 状态 KPI ===== -->
-    <div class="kpi-row">
-      <div
-        v-for="item in kpiItems"
-        :key="item.key"
-        class="kpi-card"
-        :style="{ borderTopColor: item.color }"
-      >
-        <div class="kpi-label">{{ item.label }}</div>
-        <div class="kpi-value" :style="{ color: item.color }">{{ item.count }}</div>
-        <div class="kpi-ratio">最近 {{ visibleRuns.length }} 次排产</div>
-      </div>
+    <!-- ===== 主视图：最近一次排产 ===== -->
+    <ElCard class="hero-card">
+      <template #header>
+        <div class="panel-header">
+          <span class="hero-title">
+            最近一次排产
+            <template v-if="latestRun">
+              <span class="hero-runid">#{{ latestRun.id }}</span>
+              <ElTag :type="runStatusTag(latestRun.status)" size="small">
+                {{ runStatusLabel(latestRun.status) }}
+              </ElTag>
+            </template>
+          </span>
+          <div class="hero-actions">
+            <ElTooltip :content="scopeLabelHint" placement="bottom">
+              <span class="scope-label">{{ scopeLabelText }}</span>
+            </ElTooltip>
+            <ElButton :loading="loading" size="small" @click="refresh">
+              <Icon icon="vi-ep:refresh" /> 刷新
+            </ElButton>
+          </div>
+        </div>
+      </template>
+
+      <ElEmpty v-if="!latestRun" :description="emptyRunsText" />
+
+      <template v-else>
+        <div class="hero-fields">
+          <div v-for="f in heroFields" :key="f.label" class="hero-field">
+            <div class="hero-field-label">{{ f.label }}</div>
+            <ElTooltip v-if="f.hint" :content="f.hint" placement="top">
+              <div class="hero-field-value muted">{{ f.value }}</div>
+            </ElTooltip>
+            <div v-else class="hero-field-value">{{ f.value }}</div>
+          </div>
+        </div>
+
+        <div class="hero-domains">
+          <span class="hero-domains-label">排程域状态</span>
+          <span v-for="c in domainStatusSummary" :key="c.key" class="hero-chip" :class="c.cls">
+            <i class="chip-dot"></i>{{ c.label }} {{ c.count }}
+          </span>
+        </div>
+
+        <!-- 域级失败警示：批次还是「运行中」但域已经失败时，这里是唯一的抓手 -->
+        <div v-if="failedDomains.length" class="hero-warn">
+          <Icon icon="vi-mdi:alert-circle" class="warn-icon" />
+          <span class="warn-text">
+            本次排产有 {{ failedDomains.length }} 个排程域失败或被阻断：{{ failedDomainNames }}
+          </span>
+          <ElButton type="danger" link size="small" @click="goExplanation">
+            看异常解释 <Icon icon="vi-ep:arrow-right" />
+          </ElButton>
+        </div>
+      </template>
+    </ElCard>
+
+    <!-- ===== 批次统计（一行小字） ===== -->
+    <div class="batch-line">
+      <span class="batch-text">{{ batchSummaryText }}</span>
+      <span v-if="lastFailedRun" class="batch-failed">
+        最近一次失败
+        <ElTooltip
+          :content="lastFailedRun.errorMessage ?? '这条记录没有留下失败原因'"
+          placement="top"
+        >
+          <code class="code-tag">#{{ lastFailedRun.id }}</code>
+        </ElTooltip>
+      </span>
     </div>
 
     <!-- ===== 排程域状态拆解（最近一次 Run） ===== -->
@@ -285,23 +625,39 @@ async function handleRecoverFailedRun(row: {
       </template>
       <div v-if="!hasDomainStatuses" class="col-empty">{{ domainStatusEmptyText }}</div>
       <div v-else class="partial-grid">
-        <div v-for="g in domainStatusGroups" :key="g.label" class="partial-col" :class="g.cls">
+        <div v-for="g in domainStatusGroups" :key="g.key" class="partial-col" :class="g.cls">
           <div class="col-head">
             <span class="col-name">{{ g.label }}</span>
-            <ElTag
-              size="small"
-              :type="g.items.length ? domainStatusTag(g.items[0].status) : 'info'"
-            >
-              {{ g.items.length }}
-            </ElTag>
+            <ElTag size="small" :type="g.chip">{{ g.items.length }}</ElTag>
           </div>
           <div v-for="d in g.items" :key="d.domainKey" class="col-item">
-            <ElTag effect="light" :type="domainStatusTag(d.status)">
-              {{ humanLabel(d.domainKey) }}
-            </ElTag>
-            <span class="muted small">{{ domainStatusLabel(d.status) }}</span>
-            <span v-if="d.planVersionCode" class="muted small">{{ d.planVersionCode }}</span>
+            <div class="col-item-line">
+              <ElTag effect="light" :type="domainStatusTag(d.status)">
+                {{ humanLabel(d.domainKey) }}
+              </ElTag>
+              <span class="muted small">{{ domainStatusLabel(d.status) }}</span>
+              <span v-if="d.planVersionCode" class="muted small">{{ d.planVersionCode }}</span>
+              <ElTooltip v-if="d.reasonKind" :content="d.reasonKind.hint" placement="top">
+                <ElTag size="small" effect="plain" :type="d.reasonKind.tag">
+                  {{ d.reasonKind.label }}
+                </ElTag>
+              </ElTooltip>
+            </div>
+            <div class="col-item-meta">
+              <span>计划区间 {{ domainPlanHorizonText(d) }}</span>
+              <span>任务数 {{ d.totalTasks ?? '—' }}</span>
+            </div>
             <div v-if="d.reason" class="err-msg">{{ d.reason }}</div>
+            <div v-if="isIssueStatus(d.status)" class="col-actions">
+              <ElButton type="danger" link size="small" @click="goExplanation">
+                看异常解释 <Icon icon="vi-ep:arrow-right" />
+              </ElButton>
+            </div>
+            <div v-else-if="d.status === 'CANDIDATE' && canConfirmCandidate" class="col-actions">
+              <ElButton type="warning" link size="small" @click="goCandidate(d.planVersionId)">
+                去确认 <Icon icon="vi-ep:arrow-right" />
+              </ElButton>
+            </div>
           </div>
           <div v-if="!g.items.length" class="col-empty">无</div>
         </div>
@@ -317,18 +673,18 @@ async function handleRecoverFailedRun(row: {
         </div>
       </template>
       <ElTable v-if="recentRunsSorted.length" :data="recentRunsSorted" size="small" border stripe>
-        <ElTableColumn prop="id" label="批次" width="70" fixed="left" />
-        <ElTableColumn label="类型" width="100">
+        <ElTableColumn prop="id" label="批次" width="64" fixed="left" />
+        <ElTableColumn label="类型" width="92">
           <template #default="{ row }">{{ RUN_TYPE_LABEL[row.runType] }}</template>
         </ElTableColumn>
-        <ElTableColumn label="状态" width="100">
+        <ElTableColumn label="状态" width="88">
           <template #default="{ row }">
             <ElTag :type="runStatusTag(row.status)" size="small">
               {{ runStatusLabel(row.status) }}
             </ElTag>
           </template>
         </ElTableColumn>
-        <ElTableColumn label="排程域" width="170">
+        <ElTableColumn label="排程域" width="160">
           <template #default="{ row }">
             <template v-if="row.expectedDomainKeys?.length">
               <span v-for="dk in row.expectedDomainKeys" :key="dk">
@@ -340,22 +696,34 @@ async function handleRecoverFailedRun(row: {
             <span v-else class="muted">未登记</span>
           </template>
         </ElTableColumn>
-        <ElTableColumn label="触发来源" width="130">
+        <ElTableColumn label="触发来源" width="120">
           <template #default="{ row }">
-            <span class="muted">{{ row.triggeredBy ?? '-' }}</span>
+            <ElTooltip v-if="row.triggeredBy" :content="row.triggeredBy" placement="top">
+              <span class="muted">{{ triggerSourceLabel(row.triggeredBy) }}</span>
+            </ElTooltip>
+            <span v-else class="muted">—</span>
           </template>
         </ElTableColumn>
-        <ElTableColumn label="数据截止" width="140">
+        <ElTableColumn label="数据截止" width="120">
           <template #default="{ row }">
             <span class="muted">{{ dayjs(row.dataCutoffTime).format('MM-DD HH:mm') }}</span>
           </template>
         </ElTableColumn>
-        <ElTableColumn label="策略包版本" width="120">
+        <ElTableColumn label="策略包版本" width="110">
           <template #default="{ row }">
-            <span v-if="row.strategyProfileVersionId" class="muted code-tag">
-              {{ row.strategyProfileVersionId }}
-            </span>
-            <span v-else class="muted">-</span>
+            <template v-if="row.strategyProfileVersionId">
+              <span v-if="strategyProfileVersionCode(row.strategyProfileVersionId)" class="sp-code">
+                {{ strategyProfileVersionCode(row.strategyProfileVersionId) }}
+              </span>
+              <ElTooltip
+                v-else
+                :content="strategyProfileVersionMissingHint(row.strategyProfileVersionId)"
+                placement="top"
+              >
+                <span class="muted">—</span>
+              </ElTooltip>
+            </template>
+            <span v-else class="muted">未指定</span>
           </template>
         </ElTableColumn>
         <ElTableColumn label="耗时" width="80">
@@ -363,22 +731,24 @@ async function handleRecoverFailedRun(row: {
             <span class="muted">{{ runDuration(row) }}</span>
           </template>
         </ElTableColumn>
-        <ElTableColumn label="开始时间" width="140">
+        <ElTableColumn label="开始时间" width="120">
           <template #default="{ row }">{{ dayjs(row.startedAt).format('MM-DD HH:mm') }}</template>
         </ElTableColumn>
-        <ElTableColumn label="完成时间" width="140">
+        <ElTableColumn label="完成时间" width="120">
           <template #default="{ row }">
             <span v-if="row.completedAt">{{ dayjs(row.completedAt).format('MM-DD HH:mm') }}</span>
-            <span v-else class="muted">-</span>
+            <span v-else class="muted">—</span>
           </template>
         </ElTableColumn>
         <ElTableColumn label="错误信息" min-width="180">
           <template #default="{ row }">
-            <span v-if="row.errorMessage" class="err-cell">{{ row.errorMessage }}</span>
-            <span v-else class="muted">-</span>
+            <ElTooltip v-if="row.errorMessage" :content="row.errorMessage" placement="top">
+              <span class="err-cell">{{ row.errorMessage }}</span>
+            </ElTooltip>
+            <span v-else class="muted">—</span>
           </template>
         </ElTableColumn>
-        <ElTableColumn label="操作" width="130" fixed="right">
+        <ElTableColumn label="操作" width="120" fixed="right">
           <template #default="{ row }">
             <template v-if="row.status === 'FAILED'">
               <!-- 冻结语义：ExpectedDomainKeysJson 是恢复的唯一权威依据，缺了就不能恢复。
@@ -402,7 +772,7 @@ async function handleRecoverFailedRun(row: {
                 </span>
               </ElTooltip>
             </template>
-            <span v-else class="muted">-</span>
+            <span v-else class="muted">—</span>
           </template>
         </ElTableColumn>
       </ElTable>
@@ -410,152 +780,75 @@ async function handleRecoverFailedRun(row: {
         <ElEmpty description="加载中" />
       </div>
       <ElEmpty v-else description="暂无排产记录" />
+      <!-- 服务端分页（3号位 R4）；分页端点未部署时（降级到数组端点）不显示翻页控件 -->
+      <div v-if="runsPagedAvailable && runsTotal > 0" class="pager">
+        <ElPagination
+          :current-page="runsPage"
+          :page-size="runsPageSize"
+          :total="runsTotal"
+          :page-sizes="[20, 50, 100]"
+          layout="total, sizes, prev, pager, next"
+          background
+          @current-change="handlePageChange"
+          @size-change="handlePageSizeChange"
+        />
+      </div>
     </ElCard>
 
-    <!-- ===== 两列：当前生效版本 + 最近状态摘要 ===== -->
-    <div class="content-row">
-      <ElCard class="panel">
-        <template #header>
-          <div class="panel-header">
-            <span> 当前生效版本 </span>
-            <ElTag v-if="activeVersions.length" type="primary" size="small">
-              {{ activeVersions.length }} 排程域
+    <!-- ===== 当前生效版本 ===== -->
+    <ElCard class="panel">
+      <template #header>
+        <div class="panel-header">
+          <span> 当前生效版本 </span>
+          <ElTag v-if="activeVersions.length" type="primary" size="small">
+            {{ activeVersions.length }} 排程域
+          </ElTag>
+        </div>
+      </template>
+      <div v-if="!activeVersions.length" class="panel-empty">
+        <ElEmpty description="当前无生效版本" />
+      </div>
+      <div v-else class="version-list">
+        <div
+          v-for="v in activeVersions"
+          :key="v.planVersionId"
+          class="version-card"
+          :class="v.status.toLowerCase()"
+        >
+          <div class="version-head">
+            <span class="version-code">{{ v.versionCode }}</span>
+            <ElTag
+              :type="
+                v.status === 'ACTIVE'
+                  ? 'success'
+                  : v.status === 'CANDIDATE'
+                    ? 'warning'
+                    : v.status === 'FAILED'
+                      ? 'danger'
+                      : 'info'
+              "
+              size="small"
+            >
+              {{ planVersionStatusLabel(v.status) }}
             </ElTag>
           </div>
-        </template>
-        <div v-if="!activeVersions.length" class="panel-empty">
-          <ElEmpty description="当前无生效版本" />
+          <ElDescriptions :column="2" size="small" class="version-desc">
+            <ElDescriptionsItem label="排程域">{{ humanLabel(v.domainKey) }}</ElDescriptionsItem>
+            <ElDescriptionsItem label="激活时间">
+              {{ v.activatedAt ? dayjs(v.activatedAt).format('MM-DD HH:mm') : '—' }}
+            </ElDescriptionsItem>
+            <ElDescriptionsItem label="计划区间">
+              {{ dayjs(v.planHorizonStart).format('YYYY-MM-DD') }}
+              ~
+              {{ dayjs(v.planHorizonEnd).format('YYYY-MM-DD') }}
+            </ElDescriptionsItem>
+            <ElDescriptionsItem label="版本号">
+              <span class="code-tag">#{{ v.planVersionId }}</span>
+            </ElDescriptionsItem>
+          </ElDescriptions>
         </div>
-        <div v-else class="version-list">
-          <div
-            v-for="v in activeVersions"
-            :key="v.planVersionId"
-            class="version-card"
-            :class="v.status.toLowerCase()"
-          >
-            <div class="version-head">
-              <span class="version-code">{{ v.versionCode }}</span>
-              <ElTag
-                :type="
-                  v.status === 'ACTIVE'
-                    ? 'success'
-                    : v.status === 'CANDIDATE'
-                      ? 'warning'
-                      : v.status === 'FAILED'
-                        ? 'danger'
-                        : 'info'
-                "
-                size="small"
-              >
-                {{ planVersionStatusLabel(v.status) }}
-              </ElTag>
-            </div>
-            <ElDescriptions :column="2" size="small" class="version-desc">
-              <ElDescriptionsItem label="排程域">{{ humanLabel(v.domainKey) }}</ElDescriptionsItem>
-              <ElDescriptionsItem label="激活时间">
-                {{ v.activatedAt ? dayjs(v.activatedAt).format('MM-DD HH:mm') : '-' }}
-              </ElDescriptionsItem>
-              <ElDescriptionsItem label="计划区间">
-                {{ dayjs(v.planHorizonStart).format('YYYY-MM-DD') }}
-                ~
-                {{ dayjs(v.planHorizonEnd).format('YYYY-MM-DD') }}
-              </ElDescriptionsItem>
-              <ElDescriptionsItem label="版本号">
-                <span class="code-tag">#{{ v.planVersionId }}</span>
-              </ElDescriptionsItem>
-            </ElDescriptions>
-          </div>
-        </div>
-      </ElCard>
-
-      <ElCard class="panel">
-        <template #header>
-          <div class="panel-header">
-            <span> 最近状态摘要 </span>
-            <span class="hint-text">关键排产记录时间线</span>
-          </div>
-        </template>
-
-        <div
-          class="summary-rate"
-          :class="completionRate.pct >= 80 ? 'good' : completionRate.pct >= 50 ? 'mid' : 'bad'"
-        >
-          <div class="rate-num">{{ completionRate.label }}</div>
-          <div class="rate-sub">
-            完成率 · {{ completionRate.count }} / {{ completionRate.total }} 次排产
-          </div>
-        </div>
-
-        <ul class="summary-list">
-          <li class="summary-row">
-            <span class="row-label">
-              <Icon icon="vi-mdi:check-circle" class="row-icon good" />
-              最近完成
-            </span>
-            <span v-if="lastCompletedRun" class="row-val">
-              <code class="code-tag">#{{ lastCompletedRun.id }}</code>
-              <span class="muted">
-                {{
-                  dayjs(lastCompletedRun.completedAt ?? lastCompletedRun.startedAt).format(
-                    'MM-DD HH:mm'
-                  )
-                }}
-              </span>
-            </span>
-            <span v-else class="muted">无</span>
-          </li>
-
-          <li class="summary-row">
-            <span class="row-label">
-              <Icon icon="vi-mdi:alert-circle" class="row-icon bad" />
-              最近失败
-            </span>
-            <span v-if="lastFailedRun" class="row-val">
-              <code class="code-tag">#{{ lastFailedRun.id }}</code>
-              <ElTag size="small" type="danger" effect="light" class="err-mini">
-                {{ lastFailedRun.errorMessage?.slice(0, 24) ?? '-' }}
-              </ElTag>
-            </span>
-            <span v-else class="muted">无</span>
-          </li>
-
-          <li class="summary-row">
-            <span class="row-label">
-              <Icon icon="vi-mdi:alert" class="row-icon warn" />
-              最近部分成功
-            </span>
-            <span v-if="lastPartialRun" class="row-val">
-              <code class="code-tag">#{{ lastPartialRun.id }}</code>
-              <span class="muted">{{ dayjs(lastPartialRun.startedAt).format('MM-DD HH:mm') }}</span>
-            </span>
-            <span v-else class="muted">无</span>
-          </li>
-
-          <li class="summary-row">
-            <span class="row-label">
-              <Icon icon="vi-mdi:layers-triple" class="row-icon" />
-              生效版本
-            </span>
-            <span class="row-val">
-              <strong>{{ activeVersions.length }}</strong>
-              <span class="muted">排程域</span>
-            </span>
-          </li>
-
-          <li class="summary-row">
-            <span class="row-label">
-              <Icon icon="vi-mdi:refresh" class="row-icon" />
-              数据刷新
-            </span>
-            <span class="row-val">
-              <ElButton size="small" :loading="loading" @click="refresh">
-                <Icon icon="vi-ep:refresh" /> 刷新
-              </ElButton>
-            </span>
-          </li>
-        </ul>
-      </ElCard>
-    </div>
+      </div>
+    </ElCard>
   </div>
 </template>
 
@@ -566,45 +859,7 @@ async function handleRecoverFailedRun(row: {
   padding: 16px;
   background: #f5f7fa;
   flex-direction: column;
-  gap: 16px;
-}
-
-.kpi-row {
-  display: grid;
-  grid-template-columns: repeat(4, 1fr);
   gap: 12px;
-}
-
-.kpi-card {
-  padding: 14px 16px;
-  background: #fff;
-  border-top: 3px solid #94a3b8;
-  border-radius: 8px;
-  box-shadow: 0 1px 4px rgb(0 0 0 / 6%);
-
-  .kpi-label {
-    font-size: 12px;
-    color: #94a3b8;
-  }
-
-  .kpi-value {
-    margin-top: 4px;
-    font-size: 22px;
-    font-weight: 600;
-    color: #1e293b;
-  }
-
-  .kpi-ratio {
-    margin-top: 2px;
-    font-size: 11px;
-    color: #cbd5e1;
-  }
-}
-
-.content-row {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 16px;
 }
 
 .panel {
@@ -643,14 +898,181 @@ async function handleRecoverFailedRun(row: {
   font-size: 11px;
 }
 
-/* 排程域状态拆解四列 */
+/* 批次记录表分页条（服务端分页） */
+.pager {
+  display: flex;
+  justify-content: flex-end;
+  padding-top: 10px;
+}
+
+/* ===== 主视图卡 ===== */
+.hero-card {
+  border-radius: 8px;
+}
+
+.hero-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.scope-label {
+  font-size: 12px;
+  font-weight: 400;
+  color: #94a3b8;
+  cursor: default;
+  white-space: nowrap;
+}
+
+.hero-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.hero-runid {
+  font-family: 'Courier New', monospace;
+  font-size: 14px;
+  font-weight: 700;
+  color: #1e293b;
+}
+
+.hero-fields {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 12px 16px;
+}
+
+.hero-field-label {
+  font-size: 12px;
+  color: #94a3b8;
+}
+
+.hero-field-value {
+  margin-top: 2px;
+  font-size: 14px;
+  font-weight: 600;
+  color: #1e293b;
+}
+
+.hero-domains {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  padding-top: 12px;
+  margin-top: 12px;
+  border-top: 1px dashed #e2e8f0;
+}
+
+.hero-domains-label {
+  font-size: 12px;
+  color: #94a3b8;
+}
+
+.hero-chip {
+  display: inline-flex;
+  padding: 2px 10px;
+  font-size: 12px;
+  background: #f1f5f9;
+  border-radius: 10px;
+  align-items: center;
+  gap: 6px;
+
+  .chip-dot {
+    width: 7px;
+    height: 7px;
+    background: #94a3b8;
+    border-radius: 50%;
+  }
+
+  &.success {
+    color: #047857;
+    background: #ecfdf5;
+
+    .chip-dot {
+      background: #059669;
+    }
+  }
+
+  &.warning {
+    color: #b45309;
+    background: #fff7ed;
+
+    .chip-dot {
+      background: #f59e0b;
+    }
+  }
+
+  &.primary {
+    color: #1d4ed8;
+    background: #eff6ff;
+
+    .chip-dot {
+      background: #3b82f6;
+    }
+  }
+
+  &.danger {
+    color: #b91c1c;
+    background: #fef2f2;
+
+    .chip-dot {
+      background: #ef4444;
+    }
+  }
+}
+
+.hero-warn {
+  display: flex;
+  padding: 8px 12px;
+  margin-top: 10px;
+  font-size: 13px;
+  color: #b91c1c;
+  background: #fef2f2;
+  border: 1px solid #fecaca;
+  border-radius: 6px;
+  align-items: center;
+  gap: 8px;
+
+  .warn-icon {
+    font-size: 16px;
+  }
+
+  .warn-text {
+    flex: 1;
+  }
+}
+
+/* ===== 批次统计小字行 ===== */
+.batch-line {
+  display: flex;
+  padding: 8px 12px;
+  font-size: 12px;
+  color: #64748b;
+  background: #fff;
+  border: 1px solid #e2e8f0;
+  border-radius: 6px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.batch-failed {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+}
+
+/* ===== 排程域状态拆解（自适应列，空列自动收窄） ===== */
 .partial-card {
   border-radius: 8px;
 }
 
 .partial-grid {
   display: grid;
-  grid-template-columns: repeat(4, 1fr);
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
   gap: 14px;
 }
 
@@ -668,6 +1090,11 @@ async function handleRecoverFailedRun(row: {
   &.failed {
     background: #fef2f2;
     border-color: #fecaca;
+  }
+
+  &.candidate {
+    background: #fff7ed;
+    border-color: #fed7aa;
   }
 
   &.active {
@@ -698,6 +1125,27 @@ async function handleRecoverFailedRun(row: {
     margin-bottom: 6px;
     background: rgb(255 255 255 / 70%);
     border-radius: 4px;
+  }
+
+  .col-item-line {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+  }
+
+  /* 该域本次的计划区间 / 任务数（3号位 R1/R2） */
+  .col-item-meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+    margin-top: 4px;
+    font-size: 11px;
+    color: #64748b;
+  }
+
+  .col-actions {
+    margin-top: 4px;
   }
 
   .col-empty {
@@ -780,104 +1228,17 @@ async function handleRecoverFailedRun(row: {
   white-space: nowrap;
 }
 
+.sp-code {
+  font-size: 12px;
+  font-weight: 600;
+  color: #1e293b;
+}
+
 .code-tag {
   padding: 1px 6px;
   font-family: 'Courier New', monospace;
   font-size: 11px;
   background: #f1f5f9;
   border-radius: 3px;
-}
-
-/* 最近状态摘要 */
-.summary-rate {
-  padding: 12px 16px;
-  margin-bottom: 12px;
-  border-radius: 6px;
-
-  &.good {
-    background: #ecfdf5;
-    border: 1px solid #a7f3d0;
-  }
-
-  &.mid {
-    background: #fff7ed;
-    border: 1px solid #fed7aa;
-  }
-
-  &.bad {
-    background: #fef2f2;
-    border: 1px solid #fecaca;
-  }
-
-  .rate-num {
-    font-family: 'Courier New', monospace;
-    font-size: 26px;
-    font-weight: 700;
-    color: #1e293b;
-  }
-
-  .rate-sub {
-    margin-top: 2px;
-    font-size: 12px;
-    color: #64748b;
-  }
-}
-
-.summary-list {
-  padding: 0;
-  margin: 0 0 12px;
-  list-style: none;
-}
-
-.summary-row {
-  display: flex;
-  padding: 6px 4px;
-  font-size: 13px;
-  border-bottom: 1px dashed #e2e8f0;
-  align-items: center;
-  justify-content: space-between;
-
-  &:last-child {
-    border-bottom: none;
-  }
-
-  .row-label {
-    display: inline-flex;
-    font-size: 12px;
-    color: #64748b;
-    align-items: center;
-    gap: 6px;
-  }
-
-  .row-val {
-    display: inline-flex;
-    font-size: 12px;
-    color: #1e293b;
-    align-items: center;
-    gap: 6px;
-  }
-
-  .row-icon {
-    font-size: 14px;
-
-    &.good {
-      color: #059669;
-    }
-
-    &.bad {
-      color: #ef4444;
-    }
-
-    &.warn {
-      color: #f59e0b;
-    }
-  }
-
-  .err-mini {
-    max-width: 130px;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
 }
 </style>

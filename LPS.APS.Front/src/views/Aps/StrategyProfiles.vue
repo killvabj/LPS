@@ -54,17 +54,20 @@ import {
   STRATEGY_STATUS_META,
   STRATEGY_VERSION_STATUSES,
   STRATEGY_V1_REACHABLE_STATUSES,
+  NO_VERSION_LABEL,
+  type StrategyProfileListRowDto,
   type StrategyProfileVersionDto,
   type StrategyVersionDraftInput,
   type StrategyVersionStatus
 } from '@/api/aps-v1'
 import { useStrategyProfileStore } from '@/store/modules/aps/strategyProfile'
+import { formatEffectiveFrom, formatEffectiveTo } from '@/utils/effectiveWindow'
 import StrategyDraftDialog from './components/StrategyDraftDialog.vue'
 import StrategyDiffPanel from './components/StrategyDiffPanel.vue'
 
 const store = useStrategyProfileStore()
 const {
-  visibleProfiles,
+  visibleProfileRows,
   showInactive,
   inactiveCount,
   selectedProfileId,
@@ -92,9 +95,10 @@ const {
 
 async function loadAll(): Promise<void> {
   await store.loadProfiles()
-  // 默认选中第一个可见 Profile（默认视图不含停用行，选中隐藏行会出现「左无行、右有内容」）
-  if (selectedProfileId.value === null && visibleProfiles.value.length > 0) {
-    await selectProfile(visibleProfiles.value[0].id)
+  // 默认选中第一个可见行（一版一行：行 = 某策略包的某个版本）
+  // （默认视图不含停用行，选中隐藏行会出现「左无行、右有内容」）
+  if (selectedProfileId.value === null && visibleProfileRows.value.length > 0) {
+    await selectProfileRow(visibleProfileRows.value[0])
   }
 }
 
@@ -105,6 +109,25 @@ onMounted(loadAll)
 async function selectProfile(profileId: number): Promise<void> {
   store.selectProfile(profileId)
   await store.loadVersions(profileId)
+}
+
+/** 刷新当前策略包的版本列表（保持当前选中的版本） */
+async function reloadVersions(): Promise<void> {
+  const id = selectedProfileId.value
+  if (id === null) return
+  const keep = currentVersion.value?.id
+  await store.loadVersions(id)
+  if (keep != null) store.selectVersion(keep)
+}
+
+/**
+ * 选中列表里的一行（一版一行 ⇒ 同时选中该策略包 + 该版本）
+ *
+ * 2026-11-11：左栏列表源改为「主子表联查·一版一行」后，同族多个版本各占一行；
+ * 点哪一行就选中哪一版，右侧版本表格随之定位到该版本。
+ */
+async function selectProfileRow(row: StrategyProfileListRowDto): Promise<void> {
+  await store.selectProfileRow(row)
 }
 
 function selectVersion(versionId: number): void {
@@ -152,7 +175,7 @@ function openCreateDraft(): void {
     return
   }
   if (!currentProfile.value) {
-    ElMessage.warning('请先选择求解器策略')
+    ElMessage.warning('请先选择一个策略包')
     return
   }
   draftMode.value = 'create'
@@ -360,8 +383,16 @@ async function onDeleteProfile(): Promise<void> {
 
 /* ==================== Validate ==================== */
 
+/** 只有还能发布的版本才谈得上「发布前校验」。
+ *  已发布 / 已退役版本点校验，后端必然回 INVALID_STATUS（版本状态不可发布）
+ *  ⇒ 按钮直接置灰并说明原因，别让用户以为是自己配错了（2026-11-09 实看发现）。 */
+const VALIDATABLE_STATUSES: readonly StrategyVersionStatus[] = ['DRAFT', 'SUBMITTED', 'APPROVED']
+const canValidateCurrent = computed(
+  () => !!currentVersion.value && VALIDATABLE_STATUSES.includes(currentVersion.value.status)
+)
+
 async function onValidate(): Promise<void> {
-  if (!currentVersion.value) return
+  if (!currentVersion.value || !canValidateCurrent.value) return
   await store.validateDraft(currentVersion.value.id)
 }
 
@@ -505,7 +536,7 @@ const statusTagEffect = (s: StrategyVersionStatus): 'light' | 'dark' | 'plain' |
         <h2 class="page-title">策略包版本</h2>
         <span class="page-subtitle">策略包与版本维护（草稿 / 发布 / 默认版本 / 版本对比）</span>
       </div>
-      <ElButton @click="loadAll" :loading="listLoading">刷新求解器策略列表</ElButton>
+      <ElButton @click="loadAll" :loading="listLoading">刷新策略包列表</ElButton>
     </div>
 
     <!-- 错误条 -->
@@ -550,24 +581,58 @@ const statusTagEffect = (s: StrategyVersionStatus): 'light' | 'dark' | 'plain' |
               </div>
             </div>
           </template>
-          <template v-if="visibleProfiles.length === 0 && !listLoading">
+          <template v-if="visibleProfileRows.length === 0 && !listLoading">
             <ElEmpty description="暂无策略包" :image-size="80" />
           </template>
           <div v-else class="profile-list">
+            <!--
+              一版一行（2026-11-11）：左栏一行 = 某个策略包的**某个版本**，
+              点哪一行就选中该策略包 + 该版本；没有版本的主表补一行「未配版本」。
+            -->
             <div
-              v-for="p in visibleProfiles"
-              :key="p.id"
-              :class="['profile-card', { active: selectedProfileId === p.id }]"
-              @click="selectProfile(p.id)"
+              v-for="p in visibleProfileRows"
+              :key="p.rowKey"
+              :class="[
+                'profile-card',
+                {
+                  active:
+                    selectedProfileId === p.strategyProfileId &&
+                    (p.versionId == null || p.versionId === currentVersion?.id)
+                }
+              ]"
+              @click="selectProfileRow(p)"
             >
               <div class="profile-card-head">
                 <code class="profile-code">{{ p.strategyProfileCode }}</code>
                 <ElTag v-if="!p.isActive" size="small" type="info">停用</ElTag>
+                <ElTag
+                  v-if="p.hasVersion && p.versionStatus"
+                  :type="statusTagType(p.versionStatus)"
+                  :effect="statusTagEffect(p.versionStatus)"
+                  size="small"
+                >
+                  {{ STRATEGY_STATUS_META[p.versionStatus].label }}
+                </ElTag>
+                <ElTag v-else size="small" type="info">{{ NO_VERSION_LABEL }}</ElTag>
               </div>
               <div class="profile-name">{{ p.strategyProfileName }}</div>
+              <!-- 版本码单独一行（与编码并列时，长编码会把右侧标签挤出可视区） -->
+              <div class="profile-ver-line">
+                <code class="profile-ver">{{ p.versionCode || NO_VERSION_LABEL }}</code>
+                <ElTooltip
+                  v-if="p.isDefault"
+                  content="默认版本：夜班排产使用这一个"
+                  placement="top"
+                >
+                  <ElTag size="small" type="warning" effect="dark">★</ElTag>
+                </ElTooltip>
+              </div>
               <div class="profile-meta">
                 <span class="profile-run-type">{{ p.runType ?? '—' }}</span>
-                <span class="profile-time">创建于 {{ formatDateTime(p.createdAt) }}</span>
+                <span class="profile-time">
+                  {{ p.publishedAt ? '发布于' : '创建于' }}
+                  {{ formatDateTime(p.publishedAt ?? p.createdAt) }}
+                </span>
               </div>
               <div v-if="p.description" class="profile-desc">{{ p.description }}</div>
             </div>
@@ -676,11 +741,7 @@ const statusTagEffect = (s: StrategyVersionStatus): 'light' | 'dark' | 'plain' |
               <div class="card-head">
                 <span class="card-title">版本列表（{{ versions.length }}）</span>
                 <div>
-                  <ElButton
-                    size="small"
-                    @click="selectProfile(currentProfile.id)"
-                    :loading="versionsLoading"
-                  >
+                  <ElButton size="small" @click="reloadVersions" :loading="versionsLoading">
                     刷新
                   </ElButton>
                 </div>
@@ -690,7 +751,9 @@ const statusTagEffect = (s: StrategyVersionStatus): 'light' | 'dark' | 'plain' |
               :data="versions"
               v-loading="versionsLoading"
               border
+              row-key="id"
               highlight-current-row
+              :current-row-key="currentVersion?.id"
               @row-click="(row: StrategyProfileVersionDto) => selectVersion(row.id)"
             >
               <ElTableColumn type="index" label="#" width="50" />
@@ -712,7 +775,13 @@ const statusTagEffect = (s: StrategyVersionStatus): 'light' | 'dark' | 'plain' |
               </ElTableColumn>
               <ElTableColumn label="默认" width="60" align="center">
                 <template #default="{ row }: { row: StrategyProfileVersionDto }">
-                  <ElTag v-if="row.isDefault" size="small" type="warning" effect="dark">★</ElTag>
+                  <ElTooltip
+                    v-if="row.isDefault"
+                    content="默认版本：夜班排产使用这一个"
+                    placement="top"
+                  >
+                    <ElTag size="small" type="warning" effect="dark">★</ElTag>
+                  </ElTooltip>
                   <span v-else>—</span>
                 </template>
               </ElTableColumn>
@@ -804,7 +873,25 @@ const statusTagEffect = (s: StrategyVersionStatus): 'light' | 'dark' | 'plain' |
                   <code class="code-tag">{{ currentVersion.versionCode }}</code>
                 </span>
                 <div class="card-head-actions">
-                  <ElButton size="small" @click="onValidate" :loading="validating">校验</ElButton>
+                  <ElTooltip
+                    :content="
+                      canValidateCurrent
+                        ? '按当前绑定校验能否发布'
+                        : '只有草稿 / 待审 / 已批准版本需要校验；已发布或已退役版本不能发布'
+                    "
+                    placement="top"
+                  >
+                    <span>
+                      <ElButton
+                        size="small"
+                        :disabled="!canValidateCurrent"
+                        @click="onValidate"
+                        :loading="validating"
+                      >
+                        校验
+                      </ElButton>
+                    </span>
+                  </ElTooltip>
                   <ElButton size="small" @click="loadTrace">追溯</ElButton>
                 </div>
               </div>
@@ -835,9 +922,11 @@ const statusTagEffect = (s: StrategyVersionStatus): 'light' | 'dark' | 'plain' |
               <ElDescriptionsItem label="参数集版本">{{
                 currentVersion.parameterSetVersionCode ?? '—'
               }}</ElDescriptionsItem>
-              <ElDescriptionsItem label="生效窗口">
-                {{ formatDateTime(currentVersion.effectiveFrom) }} ~
-                {{ formatDateTime(currentVersion.effectiveTo) }}
+              <ElDescriptionsItem label="生效起">
+                {{ formatEffectiveFrom(currentVersion.effectiveFrom) }}
+              </ElDescriptionsItem>
+              <ElDescriptionsItem label="生效止">
+                {{ formatEffectiveTo(currentVersion.effectiveTo, currentVersion.status) }}
               </ElDescriptionsItem>
               <ElDescriptionsItem label="创建人 / 时间">
                 {{ currentVersion.createdBy ?? '—' }} /
@@ -1095,7 +1184,7 @@ const statusTagEffect = (s: StrategyVersionStatus): 'light' | 'dark' | 'plain' |
       :close-on-press-escape="!actionRunning"
     >
       <ElForm label-width="100px">
-        <ElFormItem label="求解器策略">
+        <ElFormItem label="策略包">
           <span class="d-val">{{ currentProfile?.strategyProfileCode ?? '—' }}</span>
         </ElFormItem>
         <ElFormItem label="版本号">
@@ -1141,7 +1230,7 @@ const statusTagEffect = (s: StrategyVersionStatus): 'light' | 'dark' | 'plain' |
       :close-on-press-escape="!actionRunning"
     >
       <ElForm label-width="100px">
-        <ElFormItem label="求解器策略">
+        <ElFormItem label="策略包">
           <span class="d-val">{{ currentProfile?.strategyProfileCode ?? '—' }}</span>
         </ElFormItem>
         <ElFormItem label="版本号">
@@ -1227,6 +1316,20 @@ const statusTagEffect = (s: StrategyVersionStatus): 'light' | 'dark' | 'plain' |
   justify-content: space-between;
   align-items: center;
   margin-bottom: 4px;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+/* 一版一行：版本码单独一行 */
+.profile-ver-line {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 4px;
+}
+.profile-ver {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  color: var(--el-text-color-secondary);
 }
 .profile-code {
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;

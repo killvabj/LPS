@@ -17,7 +17,7 @@
  *
  * 菜单分组（10-16 4号位）：本文件全部是 **6 个顶级节点**，侧边栏渲染为 6 个一级菜单：
  *   ① /aps             APS 排产 —— 只留 4 个直达页：排产总览 / 甘特图/资源计划 / 异常与原因解释 / 审计日志
- *   ② /aps-demand      需求与供给     订单/需求计划 · 人工到货时间 · PI位置 · 需求保护释放
+ *   ② /aps-demand      需求与供给     订单/需求计划 · 人工到货时间 · 生产指示位置 · 需求保护释放
  *   ③ /aps-execution   排产执行       插单评估 · 候选版本确认 · 运行与下发
  *   ④ /aps-master-data 基础数据与日历  排程域定义维护 · 工艺规划模式 · 资源日历维护 · 上级工作日历
  *   ⑤ /strategy-config 策略配置 —— 汇进同一份 FrozenStrategySnapshot 的 8 页，
@@ -138,7 +138,7 @@ export const apsV1Routes: AppRouteRecordRaw[] = [
    *  - 本组 4 页 URL 仍是 /aps/xxx（绝对路径 ⇒ 老书签 / router.push / verify-rbac 断言零改动），
    *    壳 path='/aps-demand' 只是菜单分组，不是页面
    *  - 组内顺序 = 使用顺序：订单/需求计划（输入单据）→ 人工到货时间（供给 ETA 修正）
-   *    → PI位置（PI 剩余量在哪）→ 需求保护释放（冻结需求的释放通道）
+   *    → 生产指示位置（这批货现在在哪个位置）→ 需求保护释放（冻结需求的释放通道）
    * ⚠️ 父分组**故意不挂** apsRequiredPermissions：guard.ts:72 判无权限码即放行，
    *    菜单本就不按权限过滤，越权在点进子页时由子路由守卫拦 /403。
    */
@@ -186,10 +186,11 @@ export const apsV1Routes: AppRouteRecordRaw[] = [
         component: () => import('@/views/Aps/Pi.vue'),
         name: 'ApsPi',
         meta: {
-          // 2026-10-17 改名：原「供给来源追溯」是自拟名，冻结文档零命中；
-          // 权威中文名取冻结 07 v5.1.13:4042「ProductionInstructionPositionSnapshot（PI位置最小快照表）」
-          // 与 01 号「第七部分 PI选择与PI位置」。供给构成整块下线后本页就是 PI 位置页。
-          title: 'PI位置',
+          // 2026-10-17 改名：原「供给来源追溯」是自拟名，冻结文档零命中。
+          // 2026-11-12 再改：去掉字母「PI」（工厂用户看不懂缩写），
+          // 中文名取冻结 01:567「生产指示位置计算」/ 01:786「生产指示位置可能事实包」，
+          // 与 07:4042「ProductionInstructionPositionSnapshot（生产指示位置最小快照表）」同源。
+          title: '生产指示位置',
           icon: 'vi-mdi:package-variant-closed',
           stage: 'D',
           acceptance: 'U16',

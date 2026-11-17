@@ -68,6 +68,62 @@ const ENUM_OPTIONS: Partial<Record<BlockKey, Record<string, readonly ParameterEn
   }
 }
 
+/* ===== 字符串值域（值本身是英文码，不是数字序号）=====
+ * 与上面的数字枚举是两回事：这些字段在块 JSON 里存的就是字符串 / 字符串数组
+ * （如 `Trigger.ProtectedOrderTypes: ["SALES_ORDER"]`）。
+ *
+ * 为什么必须由前端兜住值域：后端**发布校验不拦**这些值，只在运行期按 Ordinal 精确比
+ * （`DemandProtectionTriggerEvaluator.cs:170` 客户等级等值 / `:184` 订单类型集合包含
+ *  / `:197` 成熟度集合包含）⇒ 填错一个字母、填中文、填旧别名，都是「配了但不命中」，
+ * 而且**没有任何报错**。自由文本框挡不住 ⇒ 页面只给下拉。
+ */
+
+/** 字符串值域的候选项 */
+export interface ParameterStringOption {
+  /** 中文展示名（用户看到的就是这个） */
+  label: string
+  /** 写回 JSON 的英文码（必须与实库原值逐字相同） */
+  value: string
+}
+
+export interface ParameterStringDomain {
+  /** 候选项 */
+  options: readonly ParameterStringOption[]
+  /** 允许手填（值域可能随源字典扩展；手填的值照样写回 JSON） */
+  allowCustom?: boolean
+}
+
+/**
+ * 订单类型（实库 `Order.OrderType` 原值，`OrderQueryDtos.cs:24`）
+ *
+ * ⚠️ 旧别名 `SO` / `WO` **不在值域里**：规则集侧为兼容存量把它们放行
+ * （`prioritySegmentEditor.ts:67`），但需求保护是 Ordinal 精确匹配 ⇒ 填 SO 永不命中。
+ */
+const ORDER_TYPE_OPTIONS: readonly ParameterStringOption[] = [
+  { value: 'SALES_ORDER', label: '客户订单（SALES_ORDER）' },
+  { value: 'PRODUCTION_INSTRUCTION', label: '生产指示（PRODUCTION_INSTRUCTION）' }
+]
+
+/** 客户等级（2号位 2026-11-06 校准收敛为 VIP / GENERAL；旧 A/B/C、KEY_ACCOUNT/STANDARD 不再是合法维护值） */
+const CUSTOMER_TIER_OPTIONS: readonly ParameterStringOption[] = [
+  { value: 'VIP', label: 'VIP' },
+  { value: 'GENERAL', label: '一般（GENERAL）' }
+]
+
+/** 需求成熟度（`FrozenStrategySnapshot.cs:193` 枚举：事前确认 PRE_CONFIRMED / 预测 FORECAST） */
+const DEMAND_MATURITY_OPTIONS: readonly ParameterStringOption[] = [
+  { value: 'PRE_CONFIRMED', label: '事前确认（PRE_CONFIRMED）' },
+  { value: 'FORECAST', label: '预测（FORECAST）' }
+]
+
+const STRING_DOMAINS: Partial<Record<BlockKey, Record<string, ParameterStringDomain>>> = {
+  lock: {
+    'Trigger.VipTierValue': { options: CUSTOMER_TIER_OPTIONS, allowCustom: true },
+    'Trigger.ProtectedOrderTypes': { options: ORDER_TYPE_OPTIONS },
+    'Trigger.MaturityStatusValues': { options: DEMAND_MATURITY_OPTIONS }
+  }
+}
+
 /* ===== 数值区间（SolverStrategyValidator 发布前校验口径） ===== */
 
 const NUMBER_LIMITS: Partial<Record<BlockKey, Record<string, ParameterNumberLimits>>> = {
@@ -92,4 +148,12 @@ export function lookupParameterLimits(
   path: readonly string[]
 ): ParameterNumberLimits | undefined {
   return NUMBER_LIMITS[block]?.[path.join('.')]
+}
+
+/** 字符串值域（字段有值域 ⇒ 页面渲染下拉，不给自由文本） */
+export function lookupParameterStringDomain(
+  block: BlockKey,
+  path: readonly string[]
+): ParameterStringDomain | undefined {
+  return STRING_DOMAINS[block]?.[path.join('.')]
 }

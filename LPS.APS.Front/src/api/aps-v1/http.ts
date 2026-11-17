@@ -218,13 +218,30 @@ function createInstance(): AxiosInstance {
   return instance
 }
 
-/** 跳登录页（避免循环依赖，直接用 window.location 防 router 未就绪） */
+/**
+ * 当前 hash 路由路径（含 query），如 '/aps/run?x=1'。
+ *
+ * ⚠️ 本项目路由是 **hash 模式**（`src/router/index.ts` 用 `createWebHashHistory`），
+ *    所以 `location.pathname` 恒为 '/'，真实路由在 `location.hash` 里。
+ *    早前这里按 pathname 拼 URL（`/login?redirect=...`）⇒ 浏览器把它当**服务器真实路径**去请求，
+ *    dev 下被 vite 的 SPA 回退兜住（看不出问题），部署到 IIS 上没有该文件、也没配 SPA 回退
+ *    ⇒ 用户看到 IIS 的「404 - File or directory not found」（登录过期即触发）。
+ */
+function currentRoutePath(): string {
+  const h = window.location.hash ?? ''
+  if (h.startsWith('#') && h.length > 1) return h.slice(1)
+  return window.location.pathname + window.location.search
+}
+
+/** 跳登录页（避免循环依赖，直接用 window.location 防 router 未就绪）
+ *  hash 模式 ⇒ 必须带 '#'，否则会被 Web 服务器当成真实路径去请求（生产 404）。 */
 function redirectToLogin(): void {
+  if (typeof window === 'undefined') return
+  const cur = currentRoutePath()
   // 当前不在登录页才跳
-  if (typeof window !== 'undefined' && !window.location.pathname.startsWith('/login')) {
-    const returnUrl = encodeURIComponent(window.location.pathname + window.location.search)
-    window.location.href = `/login?redirect=${returnUrl}`
-  }
+  if (cur.startsWith('/login')) return
+  const returnUrl = encodeURIComponent(cur)
+  window.location.href = `${import.meta.env.BASE_URL}#/login?redirect=${returnUrl}`
 }
 
 /** 出错时给用户看的大白话（不把 axios 英文原文 / 状态码摆到页面上）
@@ -242,14 +259,14 @@ function plainErrorMessage(err: AxiosError, status?: number): { message: string;
   return { message: '网络连接失败，请检查网络后重试', code: 0 }
 }
 
-/** 跳错误页（避免在 router 未就绪时拿不到 push，用 window.location） */
+/** 跳错误页（避免在 router 未就绪时拿不到 push，用 window.location）
+ *  hash 模式 ⇒ 必须带 '#'（同 redirectToLogin：不带会被服务器当真实路径，生产 404）。 */
 function redirectToError(code: 403 | 404 | 500): void {
   if (typeof window === 'undefined') return
-  const cur = window.location.pathname
   const target = `/${code}`
-  if (cur === target) return
+  if (currentRoutePath().startsWith(target)) return
   // 500 用 replace 避免返回栈污染；500 是系统级错误，用户点返回会回到错状态
-  window.location.replace(target)
+  window.location.replace(`${import.meta.env.BASE_URL}#${target}`)
 }
 
 /** 全局单例（用于普通业务请求） */

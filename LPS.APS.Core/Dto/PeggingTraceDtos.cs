@@ -74,6 +74,16 @@ public sealed class PeggingTraceSummaryDto
 }
 
 /// <summary>
+/// 供需追溯筛选后总数（**R2.1，11-14 4号位件**，形状 B=并列 count 端点）：
+/// 与列表端点**同名同义全部筛选参数 + 同一条 WHERE 文本**（含数据范围 DemandFactoryCode），
+/// 即「当前账号 + 当前筛选条件下」的准确总条数；与 /summary 的 totalAllocations 同源后二者应相等。
+/// </summary>
+public sealed class PeggingTraceCountDto
+{
+    public int Total { get; init; }
+}
+
+/// <summary>
 /// SupplyType统计
 /// </summary>
 public sealed class SupplyTypeCountDto

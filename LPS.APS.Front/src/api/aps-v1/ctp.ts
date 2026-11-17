@@ -186,12 +186,17 @@ const mockCtpResult = (input: CtpInput): CtpResultDto => {
 }
 
 export const ctpApi = {
-  /** CTP 评估（页面 4，U11/Purpose=CTP 不可"采用"，仅展示结果） */
+  /** CTP 评估（页面 4，U11/Purpose=CTP 不可"采用"，仅展示结果）
+   *  - ⚠️ `silent: true`：后端在试算能力未接入时回 **501**，报文里带内部归属说明
+   *    （"…核心能力由 1号位/2号位 接入，暂未开放"）。http 层默认会把这个报文直接弹成全局
+   *    ElMessage ⇒ 工厂用户会看到内部协同话术。此处静音，由页面自己翻成大白话提示。
+   */
   async evaluate(input: CtpInput): Promise<CtpResultDto> {
     if (APS_USE_MOCK) return mockCtpResult(input)
     return apsHttp.post<CtpResultDto>({
       url: '/api/ctp/evaluate',
-      data: input
+      data: input,
+      silent: true
     })
   }
 }

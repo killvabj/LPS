@@ -22,7 +22,9 @@ import { lookupBinding, hasBinding } from './parameterSetBindings'
 import {
   lookupParameterEnum,
   lookupParameterLimits,
-  type ParameterEnumOption
+  lookupParameterStringDomain,
+  type ParameterEnumOption,
+  type ParameterStringDomain
 } from './parameterSetEnums'
 import {
   findBlockField,
@@ -55,6 +57,8 @@ export interface ParameterRow {
   hint?: string
   /** 内容层枚举可选项（有值时渲染下拉；value 是写回 JSON 的数字序号） */
   options?: readonly ParameterEnumOption[]
+  /** 字符串值域（订单类型 / 客户等级 / 需求成熟度…；有值时渲染下拉而非自由文本） */
+  stringDomain?: ParameterStringDomain
   /** 数值边界（后端发布校验口径；有值时 ElInputNumber 夹住） */
   min?: number
   max?: number
@@ -103,6 +107,7 @@ export function flattenBlocks(blocks: ParameterSetBlocks): ParameterRow[] {
           type: isTextList ? 'TEXT_LIST' : 'STRING',
           label: def?.label,
           hint: def?.hint,
+          stringDomain: lookupParameterStringDomain(block, path),
           inert: isInertBlockField(block, keyPath),
           hidden,
           fixed,
@@ -121,6 +126,7 @@ export function flattenBlocks(blocks: ParameterSetBlocks): ParameterRow[] {
         label: def?.label,
         hint: def?.hint,
         options: lookupParameterEnum(block, path),
+        stringDomain: lookupParameterStringDomain(block, path),
         min: limits.min,
         max: limits.max,
         step: def?.step,

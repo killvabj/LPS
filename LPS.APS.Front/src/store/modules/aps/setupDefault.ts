@@ -153,6 +153,24 @@ export const useSetupDefaultStore = defineStore('aps.setupDefault', () => {
     }
   }
 
+  /**
+   * 切换一条规则的启停（工作簿 #67）。
+   *
+   * 后端只有 PUT（无 PATCH / 启停专用端点），且入参 `IsActive` 默认 `true`
+   * ⇒ 必须把该行**完整**回传：漏字段既会重置其它值，也会把停用规则悄悄复活。
+   */
+  async function setRuleActive(rule: SetupRuleDto, active: boolean): Promise<boolean> {
+    return updateRule(rule.id, {
+      ruleSetVersionId: rule.ruleSetVersionId,
+      productionDepartmentId: rule.productionDepartmentId,
+      stageCode: rule.stageCode,
+      operationCode: rule.operationCode,
+      resourceId: rule.resourceId,
+      setupMinutes: rule.setupMinutes,
+      isActive: active
+    })
+  }
+
   /** 删除 DEFAULT 规则（需 edit 权限 + DRAFT 状态） */
   async function deleteRule(id: number): Promise<boolean> {
     if (!canWrite.value) {
@@ -216,6 +234,7 @@ export const useSetupDefaultStore = defineStore('aps.setupDefault', () => {
     loadRules,
     createRule,
     updateRule,
+    setRuleActive,
     deleteRule,
     handleError,
     reset

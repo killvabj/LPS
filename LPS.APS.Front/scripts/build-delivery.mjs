@@ -15,8 +15,8 @@
  *      必须 `MSYS_NO_PATHCONV=1`；本脚本用 node spawn 传参数数组，**不经过 shell，无此问题**。
  *
  * 用法：
- *   node scripts/build-delivery.mjs                        # 基址取默认 http://10.116.2.75:8081
- *   node scripts/build-delivery.mjs --api http://10.116.2.75:8081
+ *   node scripts/build-delivery.mjs                        # 基址取 .env.pro 的 VITE_APS_API_BASE_URL
+ *   node scripts/build-delivery.mjs --api http://10.116.2.75:8081   # 临时覆盖基址
  *   node scripts/build-delivery.mjs --out 我的包.zip
  *   node scripts/build-delivery.mjs --no-mirror             # 不同步 lps/LPS.APS.Front/dist-pro
  *
@@ -34,7 +34,27 @@ const ROOT = join(__dirname, '..')
 const DIST = join(ROOT, 'dist-pro')
 const MIRROR = join(ROOT, '..', 'lps', 'LPS.APS.Front', 'dist-pro')
 
-const DEFAULT_API = 'http://10.116.2.75:8081'
+const ENV_PRO = join(ROOT, '.env.pro')
+
+/**
+ * 从 .env.pro 里读 VITE_APS_API_BASE_URL（去引号、去行尾注释）。
+ *
+ * 为什么默认基址要「从文件读」而不是写死在本脚本里：
+ *   写死会出现**两个真相源** —— 本脚本的常量与 .env.pro 的值各说各话。
+ *   本脚本每次构建都会注入 process.env，而 vite 的 loadEnv 里 **process.env 优先于文件值**
+ *   ⇒ 你改了 .env.pro 却用本脚本出包时，脚本的旧值会**静默盖掉**你的修改。
+ *   统一成「.env.pro 是唯一真相源」后：改地址只改 .env.pro 一处；
+ *   临时换服务器仍可用 --api 覆盖（process.env 依然优先）。
+ */
+function readApiFromEnvPro() {
+  if (!existsSync(ENV_PRO)) return ''
+  const m = readFileSync(ENV_PRO, 'utf8').match(/^\s*VITE_APS_API_BASE_URL\s*=\s*(.+?)\s*$/m)
+  if (!m) return ''
+  return m[1].replace(/^["']|["']$/g, '').trim()
+}
+
+/** 默认基址：.env.pro 优先，读不到才退回历史值（兜底，防止 .env.pro 被改坏时无基址可用） */
+const DEFAULT_API = readApiFromEnvPro() || 'http://10.116.2.75:8081'
 
 /**
  * mock 检查分两档：
@@ -85,7 +105,7 @@ function countHits(dir, token) {
 
 // ---------------------------------------------------------------- 0. 前置检查
 step('0. 前置检查')
-const envPro = join(ROOT, '.env.pro')
+const envPro = ENV_PRO
 if (!existsSync(envPro)) {
   console.error('  [FAIL] 找不到 .env.pro，无法确认构建模式')
   process.exit(1)
@@ -104,7 +124,7 @@ if (!existsSync(join(ROOT, 'node_modules'))) {
 if (!/^https?:\/\/.+:\d+/.test(API)) {
   fail(`API 基址格式不对：${API}`)
 } else {
-  console.log('  API 基址 = ' + API)
+  console.log('  API 基址 = ' + API + (readApiFromEnvPro() ? '（取自 .env.pro）' : '（.env.pro 未写，取脚本兜底值）'))
 }
 if (process.exitCode) process.exit(1)
 

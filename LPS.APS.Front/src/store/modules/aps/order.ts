@@ -30,6 +30,35 @@ import {
 const PAGE_SIZE_CAP = 200
 const DEFAULT_PAGE_SIZE = 20
 
+/**
+ * 默认计划版本挑选规则（2026-11-12 工厂视角改版）
+ *
+ * 旧规则 = `versions[0]`（`GET /api/schedule/versions` 按「最新优先」返回）
+ * ⇒ dev 上最新一条是 `FAILED` 的测试版本 `SYN-PLAN-...`，用户一进页面看到的是
+ *    「延迟 0 / 未排产 100%」的空版本，像是系统坏了。
+ *
+ * 新规则（按业务含义取优先级，端点返回顺序 = 最新优先 ⇒ 取到的是**最新**的那一版）：
+ *  1. `ACTIVE`（已生效）—— 计划员日常看的就是这一版
+ *  2. `CANDIDATE`（算完待确认）—— 没有生效版时的次选
+ *  3. 其余非 `FAILED`（待发令 / 计算中 / 已被顶替）
+ *  4. 兜底：列表第一条
+ *
+ * ⚠️ 这仍是前端**猜**的：端点没给「当前生效版本」标识（`PlanVersionSummaryDto` 无 `isDefault`）。
+ *    真值应由后端给（已出函 5号位 R5）；在此之前前端按上述规则兜底，
+ *    页面同时显示版本状态，让用户知道自己看的是哪一版。
+ */
+export function pickDefaultVersion<T extends { status?: string | null }>(versions: T[]): T | null {
+  if (!versions.length) return null
+  const byStatus = (status: string): T | undefined => versions.find((v) => v.status === status)
+  return (
+    byStatus('ACTIVE') ??
+    byStatus('CANDIDATE') ??
+    versions.find((v) => v.status !== 'FAILED') ??
+    versions[0] ??
+    null
+  )
+}
+
 export const useOrderStore = defineStore('aps.order', () => {
   // ===== state =====
   const list = ref<OrderListItemDto[]>([])
@@ -71,7 +100,7 @@ export const useOrderStore = defineStore('aps.order', () => {
     try {
       versions.value = await scheduleApi.getVersions(100)
       if (planVersionId.value === null) {
-        planVersionId.value = versions.value[0]?.id ?? null
+        planVersionId.value = pickDefaultVersion(versions.value)?.id ?? null
       }
     } catch {
       versions.value = []

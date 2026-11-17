@@ -282,7 +282,7 @@ export const useApsAuthStore = defineStore('aps.auth', () => {
   const isPmc = computed(() => hasRole('aps.planner'))
   const isViewer = computed(() => hasRole('aps.viewer.management'))
 
-  /** P1-15 业务范围（4 维度；空数组 = 未限制）
+  /** P1-15 业务范围（4 维度；空数组 = 该维度未限制）
    *  - 来源：userInfo 后端扁平字段（isGlobal + factories + productFamilies + departments + domains）
    *  - IsGlobal=true → 全空（视为"未限制"）；各维度非空 → 受限白名单
    */
@@ -291,6 +291,18 @@ export const useApsAuthStore = defineStore('aps.auth', () => {
     if (!u) return normalizeScope(null)
     return fromBackendScope(u)
   })
+
+  /**
+   * 是否全局范围 —— **以后端 `/api/auth/me` 的 `isGlobal` 为准**（2026-11-12 4号位 F2）
+   *
+   * 旧做法是「四个维度数组是否全空」来推断全局，那是错的：
+   *  - 后端 `DataScopeContext`：**Global = 放行全部**；**非 Global 且某维度未授权 = 该维度拒绝**（fail-closed）；
+   *    一条范围策略都没配的账号 = 后端 `DataScopeContext.Empty` = 拒绝全部。
+   *  - 前端旧推断把「全局」与「什么都没配」压成同一种（全空）⇒ 两者在页面上长得一模一样。
+   *
+   * ⇒ 凡是问「这个账号是不是不受限」，一律读这里，不要再看数组空不空。
+   */
+  const isGlobalScope = computed(() => userInfo.value?.isGlobal ?? false)
 
   /** mock 可切角色列表（生产模式返回空数组；UI 不显示切换器） */
   const mockAvailableRoles = computed<RoleKey[]>(() => (APS_USE_MOCK ? MOCK_AVAILABLE_ROLES : []))
@@ -374,6 +386,7 @@ export const useApsAuthStore = defineStore('aps.auth', () => {
     isPmc,
     isViewer,
     dataScope,
+    isGlobalScope,
     mockActiveRole,
     mockAvailableRoles,
     mockSwitchRole,

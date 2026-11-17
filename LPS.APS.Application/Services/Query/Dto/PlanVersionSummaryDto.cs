@@ -12,6 +12,15 @@ public class PlanVersionSummaryDto
     public DateTime PlanHorizonStart { get; set; }
     public DateTime PlanHorizonEnd { get; set; }
     public string Status { get; set; } = string.Empty;
+
+    /// <summary>
+    /// R5（11-12 4号位件）：本行是**其域内当前生效版本**（=Status='ACTIVE'；
+    /// `UQ_PlanVersion_OneActivePerDomain` 保证每域至多一条，无需再按 ActivatedAt 去重）。
+    /// 语义是"按域各有一条默认"——**不存在全局唯一 isDefault**（11 域并存是常态），
+    /// 跨域账号取页面默认时请用「isDefault 行中 ActivatedAt 最新者」。JSON: isDefault。
+    /// </summary>
+    public bool IsDefault { get; set; }
+
     public DateTime? ComputedAt { get; set; }
     public int? TotalTasks { get; set; }
     public int? SourceScheduleRunId { get; set; }

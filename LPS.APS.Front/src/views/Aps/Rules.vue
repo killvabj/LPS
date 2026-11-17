@@ -32,10 +32,17 @@ import { computed, onActivated, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { storeToRefs } from 'pinia'
 import { useRulesStore } from '@/store/modules/aps/rules'
+import { RULE_LIST_SORT_LABELS, type RuleListSort } from '@/store/modules/aps/rules'
 import { useSetupExactStore } from '@/store/modules/aps/setupExact'
 import { useSetupDefaultStore } from '@/store/modules/aps/setupDefault'
 import { useApsAuthStore } from '@/store/modules/aps/auth'
 import { formatLocalDateTime, formatUtcDateTime } from '@/utils/datetime'
+import {
+  EFFECTIVE_WINDOW_HINT,
+  diffFieldDisplayName,
+  formatEffectiveFrom,
+  formatEffectiveTo
+} from '@/utils/effectiveWindow'
 import {
   ApiError,
   RULE_STATUS_LABELS,
@@ -46,13 +53,19 @@ import {
   setupApi,
   type FieldDiff,
   type RuleStatus,
-  type RuleSetSummaryDto,
+  type RuleSetListRowDto,
   type RuleVersionHistoryDto,
   type PrioritySegmentDto,
   type SetupRuleDto,
   type SetupDialogPrefill
 } from '@/api/aps-v1'
-import { competitionRoundLabel, conditionText, sortFieldText } from '@/api/aps-v1/prioritySegment'
+import {
+  competitionRoundLabel,
+  conditionGroupLabel,
+  conditionText,
+  segmentConditionView,
+  sortFieldText
+} from '@/api/aps-v1/prioritySegment'
 import { toEditableSegments } from '@/api/aps-v1/prioritySegmentEditor'
 import PrioritySegmentEditor from './components/PrioritySegmentEditor.vue'
 import SetupExactDialog from './components/SetupExactDialog.vue'
@@ -88,16 +101,17 @@ import {
 const rulesStore = useRulesStore()
 const {
   filteredRuleSets,
-  statusCounts,
-  noVersionCount,
-  inactiveCount,
+  tabCounts,
   currentDetail,
   currentDiff,
   diffBaseVersionId,
   diffTargetVersionId,
+  diffError,
   lastValidation,
   statusFilter,
-  showInactive,
+  listKeyword,
+  listActiveFilter,
+  listSort,
   loading,
   listLoading,
   actionRunning,
@@ -303,6 +317,20 @@ const currentDraftVersionCode = computed<string>(() => {
   return hit?.versionCode ?? ''
 })
 
+/**
+ * 「换型规则」页签显示的是哪一版（11-11）
+ *
+ * 换型规则（⑦）只能改草稿 ⇒ 页签固定跟着草稿版走（setupTargetVersionId：有草稿看草稿）。
+ * 而顶部信息表的「本页内容来自版本」是**用户点中的那一版**（可能是已发布版）——
+ * 两者不同版，同屏出现时极易被读成「刚配的规则进了已发布版」（用户 11-11 实看误读）。
+ * 故这一页签里一律点明自己显示的是哪一版。
+ */
+const setupShownVersionCode = computed<string>(() =>
+  setupDraftVersionId.value != null
+    ? currentDraftVersionCode.value
+    : (detailNN.value?.contentVersionCode ?? '')
+)
+
 async function openExactCreate(): Promise<void> {
   if ((await startSetupWrite()) === null) return
   exactDialogMode.value = 'create'
@@ -331,6 +359,30 @@ async function openDefaultEdit(rule: SetupRuleDto): Promise<void> {
   editingDefaultRule.value = rule
   defaultDialogPrefill.value = null
   defaultDialogVisible.value = true
+}
+
+/**
+ * 切换换型规则启停（工作簿 #67）。
+ *
+ * 后端只有 PUT，且入参 `IsActive` 默认 true ⇒ store 会把该行**完整**回传；
+ * 这里只负责拦截「非草稿 / 无权限」并把错误如实显示。
+ */
+async function onToggleSetupActive(
+  kind: 'exact' | 'default',
+  rule: SetupRuleDto,
+  active: boolean
+): Promise<void> {
+  if ((await startSetupWrite()) === null) return
+  const store = kind === 'exact' ? exactStore : defaultStore
+  const ok = await store.setRuleActive(rule, active)
+  if (ok) {
+    ElMessage.success(active ? '规则已启用' : '规则已停用')
+    // 本页的换型列表是独立 ref（不读 store），成功后自己重拉一遍
+    const versionId = setupSummaryVersionId.value
+    if (versionId !== null) await loadSetupSummary(versionId)
+  } else if (store.error) {
+    ElMessage.error(store.error)
+  }
 }
 
 async function handleExactDelete(rule: SetupRuleDto): Promise<void> {
@@ -418,7 +470,7 @@ function goSetupDiffPage(): void {
 
 /* ===== 操作 ===== */
 /** 选中的规则集没有任何版本时的占位（右侧空态用；避免抛红条 + 外露内部 ID） */
-const noVersionPicked = ref<RuleSetSummaryDto | null>(null)
+const noVersionPicked = ref<RuleSetListRowDto | null>(null)
 
 /* ===== 段位编辑器（只对 DRAFT + 有写权限开放） ===== */
 const editorSegments = ref<PrioritySegmentDto[]>([])
@@ -457,24 +509,72 @@ async function blockIfDirty(action: string): Promise<boolean> {
   return true
 }
 
-async function selectRuleSet(ruleSet: RuleSetSummaryDto): Promise<boolean> {
+/**
+ * 选中列表里的一行（一版一行 ⇒ 传 versionId，决定右侧展示哪一版）
+ *
+ * 2026-11-11：列表源改为「主子表联查·一版一行」后，同族多个版本各占一行；
+ * 点哪一行就展示哪一版的内容，页面上的状态/发布/停用都作用在这一版上。
+ */
+async function selectRuleSet(row: RuleSetListRowDto): Promise<boolean> {
   if (await blockIfDirty('切换')) return false
   noVersionPicked.value = null
   rulesStore.reset()
   activeTab.value = 'segments'
   // 无版本的规则集必然加载不出内容（versions 返回空数组），
   // 与其让用户看一条报错红条，不如直接告诉他「这个还没配版本」
-  if (!ruleSet.hasVersion) {
-    noVersionPicked.value = ruleSet
+  if (!row.hasVersion || row.versionId == null) {
+    noVersionPicked.value = row
     return false
   }
-  await rulesStore.loadDetail(ruleSet.ruleSetId)
+  await rulesStore.loadDetail(row.ruleSetId, row.versionId)
   return true
+}
+
+/* ===== 列表行的展示口径（一版一行） ===== */
+
+/** 该行的状态标签文案（无版本的行显示「未配版本」） */
+function rowStatusLabel(row: RuleSetListRowDto): string {
+  if (!row.hasVersion || !row.versionStatus) return NO_VERSION_LABEL
+  return RULE_STATUS_LABELS[row.versionStatus]
+}
+
+/** 该行的状态标签颜色 */
+function rowStatusTag(
+  row: RuleSetListRowDto
+): 'success' | 'warning' | 'info' | 'primary' | 'danger' {
+  if (!row.hasVersion || !row.versionStatus) return 'info'
+  return RULE_STATUS_TAG[row.versionStatus]
+}
+
+/** 该行的时间项标题：发布过的版本看发布时间，其余看建档时间；无版本行看说明 */
+function rowTimeKey(row: RuleSetListRowDto): string {
+  if (!row.hasVersion) return '说明'
+  return row.publishedAt ? '发布时间' : '建档时间'
+}
+
+/**
+ * 该行的时间（治理域时间一律本地直显，不做 UTC 位移）
+ *
+ * ⚠️ 无版本的主表没有版本时间 ⇒ 展示主表说明（后端列表行的 description）
+ */
+function rowTimeText(row: RuleSetListRowDto): string {
+  if (!row.hasVersion) return row.description || '—'
+  const t = row.publishedAt ?? row.createdAt
+  return t ? formatLocalDateTime(t) : '—'
 }
 
 async function onValidate(): Promise<void> {
   if (await blockIfDirty('校验')) return
-  await rulesStore.validateDraft()
+  const ok = await rulesStore.validateDraft()
+  if (ok) {
+    ElMessage.success('校验通过')
+    return
+  }
+  // 校验不过时给一句大白话提示（用户可能正停在段位区，看不到页面上方的校验结果）
+  const n = lastValidation.value?.errors.length ?? 0
+  ElMessage.warning(
+    n > 0 ? `校验未通过：${n} 项没填好，详见页面上方的校验结果` : '校验未通过，详见页面上方的提示'
+  )
 }
 
 /* ===== 保存段位 Dialog ===== */
@@ -497,9 +597,30 @@ async function onSaveDraft(): Promise<void> {
   }
 }
 
-function setFilter(filter: RuleStatus | 'ALL'): void {
+function setFilter(filter: RuleStatus | typeof NO_VERSION | 'ALL'): void {
   rulesStore.setStatusFilter(filter)
 }
+
+/* ===== 列表筛选条件（2026-11-11） ===== */
+function onKeywordChange(value: string): void {
+  rulesStore.setListKeyword(value ?? '')
+}
+
+function onActiveFilterChange(value: string): void {
+  rulesStore.setListActiveFilter(value as 'ALL' | 'ACTIVE' | 'INACTIVE')
+}
+
+function onSortChange(value: string): void {
+  rulesStore.setListSort(value as RuleListSort)
+}
+
+/** 是否有筛选条件生效（「重置筛选」按钮的显隐） */
+const hasListFilter = computed(
+  () =>
+    listKeyword.value.trim() !== '' ||
+    listActiveFilter.value !== 'ALL' ||
+    listSort.value !== 'DEFAULT'
+)
 
 /* ===== [+ 新建草稿] Dialog ===== */
 const createDraftDialog = ref(false)
@@ -827,6 +948,12 @@ async function applySetupDeepLink(): Promise<void> {
     operationCode: String(q.operationCode),
     resourceCode: String(q.resourceCode ?? '')
   }
+  // Id 一并解析回来（11-11）：后端 lookups 写死 TOP(200) 截断，预填的部门/设备常在截断之外
+  // ⇒ 光有 Code 解析不出写输入要的 Id。缺 Id 时留 undefined，Dialog 会退回按编码补搜。
+  const deptId = Number(q.departmentId)
+  if (Number.isFinite(deptId) && deptId > 0) prefill.departmentId = deptId
+  const resId = Number(q.resourceId)
+  if (Number.isFinite(resId) && resId > 0) prefill.resourceId = resId
   const ruleSetCode = typeof q.ruleSetCode === 'string' ? q.ruleSetCode : ''
   // 来源版本（缺失规则那一行所属的规则集版本）——用于明示「来源版本 vs 写入草稿」
   const sourceVersionId = Number(q.ruleSetVersionId ?? '')
@@ -834,9 +961,14 @@ async function applySetupDeepLink(): Promise<void> {
   //    (AppView.vue:30) 会因 fullPath 变化**重建整个页面组件** ⇒ 正在跑的深链连同弹窗一起被销毁。
   //    深链参数留在 URL 上（刷新后仍回到同一处，这是深链的正常行为）。
   if (rulesStore.ruleSets.length === 0) await rulesStore.loadList()
-  const target = ruleSetCode
-    ? rulesStore.ruleSets.find((r) => r.ruleSetCode === ruleSetCode)
-    : undefined
+  // 一版一行 ⇒ 同一编码可能有多行：优先命中深链指定的来源版本，其次取已发布那一版
+  const candidates = ruleSetCode
+    ? rulesStore.ruleSets.filter((r) => r.ruleSetCode === ruleSetCode)
+    : []
+  const target =
+    candidates.find((r) => r.versionId != null && r.versionId === sourceVersionId) ??
+    candidates.find((r) => r.versionStatus === 'PUBLISHED') ??
+    candidates[0]
   if (!target) return
   if (!(await selectRuleSet(target))) return
   activeTab.value = 'setup'
@@ -896,38 +1028,60 @@ onActivated(() => {
     <!-- ===== 错误条 ===== -->
     <ElAlert v-if="error" type="error" :closable="false" show-icon :title="error" />
 
-    <!-- ===== KPI 横条（UI 流程 3 态子集；后端 6 态为 DDL 冻结但前端无 submit/approve/archive 入口） ===== -->
-    <div class="kpi-strip">
-      <div class="kpi-pill">
-        <span class="pill-label">规则集总数</span>
-        <span class="pill-val">{{ rulesStore.ruleSets.length }}</span>
-      </div>
-      <div v-for="key in RULE_STATUSES_UI" :key="key" class="kpi-pill">
-        <span class="pill-label">{{ RULE_STATUS_LABELS[key] }}</span>
-        <span class="pill-val">{{ statusCounts[key] ?? 0 }}</span>
-      </div>
-      <!-- 「未配版本」是 6 态之外的正交计数：这些规则集一条版本都没有，点开必然加载不出内容 -->
-      <div class="kpi-pill">
-        <span class="pill-label">{{ NO_VERSION_LABEL }}</span>
-        <span class="pill-val">{{ noVersionCount }}</span>
-      </div>
-    </div>
-
-    <!-- ===== 状态过滤（UI 流程 3 态子集；与 KPI 一致） ===== -->
+    <!-- ===== 状态页签（计数直接落在页签上）+ 筛选条件 =====
+         2026-11-11 用户拍板：
+           · 顶部 KPI 横条撤除，各状态数量改为显示在页签上；
+           · 「全部」页签 = 显示全部（**含停用的**），故原「显示已停用」开关撤除；
+           · 补筛选条件：关键词 / 主表状态 / 排序。 ===== -->
     <div class="filter-row">
       <ElRadioGroup v-model="statusFilter" @change="setFilter">
-        <ElRadioButton label="ALL">全部</ElRadioButton>
-        <ElRadioButton v-for="key in RULE_STATUSES_UI" :key="key" :label="key">
-          {{ RULE_STATUS_LABELS[key] }}
+        <ElRadioButton
+          label="ALL"
+          :title="`共 ${tabCounts.ALL} 行 / ${rulesStore.ruleSetTotal} 个规则集（按主表去重）`"
+        >
+          全部<span class="tab-count">{{ tabCounts.ALL }}</span>
         </ElRadioButton>
-        <ElRadioButton :label="NO_VERSION">{{ NO_VERSION_LABEL }}</ElRadioButton>
+        <ElRadioButton v-for="key in RULE_STATUSES_UI" :key="key" :label="key">
+          {{ RULE_STATUS_LABELS[key] }}<span class="tab-count">{{ tabCounts[key] }}</span>
+        </ElRadioButton>
+        <ElRadioButton :label="NO_VERSION">
+          {{ NO_VERSION_LABEL }}<span class="tab-count">{{ tabCounts.NO_VERSION }}</span>
+        </ElRadioButton>
       </ElRadioGroup>
-      <ElTooltip content="停用的规则集默认不显示；勾选后才能看到并重新启用它们" placement="top">
-        <label class="show-inactive-toggle">
-          <ElSwitch v-model="showInactive" size="small" />
-          <span>显示已停用（{{ inactiveCount }}）</span>
-        </label>
-      </ElTooltip>
+
+      <div class="filter-tools">
+        <ElInput
+          :model-value="listKeyword"
+          class="tool-kw"
+          placeholder="搜索规则集编码 / 名称 / 版本码"
+          clearable
+          @update:model-value="onKeywordChange"
+        >
+          <template #prefix>
+            <Icon icon="vi-mdi:magnify" />
+          </template>
+        </ElInput>
+        <ElSelect
+          :model-value="listActiveFilter"
+          class="tool-select"
+          @change="onActiveFilterChange"
+        >
+          <ElOption label="主表状态：全部" value="ALL" />
+          <ElOption label="主表状态：启用" value="ACTIVE" />
+          <ElOption label="主表状态：停用" value="INACTIVE" />
+        </ElSelect>
+        <ElSelect :model-value="listSort" class="tool-select" @change="onSortChange">
+          <ElOption
+            v-for="(label, key) in RULE_LIST_SORT_LABELS"
+            :key="key"
+            :label="label"
+            :value="key"
+          />
+        </ElSelect>
+        <ElButton v-if="hasListFilter" text size="small" @click="rulesStore.resetListFilters()">
+          重置筛选
+        </ElButton>
+      </div>
     </div>
 
     <div class="content-row">
@@ -945,13 +1099,13 @@ onActivated(() => {
         <div v-else class="ruleset-list">
           <div
             v-for="r in filteredRuleSets"
-            :key="r.ruleSetId"
+            :key="r.rowKey"
             class="ruleset-card"
             :class="{
-              active: detailNN?.summary.ruleSetId === r.ruleSetId,
-              draft: r.status === 'DRAFT',
-              published: r.status === 'PUBLISHED',
-              disabled: r.status === 'DISABLED'
+              active: detailNN?.contentVersionId === r.versionId,
+              draft: r.versionStatus === 'DRAFT',
+              published: r.versionStatus === 'PUBLISHED',
+              disabled: r.versionStatus === 'DISABLED'
             }"
             @click="selectRuleSet(r)"
           >
@@ -960,25 +1114,19 @@ onActivated(() => {
               <span class="rs-tags">
                 <!-- 主表停用（Q4：只关主表，不级联版本）——与右边的版本状态是两件事 -->
                 <ElTag v-if="!r.isActive" size="small" effect="plain">主表停用</ElTag>
-                <ElTag
-                  :type="r.hasVersion ? RULE_STATUS_TAG[r.status] : 'info'"
-                  size="small"
-                  effect="dark"
-                >
-                  {{ r.hasVersion ? RULE_STATUS_LABELS[r.status] : NO_VERSION_LABEL }}
+                <ElTag :type="rowStatusTag(r)" size="small" effect="dark">
+                  {{ rowStatusLabel(r) }}
                 </ElTag>
               </span>
             </div>
             <div class="rs-name">{{ r.ruleSetName }}</div>
-            <div class="rs-meta">
-              <span class="meta-key">最新已发布版本</span>
-              <span class="meta-val">{{ r.currentVersionCode || '—' }}</span>
-              <span v-if="r.draftVersionCode" class="meta-draft">
-                / 草稿 {{ r.draftVersionCode }}
-              </span>
+            <!-- 一版一行：版本码单独一行（与编码并列时，长编码会把右侧状态标签挤出可视区） -->
+            <div class="rs-ver-line">
+              <span class="rs-ver">{{ r.versionCode || NO_VERSION_LABEL }}</span>
             </div>
-            <div v-if="r.lastChangeReason" class="rs-reason">
-              {{ r.lastChangeReason }}
+            <div class="rs-meta">
+              <span class="meta-key">{{ rowTimeKey(r) }}</span>
+              <span class="meta-val">{{ rowTimeText(r) }}</span>
             </div>
           </div>
         </div>
@@ -1014,11 +1162,13 @@ onActivated(() => {
                 {{ RULE_STATUS_LABELS[detailNN.summary.status] }}
               </ElTag>
               {{ detailNN.summary.ruleSetCode }}
-              <span class="muted-tag">{{
-                detailNN.summary.currentVersionCode || '（无已发布版本）'
-              }}</span>
+              <!-- 一版一行：这里明确标出「本页展示的是哪一版」 -->
+              <span class="muted-tag">版本 {{ detailNN.contentVersionCode || '—' }}</span>
+              <span class="muted-tag">
+                最新已发布 {{ detailNN.summary.currentVersionCode || '（无）' }}
+              </span>
               <span v-if="detailNN.summary.draftVersionCode" class="muted-tag">
-                → 草稿 {{ detailNN.summary.draftVersionCode }}
+                草稿 {{ detailNN.summary.draftVersionCode }}
               </span>
             </div>
             <div class="head-actions">
@@ -1107,7 +1257,12 @@ onActivated(() => {
               <span v-else class="muted">—</span>
             </ElDescriptionsItem>
             <ElDescriptionsItem label="本页内容来自版本">
-              <span class="code-tag">{{ detailNN.contentVersionCode || '—' }}</span>
+              <ElTooltip
+                content="指「优先级段位」来自你点中的那一版；「换型规则」页签显示的是草稿版（只有草稿能改）。"
+                placement="top"
+              >
+                <span class="code-tag">{{ detailNN.contentVersionCode || '—' }}</span>
+              </ElTooltip>
             </ElDescriptionsItem>
             <ElDescriptionsItem label="最近变更" :span="3">
               {{ detailNN.summary.lastChangeReason || '（无）' }}
@@ -1159,7 +1314,8 @@ onActivated(() => {
                 class="tab-alert"
               >
                 <template #title>改完要点「保存段位」才会生效</template>
-                保存后仍是草稿，需要再走「校验草稿 → 发布」；未发布的修改不影响实际排产。
+                保存后仍是草稿，需要再走「校验草稿 →
+                发布」；未发布的修改不影响实际排产。没填完也能先存，缺的值会在「校验草稿」时列出来。
               </ElAlert>
               <ElAlert v-else type="info" :closable="false" show-icon class="tab-alert">
                 <template #title>当前为只读</template>
@@ -1213,9 +1369,31 @@ onActivated(() => {
                       {{ competitionRoundLabel(row.competitionRound) }}
                     </template>
                   </ElTableColumn>
-                  <ElTableColumn label="命中条件" min-width="240">
+                  <ElTableColumn label="命中条件" min-width="300">
                     <template #default="{ row }">
-                      <span v-if="!row.matchConditions.length" class="muted"
+                      <template v-if="row.matchConditionGroups?.length">
+                        <div
+                          v-for="(g, gi) in row.matchConditionGroups"
+                          :key="gi"
+                          class="cond-group-view"
+                        >
+                          <div class="cond-group-view-head">
+                            <span class="cond-group-no">{{ conditionGroupLabel(gi) }}</span>
+                            <span class="muted">组内全部满足（且）</span>
+                          </div>
+                          <ul class="cond-list">
+                            <li v-for="(c, ci) in g.conditions" :key="ci">
+                              {{ conditionText(c) }}
+                            </li>
+                            <li v-if="!g.conditions.length" class="muted">（空组，不成立）</li>
+                          </ul>
+                          <div v-if="gi < row.matchConditionGroups.length - 1" class="cond-or">
+                            或
+                          </div>
+                        </div>
+                        <div class="cond-expr">即：{{ segmentConditionView(row).expression }}</div>
+                      </template>
+                      <span v-else-if="!row.matchConditions.length" class="muted"
                         >（无条件，命中全部）</span
                       >
                       <ul v-else class="cond-list">
@@ -1292,8 +1470,17 @@ onActivated(() => {
 
                   <ElAlert type="info" :closable="false" show-icon class="tab-alert">
                     <template #title>换型规则与需求优先级段位一起整版生效</template>
-                    这里改的是当前草稿，改完要回页面上方「发布」才生效。命中顺序：明确产品转换 →
-                    当前工序+设备默认规则 → 0 分钟兜底；同一产品连续生产按 0 分钟算。
+                    <template v-if="setupDraftVersionId != null">
+                      这里显示和修改的是草稿版本 {{ setupShownVersionCode }} 的换型规则； 已发布版本
+                      {{ detailNN.summary.currentVersionCode || '—' }} 里还是发布时的老内容，
+                      改完要点页面上方「发布」才生效。命中顺序：明确产品转换 → 当前工序+设备默认规则
+                      → 0 分钟兜底；同一产品连续生产按 0 分钟算。
+                    </template>
+                    <template v-else>
+                      这里显示的是已发布版本 {{ setupShownVersionCode || '—' }} 的换型规则（只读）；
+                      要修改请先在页面上方「新建草稿」。命中顺序：明确产品转换 →
+                      当前工序+设备默认规则 → 0 分钟兜底；同一产品连续生产按 0 分钟算。
+                    </template>
                   </ElAlert>
 
                   <!-- 来源版本说明（#4：从「缺失规则查询」回填时，明示来源版本与写入目标） -->
@@ -1331,6 +1518,9 @@ onActivated(() => {
                     <div class="setup-block">
                       <div class="seg-toolbar">
                         <span class="setup-block-title">明确产品转换</span>
+                        <span v-if="setupShownVersionCode" class="code-tag">{{
+                          setupShownVersionCode
+                        }}</span>
                         <span class="muted">共 {{ setupExactRules.length }} 条 · 优先级最高</span>
                         <span class="toolbar-spacer"></span>
                         <ElButton
@@ -1371,6 +1561,16 @@ onActivated(() => {
                           width="100"
                           align="right"
                         />
+                        <ElTableColumn label="启用" width="80" align="center">
+                          <template #default="{ row }">
+                            <ElSwitch
+                              :model-value="row.isActive !== false"
+                              size="small"
+                              :disabled="!setupEditable"
+                              @change="(v) => onToggleSetupActive('exact', row, v === true)"
+                            />
+                          </template>
+                        </ElTableColumn>
                         <ElTableColumn label="最近修改" width="180">
                           <template #default="{ row }">
                             <div>{{ setupRuleModifiedText(row) }}</div>
@@ -1406,6 +1606,9 @@ onActivated(() => {
                     <div class="setup-block">
                       <div class="seg-toolbar">
                         <span class="setup-block-title">默认换型规则</span>
+                        <span v-if="setupShownVersionCode" class="code-tag">{{
+                          setupShownVersionCode
+                        }}</span>
                         <span class="muted">
                           共 {{ setupDefaultRules.length }} 条 · 明确规则未命中时生效
                         </span>
@@ -1436,6 +1639,16 @@ onActivated(() => {
                           width="100"
                           align="right"
                         />
+                        <ElTableColumn label="启用" width="80" align="center">
+                          <template #default="{ row }">
+                            <ElSwitch
+                              :model-value="row.isActive !== false"
+                              size="small"
+                              :disabled="!setupEditable"
+                              @change="(v) => onToggleSetupActive('default', row, v === true)"
+                            />
+                          </template>
+                        </ElTableColumn>
                         <ElTableColumn label="最近修改" width="180">
                           <template #default="{ row }">
                             <div>{{ setupRuleModifiedText(row) }}</div>
@@ -1476,13 +1689,19 @@ onActivated(() => {
               <!-- `fieldDiffs` 是后端**全字段平铺**（未变字段 isChanged=false），
                    只有 isChanged 的行才是差异；后端不返 added/modified/removed 计数
                    （见 types/rule.ts VersionDiffResultDto 注释），故此处只数「变更字段数」，
-                   不自造「新增/删除」分类。 -->
-              <template v-if="!currentDiff || changedFields.length === 0">
+                   不自造「新增/删除」分类。
+                   ⚠️ 后端 diff 端点在「同一版本内两条换型规则业务键重复」时会 400
+                      （.NET ToDictionary 重复键）⇒ 差异算不出来时在这里说明，
+                      不把后端英文异常糊到用户脸上，也不影响内容/历史/发布。 -->
+              <template v-if="diffError">
+                <ElAlert type="warning" :closable="false" show-icon :title="diffError" />
+              </template>
+              <template v-else-if="!currentDiff || changedFields.length === 0">
                 <ElEmpty
                   :description="
                     currentDiff
                       ? '两版本无字段差异'
-                      : '暂无可对比的两个版本（需存在已发布版本 + 另一个版本）'
+                      : '暂无可对比的两个版本：需要一个「最新已发布版本」加上另一个版本（草稿版，或上一个已发布版本）'
                   "
                 />
               </template>
@@ -1506,7 +1725,9 @@ onActivated(() => {
                   <ElTableColumn label="字段" min-width="200">
                     <template #default="{ row }">
                       <div class="diff-field">
-                        <span class="diff-field-cn">{{ row.fieldDisplayName }}</span>
+                        <span class="diff-field-cn">{{
+                          diffFieldDisplayName(row.fieldName, row.fieldDisplayName)
+                        }}</span>
                         <code class="code-tag">{{ row.fieldName }}</code>
                       </div>
                     </template>
@@ -1570,13 +1791,23 @@ onActivated(() => {
                   </template>
                 </ElTableColumn>
                 <ElTableColumn label="生效起" width="160">
+                  <template #header>
+                    <ElTooltip :content="EFFECTIVE_WINDOW_HINT" placement="top">
+                      <span class="th-hint">生效起</span>
+                    </ElTooltip>
+                  </template>
                   <template #default="{ row }">
-                    {{ formatLocalDateTime(row.effectiveFrom) }}
+                    {{ formatEffectiveFrom(row.effectiveFrom) }}
                   </template>
                 </ElTableColumn>
                 <ElTableColumn label="生效止" width="160">
+                  <template #header>
+                    <ElTooltip :content="EFFECTIVE_WINDOW_HINT" placement="top">
+                      <span class="th-hint">生效止</span>
+                    </ElTooltip>
+                  </template>
                   <template #default="{ row }">
-                    {{ formatLocalDateTime(row.effectiveTo) }}
+                    {{ formatEffectiveTo(row.effectiveTo, row.status) }}
                   </template>
                 </ElTableColumn>
                 <ElTableColumn width="120" align="center">
@@ -1599,6 +1830,10 @@ onActivated(() => {
               <ElAlert type="info" :closable="false" show-icon class="u22-alert">
                 <template #title>发布产生新版本，历史不覆盖</template>
                 每次发布产生新的版本，历史版本完整保留，可随时回看变更轨迹。
+              </ElAlert>
+              <ElAlert type="info" :closable="false" show-icon class="u22-alert">
+                <template #title>「生效起 / 生效止」记的是这一版的生命周期</template>
+                版本发布时后端自动写入「生效起」（发布时间），停用时自动写入「生效止」（停用时刻）；已发布未停用的版本显示「仍在有效期」。草稿未发布时两列都是空的，历史版本也可能没有记录。
               </ElAlert>
             </ElTabPane>
           </ElTabs>
@@ -1889,7 +2124,8 @@ onActivated(() => {
         </ElFormItem>
         <ElAlert type="info" :closable="false" show-icon class="d-alert">
           <template #title>保存只影响这一版草稿</template>
-          保存后不会自动发布，需要在页面上继续「校验草稿 → 发布」。
+          保存后不会自动发布，需要在页面上继续「校验草稿 →
+          发布」。没填完也能先存，缺的值会在「校验草稿」时提示。
         </ElAlert>
       </ElForm>
       <template #footer>
@@ -2001,6 +2237,12 @@ onActivated(() => {
   border-radius: 3px;
 }
 
+/* 表头提示（生效起 / 最新已发布 的语义说明） */
+.th-hint {
+  border-bottom: 1px dashed #94a3b8;
+  cursor: help;
+}
+
 .loading-tip {
   padding: 30px;
   font-size: 14px;
@@ -2008,33 +2250,7 @@ onActivated(() => {
   text-align: center;
 }
 
-/* KPI 条 */
-.kpi-strip {
-  display: flex;
-  gap: 10px;
-  flex-wrap: wrap;
-}
-
-.kpi-pill {
-  display: inline-flex;
-  padding: 6px 14px;
-  font-size: 12px;
-  background: #f8fafc;
-  border-radius: 16px;
-  align-items: center;
-  gap: 6px;
-
-  .pill-label {
-    color: #64748b;
-  }
-
-  .pill-val {
-    font-weight: 600;
-    color: #1e293b;
-  }
-}
-
-/* 过滤行 */
+/* 过滤行（状态页签 + 筛选条件） */
 .filter-row {
   padding: 8px 12px;
   background: #fff;
@@ -2047,14 +2263,27 @@ onActivated(() => {
   flex-wrap: wrap;
 }
 
-.show-inactive-toggle {
-  display: inline-flex;
+/* 页签上的数量 */
+.tab-count {
+  margin-left: 6px;
+  font-size: 12px;
+  opacity: 0.75;
+}
+
+/* 筛选条件区 */
+.filter-tools {
+  display: flex;
   align-items: center;
-  gap: 6px;
-  font-size: 13px;
-  color: #4b5563;
-  cursor: pointer;
-  user-select: none;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.tool-kw {
+  width: 240px;
+}
+
+.tool-select {
+  width: 150px;
 }
 
 /* 主内容 */
@@ -2106,7 +2335,7 @@ onActivated(() => {
 
   .rs-head {
     display: flex;
-    justify-content: space-between;
+    gap: 8px;
     align-items: center;
     margin-bottom: 6px;
 
@@ -2114,7 +2343,32 @@ onActivated(() => {
       font-family: 'Courier New', monospace;
       font-weight: 600;
       color: #1e293b;
+      /* 编码过长时截断，保证右侧状态标签不被挤出卡片 */
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      min-width: 0;
     }
+
+    .rs-tags {
+      display: flex;
+      margin-left: auto;
+      gap: 4px;
+      align-items: center;
+      /* 状态标签不参与压缩（编码再长也要看得见「已发布/草稿」） */
+      flex-shrink: 0;
+    }
+  }
+
+  /* 版本码单独一行（一版一行：与编码并列时右侧状态标签会被挤出可视区） */
+  .rs-ver-line {
+    margin-bottom: 6px;
+  }
+
+  .rs-ver {
+    font-family: 'Courier New', monospace;
+    font-size: 11px;
+    color: #64748b;
   }
 
   .rs-name {
@@ -2231,6 +2485,36 @@ onActivated(() => {
   font-size: 12px;
   line-height: 1.6;
   color: #334155;
+}
+
+/* DNF 条件组只读呈现（组内 AND、组间 OR） */
+.cond-group-view {
+  margin-bottom: 4px;
+}
+
+.cond-group-view-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+}
+
+.cond-group-no {
+  font-weight: 600;
+  color: #1e293b;
+}
+
+.cond-or {
+  margin: 2px 0 2px 8px;
+  font-size: 12px;
+  color: #b45309;
+}
+
+.cond-expr {
+  margin-top: 4px;
+  font-size: 12px;
+  color: #475569;
+  line-height: 1.6;
 }
 
 /* Diff */

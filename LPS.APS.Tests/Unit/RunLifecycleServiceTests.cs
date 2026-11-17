@@ -663,6 +663,69 @@ public class RunLifecycleServiceTests
     }
 
     /// <summary>
+    /// R1/R2（4号位 2026-11-11 运行与下发页改版）：域状态补该域本次 PlanVersion 的计划区间 + 任务数（纯投影）。
+    /// PlanVersion 实体本有 PlanHorizonStart/End/TotalTasks，域级 DTO 投影填充，供"最近一次排产"页回答"排的是哪段、排了多少"。
+    /// </summary>
+    [Fact]
+    public async Task 域级状态_投影计划区间与任务数()
+    {
+        // Arrange：单域 Run + 一个带计划窗口与任务数的 PlanVersion
+        var from = new DateTime(2026, 11, 1);
+        var to = new DateTime(2027, 2, 5);
+        var version = DomainVersion(7, "DAILY_BASELINE", "ACTIVE");
+        version.PlanHorizonStart = from;
+        version.PlanHorizonEnd = to;
+        version.TotalTasks = 1225;
+
+        _scheduleRunRepo.Setup(r => r.GetByIdAsync(1, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(FullRun(1, expectedJson: """["D1"]"""));
+        _planVersionRepo.Setup(r => r.GetByScheduleRunIdAsync(1, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new List<PlanVersion> { version });
+
+        // Act
+        var domains = await _service.GetRunDomainStatusAsync(1, CancellationToken.None);
+
+        // Assert：纯投影字段如实带出
+        domains.Should().HaveCount(1);
+        domains[0].PlanHorizonStart.Should().Be(from);
+        domains[0].PlanHorizonEnd.Should().Be(to);
+        domains[0].TotalTasks.Should().Be(1225);
+    }
+
+    /// <summary>
+    /// R3（4号位 2026-11-11 运行与下发页改版）：失败原因结构化。
+    /// FAILED 域给稳定原因码 DOMAIN_CALC_FAILED（供前端分类）；BLOCKED 域给 BLOCKED_BY_UPSTREAM_DOMAIN。
+    /// </summary>
+    [Fact]
+    public async Task 域级失败_给稳定原因码()
+    {
+        // Arrange：两域，D1 失败（FAILED），D2 未生成；Run 已终态(PARTIAL_SUCCESS)且存在失败域 ⇒ D2 被 BLOCKED
+        var failedVersion = DomainVersion(7, "DAILY_BASELINE", "FAILED", "D1");
+        var partialRun = new ScheduleRunGov
+        {
+            Id = 1,
+            RunType = "FULL_SCHEDULE",
+            Status = "PARTIAL_SUCCESS",
+            TriggeredBy = "Hangfire",
+            DataCutoffTime = DateTime.Now,
+            ExpectedDomainKeysJson = """["D1","D2"]""",
+            StartedAt = DateTime.Now,
+        };
+        _scheduleRunRepo.Setup(r => r.GetByIdAsync(1, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(partialRun);
+        _planVersionRepo.Setup(r => r.GetByScheduleRunIdAsync(1, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new List<PlanVersion> { failedVersion });
+
+        // Act
+        var domains = await _service.GetRunDomainStatusAsync(1, CancellationToken.None);
+
+        // Assert
+        domains.Should().HaveCount(2);
+        domains.Should().ContainSingle(d => d.DomainKey == "D1" && d.Status == "FAILED" && d.ReasonCode == "DOMAIN_CALC_FAILED");
+        domains.Should().ContainSingle(d => d.DomainKey == "D2" && d.Status == "BLOCKED" && d.ReasonCode == "BLOCKED_BY_UPSTREAM_DOMAIN");
+    }
+
+    /// <summary>
     /// 回归钉（2026-10-15，B）：激活写点产出的实体，喂给域级状态读点，必须判 COMPLETED。
     /// 原 bug：读点先判 VersionCategory=='CANDIDATE'，而每一行已采用的 VersionCategory 恒为 CANDIDATE
     ///        ⇒ 「ACTIVE ⇒ COMPLETED」分支永不可达，激活后域级视图永远显示「候选待确认」。

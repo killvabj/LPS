@@ -20,6 +20,13 @@ public sealed class RunDomainStatusDto
     /// <summary>域级状态：COMPLETED / CANDIDATE / RUNNING / FAILED / BLOCKED / NOT_STARTED</summary>
     public string Status { get; set; } = string.Empty;
 
+    /// <summary>
+    /// 稳定原因码（R3，4号位 2026-11-11 运行与下发页改版：失败原因结构化）。
+    /// FAILED=DOMAIN_CALC_FAILED；BLOCKED=BLOCKED_BY_UPSTREAM_DOMAIN；其余为 null。
+    /// 供前端按稳定码分类/跳查，不随后端错误文本变化；中文说明见 <see cref="Reason"/>。
+    /// </summary>
+    public string? ReasonCode { get; set; }
+
     /// <summary>原因说明（FAILED=失败信息；BLOCKED=被阻断说明；其余可为空）</summary>
     public string? Reason { get; set; }
 
@@ -37,4 +44,13 @@ public sealed class RunDomainStatusDto
 
     /// <summary>该域 PlanVersion 激活时间（未激活时为空）</summary>
     public DateTime? ActivatedAt { get; set; }
+
+    /// <summary>该域本次 Run 计划版本的计划区间开始（PlanVersion.PlanHorizonStart；未生成时无值）</summary>
+    public DateTime? PlanHorizonStart { get; set; }
+
+    /// <summary>该域本次 Run 计划版本的计划区间结束（PlanVersion.PlanHorizonEnd；未生成时无值）</summary>
+    public DateTime? PlanHorizonEnd { get; set; }
+
+    /// <summary>该域本次 Run 计划版本的任务数（PlanVersion.TotalTasks；未生成时无值）</summary>
+    public int? TotalTasks { get; set; }
 }

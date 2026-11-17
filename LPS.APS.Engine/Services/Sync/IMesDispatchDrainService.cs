@@ -36,4 +36,12 @@ public sealed class MesDispatchDrainResult
     public int RowsFailed { get; init; }
     public int RowsBackToPending { get; init; }
     public bool AdapterMissing { get; init; }
+
+    /// <summary>
+    /// 因**必填字段取不到**而跳过、且**保持 `PENDING`** 的组合数（2026-11-12，`O77`）。
+    /// 判据：`factoryCode`（附录 A 必填）或 `materialCode`（附录 A 必填）任一为空。
+    /// **为什么不发**：缺必填字段送出去只会拿到 MES 的拒收，且我方无从得知是数据缺还是接口错；
+    /// 跳过并留 `PENDING` ＋ WARN 日志，等落库侧补齐后下一轮自然重试。
+    /// </summary>
+    public int GroupsSkippedMissingField { get; init; }
 }

@@ -18,6 +18,7 @@ import type {
   RecoverFailedRunInput,
   RecoverFailedRunResult,
   ScheduleRunGovDto,
+  ScheduleRunGovPage,
   TriggerRescheduleInput,
   TriggerRescheduleResult
 } from './types'
@@ -35,6 +36,35 @@ export const runApi = {
       params: { take }
     })
     return rows ?? []
+  },
+
+  /**
+   * Run 列表**服务端分页**（3号位 2026-11-12 R4 新增端点 `GET /api/governance/runs/paged`）
+   *  - 入参：`page`（1 基）/ `pageSize`（后端缺省 100、上限 200）/ `status` / `runType`
+   *  - 返回 `{ items, total, page, pageSize }`：`total` 是**按业务范围过滤后**的全量条数
+   *  - 服务端排序 `[StartedAt] DESC, [Id] DESC` ⇒ 翻页不会重复/漏行
+   *  - 既有数组端点 `GET /api/governance/runs` 原样保留（其它消费方不受影响）
+   *
+   * ⚠️ 该端点**尚未部署**：调用失败时由 store 降级到 `listRuns()`（数组端点），
+   *    故此处 silent + noErrorRedirect —— 不弹全局错误、不跳 /500。
+   */
+  async listRunsPaged(params: {
+    page: number
+    pageSize: number
+    status?: string
+    runType?: string
+  }): Promise<ScheduleRunGovPage> {
+    return apsHttp.get<ScheduleRunGovPage>({
+      url: '/api/governance/runs/paged',
+      params: {
+        page: params.page,
+        pageSize: params.pageSize,
+        ...(params.status ? { status: params.status } : {}),
+        ...(params.runType ? { runType: params.runType } : {})
+      },
+      silent: true,
+      noErrorRedirect: true
+    })
   },
 
   /**

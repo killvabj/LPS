@@ -213,6 +213,13 @@ public class BOMResultPullService : IBOMResultPullService
                 //   ⇒ 放进同一事务，天然与 BOM 快照对齐，不会出现「边新批、BOM 旧批」的错配。
                 await PullCrossFactoryEdgeAsync(sqlConn, sqlTx, batchNo);
 
+                // Step 5e（2026-11-14，按 5号位《定稿判据补正》§三.3）：**同一事务内写下令牌**。
+                //   令牌 = ODS `MES_API_BOM_Request_Log` 中该批 `Message LIKE 'CrossFactoryEdge rebuild%'` 的 MAX(Id)。
+                //   消费侧用前比对：相等 ⇒ 只读 APS 本地；不等 ⇒ 整批重拉。
+                //   ⚠ 必须 LIKE 过滤（同表混 enrich 完成行）；**Id 序 ≠ 时间序**（enrich 行记运行启动时刻）；
+                //      三件共用一个令牌（同一次展开的产物），故只落一行。
+                await WriteEdgeVersionAsync(sqlConn, sqlTx, batchNo);
+
                 return pulled;
             }, DatabaseId.APS);
 
@@ -286,6 +293,45 @@ public class BOMResultPullService : IBOMResultPullService
     /// <para><b>为什么 TRUNCATE 而不是按批删</b>：与 `APS_BOM_RAW` 同口径——单批制，排程只用最新批次，历史不保留；
     /// 事务内可回滚，失败不留空表。</para>
     /// </summary>
+    /// <summary>
+    /// 写跨厂边定稿令牌（5号位 2026-11-14 §三.3）：接货事务内 UPSERT 一行。
+    /// 读 ODS 的令牌必须在**同一时刻**取——令牌变了说明源被重建，本轮搬的就不是定稿版。
+    /// </summary>
+    private async Task WriteEdgeVersionAsync(SqlConnection connection, SqlTransaction transaction, string batchNo)
+    {
+        long? edgeVersion = null;
+        try
+        {
+            edgeVersion = await _connectionManager.QueryFirstOrDefaultAsync<long?>(
+                @"SELECT MAX(Id) FROM MES_API_BOM_Request_Log
+                  WHERE BatchNo = @BatchNo AND Message LIKE 'CrossFactoryEdge rebuild%'",
+                new { BatchNo = batchNo }, db: DatabaseId.ODS, commandTimeout: 120);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "[O67] 取跨厂边定稿令牌失败（BatchNo={BatchNo}），本次不写令牌 ⇒ 消费侧将判为过期并直读 ODS。", batchNo);
+        }
+
+        if (!edgeVersion.HasValue)
+        {
+            _logger.LogWarning(
+                "[O67] ODS 未找到该批的 `CrossFactoryEdge rebuild` 行（BatchNo={BatchNo}）⇒ 不写令牌；" +
+                "消费侧会判本地过期、直读 ODS（慢但不会用旧数据）。", batchNo);
+            return;
+        }
+
+        await connection.ExecuteAsync(@"
+            MERGE dbo.APS_BOM_EDGE_VERSION AS t
+            USING (SELECT @BatchNo AS BatchNo, @EdgeVersion AS EdgeVersion) AS s
+               ON t.BatchNo = s.BatchNo
+            WHEN MATCHED THEN UPDATE SET EdgeVersion = s.EdgeVersion, PulledAt = GETDATE()
+            WHEN NOT MATCHED THEN INSERT (BatchNo, EdgeVersion, PulledAt) VALUES (s.BatchNo, s.EdgeVersion, GETDATE());",
+            new { BatchNo = batchNo, EdgeVersion = edgeVersion.Value },
+            transaction: transaction);
+
+        _logger.LogInformation("[O67] 跨厂边定稿令牌已落库: BatchNo={BatchNo}, EdgeVersion={Ver}", batchNo, edgeVersion.Value);
+    }
+
     private async Task PullCrossFactoryEdgeAsync(SqlConnection connection, SqlTransaction transaction, string batchNo)
     {
         await connection.ExecuteAsync("TRUNCATE TABLE APS_BOM_CROSS_FACTORY_EDGE_RAW", transaction: transaction);

@@ -68,6 +68,13 @@ export interface RoutingOperationDto {
   stageCode: string
   /** OPM 当前值（三态之一；缺省默认 FINITE_RESOURCE） */
   operationPlanningMode: OperationPlanningMode
+  /**
+   * 生产部门名称
+   *  - 3号位 2026-11-16 回执已落码：DTO 字段 + LEFT JOIN ProductionDepartment.DeptName（零 DDL）
+   *  - LEFT JOIN 未命中（部门停用/缺失）时为 null ⇒ 页面回退显示 Id，不丢行
+   *  - 后端尚未部署该字段时为 undefined ⇒ 页面走 5号位 名称表兜底，仍取不到才显示 Id
+   */
+  productionDepartmentName?: string | null
 }
 
 /** PUT 请求 body（路径 {id} 与 body.operationId 必须一致） */

@@ -25,8 +25,10 @@
  *      日期型（统一交期/发行日期/出荷指示入物流日）：执行器把字段转成 `ToString("O")` 再比较，
  *        `Equals` 拿 "2026-10-22" 去比 "2026-10-22T00:00:00.0000000" 恒不等 ⇒ 只给比较符
  *      数值型（库存消耗日/数量）：执行器用 `decimal`/`CompareNumericOrDate` 比较 ⇒ 只给比较符
- *  - 条件组（组间 OR）**编辑器不开放**：运行侧投影对非空 `MatchConditionGroups` 显式抛错，
- *    现在做编辑器会产出「发布能过、跑排程必炸」的配置（3号位 实施包 §五）。
+ *  - 条件组（**DNF：组内 AND、组间 OR**）**已开放**（2026-11-11 3号位正式需求函）：
+ *    后端执行器/投影层 2026-11-07 已接线（`DemandPriorityExecutor.IsMatchSegment`、
+ *    `DemandPriorityProjector.ProjectSegment` 整组投影），本文件负责两种模式**互斥产出**
+ *    （有组只写组、无组只写平铺）＋ 空组拦截。
  *
  * 落库格式（`FrozenStrategySnapshot.cs:34-37 / :55+`）：
  *  - 顶层 `{"Segments":[...]}`
@@ -54,17 +56,31 @@ export interface EditorDemandFieldDef {
   allowRelativeOffset?: boolean
   /** 发布校验 `SupportedFieldValues` 的英文码值域；空 = 不拦（兼容存量自定义值） */
   valueDomain?: readonly string[]
+  /**
+   * 是否允许手填值域外的值。
+   *
+   * - 关闭值域的字段（客户等级 / 订单类型 / 各枚举字段）**不许手填**：
+   *   后端发布校验只登记了部分字段（`DemandPriorityValidator.SupportedFieldValues`，
+   *   **客户等级不在其中**），运行期又按 Ordinal 比对 ⇒ 手填错值「能发布、永不命中、不报错」。
+   * - 只有「物料编码」（前缀匹配、本身无固定值域）保留手填。
+   */
+  allowCustom?: boolean
 }
 
 export const EDITOR_DEMAND_FIELDS: ReadonlyArray<EditorDemandFieldDef> = [
   // 1 延期状态：2026-11-07 0号位 裁决归参数集（ProtectDelayed），规则集不再承载 ⇒ 关闭。
-  { value: 2, label: '客户等级', kind: 'TEXT' },
+  // 客户等级：候选已由 2号位 2026-11-06 收敛为 VIP/GENERAL；后端发布**不校验**该字段的值
+  //   （`SupportedFieldValues` 里没有 CustomerTier），运行期按 Ordinal 比对 ⇒ 手填错值永不命中，故关闭手填。
+  // 刻意**不登记 valueDomain**：登记后保存校验会拦下存量旧值（KEY_ACCOUNT / STANDARD 等已发布值），
+  //   与本文件「存量不漂移」的口径冲突；关闭手填已能挡住新增错值。
+  { value: 2, label: '客户等级', kind: 'TEXT', allowCustom: false },
   {
     value: 3,
     label: '订单类型',
     kind: 'TEXT',
     // 后端兼容存量旧词 SO/WO（等价 SALES_ORDER/PRODUCTION_INSTRUCTION），这里一并放行
-    valueDomain: ['SALES_ORDER', 'PRODUCTION_INSTRUCTION', 'SO', 'WO']
+    valueDomain: ['SALES_ORDER', 'PRODUCTION_INSTRUCTION', 'SO', 'WO'],
+    allowCustom: false
   },
   { value: 6, label: '统一交期', kind: 'DATE' },
   { value: 7, label: '订单发行日期', kind: 'DATE' },
@@ -96,7 +112,8 @@ export const EDITOR_DEMAND_FIELDS: ReadonlyArray<EditorDemandFieldDef> = [
     kind: 'TEXT',
     valueDomain: ['FULL_PURPLE_SLIP', 'DIFF_PURPLE_SLIP']
   },
-  { value: 15, label: '物料编码', kind: 'TEXT', allowContains: true },
+  // 物料编码没有固定值域（「包含」＝前缀匹配），唯一保留手填的字段
+  { value: 15, label: '物料编码', kind: 'TEXT', allowContains: true, allowCustom: true },
   { value: 16, label: '数量', kind: 'NUMBER' }
 ]
 
@@ -293,6 +310,17 @@ export function valueSuggestionsOf(field: number): EditorValueSuggestion[] {
 }
 
 /**
+ * 该字段是否允许手填值域外的值（默认**不允许**）。
+ *
+ * 闭集字段手填的结果是「发布得出去、运行期永不命中、还不报错」——
+ * 客户等级尤其如此（后端 `SupportedFieldValues` 没有登记它，发布期也不拦）。
+ * 只有本身没有固定值域的「物料编码」保留手填。
+ */
+export function allowsCustomValue(field: number): boolean {
+  return EDITOR_DEMAND_FIELDS.find((f) => f.value === field)?.allowCustom === true
+}
+
+/**
  * 该字段是否允许「相对冻结日整数天数」（当前只有出荷指示入物流日）。
  * 后端换算点：`DemandPriorityProjector.IsRelativeDateThreshold`（只认 CUSTOMERDUEDATE + 范围算子）。
  */
@@ -330,6 +358,7 @@ export function createEmptySegment(
     isEnabled: true,
     competitionRound: round,
     matchConditions: [],
+    matchConditionGroups: [],
     sortFields: [{ field: 6, direction: 0 }],
     stableTieBreakFields: ['DEMANDKEY']
   }
@@ -368,6 +397,13 @@ export function toEditableSegments(segments: PrioritySegmentDto[]): PrioritySegm
       operator: c.operator,
       value: normalizeValue(c.field, c.operator, c.value)
     })),
+    matchConditionGroups: (s.matchConditionGroups ?? []).map((g) => ({
+      conditions: (g?.conditions ?? []).map((c) => ({
+        field: c.field,
+        operator: c.operator,
+        value: normalizeValue(c.field, c.operator, c.value)
+      }))
+    })),
     sortFields: (s.sortFields ?? []).map((f) => ({ field: f.field, direction: f.direction })),
     stableTieBreakFields: [FIXED_TIE_BREAK_FIELD]
   }))
@@ -383,27 +419,48 @@ export function renumberSegments(segments: PrioritySegmentDto[]): PrioritySegmen
  *
  * 轮次声明：全段都选了才写 `CompetitionRound`；一段没选就整块不写
  * （后端投影层对「部分声明」是显式抛错，不能靠 null 混过去）。
+ *
+ * **命中条件两种模式互斥**（后端 `DemandPriorityValidator`：同一段同时带
+ * `MatchConditions` 与 `MatchConditionGroups` 直接报错，属歧义配置）：
+ *  - 有组（DNF）⇒ 只写 `MatchConditionGroups`（组内 AND、组间 OR）
+ *  - 无组（存量）⇒ 只写 `MatchConditions`（全部 AND）
  */
 export function serializePrioritySegments(segments: PrioritySegmentDto[]): string {
   const rows = renumberSegments(segments)
   const allDeclared = rows.length > 0 && rows.every((s) => s.competitionRound != null)
   return JSON.stringify({
-    Segments: rows.map((s) => ({
-      SegmentOrder: s.orderInSegment,
-      SegmentName: (s.segmentName ?? '').trim(),
-      IsEnabled: s.isEnabled !== false,
-      ...(allDeclared ? { CompetitionRound: Number(s.competitionRound) } : {}),
-      MatchConditions: (s.matchConditions ?? []).map((c) => ({
-        Field: Number(c.field),
-        Operator: Number(c.operator),
-        Value: c.value
-      })),
-      SortFields: (s.sortFields ?? []).map((f) => ({
-        Field: Number(f.field),
-        Direction: Number(f.direction)
-      })),
-      StableTieBreakFields: [FIXED_TIE_BREAK_FIELD]
-    }))
+    Segments: rows.map((s) => {
+      const groups = s.matchConditionGroups ?? []
+      const dnf = groups.length > 0
+      return {
+        SegmentOrder: s.orderInSegment,
+        SegmentName: (s.segmentName ?? '').trim(),
+        IsEnabled: s.isEnabled !== false,
+        ...(allDeclared ? { CompetitionRound: Number(s.competitionRound) } : {}),
+        ...(dnf
+          ? {
+              MatchConditionGroups: groups.map((g) => ({
+                Conditions: (g?.conditions ?? []).map((c) => ({
+                  Field: Number(c.field),
+                  Operator: Number(c.operator),
+                  Value: c.value
+                }))
+              }))
+            }
+          : {
+              MatchConditions: (s.matchConditions ?? []).map((c) => ({
+                Field: Number(c.field),
+                Operator: Number(c.operator),
+                Value: c.value
+              }))
+            }),
+        SortFields: (s.sortFields ?? []).map((f) => ({
+          Field: Number(f.field),
+          Direction: Number(f.direction)
+        })),
+        StableTieBreakFields: [FIXED_TIE_BREAK_FIELD]
+      }
+    })
   })
 }
 
@@ -421,8 +478,7 @@ function inValueDomain(
   return bad === undefined ? null : `值「${bad}」不在合法值域（${domain.join(' / ')}）`
 }
 
-function conditionError(segNo: number, idx: number, c: SegmentMatchConditionDto): string | null {
-  const where = `第 ${segNo} 段 条件 ${idx + 1}`
+function conditionError(where: string, c: SegmentMatchConditionDto): string | null {
   if (!isEditorField(c.field)) return `${where}：字段不在可用范围`
   if (!operatorsForField(c.field).some((o) => o.value === c.operator)) {
     return `${where}：${fieldLabelOf(c.field)} 不能使用该操作符`
@@ -489,10 +545,32 @@ export function validatePrioritySegments(segments: PrioritySegmentDto[]): string
   segments.forEach((s, i) => {
     const no = i + 1
     if (!String(s.segmentName ?? '').trim()) errors.push(`第 ${no} 段：名称不能为空`)
-    ;(s.matchConditions ?? []).forEach((c, ci) => {
-      const err = conditionError(no, ci, c)
-      if (err) errors.push(err)
-    })
+    const groups = s.matchConditionGroups ?? []
+    if (groups.length > 0) {
+      // DNF 模式：组内 AND、组间 OR
+      groups.forEach((g, gi) => {
+        const conds = g?.conditions ?? []
+        // 空组＝「无条件命中」，会吞掉其后所有段 ⇒ 编辑期就拦住（后端发布校验同样拒绝）
+        if (conds.length === 0) {
+          errors.push(
+            `第 ${no} 段 第 ${gi + 1} 组：条件组不能为空 —— 空组会恒成立并吞掉其后所有段，请补条件或删除该组`
+          )
+        }
+        conds.forEach((c, ci) => {
+          const err = conditionError(`第 ${no} 段 第 ${gi + 1} 组 条件 ${ci + 1}`, c)
+          if (err) errors.push(err)
+        })
+      })
+      // 同一段不能既填平铺又填组（后端按「非空即优先」判歧义并报错）
+      if ((s.matchConditions ?? []).length > 0) {
+        errors.push(`第 ${no} 段：条件组与单组条件不能同时存在，请只保留一种写法`)
+      }
+    } else {
+      ;(s.matchConditions ?? []).forEach((c, ci) => {
+        const err = conditionError(`第 ${no} 段 条件 ${ci + 1}`, c)
+        if (err) errors.push(err)
+      })
+    }
     ;(s.sortFields ?? []).forEach((f, fi) => {
       if (!isEditorField(f.field)) errors.push(`第 ${no} 段 排序 ${fi + 1}：字段不在可用范围`)
       if (![0, 1].includes(Number(f.direction))) {
@@ -509,8 +587,11 @@ export function validatePrioritySegments(segments: PrioritySegmentDto[]): string
   })
 
   // 空条件段＝无条件命中，会吞掉其后所有段 ⇒ 只能有一段且必须末位
+  // （与后端 `ValidateFallbackSegment` 同口径：**平铺空 且 组空**才算兜底段）
   const fallbackIdx = segments
-    .map((s, i) => ((s.matchConditions ?? []).length === 0 ? i : -1))
+    .map((s, i) =>
+      (s.matchConditions ?? []).length === 0 && (s.matchConditionGroups ?? []).length === 0 ? i : -1
+    )
     .filter((i) => i >= 0)
   if (fallbackIdx.length > 1) {
     errors.push('无条件的段最多只能有 1 个')

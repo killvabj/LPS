@@ -23,8 +23,18 @@
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { onBeforeRouteLeave } from 'vue-router'
 import { storeToRefs } from 'pinia'
-import { useParameterSetsStore } from '@/store/modules/aps/parameterSets'
+import {
+  useParameterSetsStore,
+  PARAMETER_LIST_SORT_LABELS,
+  type ParameterListSort
+} from '@/store/modules/aps/parameterSets'
 import { formatLocalDateTime, formatUtcDateTime } from '@/utils/datetime'
+import {
+  EFFECTIVE_WINDOW_HINT,
+  diffFieldDisplayName,
+  formatEffectiveFrom,
+  formatEffectiveTo
+} from '@/utils/effectiveWindow'
 import {
   RULE_STATUS_LABELS,
   RULE_STATUS_TAG,
@@ -34,7 +44,7 @@ import {
   BLOCK_KEYS,
   type BlockKey,
   type RuleStatus,
-  type ParameterSetSummaryDto,
+  type ParameterSetListRowDto,
   type ParameterSetVersionHistoryDto
 } from '@/api/aps-v1'
 import type { ParameterRow, JsonValue } from '@/api/aps-v1/draftBuffer'
@@ -48,7 +58,7 @@ import {
   type BlockFieldDef,
   type InertAnnotation
 } from '@/api/aps-v1/parameterBlockFields'
-import { lookupParameterEnum } from '@/api/aps-v1/parameterSetEnums'
+import { lookupParameterEnum, lookupParameterStringDomain } from '@/api/aps-v1/parameterSetEnums'
 import { translateValidationError } from '@/api/aps-v1/validationMessages'
 import WarehouseRefEditor from './components/WarehouseRefEditor.vue'
 import PlanningYieldEditor from './components/PlanningYieldEditor.vue'
@@ -83,16 +93,17 @@ import {
 const paramStore = useParameterSetsStore()
 const {
   filteredParameterSets,
-  statusCounts,
-  noVersionCount,
-  inactiveCount,
+  tabCounts,
+  parameterSetTotal,
   currentDetail,
   currentDiff,
   paramDiffRows,
   paramDiffPair,
   lastValidation,
   statusFilter,
-  showInactive,
+  listKeyword,
+  listActiveFilter,
+  listSort,
   loading,
   listLoading,
   actionRunning,
@@ -191,22 +202,84 @@ function addFieldExamples(blockKey: BlockKey): string {
 }
 
 /* ===== 选中 ===== */
-const noVersionPicked = ref<ParameterSetSummaryDto | null>(null)
+const noVersionPicked = ref<ParameterSetListRowDto | null>(null)
 
-async function selectParameterSet(ps: ParameterSetSummaryDto): Promise<void> {
+/**
+ * 选中列表里的一行（一版一行 ⇒ 传 versionId，决定右侧展示哪一版）
+ *
+ * 2026-11-11：列表源改为「主子表联查·一版一行」后，同族多个版本各占一行；
+ * 点哪一行就展示哪一版的内容，页面上的状态/发布/停用都作用在这一版上。
+ */
+async function selectParameterSet(row: ParameterSetListRowDto): Promise<void> {
   noVersionPicked.value = null
   paramStore.reset()
   activeTab.value = 'edit'
-  if (!ps.hasVersion) {
-    noVersionPicked.value = ps
+  // 无版本的参数集必然加载不出内容（versions 返回空数组），
+  // 与其让用户看一条报错红条，不如直接告诉他「这个还没配版本」
+  if (!row.hasVersion || row.versionId == null) {
+    noVersionPicked.value = row
     return
   }
-  await paramStore.loadDetail(ps.parameterSetId)
+  await paramStore.loadDetail(row.parameterSetId, row.versionId)
 }
 
-function setFilter(filter: RuleStatus | 'ALL'): void {
+function setFilter(filter: RuleStatus | typeof NO_VERSION | 'ALL'): void {
   paramStore.setStatusFilter(filter)
 }
+
+/* ===== 列表行的展示口径（一版一行） ===== */
+
+/** 该行的状态标签文案（无版本的行显示「未配版本」） */
+function rowStatusLabel(row: ParameterSetListRowDto): string {
+  if (!row.hasVersion || !row.versionStatus) return NO_VERSION_LABEL
+  return RULE_STATUS_LABELS[row.versionStatus]
+}
+
+/** 该行的状态标签颜色 */
+function rowStatusTag(
+  row: ParameterSetListRowDto
+): 'success' | 'warning' | 'info' | 'primary' | 'danger' {
+  if (!row.hasVersion || !row.versionStatus) return 'info'
+  return RULE_STATUS_TAG[row.versionStatus]
+}
+
+/** 该行的时间项标题：发布过的版本看发布时间，其余看建档时间；无版本行看说明 */
+function rowTimeKey(row: ParameterSetListRowDto): string {
+  if (!row.hasVersion) return '说明'
+  return row.publishedAt ? '发布时间' : '建档时间'
+}
+
+/**
+ * 该行的时间（治理域时间一律本地直显，不做 UTC 位移）
+ *
+ * ⚠️ 无版本的主表没有版本时间 ⇒ 展示主表说明（后端列表行的 description）
+ */
+function rowTimeText(row: ParameterSetListRowDto): string {
+  if (!row.hasVersion) return row.description || '—'
+  const t = row.publishedAt ?? row.createdAt
+  return t ? formatLocalDateTime(t) : '—'
+}
+
+/* ===== 列表筛选条件（2026-11-11） ===== */
+function onKeywordChange(value: string): void {
+  paramStore.setListKeyword(value ?? '')
+}
+
+function onActiveFilterChange(value: string): void {
+  paramStore.setListActiveFilter(value as 'ALL' | 'ACTIVE' | 'INACTIVE')
+}
+
+function onSortChange(value: string): void {
+  paramStore.setListSort(value as ParameterListSort)
+}
+
+/** 是否有筛选条件生效（「重置筛选」按钮的显隐） */
+const hasListFilter = computed(
+  () =>
+    listKeyword.value.trim() !== '' ||
+    listActiveFilter.value !== 'ALL' ||
+    listSort.value !== 'DEFAULT'
+)
 
 /* ===== [+ 新建参数集] Dialog（主表；POST /parameter-set） ===== */
 const createParameterSetDialog = ref(false)
@@ -244,7 +317,7 @@ const editParameterSetForm = ref({
   isActive: true
 })
 
-function openEditParameterSetDialog(p: ParameterSetSummaryDto): void {
+function openEditParameterSetDialog(p: ParameterSetListRowDto): void {
   editParameterSetForm.value = {
     parameterSetId: p.parameterSetId,
     parameterSetCode: p.parameterSetCode,
@@ -298,12 +371,46 @@ const TYPE_LABELS: Record<ParameterRow['type'], string> = {
 /** 只读态的值展示（数组不再直出 JSON 串） */
 function displayValueOf(row: ParameterRow): string {
   if (row.options) return enumLabelOf(row)
+  if (row.stringDomain) return stringDomainLabelOf(row)
   const v = row.value
   if (v === null || v === undefined) return '—'
   if (Array.isArray(v)) {
     return v.every((x) => typeof x === 'string') ? v.join('、') : JSON.stringify(v)
   }
   return String(v)
+}
+
+/** 值域行的只读展示：显示中文名；值不在值域内（如存量脏值）就原样显示出来让人看见 */
+function stringDomainLabelOf(row: ParameterRow): string {
+  const domain = row.stringDomain
+  if (!domain) return '—'
+  const label = (v: string): string => domain.options.find((o) => o.value === v)?.label ?? v
+  if (Array.isArray(row.value)) {
+    const items = row.value.filter((v): v is string => typeof v === 'string')
+    return items.length ? items.map(label).join('、') : '—'
+  }
+  return typeof row.value === 'string' ? label(row.value) : '—'
+}
+
+/** 值域多选行的当前值（只取字符串；存量非字符串项不参与下拉） */
+function stringListOf(row: ParameterRow): string[] {
+  return Array.isArray(row.value) ? row.value.filter((v): v is string => typeof v === 'string') : []
+}
+
+/** 值域行的候选项（没有值域 ⇒ 空数组） */
+function stringDomainOptionsOf(row: ParameterRow): readonly { label: string; value: string }[] {
+  return row.stringDomain?.options ?? []
+}
+
+/** 值域行是否允许手填（客户等级允许；订单类型 / 成熟度不允许） */
+function stringDomainAllowsCustom(row: ParameterRow): boolean {
+  return row.stringDomain?.allowCustom === true
+}
+
+/** 值域多选编辑：整份数组写回（空选 ⇒ 空数组 = 一项都不限） */
+function onStringListEdit(row: ParameterRow, value: unknown): void {
+  const items = Array.isArray(value) ? value.filter((v): v is string => typeof v === 'string') : []
+  paramStore.onCellEdit(row, items)
 }
 
 /** 文本清单 → 编辑框文本（每行一项） */
@@ -360,12 +467,20 @@ const addFieldNumber = ref<number | undefined>(undefined)
 const addFieldEnum = ref<number | undefined>(undefined)
 const addFieldText = ref('')
 const addFieldList = ref('')
+/** 值域字段（订单类型 / 客户等级 / 需求成熟度…）的取值：单选一项 / 多选若干项 */
+const addFieldChoice = ref('')
+const addFieldChoiceList = ref<string[]>([])
 
 /** 该块里**尚未配置**的字段（已配过的由通用参数表直接编辑） */
 const addFieldCandidates = computed<BlockFieldDef[]>(() => {
   const blockObj = buffer.value.workingBlocks?.[addFieldBlock.value]
   return listAbsentFields(addFieldBlock.value, blockObj)
 })
+
+/** 该块还有没有可新增的字段（没有就不给入口 —— 例如采购块的标量字段全被工作簿口径挡掉） */
+function hasAddableFields(block: BlockKey): boolean {
+  return listAbsentFields(block, buffer.value.workingBlocks?.[block]).length > 0
+}
 
 const addFieldDef = computed<BlockFieldDef | undefined>(() =>
   findBlockField(addFieldBlock.value, addFieldPath.value)
@@ -393,12 +508,27 @@ const addFieldEnumOptions = computed(() =>
     : undefined
 )
 
+/** 字符串值域（订单类型 / 客户等级 / 需求成熟度…）；有值域 ⇒ 给下拉，不给自由文本 */
+const addFieldStringDomain = computed(() =>
+  addFieldDef.value
+    ? lookupParameterStringDomain(addFieldBlock.value, addFieldDef.value.path.split('.'))
+    : undefined
+)
+
+/** 值域候选项（没有值域 ⇒ 空数组） */
+const addFieldStringOptions = computed(() => addFieldStringDomain.value?.options ?? [])
+
+/** 值域是否允许手填（客户等级允许；订单类型 / 成熟度不允许） */
+const addFieldAllowsCustom = computed(() => addFieldStringDomain.value?.allowCustom === true)
+
 function resetAddFieldValue(): void {
   addFieldBool.value = undefined
   addFieldNumber.value = undefined
   addFieldEnum.value = undefined
   addFieldText.value = ''
   addFieldList.value = ''
+  addFieldChoice.value = ''
+  addFieldChoiceList.value = []
 }
 
 function openAddFieldDialog(blockKey: BlockKey): void {
@@ -418,6 +548,15 @@ function collectAddFieldValue(def: BlockFieldDef): JsonValue | null {
   if (def.kind === 'BOOL') return addFieldBool.value === undefined ? null : addFieldBool.value
   if (def.kind === 'NUMBER') return addFieldNumber.value === undefined ? null : addFieldNumber.value
   if (def.kind === 'ENUM') return addFieldEnum.value === undefined ? null : addFieldEnum.value
+  // 值域字段：下拉选的码原样写回（多选取数组）
+  if (addFieldStringDomain.value) {
+    if (def.kind === 'TEXT_LIST') {
+      const items = addFieldChoiceList.value.filter(Boolean)
+      return items.length ? items : null
+    }
+    const t = addFieldChoice.value.trim()
+    return t ? t : null
+  }
   if (def.kind === 'TEXT') {
     const t = addFieldText.value.trim()
     return t ? t : null
@@ -675,37 +814,60 @@ onBeforeRouteLeave(async () => {
     <!-- ===== 错误条 ===== -->
     <ElAlert v-if="error" type="error" :closable="false" show-icon :title="error" />
 
-    <!-- ===== KPI 横条 ===== -->
-    <div class="kpi-strip">
-      <div class="kpi-pill">
-        <span class="pill-label">参数集总数</span>
-        <span class="pill-val">{{ paramStore.parameterSets.length }}</span>
-      </div>
-      <div v-for="key in RULE_STATUSES_UI" :key="key" class="kpi-pill">
-        <span class="pill-label">{{ RULE_STATUS_LABELS[key] }}</span>
-        <span class="pill-val">{{ statusCounts[key] ?? 0 }}</span>
-      </div>
-      <div class="kpi-pill">
-        <span class="pill-label">{{ NO_VERSION_LABEL }}</span>
-        <span class="pill-val">{{ noVersionCount }}</span>
-      </div>
-    </div>
-
-    <!-- ===== 状态过滤 ===== -->
+    <!-- ===== 状态页签（计数直接落在页签上）+ 筛选条件 =====
+         2026-11-11 用户拍板（与规则集页同口径）：
+           · 顶部 KPI 横条撤除，各状态数量改为显示在页签上；
+           · 「全部」页签 = 显示全部（**含停用的**），故原「显示已停用」开关撤除；
+           · 补筛选条件：关键词 / 主表状态 / 排序。 ===== -->
     <div class="filter-row">
       <ElRadioGroup v-model="statusFilter" @change="setFilter">
-        <ElRadioButton label="ALL">全部</ElRadioButton>
-        <ElRadioButton v-for="key in RULE_STATUSES_UI" :key="key" :label="key">
-          {{ RULE_STATUS_LABELS[key] }}
+        <ElRadioButton
+          label="ALL"
+          :title="`共 ${tabCounts.ALL} 行 / ${parameterSetTotal} 个参数集（按主表去重）`"
+        >
+          全部<span class="tab-count">{{ tabCounts.ALL }}</span>
         </ElRadioButton>
-        <ElRadioButton :label="NO_VERSION">{{ NO_VERSION_LABEL }}</ElRadioButton>
+        <ElRadioButton v-for="key in RULE_STATUSES_UI" :key="key" :label="key">
+          {{ RULE_STATUS_LABELS[key] }}<span class="tab-count">{{ tabCounts[key] }}</span>
+        </ElRadioButton>
+        <ElRadioButton :label="NO_VERSION">
+          {{ NO_VERSION_LABEL }}<span class="tab-count">{{ tabCounts.NO_VERSION }}</span>
+        </ElRadioButton>
       </ElRadioGroup>
-      <ElTooltip content="停用的参数集默认不显示；勾选后才能看到并重新启用它们" placement="top">
-        <label class="show-inactive-toggle">
-          <ElSwitch v-model="showInactive" size="small" />
-          <span>显示已停用（{{ inactiveCount }}）</span>
-        </label>
-      </ElTooltip>
+
+      <div class="filter-tools">
+        <ElInput
+          :model-value="listKeyword"
+          class="tool-kw"
+          placeholder="搜索参数集编码 / 名称 / 版本码"
+          clearable
+          @update:model-value="onKeywordChange"
+        >
+          <template #prefix>
+            <Icon icon="vi-mdi:magnify" />
+          </template>
+        </ElInput>
+        <ElSelect
+          :model-value="listActiveFilter"
+          class="tool-select"
+          @change="onActiveFilterChange"
+        >
+          <ElOption label="主表状态：全部" value="ALL" />
+          <ElOption label="主表状态：启用" value="ACTIVE" />
+          <ElOption label="主表状态：停用" value="INACTIVE" />
+        </ElSelect>
+        <ElSelect :model-value="listSort" class="tool-select" @change="onSortChange">
+          <ElOption
+            v-for="(label, key) in PARAMETER_LIST_SORT_LABELS"
+            :key="key"
+            :label="label"
+            :value="key"
+          />
+        </ElSelect>
+        <ElButton v-if="hasListFilter" text size="small" @click="paramStore.resetListFilters()">
+          重置筛选
+        </ElButton>
+      </div>
     </div>
 
     <div class="content-row">
@@ -723,26 +885,25 @@ onBeforeRouteLeave(async () => {
         <div v-else class="ps-list">
           <div
             v-for="p in filteredParameterSets"
-            :key="p.parameterSetId"
+            :key="p.rowKey"
             class="ps-card"
             :class="{
-              active: detailNN?.summary.parameterSetId === p.parameterSetId,
-              draft: p.status === 'DRAFT',
-              published: p.status === 'PUBLISHED',
-              disabled: p.status === 'DISABLED'
+              active:
+                detailNN?.summary.parameterSetId === p.parameterSetId &&
+                detailNN?.version?.id === p.versionId,
+              draft: p.versionStatus === 'DRAFT',
+              published: p.versionStatus === 'PUBLISHED',
+              disabled: p.versionStatus === 'DISABLED'
             }"
             @click="selectParameterSet(p)"
           >
             <div class="ps-head">
               <span class="ps-code">{{ p.parameterSetCode }}</span>
               <span class="ps-head-tags">
+                <!-- 主表停用（只关主表，不级联版本）——与版本状态是两件事 -->
                 <ElTag v-if="p.isActive === false" size="small" type="info">主表停用</ElTag>
-                <ElTag
-                  :type="p.hasVersion ? RULE_STATUS_TAG[p.status] : 'info'"
-                  size="small"
-                  effect="dark"
-                >
-                  {{ p.hasVersion ? RULE_STATUS_LABELS[p.status] : NO_VERSION_LABEL }}
+                <ElTag :type="rowStatusTag(p)" size="small" effect="dark">
+                  {{ rowStatusLabel(p) }}
                 </ElTag>
                 <ElTooltip
                   :content="
@@ -763,12 +924,13 @@ onBeforeRouteLeave(async () => {
               </span>
             </div>
             <div class="ps-name">{{ p.parameterSetName }}</div>
+            <!-- 一版一行：版本码单独一行（与编码并列时，长编码会把右侧状态标签挤出可视区） -->
+            <div class="ps-ver-line">
+              <span class="ps-ver">{{ p.versionCode || NO_VERSION_LABEL }}</span>
+            </div>
             <div class="ps-meta">
-              <span class="meta-key">最新已发布版本</span>
-              <span class="meta-val">{{ p.currentVersionCode || '—' }}</span>
-              <span v-if="p.draftVersionCode" class="meta-draft"
-                >/ 草稿 {{ p.draftVersionCode }}</span
-              >
+              <span class="meta-key">{{ rowTimeKey(p) }}</span>
+              <span class="meta-val">{{ rowTimeText(p) }}</span>
             </div>
             <div v-if="p.lastChangeReason" class="ps-reason">{{ p.lastChangeReason }}</div>
           </div>
@@ -810,11 +972,13 @@ onBeforeRouteLeave(async () => {
                 {{ RULE_STATUS_LABELS[detailNN.summary.status] }}
               </ElTag>
               {{ detailNN.summary.parameterSetCode }}
+              <!-- 一版一行：这里明确标出「本页展示的是哪一版」 -->
+              <span class="muted-tag"> 版本 {{ detailNN.version?.versionCode || '—' }} </span>
               <span class="muted-tag">
-                {{ detailNN.summary.currentVersionCode || '（无已发布版本）' }}
+                最新已发布 {{ detailNN.summary.currentVersionCode || '（无）' }}
               </span>
               <span v-if="detailNN.summary.draftVersionCode" class="muted-tag">
-                → 草稿 {{ detailNN.summary.draftVersionCode }}
+                草稿 {{ detailNN.summary.draftVersionCode }}
               </span>
             </div>
             <div class="head-actions">
@@ -1000,16 +1164,26 @@ onBeforeRouteLeave(async () => {
                       type="primary"
                       size="small"
                       class="block-add-btn"
-                      :disabled="!actions.canEdit"
+                      :disabled="!actions.canEdit || !hasAddableFields(blockKey)"
+                      :title="
+                        hasAddableFields(blockKey)
+                          ? ''
+                          : '本块没有可新增的字段（参数以 0号位 工作簿为准）'
+                      "
                       @click="openAddFieldDialog(blockKey)"
                     >
                       <Icon icon="vi-mdi:plus" /> 新增字段
                     </ElButton>
                   </div>
                   <!-- 有专属编辑器的块（供应 / 采购）不显示空态插图，但**必须**留一句引导：
-                       否则用户只看到「采购仓库优先级」，不知道上面的普通参数从哪加。 -->
+                       否则用户只看到「采购仓库优先级」，不知道上面的普通参数从哪加。
+                       没有可新增字段时不给这句（否则教用户点一个禁用的按钮）。 -->
                   <div
-                    v-if="rowsGrouped[blockKey].length === 0 && hasWarehouseEditor(blockKey)"
+                    v-if="
+                      rowsGrouped[blockKey].length === 0 &&
+                      hasWarehouseEditor(blockKey) &&
+                      hasAddableFields(blockKey)
+                    "
                     class="add-field-hintline"
                   >
                     这块还没有参数。点右上角「新增字段」添加，例如：{{ addFieldExamples(blockKey) }}
@@ -1072,7 +1246,13 @@ onBeforeRouteLeave(async () => {
                     <ElTableColumn label="类型" width="100" align="center">
                       <template #default="{ row }">
                         <ElTag size="small" effect="plain">{{
-                          row.options ? '枚举' : TYPE_LABELS[row.type]
+                          row.stringDomain
+                            ? row.type === 'TEXT_LIST'
+                              ? '下拉多选'
+                              : '下拉单选'
+                            : row.options
+                              ? '枚举'
+                              : TYPE_LABELS[row.type]
                         }}</ElTag>
                       </template>
                     </ElTableColumn>
@@ -1091,6 +1271,42 @@ onBeforeRouteLeave(async () => {
                         >
                           <ElOption
                             v-for="opt in row.options"
+                            :key="opt.value"
+                            :label="opt.label"
+                            :value="opt.value"
+                          />
+                        </ElSelect>
+                        <!-- 值域多选（订单类型 / 需求成熟度…）：后端 Ordinal 精确比对，填错不报错也不命中
+                             ⇒ 只给下拉。存量脏值（如「振荡」）照原样显示出来，可直接删掉。 -->
+                        <ElSelect
+                          v-else-if="row.stringDomain && row.type === 'TEXT_LIST'"
+                          :model-value="stringListOf(row)"
+                          multiple
+                          size="small"
+                          style="width: 100%"
+                          placeholder="可多选"
+                          @change="(v) => onStringListEdit(row, v)"
+                        >
+                          <ElOption
+                            v-for="opt in stringDomainOptionsOf(row)"
+                            :key="opt.value"
+                            :label="opt.label"
+                            :value="opt.value"
+                          />
+                        </ElSelect>
+                        <!-- 值域单选（客户等级）：候选 VIP / GENERAL，仍允许手填（源字典可能扩展） -->
+                        <ElSelect
+                          v-else-if="row.stringDomain"
+                          :model-value="typeof row.value === 'string' ? row.value : ''"
+                          size="small"
+                          filterable
+                          :allow-create="stringDomainAllowsCustom(row)"
+                          style="width: 100%"
+                          placeholder="选择一项"
+                          @change="(v) => onCellEdit(row, typeof v === 'string' ? v : '')"
+                        >
+                          <ElOption
+                            v-for="opt in stringDomainOptionsOf(row)"
                             :key="opt.value"
                             :label="opt.label"
                             :value="opt.value"
@@ -1161,19 +1377,12 @@ onBeforeRouteLeave(async () => {
                        供应 Inventory.WarehousePriority 按 3号位 2026-11-06 v1.1 改判隐藏；
                        值仍留在块 JSON 中并原样回写，载荷边界不变。 -->
                   <template v-if="blockKey === 'procurement'">
+                    <!-- 0号位 11-04 工作簿只收「采购仓库优先级」与「采购良率」两项；
+                         「默认采购提前期 / 到货可用偏移」工作簿未收录 ⇒ 2026-11-09 撤除编辑器
+                         （值仍在块 JSON 里，保存原样回写）。 -->
                     <WarehouseRefEditor
                       kind="procurement-priority"
                       title="采购仓库优先级"
-                      :disabled="!actions.canEdit"
-                    />
-                    <WarehouseRefEditor
-                      kind="purchase-lt"
-                      title="默认采购提前期"
-                      :disabled="!actions.canEdit"
-                    />
-                    <WarehouseRefEditor
-                      kind="arrival-offset"
-                      title="到货可用偏移"
                       :disabled="!actions.canEdit"
                     />
                     <!-- 采购良率（专属编辑器：物料 + 工序 + 良率，通用单值控件表达不了） -->
@@ -1236,7 +1445,7 @@ onBeforeRouteLeave(async () => {
             <ElTabPane label="版本对比" name="diff">
               <template v-if="!paramDiffPair">
                 <ElEmpty
-                  description="暂无可对比的两个版本（需要至少两个版本：一个已发布版本 + 另一个版本）"
+                  description="暂无可对比的两个版本：需要一个「最新已发布版本」加上另一个版本（草稿版，或上一个已发布版本）"
                 />
               </template>
               <template v-else>
@@ -1289,7 +1498,9 @@ onBeforeRouteLeave(async () => {
                     <ElTableColumn label="字段" min-width="200">
                       <template #default="{ row }">
                         <div class="diff-field">
-                          <span class="diff-field-cn">{{ row.fieldDisplayName }}</span>
+                          <span class="diff-field-cn">{{
+                            diffFieldDisplayName(row.fieldName, row.fieldDisplayName)
+                          }}</span>
                           <code class="code-tag">{{ row.fieldName }}</code>
                         </div>
                       </template>
@@ -1344,28 +1555,22 @@ onBeforeRouteLeave(async () => {
                 </ElTableColumn>
                 <ElTableColumn width="160">
                   <template #header>
-                    <ElTooltip
-                      content="为空 = 不限有效期（发布即生效，直到停用）。参数集/规则集发布时后端不写这列。"
-                      placement="top"
-                    >
+                    <ElTooltip :content="EFFECTIVE_WINDOW_HINT" placement="top">
                       <span class="th-hint">生效起</span>
                     </ElTooltip>
                   </template>
                   <template #default="{ row }">
-                    {{ formatLocalDateTime(row.effectiveFrom) }}
+                    {{ formatEffectiveFrom(row.effectiveFrom) }}
                   </template>
                 </ElTableColumn>
                 <ElTableColumn width="160">
                   <template #header>
-                    <ElTooltip
-                      content="为空 = 一直有效（直到这个版本被停用）。参数集/规则集发布时后端不写这列。"
-                      placement="top"
-                    >
+                    <ElTooltip :content="EFFECTIVE_WINDOW_HINT" placement="top">
                       <span class="th-hint">生效止</span>
                     </ElTooltip>
                   </template>
                   <template #default="{ row }">
-                    {{ formatLocalDateTime(row.effectiveTo) }}
+                    {{ formatEffectiveTo(row.effectiveTo, row.status) }}
                   </template>
                 </ElTableColumn>
                 <ElTableColumn width="120" align="center">
@@ -1390,8 +1595,8 @@ onBeforeRouteLeave(async () => {
                 每次发布产生新的版本，历史版本完整保留，可随时回看变更轨迹。
               </ElAlert>
               <ElAlert type="info" :closable="false" show-icon class="u22-alert">
-                <template #title>「生效起 / 生效止」留空是正常的</template>
-                参数集与规则集发布时不写有效期；留空 = 这个版本一直有效，直到它被停用。
+                <template #title>「生效起 / 生效止」记的是这一版的生命周期</template>
+                版本发布时后端自动写入「生效起」（发布时间），停用时自动写入「生效止」（停用时刻）；已发布未停用的版本显示「仍在有效期」。草稿未发布时两列都是空的，历史版本也可能没有记录。
               </ElAlert>
             </ElTabPane>
           </ElTabs>
@@ -1553,6 +1758,37 @@ onBeforeRouteLeave(async () => {
           >
             <ElOption
               v-for="opt in addFieldEnumOptions ?? []"
+              :key="opt.value"
+              :label="opt.label"
+              :value="opt.value"
+            />
+          </ElSelect>
+          <!-- 值域字段（订单类型 / 需求成熟度 / 客户等级）：只给下拉，不给自由文本
+               （后端按英文码精确比对，填错既不报错也不命中） -->
+          <ElSelect
+            v-else-if="addFieldDef.kind === 'TEXT_LIST' && addFieldStringDomain"
+            v-model="addFieldChoiceList"
+            multiple
+            placeholder="可多选"
+            style="width: 100%"
+          >
+            <ElOption
+              v-for="opt in addFieldStringOptions"
+              :key="opt.value"
+              :label="opt.label"
+              :value="opt.value"
+            />
+          </ElSelect>
+          <ElSelect
+            v-else-if="addFieldDef.kind === 'TEXT' && addFieldStringDomain"
+            v-model="addFieldChoice"
+            :filterable="addFieldAllowsCustom"
+            :allow-create="addFieldAllowsCustom"
+            placeholder="选择一项"
+            style="width: 100%"
+          >
+            <ElOption
+              v-for="opt in addFieldStringOptions"
               :key="opt.value"
               :label="opt.label"
               :value="opt.value"
@@ -1869,31 +2105,6 @@ onBeforeRouteLeave(async () => {
   text-align: center;
 }
 
-.kpi-strip {
-  display: flex;
-  gap: 10px;
-  flex-wrap: wrap;
-}
-
-.kpi-pill {
-  display: inline-flex;
-  padding: 6px 14px;
-  font-size: 12px;
-  background: #f8fafc;
-  border-radius: 16px;
-  align-items: center;
-  gap: 6px;
-
-  .pill-label {
-    color: #64748b;
-  }
-
-  .pill-val {
-    font-weight: 600;
-    color: #1e293b;
-  }
-}
-
 .filter-row {
   padding: 8px 12px;
   background: #fff;
@@ -1906,14 +2117,27 @@ onBeforeRouteLeave(async () => {
   flex-wrap: wrap;
 }
 
-.show-inactive-toggle {
-  display: inline-flex;
+/* 页签上的行数徽标 */
+.tab-count {
+  margin-left: 6px;
+  font-size: 12px;
+  opacity: 0.75;
+}
+
+/* 筛选条件区 */
+.filter-tools {
+  display: flex;
   align-items: center;
-  gap: 6px;
-  font-size: 13px;
-  color: #4b5563;
-  cursor: pointer;
-  user-select: none;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.tool-kw {
+  width: 240px;
+}
+
+.tool-select {
+  width: 150px;
 }
 
 .content-row {
@@ -1990,6 +2214,16 @@ onBeforeRouteLeave(async () => {
     margin-bottom: 8px;
     font-size: 13px;
     color: #334155;
+  }
+
+  .ps-ver-line {
+    margin-bottom: 6px;
+  }
+
+  .ps-ver {
+    font-family: 'Courier New', monospace;
+    font-size: 11px;
+    color: #64748b;
   }
 
   .ps-meta {

@@ -21,26 +21,49 @@
  * 2026-11-02 按 5号位 答复函（r14009 已部署）接入**计划派生交付判定**：
  *  - 交付状态改读后端算好的 `riskLevel`（`DELAYED` 红 / `ON_TRACK` 绿 / **缺键=未排产** 灰）；
  *    `Order.DelayStatus` 是 ERP/ODS 独立维度，冻结 `01 §64` 红线禁止拿它当本版本交付结果
- *    （实测 v999333 O20630651 就是 `delayStatus=ON_TIME` + 计划超期 15.4 天，两结论同屏打架）
  *  - KPI 四卡 = 总数 / 按期 / 延迟 / 未排产，全部取 summary 的**计划派生三桶**
  *    （恒等式：按期+延迟+未排产 = 总数）
  *  - 「未排」卡重新上线：后端 `unscheduledCount` 已从 `CAST(0 AS INT)` 字面量改为**实值**
  *    （本版本无 Task 行）；旧「未计算」卡（= 总数 − 按期 − 延迟）口径已废，删掉
+ *
+ * 2026-11-12 **工厂用户视角改版**（用户：站在工厂用户角度，页面怎么弄比较好用）：
+ *
+ *  ① 默认计划版本：旧规则取「最新一条」（`GET /api/schedule/versions` 最新优先）
+ *     ⇒ dev 最新一条是 `FAILED` 的测试版本，用户一进页面看到的是「延迟 0 / 未排产 100%」的空版本，
+ *     像是系统坏了。改由 store 的 `pickDefaultVersion()` 按「已生效(ACTIVE) 优先」挑
+ *     （端点没给生效标识，仍是前端兜底 ⇒ 已出函 5号位要 `isDefault`，见函件 R5）。
+ *  ② 交期快捷区间：后端本来就有 `dueDateFrom` / `dueDateTo`，页面却只有一个日期区间框，
+ *     计划员每天要看的是「本周/近 4 周要交期的、已经逾期的」。现给 5 个一键区间
+ *     （工作窗口 / 已逾期 / 近 4 周 / 近 13 周 / 全部交期），默认「工作窗口」。
+ *  ③ 工厂 / 产品族：原来是**精确匹配的自由文本**（计划员不认编码，只认「北京工厂」），
+ *     现改走主数据下拉（3号位 `GET /api/governance/factories` / `product-families`）：
+ *     显示中文名、传编码，仍允许手输编码兜底。
+ *  ④ 文本筛选 400ms 防抖：旧实现每敲一个字就打一次后端。
+ *  ⑤ 表格瘦身：生产指示号并进订单号下方、延期原因并进「交付状态」列
+ *     （原来 14 列，右边「操作」列常被横向滚动裁掉）。
+ *  ⑥ KPI 口径标注：summary 端点只收 `planVersionId`（不收筛选条件）⇒ KPI 恒为**全版本**，
+ *     页面必须写明，否则用户以为 KPI 跟着筛选变。
+ *  ⑦ 版本状态大白话提示（失败 / 计算中 / 未发令 / 已被顶替 / 全版本都未排产）。
  *
  * 写接口：本页查询部分只读；**唯一写入口 = §10A.1「已有订单提前」**
  * （EXISTING_ORDER_ADVANCE → POST /api/governance/run/candidate，Policy aps.plan.run）
  * @see 4号位实施包 v1.4 §十A
  */
 
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { storeToRefs } from 'pinia'
 import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { useOrderStore } from '@/store/modules/aps/order'
 import { useDomainStore } from '@/store/modules/aps/domain'
 import { useApsAuthStore } from '@/store/modules/aps/auth'
-import { triggerBusinessEntry } from '@/api/aps-v1'
-import { formatUtcDateTime, formatUtcMonthDay, formatUtcMonthDayHM } from '@/utils/datetime'
+import { domainApi, triggerBusinessEntry } from '@/api/aps-v1'
+import {
+  formatUtcDate,
+  formatUtcDateTime,
+  formatUtcMonthDay,
+  formatUtcMonthDayHM
+} from '@/utils/datetime'
 import type { BusinessEntrySubmission, OrderListItemDto } from '@/api/aps-v1'
 import OrderAdvanceDialog from './components/OrderAdvanceDialog.vue'
 import {
@@ -52,6 +75,7 @@ import {
   ORDER_STATUS_FILTER_OPTIONS,
   PLAN_VERSION_STATUS_LABELS,
   normalizeOrderStatus,
+  planVersionStatusTag,
   reasonLabelOf,
   type DomainKey,
   type OrderDelayStatus,
@@ -75,7 +99,8 @@ import {
   ElSelect,
   ElTable,
   ElTableColumn,
-  ElTag
+  ElTag,
+  ElTooltip
 } from 'element-plus'
 
 const orderStore = useOrderStore()
@@ -214,45 +239,189 @@ const DOMAIN_OPTIONS = computed<Array<{ value: DomainKey | 'ALL'; label: string 
   return [{ value: 'ALL' as const, label: '全部' }, ...list]
 })
 
+// ===== 交期快捷区间（后端既有参数 dueDateFrom / dueDateTo，页面此前没给入口）=====
+//
+// 计划员每天要回答的问题是「这周/近 4 周有哪些订单要交、哪些已经逾期」，
+// 而不是「按 2016 年的交期顺序翻 200 行」。故给 5 个一键区间。
+//
+// ⚠️ 日期基准用 **UTC 今天**：后端 `customerDueDate` 是 UTC 无时区字符串，
+//    而「剩余 N 天」的显示（fmtDue）也是拿 UTC 零点与当前时刻比 —— 两处必须同基准，
+//    否则芯片选中的区间和格子里的天数会对不上。
+type RangeKey = 'work' | 'overdue' | 'w4' | 'w13' | 'all' | 'custom'
+
+const RANGE_PRESETS: Array<{ key: RangeKey; label: string; desc: string }> = [
+  {
+    key: 'work',
+    label: '近期订单',
+    desc: '这批最该动手：近 28 天内要交货的，加上近 30 天内已经拖期的'
+  },
+  { key: 'overdue', label: '已逾期', desc: '交货日期已经过了今天的订单' },
+  { key: 'w4', label: '4 周内到期', desc: '从今天起 4 周内要交货的订单' },
+  { key: 'w13', label: '13 周内到期', desc: '从今天起 13 周内要交货的订单' },
+  { key: 'all', label: '全部', desc: '不按交货日期挑单（含很早以前的历史积压单）' }
+]
+
+/** 相对今天偏移 n 天的 UTC 日期（YYYY-MM-DD） */
+function dayOffset(offset: number): string {
+  const d = new Date()
+  d.setUTCDate(d.getUTCDate() + offset)
+  return d.toISOString().slice(0, 10)
+}
+
+/** 区间 → 后端真实参数（dueDateFrom / dueDateTo） */
+function rangeBounds(key: RangeKey): { from?: string; to?: string } {
+  switch (key) {
+    case 'work':
+      return { from: dayOffset(-30), to: dayOffset(28) }
+    case 'overdue':
+      return { to: dayOffset(-1) }
+    case 'w4':
+      return { from: dayOffset(0), to: dayOffset(28) }
+    case 'w13':
+      return { from: dayOffset(0), to: dayOffset(91) }
+    case 'all':
+    case 'custom':
+    default:
+      return {}
+  }
+}
+
+const activeRange = ref<RangeKey>('work')
+const dueFrom = ref<string | undefined>()
+const dueTo = ref<string | undefined>()
+const rangeDesc = computed(
+  () => RANGE_PRESETS.find((r) => r.key === activeRange.value)?.desc ?? '按下面自己填的日期过滤'
+)
+
+/** 当前生效的交货日期区间（写成真实日期，比写「4 周内」更好懂） */
+const rangeDateText = computed(() => {
+  if (activeRange.value === 'all') return '交货日期不限'
+  const from = dueFrom.value
+  const to = dueTo.value
+  if (from && to) return `交货日期 ${from} ~ ${to}`
+  if (to) return `交货日期早于 ${to}`
+  if (from) return `交货日期 ${from} 之后`
+  return '交货日期不限'
+})
+
+/** 落区间到后端参数（不重查 —— 供「先设好再统一刷一次」的场景用） */
+function setRangeFilter(key: RangeKey): void {
+  activeRange.value = key
+  const { from, to } = rangeBounds(key)
+  dueFrom.value = from
+  dueTo.value = to
+  orderStore.setFilter({ dueDateFrom: from, dueDateTo: to })
+}
+
+/** 落区间 + 重查列表 */
+async function applyRange(key: RangeKey): Promise<void> {
+  setRangeFilter(key)
+  await orderStore.loadList(true)
+}
+
 // ===== 筛选输入（全部对应后端真实 Query 参数）=====
 const orderNoInput = ref('')
 const piInput = ref('')
 const materialInput = ref('')
 /** 客户：无 distinct 端点，且后端是 `CustomerName LIKE %x%` ⇒ 自由文本，不造下拉选项 */
 const customerNameInput = ref('')
-/** 工厂 / 产品族：后端是**精确匹配**（`f.Code =` / `pf.Code =`），无 distinct 端点 ⇒ 自由文本 */
-const factoryCodeInput = ref('')
-const productFamilyInput = ref('')
-const dueDateRange = ref<[string, string] | undefined>()
-const domainCode = ref<string | undefined>()
+/** 工厂 / 产品族：后端是**精确匹配**（`f.Code =` / `pf.Code =`）⇒ 走主数据下拉（显示中文名、传编码） */
+const factoryCodeInput = ref<string | undefined>()
+const productFamilyInput = ref<string | undefined>()
 const delayStatusInput = ref<OrderDelayStatus | undefined>()
 const statusInput = ref<OrderStatusDisplay | undefined>()
 
-watch(
-  [orderNoInput, piInput, materialInput, customerNameInput, factoryCodeInput, productFamilyInput],
-  () => {
+// ===== 主数据下拉（工厂 / 产品族）=====
+//
+// 来源：3号位 `GET /api/governance/factories` / `GET /api/governance/product-families`
+//  （Domain 维护页同一份主数据，非本页自造 ⇒ 与「域定义」里选的工厂/产品族永远对得上）
+const factoryOptions = ref<Array<{ code: string; name: string }>>([])
+const familyOptions = ref<Array<{ code: string; name: string }>>([])
+const dictError = ref<string>('')
+
+/**
+ * 工厂下拉按**业务范围**收窄。
+ *
+ * 后端 `OrderQueryController.QueryOrders` 对入参做范围校验：
+ * `factoryCode` 不在授权范围内 ⇒ 直接 403「Factory 范围越界」。
+ * ⇒ 下拉若把范围外的工厂摆出来，用户点一下就撞 403（自己找的坑）。
+ * 全局范围（isGlobal）⇒ 全部可选；受限范围 ⇒ 只列授权内的。
+ */
+const visibleFactories = computed(() => {
+  const allowed = apsAuth.isGlobalScope ? [] : (apsAuth.dataScope.factoryCodes ?? [])
+  if (allowed.length === 0) return factoryOptions.value
+  return factoryOptions.value.filter((f) => allowed.includes(f.code))
+})
+
+async function loadMasterData(): Promise<void> {
+  try {
+    const [factories, families] = await Promise.all([
+      domainApi.listFactories(),
+      domainApi.listProductFamilies()
+    ])
+    factoryOptions.value = factories.map((f) => ({ code: f.code, name: f.name }))
+    familyOptions.value = families.map((f) => ({ code: f.code, name: f.name }))
+    dictError.value = ''
+  } catch (err) {
+    factoryOptions.value = []
+    familyOptions.value = []
+    dictError.value = (err as Error)?.message ?? '加载工厂/产品族字典失败'
+  }
+}
+
+/** 编码 → 中文名（字典里没有就原样显示编码，绝不臆造名字） */
+function factoryLabel(code?: string | null): string {
+  const raw = (code ?? '').trim()
+  if (!raw) return '—'
+  return factoryOptions.value.find((f) => f.code === raw)?.name ?? raw
+}
+function familyLabel(code?: string | null): string {
+  const raw = (code ?? '').trim()
+  if (!raw) return '—'
+  return familyOptions.value.find((f) => f.code === raw)?.name ?? raw
+}
+
+// ===== 文本筛选：400ms 防抖 =====
+//
+// 旧实现 watch 六个输入框，每敲一个字就 `loadList` 一次（每个键一次后端请求）。
+// 现在：文本框 400ms 防抖；下拉/日期即刻生效（选择本身就是一次明确动作）。
+const TEXT_FILTER_DEBOUNCE_MS = 400
+let textTimer: ReturnType<typeof setTimeout> | null = null
+/** 重置时抑制一次 watch（否则重置后 400ms 又补打一次请求） */
+const suppressTextWatch = ref(false)
+
+watch([orderNoInput, piInput, materialInput, customerNameInput], () => {
+  if (suppressTextWatch.value) {
+    suppressTextWatch.value = false
+    return
+  }
+  if (textTimer) clearTimeout(textTimer)
+  textTimer = setTimeout(() => {
     orderStore.setFilter({
       orderNo: orderNoInput.value || undefined,
       productionInstructionNo: piInput.value || undefined,
       materialCode: materialInput.value || undefined,
-      customerName: customerNameInput.value || undefined,
-      factoryCode: factoryCodeInput.value || undefined,
-      productFamilyCode: productFamilyInput.value || undefined
+      customerName: customerNameInput.value || undefined
     })
     void orderStore.loadList(true)
-  }
-)
+  }, TEXT_FILTER_DEBOUNCE_MS)
+})
 
-function onDueRangeChange(v: [string, string] | null | undefined): void {
-  dueDateRange.value = v ?? undefined
-  orderStore.setFilter({ dueDateFrom: v?.[0], dueDateTo: v?.[1] })
+onUnmounted(() => {
+  if (textTimer) clearTimeout(textTimer)
+})
+
+function onDueFromChange(v: string | null | undefined): void {
+  dueFrom.value = v || undefined
+  activeRange.value = 'custom'
+  orderStore.setFilter({ dueDateFrom: dueFrom.value })
   void orderStore.loadList(true)
 }
 
-function onDomainChange(v: string): void {
-  const val = v && v !== 'ALL' ? v : undefined
-  domainCode.value = val
-  orderStore.setFilter({ domainKey: val })
+function onDueToChange(v: string | null | undefined): void {
+  dueTo.value = v || undefined
+  activeRange.value = 'custom'
+  orderStore.setFilter({ dueDateTo: dueTo.value })
   void orderStore.loadList(true)
 }
 
@@ -268,23 +437,38 @@ function onStatusChange(v: OrderStatusDisplay | undefined): void {
   void orderStore.loadList(true)
 }
 
-function onVersionChange(v: number): void {
-  void orderStore.setPlanVersion(v)
+function onFactoryChange(v: string | undefined): void {
+  factoryCodeInput.value = v
+  orderStore.setFilter({ factoryCode: v })
+  void orderStore.loadList(true)
 }
 
-function onResetSearch(): void {
+function onFamilyChange(v: string | undefined): void {
+  productFamilyInput.value = v
+  orderStore.setFilter({ productFamilyCode: v })
+  void orderStore.loadList(true)
+}
+
+async function onVersionChange(v: number): Promise<void> {
+  // store 切版本会清空全部筛选并重查（既有语义）；交期区间跟着版本走 ⇒ 再落一次区间并重查。
+  await orderStore.setPlanVersion(v)
+  await applyRange(activeRange.value)
+}
+
+async function onResetSearch(): Promise<void> {
+  suppressTextWatch.value = true
   orderNoInput.value = ''
   piInput.value = ''
   materialInput.value = ''
   customerNameInput.value = ''
-  factoryCodeInput.value = ''
-  productFamilyInput.value = ''
-  dueDateRange.value = undefined
-  domainCode.value = undefined
+  factoryCodeInput.value = undefined
+  productFamilyInput.value = undefined
   delayStatusInput.value = undefined
   statusInput.value = undefined
   orderStore.clearFilter()
-  void orderStore.loadList(true)
+  await applyRange('work')
+  // watch 若这次没被触发（输入框本来就是空的），标记要在这里回收，否则下一次真输入会被吞掉
+  suppressTextWatch.value = false
 }
 
 // ===== 版本下拉标签 =====
@@ -304,12 +488,54 @@ const currentVersionLabel = computed(() => {
   return `${v.domainKey ?? ''} ｜ 版本 #${v.id}${s}`
 })
 
+/**
+ * 版本状态的大白话提示（2026-11-12）
+ *
+ * 工厂用户看到一版「全是未排产」的订单时，第一反应是「系统坏了」。
+ * 其实多数情况是**这一版还没发令 / 算失败 / 已被顶替**——把状态翻译成人话即可。
+ */
+const versionNotice = computed<{ type: 'error' | 'warning' | 'info'; text: string } | null>(() => {
+  const v = orderStore.currentVersion
+  if (!v) return null
+  switch (v.status) {
+    case 'FAILED':
+      return {
+        type: 'error',
+        text: '这一版排产失败，没有排产结果。订单本身还在，但看不到排产任务；换一版看。'
+      }
+    case 'Computing':
+      return { type: 'warning', text: '这一版还在计算中，排产结果可能不完整，过一会儿再看。' }
+    case 'BUILDING':
+      return {
+        type: 'warning',
+        text: '这一版还没发令，订单暂时没有排产任务，所以都显示成「未排产」。'
+      }
+    case 'ARCHIVED':
+      return { type: 'info', text: '这一版已经被更新的版本顶替，看到的是当时的排产结果。' }
+    default:
+      return null
+  }
+})
+
+/** 全版本都未排产时的补充说明（ACTIVE 版也可能没排产任务） */
+const allUnscheduledNotice = computed<string | null>(() => {
+  const s = summary.value
+  if (!s || !s.totalCount) return null
+  if (s.unscheduledCount === s.totalCount) {
+    return '这一版的订单都还没有排产任务（未排产），所以看不到「APS 预计完成时间」。'
+  }
+  return null
+})
+
 // ===== KPI（全部取 /api/order-query/summary 的服务端聚合）=====
 //
 // ⚠️ 2026-11-02 口径全换（5号位 r14009 答复函 §二）：三桶改为**计划派生**，
 //   与列表 `riskLevel` 同源（冻结 `01 §64`）⇒ 格子与 KPI 不再各说各话。
 //   三桶互斥且穷尽：按期 + 延迟 + 未排产 = 总数（可作探针断言）。
 //   旧「未延迟」卡文案已换「按期」（同一判定，但「按期」不与 ERP 维度混读）。
+//
+// ⚠️ 2026-11-12 补一句口径说明：summary 端点**只收 planVersionId**（不收筛选条件）
+//   ⇒ 这四个数字恒为「该版本全部订单」，不随下面的筛选变。不写清楚用户会误以为 KPI 跟着筛选走。
 const totalCount = computed(() => summary.value?.totalCount ?? null)
 const kpis = computed(() => {
   const s = summary.value
@@ -385,8 +611,11 @@ const advanceDomainOptions = computed<DomainKey[]>(() =>
   DOMAIN_OPTIONS.value.filter((o) => o.value !== 'ALL').map((o) => o.value as DomainKey)
 )
 
+/** 候选推进弹窗的默认域：取**选中订单自己的域**（一版一域 ⇒ 行内 domainKey 即该版所属域）；
+ *  没勾选时退回第一个可选域。此前默认域来自「排程域」筛选（该筛选已撤），语义不变。 */
 const advanceDefaultDomain = computed<DomainKey | undefined>(() => {
-  if (domainCode.value) return domainCode.value
+  const picked = selectedOrders.value.find((o) => o.domainKey)
+  if (picked?.domainKey) return picked.domainKey
   return advanceDomainOptions.value[0]
 })
 
@@ -437,10 +666,26 @@ function fmtDue(due: string): string {
   const dueMs = new Date(`${due}Z`).getTime()
   if (Number.isNaN(dueMs)) return due
   const days = Math.round((dueMs - Date.now()) / 86400000)
-  const text = formatUtcMonthDay(due)
-  return days >= 0 ? `${text}（剩 ${days} 天）` : `${text}（已过 ${-days} 天）`
+  // 年月日（原来只显示月日 ⇒ 跨年订单看不出是哪一年，2024-03-14 和 2026-03-14 长得一样）
+  const text = formatUtcDate(due)
+  return days >= 0 ? `${text}（剩 ${days} 天）` : `${text}（逾期 ${-days} 天）`
 }
 const isOverdue = (due: string): boolean => new Date(`${due}Z`).getTime() < Date.now()
+
+/** 表头计数：当前筛选命中多少 + 该版本一共多少（两个口径别混） */
+const listCountLabel = computed(() => {
+  const total = totalCount.value
+  const filtered = listTotal.value
+  return total === null
+    ? `当前筛选 ${filtered} 条`
+    : `当前筛选 ${filtered} 条 · 该版本共 ${total} 单`
+})
+
+/** 空态文案：区分「这版没订单」和「筛选太窄」 */
+const emptyText = computed(() => {
+  if (totalCount.value === 0) return '这一版没有订单'
+  return '当前筛选条件下没有订单，换个交期区间或放宽条件再看看'
+})
 
 const detailOrder = computed(() => currentDetail.value?.order ?? null)
 const detailPegging = computed(() => currentDetail.value?.pegging ?? [])
@@ -448,7 +693,14 @@ const detailTasks = computed(() => currentDetail.value?.tasks ?? [])
 
 // ===== 加载入口 =====
 onMounted(async () => {
+  // 排程域字典：**「已有订单提前」候选弹窗**要用域下拉，而全项目只有异常解释页加载过
+  // ⇒ 直接进本页时下拉是空的。这里补一次加载（store 内有并发守卫）。
+  if (!domainStore.loadedAt) void domainStore.load()
+  void loadMasterData()
   await orderStore.loadVersions()
+  // 默认交期区间随版本一起落上（否则第一屏是 2016 年的历史订单）；
+  // 区间先落进 store，再统一刷列表 + KPI，避免连打两次列表。
+  setRangeFilter(activeRange.value)
   await orderStore.refresh(true)
 })
 </script>
@@ -465,7 +717,18 @@ onMounted(async () => {
         :loading="versionsLoading"
         @change="onVersionChange"
       >
-        <ElOption v-for="v in versions" :key="v.id" :label="versionLabel(v.id)" :value="v.id" />
+        <ElOption v-for="v in versions" :key="v.id" :label="versionLabel(v.id)" :value="v.id">
+          <div class="version-option">
+            <span class="version-code">{{ v.versionCode }}</span>
+            <ElTag size="small" :type="planVersionStatusTag(v.status)">
+              {{ PLAN_VERSION_STATUS_LABELS[v.status] ?? v.status }}
+            </ElTag>
+            <span class="muted version-meta">
+              {{ v.domainKey }} · {{ formatUtcMonthDay(v.planHorizonStart) }} ~
+              {{ formatUtcMonthDay(v.planHorizonEnd) }}
+            </span>
+          </div>
+        </ElOption>
       </ElSelect>
       <div class="toolbar-meta">
         <span v-if="currentVersionLabel" class="muted">{{ currentVersionLabel }}</span>
@@ -492,20 +755,58 @@ onMounted(async () => {
       :title="`加载失败：${listError}`"
     />
 
+    <!-- ===== 版本状态大白话提示（失败 / 计算中 / 未发令 / 已被顶替）===== -->
+    <ElAlert
+      v-if="versionNotice"
+      :type="versionNotice.type"
+      :closable="false"
+      show-icon
+      :title="versionNotice.text"
+    />
+    <ElAlert
+      v-if="allUnscheduledNotice"
+      type="info"
+      :closable="false"
+      show-icon
+      :title="allUnscheduledNotice"
+    />
+
     <!-- ===== KPI（取 /summary 服务端聚合；取不到整块空态）===== -->
+    <!-- 2026-11-12 用户反馈：原先四张大卡片占掉大半屏首屏 ⇒ 改一行紧凑指标条，
+         口径说明也并到同一行右端（不必为说明单占一行）。 -->
     <div v-if="kpis.length" class="kpi-row">
-      <div v-for="k in kpis" :key="k.key" class="kpi-card" :style="{ borderTopColor: k.color }">
-        <div class="kpi-label">{{ k.label }}</div>
-        <div class="kpi-value" :style="{ color: k.color }">{{ k.value }}</div>
-        <div class="kpi-ratio">{{ kpiRatio(k.value) }}%</div>
+      <div v-for="k in kpis" :key="k.key" class="kpi-item">
+        <span class="kpi-bar" :style="{ background: k.color }"></span>
+        <span class="kpi-label">{{ k.label }}</span>
+        <span class="kpi-value" :style="{ color: k.color }">{{ k.value }}</span>
+        <span class="kpi-ratio">{{ kpiRatio(k.value) }}%</span>
       </div>
+      <span class="kpi-caption">
+        这四个数字是「该版本全部订单」的结果（按计划算的），不随下面的筛选变化。
+      </span>
     </div>
 
     <!-- ===== 过滤栏 ===== -->
     <ElCard class="filter-bar">
+      <!-- 交货日期快捷区间：计划员每天最常用的一刀 -->
+      <div class="range-row">
+        <span class="range-label">按交货日期挑单</span>
+        <ElTooltip v-for="r in RANGE_PRESETS" :key="r.key" :content="r.desc" placement="top">
+          <ElButton
+            size="small"
+            :type="activeRange === r.key ? 'primary' : 'default'"
+            :plain="activeRange !== r.key"
+            @click="applyRange(r.key)"
+          >
+            {{ r.label }}
+          </ElButton>
+        </ElTooltip>
+        <span class="range-desc">{{ rangeDateText }} · {{ rangeDesc }}</span>
+      </div>
+
       <div class="filter-row">
         <ElInput v-model="orderNoInput" placeholder="订单号" clearable class="filter-sm" />
-        <ElInput v-model="piInput" placeholder="MTS 生产指令号" clearable class="filter-sm" />
+        <ElInput v-model="piInput" placeholder="生产指示号" clearable class="filter-sm" />
         <ElInput v-model="materialInput" placeholder="物料编码" clearable class="filter-sm" />
         <ElInput
           v-model="customerNameInput"
@@ -513,40 +814,41 @@ onMounted(async () => {
           clearable
           class="filter-sm"
         />
-        <ElInput
-          v-model="factoryCodeInput"
-          placeholder="工厂编码（精确）"
-          clearable
-          class="filter-sm"
-        />
-        <ElInput
-          v-model="productFamilyInput"
-          placeholder="产品族编码（精确）"
-          clearable
-          class="filter-sm"
-        />
-        <ElDatePicker
-          v-model="dueDateRange"
-          type="daterange"
-          range-separator="~"
-          start-placeholder="交期起"
-          end-placeholder="交期止"
-          value-format="YYYY-MM-DD"
-          class="filter-date"
-          @change="onDueRangeChange"
-        />
+      </div>
+
+      <div class="filter-row">
         <ElSelect
-          :model-value="delayStatusInput"
-          placeholder="ERP 延期属性"
+          :model-value="factoryCodeInput"
+          placeholder="工厂"
           clearable
-          class="filter-select-sm"
-          @change="onDelayStatusChange"
+          filterable
+          allow-create
+          default-first-option
+          class="filter-select-md filter-factory"
+          @change="onFactoryChange"
         >
           <ElOption
-            v-for="d in ORDER_DELAY_STATUSES"
-            :key="d"
-            :label="ORDER_DELAY_STATUS_LABELS[d]"
-            :value="d"
+            v-for="f in visibleFactories"
+            :key="f.code"
+            :label="`${f.name}（${f.code}）`"
+            :value="f.code"
+          />
+        </ElSelect>
+        <ElSelect
+          :model-value="productFamilyInput"
+          placeholder="产品族"
+          clearable
+          filterable
+          allow-create
+          default-first-option
+          class="filter-select-md filter-family"
+          @change="onFamilyChange"
+        >
+          <ElOption
+            v-for="f in familyOptions"
+            :key="f.code"
+            :label="`${f.name}（${f.code}）`"
+            :value="f.code"
           />
         </ElSelect>
         <ElSelect
@@ -564,14 +866,39 @@ onMounted(async () => {
           />
         </ElSelect>
         <ElSelect
-          :model-value="domainCode ?? 'ALL'"
-          placeholder="排程域"
+          :model-value="delayStatusInput"
+          placeholder="ERP 延期标记"
+          clearable
           class="filter-select-sm"
-          @change="onDomainChange"
+          @change="onDelayStatusChange"
         >
-          <ElOption v-for="d in DOMAIN_OPTIONS" :key="d.value" :label="d.label" :value="d.value" />
+          <ElOption
+            v-for="d in ORDER_DELAY_STATUSES"
+            :key="d"
+            :label="ORDER_DELAY_STATUS_LABELS[d]"
+            :value="d"
+          />
         </ElSelect>
+        <ElDatePicker
+          :model-value="dueFrom"
+          type="date"
+          placeholder="交期起"
+          value-format="YYYY-MM-DD"
+          class="filter-date"
+          @change="onDueFromChange"
+        />
+        <ElDatePicker
+          :model-value="dueTo"
+          type="date"
+          placeholder="交期止"
+          value-format="YYYY-MM-DD"
+          class="filter-date"
+          @change="onDueToChange"
+        />
         <ElButton @click="onResetSearch">重置</ElButton>
+      </div>
+      <div v-if="dictError" class="filter-error">
+        工厂 / 产品族字典加载失败，暂时只能按编码手输：{{ dictError }}
       </div>
     </ElCard>
 
@@ -580,7 +907,7 @@ onMounted(async () => {
       <template #header>
         <div class="panel-header">
           <span>订单列表</span>
-          <span class="header-total">{{ orderStore.filteredTotalLabel }}</span>
+          <span class="header-total">{{ listCountLabel }}</span>
         </div>
       </template>
       <ElTable
@@ -595,24 +922,29 @@ onMounted(async () => {
         @selection-change="onOrderSelectionChange"
       >
         <ElTableColumn type="selection" width="44" :selectable="() => canPlanRun" />
-        <ElTableColumn prop="orderNo" label="订单号" min-width="130" show-overflow-tooltip />
-        <ElTableColumn prop="mtS_InstructionNo" label="MTS 指令号" width="110" />
-        <ElTableColumn prop="materialCode" label="物料编码" min-width="160" show-overflow-tooltip />
-        <ElTableColumn label="客户" min-width="130" show-overflow-tooltip>
+        <!-- 订单号 + 生产指示号（生产指示号并进订单号下方，省一列；原来 14 列把右边的操作列挤到横向滚动外） -->
+        <ElTableColumn prop="orderNo" label="订单号" min-width="150" show-overflow-tooltip>
+          <template #default="{ row }">
+            <div class="cell-order-no">{{ row.orderNo }}</div>
+            <div v-if="row.mtS_InstructionNo" class="muted cell-sub">
+              指示号 {{ row.mtS_InstructionNo }}
+            </div>
+          </template>
+        </ElTableColumn>
+        <ElTableColumn prop="materialCode" label="物料编码" min-width="140" show-overflow-tooltip />
+        <ElTableColumn label="客户" min-width="110" show-overflow-tooltip>
           <template #default="{ row }">
             <span v-if="row.customerName">{{ row.customerName }}</span>
             <span v-else class="muted">—</span>
           </template>
         </ElTableColumn>
-        <ElTableColumn prop="productFamilyCode" label="产品族" width="90" />
-        <ElTableColumn prop="factoryCode" label="工厂" width="80" />
-        <ElTableColumn prop="quantity" label="数量" width="100" align="right">
+        <ElTableColumn label="数量" width="84" align="right">
           <template #default="{ row }">
             <span>{{ row.quantity }}</span>
             <span class="muted"> {{ row.uom }}</span>
           </template>
         </ElTableColumn>
-        <ElTableColumn label="客户交期" width="150">
+        <ElTableColumn label="客户交期" width="176">
           <template #default="{ row }">
             <span :class="{ overdue: isOverdue(row.customerDueDate) }">
               {{ fmtDue(row.customerDueDate) }}
@@ -630,15 +962,8 @@ onMounted(async () => {
             <span v-else class="muted" title="该订单在当前版本没有排产任务">未排产</span>
           </template>
         </ElTableColumn>
-        <ElTableColumn prop="priority" label="优先级" width="80" align="right" />
-        <ElTableColumn label="订单状态" width="90" align="center">
-          <template #default="{ row }">
-            <ElTag size="small" :type="statusTagType(row.status)">{{
-              statusLabel(row.status)
-            }}</ElTag>
-          </template>
-        </ElTableColumn>
-        <ElTableColumn label="交付状态" width="100" align="center">
+        <!-- 交付状态 = 计划派生判定 + 延期时长 + 主因（原来「延期原因」单列常年空，占 180px） -->
+        <ElTableColumn label="交付状态" width="150">
           <template #default="{ row }">
             <ElTag
               size="small"
@@ -655,22 +980,36 @@ onMounted(async () => {
             <div v-if="delayHoursText(row.delayHours)" class="muted delay-hours">
               {{ delayHoursText(row.delayHours) }}
             </div>
-          </template>
-        </ElTableColumn>
-        <ElTableColumn label="延期原因" width="180" show-overflow-tooltip>
-          <template #default="{ row }">
-            <span :class="{ 'reason-unchecked': !!row.primaryReasonCode }">
+            <div
+              v-if="row.primaryReasonCode"
+              class="reason-unchecked"
+              :title="row.primaryReasonCode"
+            >
               {{ delayReasonLabel(row.primaryReasonCode) }}
-            </span>
+            </div>
           </template>
         </ElTableColumn>
-        <ElTableColumn label="操作" width="70" align="center" fixed="right">
+        <ElTableColumn label="订单状态" width="88" align="center">
+          <template #default="{ row }">
+            <ElTag size="small" :type="statusTagType(row.status)">
+              {{ statusLabel(row.status) }}
+            </ElTag>
+          </template>
+        </ElTableColumn>
+        <ElTableColumn label="工厂" width="96">
+          <template #default="{ row }">{{ factoryLabel(row.factoryCode) }}</template>
+        </ElTableColumn>
+        <ElTableColumn label="产品族" width="96">
+          <template #default="{ row }">{{ familyLabel(row.productFamilyCode) }}</template>
+        </ElTableColumn>
+        <ElTableColumn prop="priority" label="优先级" width="68" align="right" />
+        <ElTableColumn label="操作" width="62" align="center" fixed="right">
           <template #default="{ row }">
             <a href="javascript:;" @click.stop="openDetail(row)">详情</a>
           </template>
         </ElTableColumn>
         <template #empty>
-          <ElEmpty description="该计划版本下没有订单" />
+          <ElEmpty :description="emptyText" />
         </template>
       </ElTable>
       <div class="pager-row">
@@ -704,7 +1043,7 @@ onMounted(async () => {
           <h4 class="section-title">基本信息</h4>
           <ElDescriptions :column="2" size="small" border>
             <ElDescriptionsItem label="订单号">{{ detailOrder.orderNo }}</ElDescriptionsItem>
-            <ElDescriptionsItem label="MTS 指令号">
+            <ElDescriptionsItem label="生产指示号">
               {{ detailOrder.mtS_InstructionNo ?? '—' }}
             </ElDescriptionsItem>
             <ElDescriptionsItem label="物料编码">
@@ -717,10 +1056,10 @@ onMounted(async () => {
               {{ detailOrder.customerSegment ?? '—' }}
             </ElDescriptionsItem>
             <ElDescriptionsItem label="工厂">
-              {{ detailOrder.factoryCode ?? '—' }}
+              {{ factoryLabel(detailOrder.factoryCode) }}
             </ElDescriptionsItem>
             <ElDescriptionsItem label="产品族">
-              {{ detailOrder.productFamilyCode ?? '—' }}
+              {{ familyLabel(detailOrder.productFamilyCode) }}
             </ElDescriptionsItem>
             <ElDescriptionsItem label="排程域">
               {{ detailOrder.domainKey ?? '—' }}
@@ -918,8 +1257,33 @@ onMounted(async () => {
   }
 }
 
+.version-option {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+
+  .version-code {
+    font-weight: 500;
+    color: #1e293b;
+  }
+
+  .version-meta {
+    font-size: 12px;
+  }
+}
+
 .muted {
   color: #94a3b8;
+}
+
+.cell-order-no {
+  font-weight: 500;
+  color: #1e293b;
+}
+
+.cell-sub {
+  font-size: 11px;
+  line-height: 1.3;
 }
 
 .delay-hours {
@@ -929,45 +1293,88 @@ onMounted(async () => {
 
 /* 未入冻结 15 码字典的主因码：中性灰，不与正式码同色，避免被当成已确认原因 */
 .reason-unchecked {
+  font-size: 12px;
+  line-height: 1.4;
   color: #94a3b8;
   font-style: italic;
 }
 
+/* KPI：一行紧凑指标条（四项 + 口径说明同一行），不占首屏高度 */
 .kpi-row {
-  display: grid;
-  /* 卡片数会随「未计算」一项增减，用 auto-fit 避免留空格 */
-  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-  gap: 12px;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  padding: 6px 14px;
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
 }
 
-.kpi-card {
-  padding: 14px 16px;
-  background: #fff;
-  border-top: 3px solid #94a3b8;
-  border-radius: 8px;
-  box-shadow: 0 1px 4px rgb(0 0 0 / 6%);
+.kpi-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 16px;
+  border-right: 1px solid #e2e8f0;
 
-  .kpi-label {
-    font-size: 12px;
-    color: #94a3b8;
+  &:last-of-type {
+    border-right: none;
   }
+}
 
-  .kpi-value {
-    margin-top: 4px;
-    font-size: 22px;
-    font-weight: 600;
-    color: #1e293b;
-  }
+.kpi-bar {
+  width: 3px;
+  height: 12px;
+  border-radius: 2px;
+}
 
-  .kpi-ratio {
-    margin-top: 2px;
-    font-size: 11px;
-    color: #cbd5e1;
-  }
+.kpi-label {
+  font-size: 12px;
+  color: #64748b;
+}
+
+.kpi-value {
+  font-size: 17px;
+  font-weight: 600;
+  line-height: 1.2;
+}
+
+.kpi-ratio {
+  font-size: 11px;
+  color: #94a3b8;
+}
+
+.kpi-caption {
+  margin-left: auto;
+  padding-left: 16px;
+  font-size: 12px;
+  color: #94a3b8;
 }
 
 .filter-bar {
   border-radius: 8px;
+}
+
+.range-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+  padding-bottom: 12px;
+  margin-bottom: 12px;
+  border-bottom: 1px dashed #e2e8f0;
+
+  .range-label {
+    font-size: 13px;
+    color: #475569;
+  }
+
+  .range-desc {
+    /* 说明整句另起一行（挤在按钮后面会被右边缘截断，看不全） */
+    flex: 1 1 100%;
+    font-size: 12px;
+    color: #94a3b8;
+  }
 }
 
 .filter-row {
@@ -975,6 +1382,10 @@ onMounted(async () => {
   gap: 12px;
   align-items: center;
   flex-wrap: wrap;
+
+  & + .filter-row {
+    margin-top: 12px;
+  }
 }
 
 .filter-sm {
@@ -985,8 +1396,18 @@ onMounted(async () => {
   width: 145px;
 }
 
+.filter-select-md {
+  width: 190px;
+}
+
 .filter-date {
-  width: 250px;
+  width: 140px;
+}
+
+.filter-error {
+  margin-top: 10px;
+  font-size: 12px;
+  color: #d97706;
 }
 
 .table-card {

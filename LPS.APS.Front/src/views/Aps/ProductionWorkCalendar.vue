@@ -35,7 +35,6 @@ import {
   ElAlert,
   ElButton,
   ElCard,
-  ElCheckbox,
   ElDatePicker,
   ElDialog,
   ElEmpty,
@@ -99,6 +98,24 @@ function shiftLocal(days: number, base?: string): string {
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`
 }
 
+/* ===== 时分秒归一 =====
+ *  后端 StartAt/EndAt 是 TimeSpan?，**收不了空字符串**：JSON 里给 "" ⇒ 整个请求体绑定失败
+ *  ⇒ 422「The request field is required.」（那句英文指的是控制器那个叫 request 的参数，
+ *  不是「少填了业务字段」，别照着去补字段）。OFF 全天必须**整对不传**，不能传 ""。
+ *  这里顺带把 8:00 / 080000 / 08:00 统一成 08:00:00，免得用户手输格式又被拒。 */
+function normalizeTimeInput(v?: string): string | undefined {
+  const s = (v ?? '').trim()
+  if (!s) return undefined
+  const m = /^(\d{1,2})[:：]?(\d{2})(?:[:：]?(\d{2}))?$/.exec(s)
+  if (!m) return undefined
+  const hh = Number(m[1])
+  const mm = Number(m[2])
+  const ss = Number(m[3] ?? '0')
+  if (hh > 23 || mm > 59 || ss > 59) return undefined
+  const pad = (n: number): string => String(n).padStart(2, '0')
+  return `${pad(hh)}:${pad(mm)}:${pad(ss)}`
+}
+
 /* ===== 行生效状态（前端派生）=====
  *  dev 实测 62 行里 10 行已过期、3 行未生效，此前列表无任何标识，用户会把过期行当现状。
  *  effectiveTo 含当日（后端换版闭到 eff.AddDays(-1)，即末日仍生效）⇒ 到期日当天仍是「生效中」。 */
@@ -115,6 +132,13 @@ const PWC_EFFECTIVE_STATUS_META: Record<
 function effectiveStatus(row: ProductionWorkCalendarDto): PwcEffectiveStatus {
   if (!row.isActive) return 'DISABLED'
   const today = todayLocal()
+  // 日期例外行：只管 workDate 那一天（EffectiveTo 恒空，拿有效期区间判会「永远生效中」）
+  if (row.workDate) {
+    const d = row.workDate.slice(0, 10)
+    if (d > today) return 'NOT_YET'
+    if (d < today) return 'EXPIRED'
+    return 'ACTIVE'
+  }
   if (row.effectiveFrom.slice(0, 10) > today) return 'NOT_YET'
   const to = row.effectiveTo ? row.effectiveTo.slice(0, 10) : null
   if (to && to < today) return 'EXPIRED'
@@ -124,12 +148,13 @@ function effectiveStatus(row: ProductionWorkCalendarDto): PwcEffectiveStatus {
 /* ===== 筛选已选 label（@see feedback_list_id_to_name：展示名称不展示 ID）===== */
 const filterFactoryLabel = computed(() => {
   const f = factoryOptions.value.find((x) => x.id === filterFactoryId.value)
-  return f ? `${f.code}（${f.name}）` : ''
+  if (!f) return ''
+  return f.name ? `${f.name}（${f.code}）` : f.code
 })
 const filterDepartmentLabel = computed(() => {
   const d = departmentOptions.value.find((x) => x.masterId === filterDepartmentId.value)
   if (!d) return ''
-  return d.code + (d.holon ? `（${d.holon}）` : d.stageCode ? `（${d.stageCode}）` : '')
+  return deptOptionLabel(d)
 })
 
 /* ===== 筛选本地 state ===== */
@@ -148,13 +173,35 @@ const filterOnlyEffective = ref<boolean>(false)
  */
 const factoryOptions = ref<FactorySummaryDto[]>([])
 const departmentOptions = ref<DepartmentLookupItem[]>([])
+/** 部门名称表：Id → { code, name }
+ *  - 数据源：GET /api/production-departments（5号位 ProductionDepartmentController，出参含 deptName）
+ *  - 权限码与本页**完全一致**（PermissionCodes.ResourceCalendarView = aps.resource_calendar.view）
+ *    ⇒ 只持日历域权限的角色也能取到，不会像 OPM 页那样跨域 403
+ *  - 用途：把「部门 Id」翻译成「部门名称（编码）」；取不到时页面退化为显示编码，**不显示数字 Id**
+ */
+const departmentNameMap = ref<Record<number, { code: string; name: string }>>({})
 async function loadFilterOptions(): Promise<void> {
   const results = await Promise.allSettled([
     domainApi.listFactories(),
-    departmentLookupApi.listDepartments()
+    // limit=500：dev 实库 287 个部门，缺省 200 会截断（后面的部门在下拉里直接消失）
+    departmentLookupApi.listDepartments(500),
+    departmentLookupApi.listProductionDepartmentsOrThrow()
   ])
   factoryOptions.value = results[0].status === 'fulfilled' ? results[0].value : []
   departmentOptions.value = results[1].status === 'fulfilled' ? results[1].value : []
+  const map: Record<number, { code: string; name: string }> = {}
+  if (results[2].status === 'fulfilled') {
+    for (const d of results[2].value) map[d.id] = { code: d.deptCode, name: d.deptName }
+  }
+  departmentNameMap.value = map
+}
+
+/** 部门下拉 / 筛选回显文案：名称（编码）；名称取不到时退回编码（holon / 阶段码） */
+function deptOptionLabel(d: DepartmentLookupItem): string {
+  const hit = departmentNameMap.value[d.masterId]
+  if (hit?.name) return `${hit.name}（${hit.code}）`
+  if (hit?.code) return hit.code
+  return d.code + (d.holon ? `（${d.holon}）` : d.stageCode ? `（${d.stageCode}）` : '')
 }
 
 /* ===== 工厂→部门联动（冻结 v5.1.12 line 2946 / 3284）=====
@@ -199,7 +246,7 @@ const closeOpenDialogOpen = ref(false)
 /* ===== 周基准弹窗表单 ===== */
 const weeklyDraft = ref<{
   scopeType: ProductionWorkCalendarScope
-  factoryId: number
+  factoryId: number | undefined
   productionDepartmentId: number | undefined
   effectiveFrom: string
   sourceSystem: string
@@ -207,7 +254,7 @@ const weeklyDraft = ref<{
   entries: WeeklyCalendarEntry[]
 }>({
   scopeType: 'FACTORY',
-  factoryId: 2,
+  factoryId: undefined,
   productionDepartmentId: undefined,
   effectiveFrom: shiftLocal(7),
   sourceSystem: 'MANUAL',
@@ -242,17 +289,14 @@ function onEntryPresetChange(idx: number, v: unknown): void {
     applyShiftPreset(idx, v as (typeof PWC_SHIFT_PRESETS)[number])
   }
 }
-/** 同星期多窗口的「允许下级加班」勾选框只在 OFF 时可勾；状态切成「要工作」后勾选框被禁用但值残留
- *  ⇒ 提交时后端按 DDL CK 拒（AllowLowerOverride 仅 OFF 行）。这里随状态归零（探针 PWC34 锁）。 */
-function normalizeWeeklyEntries(): void {
-  for (const e of weeklyDraft.value.entries) {
-    if (e.workState !== 'OFF') e.allowLowerOverride = false
-  }
-}
-watch(() => weeklyDraft.value.entries.map((e) => e.workState).join(','), normalizeWeeklyEntries)
 async function submitWeekly(): Promise<void> {
   if (!weeklyDraft.value.entries.length) {
     ElMessage.warning('请至少添加一条班次')
+    return
+  }
+  const fid = weeklyDraft.value.factoryId
+  if (!fid) {
+    ElMessage.warning('请选择工厂')
     return
   }
   if (weeklyDraft.value.scopeType === 'DEPARTMENT' && !weeklyDraft.value.productionDepartmentId) {
@@ -262,18 +306,41 @@ async function submitWeekly(): Promise<void> {
   if (weeklyDraft.value.scopeType === 'FACTORY') {
     weeklyDraft.value.productionDepartmentId = undefined
   }
+  // 提交前按状态清洗（不送后端必拒的组合）：
+  //  ① 时间：OFF 全天**整对不传**（传空串 ⇒ 整包绑定失败 422）；WORK 必须成对且 start<end
+  //  ② 旗位 AllowLowerOverride：后端「部门自主模式」恒 1（显式 false 拒 400）⇒ 页面无开关、也不发该字段
+  const entries: WeeklyCalendarUpsertRequest['entries'] = []
+  for (const [i, e] of weeklyDraft.value.entries.entries()) {
+    const start = normalizeTimeInput(e.startAt)
+    const end = normalizeTimeInput(e.endAt)
+    const rowName = `第 ${i + 1} 行`
+    if (e.workState === 'WORK') {
+      if (!start || !end) {
+        ElMessage.warning(`${rowName}选了「要工作」，必须填上班和下班时间（形如 08:00:00）`)
+        return
+      }
+      if (start >= end) {
+        ElMessage.warning(`${rowName}的下班时间要晚于上班时间`)
+        return
+      }
+    } else if ((start && !end) || (!start && end)) {
+      ElMessage.warning(`${rowName}选了「不工作」，时间要么都不填（全天），要么成对填`)
+      return
+    }
+    entries.push({
+      weekdayIso: e.weekdayIso,
+      workState: e.workState,
+      ...(start && end ? { startAt: start, endAt: end } : {})
+    })
+  }
   const req: WeeklyCalendarUpsertRequest = {
     scopeType: weeklyDraft.value.scopeType,
-    factoryId: weeklyDraft.value.factoryId,
+    factoryId: fid,
     productionDepartmentId: weeklyDraft.value.productionDepartmentId,
     effectiveFrom: weeklyDraft.value.effectiveFrom,
     sourceSystem: weeklyDraft.value.sourceSystem,
     sourceReference: weeklyDraft.value.sourceReference,
-    // 提交前按状态清洗（不送后端必拒的组合）
-    entries: weeklyDraft.value.entries.map((e) => ({
-      ...e,
-      allowLowerOverride: e.workState === 'OFF' && e.allowLowerOverride
-    }))
+    entries
   }
   const n = await store.upsertWeekly(req)
   if (n != null) {
@@ -285,65 +352,43 @@ async function submitWeekly(): Promise<void> {
 /* ===== 日期例外弹窗表单 ===== */
 const exceptionDraft = ref<{
   scopeType: ProductionWorkCalendarScope
-  factoryId: number
+  factoryId: number | undefined
   productionDepartmentId: number | undefined
   workDate: string
   workState: ProductionWorkState
   startAt: string
   endAt: string
-  allowLowerOverride: boolean
-  isAuthorizedOverride: boolean
   sourceSystem: string
   sourceReference: string
 }>({
   scopeType: 'FACTORY',
-  factoryId: 2,
+  factoryId: undefined,
   productionDepartmentId: undefined,
   workDate: todayLocal(),
   workState: 'OFF',
   startAt: '',
   endAt: '',
-  allowLowerOverride: false,
-  isAuthorizedOverride: false,
   sourceSystem: 'MANUAL',
   sourceReference: ''
 })
 
-/** 状态与两个互斥标记必须一致（DDL CK：AllowLowerOverride 仅 OFF 行、IsAuthorizedOverride 仅 WORK 行）
- *  - 弹窗里「允许下级加班」开关**只在状态=不工作时渲染**。用户先在「不工作」下打开开关、
- *    再把状态切到「要工作」⇒ 开关看不见了但值还是 true ⇒ 提交被自己的校验挡住，
- *    而用户既看不到也改不掉那个开关 ⇒ **无解报错**（10-23 用户实测踩坑）。
- *  - 切状态即归零；提交前再按状态清洗一次（双保险，探针 PWC34 锁）。 */
-function normalizeExceptionDraft(): void {
-  if (exceptionDraft.value.workState === 'WORK') {
-    exceptionDraft.value.allowLowerOverride = false
-  } else {
-    exceptionDraft.value.isAuthorizedOverride = false
-  }
-}
-watch(() => exceptionDraft.value.workState, normalizeExceptionDraft)
-
 async function submitException(): Promise<void> {
-  // 状态与互斥标记按状态清洗（切状态后隐藏的开关值可能残留 ⇒ 提交时归一，不做无解拦截）
-  const allowLowerOverride =
-    exceptionDraft.value.workState === 'OFF' && exceptionDraft.value.allowLowerOverride
-  const isAuthorizedOverride =
-    exceptionDraft.value.workState === 'WORK' && exceptionDraft.value.isAuthorizedOverride
-  if (allowLowerOverride !== exceptionDraft.value.allowLowerOverride) {
-    ElMessage.warning('「允许下级加班」只在「不工作」时可用，已自动取消')
-  }
-  if (isAuthorizedOverride !== exceptionDraft.value.isAuthorizedOverride) {
-    ElMessage.warning('「本行是授权加班」只在「要工作」时可用，已自动取消')
-  }
-  if (
-    exceptionDraft.value.workState === 'WORK' &&
-    (!exceptionDraft.value.startAt || !exceptionDraft.value.endAt)
-  ) {
-    ElMessage.warning('状态选「要工作」时必须填写上班和下班时间')
+  // 旗位 AllowLowerOverride / IsAuthorizedOverride：后端「部门自主模式」**恒 1**
+  //   （库约束 CK_PWCS_FlagConst 锁死 + Service INSERT 写死 alo=1/aao=1 + 显式 false 直接 400）
+  //   ⇒ 页面上的开关是无效控件，已撤；这里也不发这两个字段（缺省 null ⇒ 后端按 1 落库）。
+  // 「授权加班」的真凭据是**加班依据**（SourceReference，列表按有没有依据打标签）。
+  const start = normalizeTimeInput(exceptionDraft.value.startAt)
+  const end = normalizeTimeInput(exceptionDraft.value.endAt)
+  if (exceptionDraft.value.workState === 'WORK' && (!start || !end)) {
+    ElMessage.warning('状态选「要工作」时必须填写上班和下班时间（形如 08:00:00）')
     return
   }
-  if (isAuthorizedOverride && !exceptionDraft.value.sourceReference) {
-    ElMessage.warning('勾选「本行是授权加班」时必须填写加班依据（OA 加班单号等）')
+  if (start && end && start >= end) {
+    ElMessage.warning('下班时间要晚于上班时间')
+    return
+  }
+  if (exceptionDraft.value.workState === 'OFF' && ((start && !end) || (!start && end))) {
+    ElMessage.warning('「不工作」的时间要么都不填（全天），要么成对填')
     return
   }
   if (
@@ -353,19 +398,22 @@ async function submitException(): Promise<void> {
     ElMessage.warning('范围选「部门」时必须选择具体部门')
     return
   }
+  const fid = exceptionDraft.value.factoryId
+  if (!fid) {
+    ElMessage.warning('请选择工厂')
+    return
+  }
   if (exceptionDraft.value.scopeType === 'FACTORY') {
     exceptionDraft.value.productionDepartmentId = undefined
   }
   const req: WorkCalendarExceptionRequest = {
     scopeType: exceptionDraft.value.scopeType,
-    factoryId: exceptionDraft.value.factoryId,
+    factoryId: fid,
     productionDepartmentId: exceptionDraft.value.productionDepartmentId,
     workDate: exceptionDraft.value.workDate,
     workState: exceptionDraft.value.workState,
-    startAt: exceptionDraft.value.startAt || undefined,
-    endAt: exceptionDraft.value.endAt || undefined,
-    allowLowerOverride,
-    isAuthorizedOverride,
+    startAt: start,
+    endAt: end,
     sourceSystem: exceptionDraft.value.sourceSystem,
     sourceReference: exceptionDraft.value.sourceReference || undefined,
     // 例外天然只管 workDate 这一天，生效起始日与 workDate 同值；结束日不传=长期
@@ -374,7 +422,7 @@ async function submitException(): Promise<void> {
   }
   const id = await store.createException(req)
   if (id != null) {
-    ElMessage.success(`已创建日期例外行 id=${id}`)
+    ElMessage.success('已创建日期例外')
     exceptionDialogOpen.value = false
   }
 }
@@ -382,29 +430,34 @@ async function submitException(): Promise<void> {
 /* ===== 批量到期换版弹窗 ===== */
 const closeOpenDraft = ref<{
   scopeType: ProductionWorkCalendarScope
-  factoryId: number
+  factoryId: number | undefined
   productionDepartmentId: number | undefined
   newEffectiveFrom: string
 }>({
   scopeType: 'FACTORY',
-  factoryId: 2,
+  factoryId: undefined,
   productionDepartmentId: undefined,
   newEffectiveFrom: shiftLocal(30)
 })
 
 async function submitCloseOpen(): Promise<void> {
+  const fid = closeOpenDraft.value.factoryId
+  if (!fid) {
+    ElMessage.warning('请选择工厂')
+    return
+  }
   if (closeOpenDraft.value.scopeType === 'FACTORY') {
     closeOpenDraft.value.productionDepartmentId = undefined
   }
   const req: CalendarCloseOpenRequest = {
     scopeType: closeOpenDraft.value.scopeType,
-    factoryId: closeOpenDraft.value.factoryId,
+    factoryId: fid,
     productionDepartmentId: closeOpenDraft.value.productionDepartmentId,
     newEffectiveFrom: closeOpenDraft.value.newEffectiveFrom
   }
   const n = await store.closeOpen(req)
   if (n != null) {
-    ElMessage.success(`已到期停用 ${n} 行（effectiveTo ← ${req.newEffectiveFrom} - 1）`)
+    ElMessage.success(`已到期停用 ${n} 条旧班次（截止到 ${req.newEffectiveFrom} 前一天）`)
     closeOpenDialogOpen.value = false
   }
 }
@@ -441,13 +494,38 @@ watch(filterFactoryId, (fid) => {
   filterDepartmentId.value = deptAfterFactoryChange(fid, filterDepartmentId.value)
 })
 
+/* ===== 打开弹窗：范围/工厂/部门跟随筛选区已选（不再硬编码某一家工厂）===== */
+function syncScopeFromFilter(draft: {
+  scopeType: ProductionWorkCalendarScope
+  factoryId: number | undefined
+  productionDepartmentId: number | undefined
+}): void {
+  if (filterScope.value) draft.scopeType = filterScope.value
+  if (filterFactoryId.value) draft.factoryId = filterFactoryId.value
+  if (filterDepartmentId.value) {
+    draft.productionDepartmentId = deptAfterFactoryChange(draft.factoryId, filterDepartmentId.value)
+  }
+}
+function openWeeklyDialog(): void {
+  syncScopeFromFilter(weeklyDraft.value)
+  weeklyDialogOpen.value = true
+}
+function openExceptionDialog(): void {
+  syncScopeFromFilter(exceptionDraft.value)
+  exceptionDialogOpen.value = true
+}
+function openCloseOpenDialog(): void {
+  syncScopeFromFilter(closeOpenDraft.value)
+  closeOpenDialogOpen.value = true
+}
+
 /* ===== 行级 close/delete ===== */
 async function onCloseRow(row: ProductionWorkCalendarDto): Promise<void> {
   if (!canEdit.value) return
   try {
     const { value } = await ElMessageBox.prompt(
-      `到期停用后会保留审计。到期日早于该行生效起始日将被拒。`,
-      `单行到期停用（id=${row.id}）`,
+      `${rowTitle(row)}：填写这条设置从哪天起不再生效。到期停用后会保留历史记录；到期日早于该行生效起始日将被拒。`,
+      '到期停用这一条',
       {
         inputPattern: /^\d{4}-\d{2}-\d{2}$/,
         inputErrorMessage: '格式 yyyy-MM-dd',
@@ -464,13 +542,13 @@ async function onCloseRow(row: ProductionWorkCalendarDto): Promise<void> {
 async function onDeleteRow(row: ProductionWorkCalendarDto): Promise<void> {
   if (!canDelete.value) return
   if (row.effectiveFrom.slice(0, 10) <= todayLocal()) {
-    ElMessage.warning('行已生效，请走"到期停用"通道（保留审计）')
+    ElMessage.warning('这条设置已经生效了，请改用「到期停用」（保留历史记录）')
     return
   }
   try {
     await ElMessageBox.confirm(
-      `物理删除未生效行 id=${row.id}（仅纠错通道，无审计保留）。确认？`,
-      '物理删除',
+      `${rowTitle(row)}：这条设置还没生效，删除后无法恢复（不保留历史记录）。确认删除吗？`,
+      '删除这一条',
       { type: 'warning' }
     )
   } catch {
@@ -506,22 +584,57 @@ async function onSizeChange(s: number): Promise<void> {
   await store.load(undefined, { resetPage: true, nextPageSize: s })
 }
 
+/* ===== 行内显示：一律用名称，不把内部 Id 甩给工厂用户 ===== */
+function factoryText(row: ProductionWorkCalendarDto): string {
+  const f = factoryOptions.value.find((x) => x.id === row.factoryId)
+  const name = f?.name
+  const code = f?.code || row.factoryCode
+  if (name && code) return `${name}（${code}）`
+  return name || code || '未指定工厂'
+}
+function deptText(row: ProductionWorkCalendarDto): string {
+  if (!row.productionDepartmentId) return ''
+  const hit = departmentNameMap.value[row.productionDepartmentId]
+  const name = row.departmentName || hit?.name
+  const code = hit?.code
+  if (name && code) return `${name}（${code}）`
+  return name || code || '未命名部门'
+}
+/** 行的业务标识（弹窗提示里说清是哪一行，不用 Id 指代） */
+function rowTitle(row: ProductionWorkCalendarDto): string {
+  const scope = PWC_SCOPE_META[row.scopeType].label
+  const who = row.scopeType === 'DEPARTMENT' ? deptText(row) : factoryText(row)
+  return `${scope} · ${who} · ${fmtWeekdayOrDate(row)}`
+}
+
 /* ===== 格式化辅助 ===== */
+/** 时分秒 → HH:mm（工厂用户看班次不需要秒） */
+function fmtTime(t?: string): string {
+  return t ? t.slice(0, 5) : ''
+}
 function fmtWindow(row: ProductionWorkCalendarDto): string {
   if (!row.startAt && !row.endAt) return '全天'
-  return `${row.startAt ?? '??'} ~ ${row.endAt ?? '??'}`
+  return `${fmtTime(row.startAt) || '??'} ~ ${fmtTime(row.endAt) || '??'}`
 }
 function fmtWeekdayOrDate(row: ProductionWorkCalendarDto): string {
   if (row.workDate) return row.workDate.slice(0, 10)
   if (row.weekdayIso != null) {
     const meta = WEEKDAY_ISO_META[row.weekdayIso]
-    return meta ? `周${meta.short}（周基准）` : `weekdayIso=${row.weekdayIso}`
+    return meta ? `周${meta.short}（每周固定）` : '—'
   }
   return '—'
 }
+/** 有效期：起始日 ~ 截止日 / 长期
+ *  - 日期例外行（workDate 有值）例外：它只管那一天（靠 workDate 定位，不靠有效期区间），
+ *    显示「仅 2026-11-27」比「2026-11-27 起（长期）」贴近工厂用户的理解 */
+function fmtEffective(row: ProductionWorkCalendarDto): string {
+  if (row.workDate) return `仅 ${row.workDate.slice(0, 10)}`
+  const from = row.effectiveFrom.slice(0, 10)
+  return row.effectiveTo ? `${from} ~ ${row.effectiveTo.slice(0, 10)}` : `${from} 起（长期）`
+}
 onMounted(async () => {
   if (!canView.value) {
-    ElMessage.warning('无 PWC 查看权限（需 aps.resource_calendar.view）')
+    ElMessage.warning('当前账号没有查看工作日历的权限，请联系系统管理员')
     return
   }
   await loadFilterOptions()
@@ -568,7 +681,7 @@ onMounted(async () => {
           <ElOption
             v-for="f in factoryOptions"
             :key="f.id"
-            :label="`${f.code}（${f.name}）`"
+            :label="f.name ? `${f.name}（${f.code}）` : f.code"
             :value="f.id"
           />
         </ElSelect>
@@ -583,7 +696,7 @@ onMounted(async () => {
           <ElOption
             v-for="d in deptOptionsFor(filterFactoryId)"
             :key="d.masterId"
-            :label="d.code + (d.holon ? `（${d.holon}）` : d.stageCode ? `（${d.stageCode}）` : '')"
+            :label="deptOptionLabel(d)"
             :value="d.masterId"
           />
         </ElSelect>
@@ -595,32 +708,30 @@ onMounted(async () => {
         />
         <ElButton type="primary" :loading="loading" @click="applyFilter">查询</ElButton>
         <ElButton :disabled="loading" @click="resetFilter">重置</ElButton>
-        <ElButton type="primary" :disabled="!canWrite" @click="weeklyDialogOpen = true">
+        <ElButton type="primary" :disabled="!canWrite" @click="openWeeklyDialog">
           工作周设置
         </ElButton>
-        <ElButton type="primary" :disabled="!canWrite" @click="exceptionDialogOpen = true">
+        <ElButton type="primary" :disabled="!canWrite" @click="openExceptionDialog">
           日期例外
         </ElButton>
-        <ElButton :disabled="!canWrite" @click="closeOpenDialogOpen = true">
-          批量到期换版
-        </ElButton>
+        <ElButton :disabled="!canWrite" @click="openCloseOpenDialog">批量到期换版</ElButton>
       </div>
     </ElCard>
 
     <!-- ===== 主表 ===== -->
     <ElCard class="pwc-panel">
       <div v-if="!list.length" class="pwc-empty">
-        <ElEmpty description="无生产工作日历数据" />
+        <ElEmpty description="没有符合条件的工作日历设置" />
       </div>
       <ElTable v-else :data="list" :loading="loading" border stripe size="small">
-        <ElTableColumn label="范围 / 厂 / 部门" min-width="220">
+        <ElTableColumn label="范围 · 厂 · 部门" min-width="240">
           <template #default="{ row }">
             <ElTag :type="PWC_SCOPE_META[row.scopeType].tagType" size="small">
               {{ PWC_SCOPE_META[row.scopeType].label }}
             </ElTag>
-            <span class="pwc-cell-mono">{{ row.factoryCode ?? row.factoryId }}</span>
+            <span class="pwc-cell-main">{{ factoryText(row) }}</span>
             <span v-if="row.productionDepartmentId" class="pwc-cell-sub">
-              {{ row.departmentName ?? '—' }}（{{ row.productionDepartmentId }}）
+              {{ deptText(row) }}
             </span>
           </template>
         </ElTableColumn>
@@ -632,24 +743,24 @@ onMounted(async () => {
             <span class="pwc-cell-mono">{{ fmtWindow(row) }}</span>
           </template>
         </ElTableColumn>
-        <ElTableColumn label="状态" width="100">
+        <ElTableColumn label="状态" width="170">
           <template #default="{ row }">
             <ElTag :type="PWC_WORK_STATE_META[row.workState].tagType" size="small">
               {{ PWC_WORK_STATE_META[row.workState].label }}
             </ElTag>
-          </template>
-        </ElTableColumn>
-        <ElTableColumn label="加班授权" width="180">
-          <template #default="{ row }">
-            <ElTag v-if="row.allowLowerOverride" type="warning" size="small" effect="plain">
-              允许下级加班
-            </ElTag>
-            <ElTag v-if="row.isAuthorizedOverride" type="warning" size="small" effect="plain">
-              本行是授权加班
-            </ElTag>
-            <span v-if="!row.allowLowerOverride && !row.isAuthorizedOverride" class="pwc-cell-sub"
-              >—</span
+            <!-- 日期例外的补班行：排产侧按「授权加班时间片」算（IsAuthorizedOverride=1 + WORK + WorkDate，
+                 与解析侧 ResourceCalendarDtos.cs:167 同口径）⇒ 挂一个标识；其余行不挂。
+                 （原「加班授权」整列已撤：两个旗位在库里被 CK_PWCS_FlagConst 锁死恒 1，
+                   列内容 100% 可由「周/日期 + 状态」推出，横向复读还占 170px） -->
+            <ElTag
+              v-if="row.workState === 'WORK' && row.isAuthorizedOverride && !!row.workDate"
+              type="warning"
+              size="small"
+              effect="plain"
+              class="pwc-ml"
             >
+              授权加班
+            </ElTag>
           </template>
         </ElTableColumn>
         <ElTableColumn label="生效状态" width="100" align="center">
@@ -663,13 +774,9 @@ onMounted(async () => {
             </ElTag>
           </template>
         </ElTableColumn>
-        <ElTableColumn label="有效期" min-width="180">
+        <ElTableColumn label="有效期" min-width="190">
           <template #default="{ row }">
-            <div class="pwc-cell-mono">
-              {{ row.effectiveFrom.slice(0, 10) }}
-              <span class="pwc-cell-sub">→</span>
-              {{ row.effectiveTo ? row.effectiveTo.slice(0, 10) : '长期' }}
-            </div>
+            <span class="pwc-cell-main">{{ fmtEffective(row) }}</span>
           </template>
         </ElTableColumn>
         <ElTableColumn label="操作" width="220" fixed="right">
@@ -677,6 +784,7 @@ onMounted(async () => {
             <ElButton
               size="small"
               :disabled="!canEdit || !!row.effectiveTo || !row.isActive"
+              title="填写截止日期：这条设置从该日起不再生效，历史记录保留"
               @click="onCloseRow(row)"
             >
               到期停用
@@ -685,6 +793,11 @@ onMounted(async () => {
               size="small"
               type="danger"
               :disabled="!canRemove || row.effectiveFrom.slice(0, 10) <= todayLocal()"
+              :title="
+                row.effectiveFrom.slice(0, 10) <= todayLocal()
+                  ? '已生效的设置不能删除，请改用「到期停用」'
+                  : '删除这条还没生效的设置（不可恢复）'
+              "
               @click="onDeleteRow(row)"
             >
               删除
@@ -730,7 +843,7 @@ onMounted(async () => {
             <ElOption
               v-for="f in factoryOptions"
               :key="f.id"
-              :label="`${f.code}（${f.name}）`"
+              :label="f.name ? `${f.name}（${f.code}）` : f.code"
               :value="f.id"
             />
           </ElSelect>
@@ -745,9 +858,7 @@ onMounted(async () => {
             <ElOption
               v-for="d in deptOptionsFor(weeklyDraft.factoryId)"
               :key="d.masterId"
-              :label="
-                d.code + (d.holon ? `（${d.holon}）` : d.stageCode ? `（${d.stageCode}）` : '')
-              "
+              :label="deptOptionLabel(d)"
               :value="d.masterId"
             />
           </ElSelect>
@@ -803,9 +914,6 @@ onMounted(async () => {
                   :value="p"
                 />
               </ElSelect>
-              <ElCheckbox v-model="e.allowLowerOverride" :disabled="e.workState !== 'OFF'">
-                允许下级加班
-              </ElCheckbox>
               <ElButton size="small" type="danger" @click="removeWeeklyEntry(idx)"> 删 </ElButton>
             </div>
             <ElButton size="small" @click="addWeeklyEntry">+ 添加</ElButton>
@@ -841,7 +949,7 @@ onMounted(async () => {
             <ElOption
               v-for="f in factoryOptions"
               :key="f.id"
-              :label="`${f.code}（${f.name}）`"
+              :label="f.name ? `${f.name}（${f.code}）` : f.code"
               :value="f.id"
             />
           </ElSelect>
@@ -856,9 +964,7 @@ onMounted(async () => {
             <ElOption
               v-for="d in deptOptionsFor(exceptionDraft.factoryId)"
               :key="d.masterId"
-              :label="
-                d.code + (d.holon ? `（${d.holon}）` : d.stageCode ? `（${d.stageCode}）` : '')
-              "
+              :label="deptOptionLabel(d)"
               :value="d.masterId"
             />
           </ElSelect>
@@ -897,17 +1003,13 @@ onMounted(async () => {
             <ElInput v-model="exceptionDraft.endAt" placeholder="HH:mm:ss（可空）" class="pwc-ml" />
           </div>
         </ElFormItem>
-        <ElFormItem v-if="exceptionDraft.workState === 'OFF'" label="允许下级加班">
-          <ElSwitch v-model="exceptionDraft.allowLowerOverride" />
-          <span class="pwc-hint-text">本行虽不工作，但下级可凭授权加班覆盖</span>
-        </ElFormItem>
-        <ElFormItem v-if="exceptionDraft.workState === 'WORK'" label="本行是授权加班">
-          <ElSwitch v-model="exceptionDraft.isAuthorizedOverride" />
-          <span class="pwc-hint-text">覆盖上级"不工作"的授权加班，需填加班依据</span>
-        </ElFormItem>
-        <ElFormItem v-if="exceptionDraft.isAuthorizedOverride" label="加班依据（OA 加班单号等）">
-          <ElInput v-model="exceptionDraft.sourceReference" placeholder="OA 加班单号（必填）" />
-          <span class="pwc-hint-text">授权加班时必填（缺依据 → 后端 400）</span>
+        <ElFormItem v-if="exceptionDraft.workState === 'WORK'" label="加班依据">
+          <ElInput
+            v-model="exceptionDraft.sourceReference"
+            placeholder="OA 加班单号等（可留空）"
+            class="pwc-form-wide"
+          />
+          <span class="pwc-hint-text">这次补班的加班凭据（可留空）；填了以后追责查得到依据</span>
         </ElFormItem>
       </ElForm>
       <template #footer>
@@ -939,7 +1041,7 @@ onMounted(async () => {
             <ElOption
               v-for="f in factoryOptions"
               :key="f.id"
-              :label="`${f.code}（${f.name}）`"
+              :label="f.name ? `${f.name}（${f.code}）` : f.code"
               :value="f.id"
             />
           </ElSelect>
@@ -954,9 +1056,7 @@ onMounted(async () => {
             <ElOption
               v-for="d in deptOptionsFor(closeOpenDraft.factoryId)"
               :key="d.masterId"
-              :label="
-                d.code + (d.holon ? `（${d.holon}）` : d.stageCode ? `（${d.stageCode}）` : '')
-              "
+              :label="deptOptionLabel(d)"
               :value="d.masterId"
             />
           </ElSelect>
@@ -1025,6 +1125,9 @@ onMounted(async () => {
 .pwc-form-dept {
   width: 260px;
 }
+.pwc-form-wide {
+  width: 320px;
+}
 .pwc-empty {
   padding: 24px;
   text-align: center;
@@ -1036,6 +1139,12 @@ onMounted(async () => {
 .pwc-cell-mono {
   font-family: var(--el-font-family-monospace, ui-monospace, monospace);
   font-size: 12px;
+}
+.pwc-cell-main {
+  display: block;
+  margin-top: 2px;
+  font-size: 13px;
+  color: var(--el-text-color-regular);
 }
 .pwc-cell-sub {
   display: block;

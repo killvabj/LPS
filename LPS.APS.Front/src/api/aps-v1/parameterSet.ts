@@ -26,7 +26,9 @@ import type {
 import type {
   ParameterSetSummaryDto,
   ParameterSetDetailDto,
-  ParameterSetVersionHistoryDto
+  ParameterSetVersionHistoryDto,
+  ParameterSetVersionRowDto,
+  ParameterSetListRowDto
 } from './types/parameterSet'
 import { normalizeRuleStatus, pickLatestPublished } from './types/common'
 import type { PublishValidationResultDto } from './types/strategyProfile'
@@ -100,6 +102,73 @@ const THEME_JSON_KEYS = [
   'candidateGuardrailJson'
 ] as const
 
+/**
+ * 把「新端点版本行」与「旧端点无版本主表行」合并成前端列表行（**一版一行**）
+ *
+ * ⚠️ 2026-11-11（3号位 扩围加函）：
+ *   新端点 `GET /parameter-sets/versions` 是主表 INNER JOIN 版本 ⇒ **一条版本都没有的主表
+ *   不会出现在它里面**（dev 实测 892 个参数集主表里只有 16 个有版本）。纯切新端点会让这些主表
+ *   连同页面的「未配版本」筛选与「删除参数集」入口一起消失 ⇒ 功能回退。
+ *   故列表 = 新端点版本行（主表有版本时全部版本各占一行）+ 旧端点的「无版本主表」行。
+ *
+ *  - 版本行：`versionStatus` = 该版本**真实状态**（不再被同族新草稿覆盖）
+ *  - 主表级副信息（最新已发布版本码 / 草稿版本码）从版本行派生，版本 Id 大者为准
+ */
+export function mergeParameterSetListRows(
+  versionRows: ParameterSetVersionRowDto[],
+  mains: ParameterSetSummaryDto[]
+): ParameterSetListRowDto[] {
+  const latestPublished = new Map<number, { id: number; code: string }>()
+  const latestDraft = new Map<number, { id: number; code: string }>()
+  for (const r of versionRows) {
+    const st = normalizeRuleStatus(r.status)
+    const bucket = st === 'PUBLISHED' ? latestPublished : st === 'DRAFT' ? latestDraft : null
+    if (!bucket) continue
+    const cur = bucket.get(r.parameterSetId)
+    if (!cur || r.versionId > cur.id)
+      bucket.set(r.parameterSetId, { id: r.versionId, code: r.versionCode })
+  }
+
+  const rows: ParameterSetListRowDto[] = versionRows.map((r) => {
+    const versionStatus = normalizeRuleStatus(r.status)
+    return {
+      rowKey: `v${r.versionId}`,
+      parameterSetId: r.parameterSetId,
+      parameterSetCode: r.parameterSetCode,
+      parameterSetName: r.parameterSetName,
+      description: r.description ?? undefined,
+      isActive: r.isActive !== false,
+      createdAt: r.createdAt ?? r.parameterSetCreatedAt ?? '',
+      hasVersion: true,
+      versionId: r.versionId,
+      versionCode: r.versionCode,
+      versionStatus,
+      currentVersionCode: latestPublished.get(r.parameterSetId)?.code,
+      draftVersionCode: latestDraft.get(r.parameterSetId)?.code,
+      publishedAt: r.publishedAt ?? undefined
+    }
+  })
+
+  // 旧端点里「一条版本都没有」的主表 ⇒ 补一行「未配版本」（主表自身信息取旧端点）
+  const withVersion = new Set(versionRows.map((r) => r.parameterSetId))
+  for (const m of mains) {
+    if (m.hasVersion || withVersion.has(m.parameterSetId)) continue
+    rows.push({
+      rowKey: `n${m.parameterSetId}`,
+      parameterSetId: m.parameterSetId,
+      parameterSetCode: m.parameterSetCode,
+      parameterSetName: m.parameterSetName,
+      description: m.description,
+      isActive: m.isActive !== false,
+      createdAt: m.createdAt ?? '',
+      hasVersion: false,
+      lastChangeReason: m.lastChangeReason,
+      publishedAt: m.publishedAt
+    })
+  }
+  return rows
+}
+
 export const parameterSetApi = {
   /** 参数集列表（GET /api/governance/parameter-sets；权限 aps.parameter.view）
    *
@@ -147,6 +216,35 @@ export const parameterSetApi = {
   },
 
   /**
+   * 参数集列表（新端点·**主子表联查一版一行**）
+   *
+   * ⚠️ 2026-11-11（3号位 扩围加函）：`GET /api/governance/parameter-sets/versions`
+   *   - 权限 aps.parameter.view；入参 activeOnly（三态）/ keyword / status / name / page / pageSize
+   *     —— 本方法**不传 page/pageSize** ⇒ 后端 `ResolvePaging` 返回 (null,null) ⇒ 全量
+   *   - 每主表 N 个版本 ⇒ N 行，`status` 是**版本真实状态**，不再被同族新草稿覆盖
+   *   - 排序：主表 Id DESC；每主表内版本 Id ASC
+   */
+  async listParameterSetVersionRows(): Promise<ParameterSetVersionRowDto[]> {
+    return apsHttp.get<ParameterSetVersionRowDto[]>({
+      url: '/api/governance/parameter-sets/versions'
+    })
+  },
+
+  /**
+   * 参数集列表（前端列表源）：新端点版本行 + 旧端点「无版本主表」行
+   *
+   * 见 `mergeParameterSetListRows` 的注释（为什么不能纯切新端点）。
+   * 旧端点 `GET /parameter-sets` 保留用途。
+   */
+  async listParameterSetRows(): Promise<ParameterSetListRowDto[]> {
+    const [versionRows, mains] = await Promise.all([
+      this.listParameterSetVersionRows(),
+      this.listParameterSets()
+    ])
+    return mergeParameterSetListRows(versionRows, mains)
+  },
+
+  /**
    * 更新参数集主表（PUT /api/governance/parameter-set/{id}；权限 aps.parameter.edit）
    *
    * 编码不可变（改码 400）；`isActive=false` 只停用主表，不级联已有版本状态。
@@ -189,7 +287,17 @@ export const parameterSetApi = {
   },
 
   /** 参数集详情（版本摘要 + 当前版本内容 + 历史） */
-  async getParameterSet(parameterSetId: number): Promise<ParameterSetDetailDto> {
+  /**
+   * 参数集详情（版本摘要 + 5 主题内容 + 历史版本）
+   *
+   * ⚠️ 2026-11-11（列表改一版一行）：新增 `versionId` 参数 ——
+   *   列表点哪一行就展示哪一版的内容，`summary.status` 取**该版真实状态**。
+   *   不传 versionId 时保持旧默认（草稿优先 → 已发布 → 第一条），供内部调用使用。
+   */
+  async getParameterSet(
+    parameterSetId: number,
+    versionId?: number
+  ): Promise<ParameterSetDetailDto> {
     const versions = await this.listParameterSetVersions(parameterSetId)
     if (!Array.isArray(versions) || versions.length === 0) {
       throw new Error('该参数集没有可用版本')
@@ -212,10 +320,15 @@ export const parameterSetApi = {
       effectiveTo: v.effectiveTo ?? undefined
     }))
     /**
-     * 内容取「草稿版本」优先（同规则集：待发布的草稿才是用户要改的那一版）。
-     * 页面据此显示 `summary.status = 'DRAFT'`，发布按钮随之点亮。
+     * 内容版本：
+     *  - 传了 versionId（列表点某一行的版本）⇒ 就展示那一版；找不到（版本刚被删）才回落默认
+     *  - 没传 ⇒ 草稿优先 → 已发布 → 第一条（保持旧默认，供内部调用）
      */
-    const contentSource = draft ?? published ?? versions[0]
+    const contentSource =
+      (versionId != null ? versions.find((v) => v.id === versionId) : undefined) ??
+      draft ??
+      published ??
+      versions[0]
     const full = await this.getParameterSetVersion(contentSource.id)
     return {
       summary: {
@@ -226,7 +339,9 @@ export const parameterSetApi = {
         createdAt: contentSource.createdAt ?? '',
         currentVersionCode: published?.versionCode ?? undefined,
         draftVersionCode: draft?.versionCode ?? undefined,
-        status: draft ? 'DRAFT' : normalizeRuleStatus(contentSource.status),
+        // 本页展示的那一版的**真实状态**（不再「有草稿就一律 DRAFT」——
+        // 那样会把已发布生效的那一版错标成草稿，用户点发布时才发现版本不对）
+        status: normalizeRuleStatus(contentSource.status),
         hasVersion: true,
         lastChangeReason: contentSource.remarks ?? undefined,
         publishedAt: published?.publishedAt ?? undefined

@@ -32,6 +32,7 @@ import {
   ElOption,
   ElRow,
   ElSelect,
+  ElSwitch,
   ElTable,
   ElTableColumn,
   ElTag,
@@ -172,6 +173,12 @@ onMounted(async () => {
       operationCode: String(q.operationCode),
       resourceCode: String(q.resourceCode ?? '')
     }
+    // Id 一并解析回来（11-11）：后端 lookups 写死 TOP(200) 截断，预填的部门/设备常在截断之外
+    // ⇒ 光有 Code 解析不出写输入要的 Id。缺 Id 时留 undefined，Dialog 会退回按编码补搜。
+    const deptId = Number(q.departmentId)
+    if (Number.isFinite(deptId) && deptId > 0) dialogPrefill.value.departmentId = deptId
+    const resId = Number(q.resourceId)
+    if (Number.isFinite(resId) && resId > 0) dialogPrefill.value.resourceId = resId
     openCreateDialog()
   }
 })
@@ -253,6 +260,14 @@ const editDisabledReason = computed<string>(() => {
   if (!canEdit.value) return '只能编辑草稿（DRAFT）状态的版本'
   return ''
 })
+
+/** 切换规则启停（工作簿 #67）：store 用该行完整回传，成功后自动重载列表 */
+async function onToggleActive(rule: SetupRuleDto, active: boolean): Promise<void> {
+  if (!canWrite.value || !canEdit.value) return
+  const ok = await defaultStore.setRuleActive(rule, active)
+  if (ok) ElMessage.success(active ? '规则已启用' : '规则已停用')
+  else if (defaultStore.error) ElMessage.error(defaultStore.error)
+}
 </script>
 
 <template>
@@ -404,6 +419,16 @@ const editDisabledReason = computed<string>(() => {
             <ElTag :type="getStatusTag(row.status).tag" size="small">
               {{ getStatusTag(row.status).label }}
             </ElTag>
+          </template>
+        </ElTableColumn>
+        <ElTableColumn label="启用" width="80" align="center">
+          <template #default="{ row }">
+            <ElSwitch
+              :model-value="row.isActive !== false"
+              size="small"
+              :disabled="!!editDisabledReason"
+              @change="(v) => onToggleActive(row, v === true)"
+            />
           </template>
         </ElTableColumn>
         <!-- 09-20 交付回执偏差 #1：remark 字段撤除（备注列移除） -->

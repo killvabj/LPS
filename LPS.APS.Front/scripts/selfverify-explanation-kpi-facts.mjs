@@ -49,18 +49,20 @@ const cases = [
     to: 'const totalFacts = computed(() => data.value?.scheduleExplanationFacts?.length ?? 0)'
   },
   {
-    // view 的百分比分母不再用 totalFacts ⇒ E27 转红
+    // view 计数行改用已加载条数 ⇒ E27 转红（2026-11-10 KPI 移除后，计数行是总数唯一的落点）
     id: 'E27',
     file: VUE,
-    from: 'Math.round((item.count / totalFacts) * 100)',
-    to: 'Math.round((item.count / (loadedFactsCount || 1)) * 100)'
+    from: '共 {{ totalFacts }} 条 · 已显示 {{ loadedFactsCount }} 条',
+    to: '共 {{ loadedFactsCount }} 条 · 已显示 {{ loadedFactsCount }} 条'
   },
+
+  /* ===== E22：分类卡栅格响应式 ===== */
   {
-    // 合计卡改回「3 类汇总」且不再显示 totalFacts ⇒ E27 转红
-    id: 'E27',
+    // 栅格从 auto-fit 改回固定两列 ⇒ E22 转红（窄屏会溢出）
+    id: 'E22',
     file: VUE,
-    from: '<div class="kpi-value">{{ totalFacts }}</div>',
-    to: '<div class="kpi-value">{{ loadedFactsCount }}</div>'
+    from: 'repeat(auto-fit, minmax(220px, 1fr))',
+    to: 'repeat(2, 1fr)'
   },
 
   /* ===== E28：列表端点分页加载 ===== */

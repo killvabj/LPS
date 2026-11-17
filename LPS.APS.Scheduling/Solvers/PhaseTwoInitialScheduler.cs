@@ -478,12 +478,31 @@ internal class PhaseTwoInitialScheduler
         var lockedDraftIds = new HashSet<string>(constraints.LockedTasks.Keys.Select(k => k.DraftId));
 
         // 跨物料时序硬约束（任务喂任务，方案A）：子先父后分层遍历。
-        // 若存在 BOM 依赖环，Phase1 已标记，此处直接判技术失败。
-        if (constraints.CrossMaterialHasCycle)
+        //
+        // ── 2026-11-14（用户裁决）：成环**不再整域技术失败** ──
+        //   冻结依据：`06 v1.42:498`「无根据不得一律使整个 Domain 失败」；
+        //             `01 v1.16:1446`／`03 v2.2:375`／`10 v2.1:31`「受影响需求局部未排，其余合法需求不受牵连」。
+        //   改法：只把**卡在环上**的需求（Phase1 记的 `CrossMaterialCycleKeys`）记未排 + 留技术因；
+        //         `CrossMaterialOrder` 本就只含 Kahn 处理过的节点 ⇒ 环上需求不进排程循环，其余照常。
+        //   唯一保留整域失败的情形：环把**全部**需求都吞了 —— 那时不存在「其余合法需求」，
+        //         仍属输入不可用，照旧判技术失败（避免把「全空」当成合法空计划往下走）。
+        if (constraints.CrossMaterialHasCycle
+            && constraints.CrossMaterialCycleKeys.Count >= request.LogicalProductionDemands.Count)
         {
             result.TechnicalFailure = true;
-            result.TechnicalFailureReason = "跨物料 BOM 依赖存在环（任务喂任务）";
+            result.TechnicalFailureReason = "跨物料 BOM 依赖存在环，且覆盖全部需求（无其余合法需求可排）";
             return result;
+        }
+
+        if (constraints.CrossMaterialHasCycle)
+        {
+            foreach (var cycleKey in constraints.CrossMaterialCycleKeys)
+            {
+                result.UnscheduledDemandKeys.Add(cycleKey);
+                RecordPhase2Block(cycleKey,
+                    "Phase2 出口=P2_CROSS_MATERIAL_CYCLE：该需求处在跨物料依赖环上（子件→父件成环），"
+                    + "本需求不排；环外需求照常排程。属技术性原因，非业务短缺，不写入 15 码业务原因。");
+            }
         }
 
         // 按跨物料分层顺序排序（子层先、父层后，层内按 DemandSequence）；无跨物料关系时等价于旧平铺。
@@ -1269,6 +1288,10 @@ internal class PhaseTwoInitialScheduler
                 "P2_FLOOR", demand.LogicalDemandKey, dynamicMaterialFloor,
                 $"childUnavailable={childUnavailable};planningStart={request.PlanningStart:yyyy-MM-dd HH:mm:ss}");
 
+            // 2026-11-16（FAMILY_CYL 整域归零真因）：把本需求的跨物料下界终值落进 constraints，
+            //   供后续 Stage 合批重排读回 —— 锚点子件完工更晚时，合批不得把锚点首道拉到其子件完工之前。
+            constraints.DemandMaterialFloor[demand.LogicalDemandKey] = dynamicMaterialFloor;
+
             // ── P0-01 / P0-02 / P0-03（0号位 2026-10-07《未命名的Markdown文件 (5).md》）──
             //   执行批**先于 Routing 选择**形成，判词根因是旧实现把 `LogicalDemand` **当成了** Execution Batch
             //   （批身份由 Route/Path 反推 —— 同一 Demand 拆出的两批会撞成同一个键）。
@@ -1843,6 +1866,7 @@ internal class PhaseTwoInitialScheduler
         return result;
     }
 
+    
     /// <summary>
     /// **调试 trace：跨物料下界实参**（2026-10-28，PV190 定位「8 个父需求早于子件完工下界」）。
     ///
@@ -5568,7 +5592,18 @@ internal class PhaseTwoInitialScheduler
             if (occupied[mid].Start <= windowStart) lo0 = mid + 1; else hi0 = mid;
         }
         int startIdx = lo0;
-        while (startIdx > 0 && occupied[startIdx - 1].End > windowStart) startIdx--;
+
+        // ── 2026-11-16（PV 999507 根因·Phase2 同源）：回退**跳过零时长窗** ──
+        //   原条件只看 `End > windowStart`，默认「窗互不重叠 ⇒ End 随 Start 非降」。
+        //   零时长窗 `[X, X]` 与真实窗 `[X, X+45m]` 同起点时 End 单调被打破 ⇒ 回退停在零时长窗上
+        //   ⇒ 真实窗被跳过 ⇒ 后面的 Task 被排进真实窗内部（Phase4 侧实测 14:52:36→14:59:46）。
+        //   Phase4 侧已禁止登记零时长窗；这里同步加固，避免 Phase2 自身在同类形状上复发。
+        while (startIdx > 0
+               && (occupied[startIdx - 1].End > windowStart
+                   || occupied[startIdx - 1].End <= occupied[startIdx - 1].Start))
+        {
+            startIdx--;
+        }
 
         var cursor = windowStart;
 
@@ -10510,9 +10545,22 @@ internal class PhaseTwoInitialScheduler
         SolverDiagnostics.HotspotEnd(swDetach, SolverDiagnostics.Hotspot.MergeBatchDetach);
 
         // ── 重跑完整排程：同一 Path、同一批键、完整 Operation 链 ──
+        // 2026-11-16（FAMILY_CYL 整域归零真因）：合批重排的跨物料下界必须取
+        //   `max(锚点下界, 被并入需求下界)`。旧实现只用被并入需求自己带进来的 floor，
+        //   当锚点子件完工比被并入需求更晚时，重排会把锚点首道拉到锚点子件完工之前
+        //   ⇒ Phase5 `下游.start < 上游.end + lag` 越序，整域归零。
+        //   （锚点 = 本批最早落定的需求，其下界已在主循环写入 `constraints.DemandMaterialFloor`。）
+        var mergedFloor = dynamicMaterialFloor;
+        if (!string.IsNullOrEmpty(anchorKey)
+            && constraints.DemandMaterialFloor.TryGetValue(anchorKey, out var anchorFloor)
+            && anchorFloor > mergedFloor)
+        {
+            mergedFloor = anchorFloor;
+        }
+
         combinedTasks = ScheduleDemandOperations(
             combinedDemand, operations, routingGraph, direction, constraints,
-            resourceOccupancy, planningStart, planningEnd, dynamicMaterialFloor, stageOverlap,
+            resourceOccupancy, planningStart, planningEnd, mergedFloor, stageOverlap,
             targetKey, occupancyPristine, occupancyInsertLog);
 
         // 失败 ⇒ 原样恢复（不留下任何半成品状态），回落独立排程。

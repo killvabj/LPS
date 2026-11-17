@@ -19,7 +19,7 @@ import { computed, ref } from 'vue'
 import {
   parameterSetApi,
   ApiError,
-  type ParameterSetSummaryDto,
+  type ParameterSetListRowDto,
   type ParameterSetDetailDto,
   type VersionDiffResultDto,
   type RuleStatus,
@@ -85,6 +85,17 @@ import { useApsAuthStore } from './auth'
 /** 脏标记：5 块各自独立标记 */
 type DirtyFlags = Record<BlockKey, boolean>
 
+/** 列表排序方式（与规则集页同口径，2026-11-11 筛选条件） */
+export type ParameterListSort = 'DEFAULT' | 'PUBLISHED_DESC' | 'CREATED_DESC' | 'CODE_ASC'
+
+/** 排序选项文案（页面下拉与本表共用一份，避免两处漂移） */
+export const PARAMETER_LIST_SORT_LABELS: Record<ParameterListSort, string> = {
+  DEFAULT: '默认顺序',
+  PUBLISHED_DESC: '最近发布',
+  CREATED_DESC: '最近创建',
+  CODE_ASC: '编码升序'
+}
+
 const emptyDirtyFlags = (): DirtyFlags => ({
   lock: false,
   supply: false,
@@ -103,7 +114,14 @@ const emptyBufferState = () => ({
 
 export const useParameterSetsStore = defineStore('aps.parameterSets', () => {
   // ===== state =====
-  const parameterSets = ref<ParameterSetSummaryDto[]>([])
+  /**
+   * 参数集列表行（**一版一行**，2026-11-11 列表源切换）
+   *
+   * ⚠️ 一行 = 一个版本（`versionId` / `versionCode` / `versionStatus` 齐备），
+   *   另有「无版本主表」行（hasVersion=false）。
+   *   同族多个版本（已发布 + 草稿）各占一行、状态各自真实，不再互相覆盖。
+   */
+  const parameterSets = ref<ParameterSetListRowDto[]>([])
   const currentDetail = ref<ParameterSetDetailDto | null>(null)
   const currentDiff = ref<VersionDiffResultDto | null>(null)
   /**
@@ -122,8 +140,17 @@ export const useParameterSetsStore = defineStore('aps.parameterSets', () => {
   } | null>(null)
   const lastValidation = ref<PublishValidationResultDto | null>(null)
   const statusFilter = ref<RuleStatus | typeof NO_VERSION | 'ALL'>('ALL')
-  /** 是否显示「主表停用」的行（默认不显示；停用行是唯一的重新启用入口，故必须留开关） */
-  const showInactive = ref(false)
+  /**
+   * 列表筛选条件（2026-11-11 用户拍板，与规则集页同口径）
+   *
+   * 原「显示已停用」开关已撤：停用行**默认就显示**（「全部」页签含停用），
+   * 顶部 KPI 横条也撤了（各状态计数改为直接落在页签上）。
+   */
+  const listKeyword = ref('')
+  /** 主表启停筛选（与版本状态正交：主表停用 ≠ 版本 DISABLED） */
+  const listActiveFilter = ref<'ALL' | 'ACTIVE' | 'INACTIVE'>('ALL')
+  /** 列表排序 */
+  const listSort = ref<ParameterListSort>('DEFAULT')
   const loading = ref(false)
   const listLoading = ref(false)
   const actionRunning = ref(false)
@@ -151,45 +178,74 @@ export const useParameterSetsStore = defineStore('aps.parameterSets', () => {
   )
 
   // ===== getters =====
-  const filteredParameterSets = computed(() => {
+  /**
+   * 列表基础集：**关键词 + 主表状态**过滤后（页签过滤之前）
+   *
+   *  - 关键词：参数集编码 / 名称 / 版本码 模糊匹配（不区分大小写）。
+   *  - 主表状态：主表停用（isActive=false）的行**默认也显示**
+   *    （2026-11-11 用户拍板：「全部」页签即显示全部，含停用 ⇒ 原「显示已停用」开关已撤）。
+   */
+  const scopedParameterSets = computed(() => {
     let arr = parameterSets.value
-    if (!showInactive.value) arr = arr.filter((p) => p.isActive !== false)
-    if (statusFilter.value === NO_VERSION) {
-      arr = arr.filter((p) => !p.hasVersion)
-    } else if (statusFilter.value !== 'ALL') {
-      // 版本状态只对**有版本**的行成立：无版本的行后端 status 缺失，
-      // 前端为了列表展示兜底成 DRAFT ⇒ 若不排除，点「草稿」会捞出几百个根本没版本的行。
-      arr = arr.filter((p) => p.hasVersion && p.status === statusFilter.value)
+    const kw = listKeyword.value.trim().toLowerCase()
+    if (kw) {
+      arr = arr.filter(
+        (r) =>
+          r.parameterSetCode.toLowerCase().includes(kw) ||
+          r.parameterSetName.toLowerCase().includes(kw) ||
+          (r.versionCode ?? '').toLowerCase().includes(kw)
+      )
+    }
+    if (listActiveFilter.value === 'ACTIVE') {
+      arr = arr.filter((r) => r.isActive !== false)
+    } else if (listActiveFilter.value === 'INACTIVE') {
+      arr = arr.filter((r) => r.isActive === false)
     }
     return arr
   })
 
-  /** 版本状态分布（顶部 KPI）—— 只数**有版本**的行
+  /**
+   * 过滤后的参数集列表行（页签状态过滤 + 排序）
    *
-   *  无版本行后端 status 缺失、前端兜底成 DRAFT，计进去会让「草稿」虚高
-   *  （dev 实测 2026-11-07：真草稿 3 个，页面曾显示 886）。
+   *  - 状态过滤按**版本**真实状态；无版本的行只在「全部」「未配版本」两个页签出现
+   *    （点「草稿」不该捞出几百个根本没版本的行）。
    */
-  const statusCounts = computed(() => {
-    const c: Record<RuleStatus, number> = {
-      DRAFT: 0,
-      SUBMITTED: 0,
-      APPROVED: 0,
-      PUBLISHED: 0,
-      DISABLED: 0,
-      ARCHIVED: 0
+  const filteredParameterSets = computed(() => {
+    let arr = scopedParameterSets.value
+    if (statusFilter.value === NO_VERSION) {
+      arr = arr.filter((r) => !r.hasVersion)
+    } else if (statusFilter.value !== 'ALL') {
+      arr = arr.filter((r) => r.hasVersion && r.versionStatus === statusFilter.value)
     }
-    parameterSets.value.forEach((p) => {
-      if (!p.hasVersion) return
-      c[p.status] = (c[p.status] ?? 0) + 1
+    return sortParameterSetRows(arr)
+  })
+
+  /**
+   * 页签计数（2026-11-11：顶部 KPI 横条撤除后，计数直接落在页签上）
+   *
+   *  - ALL = 当前筛选下会显示的**行数**（含停用主表的行）
+   *  - DRAFT / PUBLISHED / DISABLED = 该**版本状态**的行数
+   *  - NO_VERSION = 没有版本的行数（「未配版本」页签）
+   * 计数随关键词 / 主表状态筛选实时变化。
+   */
+  const tabCounts = computed(() => {
+    const c = { ALL: 0, DRAFT: 0, PUBLISHED: 0, DISABLED: 0, NO_VERSION: 0 }
+    scopedParameterSets.value.forEach((r) => {
+      c.ALL += 1
+      if (!r.hasVersion) {
+        c.NO_VERSION += 1
+        return
+      }
+      if (r.versionStatus === 'DRAFT') c.DRAFT += 1
+      else if (r.versionStatus === 'PUBLISHED') c.PUBLISHED += 1
+      else if (r.versionStatus === 'DISABLED') c.DISABLED += 1
     })
     return c
   })
 
-  const noVersionCount = computed(() => parameterSets.value.filter((p) => !p.hasVersion).length)
-
-  /** 主表停用的行数（「显示已停用」开关的计数标签） */
-  const inactiveCount = computed(
-    () => parameterSets.value.filter((p) => p.isActive === false).length
+  /** 参数集（主表）总数 —— 一版一行后列表行数 ≠ 参数集数（「全部」页签的悬停说明用） */
+  const parameterSetTotal = computed(
+    () => new Set(parameterSets.value.map((r) => r.parameterSetId)).size
   )
 
   const currentStatus = computed(() => currentDetail.value?.summary.status ?? null)
@@ -332,7 +388,8 @@ export const useParameterSetsStore = defineStore('aps.parameterSets', () => {
     listLoading.value = true
     error.value = null
     try {
-      parameterSets.value = await parameterSetApi.listParameterSets()
+      // 新端点（一版一行）+ 旧端点的「无版本主表」行，合并见 parameterSetApi.listParameterSetRows
+      parameterSets.value = await parameterSetApi.listParameterSetRows()
     } catch (err) {
       handleError(err)
     } finally {
@@ -340,15 +397,26 @@ export const useParameterSetsStore = defineStore('aps.parameterSets', () => {
     }
   }
 
-  async function loadDetail(parameterSetId: number): Promise<void> {
+  /**
+   * 载入参数集详情
+   *
+   * @param parameterSetId 参数集（主表）Id
+   * @param versionId 要展示的版本 Id（列表点哪一行就传哪一版；不传 = 草稿优先）
+   */
+  async function loadDetail(parameterSetId: number, versionId?: number): Promise<void> {
     loading.value = true
     error.value = null
     currentDiff.value = null
     lastValidation.value = null
     buffer.value = emptyBufferState()
     try {
-      const detail = await parameterSetApi.getParameterSet(parameterSetId)
-      const row = parameterSets.value.find((p) => p.parameterSetId === parameterSetId)
+      const detail = await parameterSetApi.getParameterSet(parameterSetId, versionId)
+      // 参数集的代码/名称只在主表列表里（详情端点只给版本内容）⇒ 用列表行回填
+      const row =
+        parameterSets.value.find(
+          (r) =>
+            r.parameterSetId === parameterSetId && (versionId == null || r.versionId === versionId)
+        ) ?? parameterSets.value.find((r) => r.parameterSetId === parameterSetId)
       detail.summary.parameterSetCode = row?.parameterSetCode ?? detail.summary.parameterSetCode
       detail.summary.parameterSetName = row?.parameterSetName ?? detail.summary.parameterSetName
       detail.summary.description = row?.description
@@ -357,12 +425,13 @@ export const useParameterSetsStore = defineStore('aps.parameterSets', () => {
       detail.summary.isActive = row?.isActive ?? detail.summary.isActive
       currentDetail.value = detail
 
+      // 列表行同步刷新（该版本的状态可能已被别处改动）
       if (row) {
-        const idx = parameterSets.value.findIndex((p) => p.parameterSetId === parameterSetId)
+        const idx = parameterSets.value.findIndex((r) => r.rowKey === row.rowKey)
         if (idx >= 0) {
           parameterSets.value[idx] = {
             ...parameterSets.value[idx],
-            status: detail.summary.status,
+            versionStatus: detail.summary.status,
             currentVersionCode: detail.summary.currentVersionCode,
             draftVersionCode: detail.summary.draftVersionCode,
             publishedAt: detail.summary.publishedAt
@@ -494,7 +563,8 @@ export const useParameterSetsStore = defineStore('aps.parameterSets', () => {
       })
       await loadList()
       if (currentDetail.value?.summary.parameterSetId === input.parameterSetId) {
-        await loadDetail(input.parameterSetId)
+        // 仍停在这一版（改的是主表字段，版本内容没变）
+        await loadDetail(input.parameterSetId, currentDetail.value?.version?.id)
       }
       return true
     } catch (err) {
@@ -519,12 +589,14 @@ export const useParameterSetsStore = defineStore('aps.parameterSets', () => {
 
   /** 主表建成后补一条空白草稿；失败只如实提示「壳建好了、版本没建上」，不吞成功 */
   async function attachBlankDraft(parameterSetId: number, code: string): Promise<number> {
+    let draftId: number | undefined
     try {
-      await parameterSetApi.createParameterSetDraft({
+      const created = await parameterSetApi.createParameterSetDraft({
         parameterSetId,
         versionCode: `${code}-V1`,
         remarks: '新建参数集时自动创建的空白草稿'
       })
+      draftId = created?.id
     } catch (err) {
       const versions = await parameterSetApi
         .listParameterSetVersions(parameterSetId)
@@ -538,7 +610,8 @@ export const useParameterSetsStore = defineStore('aps.parameterSets', () => {
       return parameterSetId
     }
     await loadList()
-    await loadDetail(parameterSetId)
+    // 落点切到刚建出来的那条空白草稿（一版一行后，列表里它就是新的一行）
+    await loadDetail(parameterSetId, draftId)
     return parameterSetId
   }
 
@@ -898,14 +971,37 @@ export const useParameterSetsStore = defineStore('aps.parameterSets', () => {
     }
   }
 
+  /**
+   * 当前展示的那一版（**一版一行**后「校验草稿 / 发布」都作用在这一版上）
+   *
+   * 显示的是草稿 ⇒ 用它；否则回落到历史里最后一个草稿（兼容不传版本的旧调用）。
+   */
+  function displayedDraftVersionId(): number | undefined {
+    const detail = currentDetail.value
+    if (!detail) return undefined
+    if (detail.summary.status === 'DRAFT' && detail.version?.id) return detail.version.id
+    return (detail.history ?? []).filter((h) => h.status === 'DRAFT').pop()?.versionId
+  }
+
+  /**
+   * 当前展示的那一版若是已发布 ⇒ 用它；否则回落到历史里最后一个已发布版本
+   *
+   * ⚠️ 与 `displayedDraftVersionId` 对称：停用对象是**已发布版本**，
+   *   不是参数集整体状态（停用主表 ≠ 停用版本）。
+   */
+  function displayedPublishedVersionId(): number | undefined {
+    const detail = currentDetail.value
+    if (!detail) return undefined
+    if (detail.summary.status === 'PUBLISHED' && detail.version?.id) return detail.version.id
+    return (detail.history ?? []).filter((h) => h.status === 'PUBLISHED').pop()?.versionId
+  }
+
   /** 校验草稿（后端返回 PublishValidationResult：isValid / errors / warnings） */
   async function validateDraft(): Promise<boolean> {
     validating.value = true
     error.value = null
     try {
-      const versionId = (currentDetail.value?.history ?? [])
-        .filter((h) => h.status === 'DRAFT')
-        .pop()?.versionId
+      const versionId = displayedDraftVersionId()
       if (!versionId) {
         error.value = '当前没有草稿版本可校验'
         return false
@@ -931,9 +1027,7 @@ export const useParameterSetsStore = defineStore('aps.parameterSets', () => {
       error.value = '存在未保存的修改，请先保存草稿再发布'
       return false
     }
-    const versionId = (currentDetail.value?.history ?? [])
-      .filter((h) => h.status === 'DRAFT')
-      .pop()?.versionId
+    const versionId = displayedDraftVersionId()
     if (!versionId) {
       error.value = '当前没有草稿版本可发布'
       return false
@@ -944,7 +1038,8 @@ export const useParameterSetsStore = defineStore('aps.parameterSets', () => {
       await parameterSetApi.publishParameterSet({ versionId, changeReason, actor: actor.value })
       const id = currentDetail.value?.summary.parameterSetId
       await loadList()
-      if (id) await loadDetail(id)
+      // 一版一行后仍停在这一版（它已变成已发布），列表随后整体刷新
+      if (id) await loadDetail(id, versionId)
       return true
     } catch (err) {
       handleError(err)
@@ -960,9 +1055,7 @@ export const useParameterSetsStore = defineStore('aps.parameterSets', () => {
       error.value = '当前操作者无停用权限（需权限码 aps.parameter.publish）'
       return false
     }
-    const versionId = (currentDetail.value?.history ?? [])
-      .filter((h) => h.status === 'PUBLISHED')
-      .pop()?.versionId
+    const versionId = displayedPublishedVersionId()
     if (!versionId) {
       error.value = '当前没有已发布版本可停用'
       return false
@@ -973,7 +1066,8 @@ export const useParameterSetsStore = defineStore('aps.parameterSets', () => {
       await parameterSetApi.disableParameterSet({ versionId, reason })
       const id = currentDetail.value?.summary.parameterSetId
       await loadList()
-      if (id) await loadDetail(id)
+      // 停用后仍停在这一版（它已变成已停用）
+      if (id) await loadDetail(id, versionId)
       return true
     } catch (err) {
       handleError(err)
@@ -1042,10 +1136,15 @@ export const useParameterSetsStore = defineStore('aps.parameterSets', () => {
     actionRunning.value = true
     error.value = null
     try {
-      await parameterSetApi.forkDraft(sourceParameterSetVersionId, newVersionCode, changeReason)
+      const created = await parameterSetApi.forkDraft(
+        sourceParameterSetVersionId,
+        newVersionCode,
+        changeReason
+      )
       await loadList()
       const id = currentDetail.value?.summary.parameterSetId
-      if (id) await loadDetail(id)
+      // 落点切到**刚建出来的那条草稿**（一版一行后，列表里它就是新的一行）
+      if (id) await loadDetail(id, created?.id)
       return true
     } catch (err) {
       handleError(err)
@@ -1057,6 +1156,47 @@ export const useParameterSetsStore = defineStore('aps.parameterSets', () => {
 
   function setStatusFilter(filter: RuleStatus | typeof NO_VERSION | 'ALL'): void {
     statusFilter.value = filter
+  }
+
+  /**
+   * 排序（2026-11-11 筛选条件）
+   *
+   * DEFAULT = 保持后端返回顺序；其余按时间/编码排序。
+   * 时间字段可能为空（无版本行没有发布时间）⇒ 空值排在最后（降序时也是最后）。
+   */
+  function sortParameterSetRows(rows: ParameterSetListRowDto[]): ParameterSetListRowDto[] {
+    const list = [...rows]
+    switch (listSort.value) {
+      case 'PUBLISHED_DESC':
+        return list.sort((a, b) => (b.publishedAt ?? '').localeCompare(a.publishedAt ?? ''))
+      case 'CREATED_DESC':
+        return list.sort((a, b) => (b.createdAt ?? '').localeCompare(a.createdAt ?? ''))
+      case 'CODE_ASC':
+        return list.sort((a, b) =>
+          a.parameterSetCode.localeCompare(b.parameterSetCode, 'zh-Hans-CN')
+        )
+      default:
+        return list
+    }
+  }
+
+  function setListKeyword(keyword: string): void {
+    listKeyword.value = keyword
+  }
+
+  function setListActiveFilter(filter: 'ALL' | 'ACTIVE' | 'INACTIVE'): void {
+    listActiveFilter.value = filter
+  }
+
+  function setListSort(sort: ParameterListSort): void {
+    listSort.value = sort
+  }
+
+  /** 一键清空筛选条件（关键词 / 主表状态 / 排序） */
+  function resetListFilters(): void {
+    listKeyword.value = ''
+    listActiveFilter.value = 'ALL'
+    listSort.value = 'DEFAULT'
   }
 
   function handleError(err: unknown): void {
@@ -1085,7 +1225,9 @@ export const useParameterSetsStore = defineStore('aps.parameterSets', () => {
     paramDiffPair,
     lastValidation,
     statusFilter,
-    showInactive,
+    listKeyword,
+    listActiveFilter,
+    listSort,
     loading,
     listLoading,
     actionRunning,
@@ -1099,9 +1241,9 @@ export const useParameterSetsStore = defineStore('aps.parameterSets', () => {
     warehouseDictError,
     // getters
     filteredParameterSets,
-    statusCounts,
-    noVersionCount,
-    inactiveCount,
+    scopedParameterSets,
+    tabCounts,
+    parameterSetTotal,
     currentStatus,
     canWrite,
     canPublishAction,
@@ -1149,6 +1291,10 @@ export const useParameterSetsStore = defineStore('aps.parameterSets', () => {
     removeParameterSet,
     forkDraft,
     setStatusFilter,
+    setListKeyword,
+    setListActiveFilter,
+    setListSort,
+    resetListFilters,
     reset,
     handleError
   }

@@ -44,29 +44,50 @@ public class PeggingTraceService
             orderNo, supplyDocumentNo, rootOrderId, skip, take, ct, allowedFactories);
     }
 
+    /// <summary>筛选后总数（R2.1，11-14：与列表同参数集，含数据范围）。</summary>
+    public async Task<int> CountAsync(
+        int planVersionId,
+        string? materialCode = null,
+        string? supplyType = null,
+        string? commitmentStatus = null,
+        string? orderNo = null,
+        string? supplyDocumentNo = null,
+        long? rootOrderId = null,
+        CancellationToken ct = default,
+        IReadOnlySet<string>? allowedFactories = null)
+    {
+        if (planVersionId <= 0) throw new ArgumentException("planVersionId is required");
+
+        return await _repository.CountAsync(
+            planVersionId, materialCode, supplyType, commitmentStatus,
+            orderNo, supplyDocumentNo, rootOrderId, ct, allowedFactories);
+    }
+
     /// <summary>
     /// 按订单查询Pegging分配
     /// </summary>
     public async Task<List<PeggingTraceDto>> QueryByOrderAsync(
         int planVersionId,
         long orderId,
-        CancellationToken ct = default)
+        CancellationToken ct = default,
+        IReadOnlySet<string>? allowedFactories = null)
     {
         if (planVersionId <= 0) throw new ArgumentException("planVersionId is required");
         if (orderId <= 0) throw new ArgumentException("orderId is required");
 
-        return await _repository.QueryByOrderAsync(planVersionId, orderId, ct);
+        return await _repository.QueryByOrderAsync(planVersionId, orderId, ct, allowedFactories);
     }
 
     /// <summary>
-    /// 查询Pegging Trace汇总
+    /// 查询Pegging Trace汇总（R2.4，11-14：收进数据范围，与列表/计数同谓词）。
     /// </summary>
     public async Task<PeggingTraceSummaryDto> GetSummaryAsync(
         int planVersionId,
-        CancellationToken ct = default)
+        CancellationToken ct = default,
+        IReadOnlySet<string>? allowedFactories = null)
     {
         if (planVersionId <= 0) throw new ArgumentException("planVersionId is required");
 
-        return await _repository.GetSummaryAsync(planVersionId, ct);
+        return await _repository.GetSummaryAsync(planVersionId, ct, allowedFactories);
     }
 }

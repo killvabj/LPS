@@ -27,7 +27,7 @@ import {
   ApiError,
   canCreateDraftForStatus,
   normalizeRuleStatus,
-  type RuleSetSummaryDto,
+  type RuleSetListRowDto,
   type RuleSetDetailDto,
   type BackendRuleSetVersion,
   type VersionDiffResultDto,
@@ -43,27 +43,59 @@ import {
   serializePrioritySegments,
   validatePrioritySegments
 } from '@/api/aps-v1/prioritySegmentEditor'
+// 对比对选取与参数集页共用一份（函数虽在 parameterDiff.ts 里，逻辑与治理族无关，两族同口径）
+import { pickDiffPair } from '@/api/aps-v1/parameterDiff'
 import { useApsAuthStore } from './auth'
 import { assertScope, ScopeViolationError, filterByScope } from './scope'
 
+/** 列表排序方式（2026-11-11 筛选条件） */
+export type RuleListSort = 'DEFAULT' | 'PUBLISHED_DESC' | 'CREATED_DESC' | 'CODE_ASC'
+
+/** 排序选项文案（页面下拉与本表共用一份，避免两处漂移） */
+export const RULE_LIST_SORT_LABELS: Record<RuleListSort, string> = {
+  DEFAULT: '默认顺序',
+  PUBLISHED_DESC: '最近发布',
+  CREATED_DESC: '最近创建',
+  CODE_ASC: '编码升序'
+}
+
 export const useRulesStore = defineStore('aps.rules', () => {
   // ===== state =====
-  const ruleSets = ref<RuleSetSummaryDto[]>([])
+  /**
+   * 规则集列表行（**一版一行**，2026-11-11 列表源切换）
+   *
+   * ⚠️ 一行 = 一个版本（`versionId` / `versionCode` / `versionStatus` 齐备），
+   *   另有「无版本主表」行（hasVersion=false）。
+   *   同族多个版本（已发布 + 草稿）各占一行、状态各自真实，不再互相覆盖。
+   */
+  const ruleSets = ref<RuleSetListRowDto[]>([])
   const currentDetail = ref<RuleSetDetailDto | null>(null)
   const currentDiff = ref<VersionDiffResultDto | null>(null)
   /** 当前字段级 Diff 的两端版本 Id（「查看换型规则逐条差异」下钻 SetupDiff 时带参用） */
   const diffBaseVersionId = ref<number | null>(null)
   const diffTargetVersionId = ref<number | null>(null)
+  /**
+   * 「版本对比」页签内的大白话提示（diff 算不出来时的原因说明）
+   *
+   * ⚠️ 2026-11-11：后端 diff 端点在「同一版本内两条换型规则业务键重复」时直接 400
+   *   （.NET ToDictionary 重复键 ⇒ "An item with the same key has already been added"）。
+   *   那是后端数据/实现问题，前端绕不过 ⇒ **不弹全局英文报错条**（用户看不懂、也挡着页面），
+   *   改成在页签内说明「差异算不出来，但内容/历史版本/发布都照常用」。
+   */
+  const diffError = ref<string | null>(null)
   const lastValidation = ref<PublishValidationResultDto | null>(null)
   const statusFilter = ref<RuleStatus | typeof NO_VERSION | 'ALL'>('ALL')
   /**
-   * 是否在列表里显示「主表停用」的行（默认不显示）。
+   * 列表筛选条件（2026-11-11 用户拍板）
    *
-   * 治理三族已无删除入口（FC-V1-007 未获批，后端 DELETE 路由摘除），建错的主表只能靠
-   * 「停用」退出使用 ⇒ 停用行会永久堆在列表里。这里默认折叠，但**必须保留开关**：
-   * 停用行是唯一的「重新启用」入口，藏死了用户就找不回来。
+   * 原「显示已停用」开关已撤：停用行**默认就显示**（「全部」页签含停用），
+   * 顶部 KPI 横条也撤了（各状态计数改为直接落在页签上）。
    */
-  const showInactive = ref(false)
+  const listKeyword = ref('')
+  /** 主表启停筛选（与版本状态正交：主表停用 ≠ 版本 DISABLED） */
+  const listActiveFilter = ref<'ALL' | 'ACTIVE' | 'INACTIVE'>('ALL')
+  /** 列表排序 */
+  const listSort = ref<RuleListSort>('DEFAULT')
   const loading = ref(false)
   const listLoading = ref(false)
   const actionRunning = ref(false)
@@ -80,58 +112,77 @@ export const useRulesStore = defineStore('aps.rules', () => {
 
   // ===== getters =====
   /**
-   * 过滤后的 RuleSet 列表
-   *  - 状态过滤 + 业务范围（domainKey）过滤；domainKey='ALL' 表示跨域，始终放行
-   *  - ⚠️ 当前后端 RuleSet 表**无 Domain 外键**（DDL 08:9025），domainKey 恒为 'ALL'
-   *    ⇒ 这条业务范围预过滤目前**不生效**；已致函 3号位 追问后端是否二次校验（R1）。
+   * 列表基础集：**业务范围 + 关键词 + 主表状态**过滤后（页签过滤之前）
+   *
+   *  - 业务范围（domainKey）过滤沿用原口径：domainKey='ALL' 表示跨域，始终放行。
+   *    ⚠️ 当前后端 RuleSet 表**无 Domain 外键**（DDL 08:9025），domainKey 恒为 'ALL'
+   *      ⇒ 这条业务范围预过滤目前**不生效**；已致函 3号位 追问后端是否二次校验（R1）。
+   *  - 关键词：规则集编码 / 名称 / 版本码 模糊匹配（不区分大小写）。
+   *  - 主表状态：主表停用（isActive=false）的行**默认也显示**
+   *    （2026-11-11 用户拍板：「全部」页签即显示全部，含停用 ⇒ 原「显示已停用」开关已撤）。
    */
-  const filteredRuleSets = computed(() => {
+  const scopedRuleSets = computed(() => {
     let arr = ruleSets.value
-    if (!showInactive.value) arr = arr.filter((r) => r.isActive !== false)
-    if (statusFilter.value === NO_VERSION) {
-      arr = arr.filter((r) => !r.hasVersion)
-    } else if (statusFilter.value !== 'ALL') {
-      // 版本状态只对**有版本**的行成立：无版本的行后端 status 缺失，
-      // 前端为了列表展示兜底成 DRAFT ⇒ 若不排除，点「草稿」会捞出几百个根本没版本的行。
-      arr = arr.filter((r) => r.hasVersion && r.status === statusFilter.value)
+    const kw = listKeyword.value.trim().toLowerCase()
+    if (kw) {
+      arr = arr.filter(
+        (r) =>
+          r.ruleSetCode.toLowerCase().includes(kw) ||
+          r.ruleSetName.toLowerCase().includes(kw) ||
+          (r.versionCode ?? '').toLowerCase().includes(kw)
+      )
+    }
+    if (listActiveFilter.value === 'ACTIVE') {
+      arr = arr.filter((r) => r.isActive !== false)
+    } else if (listActiveFilter.value === 'INACTIVE') {
+      arr = arr.filter((r) => r.isActive === false)
     }
     return filterByScope(arr, apsAuth.dataScope, (r) =>
       r.domainKey === 'ALL' ? {} : { domainKey: r.domainKey }
     )
   })
 
-  /** 状态分布（顶部 KPI 用）—— v1.4 §二十 6 态
+  /**
+   * 过滤后的规则集列表行（页签状态过滤 + 排序）
    *
-   *  只数**有版本**的行：无版本行后端 status 缺失，前端兜底成 DRAFT，
-   *  计进去会让「草稿」虚高到几百（dev 实测：真草稿 3 个，页面曾显示 886）。
+   *  - 状态过滤按**版本**真实状态；无版本的行只在「全部」「未配版本」两个页签出现
+   *    （点「草稿」不该捞出几百个根本没版本的行）。
    */
-  const statusCounts = computed(() => {
-    const c: Record<RuleStatus, number> = {
-      DRAFT: 0,
-      SUBMITTED: 0,
-      APPROVED: 0,
-      PUBLISHED: 0,
-      DISABLED: 0,
-      ARCHIVED: 0
+  const filteredRuleSets = computed(() => {
+    let arr = scopedRuleSets.value
+    if (statusFilter.value === NO_VERSION) {
+      arr = arr.filter((r) => !r.hasVersion)
+    } else if (statusFilter.value !== 'ALL') {
+      arr = arr.filter((r) => r.hasVersion && r.versionStatus === statusFilter.value)
     }
-    ruleSets.value.forEach((r) => {
-      if (!r.hasVersion) return
-      c[r.status] = (c[r.status] ?? 0) + 1
+    return sortRuleSetRows(arr)
+  })
+
+  /**
+   * 页签计数（2026-11-11：顶部 KPI 横条撤除后，计数直接落在页签上）
+   *
+   *  - ALL = 当前筛选下会显示的**行数**（含停用主表的行）
+   *  - DRAFT / PUBLISHED / DISABLED = 该**版本状态**的行数
+   *  - NO_VERSION = 没有版本的行数（「未配版本」页签）
+   * 计数随关键词 / 主表状态筛选实时变化。
+   */
+  const tabCounts = computed(() => {
+    const c = { ALL: 0, DRAFT: 0, PUBLISHED: 0, DISABLED: 0, NO_VERSION: 0 }
+    scopedRuleSets.value.forEach((r) => {
+      c.ALL += 1
+      if (!r.hasVersion) {
+        c.NO_VERSION += 1
+        return
+      }
+      if (r.versionStatus === 'DRAFT') c.DRAFT += 1
+      else if (r.versionStatus === 'PUBLISHED') c.PUBLISHED += 1
+      else if (r.versionStatus === 'DISABLED') c.DISABLED += 1
     })
     return c
   })
 
-  /**
-   * 无任何版本的规则集数量（10-14 增）
-   *
-   * dev 实测 698 个里 695 个属于此类 —— 它们点开必然加载不出内容，
-   * 所以必须单独成列，否则「已发布」KPI 会把点不开的条目算成已发布。
-   * 这是**正交于 6 态的计数**，不并进 statusCounts（v1.4 §二十 的冻结状态语义不动）。
-   */
-  const noVersionCount = computed(() => ruleSets.value.filter((r) => !r.hasVersion).length)
-
-  /** 主表停用的行数（「显示已停用」开关的计数标签；与 6 态版本状态正交） */
-  const inactiveCount = computed(() => ruleSets.value.filter((r) => r.isActive === false).length)
+  /** 规则集（主表）总数 —— 一版一行后列表行数 ≠ 规则集数（「全部」页签的悬停说明用） */
+  const ruleSetTotal = computed(() => new Set(ruleSets.value.map((r) => r.ruleSetId)).size)
 
   /** 当前选中 RuleSet 的 status */
   const currentStatus = computed(() => currentDetail.value?.summary.status ?? null)
@@ -159,8 +210,20 @@ export const useRulesStore = defineStore('aps.rules', () => {
     }
   })
 
-  /** 当前 RuleSet 是否允许 fork 新 DRAFT */
+  /** 当前 RuleSet 是否允许 fork 新 DRAFT
+   *
+   * ⚠️ 2026-11-11（一版一行）：`currentStatus` 现在是**当前展示的那一版**的状态，
+   *   而「这个规则集有没有草稿」是**主表级**事实 ⇒ 两件事要分开看：
+   *   点「已发布」那一行时 currentStatus=PUBLISHED，但同族可能已经有草稿 ⇒
+   *   此时再建草稿会与现有草稿冲突，必须拦。
+   */
   const forkPermission = computed(() => {
+    const detail = currentDetail.value
+    if (!detail) return { allowed: false, reason: '未选中 RuleSet' }
+    const hasDraft = (detail.history ?? []).some((h) => h.status === 'DRAFT')
+    if (hasDraft) {
+      return { allowed: false, reason: '该规则集已有草稿版本；请直接编辑现有草稿' }
+    }
     const s = currentStatus.value
     if (!s) return { allowed: false, reason: '未选中 RuleSet' }
     return canCreateDraftForStatus(s)
@@ -171,7 +234,8 @@ export const useRulesStore = defineStore('aps.rules', () => {
     listLoading.value = true
     error.value = null
     try {
-      ruleSets.value = await ruleApi.listRuleSets()
+      // 新端点（一版一行）+ 旧端点的「无版本主表」行，合并见 ruleApi.listRuleSetRows
+      ruleSets.value = await ruleApi.listRuleSetRows()
     } catch (err) {
       handleError(err)
     } finally {
@@ -184,32 +248,45 @@ export const useRulesStore = defineStore('aps.rules', () => {
     currentDiff.value = null
     diffBaseVersionId.value = null
     diffTargetVersionId.value = null
+    diffError.value = null
   }
 
-  async function loadDetail(ruleSetId: number): Promise<void> {
+  /**
+   * 载入规则集详情
+   *
+   * @param ruleSetId 规则集（主表）Id
+   * @param versionId 要展示的版本 Id（列表点哪一行就传哪一版；不传 = 草稿优先）
+   */
+  async function loadDetail(ruleSetId: number, versionId?: number): Promise<void> {
     loading.value = true
     error.value = null
     clearDiff()
     lastValidation.value = null
     try {
-      const detail = await ruleApi.getRuleSet(ruleSetId)
+      const detail = await ruleApi.getRuleSet(ruleSetId, versionId)
       // 规则集的代码/名称只在主表列表里（详情端点只给版本内容）⇒ 用列表行回填
-      const row = ruleSets.value.find((r) => r.ruleSetId === ruleSetId)
+      const row =
+        ruleSets.value.find(
+          (r) => r.ruleSetId === ruleSetId && (versionId == null || r.versionId === versionId)
+        ) ?? ruleSets.value.find((r) => r.ruleSetId === ruleSetId)
       detail.summary.ruleSetCode = row?.ruleSetCode ?? detail.summary.ruleSetCode
       detail.summary.ruleSetName = row?.ruleSetName ?? detail.summary.ruleSetName
-      detail.summary.lastChangeReason = row?.lastChangeReason
+      // 最近变更 = **本页展示的那一版**的变更原因（历史里有每版备注）
+      detail.summary.lastChangeReason = detail.history.find(
+        (h) => h.versionId === detail.contentVersionId
+      )?.changeReason
       // 主表启停 / 说明同样只在列表里（Q4：与版本状态是两件事）
       detail.summary.isActive = row?.isActive
       detail.summary.description = row?.description
       currentDetail.value = detail
 
-      // 列表行同步刷新（状态 / 版本码可能已被别处改动）
+      // 列表行同步刷新（该版本的状态可能已被别处改动）
       if (row) {
-        const idx = ruleSets.value.findIndex((r) => r.ruleSetId === ruleSetId)
+        const idx = ruleSets.value.findIndex((r) => r.rowKey === row.rowKey)
         if (idx >= 0) {
           ruleSets.value[idx] = {
             ...ruleSets.value[idx],
-            status: detail.summary.status,
+            versionStatus: detail.summary.status,
             currentVersionCode: detail.summary.currentVersionCode,
             draftVersionCode: detail.summary.draftVersionCode,
             publishedAt: detail.summary.publishedAt
@@ -217,14 +294,14 @@ export const useRulesStore = defineStore('aps.rules', () => {
         }
       }
 
-      // 默认对比：已发布版本 ↔ 草稿版本（两者都存在才有意义）
-      const history = detail.history
-      const baseVer = history.find(
-        (h) => h.status === 'PUBLISHED' && h.isLatestPublished
-      )?.versionId
-      const targetVer = history.find((h) => h.status === 'DRAFT')?.versionId
-      if (baseVer && targetVer && baseVer !== targetVer) {
-        await loadDiff(baseVer, targetVer)
+      // 默认对比对：与参数集页同口径，统一走 `pickDiffPair`（真源在 api/aps-v1/parameterDiff.ts，
+      // 10-28 参数集页先修过同一个坑；规则集页此前只认「有草稿」⇒ 草稿一发布就永久空白）
+      //   ① 有草稿 → 当前已发布 ↔ 草稿（回答「我这次改了什么」）
+      //   ② 无草稿 → 上一已发布 ↔ 当前已发布（回答「上一版到这一版改了什么」）
+      //      例：CESHI1111 V1已停用 / V2已发布 / V3已发布 ⇒ 比 V2 → V3。
+      const pair = pickDiffPair(detail.history)
+      if (pair && pair.source.versionId != null && pair.target.versionId != null) {
+        await loadDiff(pair.source.versionId, pair.target.versionId)
       } else {
         clearDiff()
       }
@@ -241,9 +318,14 @@ export const useRulesStore = defineStore('aps.rules', () => {
       currentDiff.value = await ruleApi.diffVersions(base, target)
       diffBaseVersionId.value = base
       diffTargetVersionId.value = target
-    } catch (err) {
-      handleError(err)
+      diffError.value = null
+    } catch {
+      // ⚠️ 不写全局 error、不弹英文原文（后端 400 的 message 是 .NET 异常文本，
+      //   用户看不懂）。差异算不出来只影响「版本对比」这一个页签 ⇒ 页签内说明即可。
       clearDiff()
+      diffError.value =
+        '这两个版本的差异算不出来（后端对比换型规则时出错，多半是同一版本里有两条业务键重复的换型规则）。' +
+        '版本内容、历史版本、校验与发布都不受影响，可先看「历史版本」。'
     }
   }
 
@@ -252,15 +334,31 @@ export const useRulesStore = defineStore('aps.rules', () => {
    *  后端返回 `PublishValidationResult`：isValid + errors[] + warnings[] + validatedAt。
    *  ⚠️ 原前端自造 `{status:'PASSED'|'FAILED', message}` —— 那两个字段后端没有，
    *    页面上的「校验状态」标签因此永远是错的。
+   *
+   *  2026-11-11：保存段位不再拦「值没填」⇒ 这类问题挪到这一关提示。
+   *  先跑本地拦截（能指名到第几段第几条条件，比后端文案准），本地不过就不再问后端；
+   *  本地过了才走后端校验（后端才是发布的最终闸门）。
    */
   async function validateDraft(): Promise<boolean> {
     validating.value = true
     error.value = null
     try {
       const detail = currentDetail.value
-      const versionId = (detail?.history ?? []).filter((h) => h.status === 'DRAFT').pop()?.versionId
-      if (!versionId) {
+      // 校验作用在**当前展示的那一版**（一版一行后，「校验草稿」按钮只在该行是草稿时出现）
+      if (!detail || detail.summary.status !== 'DRAFT' || !detail.contentVersionId) {
         error.value = '当前没有草稿版本可校验'
+        return false
+      }
+      const versionId = detail.contentVersionId
+      // 本地拦截：条件值没填、段名没写、空条件组、兜底段位置不对…（与后端发布校验同口径）
+      const localErrors = validatePrioritySegments(detail.prioritySegments)
+      if (localErrors.length > 0) {
+        lastValidation.value = {
+          isValid: false,
+          errors: localErrors.map((message) => ({ code: 'LOCAL', message })),
+          warnings: [],
+          validatedAt: new Date().toISOString()
+        }
         return false
       }
       const result = await ruleApi.validateDraft(versionId)
@@ -300,7 +398,7 @@ export const useRulesStore = defineStore('aps.rules', () => {
         throw err
       }
     }
-    const versionId = (detail.history ?? []).filter((h) => h.status === 'DRAFT').pop()?.versionId
+    const versionId = detail.contentVersionId
     if (!versionId) {
       error.value = '当前草稿没有可用的版本标识，无法发布'
       return false
@@ -309,7 +407,8 @@ export const useRulesStore = defineStore('aps.rules', () => {
     error.value = null
     try {
       await ruleApi.publishRuleSet({ versionId, changeReason, actor: actor.value })
-      await loadDetail(ruleSetId)
+      // 发布后仍停在这一版（它已变成已发布），列表随后整体刷新
+      await loadDetail(ruleSetId, versionId)
       await loadList()
       return true
     } catch (err) {
@@ -346,9 +445,12 @@ export const useRulesStore = defineStore('aps.rules', () => {
         throw err
       }
     }
-    const versionId = (detail.history ?? [])
-      .filter((h) => h.status === 'PUBLISHED')
-      .pop()?.versionId
+    // 停用作用在**当前展示的那一版**（一版一行后，「停用」按钮只在该行是已发布时出现）
+    if (detail.summary.status !== 'PUBLISHED') {
+      error.value = '只有已发布版本可以停用'
+      return false
+    }
+    const versionId = detail.contentVersionId
     if (!versionId) {
       error.value = '当前没有已发布版本可停用'
       return false
@@ -363,7 +465,7 @@ export const useRulesStore = defineStore('aps.rules', () => {
         actor: actor.value,
         actorRoles: actorRoles.value
       })
-      await loadDetail(ruleSetId)
+      await loadDetail(ruleSetId, versionId)
       await loadList()
       return true
     } catch (err) {
@@ -440,10 +542,11 @@ export const useRulesStore = defineStore('aps.rules', () => {
     actionRunning.value = true
     error.value = null
     try {
-      await ruleApi.forkDraft(sourceRuleSetVersionId, newVersionCode, changeReason)
+      const created = await ruleApi.forkDraft(sourceRuleSetVersionId, newVersionCode, changeReason)
       await loadList()
       const ruleSetId = currentDetail.value?.summary.ruleSetId
-      if (ruleSetId) await loadDetail(ruleSetId)
+      // 落点切到**刚建出来的那条草稿**（一版一行后，列表里它就是新的一行）
+      if (ruleSetId) await loadDetail(ruleSetId, created.ruleSetDraft.id)
       return true
     } catch (err) {
       handleError(err)
@@ -585,7 +688,10 @@ export const useRulesStore = defineStore('aps.rules', () => {
    *  - PUT body 是整条 RuleSetVersion：带 versionCode + demandPriorityJson + remarks；
    *    **不带 contentSnapshotJson**（后端会强制回填库内既有快照，传了也无效，
    *    换型规则子块靠这个机制保留）
-   *  - 保存前先跑前端拦截（与后端发布校验同口径），避免用户存完去发布才被打回
+   *  - ⚠️ 2026-11-11：**保存不再做内容校验**（值没填、段名没写、空条件组等一律放过）。
+   *    草稿的用途就是「先存下来、回头再填」；内容合不合格由「校验草稿」那一关把关，
+   *    发布仍由后端校验兜底。**校验不过 ≠ 不能存**。
+   *    保留的拦截只有权限、版本状态、版本存在性这三条（与内容无关）。
    */
   async function saveDraftSegments(
     segments: PrioritySegmentDto[],
@@ -608,11 +714,6 @@ export const useRulesStore = defineStore('aps.rules', () => {
       error.value = '找不到当前展示的版本，请重新打开该规则集'
       return false
     }
-    const localErrors = validatePrioritySegments(segments)
-    if (localErrors.length > 0) {
-      error.value = localErrors.join('；')
-      return false
-    }
     saving.value = true
     error.value = null
     try {
@@ -627,7 +728,7 @@ export const useRulesStore = defineStore('aps.rules', () => {
           remarks: changeReason?.trim() || undefined
         }
       })
-      await loadDetail(detail.summary.ruleSetId)
+      await loadDetail(detail.summary.ruleSetId, detail.contentVersionId)
       await loadList()
       return true
     } catch (err) {
@@ -640,6 +741,45 @@ export const useRulesStore = defineStore('aps.rules', () => {
 
   function setStatusFilter(filter: RuleStatus | typeof NO_VERSION | 'ALL'): void {
     statusFilter.value = filter
+  }
+
+  /**
+   * 排序（2026-11-11 筛选条件）
+   *
+   * DEFAULT = 保持后端返回顺序；其余按时间/编码排序。
+   * 时间字段可能为空（无版本行没有发布时间）⇒ 空值排在最后（降序时也是最后）。
+   */
+  function sortRuleSetRows(rows: RuleSetListRowDto[]): RuleSetListRowDto[] {
+    const list = [...rows]
+    switch (listSort.value) {
+      case 'PUBLISHED_DESC':
+        return list.sort((a, b) => (b.publishedAt ?? '').localeCompare(a.publishedAt ?? ''))
+      case 'CREATED_DESC':
+        return list.sort((a, b) => (b.createdAt ?? '').localeCompare(a.createdAt ?? ''))
+      case 'CODE_ASC':
+        return list.sort((a, b) => a.ruleSetCode.localeCompare(b.ruleSetCode, 'zh-Hans-CN'))
+      default:
+        return list
+    }
+  }
+
+  function setListKeyword(keyword: string): void {
+    listKeyword.value = keyword
+  }
+
+  function setListActiveFilter(filter: 'ALL' | 'ACTIVE' | 'INACTIVE'): void {
+    listActiveFilter.value = filter
+  }
+
+  function setListSort(sort: RuleListSort): void {
+    listSort.value = sort
+  }
+
+  /** 一键清空筛选条件（关键词 / 主表状态 / 排序） */
+  function resetListFilters(): void {
+    listKeyword.value = ''
+    listActiveFilter.value = 'ALL'
+    listSort.value = 'DEFAULT'
   }
 
   function handleError(err: unknown): void {
@@ -666,9 +806,12 @@ export const useRulesStore = defineStore('aps.rules', () => {
     currentDiff,
     diffBaseVersionId,
     diffTargetVersionId,
+    diffError,
     lastValidation,
     statusFilter,
-    showInactive,
+    listKeyword,
+    listActiveFilter,
+    listSort,
     loading,
     listLoading,
     actionRunning,
@@ -679,9 +822,9 @@ export const useRulesStore = defineStore('aps.rules', () => {
     actorRoles,
     // getters
     filteredRuleSets,
-    statusCounts,
-    noVersionCount,
-    inactiveCount,
+    scopedRuleSets,
+    tabCounts,
+    ruleSetTotal,
     currentStatus,
     canWrite,
     canPublishAction,
@@ -700,6 +843,10 @@ export const useRulesStore = defineStore('aps.rules', () => {
     createRuleSet,
     updateRuleSet,
     setStatusFilter,
+    setListKeyword,
+    setListActiveFilter,
+    setListSort,
+    resetListFilters,
     reset,
     handleError
   }

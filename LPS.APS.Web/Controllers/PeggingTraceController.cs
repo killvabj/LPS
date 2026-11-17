@@ -89,7 +89,44 @@ public class PeggingTraceController : ControllerBase
     }
 
     /// <summary>
-    /// 按订单查询Pegging分配
+    /// 筛选后总数（**R2.1，11-14 4号位件**，形状 B）：`GET /api/pegging-trace/count?<与列表完全相同的筛选参数>`
+    /// ⇒ `{ total }`。与列表**同一 WHERE 文本、同一数据范围**；前端零改动（多发一次并发请求即可）。
+    /// </summary>
+    [HttpGet("count")]
+    public async Task<ApiResponse<PeggingTraceCountDto>> Count(
+        [FromQuery] int planVersionId,
+        [FromQuery] string? materialCode = null,
+        [FromQuery] string? supplyType = null,
+        [FromQuery] string? commitmentStatus = null,
+        [FromQuery] string? orderNo = null,
+        [FromQuery] string? supplyDocumentNo = null,
+        [FromQuery] long? rootOrderId = null,
+        CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            var scope = await _dataScopeService.ResolveScopeAsync(GetCurrentUserId(), cancellationToken);
+            var allowedFactories = scope.GetValues(DataScopeTypes.Factory);
+
+            var total = await _service.CountAsync(
+                planVersionId, materialCode, supplyType, commitmentStatus,
+                orderNo, supplyDocumentNo, rootOrderId, cancellationToken, allowedFactories);
+
+            return ApiResponse<PeggingTraceCountDto>.Success(new PeggingTraceCountDto { Total = total });
+        }
+        catch (ArgumentException ex)
+        {
+            return ApiResponse<PeggingTraceCountDto>.Fail(400, ex.Message);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to count pegging trace");
+            return ApiResponse<PeggingTraceCountDto>.Fail(500, $"Query failed: {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// 按订单查询Pegging分配（11-14：补数据范围收窄，同列表单源——此前按 orderId 可绕 Scope）。
     /// </summary>
     [HttpGet("order/{orderId:long}")]
     public async Task<ApiResponse<List<PeggingTraceDto>>> QueryByOrder(
@@ -99,7 +136,10 @@ public class PeggingTraceController : ControllerBase
     {
         try
         {
-            var result = await _service.QueryByOrderAsync(planVersionId, orderId, cancellationToken);
+            var scope = await _dataScopeService.ResolveScopeAsync(GetCurrentUserId(), cancellationToken);
+            var allowedFactories = scope.GetValues(DataScopeTypes.Factory);
+
+            var result = await _service.QueryByOrderAsync(planVersionId, orderId, cancellationToken, allowedFactories);
             return ApiResponse<List<PeggingTraceDto>>.Success(result);
         }
         catch (ArgumentException ex)
@@ -114,7 +154,8 @@ public class PeggingTraceController : ControllerBase
     }
 
     /// <summary>
-    /// 查询Pegging Trace汇总
+    /// 查询Pegging Trace汇总（**R2.4，11-14 裁定：收进数据范围**——与列表/计数同谓词，
+    /// 受限账号不再看到全厂总数；前端"当前计划版本的全部笔数"文案改"当前账号可见笔数"）。
     /// </summary>
     [HttpGet("summary")]
     public async Task<ApiResponse<PeggingTraceSummaryDto>> GetSummary(
@@ -123,7 +164,10 @@ public class PeggingTraceController : ControllerBase
     {
         try
         {
-            var result = await _service.GetSummaryAsync(planVersionId, cancellationToken);
+            var scope = await _dataScopeService.ResolveScopeAsync(GetCurrentUserId(), cancellationToken);
+            var allowedFactories = scope.GetValues(DataScopeTypes.Factory);
+
+            var result = await _service.GetSummaryAsync(planVersionId, cancellationToken, allowedFactories);
             return ApiResponse<PeggingTraceSummaryDto>.Success(result);
         }
         catch (ArgumentException ex)

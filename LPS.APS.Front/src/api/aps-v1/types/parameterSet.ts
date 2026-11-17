@@ -72,3 +72,84 @@ export interface ParameterSetDetailDto {
   version: ParameterSetVersion | null
   history: ParameterSetVersionHistoryDto[]
 }
+
+/* ================= 一版一行列表源（2026-11-11，3号位 扩围加函） ================= */
+
+/**
+ * 参数集「主子表联查·一版一行」行（后端 `ParameterSetVersionRowDto`）
+ *
+ * ⚠️ 2026-11-11（3号位《三族列表改主子表联查一版一行·新增三族 versions 契约变更协调件·扩围加函》）：
+ *   旧端点 `GET /parameter-sets` 用 `OUTER APPLY TOP1 ORDER BY Id DESC` 取状态 ⇒
+ *   同族「已发布生效版 + 新建草稿」并存时，**状态被草稿覆盖**（与规则集同因）。
+ *   新端点 `GET /parameter-sets/versions` 每主表 N 个版本 ⇒ N 行，各版本状态独立可读。
+ */
+export interface ParameterSetVersionRowDto {
+  /** 主表 Id */
+  parameterSetId: number
+  /** 主表编码 */
+  parameterSetCode: string
+  /** 主表名称 */
+  parameterSetName: string
+  /** 主表说明 */
+  description?: string | null
+  /** 主表启停（与版本状态是两件事） */
+  isActive?: boolean | null
+  /** 主表建档时间 */
+  parameterSetCreatedAt?: string | null
+  /** 版本 Id（发布 / 停用 / 校验 / 保存端点的键） */
+  versionId: number
+  /** 版本码（如 `PS-PROD-V1.0`） */
+  versionCode: string
+  /** **版本真实状态**（DRAFT/SUBMITTED/APPROVED/PUBLISHED/DISABLED/ARCHIVED） */
+  status: string
+  /** 同族默认版本标记 */
+  isDefault?: boolean
+  /** 生效起（发布时后端写入的发布时间；未发布 = 空） */
+  effectiveFrom?: string | null
+  /** 生效止（停用时后端写入的停用时刻；已发布未停用 = 空） */
+  effectiveTo?: string | null
+  /** 发布时间 */
+  publishedAt?: string | null
+  /** 发布人 */
+  publishedBy?: string | null
+  /** 版本建档时间 */
+  createdAt?: string | null
+}
+
+/**
+ * 前端参数集列表行（**一版一行**）
+ *
+ * 行来源两处：① 新端点版本行（每版本一行，状态真实）② 旧端点里「一条版本都没有」的主表行。
+ * ②不可省：新端点是 INNER JOIN，**无版本的主表不会出现在其中**
+ * （dev 实测 892 个参数集主表里只有 16 个有版本）⇒ 纯切新端点会让这些主表
+ * 连同「未配版本」筛选与「删除参数集」入口一起消失 ⇒ 功能回退。
+ */
+export interface ParameterSetListRowDto {
+  /** 行唯一键：版本行 = `v{versionId}`；无版本主表行 = `n{parameterSetId}` */
+  rowKey: string
+  parameterSetId: number
+  parameterSetCode: string
+  parameterSetName: string
+  /** 主表说明 */
+  description?: string
+  /** 主表启停 */
+  isActive: boolean
+  /** 建档时间（主表或版本，取可得的那个） */
+  createdAt: string
+  /** 该行是否有版本 */
+  hasVersion: boolean
+  /** 版本 Id（仅版本行） */
+  versionId?: number
+  /** 版本码（仅版本行） */
+  versionCode?: string
+  /** 版本真实状态（仅版本行） */
+  versionStatus?: RuleStatus
+  /** 本参数集「最新已发布」版本码（主表级副信息） */
+  currentVersionCode?: string
+  /** 本参数集当前草稿版本码（主表级副信息） */
+  draftVersionCode?: string
+  /** 最近变更（主表级；来自版本备注） */
+  lastChangeReason?: string
+  /** 发布时间（版本行 = 该版本发布时间；无版本行 = 主表最近一次发布时间） */
+  publishedAt?: string
+}

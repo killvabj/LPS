@@ -198,6 +198,10 @@ public class FrozenStrategySnapshotProvider : IFrozenStrategySnapshotProvider
             // ⚠ 语义与六块**刻意不同**，见 DeserializeStageHandoffWaitRules 方法注释（缺块 = 无规则，不是装载失败）。
             StageHandoffWaitRules = DeserializeStageHandoffWaitRules(parameterSetVersion),
 
+            // 跨厂LT 标准参数（准入 C-1~C-3，0号位 2026-11-16 准）：独立顶层子块，**不属六块**。
+            // 语义与六块**刻意不同**（同 StageHandoffWaitRules）：缺块 = 无规则 = 跨厂LT 缺失（不建链），不是装载失败。
+            CrossFactoryLeadTimeRules = DeserializeCrossFactoryLeadTimeRules(parameterSetVersion),
+
             // ⑧ 批量策略 Batch Policy（2026-10-17 装载侧表直读切换；PM 2026-10-15 §T-1038）：
             //   **本字段不再由本 Provider 填充** —— 发布侧自 2026-10-15 起停止向
             //   `ParameterSetVersion.ContentSnapshotJson.BatchPolicy` 注入，Batch 的现时唯一治理源
@@ -400,6 +404,57 @@ public class FrozenStrategySnapshotProvider : IFrozenStrategySnapshotProvider
         {
             throw new InvalidOperationException(
                 $"参数集版本 {version.Id} 的 ContentSnapshotJson 格式无效，StageHandoffWaitRules 子块装载失败", ex);
+        }
+    }
+
+    /// <summary>跨厂LT 标准参数顶层子块名（准入 C-1~C-3，0号位 2026-11-16 准；唯一物理路径 <c>$.CrossFactoryLeadTimeRules</c>）。</summary>
+    internal const string CrossFactoryLeadTimeRulesBlockName = "CrossFactoryLeadTimeRules";
+
+    /// <summary>
+    /// 从 <c>ParameterSetVersion.ContentSnapshotJson</c> 反序列化**顶层**跨厂LT 标准参数子块
+    /// （准入 C-1~C-3；唯一物理路径 <c>$.CrossFactoryLeadTimeRules</c>，**非** <c>$.SolverStrategy.CrossFactoryLeadTimeRules</c>）。
+    ///
+    /// **为什么不复用 <see cref="DeserializeParameterSetBlock{TBlock}"/>（禁止合并）**：
+    ///   语义与 StageHandoffWaitRules **刻意相同**（C-2「缺块 = 无规则」，非六块 P0-02 fail-fast）——
+    ///   缺键 / 显式 null ⇒ **空列表 = 无跨厂LT 标准参数**（跨厂LT 缺失、不建链）；
+    ///   但**空数组 <c>[]</c> 不属于「无源」**——恒为「配了但零行」非法形态，装载期 fail-closed（C9 同裁）；
+    ///   现网绝大多数 PSV 无此块 ⇒ 套六块写法会让几乎所有 PSV 装载失败。
+    /// **JSON 损坏仍抛**（数据事故不静默降级为「合法缺配」）。
+    /// 装载侧**不筛 <c>IsActive</c>、不按厂/产品族裁剪**：全量原样透传；匹配口径（IsActive==true + 工厂对/产品族）
+    /// 归消费侧；装载侧先筛会让「规则存在但未命中」与「规则不存在」重新同形。
+    /// </summary>
+    private static List<CrossFactoryLeadTimeRule> DeserializeCrossFactoryLeadTimeRules(
+        LPS.APS.Core.Entities.APS.ParameterSetVersion version)
+    {
+        // 整个 ContentSnapshotJson 缺失：六块 fail-fast 已先拦截，本分支仅为防御性收敛（按「无源」处理）。
+        if (string.IsNullOrWhiteSpace(version.ContentSnapshotJson))
+        {
+            return [];
+        }
+
+        try
+        {
+            using var doc = JsonDocument.Parse(version.ContentSnapshotJson);
+            if (!doc.RootElement.TryGetProperty(CrossFactoryLeadTimeRulesBlockName, out var blockElement)
+                || blockElement.ValueKind is JsonValueKind.Null or JsonValueKind.Undefined)
+            {
+                return []; // 无源不阻断（同 StageHandoffWaitRules）：缺键 / 显式 null ⇒ 无跨厂LT 标准参数
+            }
+
+            if (blockElement.ValueKind == JsonValueKind.Array && blockElement.GetArrayLength() == 0)
+            {
+                throw new InvalidOperationException(
+                    $"CROSS_FACTORY_LT_BLOCK_EMPTY：参数集版本 {version.Id} 的 " +
+                    $"{CrossFactoryLeadTimeRulesBlockName} 子块存在但为零行数组（`[]`）。" +
+                    "空数组是「已配置但无任何规则」的非法形态——若本版本不使用该块，请删除该键（缺键或显式 null 均表示未配置，正常放行）。");
+            }
+
+            return blockElement.Deserialize<List<CrossFactoryLeadTimeRule>>(JsonOptions) ?? [];
+        }
+        catch (JsonException ex)
+        {
+            throw new InvalidOperationException(
+                $"参数集版本 {version.Id} 的 ContentSnapshotJson 格式无效，CrossFactoryLeadTimeRules 子块装载失败", ex);
         }
     }
 

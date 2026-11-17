@@ -9,7 +9,11 @@
  * 验收：P1-7（审核报告第 11 节）
  *
  * 接口路径（与 5 号位 Controller 一致）：
- *  - GET    /api/procurement-manual-eta                          列表（Query 筛选）
+ *  - GET    /api/procurement-manual-eta                          列表（Query 筛选，含 bucket=overdue|dueSoon）
+ *  - GET    /api/procurement-manual-eta/summary                  指标条五数聚合（11-13 落码，回带日界）
+ *  - GET    /api/procurement-manual-eta/facets                   筛选候选（11-13 落码）
+ *  - GET    /api/procurement-manual-eta/materials                抽屉物料候选（11-14 落码，可选 poNo/lineNo 收窄）
+ *  - GET    /api/procurement-manual-eta/supply-combos           订单行供货组合（物料 × 存储地点**成对**，11-14 落码 r14214~r14218）
  *  - GET    /api/procurement-manual-eta/{poNo}/{lineNo}          单条
  *  - POST   /api/procurement-manual-eta                          Upsert
  *  - DELETE /api/procurement-manual-eta/{poNo}/{lineNo}?actor=   取消（isActive=false）
@@ -27,12 +31,17 @@
 import { apsHttp, APS_USE_MOCK } from './http'
 import type {
   ManualEtaDto,
+  ManualEtaFacets,
   ManualEtaListFilter,
+  ManualEtaSummary,
+  ManualEtaSupplyCombo,
   ManualEtaUpsertInput,
   ManualEtaCancelInput,
   ManualEtaPageResult,
+  SupplyFactTraceRow,
   WarehouseOption
 } from './types/manualEta'
+import type { MaterialLookupItem } from './types/material'
 
 const iso = (ms: number) => new Date(Date.now() + ms).toISOString()
 const ACTOR_MOCK = 'mock-pmc'
@@ -159,9 +168,36 @@ function applyFilter(list: ManualEtaDto[], filter?: ManualEtaListFilter): Manual
   if (!filter) return [...list]
   let result = [...list]
   if (filter.activeOnly) result = result.filter((x) => x.isActive)
+  if (filter.cancelledOnly) result = result.filter((x) => !x.isActive)
   if (filter.poNos?.length) result = result.filter((x) => filter.poNos!.includes(x.poNo))
   if (filter.materialIds?.length)
     result = result.filter((x) => filter.materialIds!.includes(x.materialId))
+  if (filter.materialCodes?.length)
+    result = result.filter((x) => filter.materialCodes!.includes(x.materialCode))
+  if (filter.receivingWarehouses?.length)
+    result = result.filter((x) => filter.receivingWarehouses!.includes(x.receivingWarehouse ?? ''))
+  // 到货时间边界：与真实端点同一口径（闭区间，含两端）
+  if (filter.etaAfter)
+    result = result.filter(
+      (x) => new Date(x.manualEta).getTime() >= new Date(filter.etaAfter!).getTime()
+    )
+  if (filter.etaBefore)
+    result = result.filter(
+      (x) => new Date(x.manualEta).getTime() <= new Date(filter.etaBefore!).getTime()
+    )
+  // 时间桶：mock 无服务器日界，按本机墙钟算与后端同一口径（overdue 严格早于今日00:00；dueSoon 半开 [今日00:00, +7d)）
+  const bucket = filter.bucket
+  if (bucket) {
+    const day = new Date()
+    day.setHours(0, 0, 0, 0)
+    const soon = new Date(day)
+    soon.setDate(soon.getDate() + 7)
+    result = result.filter((x) => {
+      if (!x.isActive) return false
+      const t = new Date(x.manualEta).getTime()
+      return bucket === 'overdue' ? t < day.getTime() : t >= day.getTime() && t < soon.getTime()
+    })
+  }
   return result
 }
 
@@ -185,6 +221,46 @@ function serializeFilter(filter?: ManualEtaListFilter): Record<string, unknown> 
   if (filter?.poNos?.length) out.poNos = filter.poNos.join(',')
   if (filter?.materialIds?.length) out.materialIds = filter.materialIds.join(',')
   if (filter?.materialCodes?.length) out.materialCodes = filter.materialCodes.join(',')
+  // 11-12 工厂视角改版：接上后端**早就支持、但前端一直没用**的三个筛选参数
+  //  - receivingWarehouses（收货仓库）/ etaAfter / etaBefore（到货时间区间）
+  //  ⇒ 零后端改动就能让计划员按「哪批货、到哪个仓、什么时候到」挑单
+  if (filter?.receivingWarehouses?.length)
+    out.receivingWarehouses = filter.receivingWarehouses.join(',')
+  if (filter?.etaAfter) out.etaAfter = filter.etaAfter
+  if (filter?.etaBefore) out.etaBefore = filter.etaBefore
+  // 11-13：5号位补「仅已取消」参数（cancelledOnly，与 activeOnly 互斥、cancelledOnly 优先）
+  if (filter?.cancelledOnly) out.cancelledOnly = true
+  // 11-13：5号位补排序参数（白名单 manualEta/updatedAt/poNo/materialCode；不传=原排序）
+  //  ⚠️ 非法值后端真 400 ⇒ 前端只允许白名单值下发
+  if (filter?.sortBy) out.sortBy = filter.sortBy
+  if (filter?.sortDir) out.sortDir = filter.sortDir
+  // 11-14：5号位 R6 补时间桶参数（SVN r14181～r14185 批次；桶判定式在 r14183 的 Repository 件）——
+  //  日界由服务器 GETDATE() 说了算，与 /summary 的两个桶计数同一段 WHERE 文本 ⇒ 指标条数字与列表行数必然相等
+  //  ⚠️ 非法值后端真 400（"非法 bucket"）；与 cancelledOnly 同传后端也真 400 ⇒ 前端不同时传
+  //  ⚠️ 取值白名单现封 {overdue, dueSoon}（5号位 11-14 复函 Q4）——扩桶须先书面知会 + 前端白名单同步
+  //  ⚠️ 口径（5号位 11-14 复函 Q2）：bucket 与 etaAfter/etaBefore 同传 = **保留 AND 交集、不 400**，
+  //    但**分类点击态不得叠时间窗**——指标条的桶数出自 /summary（不叠列表时间窗），叠了就会与列表对不上；
+  //    将来页面若要「桶上叠窗」，必须同时显示两个条件。
+  if (filter?.bucket) out.bucket = filter.bucket
+  // 11-14：5号位 v2.0 R2 取乙 → 列表可回带 isMatched 标注（后端默认 false，要标注须显式开）
+  if (filter?.withMatched) out.withMatched = true
+  return out
+}
+
+/**
+ * summary 专用序列化（11-13：5号位 `GET /api/procurement-manual-eta/summary`）
+ *  - **不传** activeOnly / cancelledOnly：summary 恒跨两态统计（后端短路状态开关），
+ *    传了也只是被忽略，前端不传以免口径误解
+ *  - **不传** pageIndex / pageSize：summary 返回的是聚合计数，不分页
+ */
+function serializeSummaryFilter(filter?: ManualEtaListFilter): Record<string, unknown> {
+  const out: Record<string, unknown> = {}
+  if (filter?.poNos?.length) out.poNos = filter.poNos.join(',')
+  if (filter?.materialCodes?.length) out.materialCodes = filter.materialCodes.join(',')
+  if (filter?.receivingWarehouses?.length)
+    out.receivingWarehouses = filter.receivingWarehouses.join(',')
+  if (filter?.etaAfter) out.etaAfter = filter.etaAfter
+  if (filter?.etaBefore) out.etaBefore = filter.etaBefore
   return out
 }
 
@@ -203,6 +279,160 @@ export const manualEtaApi = {
     return apsHttp.get<ManualEtaPageResult<ManualEtaDto>>({
       url: '/api/procurement-manual-eta',
       params: serializeFilter(filter)
+    })
+  },
+
+  /**
+   * 指标条五数（11-13：5号位落码 `GET /api/procurement-manual-eta/summary`）
+   *  - 一次请求给全 全部 / 生效中 / 已取消 / 已过期 / 7 天内到期
+   *    （旧口径是 1 列表 + 4 个 countOnly = 5 个请求凑这五个数）
+   *  - WHERE 与列表**同常量单源** ⇒ 指标与列表不可能对不上
+   *  - summary 恒跨两态统计 ⇒ 调用方不要传 activeOnly / cancelledOnly
+   */
+  async summary(filter?: ManualEtaListFilter): Promise<ManualEtaSummary> {
+    if (APS_USE_MOCK) {
+      await new Promise((resolve) => setTimeout(resolve, 120))
+      const rows = applyFilter(MOCK_ETAS, filter)
+      const today = new Date()
+      today.setHours(0, 0, 0, 0)
+      const active = rows.filter((x) => x.isActive)
+      return {
+        allCount: rows.length,
+        activeCount: active.length,
+        cancelledCount: rows.length - active.length,
+        overdueCount: active.filter((x) => new Date(x.manualEta).getTime() < today.getTime())
+          .length,
+        dueSoonCount: active.filter((x) => {
+          const t = new Date(x.manualEta).getTime()
+          const in7 = today.getTime() + 7 * 86400000
+          return t >= today.getTime() && t < in7
+        }).length
+      }
+    }
+    return apsHttp.get<ManualEtaSummary>({
+      url: '/api/procurement-manual-eta/summary',
+      params: serializeSummaryFilter(filter)
+    })
+  },
+
+  /**
+   * 筛选候选 facets（11-13：5号位落码 `GET /api/procurement-manual-eta/facets?search=`）
+   *  - 旧实现靠「拉 pageSize=200 全量扫描自己派生」⇒ 超过 200 条的采购单在下拉里选不到
+   *  - 新实现由后端出本表 distinct 候选（每维 TOP 500 + truncated 标志）
+   *  - 数据源 = 本表（**不是**主数据全集）：候选的意义 = 能筛到记录
+   */
+  async facets(search?: string): Promise<ManualEtaFacets> {
+    if (APS_USE_MOCK) {
+      await new Promise((resolve) => setTimeout(resolve, 120))
+      const term = (search ?? '').trim().toLowerCase()
+      const hit = (s: string) => (term ? s.toLowerCase().includes(term) : true)
+      return {
+        poNos: Array.from(new Set(MOCK_ETAS.map((x) => x.poNo))).filter(hit),
+        materialCodes: Array.from(new Set(MOCK_ETAS.map((x) => x.materialCode))).filter(hit),
+        truncated: false
+      }
+    }
+    return apsHttp.get<ManualEtaFacets>({
+      url: '/api/procurement-manual-eta/facets',
+      params: { search: search ?? '' }
+    })
+  },
+
+  /**
+   * 抽屉「选物料」候选：远程搜索（11-14 改走**乙端点**）
+   *
+   *  - 端点：`GET /api/procurement-manual-eta/materials?search=&poNo=&lineNo=&limit=`
+   *    （5号位 11-14 落码，SVN r14206～r14208；挂**本域** `aps.manual_eta.view`
+   *    ⇒ 本页不再依赖策略域的 `aps.setup.view`，3号位 11-13 裁乙的权限耦合已解）
+   *  - 返回 `MaterialLookupItem`（masterId/code/name/spec/uom/isActive），与共用端点**同结构**
+   *    ⇒ 前端接口层切换零形状变化。
+   *  - `search` **可空**（空 = 不按关键字过滤）：
+   *    dev 11-14 实测 `?search=&poNo=CC44390&limit=50` → 6 行（带中文名 + 规格 + 单位）；
+   *    `?poNo=CC44390&lineNo=3` → 1 行；`?poNo=P01`（种子 PO）→ **200 + 0 行**（不报错）；
+   *    `?search=ASSY` → 按码升序；`?search=铝&poNo=CC44390` → 5 行（search 与 poNo 是 AND）。
+   *  - `poNo` 传 = 收窄到该采购订单的**物料集合**（供给事实 ∪ ERP 收货视图，按 materialId 去重）；
+   *    `lineNo` 传 = 再收窄到该行。
+   *    ⚠️ 端点**不按工厂范围裁剪**（5号位按我方 R1.1 落码）⇒ 受限账号不会被挡掉合法候选。
+   *  - 查无 = **200 + 空集合**（不 400/404）⇒ 收窄**不阻断录入**，由前端负责逐级放宽。
+   *  - ⚠️ 本函数**不会**在「无关键字、无 poNo」时去要全量物料（那等于把全库物料拉回来列全）：
+   *    这种情况下直接返空，由视图提示用户去搜索。
+   */
+  async searchMaterials(
+    search: string,
+    limit = 50,
+    scope?: { poNo?: string; lineNo?: number }
+  ): Promise<MaterialLookupItem[]> {
+    const q = String(search ?? '').trim()
+    const poNo = String(scope?.poNo ?? '').trim()
+    const lineNo = Number(scope?.lineNo)
+    if (!q && !poNo) return []
+    const params: Record<string, unknown> = { search: q, limit }
+    if (poNo) params.poNo = poNo
+    if (poNo && Number.isFinite(lineNo) && lineNo > 0) params.lineNo = lineNo
+    return apsHttp.get<MaterialLookupItem[]>({
+      url: '/api/procurement-manual-eta/materials',
+      params,
+      silent: true
+    })
+  },
+
+  /**
+   * 订单行供货组合（**11-14 接 5号位 v2.0 R1 落码，SVN r14214～r14218**）
+   *  - 端点：`GET /api/procurement-manual-eta/supply-combos?poNo=&lineNo=&limit=`
+   *    （挂本域 `aps.manual_eta.view`；`poNo` **必填**——缺 ⇒ 后端 400 + 中文原因；
+   *      `lineNo` 可选；`limit` 默认 200、钳 [1,500]）
+   *  - 一行 = 供给事实里一条 **(物料 × 存储地点)** 组合，**成对**给出
+   *  - ⚠️ 为什么抽屉的「按订单收窄档」必须用它：人工到货时间是**对供给事实的覆盖**，
+   *    覆盖键 `(PONo, LineNo, MaterialId, ReceivingWarehouse)` ≡ 供给事实
+   *    `(SourceDocumentNo, SourceDocumentLineNo, MaterialId, StorageCode)`
+   *    （@see AvailableTimeCalculator.cs:63-73,105-107）⇒ 物料与仓库各选各的必然拼不中，
+   *    这条到货时间会**静默不生效**（不报错、不提示）。
+   *  - 只含**能真正生效**的组合（与装载侧 TimedSupplyFactLoader 同一资格谓词：
+   *    有效 + 数量>0 + 五类采购在途）；行号非整数的事实不返回（覆盖键要求 int 行号）。
+   *  - 查无 = **200 + 空数组**（收窄不阻断录入）。
+   */
+  async searchSupplyCombos(
+    poNo: string,
+    lineNo?: number,
+    limit = 200
+  ): Promise<ManualEtaSupplyCombo[]> {
+    const po = String(poNo ?? '').trim()
+    if (!po) return []
+    const params: Record<string, unknown> = { poNo: po, limit }
+    const ln = Number(lineNo)
+    if (Number.isFinite(ln) && ln > 0) params.lineNo = ln
+    return apsHttp.get<ManualEtaSupplyCombo[]>({
+      url: '/api/procurement-manual-eta/supply-combos',
+      params,
+      silent: true
+    })
+  },
+
+  /**
+   * 过渡配对源：供货事实原始追溯（**`supply-combos` 未部署时用**）
+   *
+   *  - 端点：`GET /api/supply-fact-trace?sourceDocumentNo=&activeOnly=true&take=`
+   *    （5号位 `SupplyFactTraceController`，挂 `aps.plan.view` ⇒ **跨域**；
+   *      结果按**账号可见工厂范围**裁剪 ⇒ 可能不全）
+   *  - 为什么能用它配对：追溯查询第一段 `SELECT … StorageCode AS WarehouseCode FROM SupplyFact_Pipeline`
+   *    （`SupplyFactTraceRepository.cs:39-45`）⇒ 取到的 `warehouseCode` **就是**供给事实的存储地点，
+   *    与排产侧装载器（`TimedSupplyFactLoader`）读的是**同一张表同一列**
+   *    ⇒ 配出来的 (物料 × 存储地点) 与将来 `supply-combos` 的口径一致。
+   *  - ⚠️ 只在 `supply-combos` 取不到时启用；该端点部署后应**删掉这一档**（正式口径只有一条路）。
+   */
+  async searchSupplyCombosFromTrace(
+    poNo: string,
+    lineNo?: number
+  ): Promise<SupplyFactTraceRow[]> {
+    const po = String(poNo ?? '').trim()
+    if (!po) return []
+    const params: Record<string, unknown> = { sourceDocumentNo: po, activeOnly: true, take: 500 }
+    const ln = Number(lineNo)
+    if (Number.isFinite(ln) && ln > 0) params.take = 500
+    return apsHttp.get<SupplyFactTraceRow[]>({
+      url: '/api/supply-fact-trace',
+      params,
+      silent: true
     })
   },
 

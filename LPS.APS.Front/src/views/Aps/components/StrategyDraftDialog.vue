@@ -7,8 +7,8 @@
     - versionCode        必填
     - ruleSetVersionId   必填，int —— 通过 RuleSet → RuleSetVersion 双级 ElSelect 选择
     - parameterSetVersionId 必填，int —— 通过 ParameterSet → ParameterSetVersion 双级 ElSelect 选择
-    - effectiveFrom      可选
-    - effectiveTo        可选
+    - effectiveFrom      可选（预设生效起；留空 = 发布时后端自动记发布时间）
+    - effectiveTo        可选（预设生效止；留空 = 停用时后端自动记停用时刻）
     - IsDefault 不在本表单内：Create 强制 false、Update 冻结既有值（C-7），
       默认只能对 PUBLISHED 版本在列表点「设为默认」显式置位
 
@@ -37,6 +37,20 @@
   10-15（用户报「选参数集后版本接口报错」）：PS-PROD(1305) 的 versions 端点稳定 37s
     （后端 SELECT * 读大 LOB，见 listParameterSetVersions 注释与致 3号位 函），
     30s 默认超时下必然报 timeout —— 该调用单独放宽到 60s。四处加载失败提示一并去 axios 原文。
+
+  11-11（3号位 甲回执「补回填已落码」）：后端 PUT 读改写回填 EffectiveFrom/EffectiveTo，
+    编辑态改窗口会被后端丢弃（静默无效）⇒ 编辑态禁用两个日期选择器并加说明，
+    窗口只能在新建时确定。
+  11-11（0号位/PM 再裁定，经 3号位《生效窗写入口径升级_发布写From停用写To_更正乙裁_回执》）：
+    生效窗改为**生命周期窗口** —— 发布时后端写 EffectiveFrom（发布时间）、
+    停用时写 EffectiveTo（停用时刻）；3号位 10-11 的「NULL = 常开窗」口径作废。
+    ⇒ 留空不再是「不限 / 永久」，而是「发布时自动记发布时间 / 停用时自动记停用时刻」。
+
+  11-11（用户拍板）：策略包草稿的「规则集版本 / 参数集版本」下拉**只列已发布版本**——
+    发布策略包版本时后端校验绑定版本必须 PUBLISHED（P0-06 引用合法性），
+    把草稿/已停用版摆出来只是让人选一个发不出去的东西。
+    例外：编辑态当前绑的那一版若不是已发布（当年绑了草稿版、或后来被停用），
+    仍留在列表里并显示真实状态，避免保存时把它悄悄解绑。
 -->
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref, watch } from 'vue'
@@ -63,6 +77,7 @@ import {
   type StrategyVersionDraftInput,
   type StrategyVersionStatus
 } from '@/api/aps-v1'
+import { formatEffectiveFrom, formatEffectiveTo } from '@/utils/effectiveWindow'
 
 const props = defineProps<{
   visible: boolean
@@ -142,9 +157,14 @@ async function loadRuleSetVersions(ruleSetId: number | undefined): Promise<void>
   ruleSetVersionsLoading.value = true
   try {
     const list: RuleSetVersionDto[] = await strategyProfileApi.listRuleSetVersions(ruleSetId)
-    ruleSetVersions.value = list
+    // 11-11：下拉只列已发布版本——策略包版本发布时后端校验绑定版本必须 PUBLISHED（P0-06），
+    // 把草稿/已停用版摆出来只是让人选一个发不出去的东西。
+    // 例外：编辑态当前绑的那一版若不是已发布（当年绑了草稿版、或后来被停用），
+    // 仍留在列表里并显示真实状态，避免保存时把它悄悄解绑。
+    ruleSetVersions.value = list.filter((v) => v.status === 'PUBLISHED' || v.id === prev)
     // 已选版本仍属该主表则保留（编辑态回填走这条）；否则清空——版本必须与主表匹配，否则 FK 违反
-    form.ruleSetVersionId = prev != null && list.some((v) => v.id === prev) ? prev : undefined
+    form.ruleSetVersionId =
+      prev != null && ruleSetVersions.value.some((v) => v.id === prev) ? prev : undefined
   } catch {
     ElMessage.error('加载规则集版本失败，请稍后重试')
     form.ruleSetVersionId = undefined
@@ -180,8 +200,11 @@ async function loadParameterSetVersions(parameterSetId: number | undefined): Pro
   try {
     const list: ParameterSetVersionDto[] =
       await strategyProfileApi.listParameterSetVersions(parameterSetId)
-    parameterSetVersions.value = list
-    form.parameterSetVersionId = prev != null && list.some((v) => v.id === prev) ? prev : undefined
+    // 同 loadRuleSetVersions：只列已发布版本（发布策略包版本时后端要求绑定版本为 PUBLISHED），
+    // 例外保留当前绑的那一版，避免编辑时把它悄悄解绑。
+    parameterSetVersions.value = list.filter((v) => v.status === 'PUBLISHED' || v.id === prev)
+    form.parameterSetVersionId =
+      prev != null && parameterSetVersions.value.some((v) => v.id === prev) ? prev : undefined
   } catch {
     ElMessage.error('加载参数集版本失败，请稍后重试；若一直失败，请联系系统管理员')
     form.parameterSetVersionId = undefined
@@ -242,6 +265,18 @@ watch(
   },
   { immediate: true }
 )
+
+/** 当前选中的两个版本里，哪些还不是「已发布」（发布策略版本时会被后端拦） */
+const unpublishedSelection = computed<string[]>(() => {
+  const out: string[] = []
+  const rv = ruleSetVersions.value.find((v) => v.id === form.ruleSetVersionId)
+  if (rv && rv.status !== 'PUBLISHED')
+    out.push(`规则集版本「${rv.versionCode}」是${versionStatusLabel[rv.status] ?? rv.status}`)
+  const pv = parameterSetVersions.value.find((v) => v.id === form.parameterSetVersionId)
+  if (pv && pv.status !== 'PUBLISHED')
+    out.push(`参数集版本「${pv.versionCode}」是${versionStatusLabel[pv.status] ?? pv.status}`)
+  return out
+})
 
 const rules = computed(() => ({
   versionCode: [
@@ -333,6 +368,7 @@ async function onSubmit(): Promise<void> {
         <ElSelect
           v-model="form.ruleSetVersionId"
           placeholder="先选规则集再选版本"
+          no-data-text="这个规则集还没有已发布版本，请先到「规则维护」页发布一版"
           filterable
           :loading="ruleSetVersionsLoading"
           :disabled="form.ruleSetId === undefined"
@@ -342,7 +378,11 @@ async function onSubmit(): Promise<void> {
             v-for="v in ruleSetVersions"
             :key="v.id"
             :value="v.id"
-            :label="`${v.versionCode} (${versionStatusLabel[v.status] ?? v.status})`"
+            :label="
+              v.status === 'PUBLISHED'
+                ? v.versionCode
+                : `${v.versionCode}（${versionStatusLabel[v.status] ?? v.status}）`
+            "
           />
         </ElSelect>
       </ElFormItem>
@@ -369,6 +409,7 @@ async function onSubmit(): Promise<void> {
         <ElSelect
           v-model="form.parameterSetVersionId"
           placeholder="先选参数集再选版本"
+          no-data-text="这个参数集还没有已发布版本，请先到「规则维护」页发布一版"
           filterable
           :loading="parameterSetVersionsLoading"
           :disabled="form.parameterSetId === undefined"
@@ -378,32 +419,66 @@ async function onSubmit(): Promise<void> {
             v-for="v in parameterSetVersions"
             :key="v.id"
             :value="v.id"
-            :label="`${v.versionCode} (${versionStatusLabel[v.status] ?? v.status})`"
+            :label="
+              v.status === 'PUBLISHED'
+                ? v.versionCode
+                : `${v.versionCode}（${versionStatusLabel[v.status] ?? v.status}）`
+            "
           />
         </ElSelect>
       </ElFormItem>
 
-      <ElFormItem label="生效起始">
+      <ElFormItem label="生效起">
         <ElDatePicker
+          v-if="mode === 'create'"
           v-model="form.effectiveFrom"
           type="datetime"
-          placeholder="可选"
+          placeholder="可选（留空 = 发布时自动记发布时间）"
           format="YYYY-MM-DD HH:mm:ss"
           value-format="YYYY-MM-DDTHH:mm:ss[Z]"
           style="width: 100%"
         />
+        <span v-else class="d-val">{{ formatEffectiveFrom(props.version?.effectiveFrom) }}</span>
       </ElFormItem>
 
-      <ElFormItem label="生效截止">
+      <ElFormItem label="生效止">
         <ElDatePicker
+          v-if="mode === 'create'"
           v-model="form.effectiveTo"
           type="datetime"
-          placeholder="可选"
+          placeholder="可选（留空 = 停用时自动记停用时刻）"
           format="YYYY-MM-DD HH:mm:ss"
           value-format="YYYY-MM-DDTHH:mm:ss[Z]"
           style="width: 100%"
         />
+        <span v-else class="d-val">{{
+          formatEffectiveTo(props.version?.effectiveTo, props.version?.status)
+        }}</span>
       </ElFormItem>
+
+      <!-- 11-11（3号位 甲回执）：PUT 读改写回填既有生效窗 ⇒ 编辑态改了也不落库。
+           与其让人填了以为改成功，不如直接只读并说清楚。窗口只能新建时定。 -->
+      <ElAlert v-if="mode === 'edit'" type="info" :closable="false" show-icon class="d-alert">
+        <template #title>生效窗口在版本创建后不可更改</template>
+        生效窗 =
+        这一版的生命周期：发布时后端自动写入「生效起」（发布时间），停用时自动写入「生效止」（停用时刻）。保存草稿时后端会保留这个版本原有的窗口，此处改不动；要换窗口请新建一个版本。
+      </ElAlert>
+
+      <!-- 绑定未发布版本：保存能过，但发布策略版本时会被后端拦下（P0-06 引用合法性）
+           ⇒ 提前说清楚，别让用户到发布那一步才发现 -->
+      <ElAlert
+        v-if="unpublishedSelection.length > 0"
+        type="warning"
+        :closable="false"
+        show-icon
+        class="d-alert"
+      >
+        <template #title>所选版本尚未发布</template>
+        {{
+          unpublishedSelection.join('；')
+        }}。下拉里一般只列已发布版本，出现这一条说明它是在你选完之后才被停用或退回草稿的。
+        可以先存草稿，但发布策略包版本前必须先把它恢复成「已发布」，否则发布校验会被拦下（绑定版本必须为已发布）。
+      </ElAlert>
 
       <ElAlert type="info" :closable="false" show-icon class="d-alert">
         <template #title>状态流转</template>

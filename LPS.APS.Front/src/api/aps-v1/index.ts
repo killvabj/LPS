@@ -46,8 +46,12 @@ export {
   conditionValueText,
   conditionText,
   sortFieldText,
-  parsePrioritySegments
+  parsePrioritySegments,
+  conditionGroupLabel,
+  conditionGroupText,
+  segmentConditionView
 } from './prioritySegment'
+export type { SegmentConditionView } from './prioritySegment'
 export {
   flattenBlocks,
   applyEdit,
@@ -115,13 +119,13 @@ export { manualEtaApi, mockManualEtaActor } from './manualEta'
 export { demandProtectionApi, mockDpActor } from './demandProtection'
 export { domainApi, MOCK_DOMAIN_FIXTURES, EndpointUnavailableError } from './domain'
 export { rbacApi } from './rbac'
-export { strategyProfileApi } from './strategyProfile'
+export { strategyProfileApi, mergeStrategyProfileListRows } from './strategyProfile'
 export { setupApi } from './setup'
 export { auditApi } from './audit'
 export { opmApi, MOCK_OPM_MATERIAL_ID } from './opm'
 export { materialLookupApi } from './materialLookup'
 export { departmentLookupApi } from './departmentLookup'
-export type { DepartmentLookupItem } from './departmentLookup'
+export type { DepartmentLookupItem, ProductionDepartmentItem } from './departmentLookup'
 export { resourceLookupApi } from './resourceLookup'
 export type { ResourceLookupItem } from './resourceLookup'
 export { resourceCalendarApi } from './resourceCalendar'

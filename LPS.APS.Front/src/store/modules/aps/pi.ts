@@ -10,13 +10,18 @@
  *  - `list`         ← GET /api/pi-position（服务端分页；端点不返 total，「共 N 条」只能用 summary.totalPositions）
  *  - `detailRows`   ← GET /api/pi-position/{piNo}（单 PI 全部位置行）
  *
- * 计划版本必填（5号位 2026-10-17 回执 §五）：由用户在页面上显式选择，
- * 默认取 `GET /api/schedule/versions` 的第一条（最新），不自动猜 ACTIVE。
+ * 计划版本必填（5号位 2026-10-17 回执 §五）：由用户在页面上显式选择。
+ *
+ * 2026-11-12 默认版本规则改了：原先取 `GET /api/schedule/versions` 的第一条（最新）——
+ * 而「最新」常常是我们自己跑测试留下的 `FAILED` 版本（dev 实测 id=999502 SYN-PLAN…，
+ * `totalPositions = 0`）⇒ 计划员一进页面看到的是空表，像是系统坏了。
+ * 现与订单页统一走 `pickDefaultVersion()`（已生效 → 算完待确认 → 其它非失败 → 兜底第一条）。
  */
 
 import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
 import { ApiError, piApi, scheduleApi } from '@/api/aps-v1'
+import { pickDefaultVersion } from './order'
 import type {
   PiPositionDto,
   PiPositionQuery,
@@ -90,7 +95,7 @@ export const usePiStore = defineStore('aps.pi', () => {
     try {
       versions.value = await scheduleApi.getVersions(30)
       if (planVersionId.value == null) {
-        planVersionId.value = versions.value[0]?.id ?? null
+        planVersionId.value = pickDefaultVersion(versions.value)?.id ?? null
       }
     } catch (err) {
       handleError(err)

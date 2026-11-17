@@ -17,12 +17,33 @@ public interface IScheduleRunRepository
     /// <summary>
     /// Run 列表查询（G4：0号位 2026-08-29 裁决——3号位 只读 ScheduleRun 运行事实，封装查询接口给 4号位，不降级）。
     /// 可选按 status / runType 过滤，按 Id 倒序取最新，take 缺省 100、上限 200；
+    /// R1（4号位 2026-11-12 运行与下发页业务范围未生效）新增业务范围过滤：
+    ///   allowedDomains = null ⇒ Global 跳过过滤（全量可见）；空集 ⇒ EXISTS 恒假 ⇒ 无 Domain 维度授权 fail-closed 看不到任何批次；
+    ///   非空 ⇒ 仅批次登记域集合与该用户 Domain 授权交集非空才可见；
+    ///   批次 ExpectedDomainKeysJson 空/缺失 ⇒ 受限用户不可见（Q2 裁定：无登记批次仅 Global 可见）。
     /// 只读冻结列，绝不修改 2号位 运行结果语义（状态回填仍由 2号位 运行收口负责）。
     /// </summary>
     Task<IReadOnlyList<ScheduleRunGov>> GetListAsync(
         int? take = null,
         string? status = null,
         string? runType = null,
+        IReadOnlyList<string>? allowedDomains = null,
+        CancellationToken ct = default);
+
+    /// <summary>
+    /// Run 历史**分页**查询（R4，4号位 2026-11-11 运行与下发页改版：runs 列表分页 + total）。
+    /// 服务端分页：返回 <see cref="ScheduleRunGovPage"/>（items + 过滤后 total），按 [StartedAt] DESC, [Id] DESC 稳定排序。
+    /// R1（4号位 2026-11-12 运行与下发页业务范围未生效）业务范围过滤同 <see cref="GetListAsync"/>；
+    /// 本方法 Total = 受限用户可见的**过滤后全量**（与列表同 WHERE），保证页码/总数对齐（4号位 §三 R1 要求）。
+    /// 与 <see cref="GetListAsync"/> 互补（该端点保留数组形状供既有消费方），本方法供新增分页端点使用。
+    /// skip &gt;= 0、pageSize 缺省 100、上限 200（对齐 MaxTake，防无界查询）；只读冻结列，不改 2号位 运行结果语义。
+    /// </summary>
+    Task<ScheduleRunGovPage> GetPageAsync(
+        int? skip = null,
+        int? pageSize = null,
+        string? status = null,
+        string? runType = null,
+        IReadOnlyList<string>? allowedDomains = null,
         CancellationToken ct = default);
 
     /// <summary>

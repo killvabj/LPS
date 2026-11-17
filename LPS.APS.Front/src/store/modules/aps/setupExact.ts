@@ -150,6 +150,27 @@ export const useSetupExactStore = defineStore('aps.setupExact', () => {
     }
   }
 
+  /**
+   * 切换一条规则的启停（工作簿 #67）。
+   *
+   * 后端只有 PUT（无 PATCH / 启停专用端点），且入参 `IsActive` 默认 `true`
+   * ⇒ 必须把该行**完整**回传：漏字段既会重置其它值，也会把停用规则悄悄复活。
+   * 入参从列表现有行重建（Id-口径照抄），避免界面上再拼一次表单。
+   */
+  async function setRuleActive(rule: SetupRuleDto, active: boolean): Promise<boolean> {
+    return updateRule(rule.id, {
+      ruleSetVersionId: rule.ruleSetVersionId,
+      productionDepartmentId: rule.productionDepartmentId,
+      stageCode: rule.stageCode,
+      operationCode: rule.operationCode,
+      resourceId: rule.resourceId,
+      fromMaterialId: rule.fromMaterialId ?? 0,
+      toMaterialId: rule.toMaterialId ?? 0,
+      setupMinutes: rule.setupMinutes,
+      isActive: active
+    })
+  }
+
   /** 删除 EXACT 规则（需 edit 权限 + DRAFT 状态） */
   async function deleteRule(id: number): Promise<boolean> {
     if (!canWrite.value) {
@@ -213,6 +234,7 @@ export const useSetupExactStore = defineStore('aps.setupExact', () => {
     loadRules,
     createRule,
     updateRule,
+    setRuleActive,
     deleteRule,
     handleError,
     reset

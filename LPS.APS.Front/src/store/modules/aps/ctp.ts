@@ -41,7 +41,14 @@ export const useCtpStore = defineStore('aps.ctp', () => {
   const result = ref<CtpResultDto | null>(null)
   const history = ref<CtpHistoryEntry[]>([])
   const loading = ref(false)
+  /** 错误正文（后端 message 原样；页面再翻成大白话） */
   const error = ref<string | null>(null)
+  /** 错误业务码（501 = 试算能力未接入；页面据此给固定话术，不把内部编号甩给用户） */
+  const errorCode = ref<number | null>(null)
+  /** traceId（排障用，页面只放在次要位置） */
+  const errorTraceId = ref<string | null>(null)
+  /** 本次结果的真实评估时刻（不是渲染时刻；载入历史时也用它） */
+  const evaluatedAt = ref<string | null>(null)
 
   // ===== getters =====
   const hasResult = computed(() => result.value !== null)
@@ -56,17 +63,24 @@ export const useCtpStore = defineStore('aps.ctp', () => {
     if (next) input.value = { ...input.value, ...next }
     loading.value = true
     error.value = null
+    errorCode.value = null
+    errorTraceId.value = null
     try {
       const dto = await ctpApi.evaluate(input.value)
       result.value = dto
+      evaluatedAt.value = new Date().toISOString()
       history.value.unshift({
         id: historySeq++,
         input: { ...input.value },
         result: dto,
-        evaluatedAt: new Date().toISOString()
+        evaluatedAt: evaluatedAt.value
       })
       if (history.value.length > 5) history.value = history.value.slice(0, 5)
     } catch (err) {
+      // 失败时清掉旧结论：否则页面会同时挂着「本次输入的报错」和「上一轮的结论」，
+      // 用户会把旧结论当成这次的答案。旧结果在历史里，载回即可。
+      result.value = null
+      evaluatedAt.value = null
       handleError(err)
     } finally {
       loading.value = false
@@ -76,12 +90,16 @@ export const useCtpStore = defineStore('aps.ctp', () => {
   function loadFromHistory(entry: CtpHistoryEntry): void {
     input.value = { ...entry.input }
     result.value = entry.result
+    evaluatedAt.value = entry.evaluatedAt
   }
 
   function reset(): void {
     input.value = defaultInput()
     result.value = null
     error.value = null
+    errorCode.value = null
+    errorTraceId.value = null
+    evaluatedAt.value = null
   }
 
   function clearHistory(): void {
@@ -90,10 +108,13 @@ export const useCtpStore = defineStore('aps.ctp', () => {
 
   function handleError(err: unknown): void {
     if (err instanceof ApiError) {
-      error.value =
-        `[${err.code}] ${err.message}` + (err.traceId ? ` (traceId=${err.traceId})` : '')
+      error.value = err.message
+      errorCode.value = err.code
+      errorTraceId.value = err.traceId ?? null
     } else {
       error.value = (err as Error)?.message ?? '未知错误'
+      errorCode.value = null
+      errorTraceId.value = null
     }
   }
 
@@ -103,6 +124,9 @@ export const useCtpStore = defineStore('aps.ctp', () => {
     history,
     loading,
     error,
+    errorCode,
+    errorTraceId,
+    evaluatedAt,
     hasResult,
     isOverThreshold,
     evaluate,

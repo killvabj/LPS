@@ -47,7 +47,9 @@ public class ScheduleQueryService : IScheduleQueryService
                 pv.Id, pv.VersionCode, pv.VersionCategory,
                 pv.DomainKey,
                 pv.PlanHorizonStart, pv.PlanHorizonEnd,
-                pv.Status, pv.ComputedAt,
+                pv.Status,
+                CASE WHEN pv.Status = 'ACTIVE' THEN CAST(1 AS bit) ELSE CAST(0 AS bit) END AS IsDefault,   -- R5(11-12)：域内当前生效位（UQ_OneActivePerDomain 保证每域≤1）
+                pv.ComputedAt,
                 pv.TotalTasks, pv.CreatedAt,
                 pv.SourceScheduleRunId, pv.ActivatedAt,
                 r.DataCutoffTime, r.RunType, r.TriggeredBy,
@@ -83,6 +85,25 @@ public class ScheduleQueryService : IScheduleQueryService
             sql, parameters, db: DatabaseId.APS);
 
         return rows.ToList();
+    }
+
+    /// <summary>
+    /// R5（11-12 4号位件）：版本全量条数——WHERE 与 <see cref="GetVersionsAsync"/> 逐字同式
+    /// （ArchivedAt IS NULL + 同域范围），供 X-Total-Count；空域授权 fail-closed=0。
+    /// </summary>
+    public async Task<int> CountVersionsAsync(int userId, CancellationToken cancellationToken = default)
+    {
+        var allowed = await ResolveAllowedDomainKeysAsync(userId, cancellationToken);
+        if (allowed is { Count: 0 })
+            return 0;
+
+        var sql = allowed is null
+            ? "SELECT COUNT(*) FROM PlanVersion pv WHERE pv.ArchivedAt IS NULL"
+            : "SELECT COUNT(*) FROM PlanVersion pv WHERE pv.ArchivedAt IS NULL AND pv.DomainKey IN @ScopeDomainKeys";
+
+        object parameters = allowed is null ? new { } : new { ScopeDomainKeys = allowed.ToList() };
+        return await _connectionManager.QueryFirstOrDefaultAsync<int>(
+            sql, parameters, db: DatabaseId.APS);
     }
 
     /// <inheritdoc />

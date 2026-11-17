@@ -23,6 +23,14 @@ import type { MaterialLookupItem } from './types/material'
 /** fetch-suggestions 输入校验（Element Plus 会自动 trim；这里给最低门槛） */
 const MIN_SEARCH_LEN = 1
 
+/** 端点直取（失败抛错）：严格版共用，避免各处重复拼 URL */
+async function fetchMaterials(params: Record<string, unknown>): Promise<MaterialLookupItem[]> {
+  return apsHttp.get<MaterialLookupItem[]>({
+    url: '/api/governance/lookups/materials',
+    params
+  })
+}
+
 export const materialLookupApi = {
   /** 模糊匹配物料主数据（GET）
    *  - 入参 `search`：物料编码或名称片段（≥ 1 字符；后端上限由 SQL NVARCHAR(50) 决定）
@@ -33,10 +41,7 @@ export const materialLookupApi = {
     const q = String(search ?? '').trim()
     if (q.length < MIN_SEARCH_LEN) return []
     try {
-      return await apsHttp.get<MaterialLookupItem[]>({
-        url: '/api/governance/lookups/materials',
-        params: { search: q }
-      })
+      return await fetchMaterials({ search: q })
     } catch {
       return []
     }
@@ -51,12 +56,26 @@ export const materialLookupApi = {
    */
   async listActiveMaterials(): Promise<MaterialLookupItem[]> {
     try {
-      return await apsHttp.get<MaterialLookupItem[]>({
-        url: '/api/governance/lookups/materials',
-        params: { activeOnly: true }
-      })
+      return await fetchMaterials({ activeOnly: true })
     } catch {
       return []
     }
+  },
+
+  /**
+   * 严格版：失败**抛错**，不吞。
+   *  - 供「下拉要如实告诉用户查不到 / 查失败」的页面用（CTP 插单评估的物料远程搜索）
+   *  - 与上面两个宽松版的区别：宽松版把失败伪装成空列表，页面无法区分
+   *    「确实没有物料」和「后端挂了」⇒ 用户会以为厂里没这个料。
+   */
+  async listActiveMaterialsOrThrow(): Promise<MaterialLookupItem[]> {
+    return fetchMaterials({ activeOnly: true })
+  },
+
+  /** 严格版模糊搜索（失败抛错，见 listActiveMaterialsOrThrow） */
+  async searchMaterialsOrThrow(search: string): Promise<MaterialLookupItem[]> {
+    const q = String(search ?? '').trim()
+    if (!q) return fetchMaterials({ activeOnly: true })
+    return fetchMaterials({ search: q })
   }
 }

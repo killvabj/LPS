@@ -154,7 +154,7 @@ internal static class DemandProtectionTriggerEvaluator
             {
                 gap ??= "DelayStatus 为空 ⇒ T2(ProtectDelayed) 无法判定";
             }
-            else if (!string.Equals(facts.DelayStatus, "ON_TIME", StringComparison.OrdinalIgnoreCase))
+            else if (IsDelayedStatus(facts.DelayStatus))
             {
                 return new Verdict(true, ProtectionTrigger.Delayed, null);
             }
@@ -203,6 +203,94 @@ internal static class DemandProtectionTriggerEvaluator
         _ = basisTime; // T2~T5 不依赖基准时点；保留形参是为了将来 T1 拆分时签名不变。
         return new Verdict(false, null, gap);
     }
+
+    /// <summary>
+    /// §3.4 诊断用：**单独**判定某一个触发是否成立（不看前序触发、不短路、不留 Gap）。
+    ///
+    /// 【为什么需要它】原诊断把「已配置但零命中」一律解释成「配置值与运行词表不一致」，
+    /// 于是把**正确配置**报成配置错误。实测（PV 999487，2026-11-11）：`ProtectDelayed=true` 零命中，
+    /// 真因是 `RemainingTimeThresholdHours=24` 的 T1 **先命中**——延期单必然已过交期、剩余小时为负
+    /// ⇒ 必被 T1 抓走，根本轮不到 T2。这不是词表问题。
+    ///
+    /// 两种成因必须分开说：
+    /// ① `WouldMatch=false` ⇒ 谓词在**本 Run 事实域内**根本不成立（配置值不在运行词表里）＝**真配置错**；
+    /// ② `WouldMatch=true` 却没轮到它 ⇒ **被前序触发抢先**＝覆盖，不是配置错。
+    ///
+    /// **纯诊断，不参与任何保护判定**——保护仍只走 <see cref="Evaluate"/>，行为零变化。
+    /// </summary>
+    internal static bool WouldMatch(
+        ProtectionTriggerParams? trigger,
+        ProtectionTrigger kind,
+        in DemandFacts facts,
+        DateTime basisTime)
+    {
+        if (trigger is null) return false;
+
+        return kind switch
+        {
+            ProtectionTrigger.RemainingTimeThreshold =>
+                trigger.UseRemainingTimeThreshold
+                && facts.CustomerDueDate is { } due
+                && (due - basisTime).TotalHours <= trigger.RemainingTimeThresholdHours,
+
+            ProtectionTrigger.Delayed =>
+                trigger.ProtectDelayed
+                && !string.IsNullOrWhiteSpace(facts.DelayStatus)
+                && IsDelayedStatus(facts.DelayStatus),
+
+            ProtectionTrigger.VipTier =>
+                trigger.ProtectVipTier
+                && !string.IsNullOrWhiteSpace(trigger.VipTierValue)
+                && !string.IsNullOrWhiteSpace(facts.CustomerTier)
+                && string.Equals(facts.CustomerTier, trigger.VipTierValue, StringComparison.Ordinal),
+
+            ProtectionTrigger.OrderTypes =>
+                trigger.ProtectedOrderTypes is { Count: > 0 }
+                && !string.IsNullOrWhiteSpace(facts.OrderType)
+                && trigger.ProtectedOrderTypes.Contains(facts.OrderType, StringComparer.Ordinal),
+
+            ProtectionTrigger.MaturityStatus =>
+                trigger.ProtectMaturityStatus
+                && trigger.MaturityStatusValues is { Count: > 0 }
+                && !string.IsNullOrWhiteSpace(facts.DemandMaturityStatus)
+                && trigger.MaturityStatusValues.Contains(facts.DemandMaturityStatus, StringComparer.Ordinal),
+
+            _ => false,
+        };
+    }
+
+    /// <summary>
+    /// `DelayStatus` 是否属「已延期」—— **白名单** `{FIRST_DELAY, REPEATED_DELAY}`。
+    ///
+    /// 【为什么不是黑名单】原实现写 `≠ ON_TIME`，那是黑名单：库里只要出现第三种值
+    /// （`CANCELLED`／`CLOSED`／将来新增的状态），就会被判成「延期」并**给到保护**，方向是反的。
+    /// 依据＝`ProtectionTriggerParams.ProtectDelayed` 注释「`DelayStatus ∈ {FIRST_DELAY, REPEATED_DELAY}`＝延迟，
+    /// §一.3/§六-3」。
+    ///
+    /// 【今日零行为变化】PV 999487 实测 `DelayStatus` 去重值只有 `FIRST_DELAY`(48,442)／`ON_TIME`(51,603)，
+    /// 白名单与黑名单在这一组数据上结果相同。
+    /// </summary>
+    private static readonly string[] DelayedStatusValues = ["FIRST_DELAY", "REPEATED_DELAY"];
+
+    private static bool IsDelayedStatus(string delayStatus)
+        => DelayedStatusValues.Contains(delayStatus.Trim(), StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// `OrderType` 别名归一 —— **必须与 <c>DemandPriorityExecutor.NormalizeFieldValue</c> 同口径**。
+    ///
+    /// 【为什么】参数集里写的是业务缩写（`["SO"]`），库里 `[Order].OrderType` 存的是全称
+    /// （`SALES_ORDER`／`PRODUCTION_INSTRUCTION`）。同仓两条消费链原本**一个认一个不认**：
+    /// 需求优先级执行器有 `SO→SALES_ORDER`／`WO→PRODUCTION_INSTRUCTION` 归一，
+    /// 需求保护这边用 `StringComparer.Ordinal` 裸比 ⇒ `["SO"]` 在保护侧**永远不命中**。
+    /// 实测（PV 999487，2026-11-11）：`ProtectedOrderTypes=["SO"]`，数据 `SALES_ORDER` 20,298 条，命中 **0**。
+    /// </summary>
+    // 【2026-11-11 记录：`ProtectedOrderTypes` **刻意不做别名归一**】
+    //   本类用 `StringComparer.Ordinal` 精确比，`["SO"]` 与库内 `SALES_ORDER` 不等值 ⇒ 不命中，
+    //   由 §3.4 诊断 `PROTECTION_TRIGGER_UNEVALUABLE` 显性报出，**不在代码里把 "SO" 猜成 "SALES_ORDER"**。
+    //   该决定已被表驱动用例 `T4_订单类型_配置词表决定命中` 固化（"不许猜配"）。
+    //   ⚠ 但同仓 `DemandPriorityExecutor.NormalizeFieldValue` **做了** `SO→SALES_ORDER`／`WO→PRODUCTION_INSTRUCTION`
+    //     归一 —— 同一个配置值，需求优先级链认、需求保护链不认。**这是两条链的口径分叉，须由 0号位/3号位 定谁对齐谁**，
+    //     本类不单方面改（2026-11-11 曾改为归一，因该用例失败已回滚）。
 
     /// <summary>
     /// 该触发是否「已配置」（用于 §3.4 诊断：配置了、却一条都没命中）。

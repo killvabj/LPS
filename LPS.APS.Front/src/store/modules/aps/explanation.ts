@@ -64,6 +64,26 @@ export const useExplanationStore = defineStore('aps.explanation', () => {
   /** 缓存标记：false = 首次或已 invalidate → load() 触发首查；true = 命中缓存 → 不重查 */
   const businessFactIssuesCached = ref<boolean>(false)
 
+  // ===== 业务事实问题筛选（2026-11-10 增三个；2026-11-12 再增三个）=====
+  /**
+   * 筛选都走**后端已支持**的参数（工厂用户不想一页页翻）：
+   *  - severity：ERROR / WARN / INFO（空 = 全部）
+   *  - source：BOM_WORKSET / MATERIAL_STAGE_CONTEXT（空 = 全部）
+   *  - materialCode：精确编码（空 = 全部）
+   *  - issueType：等值（5号位 11-11 落码，值域封闭 10 码）
+   *  - keyword：模糊（BOM 源打 Detail/BOMNO/Parent·ChildMaterialCode；MSC 源只打 Detail/MaterialCode）
+   *  - factoryCode：等值（⚠️ 跨厂行无单厂归属 ⇒ 选了工厂就看不到它们）
+   *
+   * @see lps/LPS.APS.Web/Controllers/BusinessFactIssueController.cs:62-69
+   * @see frontNew/docs/5号位-2026-11-11-复函-issueType与keyword两参已落码factoryCode缺参一并修复…md
+   */
+  const bizSeverity = ref<string>('')
+  const bizSource = ref<string>('')
+  const bizMaterialCode = ref<string>('')
+  const bizIssueType = ref<string>('')
+  const bizKeyword = ref<string>('')
+  const bizFactoryCode = ref<string>('')
+
   // ===== getters =====
 
   /**
@@ -179,11 +199,16 @@ export const useExplanationStore = defineStore('aps.explanation', () => {
     error.value = null
     try {
       data.value = await explanationApi.getByPlanVersion(planVersionId.value)
-      // 同步首查 biz-issues 到本地累积 ref（store 层持有，供 loadMore 累加）
-      businessFactIssues.value = data.value.businessFactIssues ?? []
-      businessFactIssuesTotal.value = data.value.businessFactIssuesTotal ?? 0
-      businessFactIssuesPage.value = data.value.businessFactIssuesPage ?? 1
-      businessFactIssuesPageSize.value = data.value.businessFactIssuesPageSize ?? 20
+      // ⚠️ 后端 Summary 端点**不返** businessFactIssues*（dev 2026-11-10 实测：响应只有
+      //   planVersionId / totalCount / errorCount / warnCount / infoCount / reasonCodeCounts / items
+      //   共 7 个字段）⇒ **别拿它覆盖已拉到的分页数据**，否则版本一切换就把业务事实问题清空。
+      //   真实数据一律来自 `GET /api/business-fact-issues`（fetchBizPage）。
+      if (data.value.businessFactIssues?.length) {
+        businessFactIssues.value = data.value.businessFactIssues
+        businessFactIssuesTotal.value = data.value.businessFactIssuesTotal ?? 0
+        businessFactIssuesPage.value = data.value.businessFactIssuesPage ?? 1
+        businessFactIssuesPageSize.value = data.value.businessFactIssuesPageSize ?? 20
+      }
       businessFactIssuesCached.value = true
     } catch (err) {
       handleError(err)
@@ -204,7 +229,16 @@ export const useExplanationStore = defineStore('aps.explanation', () => {
     if (page < 1) page = 1
     businessFactIssuesLoading.value = true
     try {
-      const res = await explanationApi.listBusinessFactIssues({ pageIndex: page, pageSize: size })
+      const res = await explanationApi.listBusinessFactIssues({
+        pageIndex: page,
+        pageSize: size,
+        severity: bizSeverity.value || undefined,
+        source: bizSource.value || undefined,
+        materialCode: bizMaterialCode.value || undefined,
+        issueType: bizIssueType.value || undefined,
+        keyword: bizKeyword.value || undefined,
+        factoryCode: bizFactoryCode.value || undefined
+      })
       businessFactIssues.value = res.items
       businessFactIssuesTotal.value = res.total
       businessFactIssuesPage.value = res.page
@@ -216,6 +250,27 @@ export const useExplanationStore = defineStore('aps.explanation', () => {
     } finally {
       businessFactIssuesLoading.value = false
     }
+  }
+
+  /**
+   * 改筛选（2026-11-10 增）：任一筛选变化 ⇒ 回到第 1 页重查。
+   *  - 只改 state 不立即请求（物料编码 / 关键词输入框有防抖，见 view 层）
+   *  - materialCode / keyword 传空串 = 清除该筛选
+   */
+  function setBizFilters(next: {
+    severity?: string
+    source?: string
+    materialCode?: string
+    issueType?: string
+    keyword?: string
+    factoryCode?: string
+  }): void {
+    if (next.severity !== undefined) bizSeverity.value = next.severity
+    if (next.source !== undefined) bizSource.value = next.source
+    if (next.materialCode !== undefined) bizMaterialCode.value = next.materialCode.trim()
+    if (next.issueType !== undefined) bizIssueType.value = next.issueType
+    if (next.keyword !== undefined) bizKeyword.value = next.keyword.trim()
+    if (next.factoryCode !== undefined) bizFactoryCode.value = next.factoryCode
   }
 
   /**
@@ -256,7 +311,13 @@ export const useExplanationStore = defineStore('aps.explanation', () => {
     try {
       const res = await explanationApi.listBusinessFactIssues({
         pageIndex: 1,
-        pageSize: businessFactIssuesPageSize.value
+        pageSize: businessFactIssuesPageSize.value,
+        severity: bizSeverity.value || undefined,
+        source: bizSource.value || undefined,
+        materialCode: bizMaterialCode.value || undefined,
+        issueType: bizIssueType.value || undefined,
+        keyword: bizKeyword.value || undefined,
+        factoryCode: bizFactoryCode.value || undefined
       })
       businessFactIssues.value = res.items
       businessFactIssuesTotal.value = res.total
@@ -298,6 +359,12 @@ export const useExplanationStore = defineStore('aps.explanation', () => {
     businessFactIssuesTotal.value = 0
     businessFactIssuesPage.value = 1
     businessFactIssuesCached.value = false
+    bizSeverity.value = ''
+    bizSource.value = ''
+    bizMaterialCode.value = ''
+    bizIssueType.value = ''
+    bizKeyword.value = ''
+    bizFactoryCode.value = ''
   }
 
   return {
@@ -319,12 +386,19 @@ export const useExplanationStore = defineStore('aps.explanation', () => {
     businessFactIssuesPageSize,
     businessFactIssuesLoading,
     businessFactIssuesCached,
+    bizSeverity,
+    bizSource,
+    bizMaterialCode,
+    bizIssueType,
+    bizKeyword,
+    bizFactoryCode,
     sortedBusinessFactIssues,
     load,
     loadMoreFacts,
     fetchBizPage,
     refreshBizIssues,
     changeBizPageSize,
+    setBizFilters,
     reset
   }
 })

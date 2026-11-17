@@ -90,6 +90,19 @@ export const constantRouterMap: AppRouteRecordRaw[] = [
       title: '403',
       noTagsView: true
     }
+  },
+  {
+    // 2026-11-11 补：views/Error/500.vue 一直存在，但**没有对应路由**
+    // ⇒ api/aps-v1/http.ts 的 redirectToError(500) 会跳到一个不存在的路由
+    //   （hash 模式下落到 404 页；dev 看不出来，生产上更难看）。
+    path: '/500',
+    component: () => import('@/views/Error/500.vue'),
+    name: 'ServerError',
+    meta: {
+      hidden: true,
+      title: '500',
+      noTagsView: true
+    }
   }
 ]
 

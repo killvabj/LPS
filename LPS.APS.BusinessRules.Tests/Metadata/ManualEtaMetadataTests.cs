@@ -51,8 +51,9 @@ public class ManualEtaMetadataTests
         _mockRepo.Setup(r => r.QueryAsync(
                 It.IsAny<List<int>?>(), It.IsAny<List<string>?>(), It.IsAny<List<string>?>(),
                 It.IsAny<List<string>?>(), It.IsAny<DateTime?>(), It.IsAny<DateTime?>(),
-                It.IsAny<DateTime?>(), It.IsAny<bool>(), It.IsAny<int>(), It.IsAny<int>(),
-                It.IsAny<CancellationToken>()))
+                It.IsAny<DateTime?>(), It.IsAny<bool>(), It.IsAny<bool>(), It.IsAny<string?>(),
+                It.IsAny<string?>(), It.IsAny<string?>(), It.IsAny<int>(), It.IsAny<int>(),
+                It.IsAny<bool>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(expected);
 
         // Act
@@ -173,6 +174,45 @@ public class ManualEtaMetadataTests
         // Act & Assert
         Assert.ThrowsAsync<ArgumentException>(async () =>
             await _service.CancelAsync("PO001", 1, 100, "WH01", ""));
+    }
+
+    // 11-14（4号位 v2.0 R1）：订单行供货组合端点——poNo 必填（缺 ⇒ 400，不静默返全库组合）
+    [Test]
+    public void F_META_01_GetSupplyCombos_WithBlankPoNo_ThrowsArgumentException()
+    {
+        Assert.ThrowsAsync<ArgumentException>(async () =>
+            await _service.GetSupplyCombosAsync("   "));
+    }
+
+    [Test]
+    public void F_META_01_GetSupplyCombos_WithNonPositiveLineNo_ThrowsArgumentException()
+    {
+        Assert.ThrowsAsync<ArgumentException>(async () =>
+            await _service.GetSupplyCombosAsync("PO001", 0));
+    }
+
+    [Test]
+    public async Task F_META_01_GetSupplyCombos_WithPoNo_CallsRepository()
+    {
+        // Arrange：物料与仓库**成对**返回（同一行里 materialId + storageCode）
+        _mockRepo.Setup(r => r.GetSupplyCombosAsync("PO001", 2, 200, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new List<ProcurementManualEtaSupplyComboDto>
+            {
+                new()
+                {
+                    PONo = "PO001", LineNo = 2, MaterialId = 100,
+                    MaterialCode = "MAT001", StorageCode = "WH01"
+                }
+            });
+
+        // Act
+        var result = await _service.GetSupplyCombosAsync("PO001", 2);
+
+        // Assert
+        Assert.That(result.Count, Is.EqualTo(1));
+        Assert.That(result[0].MaterialId, Is.EqualTo(100));
+        Assert.That(result[0].StorageCode, Is.EqualTo("WH01"));
+        _mockRepo.Verify(r => r.GetSupplyCombosAsync("PO001", 2, 200, It.IsAny<CancellationToken>()), Times.Once);
     }
 
     #endregion

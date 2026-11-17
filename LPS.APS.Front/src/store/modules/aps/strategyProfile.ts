@@ -31,7 +31,9 @@ import { computed, ref } from 'vue'
 import {
   strategyProfileApi,
   ApiError,
+  mergeStrategyProfileListRows,
   type StrategyProfileDto,
+  type StrategyProfileListRowDto,
   type StrategyProfileVersionDto,
   type StrategyVersionDraftInput,
   type PublishStrategyVersionRequest,
@@ -50,6 +52,14 @@ import { useApsAuthStore } from './auth'
 export const useStrategyProfileStore = defineStore('aps.strategyProfile', () => {
   // ===== state =====
   const profiles = ref<StrategyProfileDto[]>([])
+  /**
+   * 策略包列表行（**一版一行**，2026-11-11 列表源切换）
+   *
+   * ⚠️ 一行 = 一个版本（`versionId` / `versionCode` / `versionStatus` 齐备），
+   *   另有「无版本主表」行（hasVersion=false）。
+   *   `profiles` 仍保留（主表级字段的唯一来源：名称 / 批次类型 / 说明 / 启停）。
+   */
+  const profileRows = ref<StrategyProfileListRowDto[]>([])
   const selectedProfileId = ref<number | null>(null)
 
   const versions = ref<StrategyProfileVersionDto[]>([])
@@ -73,9 +83,9 @@ export const useStrategyProfileStore = defineStore('aps.strategyProfile', () => 
 
   // ===== getters =====
 
-  /** 列表可见的 Profile（默认滤掉停用行；「显示已停用」开关打开才全量） */
-  const visibleProfiles = computed<StrategyProfileDto[]>(() =>
-    showInactive.value ? profiles.value : profiles.value.filter((p) => p.isActive !== false)
+  /** 列表可见的 Profile 行（一版一行；默认滤掉主表停用的行；「显示已停用」开关打开才全量） */
+  const visibleProfileRows = computed<StrategyProfileListRowDto[]>(() =>
+    showInactive.value ? profileRows.value : profileRows.value.filter((r) => r.isActive !== false)
   )
 
   /** 停用的策略包数量（开关上的计数标签） */
@@ -162,12 +172,29 @@ export const useStrategyProfileStore = defineStore('aps.strategyProfile', () => 
     listLoading.value = true
     error.value = null
     try {
-      profiles.value = await strategyProfileApi.listProfiles()
+      // 主表（旧端点，主表级字段的唯一来源）+ 一版一行（新端点 + 无版本主表行）
+      const [masters, rows] = await Promise.all([
+        strategyProfileApi.listProfiles(),
+        strategyProfileApi.listProfileVersionRows()
+      ])
+      profiles.value = masters
+      profileRows.value = mergeStrategyProfileListRows(rows, masters)
     } catch (err) {
       handleError(err)
     } finally {
       listLoading.value = false
     }
+  }
+
+  /**
+   * 选中列表里的一行（一版一行 ⇒ 同时选中该策略包 + 该版本）
+   *
+   * @param row 列表行（版本行或无版本主表行）
+   */
+  async function selectProfileRow(row: StrategyProfileListRowDto): Promise<void> {
+    selectProfile(row.strategyProfileId)
+    await loadVersions(row.strategyProfileId)
+    if (row.versionId != null) selectVersion(row.versionId)
   }
 
   /**
@@ -539,6 +566,7 @@ export const useStrategyProfileStore = defineStore('aps.strategyProfile', () => 
 
   function reset(): void {
     profiles.value = []
+    profileRows.value = []
     selectedProfileId.value = null
     versions.value = []
     selectedVersionId.value = null
@@ -551,6 +579,7 @@ export const useStrategyProfileStore = defineStore('aps.strategyProfile', () => 
   return {
     // state
     profiles,
+    profileRows,
     selectedProfileId,
     versions,
     selectedVersionId,
@@ -565,7 +594,7 @@ export const useStrategyProfileStore = defineStore('aps.strategyProfile', () => 
     error,
     showInactive,
     // getters
-    visibleProfiles,
+    visibleProfileRows,
     inactiveCount,
     currentProfile,
     currentVersion,
@@ -580,6 +609,7 @@ export const useStrategyProfileStore = defineStore('aps.strategyProfile', () => 
     // actions
     selectProfile,
     selectVersion,
+    selectProfileRow,
     loadProfiles,
     createProfile,
     updateProfile,

@@ -5,7 +5,8 @@
  *  - `PrioritySegment`（:95）段内键**只有 6 个**：
  *    `SegmentOrder / SegmentName / IsEnabled / MatchConditions / SortFields / StableTieBreakFields`
  *    + 可选的 `CompetitionRound`（v1.2 B3 新增）
- *    + 可选的 `MatchConditionGroups`（2026-11-06 DNF 条件组；运行侧尚未接线，编辑器暂不开放）
+ *    + 可选的 `MatchConditionGroups`（DNF 条件组：**组内 AND、组间 OR**；
+ *      2026-11-07 后端执行器/投影层已接线，2026-11-11 3号位来函要求前端维护＋结构化展示）
  *  - 该类带 `[JsonUnmappedMemberHandling(Disallow)]` ⇒ 键名写错后端反序列化直接失败
  *  - `SegmentMatchCondition`（:117）= `{Field: DemandField(枚举), Operator: ConditionOperator(枚举), Value: any}`
  *  - `SegmentSortField`（:123）= `{Field: DemandField(枚举), Direction: SortDirection(枚举)}`
@@ -18,6 +19,7 @@
 
 import type {
   PrioritySegmentDto,
+  SegmentConditionGroupDto,
   SegmentMatchConditionDto,
   SegmentSortFieldDto
 } from './types/rule'
@@ -118,6 +120,7 @@ interface RawPrioritySegment {
   IsEnabled?: boolean
   CompetitionRound?: number | null
   MatchConditions?: RawMatchCondition[]
+  MatchConditionGroups?: RawConditionGroup[]
   SortFields?: RawSortField[]
   StableTieBreakFields?: string[]
 }
@@ -128,9 +131,22 @@ interface RawMatchCondition {
   Value?: unknown
 }
 
+/** 条件组（组内 AND、组间 OR）：后端 `SegmentConditionGroup` / `PriorityConditionGroup` */
+interface RawConditionGroup {
+  Conditions?: RawMatchCondition[]
+}
+
 interface RawSortField {
   Field?: number
   Direction?: number
+}
+
+function toRawCondition(c: RawMatchCondition | undefined): SegmentMatchConditionDto {
+  return {
+    field: c?.Field ?? -1,
+    operator: c?.Operator ?? -1,
+    value: c?.Value ?? null
+  }
 }
 
 /**
@@ -140,6 +156,9 @@ interface RawSortField {
  *  - 解析失败 / 结构不符 → 返回空数组（fail-open：页面显示「该版本没有需求优先级段位」，
  *    绝不编造段位）
  *  - `CompetitionRound` 缺省 = 未声明（保留 undefined，页面显示「未声明」）
+ *  - `MatchConditionGroups`（DNF：组内 AND、组间 OR）**必须解析出来**：
+ *    不解析就会把「带组」的段读成「无条件段」，再保存就把条件组静默抹掉
+ *    （4号位 2026-11-07 已向 3号位 提示过该风险）
  */
 export function parsePrioritySegments(demandPriorityJson?: string | null): PrioritySegmentDto[] {
   if (!demandPriorityJson) return []
@@ -158,10 +177,11 @@ export function parsePrioritySegments(demandPriorityJson?: string | null): Prior
       isEnabled: s?.IsEnabled ?? false,
       competitionRound: s?.CompetitionRound ?? undefined,
       matchConditions: Array.isArray(s?.MatchConditions)
-        ? s.MatchConditions.map((c) => ({
-            field: c?.Field ?? -1,
-            operator: c?.Operator ?? -1,
-            value: c?.Value ?? null
+        ? s.MatchConditions.map(toRawCondition)
+        : [],
+      matchConditionGroups: Array.isArray(s?.MatchConditionGroups)
+        ? s.MatchConditionGroups.map((g) => ({
+            conditions: Array.isArray(g?.Conditions) ? g.Conditions.map(toRawCondition) : []
           }))
         : [],
       sortFields: Array.isArray(s?.SortFields)
@@ -170,4 +190,54 @@ export function parsePrioritySegments(demandPriorityJson?: string | null): Prior
       stableTieBreakFields: Array.isArray(s?.StableTieBreakFields) ? s.StableTieBreakFields : []
     }))
     .sort((a, b) => a.orderInSegment - b.orderInSegment)
+}
+
+/* ───────────────────────── DNF（组内 AND、组间 OR）只读呈现 ───────────────────────── */
+
+/** 条件组标签：组A / 组B / 组C …（第 26 组起退化为「组26」，不会越界） */
+export function conditionGroupLabel(index: number): string {
+  const n = Number(index) + 1
+  return n <= 26 ? `组${String.fromCharCode(64 + n)}` : `组${n}`
+}
+
+/** 一组条件 → 大白话（组内 AND）：「(条件1) 且 (条件2)」 */
+export function conditionGroupText(group: SegmentConditionGroupDto): string {
+  const items = (group?.conditions ?? []).map(conditionText)
+  if (!items.length) return '（空组，不成立）'
+  return items.map((t) => `(${t})`).join(' 且 ')
+}
+
+/**
+ * 段的命中条件 → 只读展示视图。
+ *
+ * - `mode='FLAT'`：存量平铺，**全部满足**（组为空数组）
+ * - `mode='DNF'`：多组，**组内全部满足、组间满足任一组**
+ */
+export interface SegmentConditionView {
+  mode: 'FLAT' | 'DNF'
+  /** DNF 模式下的分组文本（每组一条，已含组内 AND 表达） */
+  groups: string[]
+  /** 可读化表达式：FLAT ⇒ 条件1 且 条件2；DNF ⇒ (组A) 或 (组B) */
+  expression: string
+}
+
+export function segmentConditionView(seg: {
+  matchConditions?: SegmentMatchConditionDto[]
+  matchConditionGroups?: SegmentConditionGroupDto[]
+}): SegmentConditionView {
+  const groups = seg?.matchConditionGroups ?? []
+  if (groups.length > 0) {
+    const texts = groups.map(conditionGroupText)
+    return {
+      mode: 'DNF',
+      groups: texts,
+      expression: texts.map((t) => `(${t})`).join(' 或 ')
+    }
+  }
+  const flat = (seg?.matchConditions ?? []).map(conditionText)
+  return {
+    mode: 'FLAT',
+    groups: [],
+    expression: flat.length ? flat.map((t) => `(${t})`).join(' 且 ') : '（无条件，命中全部）'
+  }
 }

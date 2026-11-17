@@ -56,6 +56,8 @@ export const useSetupUncoveredStore = defineStore('aps.setupUncovered', () => {
 
   const listLoading = ref(false)
   const error = ref<string | null>(null)
+  /** 请求序号：只让最后一次查询的结果落地（换批次自动重查后的并发保护） */
+  let loadSeq = 0
 
   // ===== auth =====
   const apsAuth = useApsAuthStore()
@@ -81,19 +83,24 @@ export const useSetupUncoveredStore = defineStore('aps.setupUncovered', () => {
     pageIndex = 1,
     pageSize = 20
   ): Promise<void> {
+    // 并发保护：换批次会自动重查（2026-11-09），连点两个批次时先发的可能后到
+    // ⇒ 只认最后一次请求的结果，避免「选择器显示 B、表格却是 A 的数据」。
+    const seq = ++loadSeq
     listLoading.value = true
     error.value = null
     query.value = newQuery
     try {
       const page = await setupApi.getUncoveredStatsPage({ ...newQuery, pageIndex, pageSize })
+      if (seq !== loadSeq) return
       stats.value = page.items
       total.value = page.total
     } catch (err) {
+      if (seq !== loadSeq) return
       handleError(err)
       stats.value = []
       total.value = 0
     } finally {
-      listLoading.value = false
+      if (seq === loadSeq) listLoading.value = false
     }
   }
 

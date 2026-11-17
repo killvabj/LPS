@@ -103,20 +103,22 @@ public sealed class RoutingOperationGovernanceService : IRoutingOperationGoverna
             return new List<RoutingOperationDto>();
         }
 
-        var sql = @"SELECT Id, MaterialId, ProductionDepartmentId, RouteCode, PathId, OperationCode,
-                           OperationName, ProcessType, StageCode, OperationPlanningMode
-                    FROM RoutingOperation
-                    WHERE IsActive = 1 AND MaterialId = @MaterialId";
+        var sql = @"SELECT ro.Id, ro.MaterialId, ro.ProductionDepartmentId, ro.RouteCode, ro.PathId, ro.OperationCode,
+                           ro.OperationName, ro.ProcessType, ro.StageCode, ro.OperationPlanningMode,
+                           pd.DeptName AS ProductionDepartmentName
+                    FROM RoutingOperation ro
+                    LEFT JOIN ProductionDepartment pd ON pd.Id = ro.ProductionDepartmentId
+                    WHERE ro.IsActive = 1 AND ro.MaterialId = @MaterialId";
         var p = new DynamicParameters();
         p.Add("MaterialId", materialId);
 
         if (allowedDeptIds is not null)
         {
-            sql += " AND ProductionDepartmentId IN @AllowedDeptIds";
+            sql += " AND ro.ProductionDepartmentId IN @AllowedDeptIds";
             p.Add("AllowedDeptIds", allowedDeptIds.ToList());
         }
 
-        sql += " ORDER BY RouteCode, PathId, OperationCode";
+        sql += " ORDER BY ro.RouteCode, ro.PathId, ro.OperationCode";
 
         var rows = await _connectionManager.QueryAsync<RoutingOperationDto>(sql, p, db: DatabaseId.APS);
 

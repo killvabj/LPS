@@ -42,7 +42,12 @@ public sealed record MesDispatchCommand(
     string? ResourceCode,                   // 设备码；人工槽＝部门码＋槽码组合身份
     DateTime PlannedStartTime,              // 工厂墙钟 naive，无时区换算
     DateTime PlannedEndTime,
-    IReadOnlyList<long> SourceTaskIds);     // 组合内成员行，仅作回写映射，实现侧不解读
+    IReadOnlyList<long> SourceTaskIds,      // 组合内成员行，仅作回写映射，实现侧不解读
+    // ── 2026-11-12 会签（5号位 §四：四列收两列）────────────────────────────────
+    //   只加这两列，`interfaceVersion`／`dispatchedAt` **不加**：
+    //   版本号与下发时刻的权威在出站实现方，写进 Command 会让两侧各改各的。
+    string? InstructionType = null,         // 源＝`TaskDispatch.InstructionType`（PRODUCTION_INSTRUCTION／SHIPPING）
+    string? WorkOrderType = null);          // 源＝`TaskDispatch.WorkOrderType`（ASSEMBLY／MACHINING／NULL）
 
 /// <summary>出站结果三态。</summary>
 public enum MesDispatchKind

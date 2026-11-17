@@ -21,12 +21,13 @@
  *  ② 枚举值 = **数字序号**（后端无 `JsonStringEnumConverter` ⇒ System.Text.Json 按序号读写）。
  *     枚举项的展示名与序号在 `parameterSetEnums.ts`（唯一真源），本表只声明「这个字段是枚举」。
  *  ③ 本表**只列标量字段**：
- *     - 四处仓库落点（`Inventory.WarehousePriority` / `WarehousePriority` /
- *       `DefaultPurchaseLt` / `ArrivalToUsableOffsets`）有专属编辑器，不在此列；
+ *     - 仓库落点（`Inventory.WarehousePriority` / `WarehousePriority` /
+ *       `DefaultPurchaseLt` / `ArrivalToUsableOffsets`）不在此列；
  *     - `AnchorResourceCode` 有专属自由文本录入项，不在此列；
- *     - 数组类（本轮只有 `Procurement.PlanningYields`）没有专属编辑器，也没有安全的
- *       前端录入形态（`MaterialId` 要 Material 主表数值 Id，Id↔Code 映射合同 R04 Y-04 未定）
- *       ⇒ 本轮不开放，避免前端自造结构。
+ *     - 数组类（`Procurement.PlanningYields`）有专属编辑器，不在此列。
+ *   2026-11-09 起「以 0号位 11-04 工作簿为标准」：工作簿未收录的字段不显示在维护面，
+ *   见 `NOT_IN_WORKBOOK_FIELDS`（工作簿查无的采购 ETA 两项 + 需求成熟度两项，
+ *   以及「默认采购提前期 / 到货可用偏移」两个专属编辑器已撤）。
  */
 
 import type { BlockKey } from './types/rule'
@@ -45,6 +46,26 @@ export type MaintenanceClass = 'A' | 'B' | 'C' | 'D' | 'E' | 'F' | 'H'
 
 /** 需要从维护面隐藏的分类（D 不在此列：D 是只读展示） */
 export const HIDDEN_MAINTENANCE_CLASSES: readonly MaintenanceClass[] = ['C', 'E', 'F', 'H']
+
+/**
+ * **0号位 2026-11-04 工作簿未收录**的字段 ⇒ 维护面不显示（用户 2026-11-09 定：以工作簿为标准）。
+ *
+ * 与 C/E/F/H 的区别：这些字段在 DTO 里真实存在、后端也可能有消费点，只是**工作簿没收录**
+ * （工作簿 §范围 自述「你已删除、不再出现在文件中的字段均不恢复」）。
+ * 处置与 C/E/F/H 完全一致：**页面不渲染、不进「新增字段」候选；载荷原样保留并回写**。
+ *
+ * 复核依据：`APS_V1_规则参数集71项逐字段盘点与0号位配置工作台_20261104.xlsx`
+ * 7 个 sheet 全文 `OverdueMargin` / `MaturityStatus` / `DefaultPurchaseLt` / `ArrivalToUsable` 零命中。
+ */
+export const NOT_IN_WORKBOOK_FIELDS: Partial<Record<BlockKey, readonly string[]>> = {
+  lock: ['Trigger.ProtectMaturityStatus', 'Trigger.MaturityStatusValues'],
+  procurement: ['OverdueMargin.MarginPercent', 'OverdueMargin.MinimumExtraDays']
+}
+
+/** 该路径是否属于「工作簿未收录」（⇒ 维护面隐藏） */
+export function isNotInWorkbookField(block: BlockKey, path: string): boolean {
+  return NOT_IN_WORKBOOK_FIELDS[block]?.includes(path) === true
+}
 
 /** 字段的值形态 */
 export type BlockFieldKind =
@@ -83,8 +104,11 @@ export interface BlockFieldDef {
  * `ParameterSetVersion.*.$.Lock` 反序列化成 `snapshot.Lock`，`PeggingOrchestrator.cs:13279` 取该块
  * 交给 `DemandProtectionTriggerEvaluator` 逐项判定，产出每条需求的 `ProtectionStatus`（影响需求排序）
  * ⇒ 本块 **Trigger.* 触发条件类 8 项已生效**，页面不再标「暂未生效」。
- * 仍不生效：`Trigger.AllowPmcManualProtection`（预留位，B4 §3.5 为真也不执行、只出 WARN）
- * 与 `Sticky.*` 三项（仅 DTO 声明，运行期零读取）。
+ * **不露面的**：
+ *   - `Trigger.AllowPmcManualProtection`（#7）—— **0号位 终裁（2026-11-10）：整体挪到 V1.1，V1 不做**
+ *     ⇒ 维护面隐藏（F 类）：表格不渲染、也不进「新增字段」候选；**载荷原样保留回写**
+ *       （现网快照里的 `true` 不动，V1 自动需求保护维持 2026-10-29 G4 基线不变）。
+ *   - `Sticky.*` 三项（仅 DTO 声明，运行期零读取）。
  *
  * 取值域（提示词按真实字典写，别再写「如 SO / WO」）：
  *   - `DemandProtectionTriggerEvaluator.cs:167` 对 `CustomerTier` 做 **Ordinal 精确等值**比较
@@ -118,13 +142,13 @@ const LOCK_FIELDS: BlockFieldDef[] = [
     path: 'Trigger.VipTierValue',
     label: 'VIP 客户标识',
     kind: 'TEXT',
-    hint: '客户等级英文码：VIP 或 GENERAL；按精确匹配判定，大小写要一致'
+    hint: '客户等级英文码：VIP 或 GENERAL；按精确匹配判定，大小写要一致（可下拉选，也可手填）'
   },
   {
     path: 'Trigger.ProtectedOrderTypes',
     label: '指定订单类型',
     kind: 'TEXT_LIST',
-    hint: '每行一个订单类型英文码：SALES_ORDER（客户订单）或 PRODUCTION_INSTRUCTION（生产指示）'
+    hint: '订单类型多选：SALES_ORDER（客户订单）/ PRODUCTION_INSTRUCTION（生产指示）；只能从清单里选，填错永远不命中'
   },
   {
     path: 'Trigger.ProtectMaturityStatus',
@@ -136,9 +160,16 @@ const LOCK_FIELDS: BlockFieldDef[] = [
     path: 'Trigger.MaturityStatusValues',
     label: '需求成熟度触发值',
     kind: 'TEXT_LIST',
-    hint: '每行一个：PRE_CONFIRMED（事前确认）/ FORECAST（预测）'
+    hint: '需求成熟度多选：PRE_CONFIRMED（事前确认）/ FORECAST（预测）；只能从清单里选，填错永远不命中'
   },
-  { path: 'Trigger.AllowPmcManualProtection', label: '允许 PMC 人工强保护', kind: 'BOOL' },
+  {
+    path: 'Trigger.AllowPmcManualProtection',
+    label: '允许 PMC 人工强保护',
+    kind: 'BOOL',
+    // 0号位 终裁（2026-11-10）：#7「允许 PMC 人工强保护」整体挪到 V1.1，V1 不做
+    //   ⇒ 维护面隐藏（F 类 = V1 不使用），载荷原样保留回写（现网快照里的 true 不动）
+    maintenance: 'F'
+  },
   {
     path: 'Sticky.RequireReleaseRecord',
     label: '手工释放需留记录',
@@ -437,8 +468,12 @@ export function hasBlockField(blockObj: unknown, path: string): boolean {
   return true
 }
 
-/** 该路径是否属于「维护面隐藏」分类（C/E/F/H）；目录外新键一律 false（不误伤） */
+/**
+ * 该路径是否在维护面隐藏：C/E/F/H 分类，或**工作簿未收录**（见 `NOT_IN_WORKBOOK_FIELDS`）。
+ * 目录外新键一律 false（不误伤）。
+ */
 export function isHiddenBlockField(block: BlockKey, path: string): boolean {
+  if (isNotInWorkbookField(block, path)) return true
   const cls = findBlockField(block, path)?.maintenance
   return cls !== undefined && HIDDEN_MAINTENANCE_CLASSES.includes(cls)
 }
@@ -505,7 +540,7 @@ export function listAbsentFields(block: BlockKey, blockObj: unknown): BlockField
  *       逐项判定 → 产出 `ProtectionStatus`（`PeggingOrchestrator.cs:13344`）→ 影响需求排序。
  *   - 候选版本守门 2 项 `ResourceTopN` / `WarnOnlyOnMaxImpacted`
  *     ⇒ `PhaseFourLocalRepair.cs:1435` / `:184` 读 `request.StrategySnapshot.CandidateGuardrail.*`。
- *   - 留存的 12 项逐条复核过：仅 DTO 声明 / 仅发布校验 / 预留位 ⇒ 运行期仍无消费者。
+ *   - 留存的 12 项逐条复核过：仅 DTO 声明 / 仅发布校验 / 尚未接线 ⇒ 运行期仍无消费者。
  *     （`MinimumExtraDays` 虽被写进 `FrozenFactParameters.OverdueMargin`
  *     （`PeggingOrchestrator.cs:6490`），但唯一读者 `TimedSupplyFactCalculator.ApplyOverdueMargin`
  *     在生产路径零调用点，且 `AvailableTimeCalculator.cs:28-29` 明令不得接通
@@ -549,9 +584,11 @@ export function isInertBlockField(block: BlockKey, path: string): boolean {
 /**
  * 12 项「运行期无消费者」字段的台账对照 —— 3号位 2026-11-07 回执 §五 Q1 分类表。
  *
- * 出处：3号位 自有文档目录
- *   `开发文档/工作日志/3号位/文档阅读/12_APS_V1_3号位规则参数_R1参数集未生效字段台账_20261107.md`
- *   （经 0号位 定：**保持此自有台账，不并入冻结《开发实施包 v2.4》** —— 冻结文档禁擅改）
+ * 出处（**按 K 编号引用**，3号位 11-09 回执 §四 B4 采方案②）：引「K1~K12（3号位 11-07 回执 §五）」即准 ——
+ *   R1 台账原文在 3号位 自有目录（`开发文档/工作日志/3号位/文档阅读/12_…R1参数集未生效字段台账_20261107.md`），
+ *   **不在前端仓内**（我方仓只有 `lps/` + `frontNew/`），故此处不写文件路径引用；
+ *   分类与字段路径已落在下方代码里，K 编号回指即准
+ *   （经 0号位 定：**保持 3号位 自有台账，不并入冻结《开发实施包 v2.4》** —— 冻结文档禁擅改）。
  *
  * `cls` = 0号位 11-04《71 项逐字段业务解释与 V1 处置》已定的维护责任分类：
  *   `A` 必须配置 / `D` V1固定 / `E` 由其他表替代 / `F` V1不使用 / `H` 待核证；
@@ -575,8 +612,9 @@ export const INERT_FIELD_LEDGER: Readonly<
   lock: {
     'Trigger.AllowPmcManualProtection': {
       k: 'K1',
-      cls: 'A',
-      treatment: '待 0号位 配置（非预留位）；运行期未接线 ⇒ 仍标「暂未生效」'
+      cls: 'F',
+      treatment:
+        '0号位 终裁（2026-11-10）：#7「允许 PMC 人工强保护」整体移 V1.1，V1 不实现 ⇒ 页面隐藏（F 类），载荷原样保留回写'
     },
     'Sticky.RequireReleaseRecord': {
       k: 'K2',
@@ -650,9 +688,11 @@ export const INERT_FIELD_LEDGER: Readonly<
  *
  * 为什么按字段分文案：**「暂未生效」不是一句话能说清的事**。
  *  - 「待接入」：后端接线后自动生效 —— 说「后端接入后自动生效，不用重配」是对的；
- *  - 「待开放」：还得业务上先决定开不开放（K1）—— 说「接入后自动生效」是**假承诺**；
  *  - 「受控废弃」：根本不会再接入（K8）—— 说「接入后自动生效」是**假承诺**；
  *  - 「V1 固定」：冻结值、不开放修改（K2/K9/K10）—— 说「接入后自动生效」是**假承诺**。
+ *
+ * K1（`Trigger.AllowPmcManualProtection`）原为「开放＋排程接线中」，但 0号位 2026-11-10 终裁
+ *   把它整体移 V1.1、V1 不实现 ⇒ 字段已在维护面隐藏（F 类），**不再有徽标文案**。
  */
 export interface InertAnnotation {
   /** 行上徽标文案 */
@@ -667,13 +707,10 @@ const DEFAULT_INERT_ANNOTATION: InertAnnotation = {
   note: '排产运行期还没读取它，配置后不会改变排产结果；后端接入后自动生效，不用重配。'
 }
 
-/** 逐字段标注覆盖（3号位 2026-11-07 回执 §五 K 表的页面处置口径） */
+/** 逐字段标注覆盖（3号位 2026-11-07 回执 §五 K 表的页面处置口径；
+ *  K1 已随 0号位 11-10 终裁移 V1.1 ⇒ 字段隐藏、不再出徽标） */
 const INERT_ANNOTATIONS: Partial<Record<BlockKey, Record<string, InertAnnotation>>> = {
   lock: {
-    'Trigger.AllowPmcManualProtection': {
-      tag: '暂未生效',
-      note: '排产运行期还没读取它，配置后不会改变排产结果；等这一项正式开放并接入后自动生效，不用重配。'
-    },
     'Sticky.RequireReleaseRecord': {
       tag: '暂未生效',
       note: 'V1 固定项：不开放修改；运行期没有读取点，配了也不会改变排产结果。'

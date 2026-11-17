@@ -55,6 +55,10 @@ public class RunLifecycleService : IRunLifecycleService
     /// 导致失败域永远判不出来（落到 `_ => RUNNING`）；词表对齐后该 bug 自愈。
     /// </summary>
     private const string PlanVersionFailedStatus = "FAILED";
+    /// <summary>域级失败稳定原因码（R3，4号位 2026-11-11 运行与下发页改版）：本域计算失败（根因域）。</summary>
+    private const string RunDomainReasonCodeCalcFailed = "DOMAIN_CALC_FAILED";
+    /// <summary>域级失败稳定原因码（R3）：因上游失败被拖累、本次未生成（非根因）。</summary>
+    private const string RunDomainReasonCodeBlockedByUpstream = "BLOCKED_BY_UPSTREAM_DOMAIN";
     /// <summary>运行状态：COMPLETED（G8 终态判定）</summary>
     private const string ScheduleRunCompletedStatus = "COMPLETED";
     /// <summary>运行状态：PARTIAL_SUCCESS（G8 终态判定）</summary>
@@ -975,6 +979,7 @@ public class RunLifecycleService : IRunLifecycleService
                 if (isTerminal && hasFailedDomain)
                 {
                     dto.Status = RunDomainBlockedStatus;
+                    dto.ReasonCode = RunDomainReasonCodeBlockedByUpstream;
                     dto.Reason = "上游 Domain 失败，本次未生成 PlanVersion（被阻断）";
                 }
                 else if (isTerminal)
@@ -994,6 +999,10 @@ public class RunLifecycleService : IRunLifecycleService
             dto.PlanVersionCode = pv.VersionCode;
             dto.ComputedAt = pv.ComputedAt;
             dto.ActivatedAt = pv.ActivatedAt;
+            // R1/R2（4号位 2026-11-11 运行与下发页改版）：该域本次 PlanVersion 的计划区间 + 任务数（纯投影，实体列本就在手）
+            dto.PlanHorizonStart = pv.PlanHorizonStart;
+            dto.PlanHorizonEnd = pv.PlanHorizonEnd;
+            dto.TotalTasks = pv.TotalTasks;
 
             // 口径（2026-10-15，B + 词表对齐）：**只看 Status，不再拿 VersionCategory 兜底**。
             //   · 原 bug：先判 VersionCategory=='CANDIDATE'，而每一行已采用的 VersionCategory 恒为 CANDIDATE
@@ -1015,6 +1024,7 @@ public class RunLifecycleService : IRunLifecycleService
 
             if (pv.Status == PlanVersionFailedStatus)
             {
+                dto.ReasonCode = RunDomainReasonCodeCalcFailed;
                 dto.Reason = string.IsNullOrWhiteSpace(run.ErrorMessage)
                     ? "域级计算失败"
                     : run.ErrorMessage;

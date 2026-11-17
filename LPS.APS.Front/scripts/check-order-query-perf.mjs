@@ -18,7 +18,7 @@
  *   node --experimental-websocket scripts/check-order-query-perf.mjs --url http://localhost:4001
  */
 import { spawn, execFileSync } from 'node:child_process'
-import { existsSync, mkdirSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import os from 'node:os'
@@ -147,7 +147,12 @@ async function browserCheck() {
     '--no-first-run', '--no-default-browser-check', '--disable-gpu', '--window-size=1920,1080',
     `${BASE}/#/login`
   ], { stdio: 'ignore' })
-  const kill = () => { try { execFileSync('taskkill', ['/pid', String(chrome.pid), '/T', '/F'], { stdio: 'ignore' }) } catch {} }
+  const kill = () => {
+    try { execFileSync('taskkill', ['/pid', String(chrome.pid), '/T', '/F'], { stdio: 'ignore' }) } catch {}
+    // 2026-11-13: 顺手删掉本轮 Chrome 临时 profile —— 以前只杀进程不删目录，
+    // 每跑一次实看就在 C:\Users\...\Temp 留 ~0.2 GB，攒几十次就把 C 盘撑爆了。
+    try { rmSync(profileDir, { recursive: true, force: true }) } catch {}
+  }
   try {
     let target = null
     for (let i = 0; i < 60; i++) {

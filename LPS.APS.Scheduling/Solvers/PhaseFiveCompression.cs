@@ -43,6 +43,7 @@ internal class PhaseFiveCompression
         //   不连库、不重跑 Phase2，还能按需求切片（几秒一轮）。
         //   零 I/O 红线不变：环境变量未设 ⇒ `SnapshotPhase5Inputs` 第一行即返回，程序集行为逐字不变。
         SnapshotPhase5Inputs(allScheduledTasks, request, constraints);
+        ProbeOverlaps("ENTRY", allScheduledTasks);   // 2026-11-14 探针：Phase2/4 交付时就有的重叠
 
         // ── R11-2（0号位 2026-10-28《R11_致1号位核查通知_新交付》§R11-2「可停止搜索」）──
         //   整改前：`PhaseFiveCompression.cs` 内 `CancellationToken` **0 命中** ⇒ Phase2/4 能被人工掐断，
@@ -61,6 +62,7 @@ internal class PhaseFiveCompression
         // 必须在 Shares/Dependency/硬校验/诊断之前执行，让下游看到压实后的最终时间。
         long swP5Compact = SolverDiagnostics.HotspotStart();
         CompactGaps(allScheduledTasks, request, constraints, cancellationToken);
+        ProbeOverlaps("AFTER_COMPACT", allScheduledTasks);   // 压实后
         SolverDiagnostics.HotspotEnd(swP5Compact, SolverDiagnostics.Hotspot.Phase5CompactGaps);
 
         // P1-02 item1（夜间 FULL，v1.2 §14-§16）：单 Resource × 生产日窗口 × 固定锚点间可移动段的
@@ -68,6 +70,7 @@ internal class PhaseFiveCompression
         // 门控：仅 FULL Run（§17：白天 Candidate 局部优先，不做全天重排）且 FORWARD（与压实同口径）。
         long swP5Setup = SolverDiagnostics.HotspotStart();
         OptimizeSetupSequences(allScheduledTasks, request, constraints, cancellationToken);
+        ProbeOverlaps("AFTER_SETUP", allScheduledTasks);   // Setup 序列优化后
         SolverDiagnostics.HotspotEnd(swP5Setup, SolverDiagnostics.Hotspot.Phase5SetupSeq);
 
         // ── N8-02（2026-10-17，1号位）：末端 Task × Demand 产出构成 —— 必须在**份额生成之前**算 ──
@@ -385,6 +388,46 @@ internal class PhaseFiveCompression
         }
         SolverDiagnostics.HotspotEnd(swP5UnschedAgg, SolverDiagnostics.Hotspot.Phase5UnschedAgg);
         SolverDiagnostics.HotspotEnd(swP5Unsched, SolverDiagnostics.Hotspot.Phase5Unsched);
+
+        // ── 2026-11-14 定向埋点（默认关闭；`APS_P5_TRACE_DEMAND` 未设 ⇒ 一条语句即返回）──
+        //   用途：某条需求「Phase2 已记未排」但 Phase5 的 U 仍是 0 时，一次打清它落在哪一步。
+        try
+        {
+            var p5TraceKey = Environment.GetEnvironmentVariable("APS_P5_TRACE_DEMAND");
+            if (!string.IsNullOrWhiteSpace(p5TraceKey))
+            {
+                var inv = System.Globalization.CultureInfo.InvariantCulture;
+                var inP2 = scheduleResult.UnscheduledDemandKeys.Contains(p5TraceKey);
+                var inP4 = repairedSourceDraftIds.Contains(p5TraceKey);
+                var taskCount = allScheduledTasks.Count(t => t.SourceDraftId == p5TraceKey);
+                var unsRow = unscheduledTasks.FirstOrDefault(u => u.DraftId == p5TraceKey);
+                declaredQtyByDemand.TryGetValue(p5TraceKey, out var dq);
+                landedQtyByDemand.TryGetValue(p5TraceKey, out var lq);
+                allocationSeqByDemandKey.TryGetValue(p5TraceKey, out var allocSeq);
+
+                var line = $"[{DateTime.Now:O}] P5 key={p5TraceKey}"
+                    + $" inP2Unsched={inP2} inP4Repaired={inP4} scheduledTaskCount={taskCount}"
+                    + $" declared={dq.ToString("G29", inv)} landed={lq.ToString("G29", inv)}"
+                    + (unsRow is null
+                        ? " unsRow=none"
+                        : $" unsRowQty={unsRow.UnscheduledQty.ToString("G29", inv)} unsRowReason={unsRow.Reason}")
+                    + $" allocSeq={allocSeq} allocU={unscheduledQtyByAllocation.GetValueOrDefault(allocSeq).ToString("G29", inv)}"
+                    + $" unscheduledTasksCount={unscheduledTasks.Count}"
+                    + $" p2UnschedCount={scheduleResult.UnscheduledDemandKeys.Count}"
+                    + $" p4UnschedCount={repairResult.StillUnscheduledKeys.Count}";
+
+                var traceOut = Environment.GetEnvironmentVariable("APS_P5_TRACE_OUT");
+                if (string.IsNullOrWhiteSpace(traceOut))
+                {
+                    traceOut = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "p5_trace.txt");
+                }
+                System.IO.File.AppendAllText(traceOut, line + Environment.NewLine);
+            }
+        }
+        catch
+        {
+            // 埋点失败绝不影响跑批
+        }
 
         long swP5Shares = SolverDiagnostics.HotspotStart();
         var allocationShares = GenerateAllocationShares(
@@ -1259,6 +1302,146 @@ internal class PhaseFiveCompression
     internal List<FinalTaskPeggingDraft> GenerateTaskDependenciesForTest(
         List<FinalTaskDraft> tasks, DomainSolveRequest request, ConstraintContext constraints)
         => GenerateTaskDependencies(tasks, request, constraints);
+
+    /// <summary>
+    /// 2026-11-14｜**同资源重叠探针**（`APS_P5_OVERLAP_PROBE=1` 时启用；未设 ⇒ 第一行即返回，零行为变更）。
+    ///
+    /// <para>用途：判定「同资源两任务重叠」是 <b>Phase2/4 排出来的</b>，还是 <b>Phase5 压实/Setup 优化移动出来的</b>。
+    /// 在 Phase5 的 ENTRY / AFTER_COMPACT / AFTER_SETUP 三个时点各调一次，逐行追加到
+    /// `APS_P5_OVERLAP_OUT`（默认 `%TEMP%/p5_overlap.txt`）。</para>
+    ///
+    /// <para>判据与 <c>ValidateHardResult</c> 第 1 项**逐字相同**：占用起点 = PlannedStart − Setup，
+    /// 半开区间 <c>a.Start &lt; b.End &amp;&amp; a.End &gt; b.Start</c>；零时长窗（Start ≥ End）不参与。</para>
+    /// </summary>
+    internal static void ProbeOverlaps(string tag, IReadOnlyList<FinalTaskDraft> tasks)
+    {
+        try
+        {
+            if (!string.Equals(Environment.GetEnvironmentVariable("APS_P5_OVERLAP_PROBE"), "1", StringComparison.Ordinal))
+            {
+                return;
+            }
+
+            var targetRes = int.TryParse(
+                Environment.GetEnvironmentVariable("APS_P5_OVERLAP_RESOURCE"), out var parsed) && parsed > 0
+                ? parsed
+                : 1000025577;
+
+            var outPath = Environment.GetEnvironmentVariable("APS_P5_OVERLAP_OUT");
+            if (string.IsNullOrWhiteSpace(outPath))
+            {
+                outPath = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "p5_overlap.txt");
+            }
+
+            var perResource = new Dictionary<int, int>();
+            var samples = new List<string>();
+            var totalOverlaps = 0;
+
+            foreach (var group in tasks
+                         .Where(t => t.ResourceId is not null)
+                         .GroupBy(t => t.ResourceId!.Value))
+            {
+                var rows = group
+                    .Where(t => t.PlannedStartTime.AddMinutes(-(double)t.SetupTime) < t.PlannedEndTime)
+                    .OrderBy(t => t.PlannedStartTime)
+                    .ToList();
+
+                for (var i = 0; i < rows.Count - 1; i++)
+                {
+                    var a = rows[i];
+                    var b = rows[i + 1];
+                    var aStart = a.PlannedStartTime.AddMinutes(-(double)a.SetupTime);
+                    var bStart = b.PlannedStartTime.AddMinutes(-(double)b.SetupTime);
+
+                    if (aStart < b.PlannedEndTime && a.PlannedEndTime > bStart)
+                    {
+                        totalOverlaps++;
+                        perResource[group.Key] = perResource.GetValueOrDefault(group.Key) + 1;
+                        if (samples.Count < 5)
+                        {
+                            samples.Add(
+                                $"Res{group.Key}: {a.FinalDraftId}[{aStart:MM-dd HH:mm:ss}-{a.PlannedEndTime:HH:mm:ss}]"
+                                + $" x {b.FinalDraftId}[{bStart:MM-dd HH:mm:ss}-{b.PlannedEndTime:HH:mm:ss}]");
+                        }
+                    }
+                }
+            }
+
+            var targetTasks = tasks.Count(t => t.ResourceId == targetRes);
+            var line = $"[{DateTime.Now:O}] {tag}"
+                + $" tasks={tasks.Count} overlaps={totalOverlaps} resourcesWithOverlap={perResource.Count}"
+                + $" targetRes={targetRes} targetTasks={targetTasks}"
+                + $" targetOverlaps={perResource.GetValueOrDefault(targetRes)}"
+                + $" | e.g. {string.Join(" ; ", samples)}";
+
+            System.IO.File.AppendAllText(outPath, line + Environment.NewLine);
+        }
+        catch
+        {
+            // 探针失败绝不影响跑批
+        }
+    }
+
+    /// <summary>
+    /// **2026-11-16｜跨物料 TaskDependency 越序取证探针（1号位，只读）**。
+    ///
+    /// <para>与 <see cref="ProbeOverlaps"/> 同款：只回答「此刻的 tasks 里，父件首道是否早于子件末道」。
+    /// 复用 <see cref="GenerateCrossMaterialDependencies"/> + <see cref="CheckTaskDependencies"/> 的**同一份**判据，
+    /// 在 AFTER_PHASE2 / AFTER_PHASE4 各跑一次，即可判定越序是 Phase2 就存在、还是 Phase4 之后才冒出来。</para>
+    ///
+    /// <para>零行为变化：仅当 <c>APS_P5_XMAT_PROBE=1</c> 时工作；输出到 <c>APS_P5_XMAT_OUT</c>（默认 /tmp/p5_xmat.txt）。</para>
+    /// </summary>
+    internal static void ProbeCrossMaterial(
+        string tag,
+        List<FinalTaskDraft> tasks,
+        DomainSolveRequest request,
+        ConstraintContext constraints)
+    {
+        try
+        {
+            if (!string.Equals(Environment.GetEnvironmentVariable("APS_P5_XMAT_PROBE"), "1", StringComparison.Ordinal))
+            {
+                return;
+            }
+
+            var outPath = Environment.GetEnvironmentVariable("APS_P5_XMAT_OUT");
+            if (string.IsNullOrWhiteSpace(outPath))
+            {
+                outPath = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "p5_xmat.txt");
+            }
+
+            var deps = GenerateCrossMaterialDependencies(tasks, request, constraints);
+            var taskDict = tasks.ToDictionary(t => t.FinalDraftId);
+            var violations = new List<string>();
+
+            foreach (var dep in deps)
+            {
+                if (!taskDict.TryGetValue(dep.UpstreamFinalDraftId, out var up)
+                    || !taskDict.TryGetValue(dep.DownstreamFinalDraftId, out var down))
+                {
+                    continue;
+                }
+
+                var earliest = up.PlannedEndTime.AddMinutes((double)dep.LagTime);
+                if (down.PlannedStartTime >= earliest) continue;
+
+                if (violations.Count < 8)
+                {
+                    violations.Add(
+                        $"上游[{up.StageCode}/{up.OperationCode} src={up.SourceDraftId}] end={up.PlannedEndTime:MM-dd HH:mm:ss}"
+                        + $" × 下游[{down.StageCode}/{down.OperationCode} src={down.SourceDraftId}] start={down.PlannedStartTime:MM-dd HH:mm:ss} lag={dep.LagTime}");
+                }
+            }
+
+            var line = $"[{DateTime.Now:O}] {tag} tasks={tasks.Count} deps={deps.Count} violations={violations.Count}"
+                + (violations.Count > 0 ? " | " + string.Join(" ; ", violations) : string.Empty);
+            System.IO.File.AppendAllText(outPath, line + Environment.NewLine);
+        }
+        catch
+        {
+            // 探针失败绝不影响跑批
+        }
+    }
 
     private static void CompactGaps(
         List<FinalTaskDraft> tasks,
@@ -3079,7 +3262,7 @@ internal class PhaseFiveCompression
     ///   • 判别（R4）：跨物料靠 `UpstreamMaterialId != DownstreamMaterialId`，不新增枚举。
     ///   • 子件或父件未排成 → 无血缘可产（父件本就 Unscheduled），跳过。
     /// </summary>
-    private List<FinalTaskPeggingDraft> GenerateCrossMaterialDependencies(
+    private static List<FinalTaskPeggingDraft> GenerateCrossMaterialDependencies(
         List<FinalTaskDraft> tasks,
         DomainSolveRequest request,
         ConstraintContext constraints)
@@ -3148,7 +3331,11 @@ internal class PhaseFiveCompression
                 ? producerDemand.NetOutputQty
                 : link.RequiredQty;
 
-            // P1-12 跨厂滞后（分钟）。当前 2号位 血缘边恒同厂 → 恒 0（1号位 20260924 回执 §六 已对齐）。
+            // P1-12 跨厂滞后（分钟）。
+            // ⚠ 2026-11-13 更正：原注写「当前 2号位 血缘边恒同厂 → 恒 0（1号位 20260924 回执 §六 已对齐）」，
+            //   CF-007 落地后**不再成立** —— 跨厂 SH 的 LagMinutes 会非 0（跨厂 LT；
+            //   0号位 2026-11-13 已裁「合法多层兜底解析后提供，缺失不得按 0」）。
+            //   本方法读的是实际值，**逻辑无需改动**；原「恒 0」只描述当时的输入，不是本方法的假设。
             decimal lagMinutes = 0m;
             if (constraints.CrossMaterialLagMinutes.TryGetValue(
                     (link.ConsumerLogicalDemandKey, producerKey), out var lag))

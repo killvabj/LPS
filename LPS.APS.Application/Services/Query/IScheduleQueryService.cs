@@ -25,10 +25,22 @@ namespace LPS.APS.Application.Services.Query;
 /// </summary>
 public interface IScheduleQueryService
 {
-    /// <summary>获取计划版本列表（最新优先，按当前用户业务范围过滤）</summary>
+    /// <summary>
+    /// 获取计划版本列表（最新优先，按当前用户业务范围过滤）。
+    /// R5（11-12 4号位件）：行内新增 `isDefault`——该行是其**域内当前生效版本**（ACTIVE，
+    /// UQ_PlanVersion_OneActivePerDomain 保证每域至多一条）；全局无单一"当前生效"，跨域用户请从 isDefault 行中取 ActivatedAt 最新者作页面默认。
+    /// </summary>
     Task<IReadOnlyList<PlanVersionSummaryDto>> GetVersionsAsync(
         int userId,
         int take = 30,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// 与 <see cref="GetVersionsAsync"/> 同 WHERE（ArchivedAt IS NULL + 同范围收窄）的**全量条数**（R5：
+    /// 供 X-Total-Count 响应头，避免 TOP take 静默截断；空域授权 fail-closed=0）。
+    /// </summary>
+    Task<int> CountVersionsAsync(
+        int userId,
         CancellationToken cancellationToken = default);
 
     /// <summary>

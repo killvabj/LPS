@@ -1419,8 +1419,48 @@ public class GovernanceController : ControllerBase
         [FromQuery] string? runType = null,
         CancellationToken ct = default)
     {
-        var result = await _scheduleRunRepo.GetListAsync(take, status, runType, ct);
+        var scope = await _dataScopeService.ResolveScopeAsync(GetCurrentUserId(), ct);
+        var allowedDomains = ResolveRunScopeDomains(scope);
+        var result = await _scheduleRunRepo.GetListAsync(take, status, runType, allowedDomains, ct);
         return Ok(ApiResponse<IReadOnlyList<ScheduleRunGov>>.Success(result));
+    }
+
+    /// <summary>
+    /// Run 历史分页查询（R4，4号位 2026-11-11 运行与下发页改版：runs 列表分页 + total）。
+    /// 服务端分页返回 <see cref="ScheduleRunGovPage"/>（items + 过滤后 total），排序 [StartedAt] DESC, [Id] DESC 稳定翻页。
+    /// 保留既有 <c>/runs</c> 数组端点兼容旧消费方；本端点新增分页形态（不破坏既有消费方，4号位 倾向方案）。
+    /// </summary>
+    /// <param name="page">页码（1 基，缺省 1）</param>
+    /// <param name="pageSize">每页条数（缺省 100，上限 200）</param>
+    /// <param name="status">按运行状态过滤（RUNNING / COMPLETED / PARTIAL_SUCCESS / FAILED，可选）</param>
+    /// <param name="runType">按运行类型过滤（可选）</param>
+    [Authorize(Policy = PermissionCodes.PlanView)]
+    [HttpGet("runs/paged")]
+    public async Task<IActionResult> GetRunsPaged(
+        [FromQuery] int? page = null,
+        [FromQuery] int? pageSize = null,
+        [FromQuery] string? status = null,
+        [FromQuery] string? runType = null,
+        CancellationToken ct = default)
+    {
+        var (skip, take) = ResolvePaging(page, pageSize);
+        var scope = await _dataScopeService.ResolveScopeAsync(GetCurrentUserId(), ct);
+        var allowedDomains = ResolveRunScopeDomains(scope);
+        var result = await _scheduleRunRepo.GetPageAsync(skip, take, status, runType, allowedDomains, ct);
+        return Ok(ApiResponse<ScheduleRunGovPage>.Success(result));
+    }
+
+    /// <summary>
+    /// 解析 runs 列表/分页的业务范围过滤域集合（R1，4号位 2026-11-12 运行与下发页业务范围未生效）。
+    /// Global（全放行）⇒ null（仓储跳过过滤）；非 Global ⇒ 取 Domain 维度授权值；
+    /// 无 Domain 维度授权 ⇒ 空集（除非持有其他维度）⇒ 仓储 EXISTS 恒假 fail-closed，受限用户看不到任何批次
+    /// （judging = 仅 Domain 维度为准，Q1 裁定；无登记域批次对受限用户不可见，Q2 裁定：仅 Global 可见）。
+    /// </summary>
+    private static IReadOnlyList<string>? ResolveRunScopeDomains(DataScopeContext scope)
+    {
+        if (scope.IsGlobal)
+            return null;
+        return scope.GetValues(DataScopeTypes.Domain)?.ToList() ?? new List<string>();
     }
 
     /// <summary>解析 1 基页码到 skip/take（page=1 → skip=0；pageSize 上限 500 防全表拉取）</summary>
