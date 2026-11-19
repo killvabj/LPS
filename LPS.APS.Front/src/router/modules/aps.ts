@@ -214,6 +214,29 @@ export const apsV1Routes: AppRouteRecordRaw[] = [
         }
       },
       {
+        /* ===== 采购协同（PO 行主表）=====
+         * 5号位 2026-11-16《P01～P13＋采购协同 页面—接口实施矩阵 v0.1》A9/A11/A12/A13 行：
+         *  - 数据面 A9  GET /api/supply-fact-trace（供给事实行：采购/在途/到厂未入库/已收货）
+         *  - 数据面 A13 GET /api/procurement-manual-eta（人工到货，只读关联）
+         *  - A11 三列（关联根订单/最早需用日/晚到）后端缺源 ⇒ 显「未提供」，不造「统一需用日」
+         *  - A12（D-01 版本间新增/变化筛选）缺源 ⇒ 页面置灰（v0.2 §8.1 D-01 允许 V1.1）
+         * ⚠️ 菜单名用 5号位矩阵里的原词「采购协同」；**正式菜单名签发权在 0号位**
+         *    （我方 11-17 函 Q2 未闭）⇒ 若 0号位另发名字，改这里一处即可。
+         * ⚠️ 后端 `SupplyFactTraceController` 的 Policy 同为 PermissionCodes.PlanView
+         */
+        path: '/aps/procurement',
+        component: () => import('@/views/Aps/Procurement.vue'),
+        name: 'ApsProcurement',
+        meta: {
+          title: '采购协同',
+          icon: 'vi-mdi:truck-fast',
+          noCache: true,
+          stage: 'D',
+          acceptance: 'P07 / 矩阵 A9·A11·A12·A13',
+          apsRequiredPermissions: ['aps.plan.view']
+        }
+      },
+      {
         path: '/aps/demand-protection',
         component: () => import('@/views/Aps/DemandProtection.vue'),
         name: 'ApsDemandProtection',

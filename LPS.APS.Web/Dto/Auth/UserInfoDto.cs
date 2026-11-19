@@ -9,8 +9,14 @@ public class UserInfoDto
     /// <summary>用户工号</summary>
     public string UserCode { get; set; } = string.Empty;
 
-    /// <summary>用户姓名</summary>
+    /// <summary>用户姓名（显示名 DisplayName；R1 起改读 DB 真值而非 JWT claim，改资料后立即生效）</summary>
     public string UserName { get; set; } = string.Empty;
+
+    /// <summary>邮箱（可空；库里为空返回 null，前端按「未提供」显示）</summary>
+    public string? Email { get; set; }
+
+    /// <summary>手机号（可空；库里为空返回 null，前端按「未提供」显示）</summary>
+    public string? PhoneNumber { get; set; }
 
     /// <summary>角色列表</summary>
     public List<string> Roles { get; set; } = new();

@@ -1,0 +1,1870 @@
+<?xml version="1.0"?>
+<doc>
+    <assembly>
+        <name>LPS.APS.Web</name>
+    </assembly>
+    <members>
+        <member name="T:LPS.APS.Web.Authorization.PermissionRequirement">
+            <summary>功能权限点授权要求（携带目标 PermissionCode）</summary>
+        </member>
+        <member name="P:LPS.APS.Web.Authorization.PermissionRequirement.PermissionCode">
+            <summary>目标权限码</summary>
+        </member>
+        <member name="T:LPS.APS.Web.Authorization.PermissionAuthorizationHandler">
+            <summary>
+            功能权限点授权处理器（F-G3，3号位）
+            从 JWT 取用户 Id，经 IPermissionService 校验目标权限码；缺用户或未命中 → 失败。
+            </summary>
+        </member>
+        <member name="M:LPS.APS.Web.Authorization.PermissionAuthorizationHandler.HandleRequirementAsync(Microsoft.AspNetCore.Authorization.AuthorizationHandlerContext,LPS.APS.Web.Authorization.PermissionRequirement)">
+            <inheritdoc />
+        </member>
+        <member name="T:LPS.APS.Web.Authorization.ScopeFilter">
+             <summary>
+             Scope 校验/过滤辅助（5号位接口接入线，消费 3号位 IDataScopeService 的样板）
+            
+             语义（对齐 3号位 30-3 回执 + F-G4 裁决）：
+               - Global：全放行，不追加过滤；
+               - Empty（无任何策略）：拒绝全部（安全默认）；
+               - 同一维度并集（IN 集合过滤），不同维度交集（多列 AND 过滤）；
+               - 本端点可执行的维度均未获授权时 fail-closed 拒绝全部（Business Scope ≠ Domain Scope 别名，
+                 ProductFamily/Department 等无法映射到本端点过滤列的维度授权不扩大可见范围）。
+             </summary>
+        </member>
+        <member name="M:LPS.APS.Web.Authorization.ScopeFilter.IsDenyAll(LPS.APS.Core.Authorization.DataScopeContext,System.String[])">
+            <summary>
+            是否应拒绝全部（fail-closed）。
+            scope 为空，或本端点可执行的维度均未获授权时返回 true。
+            </summary>
+            <param name="scope">已解析的业务范围</param>
+            <param name="enforceableTypes">本端点可执行的过滤维度（DataScopeTypes 常量）</param>
+        </member>
+        <member name="M:LPS.APS.Web.Authorization.ScopeFilter.Values(LPS.APS.Core.Authorization.DataScopeContext,System.String)">
+            <summary>
+            取某维度的过滤集合。
+            Global 或该维度未授权时返回 null（表示不追加该维度过滤）。
+            </summary>
+        </member>
+        <member name="T:LPS.APS.Web.Controllers.AuditController">
+            <summary>
+            审计日志查询控制器（3号位）
+            独立于 <see cref="T:LPS.APS.Web.Controllers.RbacController"/>——其类级 auth.manage 门禁会与本类 audit.view 叠加为 AND，
+            锁死仅持 audit.view 的审计用户（违背最小权限）。本控制器仅要求 audit.view，
+            路由保持 api/rbac/audit-logs 不变（前端契约零改动）。
+            </summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.AuditController.GetAuditLogs(System.Nullable{System.Int32},System.String,System.Nullable{System.DateTime},System.Nullable{System.DateTime},System.Int32,System.Int32,System.Threading.CancellationToken)">
+            <summary>审计日志分页查询（审计页；audit.view 权限；操作人/动作/时间范围 可空组合，倒序分页）</summary>
+        </member>
+        <member name="T:LPS.APS.Web.Controllers.AuthController">
+            <summary>
+            认证控制器
+            提供登录、刷新Token、登出接口
+            </summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.AuthController.Login(LPS.APS.Web.Dto.Auth.LoginRequestDto)">
+            <summary>
+            用户登录
+            </summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.AuthController.RefreshToken(LPS.APS.Web.Dto.Auth.RefreshTokenRequestDto)">
+            <summary>
+            刷新 AccessToken
+            </summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.AuthController.Logout">
+            <summary>
+            登出
+            </summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.AuthController.UpdateProfile(LPS.APS.Web.Dto.Auth.UpdateProfileRequest)">
+            <summary>
+            改自己资料（R1，4号位 2026-11-17 来文；仅显示名/邮箱/手机号——登录名 UserCode/Status/角色/范围归 auth.manage 管理面，不可自助改）。
+            </summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.AuthController.ChangePassword(LPS.APS.Web.Dto.Auth.ChangePasswordRequest)">
+            <summary>
+            修改密码（R2，4号位 2026-11-17 来文；验旧密码 + 新密码规则 + 改后清 RefreshToken 旧会话失效）。
+            </summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.AuthController.GetCurrentUser(System.Threading.CancellationToken)">
+            <summary>
+            获取当前用户信息（验证Token有效性）
+            含业务范围（IsGlobal + 各维度集合），直接复用 IDiaScopeService（不建立第二套 Scope DTO 真值）。
+            </summary>
+        </member>
+        <member name="T:LPS.APS.Web.Controllers.BusinessFactIssueController">
+             <summary>
+             ODS/复杂事实Issue查询控制器（5号位提供给4号位）
+            
+             用于Explanation辅助、事实异常展示
+             统一聚合来自多个5号位事实源的Issue（BOM Workset / MaterialStageDeptContext等）
+            
+             路由规范：
+               GET /api/business-fact-issues                  - 聚合查询所有Issue
+               GET /api/business-fact-issues/bom-workset      - 查询BOM Workset Issues
+               GET /api/business-fact-issues/material-stage   - 查询MaterialStageDeptContext Issues
+            
+             【职责边界】
+             - 5号位提供ODS/复杂事实Issue查询
+             - 4号位用于Explanation辅助和事实异常展示
+             </summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.BusinessFactIssueController.GetCurrentUserId">
+            <summary>解析当前登录用户 Id（无效返回 0 → 范围解析为拒绝全部，安全默认）</summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.BusinessFactIssueController.QueryAll(System.String,System.String,System.String,System.String,System.String,System.String,System.String,System.Int32,System.Int32,System.Threading.CancellationToken)">
+             <summary>
+             聚合查询所有ODS/复杂事实Issues
+            
+             Q5 三级 Scope 处理（31-0 裁决，33-0 红线）：
+             ① Issue 有 Factory 关联 → 按 Factory Scope 过滤
+             ② Factory 为空但可经 StageCode→ProcessCodeDict 派生 → 按派生 Factory 过滤
+             ③ 真正系统级/全局 Issue → 仅 Global Scope 用户可见
+            
+             实现：全链路下推 allowedFactories 到 SQL WHERE，null = Global 全放行。
+             </summary>
+             <summary>
+             11-11（4号位《业务事实问题表工厂视角改版》件 §二）：新增两个可选参数——
+             `issueType`（问题类型等值，10 码封闭值域，空串=不过滤）；
+             `keyword`（模糊：BOM 源打 Detail/BOMNO/Parent+ChildMaterialCode 四列，MSC 源无单据号列只打 Detail/MaterialCode；
+              CI 排序规则大小写不敏感；**各自源内先过滤**，不跨源取数）。
+             同时修复：`factoryCode` 此前被接受但从未下推（列表与计数都丢参）⇒ 现在两路都生效；
+             `CountAllAsync` 与列表同参数集（total/列表分叉同型清扫）。
+             </summary>
+        </member>
+        <member name="T:LPS.APS.Web.Controllers.CandidateController">
+            <summary>
+            白天候选统一入口 API（E：PM 2026-09-23 裁决 Candidate 统一入口；3号位 Web 层薄封装）。
+            只做读查询 + 委托 IScheduleQueryService，不触碰排程编排（编排仍归 2号位 SchedulingOrchestrator）。
+            </summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.CandidateController.GetCurrentUserId">
+            <summary>解析当前登录用户 Id（无效返回 0 → 范围解析为拒绝全部，安全默认）</summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.CandidateController.GetSummary(System.Int32,System.Threading.CancellationToken)">
+            <summary>候选运行摘要（E-1：Status/创建时间/订单数/Task 数）</summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.CandidateController.GetComparison(System.Int32,System.Threading.CancellationToken)">
+            <summary>候选 vs 基础差异（E-1：最小集 addedOrders/removedOrders/changedTasks）</summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.CandidateController.GetExpediteImpact(System.Int32)">
+            <summary>候选加速影响范围（E-2：宿主先行骨架端点；P1-2 数据就绪后填充真实影响范围）</summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="T:LPS.APS.Web.Controllers.CtpController">
+            <summary>
+            CTP（承诺交期）评估接口（骨架）。
+            3号位 职责：挂权限码 + domainKey resolve（缺省自动）+ F-G4 业务范围（Domains）二次校验；
+            核心试算能力归 1号位/2号位，接入前返回 501。
+            契约：APS V1 CTP 评估接口契约登记 v1.0（2026-09-30）。
+            错误映射：resolve 失败 400 / scope 越界 403 / 核心未接入 501。
+            </summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.CtpController.GetCurrentUserId">
+            <summary>解析当前登录用户 Id（无效时返回 0 → 范围解析为拒绝全部，安全默认）</summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.CtpController.Evaluate(LPS.APS.Core.DTOs.Ctp.CtpEvaluateRequest,System.Threading.CancellationToken)">
+            <summary>发起承诺交期评估（CTP 试算）——骨架：resolve + scope 二次校验，核心计算待 1号位/2号位 接入</summary>
+            <remarks>开发者：3号位（编排骨架）；核心试算能力归 1号位/2号位</remarks>
+        </member>
+        <member name="T:LPS.APS.Web.Controllers.DemandProtectionController">
+             <summary>
+             Demand Protection控制器（5号位提供给4号位）
+            
+             路由规范：
+               GET  /api/demand-protection                      - Demand Protection列表查询
+               GET  /api/demand-protection/summary              - Demand Protection汇总
+               POST /api/demand-protection/release              - 释放Demand Protection
+            
+             【职责边界 - 2026-09-12】
+             - 查看：5号位自己实现（直接查库）
+             - 释放：逐lock处理，部分成功；Allocation不动，下一轮Pegging自然回流
+            
+             【架构】通过 IDemandProtectionAppService（Application 层）中转，
+              与 ScheduleController / GovernanceController 分层一致。
+             </summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.DemandProtectionController.Query(System.String,System.String,System.String,System.String,System.Int32,System.Int32,System.Threading.CancellationToken)">
+            <summary>
+            查询Demand Protection列表
+            </summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.DemandProtectionController.GetSummary(System.String,System.Threading.CancellationToken)">
+            <summary>
+            查询Demand Protection汇总
+            </summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.DemandProtectionController.Release(LPS.APS.Core.Dto.DemandProtectionReleaseRequest,System.Threading.CancellationToken)">
+            <summary>
+            释放Demand Protection（逐lock处理，部分成功）
+            通过 IDemandProtectionAppService 中转（5号位只做权限/Scope校验与中转）
+            </summary>
+        </member>
+        <member name="T:LPS.APS.Web.Controllers.DomainStatusController">
+             <summary>
+             排程域状态查询控制器（G8：5号位业务接口接入层）
+            
+             路由规范：
+               GET /api/domain-status/{scheduleRunId}  - 查询排程域状态
+            
+             【职责边界 - 2026-09-06审核确认】
+             - 普通结果查询：4 → 5 → 2（5号位中转，2号位运行真值）
+             - 当前实现：5号位调用3号位RunLifecycleService获取状态真源
+             - 后续目标：G8数据源从5→3迁移到5→2（2号位Query Service）
+             - 5号位不自行聚合状态，不重算业务真值
+             - 状态取值：COMPLETED / CANDIDATE / RUNNING / FAILED / BLOCKED / NOT_STARTED
+             </summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.DomainStatusController.GetCurrentUserId">
+            <summary>解析当前登录用户 Id（无效返回 0 → 范围解析为拒绝全部，安全默认）</summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.DomainStatusController.GetRunDomainStatus(System.Int32,System.Threading.CancellationToken)">
+             <summary>
+             查询排程域状态（G8）
+            
+             【异常→HTTP 语义修正 2026-10-16（4号位 R4 联调回执）】
+               原实现 catch Exception → ApiResponse.Fail(500)。但 Fail 只改 body.code、HTTP 状态恒 200，
+               前端无法区分「查询失败」与「该 Run 无域状态记录」。现与 GovernanceController 同逻辑端点对齐：
+                 · Run 不存在 / ExpectedDomainKeysJson 缺失或损坏（InvalidOperationException）→ 404
+                 · 其他异常 → 500
+                 · 正常空域状态（合法 ExpectedDomainKeys 但计划域当前无记录）→ 200 + []
+            
+             【数据范围过滤 2026-11-07（4号位 越权缺陷函，口径=甲方 A 案）】
+               原实现不调用 IDataScopeService ⇒ 未授权用户可见整批 Run 的全部域状态。
+               现按 Domain 维度逐条 Allows 过滤：Global 全放行；有范围集合按集；**无 Domain 维度授权 ⇒ 全部滤除（fail-closed）**。
+               过滤后为空 = 200 + []（与 order-query/schedule 同口径：空集合不区分"无权"与"确无"，均不泄露存在性）。
+             </summary>
+             <param name="scheduleRunId">排程运行ID</param>
+             <param name="cancellationToken">取消令牌</param>
+        </member>
+        <member name="T:LPS.APS.Web.Controllers.ExplanationController">
+             <summary>
+             Explanation排程原因解释控制器（5号位提供给4号位）
+            
+             路由规范：
+               GET /api/explanation?planVersionId=           - Explanation列表查询
+               GET /api/explanation/summary?planVersionId=   - Explanation汇总
+            
+             【职责边界】
+             - 5号位提供只读查询接口，直接读取ScheduleExplanationFact表
+             - 不重新裁决延期原因
+             - 数据来源：1号位产出，2号位落盘
+             </summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.ExplanationController.Query(System.Int32,System.String,System.Nullable{System.Int64},System.Nullable{System.Int64},System.String,System.String,System.Int32,System.Int32,System.Threading.CancellationToken)">
+            <summary>
+            查询Explanation列表
+            </summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.ExplanationController.GetSummary(System.Int32,System.Threading.CancellationToken)">
+            <summary>
+            查询Explanation汇总（含按ReasonCode分组统计）
+            </summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.ExplanationController.GetDemandReconciliation(System.Int32,System.Nullable{System.Int32},System.Nullable{System.Int64},System.String,System.String,System.Int32,System.Int32,System.Threading.CancellationToken)">
+            <summary>
+            Demand 数量对账读模型（**FULL-06**，0号位 11-09 任务书 §2.A）：
+            `GET /api/explanation/demand-reconciliation?planVersionId=…`
+            同 Run／同 PlanVersion／同 Demand 的 Q/S/U **原值**+事实类型三族（判据=UnscheduledSource，非 ObjectType）；
+            读侧不重算、不掩盖 S&gt;Q（211 行现值如实透出，修数=2号位 FULL-01）。
+            </summary>
+        </member>
+        <member name="T:LPS.APS.Web.Controllers.GovernanceController">
+            <summary>
+            治理版本管理 API（阶段 A-9：3号位 Web 层实现）
+            提供 RuleSetVersion / ParameterSetVersion 的 CRUD + 发布接口。
+            红线：发布接口仅接受 DRAFT/SUBMITTED/APPROVED 状态（六态状态机 R01 验收）。
+            </summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.GetCurrentUserId">
+            <summary>解析当前登录用户 Id（无效时返回 0 → 范围解析为拒绝全部，安全默认）</summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.GetCurrentUserCode">
+            <summary>解析当前登录用户工号（审计真实 Actor，P1-04 强制后端取身份，禁止信任请求体）</summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.CreateRuleSet(LPS.APS.Core.Entities.APS.RuleSet,System.Threading.CancellationToken)">
+            <summary>
+            新建规则集主表（POST /rule-set；2026-10-22 补齐 4号位 缺口/T4）。
+            Q1：RuleSetCode 用户填、唯一（大小写不敏感）、创建后不可变更；Q2：两步——主表仅建壳，前端随后自动跟建空白 DRAFT 版本；
+            Q3＝方案 A 跨域通用（无排程域字段）；Q6＝挂 aps.rule.edit（RuleMaintain）。无 DELETE 端点（Q5，一律 IsActive 停用）。
+            </summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.UpdateRuleSet(System.Int64,LPS.APS.Core.Entities.APS.RuleSet,System.Threading.CancellationToken)">
+            <summary>
+            编辑规则集主表（PUT /rule-set/{id}）：改 Name/Description/IsActive；RuleSetCode 冻结不可改；不符 → 400。
+            Q4：IsActive=0 仅关主表、不级联版本（运行时装载判主表归 2号位/1号位 转达项）；Q6＝aps.rule.edit。
+            </summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.CreateParameterSet(LPS.APS.Core.Entities.APS.ParameterSet,System.Threading.CancellationToken)">
+            <summary>
+            新建参数集主表（POST /parameter-set；2026-10-25 补齐 4号位 缺口，照 rule-set 10-22 范式）。
+            Q1＝编码用户填、唯一（大小写不敏感）、创建后不可变更；Q2＝两步——主表仅建壳，前端随后自动跟建空白 DRAFT 版本；
+            Q3＝方案 A 跨域通用（无排程域字段）；Q5＝不给 DELETE；Q6＝挂 aps.parameter.edit（ParameterEdit）。
+            </summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.UpdateParameterSet(System.Int64,LPS.APS.Core.Entities.APS.ParameterSet,System.Threading.CancellationToken)">
+            <summary>
+            编辑参数集主表（PUT /parameter-set/{id}）：改 Name/Description/IsActive；ParameterSetCode 冻结不可改；不符 → 400。
+            Q4：IsActive=0 仅关主表、不级联版本（运行时装载判主表归 2号位/1号位 转达项）；Q6＝aps.parameter.edit。
+            </summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.CreateStrategyProfile(LPS.APS.Core.Entities.APS.StrategyProfile,System.Threading.CancellationToken)">
+            <summary>
+            新建策略包主表（POST /strategy-profile；2026-10-25 补齐 4号位 缺口，照 rule-set 10-22 范式）。
+            Q1＝编码用户填、唯一、创建后不可变更；Q2＝**只建壳，不能自动跟建版本**（StrategyProfileVersion.RuleSetVersionId/ParameterSetVersionId 均必填 FK，
+            无「空白首版」合法状态 ⇒ 首版在「新建草稿」里选两个已发布版本）；Q3＝跨域通用；Q5＝不给 DELETE；
+            Q6＝aps.strategy.edit（StrategyEdit）；Q8＝RunType 仅五值或 NULL（冻结 07 §5.5）。
+            </summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.UpdateStrategyProfile(System.Int64,LPS.APS.Core.Entities.APS.StrategyProfile,System.Threading.CancellationToken)">
+            <summary>
+            编辑策略包主表（PUT /strategy-profile/{id}）：改 Name/Description/RunType/IsActive；StrategyProfileCode 冻结不可改；不符 → 400。
+            Q4：IsActive=0 仅关主表、不级联版本（运行时装载判主表归 2号位/1号位 转达项）；Q6＝aps.strategy.edit。
+            </summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.DeleteParameterSet(System.Int64,System.Threading.CancellationToken)">
+            <summary>
+            物理删除参数集整族（DELETE /parameter-set/{id}，2026-10-26 同 R1 规则集删除口径）：无任何 PUBLISHED（已发布）版本才可删
+            （纯新建未发布族）；含 PUBLISHED（已发布）仍只可停用（历史不可变守恒）。被策略包版本引用则拒绝（FK 反查阻断）。
+            审计前置（ActionCode=Delete）后整族删（单事务）。权限 Q6＝aps.parameter.edit。
+            </summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.DeleteStrategyProfile(System.Int64,System.Threading.CancellationToken)">
+            <summary>
+            物理删除策略包整族（DELETE /strategy-profile/{id}，2026-10-26 同 R1 规则集删除口径）：无任何 PUBLISHED（已发布）版本才可删
+            （纯新建未发布族）；含 PUBLISHED（已发布）仍只可停用（历史不可变守恒）。被 ScheduleRun（运行）引用则拒绝（FK 反查阻断）。
+            审计前置（ActionCode=Delete）后整族删（单事务）。权限 Q6＝aps.strategy.edit。
+            </summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.DeleteRuleSet(System.Int64,System.Threading.CancellationToken)">
+            <summary>
+            物理删除规则集整族（DELETE /rule-set/{id}，R1 2026-10-25 例外 Q5）：无任何 PUBLISHED 版本才可删（纯新建未发布族）；
+            有 PUBLISHED 仍只可停用（历史不可变守恒）。被策略包引用则拒绝（FK 防护）。审计前置后整族删（单事务）。
+            </summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.DeleteRuleSetVersion(System.Int64,System.Threading.CancellationToken)">
+            <summary>
+            物理删除单个草稿版本（DELETE /rule-set/version/{id}，R1 2026-10-25）：仅 Status=DRAFT 可删（清空白草稿壳）；
+            已发布/停用/归档拒绝。被策略包引用则拒绝。审计前置后删单行。
+            </summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.GetRuleSetVersions(System.Int64,System.Threading.CancellationToken)">
+            <summary>
+            获取规则集的所有版本（rule-set 同族 2026-10-15：摘要 DTO，镜像参数集 R2——不含 ContentSnapshotJson/DemandPriorityJson 大 JSON 载体；
+            2026-10-15 4号位 来文 Q2：加补传输层——改调摘要查询，防将来规则集快照变大后版本下拉同方式不可用）
+            </summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.GetRuleSetVersion(System.Int64,System.Threading.CancellationToken)">
+            <summary>获取规则集版本详情（P0-01：ContentSnapshotJson 投影回 DemandPriorityJson，前端 API 兼容）</summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.CreateRuleSetVersion(LPS.APS.Core.Entities.APS.RuleSetVersion,System.Threading.CancellationToken)">
+            <summary>创建规则集版本（P0-02：Service 强制初始状态 DRAFT——入参 Status 一律被忽略覆盖；内容归一化到 ContentSnapshotJson 持久化）</summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.UpdateRuleSetVersion(System.Int64,LPS.APS.Core.Entities.APS.RuleSetVersion,System.Threading.CancellationToken)">
+            <summary>更新规则集版本（P0-02：状态机约束——已发布/失效/归档拒绝原地修改；Status/治理字段冻结，禁止越权改状态）</summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.GetParameterSetVersions(System.Int64,System.Threading.CancellationToken)">
+            <summary>
+            获取参数集的所有版本（R2 修复：摘要 DTO，不含 ContentSnapshotJson 大 JSON 载体，防 PSV 1305 序列化 500；
+            2026-10-15 4号位 来文：加补传输层——改调摘要查询，不再 SELECT * 整列搬 ContentSnapshotJson 大 LOB，PSV 1305 37s → 摘要列 10ms 级）
+            </summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.GetParameterSetVersion(System.Int64,System.Threading.CancellationToken)">
+            <summary>获取参数集版本详情（P0-01：ContentSnapshotJson 五子块投影回五主题 JSON，前端 API 兼容）</summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.CreateParameterSetVersion(LPS.APS.Core.Entities.APS.ParameterSetVersion,System.Threading.CancellationToken)">
+            <summary>创建参数集版本（P0-02：Service 强制初始状态 DRAFT——入参 Status 一律被忽略覆盖；五主题 JSON 归一化到 ContentSnapshotJson 持久化）</summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.UpdateParameterSetVersion(System.Int64,LPS.APS.Core.Entities.APS.ParameterSetVersion,System.Threading.CancellationToken)">
+            <summary>更新参数集版本（P0-02：状态机约束——已发布/失效/归档拒绝原地修改；Status/治理字段冻结，禁止越权改状态）</summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.SaveStageHandoffWaitRules(System.Int64,System.Text.Json.JsonElement,System.Threading.CancellationToken)">
+            <summary>
+            写入参数集版本 Stage 固定交接等待规则（R05 治理写面补全，2026-11-02；仅 DRAFT/SUBMITTED/APPROVED 可改）。
+            请求体为规则 JSON 数组；写前校验 + P1-04 审计；空数组 = 删除该键（C9：本版不用该块）。
+            </summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.PublishRuleSetVersion(System.Int64,LPS.APS.Web.Controllers.PublishRequest,System.Threading.CancellationToken)">
+            <summary>
+            发布规则集版本（六态状态机 R01 验收）
+            红线：仅 DRAFT/SUBMITTED/APPROVED 可发布；PUBLISHED 拒绝（历史不可覆盖）；A-6 不变量自动处理。
+            </summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.PublishParameterSetVersion(System.Int64,LPS.APS.Web.Controllers.PublishRequest,System.Threading.CancellationToken)">
+            <summary>
+            发布参数集版本（六态状态机 R02 验收）
+            红线：仅 DRAFT/SUBMITTED/APPROVED 可发布；新 Run 可引用新版本、旧 Run 引用不变；A-6 不变量自动处理。
+            授权：D-1 独立权限 ParameterPublish（0号位 §3.2 参数发布 aps.parameter.publish，不因规则发布自动获得）
+            </summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.DisableRuleSetVersion(System.Int64,LPS.APS.Web.Controllers.DisableRequest,System.Threading.CancellationToken)">
+            <summary>
+            停用规则集版本（SUBMITTED/APPROVED/PUBLISHED → DISABLED）
+            红线：DRAFT 拒绝（草稿直接编辑/删除）；DISABLED/ARCHIVED 幂等保护拒绝。
+            </summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.DisableParameterSetVersion(System.Int64,LPS.APS.Web.Controllers.DisableRequest,System.Threading.CancellationToken)">
+            <summary>
+            停用参数集版本（SUBMITTED/APPROVED/PUBLISHED → DISABLED）
+            红线：DRAFT 拒绝（草稿直接编辑/删除）；DISABLED/ARCHIVED 幂等保护拒绝。
+            授权：C-5/D-1 参数停用改挂 ParameterEdit（0号位 §3.2 参数停用操作授权 aps.parameter.edit）
+            </summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.DisableStrategyProfileVersion(System.Int64,LPS.APS.Web.Controllers.DisableRequest,System.Threading.CancellationToken)">
+            <summary>
+            停用策略包版本（SUBMITTED/APPROVED/PUBLISHED → DISABLED）
+            红线：DRAFT 拒绝；DISABLED/ARCHIVED 幂等保护拒绝。
+            IsDefault=1 停用时自动清默认标志（避免 DISABLED 默认残留于 ResolveDefault 范围）。
+            </summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.SetDefaultRuleSetVersion(System.Int64,System.Threading.CancellationToken)">
+            <summary>
+            设置规则集版本为同族默认（D-3，2026-10 受控开发，契约 06 §D组 D-1）。
+            默认标记 IsDefault 属治理元数据，仅 PUBLISHED 版本可置位；切换经仓储 SetDefaultAsync 单事务原子
+            「清同族其它 + 置目标」，避免 UQ_RuleSetVersion_DefaultPublished 过滤唯一索引冲突；写审计。
+            </summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.SetDefaultParameterSetVersion(System.Int64,System.Threading.CancellationToken)">
+            <summary>
+            设置参数集版本为同族默认（D-3，2026-10 受控开发，契约 06 §D组 D-2）。
+            同规则集语义；切换经 IParameterSetVersionRepository.SetDefaultAsync 单事务原子化（D-3 修正 SPV
+            ClearDefaultFlag + Update 两条独立 SQL 非原子缺陷），避免 UQ_ParameterSetVersion_DefaultPublished 冲突。
+            </summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.SetDefaultStrategyProfileVersion(System.Int64,System.Threading.CancellationToken)">
+            <summary>
+            设置策略包版本为同族默认（C-7 §9.2 显式治理操作，D-3）。
+            仅 PUBLISHED 版本可置位；清同 Profile 其它默认再置位，避免 UQ_StrategyProfileVersion_DefaultPublished 冲突；写审计。
+            服务层内部对已是默认则幂等早退（不重复清默认+置位与审计）。
+            </summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.ResolveDefaultRuleSet(System.Int64,System.Nullable{System.DateTime},System.Threading.CancellationToken)">
+            <summary>
+            读侧默认解析：规则集同族当前有效、无歧义的 PUBLISHED 默认版本（D-3，Q-C，契约 06 §D组 D-4）。
+            无 RunType（RS 族解析）；镜象 SPV 三态判定：候选按生效窗过滤后 0→404、1→返回、&gt;1→400（红线 #4 禁止随机取，不以最新发布代替）。
+            </summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.ResolveDefaultParameterSet(System.Int64,System.Nullable{System.DateTime},System.Threading.CancellationToken)">
+            <summary>
+            读侧默认解析：参数集同族当前有效、无歧义的 PUBLISHED 默认版本（D-3，Q-C，契约 06 §D组 D-5）。
+            无 RunType（PS 族解析）；三态判定同规则集：0→404、1→返回、&gt;1→400（不随机取、不以最新发布代替）。
+            </summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.CompareRuleSetVersions(System.Int64,System.Int64,System.Threading.CancellationToken)">
+            <summary>对比两个规则集版本的差异（阶段 A-8：版本溯源）</summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.CompareParameterSetVersions(System.Int64,System.Int64,System.Threading.CancellationToken)">
+            <summary>对比两个参数集版本的差异（阶段 A-8：版本溯源）</summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.CompareStrategyProfileVersions(System.Int64,System.Int64,System.Threading.CancellationToken)">
+            <summary>对比两个策略包版本的差异（G5/D3：策略包对比页；裸 DTO，同 D1/D2）</summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.CompareStrategyProfileVersionWith(System.Int64,System.Int64,System.Threading.CancellationToken)">
+            <summary>策略包版本富对比（S12：06 §6.4.1「版本富对比（H1）」；a＝对比方、b＝基准方）</summary>
+            <remarks>
+            开发者：3号位。06 该行只冻结「路径／a、b 为 VersionId／治理读／403」，**字段清单属契约空白**，
+            最小 DTO 已登记为 S-14。参数方向与 <c>plan-version/{a}/compare-with/{b}</c> 同序。
+            </remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.ValidateRuleSetVersionForPublish(System.Int64,System.Threading.CancellationToken)">
+            <summary>校验规则集版本是否可发布（阶段 A-5：发布前完整校验）</summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.ValidateParameterSetVersionForPublish(System.Int64,System.Threading.CancellationToken)">
+            <summary>校验参数集版本是否可发布（阶段 A-5：发布前完整校验）</summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.GetStrategyProfileVersions(System.Int64,System.Threading.CancellationToken)">
+            <summary>获取策略包的所有版本</summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.GetStrategyProfileVersion(System.Int64,System.Threading.CancellationToken)">
+            <summary>获取策略包版本详情</summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.CreateStrategyProfileVersion(LPS.APS.Core.Entities.APS.StrategyProfileVersion,System.Threading.CancellationToken)">
+            <summary>创建策略包版本（P0-02：Service 强制初始状态 DRAFT——入参 Status 一律被忽略覆盖）</summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.ValidateVersionCreate(System.Int64,System.String,System.String)">
+            <summary>
+            建版入参边界校验（D-1）：空体或缺必填在入口拦成 400，
+            避免空实体直落数据库被约束拒绝、异常逃逸成 500。
+            </summary>
+            <param name="parentId">父载体 Id（规则集 / 参数集 / 策略包）</param>
+            <param name="parentField">父载体字段名，用于错误提示</param>
+            <param name="versionCode">版本编码</param>
+            <returns>不合法时返回提示文本；合法返回 <c>null</c></returns>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.UpdateStrategyProfileVersion(System.Int64,LPS.APS.Core.Entities.APS.StrategyProfileVersion,System.Threading.CancellationToken)">
+            <summary>更新策略包版本（P0-02：状态机约束——已发布/失效/归档拒绝原地修改；Status/治理字段/引用字段冻结，禁止越权改状态）</summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.PublishStrategyProfileVersion(System.Int64,LPS.APS.Web.Controllers.PublishRequest,System.Threading.CancellationToken)">
+            <summary>发布策略包版本（P0-06：DRAFT/SUBMITTED/APPROVED → PUBLISHED；发布前强制校验）</summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.ValidateStrategyProfileVersionForPublish(System.Int64,System.Threading.CancellationToken)">
+            <summary>校验策略包版本是否可发布（P0-06）</summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.ResolveDefaultStrategyProfile(System.String,System.Nullable{System.DateTime},System.Threading.CancellationToken)">
+            <summary>解析当前有效默认 PUBLISHED 策略包（P0-06：跨号位冻结语义；歧义报错不随机取）</summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.GetRunStrategyProfileTrace(System.Int64,System.Threading.CancellationToken)">
+            <summary>Run 引用追溯（P0-06：策略包版本 → 父 Profile + 规则集/参数集版本）</summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.ValidateExpectedDomainKeys(System.Int32,System.Threading.CancellationToken)">
+            <summary>校验 ScheduleRun.ExpectedDomainKeysJson 冻结规则（P0-08：FULL≥1 / RESCHEDULE 恰1）</summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.ConfirmCandidate(System.Int32,LPS.APS.Web.Controllers.ConfirmCandidateRequest,System.Threading.CancellationToken)">
+            <summary>Candidate 最小人工确认（P0-08：仅记录 Actor/ConfirmedAt/CandidatePlanVersionId/Remark，不转 ACTIVE）</summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.ActivateCandidate(System.Int32,LPS.APS.Web.Controllers.ActivateCandidateRequest,System.Threading.CancellationToken)">
+            <summary>激活 Candidate（P0-08：CANDIDATE → ACTIVE，每域单一正式采用版本）</summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.CompareCandidateWithBase(System.Int32,System.Int32,System.Threading.CancellationToken)">
+            <summary>候选 vs 基础 计划版本对比复合查询（H1；U10 候选对比页；v1.2 §三）</summary>
+            <remarks>开发者：3号位；estimatedOnlyCount 归 2号位 边界返 null；crossDomain 计数未落盘保守返 0（v1.2 §九-b）；reasons[] 不在 v1.2 返回</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.RecoverFailedRun(System.Int32,System.Threading.CancellationToken)">
+            <summary>FAILED 恢复（P0-08：为 FAILED ScheduleRun 新建一条 RUNNING 重跑，继承基线；旧记录不动）</summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.CreateCandidateRun(LPS.APS.Web.Controllers.CreateCandidateRunRequest,System.Threading.CancellationToken)">
+            <summary>白天候选运行创建（B-1：0号位 2026-08-29 裁决3——4号位 → 3号位 入口；冻结 RunType×Purpose×策略版本，交 2号位 主流程执行收口）</summary>
+            <remarks>开发者：3号位；触发 2号位 主流程留契约接缝（契约草案 §四 方案 A/B/C，待 2号位/0号位 裁定）</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.GetRunReferenceTrace(System.Int32,System.Threading.CancellationToken)">
+            <summary>Run 引用追溯（P0-08：ScheduleRun → 策略包版本 → 规则集/参数集版本 + 关联 PlanVersion 状态）</summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.GetRuleSetVersionsWithMain(System.Nullable{System.Boolean},System.String,System.String,System.String,System.Nullable{System.Int32},System.Nullable{System.Int32},System.Threading.CancellationToken)">
+            <summary>
+            规则集「主子表联查·一版一行」列表（路线 A，2026-11-11：规则集维护页新列表源）。
+            每主表 N 个版本 ⇒ N 行，各版本状态独立可读，修复旧列表（GET /rule-sets）把 Status 取「最新创建版本」
+            被同族新草稿覆盖生效 PUBLISHED 的问题。保留既有 GET /rule-sets（一主表带最新概要）供策略包下拉等场景。
+            </summary>
+            <remarks>开发者：3号位。参数语义与 <see cref="M:LPS.APS.Web.Controllers.GovernanceController.GetRuleSets(System.Nullable{System.Boolean},System.String,System.Nullable{System.Int32},System.Nullable{System.Int32},System.Threading.CancellationToken)"/> 一致：activeOnly 三态 / keyword 匹配 Code/Name / 分页。零 DDL。</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.GetRuleSets(System.Nullable{System.Boolean},System.String,System.Nullable{System.Int32},System.Nullable{System.Int32},System.Threading.CancellationToken)">
+            <summary>规则集主表列表（G1/A1：4号位规则集列表页；R2 起返回含最新版本摘要的列表 DTO）</summary>
+            <remarks>开发者：3号位。activeOnly 三态语义（契约 v1.0 2026-10-10）：true=仅查 IsActive=1；false=仅查 IsActive=0（≠查全部）；缺省=不过滤全量。dev DB 当前无停用数据，传 false 恒返 0（客观状态非 bug）。</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.GetParameterSets(System.Nullable{System.Boolean},System.String,System.Nullable{System.Int32},System.Nullable{System.Int32},System.Threading.CancellationToken)">
+            <summary>参数集主表列表（G1/A8：4号位参数集列表页）</summary>
+            <remarks>开发者：3号位。activeOnly 三态语义（契约 v1.0 2026-10-10）：true=仅查 IsActive=1；false=仅查 IsActive=0（≠查全部）；缺省=不过滤全量。dev DB 当前无停用数据，传 false 恒返 0（客观状态非 bug）。</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.GetParameterSetVersionsWithMain(System.Nullable{System.Boolean},System.String,System.String,System.String,System.Nullable{System.Int32},System.Nullable{System.Int32},System.Threading.CancellationToken)">
+            <summary>参数集主从联查·一版一行（2026-11-11，路线 A：参数集维护页新列表源）</summary>
+            <remarks>开发者：3号位。每行=一条 ParameterSet + 其一个版本，各版本状态独立，修复旧列表 Status 取「最新创建版本」
+            被新草稿覆盖 PUBLISHED 的缺陷（同规则集 OUTER APPLY TOP1 因）。status/name 为新增筛选（对齐 rule-sets/versions）。</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.GetStrategyProfiles(System.Nullable{System.Boolean},System.String,System.Nullable{System.Int32},System.Nullable{System.Int32},System.Threading.CancellationToken)">
+            <summary>策略包主表列表（G1/A12：4号位策略包列表页）</summary>
+            <remarks>开发者：3号位。activeOnly 三态语义（契约 v1.0 2026-10-10）：true=仅查 IsActive=1；false=仅查 IsActive=0（≠查全部）；缺省=不过滤全量。dev DB 当前无停用数据，传 false 恒返 0（客观状态非 bug）。</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.GetStrategyProfileVersionsWithMain(System.Nullable{System.Boolean},System.String,System.String,System.String,System.Nullable{System.Int32},System.Nullable{System.Int32},System.Threading.CancellationToken)">
+            <summary>策略包主从联查·一版一行（2026-11-11，路线 A：策略包维护页新列表源）</summary>
+            <remarks>开发者：3号位。每行=一条 StrategyProfile + 其一个版本，逐版本可见状态（旧列表纯主表无版本信息）；
+            经父表带 RunType，随行 RuleSetVersionId/ParameterSetVersionId 绑定。status/name 为新增筛选（对齐 rule-sets/versions）。</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.GetPublishedRuleSetVersion(System.Int64,System.Threading.CancellationToken)">
+            <summary>规则集当前生效 PUBLISHED 版本直达（G3/C2：当前 Published 版本展示；生效窗口过滤；多候选报错）</summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.GetPublishedParameterSetVersion(System.Int64,System.Threading.CancellationToken)">
+            <summary>参数集当前生效 PUBLISHED 版本直达（G3/C2；R2 修复：快照载体经投影置空不外泄，五主题子块保留）</summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.GetPublishedStrategyProfileVersion(System.Int64,System.Threading.CancellationToken)">
+            <summary>策略包当前生效 PUBLISHED 版本直达（G3/C2）</summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.GetDomainDependencies(System.String,System.String,System.Threading.CancellationToken)">
+            <summary>域依赖关系查询（G7：4号位失败链 / 域依赖展示；数据源为 2号位 sp_ScanDomainDependency 扫描结果，只读）
+            2026-10-22 4号位 缺口修复：补数据范围收窄（第二道防线）——ResolveScope → 入参 403 → allowedDomains 下推仓储收窄。</summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.GetAuditLogs(System.String,System.String,System.Nullable{System.DateTime},System.Nullable{System.DateTime},System.Nullable{System.Int32},System.Threading.CancellationToken)">
+            <summary>治理审计日志查询（G6：实体类型/实体ID/时间范围 可空组合，按操作时间倒序）</summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.GetRunDomainStatus(System.Int32,System.Threading.CancellationToken)">
+            <summary>Run 域级状态汇总（G8：FULL 失败链 成功/失败/被阻断 区分；3号位文档 §十六）</summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.GetRuns(System.Nullable{System.Int32},System.String,System.String,System.Threading.CancellationToken)">
+            <summary>Run 历史列表查询（G4：0号位 2026-08-29 裁决——3号位 只读 ScheduleRun 运行事实封装查询；状态回填由 2号位 运行收口负责，本端点不修改运行结果语义）</summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.GetRunsPaged(System.Nullable{System.Int32},System.Nullable{System.Int32},System.String,System.String,System.Threading.CancellationToken)">
+            <summary>
+            Run 历史分页查询（R4，4号位 2026-11-11 运行与下发页改版：runs 列表分页 + total）。
+            服务端分页返回 <see cref="T:LPS.APS.Core.DTOs.Governance.ScheduleRunGovPage"/>（items + 过滤后 total），排序 [StartedAt] DESC, [Id] DESC 稳定翻页。
+            保留既有 <c>/runs</c> 数组端点兼容旧消费方；本端点新增分页形态（不破坏既有消费方，4号位 倾向方案）。
+            </summary>
+            <param name="page">页码（1 基，缺省 1）</param>
+            <param name="pageSize">每页条数（缺省 100，上限 200）</param>
+            <param name="status">按运行状态过滤（RUNNING / COMPLETED / PARTIAL_SUCCESS / FAILED，可选）</param>
+            <param name="runType">按运行类型过滤（可选）</param>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.ResolveRunScopeDomains(LPS.APS.Core.Authorization.DataScopeContext)">
+            <summary>
+            解析 runs 列表/分页的业务范围过滤域集合（R1，4号位 2026-11-12 运行与下发页业务范围未生效）。
+            Global（全放行）⇒ null（仓储跳过过滤）；非 Global ⇒ 取 Domain 维度授权值；
+            无 Domain 维度授权 ⇒ 空集（除非持有其他维度）⇒ 仓储 EXISTS 恒假 fail-closed，受限用户看不到任何批次
+            （judging = 仅 Domain 维度为准，Q1 裁定；无登记域批次对受限用户不可见，Q2 裁定：仅 Global 可见）。
+            </summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.ResolvePaging(System.Nullable{System.Int32},System.Nullable{System.Int32})">
+            <summary>解析 1 基页码到 skip/take（page=1 → skip=0；pageSize 上限 500 防全表拉取）</summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.GetDomainDefinitions(System.Threading.CancellationToken)">
+            <summary>域定义列表（含停用；G-D01）</summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.GetActiveDomainDefinitions(System.Threading.CancellationToken)">
+            <summary>当前有效域集合（G-D09/G-D10：2号位归域执行唯一事实源）</summary>
+            <remarks>开发者：3号位｜N-03：信任调用（2号位 归域执行唯一事实源），不做用户 Domain Scope 过滤——与用户态列表/详情严格分离。</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.GetDomainDefinition(System.Int32,System.Threading.CancellationToken)">
+            <summary>域定义详情（G-D01）</summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.GetProductFamilies(System.Threading.CancellationToken)">
+            <summary>产品族下拉列表（Domain 维护页数据源；方案 A：前端 productFamilyId 数字选择器）</summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.GetFactories(System.Threading.CancellationToken)">
+            <summary>工厂下拉列表（Domain 维护页数据源；方案 A：前端 factoryId 数字选择器）</summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.CreateDomainDefinition(LPS.APS.Core.Entities.APS.DomainDefinition,System.Threading.CancellationToken)">
+            <summary>新建域定义（G-D02：唯一性 / ScopeType / 引用合法性校验 + 审计；新建默认启用）</summary>
+            <remarks>开发者：3号位｜2026-10-25 权限修正：RuleMaintain→DomainMaintain（冻结 §4.1 系统管理员维护，勿再误挂规则码）</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.UpdateDomainDefinition(System.Int32,LPS.APS.Core.Entities.APS.DomainDefinition,System.Threading.CancellationToken)">
+            <summary>编辑域定义（G-D03~G-D05：DomainKey 不可变更 + 校验）</summary>
+            <remarks>开发者：3号位｜2026-10-25 权限修正：RuleMaintain→DomainMaintain（冻结 §4.1 系统管理员维护）</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.EnableDomainDefinition(System.Int32,System.String,System.Threading.CancellationToken)">
+            <summary>启用域定义（G-D16 反向）</summary>
+            <remarks>开发者：3号位｜2026-10-25 权限修正：RuleMaintain→DomainMaintain（冻结 §4.1 系统管理员维护）</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceController.DisableDomainDefinition(System.Int32,System.String,System.Threading.CancellationToken)">
+            <summary>停用域定义</summary>
+            <remarks>开发者：3号位｜2026-10-25 权限修正：RuleMaintain→DomainMaintain（冻结 §4.1 系统管理员维护）</remarks>
+        </member>
+        <member name="T:LPS.APS.Web.Controllers.PublishRequest">
+            <summary>发布请求 DTO（3号位 Web 层契约）</summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="P:LPS.APS.Web.Controllers.PublishRequest.ChangeReason">
+            <summary>变更原因（G10：发布时写入版本 Remarks，审计可追溯）</summary>
+        </member>
+        <member name="T:LPS.APS.Web.Controllers.DisableRequest">
+            <summary>版本停用请求 DTO（G2：3-4联调）</summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="P:LPS.APS.Web.Controllers.DisableRequest.Reason">
+            <summary>停用原因（写入版本 Remarks + 审计 Remarks，可空）</summary>
+        </member>
+        <member name="T:LPS.APS.Web.Controllers.ConfirmCandidateRequest">
+            <summary>Candidate 确认请求 DTO（P0-08）</summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="P:LPS.APS.Web.Controllers.ConfirmCandidateRequest.Remark">
+            <summary>必要备注（可空）</summary>
+        </member>
+        <member name="T:LPS.APS.Web.Controllers.ActivateCandidateRequest">
+            <summary>Candidate 激活请求 DTO（P0-08）</summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="T:LPS.APS.Web.Controllers.CreateCandidateRunRequest">
+            <summary>白天候选运行创建请求 DTO（B-1）</summary>
+            <remarks>开发者：3号位</remarks>
+        </member>
+        <member name="P:LPS.APS.Web.Controllers.CreateCandidateRunRequest.RunType">
+            <summary>运行类型（白天候选类：MANUAL_RESCHEDULE / LOCAL_RESCHEDULE / INSERT_ORDER_WHATIF）</summary>
+        </member>
+        <member name="P:LPS.APS.Web.Controllers.CreateCandidateRunRequest.Purpose">
+            <summary>用途（须 ∈ RunType 冻结合法组合：CTP / INSERT_IMPACT_ANALYSIS / INSERT_RESCHEDULE / MANUAL_ADJUSTMENT）</summary>
+        </member>
+        <member name="P:LPS.APS.Web.Controllers.CreateCandidateRunRequest.DomainKey">
+            <summary>目标 Domain（严格单 Domain）</summary>
+        </member>
+        <member name="P:LPS.APS.Web.Controllers.CreateCandidateRunRequest.BasePlanVersionId">
+            <summary>所基于的当前 ACTIVE 计划版本（可选；缺省按 DomainKey 解析当前 ACTIVE）</summary>
+        </member>
+        <member name="P:LPS.APS.Web.Controllers.CreateCandidateRunRequest.DataCutoffTime">
+            <summary>本次运行统一数据切片边界（可选；缺省 now）</summary>
+        </member>
+        <member name="P:LPS.APS.Web.Controllers.CreateCandidateRunRequest.Remark">
+            <summary>备注（契约位保留，B-1 本轮不参与业务逻辑；R1 P2 结论：前端停传、后端维持丢弃）</summary>
+        </member>
+        <member name="P:LPS.APS.Web.Controllers.CreateCandidateRunRequest.Scope">
+            <summary>局部重排范围载荷（ScopeJsonV2；承载 ScheduleRun.ScopeJson）。缺省 null = 不承载结构化范围（旧调用兼容）</summary>
+        </member>
+        <member name="T:LPS.APS.Web.Controllers.GovernanceQueryController">
+             <summary>
+             治理查询控制器（G4/G7：5号位业务接口接入层）
+            
+             路由规范：
+               GET /api/governance-query/run/{scheduleRunId}/scope - 单 Run 候选范围明细（G4；10-19 新增，4号位 提议路径已登记采纳）
+               GET /api/governance-query/domain-dependencies     - 排程域依赖（G7）
+               （注：原头注所列 GET runs **无实现**——QueryScheduleRunsAsync 死方法；10-19 与 4号位 复核一致后关闭该账面项，不补路由）
+            
+             【职责边界 - 2026-09-06审核确认】
+             - 普通结果查询：4 → 5 → 2（5号位中转，2号位运行真值）
+             - 治理动作：4 → 3 → 2（3号位治理，5号位不涉及）
+             - 5号位提供只读查询接口，不修改、不重算业务结果
+             - ScheduleRun状态由2号位运行收口产生，5号位只读展示
+             - 后续目标：G4/G7数据源从直读APS表迁移到2号位Query Service
+             </summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceQueryController.ListWarehouses(System.String,System.Threading.CancellationToken)">
+            <summary>
+            治理侧仓库/工序码取值下拉（4号位 10-22 R2 建；10-25 Q1 补列）：
+            ① **按 ProcessCode 归并去重**（`51305101` 视图两行⇒下拉一次；下游 PeggingOrchestrator:5822 亦按 MIN(StageCode) 归并）；
+            ② 补 `erpProperty / warehouseRole / factoryCode` 三列（前端**展示用**，用于用户识别码的性质，**不据此过滤**——
+               冻结 07:1286 值域写 M/XC/ZP/BP，但实库另有 KS/BS/AC/ST/NULL 五类且前 6 大收货仓恰为 KS/BS，
+               值域漂移待 0号位 裁决，见 5号位 10-25 回执 Q1）；
+            ③ **不按码长过滤**：ERP 6 位码与 MES 8 位码是两源互不相交的合法空间（PeggingOrchestrator:9470-9472）。
+            权限=类级 aps.plan.view（Q3 本轮维持现状）。
+            </summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceQueryController.GetCurrentUserId">
+            <summary>解析当前登录用户 Id（无效返回 0 → 范围解析为拒绝全部，安全默认）</summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceQueryController.GetDomainDependencies(System.String,System.String,System.Threading.CancellationToken)">
+            <summary>
+            查询排程域依赖（G7）
+            </summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.GovernanceQueryController.GetRunScope(System.Int32,System.Threading.CancellationToken)">
+            <summary>
+            单 Run 候选范围明细（G4；候选五字段的明细面板数据源，13 v1.8 §五）。
+            语义分档（4号位 10-19 §二硬要求）：RunId 不存在 → 404（经全局 Filter 为真 HTTP 404）；
+            Run 存在但无 ScopeJson（夹具/老 Run）→ **200 + scopeAvailable=false**（"老数据"与"单号打错"必须可分）。
+            </summary>
+        </member>
+        <member name="T:LPS.APS.Web.Controllers.ManualCapacityController">
+             <summary>
+             人工能力槽维护控制器（5号位提供，供4号位页面）
+            
+             路由规范：
+               POST   /api/manual-capacity/slots                     - 新增人工槽主档
+               GET    /api/manual-capacity/slots                     - 查询人工槽主档（分页；可按部门/工序过滤）
+               DELETE /api/manual-capacity/slots/{manualSlotId}      - 软删人工槽主档（IsActive=0）
+               POST   /api/manual-capacity/calendar                  - 批量铺人工槽窗口（覆盖式；Days=1 覆盖逐条）
+               GET    /api/manual-capacity/calendar/{manualSlotId}   - 查询某人工槽所有窗口
+               DELETE /api/manual-capacity/calendar/{id}             - 物理删除某窗口
+               GET    /api/manual-capacity/resolve-preview           - 人工槽版三级合并解析预览（10-23，13 v1.8:31）
+            
+             【权限码】3号位已落：ManualCapacityView / Edit / Delete（43 码）
+             【S5-01 整改（2026-10-14）】功能权限之外，Service 层按目标槽所属 ProductionDepartment.DeptCode
+             做业务范围二次校验（IDataScopeService，fail-closed，照 Routing/Setup 治理先例）；
+             越界抛 ScopeViolationException → 本控制器映射 403。列表查询按授权部门过滤。
+             【职责边界】主档软删 IsActive=0；窗口物理删 DELETE；5号位维护，不重算业务
+             </summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.ManualCapacityController.GetCurrentUserId">
+            <summary>解析当前登录用户 Id（无效时返回 0 → 范围解析为拒绝全部，安全默认，照 MesDispatchController 先例）</summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.ManualCapacityController.ResolvePreview(System.String,System.DateTime,System.DateTime,System.Threading.CancellationToken)">
+            <summary>
+            人工槽版三级合并解析预览（4号位 10-23 函 R1 选 (a) 新端点；13 v1.8:31 三态+来源+授权+时间片）：
+            manualSlotIds 逗号分隔（≤200），返回与设备侧 resolve-preview 同构；只读不写库；越界槽 fail-closed 剔除。
+            </summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.ManualCapacityController.CreateSlot(LPS.APS.Application.Services.Dto.ManualCapacitySlotDto,System.Threading.CancellationToken)">
+            <summary>新增人工槽主档（目标部门须在业务范围内）</summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.ManualCapacityController.GetSlots(System.Nullable{System.Int32},System.String,System.Boolean,System.Int32,System.Int32,System.Threading.CancellationToken)">
+            <summary>查询人工槽主档（软删不含在默认查询；可按部门/工序过滤；分页 PageResult，4号位 10-12 函；结果按授权部门过滤）</summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.ManualCapacityController.SoftDeleteSlot(System.Int32,System.Threading.CancellationToken)">
+            <summary>软删人工槽主档（IsActive=0；目标槽所属部门须在业务范围内）</summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.ManualCapacityController.BulkCreateCalendar(LPS.APS.Application.Services.Dto.ManualSlotCalendarBulkRequest,System.Threading.CancellationToken)">
+            <summary>批量铺人工槽窗口（覆盖式；目标槽所属部门须在业务范围内）</summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.ManualCapacityController.AddCalendarSingle(LPS.APS.Application.Services.Dto.ManualSlotCalendarSingleRequest,System.Threading.CancellationToken)">
+            <summary>
+            单条窗口追加（2026-10-14 放开"一天多条"方向2，与设备日历同口径）：
+            只插不删；同日重叠 409；相切合法；不跨天。批量端点覆盖语义不变。
+            </summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.ManualCapacityController.GetCalendar(System.Int32,System.Nullable{System.DateTime},System.Nullable{System.DateTime},System.Int32,System.Int32,System.Threading.CancellationToken)">
+            <summary>查询某人工槽窗口（分页 PageResult；可按时间范围过滤；目标槽所属部门须在业务范围内）</summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.ManualCapacityController.DeleteCalendar(System.Int64,System.Threading.CancellationToken)">
+            <summary>物理删除某人工槽窗口（窗口所属槽的部门须在业务范围内）</summary>
+        </member>
+        <member name="T:LPS.APS.Web.Controllers.MesDispatchController">
+            <summary>
+            MES 受控操作下发接口（中转端点）。
+            归属：**端点/受控操作中转层归 5号位**（冻结 06 v1.38 §7.4、05 v1.48:379,390-391、13 v1.8 §十：4号位 → 5号位 API → 权限校 → 2号位 Application）。
+            5号位 职责：中转承载 + F-G4 业务范围（Factories）二次校验。
+            权限码（MesControlledOperation）由 3号位 落；核心下发能力归 2号位，接入前返回 501，属预期。
+            </summary>
+            <remarks>骨架：3号位；归属归一（10-17）后中转承载：5号位；业务判定/下发：2号位</remarks>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.MesDispatchController.GetCurrentUserId">
+            <summary>解析当前登录用户 Id（无效时返回 0 → 范围解析为拒绝全部，安全默认）</summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.MesDispatchController.GetStatus(System.Int32,System.Nullable{System.DateTime},System.Nullable{System.DateTime},System.String,System.String,System.String,System.String,System.String,System.String,System.Int32,System.Int32,System.Threading.CancellationToken)">
+            <summary>
+            P11 状态查询列表（**B6，11-17；Q-d 裁读面=5号位**）：`GET /api/mes/status?planVersionId=…`——
+            一行=一个 Stage 执行批（TaskNo）。**三层状态分列互不冒充**：
+            下发计数（TaskDispatch 原词表）／工单状态（MESWorkOrderSnapshot）／报工数量（OperationProgressSnapshot）。
+            筛选：`from/to`（计划窗，NULL 时刻恒保留=同甘特语义）、`stageCodes`/`departmentCodes`（逗号）、
+            `piNo`、`workOrderNo`、`keyword`（物料码/TaskNo/PI 三路）、`dispatchStatus`（**批内含该态工序行**才命中，HAVING 级）。
+            Scope：PV 域＋Factory＋Department 三重 fail-closed；越权=200+`scopeDenied`、PV 缺=`versionExists=false`。
+            顶层 `woSnapshotSourceUpdatedAt/opsSnapshotSourceUpdatedAt/dataCutoffTime`=快照同步面（"数据截至"列权威）；
+            **无 dispatchUpdatedAt 面**——全表 NULL=消费环留痕缺口（Q-d 在案），不得据缺痕断言链未开。
+            分类位 `mesRequirementCategory` 恒 null（Q-a 未裁，禁由工单号空值反推"无需MES"）。
+            </summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.MesDispatchController.GetStatusBatch(System.Int32,System.String,System.Threading.CancellationToken)">
+            <summary>
+            P11 批详情（点行展开）：`GET /api/mes/status/batch?planVersionId=&amp;taskNo=`——
+            工序级下发行（FailureCode/Reason 原值）＋同 (Run,PI,Stage,OperationName) 报工列（缺行=null=未判定）。
+            批不存在/越权=200+`found=false`（不 404，同全链形状 B 纪律）。
+            </summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.MesDispatchController.Dispatch(LPS.APS.Web.Controllers.MesDispatchRequest,System.Threading.CancellationToken)">
+            <summary>发起 MES 受控操作下发——中转：权限/Scope 校验 + 透传 2号位 判定，接入前返回 501（预期）</summary>
+            <remarks>中转承载：5号位；判定/下发能力：2号位（接入前 501，前端不接线）</remarks>
+        </member>
+        <member name="T:LPS.APS.Web.Controllers.MesDispatchRequest">
+            <summary>MES 下发请求体</summary>
+        </member>
+        <member name="P:LPS.APS.Web.Controllers.MesDispatchRequest.FactoryCode">
+            <summary>目标工厂代码</summary>
+        </member>
+        <member name="T:LPS.APS.Web.Controllers.OrderQueryController">
+             <summary>
+             订单/需求计划查询控制器（5号位提供给4号位）
+            
+             路由规范：
+               GET /api/order-query?planVersionId=             - 订单列表查询
+               GET /api/order-query/{orderId}?planVersionId=   - 订单详情（含Pegging+生产计划）
+            
+             【职责边界】
+             - 5号位提供只读查询接口，直接读取APS事实表
+             - 不重算Pegging，不修改订单状态
+             </summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.OrderQueryController.GetCurrentUserId">
+            <summary>解析当前登录用户 Id（无效返回 0 → 范围解析为拒绝全部，安全默认）</summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.OrderQueryController.QueryOrders(System.Int32,System.String,System.String,System.String,System.String,System.String,System.String,System.String,System.String,System.String,System.Nullable{System.DateTime},System.Nullable{System.DateTime},System.String,System.String,System.String,System.Int32,System.Int32,System.Int32,System.Int32,System.Threading.CancellationToken)">
+            <summary>
+            查询订单列表
+            </summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.OrderQueryController.GetOrderDetail(System.Int64,System.Int32,System.Threading.CancellationToken)">
+            <summary>
+            查询订单详情（含Pegging承接+生产计划）
+            </summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.OrderQueryController.GetOrderTree(System.Int64,System.Int32,System.Threading.CancellationToken)">
+            <summary>
+            订单完整树（**B3/B4，11-17**）：`GET /api/order-query/{orderId}/tree?planVersionId=…`——
+            P02 行展开与 P03 独立深链**共用本端点**（同一树同一数据同一 PV，v0.2 §5 禁第二套）。
+            三段：①身份头（域/PV 状态/cutoff/交期）；②**结构**=nodes+edges（Pegging 图上游闭包，深度≤10 路径防环；
+            种子=Task.OrderId 直挂 ∪ share.RootOrderId 两路；节点带 InSeed/OwnRootOrder/MinDepth，前端按 parent→child 组树）；
+            ③**数量账**=demands（PSA 行：DemandQty/AllocatedQty/Gap＋供给段＋Stage 链三列＋RemainingStagePathJson 原文）。
+            截断三态独立：<c>nodesTruncated/edgesTruncated/demandsTruncated</c>——页面按"已加载 N/截断"如实标注（v0.2 §P02.2）。
+            边界：Q/S/U 内制账**不在本响应**（走 <c>GET /api/explanation/demand-reconciliation</c>，两本账禁互加）；
+            <c>stageTimingNote</c> 恒"未提供"（Q03 待 2号位，禁前端造节点）；NeedBy 列 PSA 不存在=如实缺位。
+            越权/不存在分态：<c>scopeDenied=true</c>（域外/工厂外，403 语义走信封位不吞 404）vs <c>found=false</c>。
+            </summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.OrderQueryController.GetSummary(System.Int32,System.String,System.String,System.String,System.String,System.String,System.String,System.String,System.String,System.String,System.Nullable{System.DateTime},System.Nullable{System.DateTime},System.String,System.Threading.CancellationToken)">
+            <summary>
+            查询订单汇总 KPI（供 Order.vue 顶部；R3，11-12 4号位件：**接受与列表同名同义的全部筛选参数**，
+            谓词与列表类级单源 ⇒ KPI 与列表 total 同口径；**不传筛选=与旧行为逐字一致**，总览页共用不受影响）。
+            </summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.OrderQueryController.GetDeliveryKpi(System.Int32,System.String,System.String,System.String,System.String,System.String,System.String,System.String,System.String,System.String,System.Nullable{System.DateTime},System.Nullable{System.DateTime},System.String,System.Threading.CancellationToken)">
+            <summary>
+            P02 交付 KPI（**B2，11-17；0号位 Q-c 裁后读模型**）：`GET /api/order-query/delivery-kpi?planVersionId=…`——
+            与列表/summary **同名同义全部筛选参数**（统计随筛选走、点卡筛回同一集合）＋同 Scope 越权校验（403 同规）。
+            行=分区：总计行（orderType=null）＋ SALES_ORDER ＋ PRODUCTION_INSTRUCTION 各一（GROUPING SETS 单扫）。
+            **语义别混读三件事**：①判定=计划派生日期级（当天完成=按期），**不是** summary 的 ERP `DelayStatus` 桶、
+            不是"实际交付准交率"；②分母=去重根订单**含未判定**（onTime＋late＋undetermined=total 恒成立）；
+            ③`plannedCompletionSource=readmodel_task_max`（2号位 正式列落库后切 formal）——页面须带 `caliber` 文案展示。
+            FG/WIP 分区当前缺源（`fgWipDimensionAvailable=false`）、目标值 `targetPercent=null`（待 3号位 合同核对）。
+            </summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.OrderQueryController.GetFacets(System.Int32,System.String,System.String,System.String,System.String,System.String,System.String,System.String,System.String,System.String,System.Nullable{System.DateTime},System.Nullable{System.DateTime},System.String,System.Threading.CancellationToken)">
+            <summary>
+            订单口径可选值+条数（R4，11-12 新增）：`GET /api/order-query/facets?planVersionId=…`，
+            与列表同筛选参数（不含排序）+同范围收窄；六维各 {value,count} 按 count 降序截 200。
+            工厂/产品族中文名请继续用 3号位 governance 端点，本端点只出订单口径的编码+条数。
+            </summary>
+        </member>
+        <member name="T:LPS.APS.Web.Controllers.OverviewController">
+             <summary>
+             Overview概览页控制器（5号位提供给4号位）
+            
+             路由规范：
+               GET /api/overview/active-plan           - 当前ACTIVE计划版本信息（按 Domain 列表）
+               GET /api/overview/resource-bottleneck   - 资源负荷/Bottleneck
+               GET /api/overview/candidate-summary     - Candidate待处理摘要
+            
+             【2026-10-16 下线】GET /api/overview/task-summary 已移除 ——
+               订单维度 KPI 由 4号位 改走 order-query/summary（订单粒度，口径正确）；
+               本端点为任务粒度，且其 6 字段中 4 个恒 0/不可判（详因见 5号位致 4号位 函 §三）：
+                 · EstimatedOnlyCount / UnscheduledCount —— 查 Task.Status 的 'ESTIMATED'/'PENDING'/'QUEUED'
+                   三个字面量均不在冻结正式值域（PLANNED/RELEASED/IN_PROGRESS/COMPLETED/CANCELLED）内 → 恒 0
+                 · OnTimeCount / DelayedCount —— "准时"需实际完成时间与计划比，而 Task 表无 ActualStartTime/ActualEndTime
+               （另 RiskCount 口径系 5号位 自造、无冻结依据；OtherCount 字面量列表错。）
+               全仓已核对无消费方（前端类型/测试/其他端点均无引用）。
+            
+             【职责边界】
+             - 5号位提供只读查询接口，直接读取APS事实表
+             - 不重算业务结果
+             </summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.OverviewController.GetCurrentUserId">
+            <summary>解析当前登录用户 Id（无效返回 0 → 范围解析为拒绝全部，安全默认）</summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.OverviewController.GetActivePlan(System.String,System.Threading.CancellationToken)">
+            <summary>
+            查询当前ACTIVE计划版本信息（R1-a：按 Domain 列表，每 Domain 至多一条）
+            不传 domainKey → 返回授权范围内全部生效 Domain；传 domainKey → 该 Domain 的单元素列表（越界 403）
+            </summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.OverviewController.GetResourceBottleneck(System.Int32,System.Int32,System.Threading.CancellationToken)">
+            <summary>
+            查询资源负荷/Bottleneck
+            </summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.OverviewController.GetCandidateSummary(System.Threading.CancellationToken)">
+            <summary>
+            查询Candidate待处理摘要
+            </summary>
+        </member>
+        <member name="T:LPS.APS.Web.Controllers.PeggingTraceController">
+             <summary>
+             Supply/Pegging Trace供需追溯控制器（5号位提供给4号位）
+            
+             路由规范：
+               GET /api/pegging-trace?planVersionId=              - Pegging分配列表查询
+               GET /api/pegging-trace/order/{orderId}?planVersionId=  - 按订单查询Pegging分配
+               GET /api/pegging-trace/summary?planVersionId=      - Pegging Trace汇总
+            
+             【职责边界】
+             - 5号位提供只读查询接口，直接读取PeggingSupplyAllocation表
+             - 不重算Allocation，不修改分配结果
+             </summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.PeggingTraceController.GetCurrentUserId">
+            <summary>解析当前登录用户 Id（无效返回 0 → 范围解析为拒绝全部，安全默认）</summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.PeggingTraceController.Query(System.Int32,System.String,System.String,System.String,System.String,System.String,System.Nullable{System.Int64},System.Int32,System.Int32,System.Threading.CancellationToken)">
+            <summary>
+            查询Pegging分配列表。
+            commitmentStatus 支持 'UNKNOWN'（=未标注，匹配 NULL，与汇总同口径）；
+            ⚠️ orderNo 依赖 RootOrderNo/CurrentOrderNo——dev 现全 NULL（写入侧归 2号位），实际筛选用 <c>rootOrderId</c>（100% 非空）。
+            </summary>
+        </member>
+        <!-- Badly formed XML comment ignored for member "M:LPS.APS.Web.Controllers.PeggingTraceController.Count(System.Int32,System.String,System.String,System.String,System.String,System.String,System.Nullable{System.Int64},System.Threading.CancellationToken)" -->
+        <member name="M:LPS.APS.Web.Controllers.PeggingTraceController.QueryByOrder(System.Int64,System.Int32,System.Threading.CancellationToken)">
+            <summary>
+            按订单查询Pegging分配（11-14：补数据范围收窄，同列表单源——此前按 orderId 可绕 Scope）。
+            </summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.PeggingTraceController.GetSummary(System.Int32,System.Threading.CancellationToken)">
+            <summary>
+            查询Pegging Trace汇总（**R2.4，11-14 裁定：收进数据范围**——与列表/计数同谓词，
+            受限账号不再看到全厂总数；前端"当前计划版本的全部笔数"文案改"当前账号可见笔数"）。
+            </summary>
+        </member>
+        <member name="T:LPS.APS.Web.Controllers.PiPositionController">
+             <summary>
+             PI Position查询控制器（5号位提供给4号位）
+            
+             路由规范：
+               GET /api/pi-position?planVersionId=        - PI Position列表查询
+               GET /api/pi-position/summary?planVersionId= - PI Position汇总
+            
+             【职责边界】
+             - 5号位提供只读查询接口，直接读取ProductionInstructionPositionSnapshot表
+             - 不重算Position，不修改Snapshot
+             </summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.PiPositionController.GetCurrentUserId">
+            <summary>解析当前登录用户 Id（无效返回 0 → 范围解析为拒绝全部，安全默认）</summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.PiPositionController.Query(System.Int32,System.String,System.String,System.String,System.String,System.Int32,System.Int32,System.Threading.CancellationToken)">
+            <summary>
+            查询PI Position列表
+            </summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.PiPositionController.GetSummary(System.Int32,System.Threading.CancellationToken)">
+            <summary>
+            查询PI Position汇总
+            </summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.PiPositionController.GetByProductionInstruction(System.String,System.Int32,System.Threading.CancellationToken)">
+            <summary>
+            查询单个生产指令的所有 Position（单 PI 详情）
+            </summary>
+        </member>
+        <member name="T:LPS.APS.Web.Controllers.ProcurementManualEtaController">
+             <summary>
+             采购人工ETA维护控制器（5号位提供，供4号位前端调用）
+            
+             路由规范：
+               GET    /api/procurement-manual-eta                  - 查询Manual ETA列表
+               GET    /api/procurement-manual-eta/{poNo}/{lineNo}  - 查询单条记录
+               POST   /api/procurement-manual-eta                  - 新增或更新Manual ETA
+               DELETE /api/procurement-manual-eta/{poNo}/{lineNo}  - 取消Manual ETA
+            
+             【职责边界 - 2026-08-26】
+             - 5号位提供Manual ETA维护API
+             - 2号位消费Manual ETA并计算Effective ETA
+            
+             参考：复审报告P1-01
+             </summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.ProcurementManualEtaController.ListWarehouses(System.String,System.Threading.CancellationToken)">
+            <summary>
+            收货仓库下拉（数据源：ext_MES_ProcessCode_View，processcode→code、processname→name）
+            GET /api/procurement-manual-eta/warehouses
+            </summary>
+        </member>
+        <!-- Badly formed XML comment ignored for member "M:LPS.APS.Web.Controllers.ProcurementManualEtaController.ListMaterials(System.String,System.String,System.Nullable{System.Int32},System.Int32,System.Threading.CancellationToken)" -->
+        <!-- Badly formed XML comment ignored for member "M:LPS.APS.Web.Controllers.ProcurementManualEtaController.ListSupplyCombos(System.String,System.Nullable{System.Int32},System.Int32,System.Threading.CancellationToken)" -->
+        <member name="M:LPS.APS.Web.Controllers.ProcurementManualEtaController.Query(System.String,System.String,System.String,System.String,System.Nullable{System.DateTime},System.Nullable{System.DateTime},System.Nullable{System.DateTime},System.Boolean,System.Boolean,System.String,System.String,System.String,System.Int32,System.Int32,System.Boolean,System.Threading.CancellationToken)">
+            <summary>
+            查询Manual ETA列表
+            **11-14（v2.0 R2 取向乙）**：`withMatched=true` 时每行带 `isMatched`（true=会参与排产 /
+            false=未命中当前供货事实，静默不生效 / null=未判定）。**默认 false**——标注要多扫一遍供给事实表
+            （实库 42.7 万行、SourceDocumentNo 无索引，实测 ≈273ms），不需要标注的调用不付这笔钱。
+            </summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.ProcurementManualEtaController.GetSummary(System.String,System.String,System.String,System.String,System.Nullable{System.DateTime},System.Nullable{System.DateTime},System.Nullable{System.DateTime},System.Threading.CancellationToken)">
+            <summary>
+            指标条一次五数（R3，11-12）：`GET /api/procurement-manual-eta/summary`，
+            接受与列表同名同义的筛选参数（不含 active/cancelled/sortBy——五桶横跨两态）；与列表 WHERE 类级单源。
+            </summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.ProcurementManualEtaController.GetFacets(System.String,System.Threading.CancellationToken)">
+            <summary>
+            筛选候选（R4，11-12）：`GET /api/procurement-manual-eta/facets?search=`——本表 distinct PONo/物料码（含已取消行），
+            每维顶 500，Truncated=true 表示候选被截（请改用 search）。收货仓库仍走 /warehouses。
+            </summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.ProcurementManualEtaController.GetByBusinessKey(System.String,System.Int32,System.Int32,System.String,System.Threading.CancellationToken)">
+            <summary>
+            根据业务键查询单条Manual ETA记录
+            </summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.ProcurementManualEtaController.Upsert(LPS.APS.Core.Dto.ProcurementManualEtaOverride,System.Threading.CancellationToken)">
+            <summary>
+            新增或更新Manual ETA
+            </summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.ProcurementManualEtaController.Cancel(System.String,System.Int32,LPS.APS.Web.Controllers.CancelManualEtaRequest,System.Threading.CancellationToken)">
+            <summary>
+            取消Manual ETA（设置IsActive=0）
+            </summary>
+        </member>
+        <member name="T:LPS.APS.Web.Controllers.WarehouseLookupItem">
+            <summary>
+            收货仓库下拉项（数据源 ext_MES_ProcessCode_View：processcode→Code、processname→Name）
+            </summary>
+        </member>
+        <member name="T:LPS.APS.Web.Controllers.CancelManualEtaRequest">
+            <summary>
+            取消Manual ETA请求体
+            </summary>
+        </member>
+        <member name="T:LPS.APS.Web.Controllers.CancelManualEtaResponse">
+            <summary>
+            取消Manual ETA响应体
+            </summary>
+        </member>
+        <member name="T:LPS.APS.Web.Controllers.ProductionDepartmentController">
+             <summary>
+             生产部门查询控制器（5号位提供；G2 部门下拉数据源）
+            
+             路由规范：
+               GET /api/production-departments - 生产部门列表（可选仅排程部门）
+            
+             【权限码】挂 ResourceCalendarView（服务资源日历页部门下拉；与资源日历页同权限）
+             【职责边界】只读 ProductionDepartment，不增删改
+             </summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.ProductionDepartmentController.GetList(System.Nullable{System.Boolean},System.Boolean,System.Threading.CancellationToken)">
+            <summary>生产部门列表（默认仅活动部门）</summary>
+        </member>
+        <member name="T:LPS.APS.Web.Controllers.ProductionWorkCalendarController">
+             <summary>
+             工厂/部门上级工作日历维护控制器（5号位=业务 Owner；表模型/三级解析=2号位）
+            
+             路由规范：
+               GET  /api/production-work-calendar            - 分页查询（PageResult，字段 page；结果按授权 Factory/Department 过滤）
+               POST /api/production-work-calendar/weekly     - 周基准铺设（同范围同星期闭区间换版）
+               POST /api/production-work-calendar/exception  - 日期例外铺设（节假日OFF/补班WORK/授权加班）
+               POST /api/production-work-calendar/close      - 闭区间换版（旧开放行闭到新版前一日）
+               POST /api/production-work-calendar/rows/{id}/close?effectiveTo= - 单行闭区间（撤销已生效例外，保留审计）
+               DELETE /api/production-work-calendar/rows/{id} - 物理删除（仅限未生效行，纠错通道）
+            
+             【治理】条款=Resource Calendar 专项 v1.4 / DDL v5.1.8.5（G1 候选）；
+             G4 公告前用于联调与备料，真实班次数据写入与解析消费等公告生效。
+             【权限】暂复用 aps.resource_calendar.*（5号位 日历域既有 3 码）；若 0号位/3号位 要求
+             独立 aps.production_work_calendar.* 权限码，G4 前另行申请，届时仅换 Policy 常量。
+             【S5-01 整改（2026-10-14）】功能权限之外，Service 层按目标行 Factory.Code（DEPARTMENT 行另加
+             ProductionDepartment.DeptCode）做业务范围二次校验（IDataScopeService，fail-closed，不同维度 AND，
+             照 StageLeadTimeParam P0-03 先例）；越界抛 ScopeViolationException → 本控制器映射 403。
+             【DDL 尾注四项发布强校验】①同级时间重叠/星期日期冲突 ②部门归属Factory匹配
+             ③操作权限（本控制器 Policy + Service 业务范围校验）④授权加班证据完整性 —— ①②③④ 在 Service 发布路径强校验。
+             </summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.ProductionWorkCalendarController.GetCurrentUserId">
+            <summary>解析当前登录用户 Id（无效时返回 0 → 范围解析为拒绝全部，安全默认，照 MesDispatchController 先例）</summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.ProductionWorkCalendarController.Query(System.String,System.Nullable{System.Int32},System.Nullable{System.Int32},System.Boolean,System.Int32,System.Int32,System.String,System.String,System.Boolean,System.Threading.CancellationToken)">
+            <summary>分页查询上级工作日历（MISSING=无行，不造虚拟行；结果按授权 Factory/Department 过滤）</summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.ProductionWorkCalendarController.UpsertWeekly(LPS.APS.Application.Services.Dto.WeeklyCalendarUpsertRequest,System.Threading.CancellationToken)">
+            <summary>周基准铺设（1..7 星期几一批；同星期可多窗口并存=白班/小夜/大夜多班制，窗口重叠拒绝；
+            同范围同星期整组替换：未生效旧行覆盖、已生效闭区间换版）</summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.ProductionWorkCalendarController.CreateException(LPS.APS.Application.Services.Dto.WorkCalendarExceptionRequest,System.Threading.CancellationToken)">
+            <summary>日期例外铺设（节假日 OFF / 补班 WORK / 授权加班；同级同日重叠拒绝）</summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.ProductionWorkCalendarController.CloseOpen(LPS.APS.Application.Services.Dto.CalendarCloseOpenRequest,System.Threading.CancellationToken)">
+            <summary>闭区间换版（把该范围全部未闭行闭到 NewEffectiveFrom-1，供新版班制接力）</summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.ProductionWorkCalendarController.CloseRow(System.Int64,System.DateTime,System.Threading.CancellationToken)">
+            <summary>单行闭区间（撤销已生效例外行：历史保留、审计完整；不可重复闭）</summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.ProductionWorkCalendarController.DeleteRow(System.Int64,System.Threading.CancellationToken)">
+            <summary>物理删除——仅限未生效行（EffectiveFrom&gt;今天，纯纠错）；已生效行 409 提示走 close</summary>
+        </member>
+        <member name="T:LPS.APS.Web.Controllers.RbacController">
+            <summary>
+            RBAC 管理控制器（F-G5，3号位）
+            提供用户/角色/权限/业务范围策略的增删改与分配端点。
+            所有端点要求 auth.manage 功能权限（PermissionAuthorizationHandler 对 DB 权威校验）。
+            </summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.RbacController.GetUsers(System.Int32,System.Int32,System.String,System.String)">
+            <summary>查询用户列表（分页）</summary>
+            <param name="page">页码，从 1 起，默认 1。</param>
+            <param name="pageSize">每页条数，默认 20，允许 20/50/100；当前硬上限 200（超限截断）。如业务需更大分页（500/1000），仅调整本常量与前端 page-size 选项两处，不动契约文档。</param>
+            <param name="keyword">模糊匹配 UserCode/UserName/Email，空＝不过滤。</param>
+            <param name="status">精确匹配状态（Active/Disabled/Deleted），空＝不含已删除。</param>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.RbacController.CreateUser(LPS.APS.Core.Dto.CreateUserRequest)">
+            <summary>创建用户</summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.RbacController.UpdateUser(System.Int32,LPS.APS.Core.Dto.UpdateUserRequest)">
+            <summary>更新用户（含启用/停用）</summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.RbacController.DeleteUser(System.Int32)">
+            <summary>删除用户（软删除）</summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.RbacController.AssignUserRoles(System.Int32,LPS.APS.Core.Dto.AssignIdsRequest)">
+            <summary>分配用户角色（覆盖式）</summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.RbacController.AssignUserScopes(System.Int32,LPS.APS.Core.Dto.AssignIdsRequest)">
+            <summary>分配用户业务范围（覆盖式）</summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.RbacController.GetRoles(System.Int32,System.Int32,System.String,System.Nullable{System.Boolean})">
+            <summary>查询角色列表（分页）</summary>
+            <param name="page">页码，从 1 起，默认 1。</param>
+            <param name="pageSize">每页条数，默认 20，允许 20/50/100；当前硬上限 200（超限截断）。</param>
+            <param name="keyword">模糊匹配 RoleCode/RoleName，空＝不过滤。</param>
+            <param name="isSystem">精确过滤 IsSystemRole，空＝不过滤。</param>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.RbacController.CreateRole(LPS.APS.Core.Dto.CreateRoleRequest)">
+            <summary>创建角色</summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.RbacController.UpdateRole(System.Int32,LPS.APS.Core.Dto.UpdateRoleRequest)">
+            <summary>更新角色（含启用/停用）</summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.RbacController.DeleteRole(System.Int32)">
+            <summary>删除角色（软删除）</summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.RbacController.AssignRolePermissions(System.Int32,LPS.APS.Core.Dto.AssignIdsRequest)">
+            <summary>分配角色权限（覆盖式）</summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.RbacController.AssignRoleScopes(System.Int32,LPS.APS.Core.Dto.AssignIdsRequest)">
+            <summary>分配角色业务范围（覆盖式）</summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.RbacController.GetPermissions(System.Int32,System.Int32,System.String,System.String,System.String)">
+            <summary>查询权限列表（分页）</summary>
+            <param name="page">页码，从 1 起，默认 1。</param>
+            <param name="pageSize">每页条数，默认 20，允许 20/50/100；当前硬上限 200（超限截断）。</param>
+            <param name="module">精确匹配 Module，空＝不过滤。</param>
+            <param name="actionType">精确匹配 ActionType，空＝不过滤。</param>
+            <param name="keyword">模糊匹配 PermissionCode/PermissionName，空＝不过滤。</param>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.RbacController.CreatePermission(LPS.APS.Core.Dto.CreatePermissionRequest)">
+            <summary>创建权限</summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.RbacController.GetScopes(System.Int32,System.Int32,System.String,System.String)">
+            <summary>查询业务范围策略列表（分页）</summary>
+            <param name="page">页码，从 1 起，默认 1。</param>
+            <param name="pageSize">每页条数，默认 20，允许 20/50/100；当前硬上限 200（超限截断）。</param>
+            <param name="scopeType">精确匹配 ScopeType，空＝不过滤。</param>
+            <param name="keyword">模糊匹配 ScopeValue/Description，空＝不过滤。</param>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.RbacController.CreateScope(LPS.APS.Core.Dto.CreateDataScopePolicyRequest)">
+            <summary>创建业务范围策略</summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.RbacController.UpdateScope(System.Int32,LPS.APS.Core.Dto.UpdateDataScopePolicyRequest)">
+            <summary>更新业务范围策略说明</summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.RbacController.DeleteScope(System.Int32)">
+            <summary>删除业务范围策略</summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.RbacController.GetUserRoles(System.Int32)">
+            <summary>读回用户当前角色分配（AssignDialog 预勾选）</summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.RbacController.GetUserScopes(System.Int32)">
+            <summary>读回用户当前业务范围分配（AssignDialog 预勾选）</summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.RbacController.GetRolePermissions(System.Int32)">
+            <summary>读回角色当前权限分配（AssignDialog 预勾选）</summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.RbacController.GetRoleScopes(System.Int32)">
+            <summary>读回角色当前业务范围分配（AssignDialog 预勾选）</summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.RbacController.CleanupTestData">
+            <summary>清理测试数据（R1 方案 a：按命名规则软删 verify 残留，admin only，仅软删/停用不物理删）</summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.RbacController.DeleteUsersBatch(LPS.APS.Core.Dto.BatchDeleteRequest)">
+            <summary>批量删除用户（软删；自删保护 + 最后 auth.manage 保护）</summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.RbacController.DeleteRolesBatch(LPS.APS.Core.Dto.BatchDeleteRequest)">
+            <summary>批量删除角色（软删；系统角色保护）</summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.RbacController.DeletePermissionsBatch(LPS.APS.Core.Dto.BatchDeleteRequest)">
+            <summary>批量删除权限（停用 IsActive=false，保留授权关联，不解绑）</summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.RbacController.DeleteScopesBatch(LPS.APS.Core.Dto.BatchDeleteRequest)">
+            <summary>批量删除业务范围策略（停用 IsEnabled=0）</summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.RbacController.GetCurrentUserId">
+            <summary>
+            从 JWT 声明解析当前操作用户 Id（用于审计 OperatedBy 与自删保护）。
+            解析失败或非法（≤0）时抛出 <see cref="T:System.InvalidOperationException"/>（fail-closed，避免落 OperatedBy="0" 的脏审计）。
+            </summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.RbacController.GetCurrentUserIdForLog">
+            <summary>仅用于日志显示的当前用户 Id（解析失败返回 0，不抛，避免日志行本身中断）。</summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.RbacController.RunAsync``1(System.Func{System.Threading.Tasks.Task{``0}},System.String)">
+            <summary>统一执行并映射异常到 <see cref="T:LPS.APS.Shared.Models.ApiResponse`1"/>。</summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.RbacController.RunAsync(System.Func{System.Threading.Tasks.Task},System.String)">
+            <summary>统一执行并映射异常到 <see cref="T:LPS.APS.Shared.Models.ApiResponse"/>（无返回数据）。</summary>
+        </member>
+        <member name="T:LPS.APS.Web.Controllers.ResourceCalendarController">
+             <summary>
+             设备资源日历维护控制器（5号位提供，供4号位页面）
+            
+             路由规范：
+               POST   /api/resource-calendar/slots          - 批量铺窗（覆盖式：先删同区间旧窗再生成；Days=1 覆盖逐条）
+               GET    /api/resource-calendar/{resourceId}    - 查询某设备所有窗口
+               DELETE /api/resource-calendar/slots/{id}      - 物理删除某窗口
+            
+             【权限码】3号位已落：ResourceCalendarView / Edit / Delete（43 码）
+             【S5-01 整改（2026-10-14）】功能权限之外，Service 层按目标 Resource 关联 Factory/Department
+             做业务范围二次校验（IDataScopeService，fail-closed）；越界抛 ScopeViolationException → 本控制器映射 403。
+             【职责边界】5号位提供维护接口；不改 Solver / 不触 Pegging
+             </summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.ResourceCalendarController.GetCurrentUserId">
+            <summary>解析当前登录用户 Id（无效时返回 0 → 范围解析为拒绝全部，安全默认，照 MesDispatchController 先例）</summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.ResourceCalendarController.BulkCreate(LPS.APS.Application.Services.Dto.ResourceCalendarBulkRequest,System.Threading.CancellationToken)">
+            <summary>批量铺窗（覆盖式：一次生成连续多天窗口）</summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.ResourceCalendarController.AddSingle(LPS.APS.Application.Services.Dto.ResourceCalendarSingleRequest,System.Threading.CancellationToken)">
+            <summary>
+            单条窗口追加（2026-10-14 放开"一天多条"方向2）：只插不删；同日重叠 409；相切合法；不跨天。
+            与批量端点分工：批量=整段重铺（覆盖式），本端点=按条增补。
+            </summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.ResourceCalendarController.ResolvePreview(System.String,System.DateTime,System.DateTime,System.Threading.CancellationToken)">
+            <summary>
+            三级合并解析预览（4号位 10-14 函 R1）：某批设备在指定区间内三级继承后的最终可排窗口与来源层级。
+            只读、不写库；业务范围 fail-closed（越界设备剔除）。
+            </summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.ResourceCalendarController.Get(System.Int32,System.Nullable{System.DateTime},System.Nullable{System.DateTime},System.Int32,System.Int32,System.Threading.CancellationToken)">
+            <summary>查询某设备窗口（分页 PageResult；可按时间范围过滤；目标设备须在业务范围内）</summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.ResourceCalendarController.Delete(System.Int64,System.Threading.CancellationToken)">
+            <summary>物理删除某窗口（窗口所属设备须在业务范围内）</summary>
+        </member>
+        <member name="T:LPS.APS.Web.Controllers.ResourceController">
+             <summary>
+             资源主表查询控制器（5号位提供；G1 设备下拉数据源）
+            
+             路由规范：
+               GET /api/resource - 资源主表列表（可部门/类型过滤，含 hasCalendar 日历状态）
+            
+             【权限码】挂 ResourceCalendarView（服务资源日历页设备下拉；与资源日历页同权限）
+             【职责边界】只读 Resource 主档，不增删改资源
+             </summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.ResourceController.GetList(System.Nullable{System.Int32},System.String,System.Boolean,System.Threading.CancellationToken)">
+            <summary>
+            资源主表列表（支持按部门/类型过滤；含 hasCalendar）。
+            10-23 R1 起按登录者业务范围收窄（与资源日历读路径 EnsureTargetScopeAsync 同源同判定：
+            Global 放行；非 Global 须 Factory 命中 ∧（资源无部门归属 或 Department 命中））；身份解析失败=0 → 空列表（fail-closed）。
+            </summary>
+        </member>
+        <member name="T:LPS.APS.Web.Controllers.RoutingOperationController">
+            <summary>
+            工序工艺属性治理 API（T1 · S2/S3 OPM 治理 API，4号位 配置页面消费）。
+            路径前缀 /api/governance（与 SetupRuleController / GovernanceController 共享前缀，字面路由段不冲突）。
+            权限：查看 aps.rule.view；维护 aps.rule.edit（复用 Rule 码，零权限种子变更）。
+            OperationPlanningMode（OPM）属 APS 工艺规划属性，治理侧直维护唯一主路径（0号位 2026-09-23 Q1 裁决）。
+            错误映射：422 数据红线（三态非法）/ 404 不存在 / 400 参数 / 403 权限不足（[Authorize]）。
+            </summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.RoutingOperationController.GetCurrentUserId">
+            <summary>解析当前登录用户 Id（无效时返回 0 → 审计可追溯性不降级原则下置空处理）</summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.RoutingOperationController.GetCurrentUserCode">
+            <summary>解析当前登录用户工号（审计真实 Actor，P1-04 强制后端取身份，禁止信任请求体）</summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.RoutingOperationController.HandleError(System.Exception,System.String)">
+            <summary>统一错误映射：422 数据红线 / 404 不存在 / 400 参数 / 403 业务范围越界；未知异常上抛由框架处理（500）</summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.RoutingOperationController.ListOperations(System.Int32,System.Threading.CancellationToken)">
+            <summary>列出指定物料的工序（含当前 OPM 值），供 4号位 选工序维护</summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.RoutingOperationController.UpdateOperationPlanningMode(System.Int64,LPS.APS.Core.DTOs.Governance.UpdateOperationPlanningModeRequest,System.Threading.CancellationToken)">
+            <summary>维护指定工序的 OPM 值（三态校验在服务内执行，非法 → 422）</summary>
+        </member>
+        <member name="T:LPS.APS.Web.Controllers.ScheduleController">
+             <summary>
+             排程结果查询控制器（5号位中转，供4号位前端甘特图调用）
+            
+             路由规范：
+               GET /api/schedule/versions          - 计划版本列表
+               GET /api/schedule/gantt/{id}        - 指定版本的甘特图数据
+               GET /api/schedule/summary/{id}      - 指定版本的排程概要 KPI
+            
+             【职责边界】
+             - 5号位提供只读查询接口
+             - 数据来源：IScheduleQueryService（读取已落盘APS事实）
+             - V1不包含：触发重排/拖拽调整/解冻申请等写操作
+             F-G4：以当前登录用户 Id 为入口，由 IScheduleQueryService 内部解析业务范围并过滤（Domain/Factory 维度）。
+             V1 不包含：触发重排 / 拖拽调整 / 解冻申请 等写操作（后续阶段铺开）
+             </summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.ScheduleController.GetVersions(System.Int32,System.Threading.CancellationToken)">
+            <summary>
+            获取计划版本列表（最新优先，默认 30 条，按当前用户业务范围过滤）。
+            R5（11-12 4号位件）两点增量、均不破坏现契约：
+            ① 行内 `isDefault`=该行是其**域内**当前生效版本（ACTIVE；UQ 保证每域≤1；无全局唯一默认，
+               跨域页面默认请取 isDefault 行中 ActivatedAt 最新者）；
+            ② 响应头 `X-Total-Count`=同 WHERE 全量条数（TOP take 截断显式化；不改变响应体结构）。
+            </summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.ScheduleController.GetGantt(System.Int32,System.Nullable{System.DateTime},System.Nullable{System.DateTime},System.Int32[],System.Nullable{System.Int32},System.Nullable{System.Int32},System.Nullable{System.DateTime},System.Nullable{System.Int64},System.Threading.CancellationToken)">
+            <summary>
+            获取指定计划版本的甘特图数据（资源行 + 任务条；越权返回空且 ScopeDenied=true）。
+            冻结 05:1013「Gantt按时间窗/资源加载」：支持可选 from / to / resourceIds。
+            <para>⚠️ <c>resourceIds</c> 只认<b>重复键</b>写法：<c>?resourceIds=1&amp;resourceIds=2</c>。
+            逗号形式（<c>1,2</c>）会被模型绑定拒绝（422）；<c>resourceIds[]=1</c> 形式会被静默忽略而返回全量，
+            故下方显式拦截，避免调用方误以为过滤生效（4号位 10-17 §3.2）。</para>
+            <para>10-29 分页契约（4号位 三步走·第 1 步，5号位 复函定稿）：
+            <c>limit</c> 缺省 8,000、硬上限 20,000——<b>不传亦按默认截断，"裸调=全量"旧语义终结</b>；
+            翻页=把响应 <c>nextAfter</c> 的 <c>afterStartAt/afterTaskId</c> 回填（11-06 时间序二元组；
+            <c>afterResourceId</c> 仍可收到、被忽略——旧前端不需要同批改）。
+            响应新增 <c>limit/totalTasks/hasMore/nextAfter</c>；<c>totalTasks</c>=当前过滤口径数（非版本总数）。</para>
+            </summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.ScheduleController.GetGanttBuckets(System.Int32,System.Nullable{System.DateTime},System.Nullable{System.DateTime},System.String,System.Int32[],System.Threading.CancellationToken)">
+            <summary>
+            甘特「资源×时间桶」聚合层（三步走·第 2 步；5号位 2026-10-30 复函九条口径定稿）。
+            <c>from/to 必填</c>（缺→真 400）；<c>bucket=day|week|month</c>（缺省 day）；
+            行数>50,000 自动 day→week→month 降级（回显 <c>bucketWidth/bucketDowngraded</c>），月桶仍超→真 400 要求 resourceIds 收窄。
+            恒等式 <c>Σ items.taskCount == totalTasks</c>（钳制归桶+未排桶）；未排桶行 <c>bucketStart</c> 整键省略；
+            不存在/越权沿用 200+flag（versionExists/scopeDenied）与明细体同惯例。
+            <c>resourceIds</c> 与明细体同款拦截：只认重复键，<c>resourceIds[]</c> 真 400。
+            </summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.ScheduleController.QueryTasks(System.Int32,System.Nullable{System.DateTime},System.Nullable{System.DateTime},System.Int32[],System.String,System.String,System.String,System.String,System.Nullable{System.Boolean},System.String,System.String,System.Int32,System.Int32,System.Threading.CancellationToken)">
+            <summary>
+            P05 任务清单（11-16 矩阵 A4，5号位）：<c>GET /api/schedule/tasks/{planVersionId}</c>——
+            一行=一个真实 <c>Task.Id</c>（不按 TaskNo 折叠）；<c>total</c>=服务端全量命中、<c>items</c>=本页已加载，两数分开。
+            筛选：<c>from/to</c>（naive 墙钟窗，NULL 计划时刻恒保留——同甘特窗口件）、<c>resourceIds</c>（重复键；
+            <c>resourceIds[]</c> 真 400）、<c>stageCodes</c>/<c>departmentIds</c>（逗号）、<c>keyword</c>（物料码/名/TaskNo 三路）、
+            <c>status</c>（原值等值）、<c>hasWorkOrder</c>（三态：缺省=不过滤 true=有工单 false=无工单，**只是工单号列过滤，
+            不是"无需MES"分类**——分类权威未建，矩阵 Q-a）。
+            排序：<c>sortBy=plannedStart|quantity|materialCode|taskNo|id</c>（缺省 plannedStart）+ <c>sortDir=asc|desc</c>，非法⇒真 400。
+            分页 <c>pageIndex/pageSize</c>（缺省 50、钳 ≤200）。越权=200+<c>scopeDenied=true</c>；PV 不存在=<c>versionExists=false</c>。
+            域/部门 Scope 与甘特**同一套解析件**（受限账号两页口径恒一致）。
+            </summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.ScheduleController.GetTaskDetail(System.Int64,System.Threading.CancellationToken)">
+            <summary>
+            P06 单 Task 详情（11-16 矩阵 A5）：<c>GET /api/schedule/task/{taskId}</c>——
+            列表行全字段 + 版本身份（versionCode/domainKey/planVersionStatus/dataCutoffTime）+
+            份额明细（AllocationTaskShare 同 PV 逐行，根订单号=同 PV [Order] 反查）。
+            共享 Task 多根订单**全量给**，页面不得贴单一订单为唯一需求来源；
+            <c>found=false</c>=不存在；<c>scopeDenied=true</c>=域外/部门外（两态不混报）。
+            前后依赖边、MES 实际执行事实=未提供（挂 Q-a/Q-d，空位显式，不做推断）。
+            </summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.ScheduleController.GetResourceLoad(System.Int32,System.Nullable{System.DateTime},System.Nullable{System.DateTime},System.Int32[],System.Threading.CancellationToken)">
+            <summary>
+            P12 资源负荷三率（11-17 矩阵 A6/A7；0号位 Q-b 已裁）：<c>GET /api/schedule/resource-load/{planVersionId}?from=&amp;to=&amp;resourceIds=</c>——
+            一行=**设备×业务日**。①日历负荷率=当日已排 Task 小时÷三级继承解析可用小时×100；②固定 16h 负荷率=当日已排÷16×100
+            （恒可算，<b>不是</b>真实可用时间、不得代替①或当 MES 利用率）；③换型损失率=<b>暂不产出</b>——
+            Setup 权威=1号位 Solver 落库产物、现无持久列 ⇒ <c>setupHoursAvailable=false</c>、③全表 null（Q-b 禁读时重匹配/禁 Duration 代）。
+            三态：<c>notApplicableReason</c> 非空=不适用（零合法可用小时/无日历/范围剔除三类文案，<b>禁显示 0</b>）；
+            有可用小时且当日无排产=① 0%（明确零，合法值）。跨午夜 Task 按日切片。<c>from/to 必填</c>（缺→真400）、窗≤31天、设备≤200；
+            不传 resourceIds=窗内有排产设备 TOP200（<c>resourcesTruncated=true</c> 须提示收窄）。域/部门 Scope 同甘特件；
+            越权=200+<c>scopeDenied</c>，PV 缺=<c>versionExists=false</c>。
+            </summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.ScheduleController.GetSummary(System.Int32,System.Threading.CancellationToken)">
+            <summary>
+            获取指定计划版本的排程概要 KPI（越权返回空）
+            </summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.ScheduleController.GetCurrentUserId">
+            <summary>解析当前登录用户 Id（无效时返回 0 → 范围解析为拒绝全部，安全默认）</summary>
+        </member>
+        <member name="T:LPS.APS.Web.Controllers.SetupRuleController">
+            <summary>
+            Setup 换型规则维护 API（4号位 Setup 契约 §11.1，#1-13 端点）。
+            路径前缀 /api/governance（与 <see cref="T:LPS.APS.Web.Controllers.GovernanceController"/> 共享前缀，字面路由段不冲突）。
+            权限：查看 aps.setup.view；维护 aps.setup.edit；**整版发布挂 aps.rule.publish（P0-A 2026-10-27 核证收口，不得仅持 aps.setup.publish 越权发布①＋⑦）**。
+            错误映射：422 数据红线 / 404 不存在 / 400 状态红线与参数 / 403 权限不足（[Authorize]）。
+            </summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.SetupRuleController.GetCurrentUserId">
+            <summary>解析当前登录用户 Id（无效时返回 0 → 审计可追溯性不降级原则下置空处理）</summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.SetupRuleController.GetCurrentUserCode">
+            <summary>解析当前登录用户工号（审计真实 Actor，P1-04 强制后端取身份，禁止信任请求体）</summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.SetupRuleController.HandleError(System.Exception,System.String)">
+            <summary>统一错误映射：422 数据红线 / 404 不存在 / 400 状态红线与参数 / 403 业务范围越界；未知异常上抛由框架处理（500）</summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.SetupRuleController.ListExact(System.Int64,System.Threading.CancellationToken)">
+            <summary>#1 列出明确换型规则（EXACT）</summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.SetupRuleController.CreateExact(LPS.APS.Core.DTOs.Setup.SetupRuleExactInput,System.Threading.CancellationToken)">
+            <summary>#2 新增明确换型规则（EXACT）</summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.SetupRuleController.UpdateExact(System.Int64,LPS.APS.Core.DTOs.Setup.SetupRuleExactInput,System.Threading.CancellationToken)">
+            <summary>#3 更新明确换型规则（EXACT）</summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.SetupRuleController.DeleteExact(System.Int64,System.Threading.CancellationToken)">
+            <summary>#4 删除明确换型规则（EXACT）</summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.SetupRuleController.ListDefault(System.Int64,System.Threading.CancellationToken)">
+            <summary>#5 列出默认换型规则（DEFAULT）</summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.SetupRuleController.CreateDefault(LPS.APS.Core.DTOs.Setup.SetupRuleDefaultInput,System.Threading.CancellationToken)">
+            <summary>#6 新增默认换型规则（DEFAULT）</summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.SetupRuleController.UpdateDefault(System.Int64,LPS.APS.Core.DTOs.Setup.SetupRuleDefaultInput,System.Threading.CancellationToken)">
+            <summary>#7 更新默认换型规则（DEFAULT）</summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.SetupRuleController.DeleteDefault(System.Int64,System.Threading.CancellationToken)">
+            <summary>#8 删除默认换型规则（DEFAULT）</summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.SetupRuleController.GetOperationResourceEligibility(System.String,System.String,System.String,System.Threading.CancellationToken)">
+            <summary>#9 工序资源资格查询（当前 Operation 合法资源 ∩ 前后产品合法设备交集；materialId/toMaterialId 为物料主键 Material.Id）</summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.SetupRuleController.ListRuleSetVersions(System.Nullable{System.Int64},System.String,System.Threading.CancellationToken)">
+            <summary>#11 规则集版本列表（可选按规则集/状态过滤）</summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.SetupRuleController.GetDiff(System.Int64,System.Int64,System.Threading.CancellationToken)">
+            <summary>#12 版本 Setup 换型规则差异（added/modified/removed + 计数）</summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.SetupRuleController.Publish(System.Int64,LPS.APS.Core.DTOs.Setup.SetupPublishRequest,System.Threading.CancellationToken)">
+            <summary>
+            #13 发布规则集版本（发布前 Setup 冲突全量预校验）。
+            权限 aps.rule.publish（P0-A 2026-10-27 核证收口）：本端点发布的是含需求优先级①的整版规则集，
+            由仅持 aps.setup.publish 越权改为规则集发布权，语义与整版发布对齐（不得仅凭 setup.publish 发布①＋⑦）。
+            端到端 403 负例（仅持 aps.setup.publish、无 aps.rule.publish 主体 → 403 且版本仍 DRAFT）归 WebApplicationFactory
+            集成基建（2号位 运行域），见《…_统一发布门禁_端到端403负例协助请求_3号位致2号位_v1.0》。
+            </summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.SetupRuleController.LookupDepartments(System.String,System.Threading.CancellationToken,System.Int32)">
+            <summary>部门下拉（masterId=Id，code=DeptCode；search 模糊 DeptCode；limit 默认 200，缺省行为不变）</summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.SetupRuleController.LookupResources(System.String,System.Threading.CancellationToken,System.Int32)">
+            <summary>设备下拉（masterId=Id，code=ResourceCode；search 模糊 ResourceCode/ResourceName；limit 默认 200，缺省行为不变）</summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.SetupRuleController.LookupMaterials(System.String,System.Threading.CancellationToken,System.Boolean,System.Int32)">
+            <summary>物料下拉（masterId=Material.Id，code=MaterialCode；search 模糊 MaterialCode/MaterialName/Spec；activeOnly=true 仅活动；limit 默认 200，缺省行为不变）</summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.SetupRuleController.GetUncoveredStats(System.Nullable{System.Int32},System.Nullable{System.Int32},System.String,System.Nullable{System.Int32},System.Nullable{System.Int32},System.Nullable{System.Int32},System.Nullable{System.Int32},System.Threading.CancellationToken)">
+            <summary>
+            #14 规则缺失（0 分钟兜底）命中频次聚合（uncovered-stats）。
+            数据源 = [Task].SetupSource='SETUP_RULE_MISSING_ZERO_FALLBACK' 聚合；四级下钻 runId → 部门 → 工序 → 设备 → 产品。
+            各级过滤参数可选（未传不筛）；响应 Code 回带（部门/设备/物料）。只读查询，空结果返回空列表。
+            路由 setup-rules/uncovered-stats 与前端 setup.ts:424 一致。
+            </summary>
+        </member>
+        <member name="T:LPS.APS.Web.Controllers.StageLeadTimeParamController">
+            <summary>
+            阶段提前期参数治理 API（StageLeadTimeParam，PM 2026-09-28 终裁归 3号位 规则参数体系）。
+            路径前缀 /api/governance（与 SetupRuleController / GovernanceController / RoutingOperationController 共享前缀，字面路由段不冲突）。
+            权限：查看 aps.rule.view；维护 aps.rule.edit（复用 Rule 码，零权限种子变更）。
+            载体「直接生效（时间窗）」；停用走 DELETE（软删 IsActive=0），不物理删。
+            错误映射：422 数据红线 / 404 不存在 / 400 参数 / 403 权限不足（[Authorize]）。
+            </summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.StageLeadTimeParamController.GetCurrentUserId">
+            <summary>解析当前登录用户 Id（无效时返回 0 → 审计可追溯性不降级原则下置空处理）</summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.StageLeadTimeParamController.GetCurrentUserCode">
+            <summary>解析当前登录用户工号（审计真实 Actor，后端从身份取，禁止信任请求体）</summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.StageLeadTimeParamController.HandleError(System.Exception,System.String)">
+            <summary>统一错误映射：422 数据红线 / 404 不存在 / 400 参数；未知异常上抛由框架处理（500）</summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.StageLeadTimeParamController.List(System.String,System.String,System.String,System.Nullable{System.Boolean},System.Threading.CancellationToken)">
+            <summary>列出阶段提前期参数（可按工厂/阶段/生产部门/启用态过滤），供 4号位 配置页面。</summary>
+            <param name="factoryCode">工厂编码（可选）</param>
+            <param name="stageCode">大工艺阶段码（可选）</param>
+            <param name="productionDeptCode">生产部门编码（可选）</param>
+            <param name="isActive">启用态（null = 全部）</param>
+            <param name="ct">取消令牌</param>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.StageLeadTimeParamController.Create(LPS.APS.Core.DTOs.Governance.SaveStageLeadTimeParamRequest,System.Threading.CancellationToken)">
+            <summary>新增阶段提前期参数。</summary>
+            <param name="input">新增请求（整对象）</param>
+            <param name="ct">取消令牌</param>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.StageLeadTimeParamController.Update(System.Int32,LPS.APS.Core.DTOs.Governance.SaveStageLeadTimeParamRequest,System.Threading.CancellationToken)">
+            <summary>编辑阶段提前期参数（PUT 整对象替换，不改动 IsActive）。</summary>
+            <param name="id">参数主键（StageLeadTimeParam.Id）</param>
+            <param name="input">编辑请求（整对象替换）</param>
+            <param name="ct">取消令牌</param>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.StageLeadTimeParamController.Deactivate(System.Int32,System.Threading.CancellationToken)">
+            <summary>停用阶段提前期参数（软删 IsActive=0，保留历史与生效窗口）。</summary>
+            <param name="id">参数主键（StageLeadTimeParam.Id）</param>
+            <param name="ct">取消令牌</param>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.StageLeadTimeParamController.Activate(System.Int32,System.Threading.CancellationToken)">
+            <summary>恢复启用阶段提前期参数（IsActive 0→1；若 IsDefault=1 须过全局默认唯一，窗口重叠 → 422）。幂等：已启用原样返回。</summary>
+            <param name="id">参数主键（StageLeadTimeParam.Id）</param>
+            <param name="ct">取消令牌</param>
+        </member>
+        <member name="T:LPS.APS.Web.Controllers.SupplyFactTraceController">
+             <summary>
+             供应事实原始追溯控制器（5号位提供给4号位）
+            
+             用于页面查看Procurement/VMI/Received/Transit原始供应事实
+            
+             路由规范：
+               GET /api/supply-fact-trace                  - 聚合查询所有供应事实
+            
+             【职责边界】
+             - 5号位提供原始供应事实查询
+             - 4号位用于Pegging行源事实查看
+             </summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.SupplyFactTraceController.GetCurrentUserId">
+            <summary>解析当前登录用户 Id（无效返回 0 → 范围解析为拒绝全部，安全默认）</summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.SupplyFactTraceController.Query(System.String,System.String,System.Nullable{System.Int32},System.String,System.String,System.String,System.Boolean,System.Int32,System.Int32,System.Threading.CancellationToken)">
+            <summary>
+            聚合查询所有供应事实
+            </summary>
+        </member>
+        <member name="T:LPS.APS.Web.Controllers.TaskSplitRuleConfigController">
+            <summary>
+            执行批拆分规则治理 API（TaskSplitRuleConfig / Batch Policy，0号位 2026-10-07 裁决本轮落码，归 3号位 治理）。
+            路径前缀 /api/governance（与 SetupRuleController / GovernanceController / StageLeadTimeParamController 共享前缀，字面路由段不冲突）。
+            权限：查看 aps.rule.view；维护 aps.rule.edit（复用 Rule 码，零权限种子变更）。
+            载体「两级承接」：主题表 CRUD；停用走 DELETE（软删 IsActive=0），不物理删。
+            错误映射：422 数据红线 / 404 不存在 / 400 参数 / 403 权限不足（[Authorize]）。
+            </summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.TaskSplitRuleConfigController.GetCurrentUserId">
+            <summary>解析当前登录用户 Id（无效时返回 0 → 审计可追溯性不降级原则下置空处理）</summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.TaskSplitRuleConfigController.GetCurrentUserCode">
+            <summary>解析当前登录用户工号（审计真实 Actor，后端从身份取，禁止信任请求体）</summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.TaskSplitRuleConfigController.HandleError(System.Exception,System.String)">
+            <summary>统一错误映射：422 数据红线 / 404 不存在 / 400 参数；未知异常上抛由框架处理（500）</summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.TaskSplitRuleConfigController.List(System.Nullable{System.Int32},System.Nullable{System.Int32},System.Nullable{System.Boolean},System.Int32,System.Int32,System.Threading.CancellationToken)">
+            <summary>分页列出执行批拆分规则（可按物料/生产部门/启用态过滤；R2 标准分页契约，4号位 2026-10-08 提请，方案 A）。</summary>
+            <param name="materialId">物料 Id（可选精确匹配）</param>
+            <param name="productionDepartmentId">生产部门 Id（可选精确匹配）</param>
+            <param name="isActive">启用态过滤（null = 全部）</param>
+            <param name="pageIndex">页码（1 基，&lt; 1 归 1）</param>
+            <param name="pageSize">每页条数（1~200，超限截断；默认 20）</param>
+            <param name="ct">取消令牌</param>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.TaskSplitRuleConfigController.Create(LPS.APS.Core.DTOs.Governance.SaveTaskSplitRuleConfigRequest,System.Threading.CancellationToken)">
+            <summary>新增执行批拆分规则。</summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.TaskSplitRuleConfigController.Update(System.Int32,LPS.APS.Core.DTOs.Governance.SaveTaskSplitRuleConfigRequest,System.Threading.CancellationToken)">
+            <summary>编辑执行批拆分规则（PUT 整对象替换，不改动 IsActive）。</summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.TaskSplitRuleConfigController.Deactivate(System.Int32,System.Threading.CancellationToken)">
+            <summary>停用执行批拆分规则（软删 IsActive=0，保留历史与生效窗口）。</summary>
+        </member>
+        <member name="M:LPS.APS.Web.Controllers.TaskSplitRuleConfigController.Activate(System.Int32,System.Threading.CancellationToken)">
+            <summary>恢复启用执行批拆分规则（IsActive 0→1；与其它有效规则窗口重叠 → 422）。幂等：已启用原样返回。</summary>
+            <param name="id">规则主键（TaskSplitRuleConfig.Id）</param>
+            <param name="ct">取消令牌</param>
+        </member>
+        <member name="T:LPS.APS.Web.Dto.Auth.ChangePasswordRequest">
+            <summary>
+            修改密码请求（R2）
+            必须带上旧密码验身；newPassword 不落审计（U42 脱敏）。
+            </summary>
+        </member>
+        <member name="P:LPS.APS.Web.Dto.Auth.ChangePasswordRequest.OldPassword">
+            <summary>旧密码</summary>
+        </member>
+        <member name="P:LPS.APS.Web.Dto.Auth.ChangePasswordRequest.NewPassword">
+            <summary>新密码</summary>
+        </member>
+        <member name="T:LPS.APS.Web.Dto.Auth.LoginRequestDto">
+            <summary>登录请求</summary>
+        </member>
+        <member name="P:LPS.APS.Web.Dto.Auth.LoginRequestDto.UserCode">
+            <summary>用户工号</summary>
+        </member>
+        <member name="P:LPS.APS.Web.Dto.Auth.LoginRequestDto.Password">
+            <summary>密码</summary>
+        </member>
+        <member name="T:LPS.APS.Web.Dto.Auth.LoginResponseDto">
+            <summary>登录响应</summary>
+        </member>
+        <member name="P:LPS.APS.Web.Dto.Auth.LoginResponseDto.AccessToken">
+            <summary>AccessToken（JWT）</summary>
+        </member>
+        <member name="P:LPS.APS.Web.Dto.Auth.LoginResponseDto.RefreshToken">
+            <summary>RefreshToken</summary>
+        </member>
+        <member name="P:LPS.APS.Web.Dto.Auth.LoginResponseDto.ExpiresAt">
+            <summary>AccessToken 过期时间</summary>
+        </member>
+        <member name="P:LPS.APS.Web.Dto.Auth.LoginResponseDto.UserId">
+            <summary>用户ID</summary>
+        </member>
+        <member name="P:LPS.APS.Web.Dto.Auth.LoginResponseDto.UserCode">
+            <summary>用户工号</summary>
+        </member>
+        <member name="P:LPS.APS.Web.Dto.Auth.LoginResponseDto.UserName">
+            <summary>用户姓名</summary>
+        </member>
+        <member name="P:LPS.APS.Web.Dto.Auth.LoginResponseDto.Roles">
+            <summary>角色列表</summary>
+        </member>
+        <member name="T:LPS.APS.Web.Dto.Auth.RefreshTokenRequestDto">
+            <summary>刷新Token请求</summary>
+        </member>
+        <member name="P:LPS.APS.Web.Dto.Auth.RefreshTokenRequestDto.AccessToken">
+            <summary>过期的 AccessToken</summary>
+        </member>
+        <member name="P:LPS.APS.Web.Dto.Auth.RefreshTokenRequestDto.RefreshToken">
+            <summary>有效的 RefreshToken</summary>
+        </member>
+        <member name="T:LPS.APS.Web.Dto.Auth.UpdateProfileRequest">
+            <summary>
+            改自己资料请求（R1）
+            仅允许改三项：userName（显示名）/ email / phoneNumber。UserCode/Status/角色/范围归管理面，不在此自助通道。
+            </summary>
+        </member>
+        <member name="P:LPS.APS.Web.Dto.Auth.UpdateProfileRequest.UserName">
+            <summary>显示名（DisplayName）；可空（不传则保持原值；传则覆盖）</summary>
+        </member>
+        <member name="P:LPS.APS.Web.Dto.Auth.UpdateProfileRequest.Email">
+            <summary>邮箱</summary>
+        </member>
+        <member name="P:LPS.APS.Web.Dto.Auth.UpdateProfileRequest.PhoneNumber">
+            <summary>手机号</summary>
+        </member>
+        <member name="T:LPS.APS.Web.Dto.Auth.UpdateProfileResponse">
+            <summary>改自己资料响应（R1 回包：回显改后的显示名/邮箱/手机号）</summary>
+        </member>
+        <member name="P:LPS.APS.Web.Dto.Auth.UpdateProfileResponse.UserName">
+            <summary>显示名（DisplayName）</summary>
+        </member>
+        <member name="P:LPS.APS.Web.Dto.Auth.UpdateProfileResponse.Email">
+            <summary>邮箱</summary>
+        </member>
+        <member name="P:LPS.APS.Web.Dto.Auth.UpdateProfileResponse.PhoneNumber">
+            <summary>手机号</summary>
+        </member>
+        <member name="T:LPS.APS.Web.Dto.Auth.UserInfoDto">
+            <summary>当前用户信息</summary>
+        </member>
+        <member name="P:LPS.APS.Web.Dto.Auth.UserInfoDto.UserId">
+            <summary>用户ID</summary>
+        </member>
+        <member name="P:LPS.APS.Web.Dto.Auth.UserInfoDto.UserCode">
+            <summary>用户工号</summary>
+        </member>
+        <member name="P:LPS.APS.Web.Dto.Auth.UserInfoDto.UserName">
+            <summary>用户姓名</summary>
+        </member>
+        <member name="P:LPS.APS.Web.Dto.Auth.UserInfoDto.Roles">
+            <summary>角色列表</summary>
+        </member>
+        <member name="P:LPS.APS.Web.Dto.Auth.UserInfoDto.Permissions">
+            <summary>功能权限码列表（登录签发时注入 JWT，供前端菜单/按钮渲染）</summary>
+        </member>
+        <member name="P:LPS.APS.Web.Dto.Auth.UserInfoDto.IsGlobal">
+            <summary>业务范围：是否全局放行（Global 时为全放行，各维度集合为空）</summary>
+        </member>
+        <member name="P:LPS.APS.Web.Dto.Auth.UserInfoDto.Factories">
+            <summary>业务范围：工厂范围值集合</summary>
+        </member>
+        <member name="P:LPS.APS.Web.Dto.Auth.UserInfoDto.ProductFamilies">
+            <summary>业务范围：产品族范围值集合</summary>
+        </member>
+        <member name="P:LPS.APS.Web.Dto.Auth.UserInfoDto.Departments">
+            <summary>业务范围：部门范围值集合</summary>
+        </member>
+        <member name="P:LPS.APS.Web.Dto.Auth.UserInfoDto.Domains">
+            <summary>业务范围：域范围值集合</summary>
+        </member>
+        <member name="P:LPS.APS.Web.Dto.Auth.UserInfoDto.ResourceOrgGroups">
+            <summary>业务范围：资源组织组范围值集合（兼容字段）</summary>
+        </member>
+        <member name="T:LPS.APS.Web.Extensions.AuthorizationExtensions">
+            <summary>认证授权扩展（F-G2/F-G3，3号位）</summary>
+        </member>
+        <member name="M:LPS.APS.Web.Extensions.AuthorizationExtensions.AddPermissionAuthorization(Microsoft.Extensions.DependencyInjection.IServiceCollection)">
+            <summary>注册功能权限点授权处理器</summary>
+        </member>
+        <member name="M:LPS.APS.Web.Extensions.AuthorizationExtensions.AddPermissionPolicies(Microsoft.AspNetCore.Authorization.AuthorizationOptions)">
+            <summary>注册 V1 全部功能权限点策略（策略名 = PermissionCode）</summary>
+        </member>
+        <member name="T:LPS.APS.Web.Extensions.HangfireAuthorizationFilter">
+            <summary>
+            Hangfire Dashboard 鉴权过滤器（生产环境使用）
+            开发环境下 Dashboard 无鉴权限制，可直接访问
+            生产环境下需要验证用户身份（后续接入 APS_Auth 权限体系）
+            </summary>
+        </member>
+        <member name="T:LPS.APS.Web.Extensions.HangfireServiceExtensions">
+            <summary>
+            Hangfire定时服务配置扩展
+            </summary>
+        </member>
+        <member name="M:LPS.APS.Web.Extensions.HangfireServiceExtensions.AddHangfireServices(Microsoft.Extensions.DependencyInjection.IServiceCollection,Microsoft.Extensions.Configuration.IConfiguration)">
+            <summary>
+            注册Hangfire服务（使用独立 APS_Hangfire 库存储Job数据）
+            </summary>
+        </member>
+        <member name="M:LPS.APS.Web.Extensions.HangfireServiceExtensions.UseHangfireJobs(Microsoft.AspNetCore.Builder.WebApplication)">
+            <summary>
+            注册所有Hangfire定时任务（在 app.Build() 之后调用）
+            开关：<c>Hangfire:CronEnabled</c>
+              · 未配置 ⇒ 沿用环境判据（开发＝只注册不触发、生产＝真定时），行为与改造前一致
+              · false  ⇒ 注册但一律写永不触发的cron，只能从 Dashboard 点 Trigger Now 手动跑
+              · true   ⇒ 写真实cron，到点自动执行
+            为什么要有这个开关：开发阶段后端虽然部署到生产机，但夜间流水线还不该自己跑起来。
+            注意 <c>APS_Hangfire</c> 库是**多实例共享**的，cron 值存在库里（不是各实例各一份）——
+            「哪个实例写了什么」= 最后启动的那个说的算，而到点触发则是**任何连着该库的实例都会做**。
+            ⇒ 该开关只能保证「写进去的是永不触发」，并不能把另一台实例挡在外面；
+               开发机的 Hangfire 实例必须一并关掉，否则两台会互相覆盖、并可能出现双跑。
+            </summary>
+        </member>
+        <member name="T:LPS.APS.Web.Filters.CodeToStatusResultFilter">
+             <summary>
+             全局「信封业务码 → HTTP 状态码」统一桥（Owner 裁定 2026-10-19，统一收口方案 (b1)）。
+            
+             <para><b>问题</b>：<c>ApiResponse</c> 是纯 POCO，<c>Fail(code,…)</c> 只写 JSON 里的 code 字段；
+             Controller <c>return ApiResponse&lt;T&gt;.Fail(400,…)</c> 裸返回时 HTTP 恒 200——
+             网关/监控/裸 HTTP 消费方把失败记成成功（同根事故三起：1305/2026-10-14、domain-status/10-16、gantt resourceIds/10-19）。</para>
+            
+             <para><b>机制</b>：仅当「HTTP 仍是 null/200」且「信封 Code∈[400,599]」同时成立才改写状态码——
+             成功响应（Code=200）、已显式 <c>NotFound()/BadRequest()/StatusCode()</c> 包装的端点（HTTP 已非 200）、
+             以及 <c>GlobalExceptionFilter</c> 已设过状态码的结果，全部天然跳过，不扩散。</para>
+            
+             <para><b>豁免</b>：见 <see cref="!:IsExempt"/>，两条规则各有解除前提，**默认全升、豁免才要理由**。</para>
+            
+             <para><b>边界</b>：不改 <c>ApiResponse</c>、不改任何 Controller 调用点（3号位 15 处与 5号位 ≈105 处零代码改动）；
+             清单与出处：《5号位-2026-10-19-清单-裸Fail返回HTTP200分类与统一收口征询-给3号位.md》。</para>
+             </summary>
+        </member>
+        <member name="T:LPS.APS.Web.Filters.GlobalExceptionFilter">
+            <summary>
+            全局异常过滤器
+            捕获所有 Controller 未处理的异常，统一包装为 ApiResponse 格式返回。
+            对外只回 message + traceId；异常类型/明细/堆栈**一律不出服务端**（含开发环境）——
+            堆栈已由 <c>LogError</c> 完整落日志，响应体带栈帧仅利于排查、无功能价值（4号位 10-17 报障，
+            Owner 2026-10-19 裁定本文件 5号位 可改后恢复 10-17 曾被回滚的同一收紧）。
+            </summary>
+        </member>
+        <member name="T:Program">
+            <summary>
+            顶层语句生成的 Program 类默认为 internal，外部工程无法以之作
+            <c>WebApplicationFactory&lt;Program&gt;</c> 的泛型实参（会产生 CS0060 可访问性不一致）。
+            此处显式声明为 public，仅供 <c>LPS.APS.IntegrationTests</c> 进程内启动真实管线使用；不改变任何运行时行为。
+            </summary>
+        </member>
+    </members>
+</doc>

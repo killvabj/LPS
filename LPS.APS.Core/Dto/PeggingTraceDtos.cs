@@ -71,6 +71,16 @@ public sealed class PeggingTraceSummaryDto
 
     /// <summary>分配列表</summary>
     public List<PeggingTraceDto> Items { get; init; } = new();
+
+    /// <summary>
+    /// 供给事实**现批在否**（Q3，11-17：追溯侧"源批缺"权威显式位，判据 IsActive=现批代理——D05 定稿）：
+    /// true=现批在（total=0 时是"明确零"）；false=现批缺（页面写「没有可用的供给事实批次」，非"没数据"）；
+    /// null=未判定（探测失败/空授权早退）。**取代 4号位 借版本级 sourceScheduleRunId 的间接判**（口径不同层）。
+    /// </summary>
+    public bool? SupplyBatchPresent { get; init; }
+
+    /// <summary>现批号（echo，如 PIPELINE_20261114_084221；null=未判定/无现批）。</summary>
+    public string? SupplyBatchNo { get; init; }
 }
 
 /// <summary>

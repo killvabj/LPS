@@ -135,7 +135,7 @@ public class ProductionInstructionPositionCalculator : IProductionInstructionPos
         ApplyStrongFacts(input, positions, issues);
 
         // 第五步：Position互斥消重
-        var deduplicatedPositions = DeduplicatePositions(positions, issues);
+        var deduplicatedPositions = DeduplicatePositions(positions, issues, input.StagePath);
 
         // 第五步半：首Stage残差项——"Stage 已投产未完工 / 尚未投入"的存量必须成位置
         // （冻结《Pegging供需承接与分层计算业务说明》§9.2「MACH未完成100」：
@@ -814,11 +814,16 @@ public class ProductionInstructionPositionCalculator : IProductionInstructionPos
     /// 消重规则：
     ///   1. 强事实（XC、Transit）优先级高于弱推导（Stage）
     ///   2. 同Stage的XC会从该Stage Position中扣除
+    ///   2b. XC超出本Stage推导量的部分=上游完工流入线边仓的同一批货（04走查 PI-XC-03／
+    ///       Pegging §9.3 差分条款），从**上游**Stage切片按StagePath顺序差分扣减（最近上游先扣）；
+    ///       XC所在Stage不在StagePath（顺序未知）时不猜，维持原XC_EXCEEDS_STAGE/§9.7出口
+    ///       （2026-11-18 实案 PI 17106349：BJ_MACH完工视图1,070 与 BJ_SURF仓816 双存→Σ1,886虚超→整批误降级）
     ///   3. Transit与Stage重叠时必须去重（F05）
     /// </summary>
     private List<PositionSlice> DeduplicatePositions(
         List<PositionSlice> positions,
-        List<PositionIssue> issues)
+        List<PositionIssue> issues,
+        IReadOnlyList<StagePathFact> stagePath)
     {
         // 阶段A：按Stage分组，扣除XC数量
         var stagePositions = positions
@@ -888,9 +893,11 @@ public class ProductionInstructionPositionCalculator : IProductionInstructionPos
                 }
             }
 
-            if (remainingXc > 0.0001m)
+            if (remainingXc > 0.0001m && stageGroup.Key == null)
             {
-                // XC 超过该 Stage 组推导总量：真超额，报一条（旧实现每切片各报一条且超额量虚大）
+                // 无Stage归属（null键）组维持原语义就地登记；
+                // 有Stage归属组的超额统一交「阶段A2」：先试跨Stage差分，未吸收余量才报XC_EXCEEDS_STAGE
+                //（旧实现每切片各报一条且超额量虚大的教训保留）
                 issues.Add(new PositionIssue
                 {
                     IssueType = "XC_EXCEEDS_STAGE",
@@ -899,6 +906,131 @@ public class ProductionInstructionPositionCalculator : IProductionInstructionPos
                     StageCode = stageGroup.Key,
                     AffectedQuantity = remainingXc
                 });
+            }
+        }
+
+        // ── 阶段A2：XC 跨Stage差分（2026-11-18，04走查 PI-XC-03／Pegging §9.3／01基线「XC/在途/Stage位置互斥」）──
+        // 物理语义：线边仓 K 的存货就是上游各 Stage 完工后流入的同一批货；
+        //   XC@K「超出本Stage推导量」的部分不是独立事实，须从上游Stage切片按StagePath顺序差分扣减
+        //   （最靠近的先扣），否则完工视图与仓共存→Σ虚超→整批§9.7误降级（实案 PI 17106349）。
+        // 保守边界：
+        //   · XC所在Stage不在StagePath ⇒ 顺序未知，不猜：维持XC_EXCEEDS_STAGE+§9.7原出口；
+        //   · 只作用于STAGE_WAITING切片（与本方法阶段A同域；FIRST_STAGE_PENDING仍不参与扣减，0号位§4.1）。
+        if (xcPositions.Count > 0)
+        {
+            var stageOrder = stagePath
+                .Where(sp => !string.IsNullOrWhiteSpace(sp.StageCode))
+                .GroupBy(sp => sp.StageCode!)
+                .ToDictionary(g => g.Key, g => g.Min(sp => sp.StageSequence));
+
+            var xcTotalsByStage = xcPositions
+                .Where(x => x.StageCode != null)
+                .GroupBy(x => x.StageCode!)
+                .ToDictionary(g => g.Key, g => g.Sum(x => x.Quantity));
+
+            var sameStageDerived = stagePositions
+                .Where(s => s.StageCode != null)
+                .GroupBy(s => s.StageCode!)
+                .ToDictionary(g => g.Key, g => g.Sum(s => s.Quantity));
+
+            foreach (var kv in xcTotalsByStage
+                         .OrderByDescending(e => stageOrder.TryGetValue(e.Key, out var o) ? o : int.MaxValue))
+            {
+                var xcStage = kv.Key;
+                var excess = Math.Max(0m, kv.Value - sameStageDerived.GetValueOrDefault(xcStage, 0m));
+                if (excess <= 0.0001m) continue;
+
+                if (!stageOrder.TryGetValue(xcStage, out var xcSeq))
+                {
+                    issues.Add(new PositionIssue
+                    {
+                        IssueType = "XC_EXCEEDS_STAGE",
+                        Level = PositionIssueLevel.WARN,
+                        Description = $"Stage {xcStage} 的XC数量({kv.Value})超过Stage推导总量" +
+                                      $"({sameStageDerived.GetValueOrDefault(xcStage, 0m)})，超出{excess}；" +
+                                      "所在Stage不在StagePath（顺序未知），未做跨Stage差分",
+                        StageCode = xcStage,
+                        AffectedQuantity = excess
+                    });
+                    continue;
+                }
+
+                decimal remainingExcess = excess;
+                decimal deducted = 0m;
+                var touchedStages = new List<string>();
+                var removeSet = new HashSet<PositionSlice>(ReferenceEqualityComparer.Instance);
+                var adjustMap = new Dictionary<PositionSlice, decimal>(ReferenceEqualityComparer.Instance);
+
+                var candidates = deduplicatedStages
+                    .Where(s => s.StageCode != null
+                                && stageOrder.TryGetValue(s.StageCode, out var sq)
+                                && sq < xcSeq)
+                    .OrderByDescending(s => stageOrder[s.StageCode!])
+                    .ThenBy(s => s.LocationKey, StringComparer.Ordinal)
+                    .ToList();
+
+                foreach (var s in candidates)
+                {
+                    if (remainingExcess <= 0.0001m) break;
+                    if (s.Quantity <= remainingExcess + 0.0001m)
+                    {
+                        remainingExcess -= s.Quantity;
+                        deducted += s.Quantity;
+                        removeSet.Add(s);
+                    }
+                    else
+                    {
+                        adjustMap[s] = s.Quantity - remainingExcess;
+                        deducted += remainingExcess;
+                        remainingExcess = 0m;
+                    }
+                    if (s.StageCode != null && !touchedStages.Contains(s.StageCode))
+                        touchedStages.Add(s.StageCode);
+                }
+
+                if (deducted > 0.0001m)
+                {
+                    deduplicatedStages = deduplicatedStages
+                        .Where(s => !removeSet.Contains(s))
+                        .Select(s => adjustMap.TryGetValue(s, out var nq)
+                            ? new PositionSlice
+                            {
+                                PositionType = s.PositionType,
+                                StageCode = s.StageCode,
+                                LocationKey = s.LocationKey,
+                                Quantity = nq,
+                                AvailableTime = s.AvailableTime,
+                                IsStrongEvidence = s.IsStrongEvidence,
+                                SourceKey = s.SourceKey,
+                                IsUnlocated = s.IsUnlocated
+                            }
+                            : s)
+                        .ToList();
+
+                    issues.Add(new PositionIssue
+                    {
+                        IssueType = "XC_CROSS_STAGE_DEDUCTED",
+                        Level = PositionIssueLevel.WARN,
+                        Description = $"Stage {xcStage} 的XC超出本Stage推导量{excess}，按PI-XC-03物理份额互斥" +
+                                      $"自上游Stage切片差分扣减{deducted}（{string.Join("→", touchedStages)}），" +
+                                      "完工视图与线边仓同批双计已消解",
+                        StageCode = xcStage,
+                        AffectedQuantity = deducted
+                    });
+                }
+
+                if (remainingExcess > 0.0001m)
+                {
+                    issues.Add(new PositionIssue
+                    {
+                        IssueType = "XC_EXCEEDS_STAGE",
+                        Level = PositionIssueLevel.WARN,
+                        Description = $"Stage {xcStage} 的XC数量({kv.Value})超过Stage推导总量，" +
+                                      $"跨Stage差分后仍超额{remainingExcess}（真超额，经闭合口径处理）",
+                        StageCode = xcStage,
+                        AffectedQuantity = remainingExcess
+                    });
+                }
             }
         }
 

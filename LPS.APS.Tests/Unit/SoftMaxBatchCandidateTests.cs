@@ -170,9 +170,9 @@ public class SoftMaxBatchCandidateTests
     /// **§4.3 第二段（0号位 逐字）**：「`n=3` 均分后可能产生 `0.0001` 级四舍五入尾差，应按真实净量
     ///   与计量精度做**末批余量**及**不重不漏**校验，不以输出近似数掩盖差额。」
     ///
-    /// 实测 `Q=10 / n=3`：前两批 `Round(10/3, 4, ToZero) = 3.3333`，**末批取余数** `= 3.3334`
-    ///   ⇒ `Σ = 10.0000` **精确闭合**（`BuildBatchFormation:4204-4209`）。
-    ///   ⇒ 无 `0.0001` 丢失；尾差全部落在**末批**且被显式补回，不是「近似数掩盖差额」。
+    /// 实测 `Q=10 / n=3`：按 0号位 v1.2 §二.3/§二.4（新增可执行批净量必须整数）⇒ 切为 `4 / 3 / 3`
+    ///   （余数 1 逐批 +1 给第 1 批）⇒ `Σ = 10` **精确闭合**，无尾差丢失。
+    ///   ⚠ 原 `3.3333/3.3333/3.3334` 口径按 v1.2 只可用于**算术闭合**，不得作为可执行批（本例为可执行批成形 ⇒ 改整数）。
     ///
     /// 同时钉住 `PlannedProcessQty` 同口径（两列**各自**闭合，不得互相挪用）。
     /// </summary>
@@ -182,7 +182,7 @@ public class SoftMaxBatchCandidateTests
         var r = Measure(qty: 10m, min: null, max: 4m);   // nMin = ceil(10/4) = 3
 
         Assert.Equal(3, r.BaselineCount);
-        Assert.Equal(new[] { 3.3333m, 3.3333m, 3.3334m }, r.BaselineQtys);
+        Assert.Equal(new[] { 4m, 3m, 3m }, r.BaselineQtys);
         Assert.Equal(10m, r.BaselineQtys.Sum());
         Assert.Equal(10m, r.BaselineProcQtys.Sum());
     }

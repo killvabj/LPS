@@ -47,6 +47,13 @@ public class ParameterSetVersion
     public string? CandidateGuardrailJson { get; set; }
 
     /// <summary>
+    /// 跨厂LT 标准参数块 JSON（6 号顶层子块，同五主题；经 ContentSnapshotJson 落库）。
+    /// 3号位 2026-11-17 回执更正：跨厂LT 与五主题走同一通用参数集版本接口读/写（非专属端点）。
+    /// `GetDetailByIdAsync` 投影读回；`EnsureParameterSetNormalized` 作为普通子块纳入归一化。
+    /// </summary>
+    public string? CrossFactoryLeadTimeRulesJson { get; set; }
+
+    /// <summary>
     /// 发布内容快照 JSON（方案 A 落点，契约 §6.10.5；DDL 由 2号位 按变更申请执行）
     /// 该版本发布时的完整参数内容（Lock/Supply/Procurement/PlanningYield/SolverStrategy/CandidateGuardrail 子块），
     /// 可重放载体；PUBLISHED 后不可原地修改。

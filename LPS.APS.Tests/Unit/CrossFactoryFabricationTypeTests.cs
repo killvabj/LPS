@@ -112,6 +112,32 @@ public class CrossFactoryFabricationTypeTests
                  "SKIP 清单里是别的三元组，不能连坐");
     }
 
+    [Fact(DisplayName = "目标厂取跨厂边 ToFactoryCode，不取 ChildRequiredFactory/节点继承厂")]
+    public void TargetFactory_UsesEdgeTo_NotChildRequiredFactory()
+    {
+        var facts = FactsWithSkip(
+            edges: new[] { ("BOM1", "PARENT1", "CHILD1") },
+            skip: Array.Empty<(string, string, string)>());
+
+        var target = facts.ResolveTargetFactoryCode(
+            "BOM1", new[] { "PARENT1" }, "CHILD1", fallback: "BJ");
+
+        target.Should().Be("CN", "边为 BJ→CN，目标厂必须是 To=CN；BJ 只是源厂/ChildRequiredFactory");
+    }
+
+    [Fact(DisplayName = "顶层 bomLevel=0 根需求不得判 ShFulfilment（CYL 根成品误判回归）")]
+    public void RootLevelDemand_IsNotCrossFactory_NotShFulfilment()
+    {
+        var facts = FactsWithSkip(edges: null, skip: Array.Empty<(string, string, string)>());
+
+        var (type, allowed, edgeId) = facts.ResolveNode(
+            "BOM1", Array.Empty<string>(), "FINAL_FG-C85KN8-15S-Z1-DNE3964-YP0457", "CN", bomLevel: 0);
+
+        type.Should().Be(PeggingOrchestrator.FabricationType.NotCrossFactory);
+        allowed.Should().BeNull();
+        edgeId.Should().BeNull();
+    }
+
     [Fact(DisplayName = "有边时 SKIP 清单不影响判定（边证明跨厂优先）")]
     public void HasEdge_SkipListDoesNotOverride()
     {

@@ -90,34 +90,6 @@ export interface ManualEtaSupplyCombo {
   storageName?: string | null
 }
 
-/**
- * 供货事实原始追溯行（5号位 `SupplyFactTraceDto` 的**子集**）
- *
- * ⚠️ **只作临时配对源**（`supply-combos` 尚未部署时用），正式口径仍是 `supply-combos`。
- *  - 端点：`GET /api/supply-fact-trace?sourceDocumentNo=&activeOnly=true&take=`
- *  - 数据与排产侧**同源**：`SupplyFact_Pipeline.StorageCode` ≡ 覆盖键里的 `ReceivingWarehouse`
- *    （追溯查询里该列被别名成 `warehouseCode`，见 `SupplyFactTraceRepository.cs:45`）
- *  - 三条限制（页面必须如实说明，不能假装齐全）：
- *    ① **跨域权限**：挂 `aps.plan.view`（本页是 `aps.manual_eta.view`）⇒ 只持本页权限的账号 403 ⇒ 退到「无仓库依据」档
- *    ② **按账号可见工厂范围裁剪**（`AllowedFactories`）⇒ 配出的仓库可能不全
- *    ③ 有 take 上限 ⇒ 订单行特别多时可能不全
- */
-export interface SupplyFactTraceRow {
-  /** 来源段：`SUPPLY_PIPELINE` = 排产侧真正装载的那张表；`RECEIVED` = ERP 收货视图（**不是**装载来源） */
-  sourceType?: string | null
-  /** 供货类型（只有五类「采购在途」才是排产侧认的） */
-  supplyType?: string | null
-  materialId?: number | null
-  materialCode?: string | null
-  /** = SupplyFact_Pipeline.StorageCode（存储地点） */
-  warehouseCode?: string | null
-  quantity?: number | null
-  sourceDocumentNo?: string | null
-  /** 行号（字符串形态；覆盖键要求整数行号） */
-  sourceDocumentLineNo?: string | null
-  isActive?: boolean | null
-}
-
 /** 列表筛选条件（与 5号位 Controller Query 参数对齐） */
 export interface ManualEtaListFilter {
   poNos?: string[]

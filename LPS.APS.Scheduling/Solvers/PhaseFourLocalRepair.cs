@@ -2402,7 +2402,29 @@ internal class PhaseFourLocalRepair
                         // 创建Split Task：Quantity按比例拆分
                         // Task的PlannedStartTime是加工开始时间（Setup之后）
                         var taskStart = pieceSlot.Value.Start + TimeSpan.FromMinutes((double)setupMinutes);
-                        var splitQuantity = demand.NetOutputQty / splitCount;
+                        // 0号位 v1.2 §二.3/§二.4（2026-11-19）：新增可执行批净量必须整数。
+                        //   非续作 + 整数净量需求 ⇒ 「整除 + 余数逐份 +1」，与 Phase2 `BuildBatchFormation` 同口径；
+                        //   续作（A/B 冻结事实）或小数净量需求维持原按比例拆分。
+                        decimal splitQuantity;
+                        if (!demand.IsContinuation
+                            && demand.NetOutputQty > 0m
+                            && demand.NetOutputQty == decimal.Truncate(demand.NetOutputQty))
+                        {
+                            var totalNet = decimal.Truncate(demand.NetOutputQty);
+                            var baseNet = decimal.Floor(totalNet / splitCount);
+                            var netRemainder = totalNet - baseNet * splitCount;
+                            splitQuantity = baseNet + ((decimal)i < netRemainder ? 1m : 0m);
+                            if (splitQuantity <= 0m)
+                            {
+                                // 份数多于可整数分配的数量 ⇒ 该 splitCount 方案不合法，换下一个候选
+                                allSplitsScheduled = false;
+                                break;
+                            }
+                        }
+                        else
+                        {
+                            splitQuantity = demand.NetOutputQty / splitCount;
+                        }
                         var splitSetupSource = convergedResolution.HasValue
                             ? SetupOptimizer.SetupOutcomeToSource(convergedResolution.Value.Outcome)
                             : null;

@@ -100,8 +100,7 @@ public class ManualFullChainRunTest
         var sp = scope.ServiceProvider;
 
         var orderSync    = sp.GetRequiredService<IERPOrderSyncService>();
-        var bomPush      = sp.GetRequiredService<IBOMRequestService>();
-        var bomExpand    = sp.GetRequiredService<IBomBatchExpandService>();
+        // BOM 推送/展开已并入 `NightlyBatchOrchestrator`（Step 1.5/1.6），本链路不再直接取用。
         var masterData   = sp.GetRequiredService<IMasterDataSyncService>();
         var resource     = sp.GetRequiredService<IResourceSyncService>();
         var routing      = sp.GetRequiredService<IRoutingSyncService>();
@@ -124,17 +123,11 @@ public class ManualFullChainRunTest
             return "ERP_Order_Staging → Order_Canonical";
         });
 
-        await Step("② BOM 请求推送（写 ODS）", true, async () =>
-        {
-            var r = await bomPush.PushBOMRequestToODSAsync(CancellationToken.None);
-            return $"BatchNo={r.BatchNo}, Root={r.RootCount}, 订单={r.TotalOrderCount}";
-        });
-
-        await Step("③ BOM 批展开（ODS 四表 truncate，无恢复路径）", true, async () =>
-        {
-            var r = await bomExpand.ExpandNightBatchAsync();
-            return $"Expanded={r.Expanded}, PENDING积压={r.PendingBacklogCount}";
-        });
+        // ⚠ 2026-11-18：BOM 推送与展开**已收进 `NightlyBatchOrchestrator`**（Step 1 全量同步之后），
+        //   本链路**不再单独执行**，否则同一天出现两次 `BomRequestPush/SUCCESS`
+        //   ⇒ `BomNightBatchResolver` 判定「不唯一」⇒ 展开与接货全部 SKIPPED。
+        //   原 ②③ 两步见下方 ⑬（nightly.RunAsync 内部 Step 1.5 / 1.6）。
+        Log("②③ BOM 推送与展开：已并入 ⑬ 夜间批（Step 1 全量同步之后执行），本链路跳过");
 
         await Step("④ 主数据 ERP", true, async () =>
         {

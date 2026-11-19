@@ -13595,14 +13595,18 @@ async function verifyRun(token) {
     .replace(/^\s*\/\/.*$/gm, '')
   const rc14Db1 = /:disabled="!canRecoverRun \|\| !row\.expectedDomainKeys\?\.length"/.test(runViewRaw)
   const rc14Db2 = runViewRaw.includes('这条记录没有登记排程域，暂不能恢复')
-  const rc14ScopeLenient =
-    /if \(!run\.expectedDomainKeys \|\| run\.expectedDomainKeys\.length === 0\) return true/.test(
-      runStoreCode
-    )
+  // ⚠️ 2026-11-17 更正归因：这条原判据（「缺字段放行」= store 里有一处按 expectedDomainKeys
+  //    放行可见性的前端过滤）**在本轮改动之前就已经是红的** —— 11-12「前端不再自判范围」
+  //    重构把那层过滤整段删掉了，探针没同步 ⇒ 不能算到本轮头上，也不能靠加回过滤来"修绿"。
+  //    现判据改为锁定 11-12 的现行口径：**前端不按 expectedDomainKeys 二次过滤可见性**，
+  //    范围由服务端（runs / runs/paged 已加 Domain 授权过滤）裁决。
+  const rc14NoSelfFilter =
+    /const visibleRuns = computed\(\(\) => runs\.value\)/.test(runStoreCode) &&
+    !/runs\.value\.filter\([\s\S]{0,200}?expectedDomainKeys/.test(runStoreCode)
   assert(
-    'RUN14：缺 ExpectedDomainKeysJson 的 Run 恢复按钮禁用 + 悬停说明（不再「点了才警告」），且缺字段仍按放行可见',
-    rc14Db1 && rc14Db2 && rc14ScopeLenient,
-    `按钮禁用=${rc14Db1} 悬停提示=${rc14Db2} 缺字段放行=${rc14ScopeLenient}`
+    'RUN14：缺 ExpectedDomainKeysJson 的 Run 恢复按钮禁用 + 悬停说明（不再「点了才警告」）；批次可见性不由前端自判（11-12 口径）',
+    rc14Db1 && rc14Db2 && rc14NoSelfFilter,
+    `按钮禁用=${rc14Db1} 悬停提示=${rc14Db2} 前端不自判范围=${rc14NoSelfFilter}`
   )
 
   // ===== RUN15：夹具 Run 的 404 是终态，但「有真分母的 Run 404」必须当缺陷（5号位 10-19 R3 裁定）=====
@@ -13612,17 +13616,221 @@ async function verifyRun(token) {
   //    没有这个判据时，真故障会被空态文案写成「没登记要跑哪些排程域」= 页面断言了它没验证过的事。
   //  - 反向探针自证可失败：删掉 store 的分母判据 / 把 404 豁免退回无条件 / 把空态文案退回二态 → 任一条转红
   const rc15DenomFlag = /domainStatusHasDenominator\s*=\s*ref\(false\)/.test(runStoreRawSrc)
-  const rc15DenomAssigned = /domainStatusHasDenominator\.value\s*=\s*Boolean\(latest\.expectedDomainKeys\?\.length\)/.test(
-    runStoreRawSrc
-  )
-  const rc15Exempt = /err\.code === 404 && !domainStatusHasDenominator\.value/.test(runStoreRawSrc)
+  // ⚠️ 2026-11-17：拆解卡可切批次后，分母取的是「**当前取数那一批**」的登记域
+  //    （不再是固定 latest）⇒ 判据放宽到「被取数那一行」，语义不变。
+  const rc15DenomAssigned =
+    /domainStatusHasDenominator\.value\s*=\s*Boolean\(\w+\.expectedDomainKeys\?\.length\)/.test(
+      runStoreRawSrc
+    )
+  const rc15Exempt = /err\.code === 404 && !hasDenominator/.test(runStoreRawSrc)
   const rc15EmptyText =
     /domainStatusHasDenominator\.value/.test(runViewSrc) &&
-    runViewSrc.includes('这次排产登记了要跑的排程域，但各域状态暂时取不到')
+    /\$\{who\}登记了要跑的排程域，但各域状态暂时取不到/.test(runViewSrc) &&
+    /\$\{who\}没有登记要跑哪些排程域/.test(runViewSrc)
   assert(
     'RUN15：域状态 404 豁免按「该 Run 有无分母」分流，空态文案三态（有分母却取不到 ≠ 没登记）',
     rc15DenomFlag && rc15DenomAssigned && rc15Exempt && rc15EmptyText,
     `分母标志=${rc15DenomFlag} 分母赋值=${rc15DenomAssigned} 豁免带判据=${rc15Exempt} 空态三态=${rc15EmptyText}`
+  )
+
+  // ===== RUN16-RUN20：拆解卡可跟随所选批次（2026-11-17）=====
+  //  改版起因：用户要看**非最新批次**的域级状态（哪个域失败、原因、版本码），
+  //  而拆解卡固定取最近一次 Run ⇒ dev 上 #999469 未登记排程域 ⇒ 卡片恒空，
+  //  页面没有任何入口能查到 #999436 / #999425 这两批的域状态。
+  //  本轮改法：点「最近排产记录」里任意一行 ⇒ 拆解卡切到那一批（同一端点换 runId）。
+  //
+  //  ⚠️ 必须拆两份状态：主视图（最近一次排产卡）的域状态分布与失败警示**恒跟最新批次**，
+  //    否则主卡写着 #999469、分布却是 #999436 的数 ⇒ 用户把两批结论混成一批。
+  //  - 反向探针自证可失败：把两份状态并回一份 / 去掉行点击 / 去掉按钮点击守卫
+  //    / 空态文案不再说批次号 / 去掉复位入口 ⇒ 任一条转红
+
+  // RUN16：表格行点击 ⇒ 拆解卡切批次
+  const rc16RowClick = /@row-click="handleRunRowClick"/.test(runViewRaw)
+  const rc16HandlerCallsStore =
+    /function handleRunRowClick[\s\S]{0,600}?runStore\.selectDomainRun\(row\)/.test(runViewSrc)
+  const rc16StoreAction =
+    /async function selectDomainRun\(run: RunListItem \| null\)/.test(runStoreSrc) &&
+    /selectedDomainRun\.value = run/.test(runStoreSrc)
+  const rc16TargetResolve =
+    /const target = selectedDomainRun\.value \?\? latestRun\.value/.test(runStoreSrc)
+  assert(
+    'RUN16：点「最近排产记录」任意一行 ⇒ 拆解卡切到该批次（选中的优先于最近一次）',
+    rc16RowClick && rc16HandlerCallsStore && rc16StoreAction && rc16TargetResolve,
+    `行点击=${rc16RowClick} 处理器调 store=${rc16HandlerCallsStore} store 动作=${rc16StoreAction} 目标解析=${rc16TargetResolve}`
+  )
+
+  // RUN17：主视图域状态恒跟最近一次批次（两份状态不得并回一份）
+  //  ⚠️ 必须**切片函数体**再判定：整段 `[\s\S]{0,400}` 窗口会把相邻 computed 里的
+  //    latestDomainStatuses 一起吞进来 ⇒ 并回一份后探针仍绿（假绿）。
+  const sliceBetween = (src, fromMark, toMark) => {
+    const i = src.indexOf(fromMark)
+    if (i < 0) return ''
+    const j = src.indexOf(toMark, i + fromMark.length)
+    return j < 0 ? src.slice(i) : src.slice(i, j)
+  }
+  const rc17LatestState = /const latestDomainStatuses = ref<RunDomainStatusItem\[\]>/.test(
+    runStoreSrc
+  )
+  const rc17HeroSummary = /latestDomainStatuses\.value/.test(
+    sliceBetween(runViewSrc, 'const domainStatusSummary = computed', 'const hasDomainStatuses')
+  )
+  const rc17HeroFailed = /latestDomainStatuses\.value/.test(
+    sliceBetween(runViewSrc, 'const failedDomains = computed', 'function isIssueStatus')
+  )
+  const rc17HeroCount =
+    /const domainCountVisible = computed\(\(\) => latestDomainStatuses\.value\.length\)/.test(
+      runViewSrc
+    )
+  const rc17CardUsesCardState = /domainStatuses\.value/.test(
+    sliceBetween(runViewSrc, 'const domainStatusGroups = computed', 'const domainStatusSummary')
+  )
+  assert(
+    'RUN17：主视图域状态分布/失败警示恒跟最近一次批次，拆解卡用可切换那份（两份不得并一份）',
+    rc17LatestState &&
+      rc17HeroSummary &&
+      rc17HeroFailed &&
+      rc17HeroCount &&
+      rc17CardUsesCardState,
+    `latest 状态=${rc17LatestState} 主视图分布=${rc17HeroSummary} 主视图失败警示=${rc17HeroFailed} 主视图域数=${rc17HeroCount} 卡片取卡片态=${rc17CardUsesCardState}`
+  )
+
+  // RUN18：切批次后按新批次重新取数（同一端点换 runId），404 豁免口径不变
+  const rc18CardFetch =
+    /await fetchDomainStatus\(target, 'card'\)/.test(runStoreSrc) &&
+    /sink\.value = await overviewApi\.getRunDomainStatus\(run\.id\)/.test(runStoreSrc)
+  const rc18ReuseLatest =
+    /if \(target\.id === latestRun\.value\?\.id\)[\s\S]{0,200}?domainStatuses\.value = latestDomainStatuses\.value/.test(
+      runStoreSrc
+    )
+  const rc18DenomStillSplit =
+    /err\.code === 404 && !hasDenominator/.test(runStoreSrc)
+  assert(
+    'RUN18：切批次按新批次重新取域状态（同端点换 runId），选中的就是最近一次时不重复请求；404 豁免仍按分母分流',
+    rc18CardFetch && rc18ReuseLatest && rc18DenomStillSplit,
+    `按新批次取数=${rc18CardFetch} 复用最近一次=${rc18ReuseLatest} 404 按分母分流=${rc18DenomStillSplit}`
+  )
+
+  // RUN19：空态文案说清是哪一批 + 有复位入口（否则用户不知道在看谁）
+  const rc19EmptySaysWhich =
+    /`批次 #\$\{domainStatusRunId\.value\}`/.test(runViewSrc) &&
+    /isShowingLatestRun\.value \? '最近这次排产'/.test(runViewSrc)
+  const rc19ResetEntry =
+    /回到最近一次[\s\S]{0,40}?<\/ElButton>/.test(runViewRaw) &&
+    /function resetDomainRun[\s\S]{0,300}?runStore\.selectDomainRun\(null\)/.test(runViewSrc)
+  const rc19HeaderShowsRun = /批次[\s\S]{0,40}?#\{\{ domainStatusRunId \}\}/.test(runViewRaw)
+  assert(
+    'RUN19：拆解卡空态/标题说清是哪一批，并提供「回到最近一次」复位入口',
+    rc19EmptySaysWhich && rc19ResetEntry && rc19HeaderShowsRun,
+    `空态说批次=${rc19EmptySaysWhich} 复位入口=${rc19ResetEntry} 标题带批次=${rc19HeaderShowsRun}`
+  )
+
+  // RUN20：行点击不劫持按钮（「人工恢复」点了不能顺带把拆解卡切走）
+  const rc20Guard =
+    /closest\('button, a, \.el-tooltip__trigger, \.el-switch, \.el-select'\)\)\s*return/.test(
+      runViewSrc
+    )
+  const rc20RowClass =
+    /:row-class-name="runRowClassName"/.test(runViewRaw) &&
+    /selectedDomainRun\.value\?\.id === row\.id \? 'run-row-selected' : ''/.test(runViewSrc)
+  assert(
+    'RUN20：点表格行切批次时不劫持按钮点击（人工恢复照常可用），且选中行有视觉标记',
+    rc20Guard && rc20RowClass,
+    `按钮点击守卫=${rc20Guard} 选中行标记=${rc20RowClass}`
+  )
+
+  // ===== RUN21：域卡里的失败原因必须换行（长串 Domain 编码不横向溢出）=====
+  //  2026-11-17 实拍发现：拆解卡能切批次后，dev #999436 的 10 个失败域第一次露出全貌，
+  //  而原因文本形如「全部 Domain 失败/被阻断（10 个），失败/阻断 Domain=FAMILY_CYL,FAMILY_FRL,...」
+  //  ⇒ 不换行会横向溢出、被列边界裁掉，用户读不到「到底是哪几个域失败」。
+  const rc21ErrWrap = /\.err-msg\s*\{[^}]*word-break:\s*break-word/.test(runViewRaw)
+  const rc21ErrWrapAnywhere = /\.err-msg\s*\{[^}]*overflow-wrap:\s*anywhere/.test(runViewRaw)
+  assert(
+    'RUN21：域卡失败原因按字符换行（长串 Domain 编码不横向溢出被裁）',
+    rc21ErrWrap && rc21ErrWrapAnywhere,
+    `word-break=${rc21ErrWrap} overflow-wrap=${rc21ErrWrapAnywhere}`
+  )
+
+  // ===== RUN22-RUN27：解释页版本下拉全量化 + 运行页带版本入参（2026-11-17）=====
+  //  用户口径：「为啥不列出来已经有的版本呢？需要哪个自己选的去看」⇒ 解释页版本条从
+  //  「3 个按钮（生效 + 最近 3 条待确认 + 最多 2 条失败）」改成「全量版本下拉（按批次分组）」。
+  //  配套：运行页「看异常解释」带 ?planVersionId= 直达那一版
+  //  （原先不带参 ⇒ 解释页落回「当前生效版本」，用户点的域和看到的解释对不上）。
+  const explViewRaw = readSrc('views/Aps/Explanation.vue')
+  const explViewSrc = stripComments(explViewRaw)
+  const explStoreSrc = stripComments(readSrc('store/modules/aps/explanation.ts'))
+  const schedStoreSrc = stripComments(readSrc('store/modules/aps/schedule.ts'))
+  const ganttViewSrc = stripComments(readSrc('views/Aps/Gantt.vue'))
+
+  // RUN22：全量列表单独存；拉列表**不重置**当前选中版本
+  //  ⚠️ 必须切片函数体判定：否则「下一个函数里的 currentVersionId.value =」会被误吞进来（假红）
+  const rc22AllState = /const allVersions = ref<PlanVersionSummaryDto\[\]>\(\[\]\)/.test(schedStoreSrc)
+  const rc22LoadAll = /async function loadAllVersions\(take = 200\)/.test(schedStoreSrc)
+  const rc22NoReset = !/currentVersionId\.value\s*=/.test(
+    sliceBetween(schedStoreSrc, 'async function loadAllVersions', 'async function selectVersion')
+  )
+  const rc22PageUsesAll = /allVersions\.value\.map/.test(explViewSrc)
+  const rc22PageNotTruncated = !/displayedVersions/.test(explViewSrc)
+  assert(
+    'RUN22：解释页版本下拉用**全量**版本列表（不继承甘特页三档截断），且拉列表不重置当前选中版本',
+    rc22AllState && rc22LoadAll && rc22NoReset && rc22PageUsesAll && rc22PageNotTruncated,
+    `全量状态=${rc22AllState} 取数动作=${rc22LoadAll} 不重置选中=${rc22NoReset} 页面用全量=${rc22PageUsesAll} 未继承截断=${rc22PageNotTruncated}`
+  )
+
+  // RUN23：按来源排产批次分组 + 域中文名 + 分组下拉
+  const rc23GroupByRun =
+    /sourceRunId/.test(explViewSrc) && /排产批次 #/.test(explViewRaw) && /无来源批次/.test(explViewRaw)
+  const rc23DomainLabel = /domainLabel: domainLabelOf\(v\.domainKey\)/.test(explViewSrc)
+  const rc23OptionGroup = /<ElOptionGroup/.test(explViewRaw)
+  assert(
+    'RUN23：版本下拉按来源排产批次分组，每版显示排程域中文名（裸码不直接给用户）',
+    rc23GroupByRun && rc23DomainLabel && rc23OptionGroup,
+    `按批次分组=${rc23GroupByRun} 域中文名=${rc23DomainLabel} 分组下拉=${rc23OptionGroup}`
+  )
+
+  // RUN24：各版本事实条数**懒取**（打开下拉才查、限并发），不得在首屏预取全量
+  //  ⚠️ dev 实测 61 个版本一次拉完要 60~90s ⇒ 预取会把首屏拖死
+  const rc24Loader = /function loadFactCounts\(ids: number\[\]\)/.test(explStoreSrc)
+  const rc24Concurrency = /FACT_COUNT_CONCURRENCY = 3\b/.test(explStoreSrc)
+  const rc24Trigger = /@visible-change="onVersionDropdownVisible"/.test(explViewRaw)
+  const rc24NotEager = !/loadFactCounts\(/.test(
+    sliceBetween(explViewSrc, 'onMounted(async () => {', 'watch(')
+  )
+  assert(
+    'RUN24：各版本事实条数懒取（打开版本下拉才查、限并发 3），首屏不预取全量',
+    rc24Loader && rc24Concurrency && rc24Trigger && rc24NotEager,
+    `懒取动作=${rc24Loader} 限并发=${rc24Concurrency} 触发点=${rc24Trigger} 首屏不预取=${rc24NotEager}`
+  )
+
+  // RUN25：运行页「看异常解释」带 planVersionId（域级按钮带那一版的 Id）
+  const rc25PushQuery = /query:\s*\{\s*planVersionId: String\(planVersionId\)\s*\}/.test(runViewSrc)
+  const rc25DomainBtn = /@click="goExplanation\(d\.planVersionId\)"/.test(runViewRaw)
+  const rc25HeroBtn = /@click="goExplanation\(\)"/.test(runViewRaw)
+  assert(
+    'RUN25：运行页「看异常解释」带 ?planVersionId=（域级按钮带该域版本 Id；批次级按钮不带）',
+    rc25PushQuery && rc25DomainBtn && rc25HeroBtn,
+    `带参跳转=${rc25PushQuery} 域级按钮=${rc25DomainBtn} 批次级按钮=${rc25HeroBtn}`
+  )
+
+  // RUN26：解释页读 ?planVersionId= ⇒ 自动选中并置顶（用户看得见自己落在哪一版）
+  const rc26UseRoute = /const route = useRoute\(\)/.test(explViewSrc)
+  const rc26ReadQuery = /route\.query\.planVersionId/.test(explViewSrc)
+  const rc26AutoSelect = /scheduleStore\.setCurrentVersion\(incoming\)/.test(explViewSrc)
+  const rc26Hoist =
+    /const pinned = incomingVersionId\.value/.test(explViewSrc) && /groups\.unshift\(g\)/.test(explViewSrc)
+  assert(
+    'RUN26：解释页读 ?planVersionId= 自动选中该版本并把它的分组置顶（运行页直达不断链）',
+    rc26UseRoute && rc26ReadQuery && rc26AutoSelect && rc26Hoist,
+    `读路由=${rc26UseRoute} 读入参=${rc26ReadQuery} 自动选中=${rc26AutoSelect} 置顶=${rc26Hoist}`
+  )
+
+  // RUN27：「失败版本最多 2 条」的截断**只留在甘特页**（解释页不受影响）
+  const rc27GanttStillTruncates = /displayedVersions/.test(ganttViewSrc)
+  const rc27StoreStillTruncates =
+    /failedVersions = computed\(\(\) =>[\s\S]{0,160}?slice\(0, 2\)/.test(schedStoreSrc)
+  assert(
+    'RUN27：「失败版本最多 2 条」的截断只留在甘特页，解释页版本下拉不受影响',
+    rc27GanttStillTruncates && rc27StoreStillTruncates,
+    `甘特仍用截断列表=${rc27GanttStillTruncates} store 仍保留截断=${rc27StoreStillTruncates}`
   )
 }
 

@@ -111,6 +111,20 @@ export interface PeggingTraceSummaryDto {
    * ⇒ 列表数据一律走 `GET /api/pegging-trace`，不要指望这里。
    */
   items: PeggingTraceDto[]
+  /**
+   * 供给事实批次**是否在**（2026-11-17 5号位 r14240/r14241 落码，dev 实测键存在）。
+   *
+   * 三态，**不是布尔**：
+   *  - `true`  ⇒ 供给批次在（本版有可归集的供给事实来源）
+   *  - `false` ⇒ **源批缺**：没有可用的供给事实批次 ⇒ 归集不到分配记录
+   *  - `null` / 键缺 ⇒ **未判定**：后端没给这一位 ⇒ 页面不得替它下结论
+   *
+   * ⚠️ 与「版本级 `sourceScheduleRunId` 为空」是**两层判据**，不合并：
+   *   前者说「供给事实批次在不在」，后者说「这个计划版本有没有记到来源排程批次」。
+   */
+  supplyBatchPresent?: boolean | null
+  /** 供给事实批次号（`supplyBatchPresent=true` 时给出，如 `PIPELINE_20261117_122517`） */
+  supplyBatchNo?: string | null
 }
 
 /**

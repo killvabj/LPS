@@ -45,6 +45,13 @@
  *  - 列表/详情接 `isMatched` 标注（5号位 v2.0 R2 取乙：允许保存 + 计算式标注，零 DDL）：
  *    true=会参与排产 / false=命不中（静默不生效）/ null=未判定（**不得当未命中显示**）。
  *
+ * 11-16 接 5号位《P01～P13＋采购协同 页面—接口实施矩阵 v0.1》A13 行：
+ *  - **撤掉「供货事实追溯」临时兜底档**（`GET /api/supply-fact-trace` 自行配对）：
+ *    正式端点 `supply-combos` 已落码可用（r14214～r14218），矩阵明确「撤临时兜底档」；
+ *    且该档跨域（挂 `aps.plan.view`）且按可见工厂范围裁剪 ⇒ 配出的仓库本来就可能不全。
+ *    正式口径只有一条路：`supply-combos` → 取不到就如实说取不到（页面提示端点不可用）。
+ *  - 未命中行文案统一为「未命中当前供货事实（暂不生效）」（列表标签与详情同口径）。
+ *
  * RBAC（@see 审核报告 P1-14/15）：
  *  - aps.manual_eta.view：只读
  *  - aps.manual_eta.edit：新增 / 编辑
@@ -65,7 +72,6 @@ import type {
   ManualEtaSupplyCombo,
   ManualEtaUpsertInput,
   MaterialLookupItem,
-  SupplyFactTraceRow,
   WarehouseOption
 } from '@/api/aps-v1'
 
@@ -474,73 +480,17 @@ function comboMatchesKeyword(c: MaterialCandidate, kw: string): boolean {
  *   dev 实测：本表 10 个 (物料, 仓库) 组合在供给事实里**一个都不存在** ⇒ 兜底档给的候选
  *   同样命不中 ⇒ 用户录进去的还是不生效的记录，只是「看起来能录」⇒ 撤掉更诚实。
  */
-/** 收窄档（supply-combos）是否取不到（端点未部署 / 权限 / 网络）——用于如实提示，不静默降级 */
+/** 收窄档（supply-combos）是否取不到（端点不可用 / 权限 / 网络）——用于如实提示，不静默降级 */
 const comboTierFailed = ref(false)
 /** 本次候选是否**成对**（带真实存储地点）
  *  false = 退到了「无仓库依据」档：物料是真的，但**取不到存储地点**
  *          ⇒ 仓库仍要用户自己选（选错 ⇒ 这条到货时间静默不生效） */
 const comboPaired = ref(false)
-/** 成对来源是否为**过渡档**（供货事实追溯）⇒ 提示要说明「受可见工厂范围限制，可能不全」 */
-const comboFromTrace = ref(false)
-
-/**
- * 排产侧装载资格谓词（`TimedSupplyFactLoader.cs:53-60`）：
- *  有效 + 数量>0 + 五类采购在途 —— 与追溯行逐字对齐，否则会配出**排产侧不认**的组合。
- */
-const SUPPLY_QUALIFY_TYPES = [
-  'PURCHASE_IN_TRANSIT',
-  'OPEN_PO_REMAINING',
-  'ARRIVED_NOT_RECEIVED',
-  'VMI_ONSITE',
-  'INTERPLANT_IN_TRANSIT'
-]
-
-/**
- * 过渡配对：把追溯行按「物料 × 存储地点」成对取出
- *  - 只取 `SUPPLY_PIPELINE` 段（`RECEIVED` 段是 ERP 收货视图，**不是**排产侧的装载来源，且行号为空）
- *  - 资格谓词与排产侧装载器一致（有效 + 数量>0 + 五类采购在途）
- *  - 行号必须能解析成整数（覆盖键要求整数行号）
- */
-function traceRowsToCombos(
-  rows: SupplyFactTraceRow[],
-  lineNo?: number
-): Array<{ materialId: number; materialCode: string; storageCode: string; lineNo: number }> {
-  const out: Array<{
-    materialId: number
-    materialCode: string
-    storageCode: string
-    lineNo: number
-  }> = []
-  const seen = new Set<string>()
-  for (const r of rows) {
-    if (String(r.sourceType ?? '') !== 'SUPPLY_PIPELINE') continue
-    if (r.isActive !== true) continue
-    if (!((r.quantity ?? 0) > 0)) continue
-    if (!SUPPLY_QUALIFY_TYPES.includes(String(r.supplyType ?? ''))) continue
-    const mid = Number(r.materialId ?? 0)
-    const wh = String(r.warehouseCode ?? '').trim()
-    if (!mid || !wh) continue
-    const ln = Number.parseInt(String(r.sourceDocumentLineNo ?? ''), 10)
-    if (!Number.isFinite(ln)) continue
-    if (lineNo && ln !== lineNo) continue
-    const key = `${ln}|${mid}|${wh}`
-    if (seen.has(key)) continue
-    seen.add(key)
-    out.push({
-      materialId: mid,
-      materialCode: String(r.materialCode ?? ''),
-      storageCode: wh,
-      lineNo: ln
-    })
-  }
-  return out
-}
 
 /**
  * 该订单行的**成对**候选（物料 × 存储地点）
- *  - 首选：正式端点 `supply-combos`
- *  - 过渡：`supply-fact-trace`（同表同 StorageCode；跨域权限 + 可见工厂范围 ⇒ 可能不全）
- *  - 都取不到 ⇒ 返 null（调用方退到「无仓库依据」档）
+ *  - 正式口径只有一条路：`supply-combos`（矩阵 A13「撤临时兜底档」）
+ *  - 取不到 ⇒ 返 null（调用方退到「无仓库依据」档），并记一笔端点不可用如实提示
  */
 async function fetchPairedCandidates(
   q: string,
@@ -555,40 +505,12 @@ async function fetchPairedCandidates(
     const rows = combos.map(comboToCandidate).filter((c) => comboMatchesKeyword(c, q))
     if (rows.length) {
       comboPaired.value = true
-      comboFromTrace.value = false
       return rows
     }
     return null
   } catch {
-    // 正式端点未部署（dev 实测 404）⇒ 记一笔，页面如实提示
+    // 正式端点取不到 ⇒ 记一笔，页面如实提示（不静默换口径）
     comboTierFailed.value = true
-  }
-  try {
-    const trace = await manualEtaApi.searchSupplyCombosFromTrace(t.poNo ?? '', t.lineNo)
-    const combos = traceRowsToCombos(trace, t.lineNo)
-    if (!combos.length) return null
-    // 名称/规格从乙端点补齐（追溯 DTO 没有名称）
-    const mats = await manualEtaApi.searchMaterials(q, MATERIAL_SEARCH_LIMIT, {
-      poNo: t.poNo,
-      lineNo: t.lineNo
-    })
-    const byId = new Map(mats.map((m) => [m.masterId, m]))
-    const rows = combos.map((c) => {
-      const m = byId.get(c.materialId)
-      return {
-        masterId: c.materialId,
-        code: c.materialCode || m?.code || '',
-        name: m?.name ?? '',
-        spec: m?.spec ?? '',
-        uom: m?.uom ?? '',
-        storageCode: c.storageCode,
-        lineNo: c.lineNo
-      }
-    })
-    comboPaired.value = true
-    comboFromTrace.value = true
-    return rows
-  } catch {
     return null
   }
 }
@@ -648,7 +570,6 @@ async function searchMaterialOptions(query: string): Promise<void> {
   materialSearching.value = true
   comboTierFailed.value = false
   comboPaired.value = false
-  comboFromTrace.value = false
   try {
     const { rows, scope } = await fetchMaterialCandidates(q, poNo, lineNo)
     if (seq !== materialSearchSeq) return
@@ -665,7 +586,6 @@ async function searchMaterialOptions(query: string): Promise<void> {
       lineNo,
       rows.length,
       comboPaired.value,
-      comboFromTrace.value,
       comboTierFailed.value
     )
   } catch {
@@ -686,12 +606,9 @@ function materialScopeNoteOf(
   lineNo: number,
   count: number,
   paired = false,
-  fromTrace = false,
   comboFailed = false
 ): string {
-  const pairedTail = fromTrace
-    ? '仓库取自供货事实追溯，受账号可见工厂范围限制，可能不全。'
-    : '仓库取自该订单行的实际存储地点。'
+  const pairedTail = '仓库取自该订单行的实际存储地点。'
   if (scope === 'line') {
     return paired
       ? `已按采购订单 ${poNo} 第 ${lineNo} 行收窄，共 ${count} 种物料（选中后仓库自动带出）。${pairedTail}`
@@ -702,9 +619,7 @@ function materialScopeNoteOf(
       ? `采购订单 ${poNo} 共 ${count} 种物料（选中后仓库自动带出）。${pairedTail}`
       : `采购订单 ${poNo} 共 ${count} 种物料；取不到实际存储地点，仓库要自己选（要与实际存储地点一致，否则不生效）。`
   }
-  const failed = comboFailed
-    ? '（按订单收窄的供货组合接口暂不可用，后端还没部署新版本）'
-    : ''
+  const failed = comboFailed ? '（按订单收窄的供货组合接口暂不可用，后端还没部署新版本）' : ''
   if (poNo)
     return `采购订单 ${poNo} 没取到物料，下面是按关键字搜到的 ${count} 种，请确认是本订单的物料；这类候选没有仓库依据，仓库要自己选，可能不生效。${failed}`
   return '按关键字搜到的候选没有该订单的供货依据，仓库要自己选，可能不生效。'
@@ -1237,7 +1152,7 @@ onMounted(() => {
               content="这条到货时间没命中该订单行当前的供货事实（物料或仓库对不上），不会参与排产。"
               placement="top"
             >
-              <ElTag type="danger" size="small">未命中供货事实</ElTag>
+              <ElTag type="danger" size="small">未命中当前供货事实（暂不生效）</ElTag>
             </ElTooltip>
             <ElTag v-else-if="row.isMatched === true" type="success" size="small">
               会参与排产
@@ -1379,7 +1294,9 @@ onMounted(() => {
               <span v-if="materialSelected?.storageName" class="muted small">
                 · {{ materialSelected.storageName }}
               </span>
-              <span class="muted small">已按该订单行的实际存储地点带出（来自同一条供货事实）。</span>
+              <span class="muted small"
+                >已按该订单行的实际存储地点带出（来自同一条供货事实）。</span
+              >
             </div>
             <ElSelect
               v-else

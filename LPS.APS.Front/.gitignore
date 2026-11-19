@@ -7,3 +7,17 @@ dist-ssr
 pnpm-debug
 stats.html
 .idea
+
+# --- 2026-11-18 纳入 git 时补充 ---
+# 交付包解压目录（每个 19M，共 4 份）
+/APS-V1-Front-dist-pro-*
+# 临时目录（140M）
+/.tmp/
+# 临时产物
+/gantt999333.tmp.json
+/_rs.json
+/.selfverify-bak-overview-usability/
+# 上游模板残留（public/ 已有同名文件）
+/新建文件夹/
+# Claude Code 本地权限配置（机器相关，不入库）
+/.claude/settings.local.json

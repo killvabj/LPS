@@ -26,12 +26,17 @@ public class ScheduleQueryService : IScheduleQueryService
     public ScheduleQueryService(
         DatabaseConnectionManager connectionManager,
         IDataScopeService dataScopeService,
-        ILogger<ScheduleQueryService> logger)
+        ILogger<ScheduleQueryService> logger,
+        Services.IResourceCalendarService resourceCalendarService)
     {
         _connectionManager = connectionManager ?? throw new ArgumentNullException(nameof(connectionManager));
         _dataScopeService = dataScopeService ?? throw new ArgumentNullException(nameof(dataScopeService));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+        // P12① 分母专用：三级继承解析**唯一件**（A6 禁抄第二份解析——同甘特窗口件纪律）。
+        _resourceCalendarService = resourceCalendarService ?? throw new ArgumentNullException(nameof(resourceCalendarService));
     }
+
+    private readonly Services.IResourceCalendarService _resourceCalendarService;
 
     /// <inheritdoc />
     public async Task<IReadOnlyList<PlanVersionSummaryDto>> GetVersionsAsync(
@@ -115,6 +120,471 @@ public class ScheduleQueryService : IScheduleQueryService
                 AND (@From IS NULL OR t.PlannedEndTime IS NULL OR t.PlannedEndTime >= @From)
                 AND (@To IS NULL OR t.PlannedStartTime IS NULL OR t.PlannedStartTime <= @To)
                 AND (@HasResources = 0 OR t.ResourceId IN @ResourceIds)";
+
+    // ───────────────────────── 11-16 矩阵 A4/A5：P05 任务清单 + P06 详情 ─────────────────────────
+    // 窗口/部门/域范围**复用甘特同一套单源件**（GanttWindowPredicate、DepartmentPredicate、
+    // WithDepartmentScope、ResolveAllowedDomainKeysAsync/ResolveAllowedDepartmentCodesAsync、IsDomainAllowed）：
+    // P05 列表与 P04 甘特是同一事实的两种表达（v0.2 §5），筛选口径物理上不允许分叉。
+    // COUNT 与列表体同一段 WHERE 文本（订单页/manual-eta/追溯页同族纪律）。
+
+    /// <summary>P05 列表 JOIN 骨架（全为 PK 1:1 左联，COUNT 不带扇出）。</summary>
+    // N2（11-17 4号位 v1.1 §四）补两列的联接：TaskDispatch 按 UX_TaskDispatch_SourceTask 唯一键 1:1
+    // （实库核），COUNT 无扇出风险；该 Task 不在下发队列 ⇒ null=未提供（**非"未下发"**——
+    // 队列资格权威未建 Q-a、消费环留痕缺口 Q-d，禁反推）。
+    private const string TaskListFrom = @"
+                FROM [Task] t
+                LEFT JOIN Material m ON m.Id = t.MaterialId
+                LEFT JOIN Resource r ON r.Id = t.ResourceId
+                LEFT JOIN ManualCapacitySlot ms ON ms.ManualSlotId = t.ManualSlotId
+                LEFT JOIN ProductionDepartment pd ON pd.Id = t.ProductionDepartmentId
+                LEFT JOIN TaskDispatch dpx ON dpx.SourceTaskId = t.Id";
+
+    /// <summary>P05 追加筛选片段（窗口/部门在 <see cref="GanttWindowPredicate"/>+DepartmentPredicate 里，不重复定义）。</summary>
+    private const string TaskListFilterTail = @"
+                AND (@HasStages = 0 OR t.StageCode IN @StageCodes)
+                AND (@HasDepts = 0 OR t.ProductionDepartmentId IN @DepartmentIds)
+                AND (@Status IS NULL OR t.Status = @Status)
+                AND (@Kw IS NULL OR m.MaterialCode LIKE @Kw OR m.MaterialName LIKE @Kw OR t.TaskNo LIKE @Kw)
+                AND (@MesMode = 0
+                     OR (@MesMode = 1 AND t.MESWorkOrderNo IS NOT NULL AND t.MESWorkOrderNo <> '')
+                     OR (@MesMode = 2 AND (t.MESWorkOrderNo IS NULL OR t.MESWorkOrderNo = '')))";
+
+    private const string TaskListSelect = @"
+                SELECT
+                    t.Id AS TaskId, t.TaskNo, t.PlanVersionId,
+                    t.MaterialId, m.MaterialCode, m.MaterialName,
+                    t.StageCode, t.OperationCode, t.OperationName,
+                    t.ResourceId, r.ResourceName, r.ResourceCode,
+                    t.ManualSlotId, ms.SlotCode AS ManualSlotCode,
+                    t.ProductionDepartmentId, pd.DeptName AS ProductionDepartmentName,
+                    t.Quantity, t.PlannedProcessQty, t.Uom AS Uom,
+                    t.PlannedStartTime, t.PlannedEndTime, t.Duration,
+                    t.Status, t.IsLocked, t.IsCriticalPath, t.TaskType,
+                    t.MTS_InstructionNo AS MtsInstructionNo, t.MESWorkOrderNo AS MesWorkOrderNo,
+                    dpx.DispatchStatus AS MesDispatchStatus, t.SetupSource";
+
+    /// <summary>P05 排序白名单（缺省=计划开始升序；全序 tiebreaker=ISNULL(ResourceId,-1), Id——同甘特游标那把尺；
+    /// **唯一例外 id**：主键本身全序，重复挂 tiebreaker 触发 SQL 169（N1 修复注）。</summary>
+    private static readonly Dictionary<string, string> TaskSortMap = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ["plannedstart"] = "t.PlannedStartTime",
+        ["quantity"]     = "t.Quantity",
+        ["materialcode"] = "m.MaterialCode",
+        ["taskno"]       = "t.TaskNo",
+        ["id"]           = "t.Id",
+    };
+
+    public async Task<LPS.APS.Core.Dto.TaskListResultDto> QueryTasksAsync(
+        int userId,
+        int planVersionId,
+        DateTime? from = null,
+        DateTime? to = null,
+        IReadOnlyList<int>? resourceIds = null,
+        IReadOnlyList<string>? stageCodes = null,
+        IReadOnlyList<int>? departmentIds = null,
+        string? keyword = null,
+        string? status = null,
+        bool? hasWorkOrder = null,
+        string? sortBy = null,
+        string? sortDir = null,
+        int pageIndex = 1,
+        int pageSize = 50,
+        CancellationToken cancellationToken = default)
+    {
+        // 参数即纪律（sortBy 家族同 manual-eta/order：非法⇒ArgumentException⇒GlobalExceptionFilter 真400，
+        // 绝不静默回落缺省序——"看着像排过"的返回比报错更坏）。
+        var sortKey = string.IsNullOrWhiteSpace(sortBy) ? "plannedstart" : sortBy.Trim();
+        if (!TaskSortMap.TryGetValue(sortKey, out var sortExpr))
+            throw new ArgumentException($"非法 sortBy：{sortBy}（允许：plannedStart/quantity/materialCode/taskNo/id 或不传=计划开始升序）");
+        var dir = string.IsNullOrWhiteSpace(sortDir) ? "ASC"
+            : sortDir.Trim().Equals("desc", StringComparison.OrdinalIgnoreCase) ? "DESC"
+            : sortDir.Trim().Equals("asc", StringComparison.OrdinalIgnoreCase) ? "ASC"
+            : throw new ArgumentException($"非法 sortDir：{sortDir}（允许：asc/desc 或不传）");
+        // 空集筛选=fail-closed（IN () 非法且空清单当"全放行"必错口径；同 manual-eta）
+        if (resourceIds is { Count: 0 } || stageCodes is { Count: 0 } || departmentIds is { Count: 0 })
+            return new LPS.APS.Core.Dto.TaskListResultDto
+            { Items = new(), Total = 0, Page = Math.Max(1, pageIndex), PageSize = Math.Clamp(pageSize, 1, 200) };
+
+        var allowed = await ResolveAllowedDomainKeysAsync(userId, cancellationToken);
+        var departmentCodes = await ResolveAllowedDepartmentCodesAsync(userId, cancellationToken);
+
+        var header = await _connectionManager.QueryFirstOrDefaultAsync<PlanVersionHeaderRow>(
+            "SELECT TOP 1 Id, DomainKey, Status FROM PlanVersion WHERE Id = @Id",
+            new { Id = planVersionId }, db: DatabaseId.APS);
+        if (header is null || header.Id == 0)
+            return new LPS.APS.Core.Dto.TaskListResultDto { VersionExists = false, Items = new(), Total = 0 };
+        if (!IsDomainAllowed(allowed, header.DomainKey))
+            return new LPS.APS.Core.Dto.TaskListResultDto { ScopeDenied = true, Items = new(), Total = 0 };
+
+        var effectivePage = Math.Max(1, pageIndex);
+        var effectiveSize = Math.Clamp(pageSize <= 0 ? 50 : pageSize, 1, 200);
+        var parameters = WithDepartmentScope(new
+        {
+            Id = planVersionId,
+            From = from,
+            To = to,
+            HasResources = resourceIds is { Count: > 0 },
+            ResourceIds = resourceIds,
+            HasStages = stageCodes is { Count: > 0 },
+            StageCodes = stageCodes,
+            HasDepts = departmentIds is { Count: > 0 },
+            DepartmentIds = departmentIds,
+            Status = string.IsNullOrWhiteSpace(status) ? null : status.Trim(),
+            Kw = string.IsNullOrWhiteSpace(keyword) ? null : "%" + keyword.Trim() + "%",
+            MesMode = hasWorkOrder is null ? 0 : hasWorkOrder.Value ? 1 : 2,
+            Skip = (effectivePage - 1) * effectiveSize,
+            Take = effectiveSize
+        }, departmentCodes);
+
+        var where = $@"
+                WHERE t.PlanVersionId = @Id{GanttWindowPredicate}{DepartmentPredicate("t")}{TaskListFilterTail}";
+
+        var total = await _connectionManager.QueryFirstOrDefaultAsync<int>(
+            "SELECT COUNT(*)" + TaskListFrom + where, parameters, db: DatabaseId.APS);
+
+        // N1（11-17 4号位 v1.1 件·我方 bug，认账）：sortBy=id 时 tiebreaker 再挂 t.Id
+        // ⇒ SQL Server 错误 169「在排序依据列表中多次指定了某一列」⇒ 500。四键正常恰因它们≠tiebreaker。
+        // t.Id 本身即全序主键，重复追加无意义 ⇒ 该键单列收尾；其余键维持 tiebreaker 全序。
+        var tiebreak = string.Equals(sortExpr, "t.Id", StringComparison.OrdinalIgnoreCase)
+            ? "" : ", ISNULL(t.ResourceId, -1), t.Id";
+        var items = (await _connectionManager.QueryAsync<LPS.APS.Core.Dto.TaskListItemDto>(
+            TaskListSelect + TaskListFrom + where
+            + $"\n                ORDER BY {sortExpr} {dir}{tiebreak}"
+            + "\n                OFFSET @Skip ROWS FETCH NEXT @Take ROWS ONLY",
+            parameters, db: DatabaseId.APS)).ToList();
+
+        return new LPS.APS.Core.Dto.TaskListResultDto
+        {
+            Items = items,
+            Total = total,
+            Page = effectivePage,
+            PageSize = effectiveSize
+        };
+    }
+
+    public async Task<LPS.APS.Core.Dto.TaskDetailResultDto> GetTaskDetailAsync(
+        int userId, long taskId, CancellationToken cancellationToken = default)
+    {
+        var allowed = await ResolveAllowedDomainKeysAsync(userId, cancellationToken);
+        var departmentCodes = await ResolveAllowedDepartmentCodesAsync(userId, cancellationToken);
+
+        // ① 身份头（不带部门谓词的单 PK 查）——先分"不存在"与"越权"两态，不得混报。
+        var ident = await _connectionManager.QueryFirstOrDefaultAsync<TaskIdentRow>(
+            @"SELECT TOP 1 t.Id, pv.DomainKey, pv.Id AS PlanVersionId
+              FROM [Task] t
+              INNER JOIN PlanVersion pv ON pv.Id = t.PlanVersionId
+              WHERE t.Id = @TaskId",
+            new { TaskId = taskId }, db: DatabaseId.APS);
+        if (ident is null || ident.Id == 0)
+            return new LPS.APS.Core.Dto.TaskDetailResultDto { Found = false };
+        if (!IsDomainAllowed(allowed, ident.DomainKey))
+            return new LPS.APS.Core.Dto.TaskDetailResultDto { Found = true, ScopeDenied = true };
+
+        // ② 全行（带部门谓词——本部门外的 Task 不可经详情旁路读到）。
+        var parameters = WithDepartmentScope(new { TaskId = taskId }, departmentCodes);
+        var row = await _connectionManager.QueryFirstOrDefaultAsync<TaskDetailRow>(
+            TaskListSelect + @",
+                    pv.VersionCode, pv.Status AS PlanVersionStatus, sr.DataCutoffTime
+                FROM [Task] t
+                LEFT JOIN Material m ON m.Id = t.MaterialId
+                LEFT JOIN Resource r ON r.Id = t.ResourceId
+                LEFT JOIN ManualCapacitySlot ms ON ms.ManualSlotId = t.ManualSlotId
+                LEFT JOIN ProductionDepartment pd ON pd.Id = t.ProductionDepartmentId
+                LEFT JOIN TaskDispatch dpx ON dpx.SourceTaskId = t.Id
+                INNER JOIN PlanVersion pv ON pv.Id = t.PlanVersionId
+                LEFT JOIN ScheduleRun sr ON sr.Id = pv.SourceScheduleRunId
+                WHERE t.Id = @TaskId" + DepartmentPredicate("t"),
+            parameters, db: DatabaseId.APS);
+        if (row is null || row.TaskId == 0)
+            return new LPS.APS.Core.Dto.TaskDetailResultDto { Found = true, ScopeDenied = true };
+
+        // ③ 份额：同 PV 全量给（共享 Task 多根订单逐行——v0.2 §P06"不得贴单一订单为唯一来源"）；
+        //    根订单号=同 PV [Order] 反查（D05-12：RootOrderNo 列空，此路径实测 100% 命中）。
+        var shares = (await _connectionManager.QueryAsync<LPS.APS.Core.Dto.TaskShareDto>(
+            @"SELECT s.AllocationSequence, s.DemandType, s.DemandKey, s.RootOrderId,
+                     o.OrderNo AS RootOrderNo, s.ShareQty
+              FROM AllocationTaskShare s
+              LEFT JOIN [Order] o ON o.Id = s.RootOrderId AND o.PlanVersionId = s.PlanVersionId
+              WHERE s.TaskId = @TaskId AND s.PlanVersionId = @PvId
+              ORDER BY s.AllocationSequence",
+            new { TaskId = taskId, PvId = ident.PlanVersionId }, db: DatabaseId.APS)).ToList();
+
+        return new LPS.APS.Core.Dto.TaskDetailResultDto
+        {
+            Found = true,
+            Task = row,
+            VersionCode = row.VersionCode,
+            DomainKey = ident.DomainKey,
+            PlanVersionStatus = row.PlanVersionStatus,
+            DataCutoffTime = row.DataCutoffTime,
+            Shares = shares,
+            SharesProvided = true
+        };
+    }
+
+    /// <summary>详情行投影=列表行 + 版本身份三列（内部件；DomainKey 走身份头查询，不在本投影重复）。</summary>
+    private sealed class TaskDetailRow : LPS.APS.Core.Dto.TaskListItemDto
+    {
+        public string? VersionCode { get; set; }
+        public string? PlanVersionStatus { get; set; }
+        public DateTime? DataCutoffTime { get; set; }
+    }
+
+    /// <summary>详情身份头投影（内部件）。</summary>
+    private sealed class TaskIdentRow
+    {
+        public long Id { get; init; }
+        public string DomainKey { get; init; } = string.Empty;
+        public int PlanVersionId { get; init; }
+    }
+
+    /// <summary>版本头投影（内部件；P05 列表入口用）。</summary>
+    private sealed class PlanVersionHeaderRow
+    {
+        public int Id { get; init; }
+        public string DomainKey { get; init; } = string.Empty;
+        public string? Status { get; init; }
+    }
+    // ─────────────────────────────── A4/A5 段结束 ───────────────────────────────
+
+    // ───────────── 11-17 矩阵 A6/A7：P12 资源负荷三率（0号位 Q-b 裁后首件） ─────────────
+    // 三件单源纪律：①分子=Task 切片（域/部门 Scope 与甘特同件、窗口同语义）；②①分母=
+    // IResourceCalendarService.ResolvePreviewAsync（三级继承**唯一解析件**，其内部自带 S5-01 fail-closed）；
+    // ③Setup 权威=1号位 Solver 落库产物——**当前无持久列（Task 只有 SetupSource 标签列，实库已核）**，
+    // 故 SetupHoursAvailable 恒 false、③一律"未具备数据条件"，**禁读时重匹配 SetupRule、禁拿 Duration 代**（Q-b 原文）。
+    // 零合法可用小时=不适用（v0.2：严禁把无 Calendar 假设为 8h 或全天开放，禁 0 冒充）。
+
+    public async Task<LPS.APS.Core.Dto.ResourceLoadResultDto> GetResourceLoadAsync(
+        int userId,
+        int planVersionId,
+        DateTime? from,
+        DateTime? to,
+        IReadOnlyList<int>? resourceIds = null,
+        CancellationToken cancellationToken = default)
+    {
+        if (from is null || to is null)
+            throw new ArgumentException("from/to 必填（P12 按 设备×业务日 出数，无窗不出数——同 buckets 纪律）");
+        var fromDay = from.Value.Date;
+        var toDay = to.Value.Date;
+        var spanDays = (toDay - fromDay).Days;
+        if (spanDays < 0)
+            throw new ArgumentException($"窗口非法：to({toDay:yyyy-MM-dd}) 早于 from({fromDay:yyyy-MM-dd})");
+        if (spanDays > 30)
+            throw new ArgumentException($"窗口超限：{(spanDays + 1)} 天 > 31 天（P12=单日默认/短窗视图，长窗请逐日查——限行数防页面无意义膨胀）");
+        if (resourceIds is { Count: 0 })
+            return new LPS.APS.Core.Dto.ResourceLoadResultDto { From = fromDay, To = toDay };
+        if (resourceIds is { Count: > 200 })
+            throw new ArgumentException($"resourceIds 单次最多 200 个（=日历解析件同额）");
+
+        var allowed = await ResolveAllowedDomainKeysAsync(userId, cancellationToken);
+        var departmentCodes = await ResolveAllowedDepartmentCodesAsync(userId, cancellationToken);
+
+        var header = await _connectionManager.QueryFirstOrDefaultAsync<ResourceLoadPvHeader>(
+            @"SELECT TOP 1 pv.Id, pv.DomainKey, pv.Status AS PlanVersionStatus, sr.DataCutoffTime
+              FROM PlanVersion pv
+              LEFT JOIN ScheduleRun sr ON sr.Id = pv.SourceScheduleRunId
+              WHERE pv.Id = @Id",
+            new { Id = planVersionId }, db: DatabaseId.APS);
+        if (header is null || header.Id == 0)
+            return new LPS.APS.Core.Dto.ResourceLoadResultDto { VersionExists = false, From = fromDay, To = toDay };
+        if (!IsDomainAllowed(allowed, header.DomainKey))
+            return new LPS.APS.Core.Dto.ResourceLoadResultDto { ScopeDenied = true, From = fromDay, To = toDay };
+
+        // ── 分子：Task 切片（先定设备宇宙：显式清单 > 窗内有 Task 的设备 TOP 200） ──
+        var baseParams = WithDepartmentScope(new { Id = planVersionId, From = from, To = to }, departmentCodes);
+        var universe = resourceIds?.ToList();
+        var truncated = false;
+        if (universe is null)
+        {
+            var discovered = (await _connectionManager.QueryAsync<int>(
+                @"SELECT DISTINCT TOP (201) t.ResourceId
+                  FROM [Task] t
+                  WHERE t.PlanVersionId = @Id
+                    AND t.ResourceId IS NOT NULL
+                    AND t.PlannedStartTime IS NOT NULL AND t.PlannedEndTime IS NOT NULL
+                    AND t.PlannedEndTime >= @From AND t.PlannedStartTime <= @To"
+                + DepartmentPredicate("t") + "\n                  ORDER BY t.ResourceId",
+                baseParams, db: DatabaseId.APS)).ToList();
+            truncated = discovered.Count > 200;
+            universe = discovered.Take(200).ToList();
+        }
+        if (universe.Count == 0)
+            return new LPS.APS.Core.Dto.ResourceLoadResultDto
+            {
+                PlanVersionId = planVersionId, DomainKey = header.DomainKey,
+                PlanVersionStatus = header.PlanVersionStatus, DataCutoffTime = header.DataCutoffTime,
+                From = fromDay, To = toDay, ResourcesTruncated = truncated
+            };
+
+        var sliceSql = @"
+;WITH days AS (
+    SELECT CAST(@FromDay AS date) AS d
+    UNION ALL
+    SELECT DATEADD(day, 1, d) FROM days WHERE d < @ToDay
+),
+tk AS (
+    SELECT t.Id, t.ResourceId, t.PlannedStartTime, t.PlannedEndTime
+    FROM [Task] t
+    WHERE t.PlanVersionId = @Id
+      AND t.ResourceId IN @Universe
+      AND t.PlannedStartTime IS NOT NULL AND t.PlannedEndTime IS NOT NULL
+      AND t.PlannedEndTime > t.PlannedStartTime
+      AND t.PlannedEndTime >= @From AND t.PlannedStartTime <= @To" + DepartmentPredicate("t") + @"
+)
+SELECT tk.ResourceId,
+       CAST(days.d AS datetime2) AS BusinessDate,
+       CAST(SUM(CAST(DATEDIFF(second,
+             CASE WHEN tk.PlannedStartTime > CAST(days.d AS datetime2) THEN tk.PlannedStartTime ELSE CAST(days.d AS datetime2) END,
+             CASE WHEN tk.PlannedEndTime < DATEADD(day, 1, CAST(days.d AS datetime2)) THEN tk.PlannedEndTime
+                  ELSE DATEADD(day, 1, CAST(days.d AS datetime2)) END) AS decimal(18,4)) / 3600.0) AS decimal(18,4)) AS ScheduledHours,
+       COUNT(DISTINCT tk.Id) AS TaskCount
+FROM tk
+JOIN days
+  ON tk.PlannedStartTime < DATEADD(day, 1, CAST(days.d AS datetime2))
+ AND tk.PlannedEndTime >= CAST(days.d AS datetime2)
+GROUP BY tk.ResourceId, days.d
+ORDER BY tk.ResourceId, days.d
+OPTION (MAXRECURSION 40)";
+
+        var slices = (await _connectionManager.QueryAsync<ResourceLoadSliceRow>(
+            sliceSql,
+            new
+            {
+                Id = planVersionId, From = from, To = to,
+                FromDay = fromDay, ToDay = toDay, Universe = universe,
+                ScopeHasDepartments = departmentCodes is { Count: > 0 },
+                ScopeDepartmentCodes = departmentCodes
+            }, db: DatabaseId.APS)).ToList();
+
+        // ── ①分母：三级继承解析件（唯一件，含 S5-01 fail-closed；越界设备被其剔除） ──
+        List<LPS.APS.Application.Services.Dto.ResourceCalendarResolvePreviewDto> resolved;
+        try
+        {
+            resolved = await _resourceCalendarService.ResolvePreviewAsync(
+                universe, fromDay, toDay, userId, cancellationToken);
+        }
+        catch (Exception ex)
+        {
+            // 日历解析失败 ≠ 可用小时 0：整窗 Calendar 留 null（未判定），①不适用；②仍可给。
+            _logger.LogWarning(ex, "P12 日历解析失败 pv={Pv}", planVersionId);
+            resolved = new();
+        }
+        var calByResourceDay = new Dictionary<(int, DateOnly), (decimal Hours, string Source)>();
+        foreach (var r in resolved)
+        {
+            foreach (var w in r.Windows)
+            {
+                var d = w.Start.Date;
+                var wEnd = w.End;
+                while (d < wEnd.Date || (d == wEnd.Date && wEnd > wEnd.Date)) // 覆盖含尾日的部分片
+                {
+                    var dayStart = d;
+                    var dayEnd = d.AddDays(1);
+                    var lo = w.Start > dayStart ? w.Start : dayStart;
+                    var hi = wEnd < dayEnd ? wEnd : dayEnd;
+                    if (hi > lo)
+                    {
+                        var key = (r.ResourceId, DateOnly.FromDateTime(d));
+                        var add = (decimal)(hi - lo).TotalHours;
+                        calByResourceDay.TryGetValue(key, out var cur);
+                        // 同日多层片：来源取"最具体"（Resource>Department>Factory），小时累加。
+                        var src = Rank(w.Source) >= Rank(cur.Source) ? w.Source : cur.Source;
+                        calByResourceDay[key] = (cur.Hours + add, string.IsNullOrEmpty(src) ? w.Source : src);
+                    }
+                    d = d.AddDays(1);
+                }
+            }
+        }
+        static int Rank(string? s) => s switch { "Resource" => 3, "Department" => 2, "Factory" => 1, _ => 0 };
+
+        // ── 组装：设备×日全矩阵（无排产无日历的日子=Calendar 未解析⇒①不适用；②恒 0） ──
+        var sliceMap = slices.ToDictionary(s => (s.ResourceId, DateOnly.FromDateTime(s.BusinessDate)));
+        var resMeta = (await _connectionManager.QueryAsync<ResourceLoadResMeta>(
+            "SELECT Id AS ResourceId, ResourceCode, ResourceName FROM Resource WHERE Id IN @Ids",
+            new { Ids = universe }, db: DatabaseId.APS)).ToDictionary(x => x.ResourceId);
+        var resolvedIds = resolved.Select(x => x.ResourceId).ToHashSet();
+
+        var rows = new List<LPS.APS.Core.Dto.ResourceLoadRowDto>();
+        for (var off = 0; off <= spanDays; off++)
+        {
+            var day = fromDay.AddDays(off);
+            var dayKey = DateOnly.FromDateTime(day);
+            foreach (var rid in universe)
+            {
+                var hasSlice = sliceMap.TryGetValue((rid, dayKey), out var sc);
+                var hasCal = calByResourceDay.TryGetValue((rid, dayKey), out var cal);
+                var sched = hasSlice ? sc!.ScheduledHours : 0m;
+                resMeta.TryGetValue(rid, out var meta);
+
+                decimal? rate1 = null;
+                string? naReason = null;
+                if (hasCal && cal.Hours > 0)
+                    rate1 = Math.Round(sched / cal.Hours * 100m, 1);
+                else
+                    naReason = hasCal
+                        ? "当日合法可用小时=0（日历当日 OFF/无 WORK 片）——不适用，禁当 0 负荷"
+                        : (resolvedIds.Contains(rid)
+                            ? "当日未解析出合法 Calendar 窗口——不适用（严禁按 8h/全天假设）"
+                            : "该设备被日历解析件按授权范围剔除或无登记——分母未判定");
+
+                rows.Add(new LPS.APS.Core.Dto.ResourceLoadRowDto
+                {
+                    ResourceId = rid,
+                    ResourceCode = meta?.ResourceCode,
+                    ResourceName = meta?.ResourceName,
+                    BusinessDate = day,
+                    ScheduledHours = sched,
+                    TaskCount = hasSlice ? sc!.TaskCount : 0,
+                    SetupHours = null,                                   // Q-b：Solver 落库产物缺，不代算
+                    CalendarLoadRatePct = rate1,
+                    Fixed16LoadRatePct = Math.Round(sched / 16m * 100m, 1),
+                    SetupLossRatePct = null,                              // 未具备数据条件（SetupHoursAvailable=false 全表统一）
+                    CalendarAvailableHours = hasCal ? Math.Round(cal.Hours, 2) : null,
+                    CalendarSource = hasCal ? cal.Source : null,
+                    NotApplicableReason = naReason
+                });
+            }
+        }
+
+        return new LPS.APS.Core.Dto.ResourceLoadResultDto
+        {
+            PlanVersionId = planVersionId,
+            DomainKey = header.DomainKey,
+            PlanVersionStatus = header.PlanVersionStatus,
+            DataCutoffTime = header.DataCutoffTime,
+            From = fromDay,
+            To = toDay,
+            ResourceCount = universe.Count,
+            ResourcesTruncated = truncated,
+            Rows = rows,
+            SetupHoursAvailable = false
+        };
+    }
+
+    /// <summary>P12 内部投影。</summary>
+    private sealed class ResourceLoadPvHeader
+    {
+        public int Id { get; init; }
+        public string DomainKey { get; init; } = string.Empty;
+        public string? PlanVersionStatus { get; init; }
+        public DateTime? DataCutoffTime { get; init; }
+    }
+
+    private sealed class ResourceLoadSliceRow
+    {
+        public int ResourceId { get; init; }
+        public DateTime BusinessDate { get; init; }
+        public decimal ScheduledHours { get; init; }
+        public int TaskCount { get; init; }
+    }
+
+    private sealed class ResourceLoadResMeta
+    {
+        public int ResourceId { get; init; }
+        public string? ResourceCode { get; init; }
+        public string? ResourceName { get; init; }
+    }
+    // ─────────────────────────────── A6/A7 段结束 ───────────────────────────────
 
     public async Task<GanttDataDto> GetGanttAsync(
         int userId,

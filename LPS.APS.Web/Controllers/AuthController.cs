@@ -108,6 +108,65 @@ public class AuthController : ControllerBase
     }
 
     /// <summary>
+    /// 改自己资料（R1，4号位 2026-11-17 来文；仅显示名/邮箱/手机号——登录名 UserCode/Status/角色/范围归 auth.manage 管理面，不可自助改）。
+    /// </summary>
+    /// <remarks>开发者：3号位</remarks>
+    [HttpPut("profile")]
+    [Authorize]
+    public async Task<ApiResponse<UpdateProfileResponse>> UpdateProfile([FromBody] UpdateProfileRequest request)
+    {
+        if (!int.TryParse(User.FindFirst(ClaimTypes.NameIdentifier)?.Value, out var currentUserId))
+            return ApiResponse<UpdateProfileResponse>.Fail(401, "无法解析当前登录用户身份");
+        if (request == null)
+            return ApiResponse<UpdateProfileResponse>.Fail(400, "请求体不能为空");
+
+        try
+        {
+            var (userName, email, phoneNumber) = await _authService.UpdateProfileAsync(
+                currentUserId, request.UserName, request.Email, request.PhoneNumber,
+                HttpContext.Connection.RemoteIpAddress?.ToString(), Request.Headers.UserAgent.ToString());
+
+            return ApiResponse<UpdateProfileResponse>.Success(new UpdateProfileResponse
+            {
+                UserName = userName,
+                Email = email,
+                PhoneNumber = phoneNumber
+            });
+        }
+        catch (InvalidOperationException ex)
+        {
+            return ApiResponse<UpdateProfileResponse>.Fail(400, ex.Message);
+        }
+    }
+
+    /// <summary>
+    /// 修改密码（R2，4号位 2026-11-17 来文；验旧密码 + 新密码规则 + 改后清 RefreshToken 旧会话失效）。
+    /// </summary>
+    /// <remarks>开发者：3号位</remarks>
+    [HttpPost("change-password")]
+    [Authorize]
+    public async Task<ApiResponse> ChangePassword([FromBody] ChangePasswordRequest request)
+    {
+        if (!int.TryParse(User.FindFirst(ClaimTypes.NameIdentifier)?.Value, out var currentUserId))
+            return ApiResponse.Fail(401, "无法解析当前登录用户身份");
+        if (request == null || string.IsNullOrWhiteSpace(request.OldPassword) || string.IsNullOrWhiteSpace(request.NewPassword))
+            return ApiResponse.Fail(400, "旧密码和新密码不能为空");
+
+        try
+        {
+            await _authService.ChangePasswordAsync(
+                currentUserId, request.OldPassword, request.NewPassword,
+                HttpContext.Connection.RemoteIpAddress?.ToString(), Request.Headers.UserAgent.ToString());
+
+            return ApiResponse.Ok("密码修改成功，请重新登录");
+        }
+        catch (InvalidOperationException ex)
+        {
+            return ApiResponse.Fail(400, ex.Message);
+        }
+    }
+
+    /// <summary>
     /// 获取当前用户信息（验证Token有效性）
     /// 含业务范围（IsGlobal + 各维度集合），直接复用 IDiaScopeService（不建立第二套 Scope DTO 真值）。
     /// </summary>
@@ -124,11 +183,17 @@ public class AuthController : ControllerBase
         var currentUserId = int.TryParse(userId, out var id) ? id : 0;
         var scope = await _dataScopeService.ResolveScopeAsync(currentUserId, ct);
 
+        // R1（4号位 2026-11-18 来文）：/me 补 email/phoneNumber → 一次 [User] 主键查询（APS_Auth）。
+        // 显示名改读 DB（DisplayName）避免 claim 延迟；userName/claim 仅作兜底（用户不存在/已删除时）。
+        var profile = await _authService.GetProfileAsync(currentUserId, ct);
+
         return ApiResponse<UserInfoDto>.Success(new UserInfoDto
         {
             UserId = currentUserId,
             UserCode = userCode ?? "",
-            UserName = userName ?? "",
+            UserName = profile?.DisplayName ?? userName ?? "",
+            Email = profile?.Email,
+            PhoneNumber = profile?.PhoneNumber,
             Roles = roles,
             Permissions = permissions,
             IsGlobal = scope.IsGlobal,

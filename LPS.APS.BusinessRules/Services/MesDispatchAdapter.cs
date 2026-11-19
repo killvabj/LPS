@@ -46,8 +46,8 @@ namespace LPS.APS.BusinessRules.Services;
 //   ③ 路由消费序：`command.WorkOrderType` 显式列 > `StageOverrides` 配置 > 内置收窄表 >
 //      Unknown(ROUTE_UNRESOLVED)（11-12 晚复函 §一 第1条）。
 //   ④ `instructionType` 消费 `command.InstructionType`（空则沿用 V1 恒 PRODUCTION_INSTRUCTION 兜底）。
-//   ⑤ Payload 三新字段先占位省略：`productionDepartmentCode`（等2号位 Command 补列）、
-//      `routeCode`（等 Task.RouteCode 真值链，现全表 'DEFAULT'）、`instructionNo`（出荷预留，V1 不产）。
+//   ⑤ `productionDepartmentCode` 已消费第三列（2号位 r14248，空串归一省略）；
+//      `routeCode`（等 Task.RouteCode 真值链）与 `instructionNo`（出荷预留，V1 不产）仍占位省略。
 // ============================================================================
 
 /// <summary>MES 建单统一出站 Adapter：按 Stage 路由组装/加工模块接口，三态返回，不落库。</summary>
@@ -236,10 +236,10 @@ public class MesDispatchAdapter : IMesDispatchAdapter
         Uom = c.Uom,
         FactoryCode = c.FactoryCode,
         ResourceCode = c.ResourceCode,
-        // ── v1.1 占位（JsonOptions=WhenWritingNull，未供值时整字段省略，MES 侧宽松缺省）──
-        // TODO(2号位会签)：MesDispatchCommand 尚无该列；须自 TaskDispatch.ProductionDepartmentCode 透传。
-        // ⚠组装 MES 联调前必须补列：MES 端口缺该字段将以 DEPT_NOT_MAPPED 拒绝（Holon 唯一来源，不可猜）。
-        ProductionDepartmentCode = null,
+        // v1.1·第三列（2号位 r14248 已落）：供值即出网；空/NULL 省略（MES 端缺值自会 DEPT_NOT_MAPPED 拒整组）。
+        ProductionDepartmentCode = string.IsNullOrWhiteSpace(c.ProductionDepartmentCode)
+            ? null
+            : c.ProductionDepartmentCode.Trim(),
         // TODO(真值链)：Task.RouteCode 现全表 'DEFAULT'（11-05 §九 登记，1号位 回写待齐）；真值就绪后透传。
         RouteCode = null,
         // 出荷预留：SH号=Order.OrderNo（INTER_FACTORY）；V1 不产 SH Task（Owner 11-11 情形A）。

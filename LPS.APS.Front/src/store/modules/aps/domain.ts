@@ -44,6 +44,26 @@ export const useDomainStore = defineStore('aps.domain', () => {
   const error = ref<string | null>(null)
   const loadedAt = ref<string | null>(null)
   const fetchStatus = ref<DomainFetchStatus>('ok')
+  /**
+   * 显示用名称表：domainKey → domainName（**含已停用域**）
+   *
+   * 为什么与 `definitions` 分开：`definitions` 是「启用域清单」（下拉、染色都按启用算），
+   * 而**历史计划版本**所属的域可能已停用（dev 实测 BJ_FAMILY_FRL 已停用）⇒ 只查启用域
+   * 会让历史版本回退显示裸 domainKey（`BJ_FAMILY_FRL`）。
+   * 名称表单独存一份，**只用于显示**，不参与任何启停/下拉/染色判断。
+   */
+  const nameMap = ref<Record<string, string>>({})
+  /**
+   * 全量域字典（**含已停用**）—— 与 `definitions`（启用域清单）并列的第二份。
+   *
+   * 为什么需要：5号位 2026-11-18 复函 §五「域字典漂移」——dev 实测 16 行里
+   *   BJ_FAMILY_FRL / TJ_FAMILY_FRL 是**停用态**（IsActive=false）却各带 ACTIVE 版本，
+   *   即「停用域在产、启用域反而无版本」。停用语义（不再排？仅不入新 run？现有 ACTIVE 怎么办）
+   *   **未定义，待 0号位 裁** ⇒ 前端不自行解释。
+   *   但「停用」只说明字典状态，**不等于该域没有数据** ⇒ 凡是要判断「这个域后端认不认识、
+   *   有没有数据」的场合，一律用这份全量清单（含停用），不要用启用域清单去卡。
+   */
+  const allDefinitions = ref<DomainDefinitionDto[]>([])
 
   // ===== getters =====
   /**
@@ -78,10 +98,27 @@ export const useDomainStore = defineStore('aps.domain', () => {
       .sort((a, b) => (a.sortOrder ?? 0) - (b.sortOrder ?? 0))
   )
 
-  /** 给 UI 显示用的 label：domainKey → domainName（找不到时回退 key） */
+  /**
+   * 业务范围（scope.domainKeys）内的**全部已知域** key（含已停用）。
+   *  - 与 `activeDomains` 的差别只在一处：**不按 isActive 过滤**（停用语义未定，前端不解释）
+   *  - 用途：筛选下拉等「让用户挑一个域」的场合——把有数据的停用态域藏起来＝用户筛不到它
+   */
+  const scopedKnownDomainKeys = computed<string[]>(() => {
+    const apsAuth = useApsAuthStore()
+    const allowed = apsAuth.dataScope.domainKeys
+    return allDefinitions.value
+      .filter((d) => allowed.length === 0 || allowed.includes(d.domainKey))
+      .slice()
+      .sort((a, b) => (a.sortOrder ?? 0) - (b.sortOrder ?? 0))
+      .map((d) => d.domainKey)
+  })
+
+  /** 给 UI 显示用的 label：domainKey → domainName（找不到时回退 key）
+   *  查启用域（byKey）→ 查名称表（含已停用）→ 都没有才回退裸 key（后端没登记的域，实情）。
+   */
   function label(domainKey: DomainKey | undefined | null): string {
     if (!domainKey) return '—'
-    return byKey.value.get(domainKey)?.domainName ?? domainKey
+    return byKey.value.get(domainKey)?.domainName ?? nameMap.value[domainKey] ?? domainKey
   }
 
   /** domainKey → 数据库 Id（后端 detail/update/enable/disable 都按 id 寻址）
@@ -102,7 +139,13 @@ export const useDomainStore = defineStore('aps.domain', () => {
     loading.value = true
     error.value = null
     try {
-      definitions.value = await domainApi.list(query)
+      // 一次拉全量（含已停用域）：显示用名称表要能查到历史版本所属的域
+      const all = await domainApi.list({ ...query, activeOnly: false })
+      nameMap.value = Object.fromEntries(all.map((d) => [d.domainKey, d.domainName]))
+      // 全量字典（含已停用）常驻：判断「这个域后端认不认识」用这份，不受启停影响
+      allDefinitions.value = all
+      // definitions 保持原语义：默认只要启用域（refresh() 传 activeOnly=false 时要全量）
+      definitions.value = query.activeOnly === false ? all : all.filter((d) => d.isActive)
       loadedAt.value = new Date().toISOString()
       fetchStatus.value = 'ok'
     } catch (err) {
@@ -201,6 +244,8 @@ export const useDomainStore = defineStore('aps.domain', () => {
     // getters
     activeDomains,
     allActive,
+    allDefinitions,
+    scopedKnownDomainKeys,
     byKey,
     label,
     getId,

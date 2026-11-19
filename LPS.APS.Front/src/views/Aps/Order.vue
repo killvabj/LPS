@@ -21,10 +21,19 @@
  * 2026-11-02 按 5号位 答复函（r14009 已部署）接入**计划派生交付判定**：
  *  - 交付状态改读后端算好的 `riskLevel`（`DELAYED` 红 / `ON_TRACK` 绿 / **缺键=未排产** 灰）；
  *    `Order.DelayStatus` 是 ERP/ODS 独立维度，冻结 `01 §64` 红线禁止拿它当本版本交付结果
- *  - KPI 四卡 = 总数 / 按期 / 延迟 / 未排产，全部取 summary 的**计划派生三桶**
- *    （恒等式：按期+延迟+未排产 = 总数）
  *  - 「未排」卡重新上线：后端 `unscheduledCount` 已从 `CAST(0 AS INT)` 字面量改为**实值**
  *    （本版本无 Task 行）；旧「未计算」卡（= 总数 − 按期 − 延迟）口径已废，删掉
+ *
+ * 2026-11-17 按 5号位 复函（**B2**，r14250～r14255 已落码）**交付 KPI 换端点**：
+ *  - KPI 从 `GET /api/order-query/summary` 三桶换成 `GET /api/order-query/delivery-kpi`
+ *    的**分区行**：总计 / 生产指示 / 销售订单 三张卡
+ *  - 判定式与列表 `riskLevel` **逐字同文**（后端类级常量 `RiskCaseExpr`）
+ *    ⇒ 卡片与点开的行集逐位一致，不会出现「格子说按期、KPI 说延期」
+ *  - 分母**随筛选走**（分母 = 当前筛选命中的订单数，含未判定不剔除）
+ *  - 「日期/计划不可判定」**单列显示**，不并进按期或延期任一侧（后端不给它率）
+ *  - summary 三桶**不再当 KPI 展示**（两者并排读会自相矛盾）；summary 只留
+ *    「整版订单总数」与「整版都还没排产」两个非 KPI 用途
+ *  - `targetPercent` 键缺 ⇒ 不出目标达成率；`fgWipDimensionAvailable=false` ⇒ 不出 FG/WIP 卡
  *
  * 2026-11-12 **工厂用户视角改版**（用户：站在工厂用户角度，页面怎么弄比较好用）：
  *
@@ -41,8 +50,8 @@
  *  ④ 文本筛选 400ms 防抖：旧实现每敲一个字就打一次后端。
  *  ⑤ 表格瘦身：生产指示号并进订单号下方、延期原因并进「交付状态」列
  *     （原来 14 列，右边「操作」列常被横向滚动裁掉）。
- *  ⑥ KPI 口径标注：summary 端点只收 `planVersionId`（不收筛选条件）⇒ KPI 恒为**全版本**，
- *     页面必须写明，否则用户以为 KPI 跟着筛选变。
+ *  ⑥ KPI 口径标注：2026-11-17 起交付 KPI 走 `delivery-kpi`（**随筛选走**，口径原文回显）；
+ *     「该版本共 N 单」仍是整版数量（summary 口径），两者不是同一个数，卡片下方已分别标注。
  *  ⑦ 版本状态大白话提示（失败 / 计算中 / 未发令 / 已被顶替 / 全版本都未排产）。
  *
  * 写接口：本页查询部分只读；**唯一写入口 = §10A.1「已有订单提前」**
@@ -52,7 +61,7 @@
 
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { storeToRefs } from 'pinia'
-import { useRouter } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { useOrderStore } from '@/store/modules/aps/order'
 import { useDomainStore } from '@/store/modules/aps/domain'
@@ -65,7 +74,9 @@ import {
   formatUtcMonthDayHM
 } from '@/utils/datetime'
 import type { BusinessEntrySubmission, OrderListItemDto } from '@/api/aps-v1'
+import { customerSegmentLabel, orderTypeLabel, supplyTypeLabel } from '@/api/aps-v1/codeLabels'
 import OrderAdvanceDialog from './components/OrderAdvanceDialog.vue'
+import OrderTreePanel from './components/OrderTreePanel.vue'
 import {
   ORDER_STATUS_LABELS,
   ORDER_DELAY_STATUSES,
@@ -80,8 +91,7 @@ import {
   type DomainKey,
   type OrderDelayStatus,
   type OrderRiskLevel,
-  type OrderStatusDisplay,
-  type SupplyType
+  type OrderStatusDisplay
 } from '@/api/aps-v1/types'
 
 import {
@@ -112,6 +122,9 @@ const {
   listLoading,
   listError,
   summary,
+  deliveryKpi,
+  deliveryKpiLoading,
+  deliveryKpiError,
   currentDetail,
   detailLoading,
   detailError,
@@ -205,19 +218,8 @@ function statusTagType(raw: string): 'success' | 'info' | 'warning' | 'primary' 
 }
 
 // ===== Pegging 供应类型标签（冻结 07 的 9 类 SupplyType；未知值原样显示）=====
-const SUPPLY_LABELS: Record<SupplyType, string> = {
-  INVENTORY: '库存',
-  PI: 'PI 在制',
-  PO: 'PO 在途',
-  VMI: 'VMI 寄售',
-  ARRIVED_NOT_INBOUND: '到货未入库',
-  INTERPLANT_TRANSIT: '跨厂在途',
-  RECEIVED: '已收货',
-  PLANNED_PRODUCTION: '计划生产',
-  PLANNING_PURCHASE_PLACEHOLDER: '采购估算（占位）'
-}
-const supplyLabel = (raw: string | undefined): string =>
-  raw ? (SUPPLY_LABELS[raw as SupplyType] ?? raw) : '—'
+// 2026-11-18：搬进 codeLabels.ts 共用一份（订单树的数量账也读同一张表，禁各页各造）。
+const supplyLabel = (raw: string | undefined): string => supplyTypeLabel(raw, '—')
 
 /** 任务状态：冻结 TASK_STATUSES 5 态（common.ts），未知值原样显示 */
 const TASK_STATUS_LABELS: Record<string, string> = {
@@ -231,11 +233,19 @@ const TASK_STATUS_LABELS: Record<string, string> = {
 const apsAuth = useApsAuthStore()
 const domainStore = useDomainStore()
 
-/** Domain 选项：从真实 domainStore 派生（非 mock 时即后端 Domain 列表），U41 按 dataScope 收敛 */
+/**
+ * Domain 选项：从真实 domainStore 派生（非 mock 时即后端 Domain 列表），U41 按 dataScope 收敛
+ *
+ * ⚠️ **域字典漂移（5号位 2026-11-18 复函 §五）**：BJ_FAMILY_FRL / TJ_FAMILY_FRL 在域字典里
+ *   是**停用态**却各带 ACTIVE 版本在产 ⇒ 若只列「启用域」，会把**有订单的域**从筛选下拉里抹掉。
+ *   停用语义未定义（0号位 待裁）⇒ 前端不自行解释停用、也不隐藏 ⇒ 列**全部已知域（含停用）**
+ *   并按业务范围收敛；显示名走 domainStore.label（名称表含已停用域，不会退成裸 key）。
+ */
 const DOMAIN_OPTIONS = computed<Array<{ value: DomainKey | 'ALL'; label: string }>>(() => {
-  const all = domainStore.activeDomains.map((d) => ({ value: d.domainKey, label: d.domainName }))
-  const allowed = apsAuth.dataScope.domainKeys as readonly string[]
-  const list = allowed.length === 0 ? all : all.filter((o) => allowed.includes(o.value))
+  const list: Array<{ value: DomainKey; label: string }> = []
+  for (const k of domainStore.scopedKnownDomainKeys) {
+    list.push({ value: k as DomainKey, label: domainStore.label(k as DomainKey) })
+  }
   return [{ value: 'ALL' as const, label: '全部' }, ...list]
 })
 
@@ -305,18 +315,19 @@ const rangeDateText = computed(() => {
 })
 
 /** 落区间到后端参数（不重查 —— 供「先设好再统一刷一次」的场景用） */
-function setRangeFilter(key: RangeKey): void {
+function setRangeFilter(key: RangeKey): { from?: string; to?: string } {
   activeRange.value = key
   const { from, to } = rangeBounds(key)
   dueFrom.value = from
   dueTo.value = to
   orderStore.setFilter({ dueDateFrom: from, dueDateTo: to })
+  return { from, to }
 }
 
-/** 落区间 + 重查列表 */
+/** 落区间 + 重查列表与交付 KPI（KPI 分母随筛选走 ⇒ 两块一起刷） */
 async function applyRange(key: RangeKey): Promise<void> {
-  setRangeFilter(key)
-  await orderStore.loadList(true)
+  const { from, to } = setRangeFilter(key)
+  await orderStore.applyFilter({ dueDateFrom: from, dueDateTo: to })
 }
 
 // ===== 筛选输入（全部对应后端真实 Query 参数）=====
@@ -397,13 +408,12 @@ watch([orderNoInput, piInput, materialInput, customerNameInput], () => {
   }
   if (textTimer) clearTimeout(textTimer)
   textTimer = setTimeout(() => {
-    orderStore.setFilter({
+    void orderStore.applyFilter({
       orderNo: orderNoInput.value || undefined,
       productionInstructionNo: piInput.value || undefined,
       materialCode: materialInput.value || undefined,
       customerName: customerNameInput.value || undefined
     })
-    void orderStore.loadList(true)
   }, TEXT_FILTER_DEBOUNCE_MS)
 })
 
@@ -414,39 +424,33 @@ onUnmounted(() => {
 function onDueFromChange(v: string | null | undefined): void {
   dueFrom.value = v || undefined
   activeRange.value = 'custom'
-  orderStore.setFilter({ dueDateFrom: dueFrom.value })
-  void orderStore.loadList(true)
+  void orderStore.applyFilter({ dueDateFrom: dueFrom.value })
 }
 
 function onDueToChange(v: string | null | undefined): void {
   dueTo.value = v || undefined
   activeRange.value = 'custom'
-  orderStore.setFilter({ dueDateTo: dueTo.value })
-  void orderStore.loadList(true)
+  void orderStore.applyFilter({ dueDateTo: dueTo.value })
 }
 
 function onDelayStatusChange(v: OrderDelayStatus | undefined): void {
   delayStatusInput.value = v
-  orderStore.setFilter({ delayStatus: v })
-  void orderStore.loadList(true)
+  void orderStore.applyFilter({ delayStatus: v })
 }
 
 function onStatusChange(v: OrderStatusDisplay | undefined): void {
   statusInput.value = v
-  orderStore.setFilter({ status: v })
-  void orderStore.loadList(true)
+  void orderStore.applyFilter({ status: v })
 }
 
 function onFactoryChange(v: string | undefined): void {
   factoryCodeInput.value = v
-  orderStore.setFilter({ factoryCode: v })
-  void orderStore.loadList(true)
+  void orderStore.applyFilter({ factoryCode: v })
 }
 
 function onFamilyChange(v: string | undefined): void {
   productFamilyInput.value = v
-  orderStore.setFilter({ productFamilyCode: v })
-  void orderStore.loadList(true)
+  void orderStore.applyFilter({ productFamilyCode: v })
 }
 
 async function onVersionChange(v: number): Promise<void> {
@@ -485,7 +489,7 @@ const currentVersionLabel = computed(() => {
     v.planHorizonStart && v.planHorizonEnd
       ? ` ｜ 时间窗 ${formatUtcMonthDay(v.planHorizonStart)} ~ ${formatUtcMonthDay(v.planHorizonEnd)}`
       : ''
-  return `${v.domainKey ?? ''} ｜ 版本 #${v.id}${s}`
+  return `${domainStore.label(v.domainKey)} ｜ 版本 #${v.id}${s}`
 })
 
 /**
@@ -527,28 +531,57 @@ const allUnscheduledNotice = computed<string | null>(() => {
   return null
 })
 
-// ===== KPI（全部取 /api/order-query/summary 的服务端聚合）=====
+// ===== 交付 KPI（取 /api/order-query/delivery-kpi，5号位 2026-11-17 B2）=====
 //
-// ⚠️ 2026-11-02 口径全换（5号位 r14009 答复函 §二）：三桶改为**计划派生**，
-//   与列表 `riskLevel` 同源（冻结 `01 §64`）⇒ 格子与 KPI 不再各说各话。
-//   三桶互斥且穷尽：按期 + 延迟 + 未排产 = 总数（可作探针断言）。
-//   旧「未延迟」卡文案已换「按期」（同一判定，但「按期」不与 ERP 维度混读）。
+// ⚠️ 口径换源（5号位 11-17 复函 §五）：
+//   交付 KPI 唯一口径 = 本端点（判定式与列表 `riskLevel` 逐字同文，且**随筛选走**）；
+//   旧 summary 三桶（按期/延迟/未排产）**不再当 KPI 展示** —— 两者并排读会自相矛盾。
+//   summary 只留两个非 KPI 用途：整版订单总数、整版「都还没排产」提示。
 //
-// ⚠️ 2026-11-12 补一句口径说明：summary 端点**只收 planVersionId**（不收筛选条件）
-//   ⇒ 这四个数字恒为「该版本全部订单」，不随下面的筛选变。不写清楚用户会误以为 KPI 跟着筛选走。
+// 三张卡 = 总计 / 生产指示 / 销售订单（后端 GROUPING SETS 单扫出来的分区行）。
+// ⚠️ 「日期/计划不可判定」**单列显示**，不并进按期或延期任一侧（未判定不占率）。
+// ⚠️ 目标达成率：`targetPercent` 键缺 ⇒ **不渲染**（不显 0、不显「未提供」）。
+// ⚠️ FG/WIP 分区：`fgWipDimensionAvailable=false` ⇒ **不出该卡**（不是出空卡）。
 const totalCount = computed(() => summary.value?.totalCount ?? null)
-const kpis = computed(() => {
-  const s = summary.value
-  if (!s) return []
-  return [
-    { key: 'total', label: '订单总数', value: s.totalCount, color: '#334155' },
-    { key: 'ontime', label: '按期', value: s.onTimeCount, color: RISK_COLORS.ON_TRACK },
-    { key: 'delayed', label: '延迟', value: s.delayedCount, color: RISK_COLORS.DELAYED },
-    { key: 'unscheduled', label: '未排产', value: s.unscheduledCount, color: RISK_MISSING_COLOR }
+
+/** 分区行 → 卡片（总计行 `orderType` 缺键 ⇒ 用 `== null` 认，勿用 `=== ''`） */
+const kpiCards = computed(() => {
+  const rows = deliveryKpi.value?.rows ?? []
+  const total = rows.find((r) => r.orderType == null)
+  const pi = rows.find((r) => r.orderType === 'PRODUCTION_INSTRUCTION')
+  const so = rows.find((r) => r.orderType === 'SALES_ORDER')
+  const defs = [
+    { key: 'total', label: '总计', color: '#334155', row: total },
+    { key: 'pi', label: '生产指示', color: RISK_COLORS.ON_TRACK, row: pi },
+    { key: 'so', label: '销售订单', color: RISK_COLORS.DELAYED, row: so }
   ]
+  return defs.filter((d) => d.row).map((d) => ({ ...d, row: d.row! }))
 })
-const kpiRatio = (v: number): number =>
-  totalCount.value && totalCount.value > 0 ? Math.round((v / totalCount.value) * 100) : 0
+
+/** 率：后端给的是 %（分母为 0 ⇒ null）。**null 不显 0%**，显「—」。 */
+function kpiRateText(v: number | null | undefined): string {
+  if (v == null) return '—'
+  return `${v}%`
+}
+
+/** 「口径来源」角标文案（后端切 formal 后自动改，前端不改代码） */
+const kpiSourceText = computed(() => {
+  const src = deliveryKpi.value?.plannedCompletionSource
+  if (!src) return ''
+  if (src === 'readmodel_task_max') return '口径来源：按本版任务的最晚完成时间算（读模型）'
+  if (src === 'formal') return '口径来源：按正式归集的完成时间算'
+  return `口径来源：${src}`
+})
+
+/** KPI 区的空态说明（版本不存在 / 越权 / 当前筛选无订单） */
+const kpiEmptyText = computed<string | null>(() => {
+  const k = deliveryKpi.value
+  if (!k) return null
+  if (k.versionExists === false) return '这一版不存在或已被清理，没有交付指标'
+  if (k.scopeDenied) return '没有这一版的查看权限，看不到交付指标'
+  if (!kpiCards.value.length) return '当前筛选下没有订单，没有交付指标'
+  return null
+})
 
 // ===== 页码 =====
 function onPageChange(p: number): void {
@@ -586,7 +619,31 @@ function onRowClick(row: OrderListItemDto, column?: { type?: string }): void {
 
 // ===== §10A.1 已有订单提前（EXISTING_ORDER_ADVANCE）=====
 const router = useRouter()
+const route = useRoute()
 const canPlanRun = computed(() => apsAuth.has('aps.plan.run'))
+
+/**
+ * 当前版本是否只读（不可写）
+ *
+ * §0.2 ⑤「历史 PV 一律只读」：已被顶替 / 排产失败 / 还没发令 / 计算中 的版本，
+ * 写入口（「已有订单提前」）一律关掉并说清原因 —— 否则用户会在这类版本上
+ * 对着一份不会变的排产结果做推进动作，写进去也没有意义。
+ */
+const versionReadOnlyReason = computed<string | null>(() => {
+  const s = orderStore.currentVersion?.status
+  switch (s) {
+    case 'ARCHIVED':
+      return '这一版已被新版本顶替，是历史版本，只读，不能推进订单，换一版看'
+    case 'FAILED':
+      return '这一版排产失败，只读，不能推进订单，换一版看'
+    case 'BUILDING':
+      return '这一版还没发令，只读，不能推进订单，换一版看'
+    case 'Computing':
+      return '这一版还在计算中，只读，不能推进订单，换一版看'
+    default:
+      return null
+  }
+})
 
 const advanceVisible = ref(false)
 const advanceSubmitting = ref(false)
@@ -672,17 +729,23 @@ function fmtDue(due: string): string {
 }
 const isOverdue = (due: string): boolean => new Date(`${due}Z`).getTime() < Date.now()
 
-/** 表头计数：当前筛选命中多少 + 该版本一共多少（两个口径别混） */
+/**
+ * 表头计数：三个口径分列，别混成一个数（§0.2 ③）
+ *  - 服务端命中数＝当前筛选下后端返回的 total
+ *  - 已加载数＝本页实际渲染的条数
+ *  - 该版本总单数＝整版订单总数（另一套口径）
+ */
 const listCountLabel = computed(() => {
   const total = totalCount.value
   const filtered = listTotal.value
-  return total === null
-    ? `当前筛选 ${filtered} 条`
-    : `当前筛选 ${filtered} 条 · 该版本共 ${total} 单`
+  const filteredText = filtered === null ? '未提供' : String(filtered)
+  const base = `服务端命中 ${filteredText} 条 · 已显示 ${list.value.length} 条`
+  return total === null ? base : `${base} · 该版本共 ${total} 单`
 })
 
-/** 空态文案：区分「这版没订单」和「筛选太窄」 */
+/** 空态文案：区分「这版没订单」「筛选太窄」「没取到」三种 */
 const emptyText = computed(() => {
+  if (listTotal.value === null) return '订单列表没取到，先看上面的错误提示'
   if (totalCount.value === 0) return '这一版没有订单'
   return '当前筛选条件下没有订单，换个交期区间或放宽条件再看看'
 })
@@ -691,6 +754,60 @@ const detailOrder = computed(() => currentDetail.value?.order ?? null)
 const detailPegging = computed(() => currentDetail.value?.pegging ?? [])
 const detailTasks = computed(() => currentDetail.value?.tasks ?? [])
 
+// ===== P02 行展开 / P03 深链（同一端点、同一组件）=====
+/**
+ * 订单结构（P02 行展开）＋ 深链定位（P03）
+ *
+ * 5号位 2026-11-17 复函B3/B4：`GET /api/order-query/{orderId}/tree` 一个端点两处用，
+ * **不建第二套**（同一树、同一数据、同一正式 PV）⇒ 行展开与深链共用 `OrderTreePanel`。
+ *
+ * 深链参数留在地址栏（计划版本＋订单＋节点键），刷新/分享都能回到同一个位置；
+ * 只改 query 不改路由记录 ⇒ 组件不重建、正在跑的逻辑不被打断。
+ */
+const treeDrawerVisible = ref(false)
+const treeOrderId = ref<number | null>(null)
+const treePlanVersionId = ref<number | null>(null)
+const treeFocusTaskId = ref<number | null>(null)
+const treeFocusMaterialId = ref<number | null>(null)
+
+/** 地址栏参数 → 数字（非法/缺省 ⇒ null，不当 0） */
+function numParam(v: unknown): number | null {
+  const raw = Array.isArray(v) ? v[0] : v
+  const n = Number(raw)
+  return Number.isFinite(n) && n > 0 ? n : null
+}
+
+/** 读地址栏上的深链参数 → 打开订单结构面板 */
+function applyDeepLink(): void {
+  const orderId = numParam(route.query.orderId)
+  if (!orderId) return
+  treeOrderId.value = orderId
+  treePlanVersionId.value = numParam(route.query.planVersionId) ?? planVersionId.value
+  treeFocusTaskId.value = numParam(route.query.taskId)
+  treeFocusMaterialId.value = numParam(route.query.materialId)
+  treeDrawerVisible.value = true
+}
+
+/** 节点表点「深链」⇒ 参数写进地址栏（不跳页、不重建组件） */
+function onTreeDeepLink(payload: { orderId: number; taskId: number; materialId: number }): void {
+  void router.replace({
+    path: route.path,
+    query: {
+      ...route.query,
+      planVersionId: String(treePlanVersionId.value ?? planVersionId.value ?? ''),
+      orderId: String(payload.orderId),
+      taskId: String(payload.taskId),
+      materialId: String(payload.materialId)
+    }
+  })
+}
+
+// 地址栏参数变化（含本页自己写入的深链）⇒ 落到面板上
+watch(
+  () => [route.query.orderId, route.query.taskId, route.query.materialId],
+  () => applyDeepLink()
+)
+
 // ===== 加载入口 =====
 onMounted(async () => {
   // 排程域字典：**「已有订单提前」候选弹窗**要用域下拉，而全项目只有异常解释页加载过
@@ -698,10 +815,18 @@ onMounted(async () => {
   if (!domainStore.loadedAt) void domainStore.load()
   void loadMasterData()
   await orderStore.loadVersions()
-  // 默认交期区间随版本一起落上（否则第一屏是 2016 年的历史订单）；
-  // 区间先落进 store，再统一刷列表 + KPI，避免连打两次列表。
-  setRangeFilter(activeRange.value)
-  await orderStore.refresh(true)
+  // P03 深链：地址栏带了计划版本 ⇒ 先切到那一版（订单树按 PV 隔离，换版必须重取）
+  const pvFromUrl = numParam(route.query.planVersionId)
+  if (pvFromUrl && pvFromUrl !== planVersionId.value) {
+    await orderStore.setPlanVersion(pvFromUrl)
+    await applyRange(activeRange.value)
+  } else {
+    // 默认交期区间随版本一起落上（否则第一屏是 2016 年的历史订单）；
+    // 区间先落进 store，再统一刷列表 + KPI，避免连打两次列表。
+    setRangeFilter(activeRange.value)
+    await orderStore.refresh(true)
+  }
+  applyDeepLink()
 })
 </script>
 
@@ -724,7 +849,7 @@ onMounted(async () => {
               {{ PLAN_VERSION_STATUS_LABELS[v.status] ?? v.status }}
             </ElTag>
             <span class="muted version-meta">
-              {{ v.domainKey }} · {{ formatUtcMonthDay(v.planHorizonStart) }} ~
+              {{ domainStore.label(v.domainKey) }} · {{ formatUtcMonthDay(v.planHorizonStart) }} ~
               {{ formatUtcMonthDay(v.planHorizonEnd) }}
             </span>
           </div>
@@ -737,8 +862,14 @@ onMounted(async () => {
       <ElButton
         type="warning"
         plain
-        :disabled="!canPlanRun || selectedOrders.length === 0"
-        :title="canPlanRun ? '已有订单提前 — 先在列表勾选订单' : '当前账号无排程执行权限'"
+        :disabled="!canPlanRun || !!versionReadOnlyReason || selectedOrders.length === 0"
+        :title="
+          versionReadOnlyReason
+            ? versionReadOnlyReason
+            : canPlanRun
+              ? '已有订单提前 — 先在列表勾选订单'
+              : '当前账号无排程执行权限'
+        "
         @click="openAdvanceDialog"
       >
         <Icon icon="vi-mdi:calendar-arrow-right" />
@@ -771,20 +902,46 @@ onMounted(async () => {
       :title="allUnscheduledNotice"
     />
 
-    <!-- ===== KPI（取 /summary 服务端聚合；取不到整块空态）===== -->
-    <!-- 2026-11-12 用户反馈：原先四张大卡片占掉大半屏首屏 ⇒ 改一行紧凑指标条，
-         口径说明也并到同一行右端（不必为说明单占一行）。 -->
-    <div v-if="kpis.length" class="kpi-row">
-      <div v-for="k in kpis" :key="k.key" class="kpi-item">
-        <span class="kpi-bar" :style="{ background: k.color }"></span>
-        <span class="kpi-label">{{ k.label }}</span>
-        <span class="kpi-value" :style="{ color: k.color }">{{ k.value }}</span>
-        <span class="kpi-ratio">{{ kpiRatio(k.value) }}%</span>
+    <!-- ===== 交付 KPI（取 /api/order-query/delivery-kpi；5号位 2026-11-17 B2）===== -->
+    <!-- 2026-11-12 用户反馈：原先四张大卡片占掉大半屏首屏 ⇒ 保持一行紧凑指标条，
+         口径说明并到同一行右端（不必为说明单占一行）。
+         2026-11-17：四卡（总数/按期/延迟/未排产）换成三张**分区卡**（总计/生产指示/销售订单），
+         每个分区里「日期/计划不可判定」单列，率由后端给，前端不自算。 -->
+    <div v-if="kpiCards.length" class="kpi-row">
+      <div v-for="c in kpiCards" :key="c.key" class="kpi-card">
+        <span class="kpi-bar" :style="{ background: c.color }"></span>
+        <span class="kpi-label">{{ c.label }}</span>
+        <span class="kpi-total">共 {{ c.row.totalOrders }} 单</span>
+        <span class="kpi-metric" :style="{ color: RISK_COLORS.ON_TRACK }">
+          按期 {{ c.row.onTimeOrders }}<em>（{{ kpiRateText(c.row.onTimeRatePct) }}）</em>
+        </span>
+        <span class="kpi-metric" :style="{ color: RISK_COLORS.DELAYED }">
+          延期 {{ c.row.lateOrders }}<em>（{{ kpiRateText(c.row.lateRatePct) }}）</em>
+        </span>
+        <span class="kpi-metric" :style="{ color: RISK_MISSING_COLOR }">
+          日期/计划不可判定 {{ c.row.undeterminedOrders }}
+        </span>
       </div>
       <span class="kpi-caption">
-        这四个数字是「该版本全部订单」的结果（按计划算的），不随下面的筛选变化。
+        {{ kpiSourceText }}·交付指标按<b>当前筛选</b>统计；
+        {{ deliveryKpi?.caliber }}
       </span>
     </div>
+    <ElAlert
+      v-else-if="deliveryKpiError"
+      type="error"
+      :closable="false"
+      show-icon
+      :title="`交付指标加载失败：${deliveryKpiError}`"
+    />
+    <div v-else-if="deliveryKpiLoading" class="kpi-loading">交付指标加载中…</div>
+    <ElAlert
+      v-else-if="kpiEmptyText"
+      type="info"
+      :closable="false"
+      show-icon
+      :title="kpiEmptyText"
+    />
 
     <!-- ===== 过滤栏 ===== -->
     <ElCard class="filter-bar">
@@ -921,7 +1078,32 @@ onMounted(async () => {
         @row-click="onRowClick"
         @selection-change="onOrderSelectionChange"
       >
-        <ElTableColumn type="selection" width="44" :selectable="() => canPlanRun" />
+        <ElTableColumn
+          type="selection"
+          width="44"
+          :selectable="() => canPlanRun && !versionReadOnlyReason"
+        />
+        <!-- ===== P02 行展开：订单结构（B3，5号位 2026-11-17 复函）=====
+             与 P03 深链共用同一端点/同一组件（OrderTreePanel），不建第二套。 -->
+        <ElTableColumn type="expand" width="40">
+          <template #default="{ row }">
+            <div class="row-expand">
+              <OrderTreePanel
+                v-if="planVersionId"
+                :order-id="row.id"
+                :plan-version-id="planVersionId"
+                @deep-link="onTreeDeepLink"
+              />
+              <ElAlert
+                v-else
+                type="info"
+                :closable="false"
+                show-icon
+                title="先选择计划版本，才能看这单的物料承接结构"
+              />
+            </div>
+          </template>
+        </ElTableColumn>
         <!-- 订单号 + 生产指示号（生产指示号并进订单号下方，省一列；原来 14 列把右边的操作列挤到横向滚动外） -->
         <ElTableColumn prop="orderNo" label="订单号" min-width="150" show-overflow-tooltip>
           <template #default="{ row }">
@@ -1016,9 +1198,9 @@ onMounted(async () => {
         <ElPagination
           v-model:current-page="pageIndex"
           v-model:page-size="pageSize"
-          :total="listTotal"
+          :total="listTotal ?? 0"
           :page-sizes="[20, 50, 100, 200]"
-          layout="total, sizes, prev, pager, next, jumper"
+          layout="sizes, prev, pager, next, jumper"
           background
           @current-change="onPageChange"
           @size-change="onSizeChange"
@@ -1053,7 +1235,7 @@ onMounted(async () => {
               {{ detailOrder.customerName ?? '—' }}
             </ElDescriptionsItem>
             <ElDescriptionsItem label="客户类别">
-              {{ detailOrder.customerSegment ?? '—' }}
+              {{ customerSegmentLabel(detailOrder.customerSegment) }}
             </ElDescriptionsItem>
             <ElDescriptionsItem label="工厂">
               {{ factoryLabel(detailOrder.factoryCode) }}
@@ -1062,7 +1244,7 @@ onMounted(async () => {
               {{ familyLabel(detailOrder.productFamilyCode) }}
             </ElDescriptionsItem>
             <ElDescriptionsItem label="排程域">
-              {{ detailOrder.domainKey ?? '—' }}
+              {{ domainStore.label(detailOrder.domainKey) }}
             </ElDescriptionsItem>
             <ElDescriptionsItem label="订单数量">
               {{ detailOrder.quantity }} {{ detailOrder.uom }}
@@ -1106,7 +1288,7 @@ onMounted(async () => {
               >
             </ElDescriptionsItem>
             <ElDescriptionsItem label="订单类型">
-              {{ detailOrder.orderType }}
+              {{ orderTypeLabel(detailOrder.orderType) }}
             </ElDescriptionsItem>
             <ElDescriptionsItem label="BOM 版本">
               {{ detailOrder.bomno ?? '—' }}
@@ -1218,6 +1400,25 @@ onMounted(async () => {
       <ElEmpty v-else :description="detailError || '请选择订单查看详情'" />
     </ElDrawer>
 
+    <!-- ===== P03 深链：订单结构抽屉（与 P02 行展开同一组件、同一端点）===== -->
+    <ElDrawer
+      v-model="treeDrawerVisible"
+      size="72%"
+      direction="rtl"
+      title="订单结构"
+      :close-on-click-modal="false"
+    >
+      <OrderTreePanel
+        v-if="treeOrderId && treePlanVersionId"
+        :order-id="treeOrderId"
+        :plan-version-id="treePlanVersionId"
+        :focus-task-id="treeFocusTaskId"
+        :focus-material-id="treeFocusMaterialId"
+        @deep-link="onTreeDeepLink"
+      />
+      <ElEmpty v-else description="地址栏里缺少订单号或计划版本，无法打开订单结构" />
+    </ElDrawer>
+
     <!-- ===== §10A.1 已有订单提前 Dialog（EXISTING_ORDER_ADVANCE）===== -->
     <OrderAdvanceDialog
       :visible="advanceVisible"
@@ -1310,15 +1511,34 @@ onMounted(async () => {
   border-radius: 8px;
 }
 
-.kpi-item {
+/* 交付 KPI 分区卡（2026-11-17 B2）：三张卡并排，每张卡一行读完 */
+.kpi-card {
   display: flex;
   align-items: center;
-  gap: 6px;
-  padding: 0 16px;
+  gap: 10px;
+  padding: 0 14px;
+  white-space: nowrap;
   border-right: 1px solid #e2e8f0;
 
   &:last-of-type {
     border-right: none;
+  }
+}
+
+.kpi-total {
+  font-size: 13px;
+  font-weight: 600;
+  color: #334155;
+}
+
+.kpi-metric {
+  font-size: 12px;
+  color: #475569;
+
+  em {
+    font-style: normal;
+    font-size: 11px;
+    opacity: 0.75;
   }
 }
 
@@ -1333,20 +1553,17 @@ onMounted(async () => {
   color: #64748b;
 }
 
-.kpi-value {
-  font-size: 17px;
-  font-weight: 600;
-  line-height: 1.2;
-}
-
-.kpi-ratio {
-  font-size: 11px;
+/* 口径说明独占一行（caliber 原文较长，挤在行尾会被裁） */
+.kpi-caption {
+  flex: 1 1 100%;
+  padding-top: 2px;
+  font-size: 12px;
+  line-height: 1.5;
   color: #94a3b8;
 }
 
-.kpi-caption {
-  margin-left: auto;
-  padding-left: 16px;
+.kpi-loading {
+  padding: 6px 14px;
   font-size: 12px;
   color: #94a3b8;
 }
@@ -1433,6 +1650,11 @@ onMounted(async () => {
   display: flex;
   margin-top: 12px;
   justify-content: flex-end;
+}
+
+.row-expand {
+  padding: 10px 12px 12px 40px;
+  background: #fbfdff;
 }
 
 .overdue {

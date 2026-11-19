@@ -34,7 +34,7 @@ public class MesDispatchDrainService : IMesDispatchDrainService
 
     /// <inheritdoc />
     public async Task<MesDispatchDrainResult> DrainAsync(
-        int scheduleRunId, int maxGroups = 50, CancellationToken ct = default)
+        int scheduleRunId, int maxGroups = 50, string? workOrderType = null, CancellationToken ct = default)
     {
         if (scheduleRunId <= 0)
             throw new ArgumentOutOfRangeException(nameof(scheduleRunId), scheduleRunId,
@@ -68,7 +68,9 @@ public class MesDispatchDrainService : IMesDispatchDrainService
                      MAX(x.PlannedEndTime)            AS PlannedEndTime,
                      -- 2026-11-12 会签（5号位 §四）：只加这两列；组内应同值，取 MIN 兜底
                      MIN(NULLIF(x.InstructionType, N'')) AS InstructionType,
-                     MIN(NULLIF(x.WorkOrderType, N''))   AS WorkOrderType
+                     MIN(NULLIF(x.WorkOrderType, N''))   AS WorkOrderType,
+                     -- 2026-11-16 5号位 会签（Command 第三列）：组内应同部门，MIN 兜底；空串归一 NULL
+                     MIN(NULLIF(x.ProductionDepartmentCode, N'')) AS ProductionDepartmentCode
               FROM   (SELECT d.*,
                              ROW_NUMBER() OVER (PARTITION BY d.SourcePlanVersionId,
                                                               d.ProductionInstructionNo,
@@ -80,10 +82,12 @@ public class MesDispatchDrainService : IMesDispatchDrainService
                       WHERE  d.DispatchStatus = @Pending
                         AND  d.SourcePlanVersionId IS NOT NULL
                         AND  pv.SourceScheduleRunId = @Run
-                        AND  ISNULL(d.ProductionInstructionNo, N'') <> '') x
+                        AND  ISNULL(d.ProductionInstructionNo, N'') <> ''
+                        -- 2026-11-17 O77：按 MES 通道过滤；仅允许 ASSEMBLY/MACHINING 的 Job 取自己的组
+                        AND  (@WorkOrderType IS NULL OR d.WorkOrderType = @WorkOrderType)) x
               GROUP BY x.ProductionInstructionNo, x.StageCode, x.SourcePlanVersionId
               ORDER BY MIN(x.Id)",
-            new { Max = maxGroups, Pending = StatusPending, Run = scheduleRunId },
+            new { Max = maxGroups, Pending = StatusPending, Run = scheduleRunId, WorkOrderType = workOrderType },
             db: DatabaseId.APS, commandTimeout: 300)).ToList();
 
         if (groups.Count == 0)
@@ -177,7 +181,7 @@ public class MesDispatchDrainService : IMesDispatchDrainService
                         factoryCode,
                         string.IsNullOrWhiteSpace(g.ResourceCode) ? null : g.ResourceCode,
                         g.PlannedStartTime ?? DateTime.Now, g.PlannedEndTime ?? DateTime.Now, taskIds,
-                        g.InstructionType, g.WorkOrderType);
+                        g.InstructionType, g.WorkOrderType, g.ProductionDepartmentCode);
 
                     result = await adapter.CreateWorkOrderAsync(command, ct);
                 }
@@ -286,6 +290,8 @@ public class MesDispatchDrainService : IMesDispatchDrainService
         /// <summary>2026-11-12 会签（5号位 §四）：`InstructionType`／`WorkOrderType` 两列。</summary>
         public string? InstructionType { get; set; }
         public string? WorkOrderType { get; set; }
+        /// <summary>2026-11-16 5号位 会签：MES 组装端口 Holon 部门码来源。</summary>
+        public string? ProductionDepartmentCode { get; set; }
     }
 
     /// <summary>`Factory.Id → Code` 反查行（2026-11-12，`O77`：附录 A 的 `factoryCode` 必填，不能再送空串）。</summary>

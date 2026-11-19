@@ -491,7 +491,8 @@ public class ExecutionBatchDraftTests
 
     /// <summary>
     /// 数量**逐分不丢**：`Σ NetOutputQty = 需求 NetOutputQty`、`Σ PlannedProcessQty = 需求 PlannedProcessQty`。
-    /// 构造刻意用除不尽的 10 / 3（前两批向下取整 3.3333，末批取余 3.3334）。
+    /// 构造刻意用除不尽的 10 / 3：按 0号位 v1.2 §二.3（新增可执行批净量必须整数）⇒ 切为 `3 / 3 / 4`，
+    /// 不再是 `3.3333 / 3.3333 / 3.3334`（后者只可用于算术闭合，不得作为可执行批）。
     /// </summary>
     [Fact]
     public void 数量守恒_逐分不丢_Σ等于需求数量()
@@ -506,10 +507,10 @@ public class ExecutionBatchDraftTests
         Assert.Equal(10m, batches.Sum(b => b.NetOutputQty));
         Assert.Equal(7m, batches.Sum(b => b.PlannedProcessQty));
 
-        // 末批取余数 ⇒ 各批之和逐分等于需求（decimal 精确，无浮点误差）
-        Assert.Equal(3.3333m, batches[0].NetOutputQty);
-        Assert.Equal(3.3333m, batches[1].NetOutputQty);
-        Assert.Equal(3.3334m, batches[2].NetOutputQty);
+        // 整数切分（0号位 v1.2 §二.3）：10 / 3 批 ⇒ 余数 1 逐批 +1 ⇒ 4 / 3 / 3；之和仍逐分等于需求。
+        Assert.Equal(4m, batches[0].NetOutputQty);
+        Assert.Equal(3m, batches[1].NetOutputQty);
+        Assert.Equal(3m, batches[2].NetOutputQty);
     }
 
     // ═══════════════════════════════════════════════════════════════════

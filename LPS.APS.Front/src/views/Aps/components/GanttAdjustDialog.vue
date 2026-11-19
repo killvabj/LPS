@@ -29,6 +29,7 @@ import {
 } from 'element-plus'
 import { TRIGGER_RUN_MATRIX, validateScopeDraft } from '@/api/aps-v1'
 import type { BusinessEntrySubmission, DomainKey, ScopeDraft } from '@/api/aps-v1'
+import { useDomainStore } from '@/store/modules/aps/domain'
 
 interface GanttAdjustTask {
   taskId: number
@@ -66,6 +67,8 @@ const spec = TRIGGER_RUN_MATRIX[TRIGGER]
 const ISO_FMT = 'YYYY-MM-DDTHH:mm:ss[Z]'
 
 const domainKey = ref<DomainKey | undefined>(undefined)
+/** 域中文名（域字典名称表含已停用域；查不到时回退裸 key） */
+const domainStore = useDomainStore()
 const rows = ref<Row[]>([])
 const selected = ref<Row[]>([])
 const errors = ref<string[]>([])
@@ -178,7 +181,7 @@ function onSubmit(): void {
     <ElForm label-width="120px" label-position="right">
       <ElFormItem label="排程域" required>
         <ElSelect v-model="domainKey" placeholder="选择单计划域" style="width: 260px">
-          <ElOption v-for="d in domainOptions" :key="d" :label="d" :value="d" />
+          <ElOption v-for="d in domainOptions" :key="d" :label="domainStore.label(d)" :value="d" />
         </ElSelect>
         <span class="field-hint">一次只处理一个排程域；切换排程域会清空已选任务</span>
       </ElFormItem>

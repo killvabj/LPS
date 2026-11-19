@@ -68,6 +68,9 @@ public class AllocationShareToleranceTests
         NetOutputQty = netQty,
         PlannedProcessQty = netQty,
         DemandSequence = (int)alloc,
+        // 2026-11-19：本文件测的是**十进制表示残渣的份额容差**（算术守恒类），不对「新增可执行批」主张执行资格；
+        //   按 0号位 v1.2 §二.3 的豁免项（冻结/A/B 事实）挂起整数门禁，断言与数量一字不动。
+        IsContinuation = true,
         StartStageCode = "S1",
         StartOperationCode = "OP1",
     };

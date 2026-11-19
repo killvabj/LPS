@@ -143,6 +143,86 @@ public class OrderQueryController : ControllerBase
     }
 
     /// <summary>
+    /// 订单完整树（**B3/B4，11-17**）：`GET /api/order-query/{orderId}/tree?planVersionId=…`——
+    /// P02 行展开与 P03 独立深链**共用本端点**（同一树同一数据同一 PV，v0.2 §5 禁第二套）。
+    /// 三段：①身份头（域/PV 状态/cutoff/交期）；②**结构**=nodes+edges（Pegging 图上游闭包，深度≤10 路径防环；
+    /// 种子=Task.OrderId 直挂 ∪ share.RootOrderId 两路；节点带 InSeed/OwnRootOrder/MinDepth，前端按 parent→child 组树）；
+    /// ③**数量账**=demands（PSA 行：DemandQty/AllocatedQty/Gap＋供给段＋Stage 链三列＋RemainingStagePathJson 原文）。
+    /// 截断三态独立：<c>nodesTruncated/edgesTruncated/demandsTruncated</c>——页面按"已加载 N/截断"如实标注（v0.2 §P02.2）。
+    /// 边界：Q/S/U 内制账**不在本响应**（走 <c>GET /api/explanation/demand-reconciliation</c>，两本账禁互加）；
+    /// <c>stageTimingNote</c> 恒"未提供"（Q03 待 2号位，禁前端造节点）；NeedBy 列 PSA 不存在=如实缺位。
+    /// 越权/不存在分态：<c>scopeDenied=true</c>（域外/工厂外，403 语义走信封位不吞 404）vs <c>found=false</c>。
+    /// </summary>
+    [HttpGet("{orderId:long}/tree")]
+    public async Task<ApiResponse<LPS.APS.Core.Dto.OrderTreeResultDto>> GetOrderTree(
+        long orderId,
+        [FromQuery] int planVersionId,
+        CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            if (planVersionId <= 0) throw new ArgumentException("planVersionId 必填");
+            var scope = await _dataScopeService.ResolveScopeAsync(GetCurrentUserId(), cancellationToken);
+            var result = await _service.GetOrderTreeAsync(
+                planVersionId, orderId,
+                scope.IsGlobal ? null : scope.GetValues(DataScopeTypes.Domain),
+                scope.IsGlobal ? null : scope.GetValues(DataScopeTypes.Factory),
+                cancellationToken);
+            return ApiResponse<LPS.APS.Core.Dto.OrderTreeResultDto>.Success(result);
+        }
+        catch (ArgumentException ex)
+        {
+            throw;   // GlobalExceptionFilter ⇒ 真 400（信封 200 假 400 形态禁用，10-16 R4 教训）
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to get order tree");
+            return ApiResponse<LPS.APS.Core.Dto.OrderTreeResultDto>.Fail(500, $"Query failed: {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// P09 选单池（**C2，11-18**）：`GET /api/order-query/pool?planVersionId=&amp;participation=&amp;keyword=&amp;orderType=&amp;pageIndex=&amp;pageSize=`——
+    /// 判据=v0.2 §P09 原文「当前真实 FULL/ACTIVE＋合法根订单参与关系」的具体化：<b>participation</b>=
+    /// `all`（缺省）/`scheduled`（在当前 ACTIVE PV 装载集=老订单，场景5/6 候选）/`fresh`（在 Order_Canonical、不在 PV=新订单，场景1/2 候选）。
+    /// **禁 CreatedAt/单号前缀猜新老**（v0.2 点名禁令）——本端点即服务端可证判据，前端不再自算。
+    /// 新单归属估算链=物料→族→域（FACTORY_FAMILY 域叠厂码；999473 实测 PV 载体 10,247 行 100% 同族反证）；
+    /// `freshScopeBasis` 位常驻（Q10 契约化后更新）。行含 `participation/hasPlanningTasks/scheduledTime`
+    /// （装载时刻≠承诺/首次关注时刻，D05-08 注记）；新单行 `orderId=null`（身份=OrderNo，canonical 严格一行/单号 D05-12）。
+    /// PV 非 ACTIVE⇒注记位 `noActiveNote`（选单以 ACTIVE 为参照）；域越权=`scopeDenied`。场景10 整域重排不走选单（本端点与之无关）。
+    /// </summary>
+    [HttpGet("pool")]
+    public async Task<ApiResponse<LPS.APS.Core.Dto.OrderPoolResultDto>> GetOrderPool(
+        [FromQuery] int planVersionId,
+        [FromQuery] string? participation = null,
+        [FromQuery] string? keyword = null,
+        [FromQuery] string? orderType = null,
+        [FromQuery] int pageIndex = 1,
+        [FromQuery] int pageSize = 50,
+        CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            if (planVersionId <= 0) throw new ArgumentException("planVersionId 必填");
+            var scope = await _dataScopeService.ResolveScopeAsync(GetCurrentUserId(), cancellationToken);
+            var result = await _service.GetOrderPoolAsync(
+                planVersionId, participation, keyword, orderType, pageIndex, pageSize,
+                scope.IsGlobal ? null : scope.GetValues(DataScopeTypes.Domain),
+                cancellationToken);
+            return ApiResponse<LPS.APS.Core.Dto.OrderPoolResultDto>.Success(result);
+        }
+        catch (ArgumentException ex)
+        {
+            throw;   // 真 400（同家族纪律）
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to get order pool");
+            return ApiResponse<LPS.APS.Core.Dto.OrderPoolResultDto>.Fail(500, $"Query failed: {ex.Message}");
+        }
+    }
+
+    /// <summary>
     /// 查询订单汇总 KPI（供 Order.vue 顶部；R3，11-12 4号位件：**接受与列表同名同义的全部筛选参数**，
     /// 谓词与列表类级单源 ⇒ KPI 与列表 total 同口径；**不传筛选=与旧行为逐字一致**，总览页共用不受影响）。
     /// </summary>
@@ -192,6 +272,60 @@ public class OrderQueryController : ControllerBase
         {
             _logger.LogError(ex, "Failed to get order summary");
             return ApiResponse<OrderSummaryDto>.Fail(500, $"Query failed: {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// P02 交付 KPI（**B2，11-17；0号位 Q-c 裁后读模型**）：`GET /api/order-query/delivery-kpi?planVersionId=…`——
+    /// 与列表/summary **同名同义全部筛选参数**（统计随筛选走、点卡筛回同一集合）＋同 Scope 越权校验（403 同规）。
+    /// 行=分区：总计行（orderType=null）＋ SALES_ORDER ＋ PRODUCTION_INSTRUCTION 各一（GROUPING SETS 单扫）。
+    /// **语义别混读三件事**：①判定=计划派生日期级（当天完成=按期），**不是** summary 的 ERP `DelayStatus` 桶、
+    /// 不是"实际交付准交率"；②分母=去重根订单**含未判定**（onTime＋late＋undetermined=total 恒成立）；
+    /// ③`plannedCompletionSource=readmodel_task_max`（2号位 正式列落库后切 formal）——页面须带 `caliber` 文案展示。
+    /// FG/WIP 分区当前缺源（`fgWipDimensionAvailable=false`）、目标值 `targetPercent=null`（待 3号位 合同核对）。
+    /// </summary>
+    [HttpGet("delivery-kpi")]
+    public async Task<ApiResponse<DeliveryKpiResultDto>> GetDeliveryKpi(
+        [FromQuery] int planVersionId,
+        [FromQuery] string? orderNo = null,
+        [FromQuery] string? materialCode = null,
+        [FromQuery] string? customerName = null,
+        [FromQuery] string? factoryCode = null,
+        [FromQuery] string? domainKey = null,
+        [FromQuery] string? delayStatus = null,
+        [FromQuery] string? status = null,
+        [FromQuery] string? productionInstructionNo = null,
+        [FromQuery] string? productFamilyCode = null,
+        [FromQuery] DateTime? dueDateFrom = null,
+        [FromQuery] DateTime? dueDateTo = null,
+        [FromQuery] string? riskLevel = null,
+        CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            var scope = await _dataScopeService.ResolveScopeAsync(GetCurrentUserId(), cancellationToken);
+            if (!string.IsNullOrEmpty(factoryCode) && !scope.Allows(DataScopeTypes.Factory, factoryCode))
+                return ApiResponse<DeliveryKpiResultDto>.Fail(403, "Factory 范围越界");
+            if (!string.IsNullOrEmpty(domainKey) && !scope.Allows(DataScopeTypes.Domain, domainKey))
+                return ApiResponse<DeliveryKpiResultDto>.Fail(403, "Domain 范围越界");
+
+            var result = await _service.GetDeliveryKpiAsync(
+                planVersionId, orderNo, materialCode, customerName,
+                factoryCode, domainKey, delayStatus, status,
+                productionInstructionNo, productFamilyCode, dueDateFrom, dueDateTo,
+                riskLevel, scope.GetValues(DataScopeTypes.Factory), scope.GetValues(DataScopeTypes.Domain),
+                cancellationToken);
+
+            return ApiResponse<DeliveryKpiResultDto>.Success(result);
+        }
+        catch (ArgumentException ex)
+        {
+            return ApiResponse<DeliveryKpiResultDto>.Fail(400, ex.Message);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to get delivery kpi");
+            return ApiResponse<DeliveryKpiResultDto>.Fail(500, $"Query failed: {ex.Message}");
         }
     }
 

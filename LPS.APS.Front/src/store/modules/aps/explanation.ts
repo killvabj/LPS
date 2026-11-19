@@ -84,6 +84,23 @@ export const useExplanationStore = defineStore('aps.explanation', () => {
   const bizKeyword = ref<string>('')
   const bizFactoryCode = ref<string>('')
 
+  // ===== 各版本事实条数（版本下拉里的「事实 N 条」；2026-11-17）=====
+  /**
+   * 版本 Id → 事实条数（后端 Summary 端点 `totalCount`）。
+   *
+   * ⚠️ **不能预取全量**：dev 实测 61 个版本逐个查 Summary，即使并发拉完也要 60~90s
+   *   （**零条版本也要 ~2s/个** —— 是固定成本，不是数据量成本）⇒ 页面改成
+   *   「打开版本下拉时才按需查、并发 3、查到即显示」，不拖慢首屏。
+   * ⚠️ 后端**没有批量端点**（@see ExplanationController：只有 /api/explanation、
+   *   /api/explanation/summary、/api/explanation/demand-reconciliation）⇒
+   *   真正的解法是后端加一个「多版本条数」端点；前端先用懒取顶住。
+   */
+  const versionFactCounts = ref<Record<number, number>>({})
+  /** 还没查完的版本数（版本条旁显示进度，避免用户以为页面卡住） */
+  const factCountPending = ref(0)
+  /** 查失败的版本 → 错误文案（不静默吞，也不当 0） */
+  const factCountErrors = ref<Record<number, string>>({})
+
   // ===== getters =====
 
   /**
@@ -92,10 +109,11 @@ export const useExplanationStore = defineStore('aps.explanation', () => {
    */
   const severityCounts = computed(() => {
     const d = data.value
+    // ⚠️ null = 未取到（不是 0）：§0.2 ②「NULL=未知，不得转 0」
     return {
-      ERROR: d?.errorCount ?? 0,
-      WARN: d?.warnCount ?? 0,
-      INFO: d?.infoCount ?? 0
+      ERROR: d?.errorCount ?? null,
+      WARN: d?.warnCount ?? null,
+      INFO: d?.infoCount ?? null
     }
   })
 
@@ -106,8 +124,11 @@ export const useExplanationStore = defineStore('aps.explanation', () => {
    *   而页面 KPI 百分比用它当分母、分子却是 Summary 的全量计数 ⇒ dev 上出现
    *   「错误 538% / 警告 516%」（分母 50 条已加载，分子 269/258）。
    * 现在分母改用后端总数（`totalCount`），已加载条数另由 `loadedFactsCount` 提供。
+   *
+   * ⚠️ **null = 未取到**（Summary 取数失败），**不是 0**：
+   *   §0.2 ②「NULL=未知，不得转 0」——取不到就显「未提供」，不许显「共 0 条」。
    */
-  const totalFacts = computed(() => data.value?.totalCount ?? 0)
+  const totalFacts = computed<number | null>(() => data.value?.totalCount ?? null)
 
   /** 已加载到本地的排程解释事实条数（可能小于 `totalFacts`，大版本会被上限截住） */
   const loadedFactsCount = computed(() => data.value?.scheduleExplanationFacts?.length ?? 0)
@@ -115,6 +136,7 @@ export const useExplanationStore = defineStore('aps.explanation', () => {
   /** 还有没有更多可加载（未取满总数，且未达累计加载上限） */
   const factsHasMore = computed(
     () =>
+      totalFacts.value !== null &&
       loadedFactsCount.value < totalFacts.value &&
       loadedFactsCount.value < EXPLANATION_FACT_LOAD_MAX
   )
@@ -188,6 +210,57 @@ export const useExplanationStore = defineStore('aps.explanation', () => {
 
   // ===== actions =====
 
+  /* ===== 版本事实条数：懒取队列（并发 3）=====
+   * 为什么排队而不是 Promise.all：dev 实测 61 个版本一次性并发全拉会互相拖慢
+   * （最慢的几个被拖到 30s+），页面长时间转圈；限并发 3 更稳，且查到即显示。
+   */
+  const FACT_COUNT_CONCURRENCY = 3
+  const factCountQueue: number[] = []
+  /** 已排队 + 在飞的版本 id（防重复排队） */
+  const factCountPendingIds = new Set<number>()
+  let factCountRunning = 0
+
+  async function fetchFactCount(planVersionId: number): Promise<void> {
+    try {
+      const d = await explanationApi.getByPlanVersion(planVersionId)
+      versionFactCounts.value = { ...versionFactCounts.value, [planVersionId]: d.totalCount }
+    } catch (err) {
+      factCountErrors.value = {
+        ...factCountErrors.value,
+        [planVersionId]:
+          err instanceof ApiError
+            ? `[${err.code}] ${err.message}`
+            : ((err as Error)?.message ?? '查询失败')
+      }
+    }
+  }
+
+  function pumpFactCounts(): void {
+    while (factCountRunning < FACT_COUNT_CONCURRENCY && factCountQueue.length) {
+      const id = factCountQueue.shift() as number
+      factCountRunning++
+      void fetchFactCount(id).finally(() => {
+        factCountRunning--
+        factCountPendingIds.delete(id)
+        factCountPending.value = factCountPendingIds.size
+        pumpFactCounts()
+      })
+    }
+  }
+
+  /** 按需查各版本事实条数（已查过 / 查失败的都不重复查；页面打开版本下拉时调用） */
+  function loadFactCounts(ids: number[]): void {
+    for (const id of ids) {
+      if (id in versionFactCounts.value) continue
+      if (id in factCountErrors.value) continue
+      if (factCountPendingIds.has(id)) continue
+      factCountPendingIds.add(id)
+      factCountQueue.push(id)
+    }
+    factCountPending.value = factCountPendingIds.size
+    pumpFactCounts()
+  }
+
   /**
    * 主 load：summary 每次必重 fetch；business-fact-issues 仅当未缓存时执行首查
    *  - 版本切换 / 路由重 mount：summary 重拉；biz-issues 复用缓存
@@ -199,6 +272,11 @@ export const useExplanationStore = defineStore('aps.explanation', () => {
     error.value = null
     try {
       data.value = await explanationApi.getByPlanVersion(planVersionId.value)
+      // 这次已经把该版本的权威条数拿到了 ⇒ 记进条数缓存，版本下拉里不用再查一遍
+      versionFactCounts.value = {
+        ...versionFactCounts.value,
+        [planVersionId.value]: data.value.totalCount
+      }
       // ⚠️ 后端 Summary 端点**不返** businessFactIssues*（dev 2026-11-10 实测：响应只有
       //   planVersionId / totalCount / errorCount / warnCount / infoCount / reasonCodeCounts / items
       //   共 7 个字段）⇒ **别拿它覆盖已拉到的分页数据**，否则版本一切换就把业务事实问题清空。
@@ -393,7 +471,11 @@ export const useExplanationStore = defineStore('aps.explanation', () => {
     bizKeyword,
     bizFactoryCode,
     sortedBusinessFactIssues,
+    versionFactCounts,
+    factCountPending,
+    factCountErrors,
     load,
+    loadFactCounts,
     loadMoreFacts,
     fetchBizPage,
     refreshBizIssues,

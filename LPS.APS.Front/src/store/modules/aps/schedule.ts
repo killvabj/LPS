@@ -45,8 +45,11 @@ import {
   type GanttBucketsDto,
   type GanttCursor,
   type GanttDataDto,
-  type PlanVersionSummaryDto
+  type PlanVersionSummaryDto,
+  type ResourceLoadResultDto,
+  type TaskListResultDto
 } from '@/api/aps-v1'
+import { pickDefaultVersion } from './order'
 
 /**
  * 单次请求任务条上限。
@@ -79,6 +82,40 @@ export interface GanttBucketRequest {
   resourceIds?: number[]
 }
 
+/**
+ * P12 资源负荷三率取数参数（5号位 2026-11-17 r14239；矩阵 A6/A7）
+ *
+ * ⚠️ `from` / `to` **必填**（后端缺任一 ⇒ 真 HTTP 400）—— 类型上就是必填。
+ * ⚠️ **窗口上限 31 天**（后端 `spanDays > 30` ⇒ 抛错 ⇒ 真 400）⇒ 调用方自己夹。
+ */
+export interface ResourceLoadRequest {
+  from: string
+  to: string
+  resourceIds?: number[]
+}
+
+/**
+ * P05 任务清单取数参数（5号位 2026-11-16 矩阵 A4 / r14237）
+ *
+ * ⚠️ `from` / `to` 传**与甘特体完全相同**的那一对（窗口谓词是同一件：
+ *   `PlannedEndTime >= from AND PlannedStartTime <= to`，计划时刻 NULL 的任务恒保留）
+ *   ⇒ 两个页面的行数才对得上。
+ */
+export interface TaskListRequest {
+  from?: string
+  to?: string
+  resourceIds?: number[]
+  stageCodes?: string[]
+  keyword?: string
+  status?: string
+  /** 三态：undefined=不过滤 / true=有 MES 工单号 / false=无 MES 工单号（**非**「无需 MES」分类） */
+  hasWorkOrder?: boolean
+  sortBy?: string
+  sortDir?: string
+  pageIndex?: number
+  pageSize?: number
+}
+
 export const useScheduleStore = defineStore('aps.schedule', () => {
   // ===== state =====
   const versions = ref<PlanVersionSummaryDto[]>([])
@@ -99,6 +136,42 @@ export const useScheduleStore = defineStore('aps.schedule', () => {
   const bucketsWindow = ref<GanttBucketRequest | null>(null)
   const bucketsLoading = ref(false)
   const bucketsError = ref<string | null>(null)
+  /**
+   * P12 资源负荷三率（设备 × 业务日）；5号位 2026-11-17 r14239。
+   *
+   * 与 `buckets`（负荷**量**）是**两个端点、两套口径**，不合并：
+   *  - buckets：资源 × 时间桶的负荷**量**（无分母 ⇒ 不能算率）
+   *  - resource-load：设备 × 业务日的**率**（分母 = 三级继承解析出的可用小时）
+   */
+  const resourceLoad = ref<ResourceLoadResultDto | null>(null)
+  const resourceLoadLoading = ref(false)
+  const resourceLoadError = ref<string | null>(null)
+
+  /**
+   * P05 任务清单（服务端分页；矩阵 A4 / r14237）。
+   *
+   * ⚠️ **与甘特体是两套读法，不合并**：
+   *  - 甘特体 `/gantt`：整窗**图**（游标分页，已加载数 ≤ limit）
+   *  - 任务清单 `/tasks`：**列表**（offset 分页，`total` = 服务端全量命中）
+   *   ⇒ 同一批任务的两种表达；数字不同不是 bug，是两个口径，必须各自标清。
+   */
+  const taskList = ref<TaskListResultDto | null>(null)
+  const taskListLoading = ref(false)
+  const taskListError = ref<string | null>(null)
+
+  /**
+   * **全量**版本列表（异常与原因解释页的版本下拉用；2026-11-17）。
+   *
+   * ⚠️ 与 `versions`（甘特页用，take=30）**分开存**，两个原因：
+   *   ① 语义不同：`displayedVersions` 是给甘特工具栏设计的「ACTIVE + 最近 3 条 CANDIDATE
+   *      + 最多 2 条 FAILED」三档截断；解释页要的是「把已有版本都列出来，用户自己选」
+   *      （用户 11-17 定调）⇒ 不能继承那套截断（否则失败批次里最有料的两版根本点不到）。
+   *   ② `loadVersions` 每次都会把 `currentVersionId` 重置成「第一个 ACTIVE」；
+   *      解释页进来时选中的版本（可能来自运行页入参）会被它冲掉 ⇒ 这里只读列表、不动选中态。
+   */
+  const allVersions = ref<PlanVersionSummaryDto[]>([])
+  const allVersionsLoading = ref(false)
+  const allVersionsError = ref<string | null>(null)
 
   // ===== in-flight 去重 =====
   /** 同 id 并发点击共享同一 Promise；解决 `ganttData.value` 在飞行中还是 null 导致的并发请求 */
@@ -116,6 +189,16 @@ export const useScheduleStore = defineStore('aps.schedule', () => {
   let pendingBucketsKey: string | null = null
   let pendingBucketsPromise: Promise<void> | null = null
   let loadedBucketsKey: string | null = null
+  /** P12 负荷率在飞句柄 + 单飞键（与甘特本体、负荷带各自独立） */
+  let resourceLoadCtrl: AbortController | null = null
+  let pendingResourceLoadKey: string | null = null
+  let pendingResourceLoadPromise: Promise<void> | null = null
+  let loadedResourceLoadKey: string | null = null
+  /** P05 任务清单在飞句柄 + 单飞键（与甘特本体、负荷带、负荷率各自独立） */
+  let taskListCtrl: AbortController | null = null
+  let pendingTaskListKey: string | null = null
+  let pendingTaskListPromise: Promise<void> | null = null
+  let loadedTaskListKey: string | null = null
 
   function windowKey(id: number, win?: GanttWindow | null): string {
     return win ? `${id}|${win.from}|${win.to}|${(win.resourceIds ?? []).join(',')}` : `${id}|`
@@ -123,6 +206,27 @@ export const useScheduleStore = defineStore('aps.schedule', () => {
 
   function bucketsKey(id: number, req: GanttBucketRequest, unit: GanttBucketUnit): string {
     return `${id}|${req.from}|${req.to}|${unit}|${(req.resourceIds ?? []).join(',')}`
+  }
+
+  function resourceLoadKey(id: number, req: ResourceLoadRequest): string {
+    return `${id}|${req.from}|${req.to}|${(req.resourceIds ?? []).join(',')}`
+  }
+
+  function taskListKey(id: number, req: TaskListRequest): string {
+    return [
+      id,
+      req.from ?? '',
+      req.to ?? '',
+      (req.resourceIds ?? []).join(','),
+      (req.stageCodes ?? []).join(','),
+      req.keyword ?? '',
+      req.status ?? '',
+      req.hasWorkOrder === undefined ? '' : String(req.hasWorkOrder),
+      req.sortBy ?? '',
+      req.sortDir ?? '',
+      req.pageIndex ?? 1,
+      req.pageSize ?? ''
+    ].join('|')
   }
 
   // ===== getters =====
@@ -196,6 +300,19 @@ export const useScheduleStore = defineStore('aps.schedule', () => {
    * （2号位 已统一，后端永不返旧值，「或 ComputeFailed」分支是死代码，已删）
    */
   const activeVersion = computed(() => versions.value.find((v) => v.status === 'ACTIVE') ?? null)
+  /**
+   * **域内当前生效版本**（后端 `isDefault=true`；矩阵 §0.1 锚表）。
+   *
+   * ⚠️ 每域至多一条 ⇒ 跨域账号这里会返回**多条**（dev 实测 5 条：BJ_FAMILY_FRL / FAMILY_LGJ /
+   *   TJ_FAMILY_FRL / FAMILY_WKQ / FAMILY_VALVE）；CYL 域当前无 ACTIVE（锚表勘正 11-17），
+   *   页面按「该域当前无正式计划版本」显示，**不拿 0 或失败冒充**。
+   * ⚠️ 后端没给 isDefault 的历史版本 ⇒ 兜底用 `status==='ACTIVE'`（等价语义）。
+   */
+  const activeVersions = computed<PlanVersionSummaryDto[]>(() => {
+    const flagged = versions.value.filter((v) => v.isDefault === true)
+    if (flagged.length) return flagged
+    return versions.value.filter((v) => v.status === 'ACTIVE')
+  })
   const recentComputed = computed(() =>
     versions.value.filter((v) => v.status === 'CANDIDATE').slice(0, 3)
   )
@@ -204,7 +321,7 @@ export const useScheduleStore = defineStore('aps.schedule', () => {
   )
   /**
    * 渲染列表（按业务优先级去重）：
-   *   1) ACTIVE（置顶，PMC 一眼定位"现在跑哪版"）
+   *   1) **全部域内当前生效版本**（isDefault，置顶，PMC 一眼定位"现在跑哪版"）
    *   2) 最近 3 条算完待确认（CANDIDATE）
    *   3) 失败版本（最多 2 条）
    *   4) 当前已选版本兜底（避免"选了之后按钮列表看不到"）
@@ -215,7 +332,12 @@ export const useScheduleStore = defineStore('aps.schedule', () => {
       : null
     const out: PlanVersionSummaryDto[] = []
     const seen = new Set<number>()
-    for (const v of [activeVersion.value, ...recentComputed.value, ...failedVersions.value, cur]) {
+    for (const v of [
+      ...activeVersions.value,
+      ...recentComputed.value,
+      ...failedVersions.value,
+      cur
+    ]) {
       if (v && !seen.has(v.id)) {
         out.push(v)
         seen.add(v.id)
@@ -225,18 +347,45 @@ export const useScheduleStore = defineStore('aps.schedule', () => {
   })
 
   // ===== actions =====
-  async function loadVersions(take = 30): Promise<void> {
+  /**
+   * 拉版本列表并按 **ACTIVE 锚表** 选默认版本。
+   *
+   * ⚠️ `take` 缺省 **100**（不是 30）：后端 ACTIVE 版本可能排在很后面
+   *   （dev 实测 2026-11-17：61 个版本里最新 30 个**一个 ACTIVE 都没有**，
+   *   ACTIVE 全在 31~61 位）⇒ take=30 时页面会落到 `versions[0]`＝FAILED 的测试版，
+   *   用户一进甘特页看到「当前版本没有排程结果」，像系统坏了。
+   *   后端 `take` 上限 200，take=100 已覆盖 dev 全部 61 条。
+   * ⚠️ 选版规则见 `pickDefaultVersion()`：走 `isDefault` 锚表（多域取 `activatedAt` 最新者），
+   *   **禁按 MAX(PV)/MAX(Run)**（5号位 2026-11-16 矩阵 §0.1 给 4号位的硬条款）。
+   */
+  async function loadVersions(take = 100): Promise<void> {
     loading.value = true
     error.value = null
     try {
       versions.value = await scheduleApi.getVersions(take)
-      // 默认选中第一个 ACTIVE 版本（4号位文档第 4 节）
-      const active = versions.value.find((v) => v.status === 'ACTIVE')
-      currentVersionId.value = active?.id ?? versions.value[0]?.id ?? null
+      currentVersionId.value = pickDefaultVersion(versions.value)?.id ?? null
     } catch (err) {
       handleError(err)
     } finally {
       loading.value = false
+    }
+  }
+
+  /**
+   * 拉**全量**版本列表（解释页版本下拉用；take=200 是后端上限）。
+   *
+   * ⚠️ 不碰 `currentVersionId`：选中态由调用方自己决定（解释页会按 URL 入参选版本）。
+   * ⚠️ 后端 `take` 上限 200（超出会被夹成 30）；dev 实测 61 个版本一次取全（X-Total-Count=61）。
+   */
+  async function loadAllVersions(take = 200): Promise<void> {
+    allVersionsLoading.value = true
+    allVersionsError.value = null
+    try {
+      allVersions.value = await scheduleApi.getVersions(take)
+    } catch (err) {
+      allVersionsError.value = describeError(err)
+    } finally {
+      allVersionsLoading.value = false
     }
   }
 
@@ -489,12 +638,150 @@ export const useScheduleStore = defineStore('aps.schedule', () => {
     bucketsLoading.value = false
   }
 
+  /**
+   * 取 P12 负荷率（设备 × 业务日；5号位 2026-11-17 r14239）。
+   *
+   * 与负荷带同型的纪律：同键单飞、换参中止上一请求、旧响应不回灌、可中止。
+   */
+  async function loadResourceLoad(request: ResourceLoadRequest): Promise<void> {
+    const id = currentVersionId.value
+    if (id === null) return
+    const key = resourceLoadKey(id, request)
+    if (loadedResourceLoadKey === key && !resourceLoadError.value && resourceLoad.value) return
+    if (pendingResourceLoadKey === key && pendingResourceLoadPromise)
+      return pendingResourceLoadPromise
+    if (resourceLoadCtrl && !resourceLoadCtrl.signal.aborted) resourceLoadCtrl.abort()
+    const ctrl = new AbortController()
+    resourceLoadCtrl = ctrl
+    pendingResourceLoadKey = key
+    resourceLoadLoading.value = true
+    resourceLoadError.value = null
+    const p = fetchResourceLoad(id, request, key, ctrl).finally(() => {
+      if (pendingResourceLoadKey === key) {
+        pendingResourceLoadKey = null
+        pendingResourceLoadPromise = null
+        resourceLoadLoading.value = false
+      }
+    })
+    pendingResourceLoadPromise = p
+    return p
+  }
+
+  async function fetchResourceLoad(
+    id: number,
+    request: ResourceLoadRequest,
+    key: string,
+    ctrl: AbortController
+  ): Promise<void> {
+    try {
+      const data = await scheduleApi.getResourceLoad(id, {
+        from: request.from,
+        to: request.to,
+        resourceIds: request.resourceIds,
+        signal: ctrl.signal
+      })
+      if (ctrl.signal.aborted || pendingResourceLoadKey !== key) return
+      resourceLoad.value = data
+      loadedResourceLoadKey = key
+    } catch (err) {
+      if (ctrl.signal.aborted || pendingResourceLoadKey !== key) return
+      resourceLoadError.value = describeError(err)
+    }
+  }
+
+  /** 中止在飞的负荷率请求（切窗口 / 换版本 / 离开页面） */
+  function cancelResourceLoadLoad(): void {
+    if (resourceLoadCtrl && !resourceLoadCtrl.signal.aborted) resourceLoadCtrl.abort()
+    resourceLoadCtrl = null
+    pendingResourceLoadKey = null
+    pendingResourceLoadPromise = null
+    resourceLoadLoading.value = false
+  }
+
+  /**
+   * 取 P05 任务清单（服务端分页；矩阵 A4 / r14237）。
+   *
+   * 与甘特本体、负荷带、负荷率**四条链各自独立**：同键单飞、换参中止上一请求、旧响应不回灌、可中止。
+   * ⇒ 任务清单失败不会把甘特图打空，反之亦然。
+   */
+  async function loadTaskList(request: TaskListRequest): Promise<void> {
+    const id = currentVersionId.value
+    if (id === null) return
+    const key = taskListKey(id, request)
+    if (loadedTaskListKey === key && !taskListError.value && taskList.value) return
+    if (pendingTaskListKey === key && pendingTaskListPromise) return pendingTaskListPromise
+    if (taskListCtrl && !taskListCtrl.signal.aborted) taskListCtrl.abort()
+    const ctrl = new AbortController()
+    taskListCtrl = ctrl
+    pendingTaskListKey = key
+    taskListLoading.value = true
+    taskListError.value = null
+    const p = fetchTaskList(id, request, key, ctrl).finally(() => {
+      if (pendingTaskListKey === key) {
+        pendingTaskListKey = null
+        pendingTaskListPromise = null
+        taskListLoading.value = false
+      }
+    })
+    pendingTaskListPromise = p
+    return p
+  }
+
+  async function fetchTaskList(
+    id: number,
+    request: TaskListRequest,
+    key: string,
+    ctrl: AbortController
+  ): Promise<void> {
+    try {
+      const data = await scheduleApi.getTasks(id, {
+        from: request.from,
+        to: request.to,
+        resourceIds: request.resourceIds,
+        stageCodes: request.stageCodes,
+        keyword: request.keyword,
+        status: request.status,
+        hasWorkOrder: request.hasWorkOrder,
+        sortBy: request.sortBy,
+        sortDir: request.sortDir,
+        pageIndex: request.pageIndex,
+        pageSize: request.pageSize,
+        signal: ctrl.signal
+      })
+      // 已被换参取代：丢弃这次结果，别把旧筛选盖回当前视图
+      if (ctrl.signal.aborted || pendingTaskListKey !== key) return
+      taskList.value = data
+      loadedTaskListKey = key
+    } catch (err) {
+      // 主动取消不是错误；旧请求的失败也不该冒到当前状态上
+      if (ctrl.signal.aborted || pendingTaskListKey !== key) return
+      // ⚠️ 取数失败必须把**上一版的结果**一起清掉：
+      //   不清 ⇒ 切版本后取数失败，页面拿上一个版本的行/总数冒充当前版本（拿旧数当新数）。
+      taskList.value = null
+      loadedTaskListKey = null
+      taskListError.value = describeError(err)
+    }
+  }
+
+  /** 中止在飞的任务清单请求（切窗口 / 切版本 / 离开页面时调用） */
+  function cancelTaskListLoad(): void {
+    if (taskListCtrl && !taskListCtrl.signal.aborted) taskListCtrl.abort()
+    taskListCtrl = null
+    pendingTaskListKey = null
+    pendingTaskListPromise = null
+    taskListLoading.value = false
+  }
+
   /** 离开甘特页 / 切到无关视图时调用：中止在飞请求，避免「前端放弃、后端白算」 */
   function cancelGanttLoad(): void {
     if (abortCtrl && !abortCtrl.signal.aborted) abortCtrl.abort()
     if (moreCtrl && !moreCtrl.signal.aborted) moreCtrl.abort()
     // 负荷带同属甘特页的在飞请求，一并中止（前端放弃、后端不再白算）
     cancelBucketsLoad()
+    // P12 负荷率同理
+    cancelResourceLoadLoad()
+    // P05 任务清单同理
+    cancelTaskListLoad()
     abortCtrl = null
     moreCtrl = null
     pendingVersionId = null
@@ -528,6 +815,12 @@ export const useScheduleStore = defineStore('aps.schedule', () => {
     bucketsWindow.value = null
     loadedBucketsKey = null
     bucketsError.value = null
+    resourceLoad.value = null
+    loadedResourceLoadKey = null
+    resourceLoadError.value = null
+    taskList.value = null
+    loadedTaskListKey = null
+    taskListError.value = null
   }
 
   return {
@@ -547,20 +840,35 @@ export const useScheduleStore = defineStore('aps.schedule', () => {
     bucketsWindow,
     bucketsLoading,
     bucketsError,
+    resourceLoad,
+    resourceLoadLoading,
+    resourceLoadError,
+    taskList,
+    taskListLoading,
+    taskListError,
     effectiveBucketWidth,
     bucketGroups,
     unscheduledBucketRows,
     activeVersion,
+    activeVersions,
     recentComputed,
     failedVersions,
     displayedVersions,
+    allVersions,
+    allVersionsLoading,
+    allVersionsError,
     loadVersions,
+    loadAllVersions,
     selectVersion,
     setCurrentVersion,
     loadCurrent,
     loadMore,
     loadBuckets,
     cancelBucketsLoad,
+    loadResourceLoad,
+    cancelResourceLoadLoad,
+    loadTaskList,
+    cancelTaskListLoad,
     cancelGanttLoad,
     reset
   }

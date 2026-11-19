@@ -38,7 +38,6 @@ import type {
   ManualEtaUpsertInput,
   ManualEtaCancelInput,
   ManualEtaPageResult,
-  SupplyFactTraceRow,
   WarehouseOption
 } from './types/manualEta'
 import type { MaterialLookupItem } from './types/material'
@@ -403,34 +402,6 @@ export const manualEtaApi = {
     if (Number.isFinite(ln) && ln > 0) params.lineNo = ln
     return apsHttp.get<ManualEtaSupplyCombo[]>({
       url: '/api/procurement-manual-eta/supply-combos',
-      params,
-      silent: true
-    })
-  },
-
-  /**
-   * 过渡配对源：供货事实原始追溯（**`supply-combos` 未部署时用**）
-   *
-   *  - 端点：`GET /api/supply-fact-trace?sourceDocumentNo=&activeOnly=true&take=`
-   *    （5号位 `SupplyFactTraceController`，挂 `aps.plan.view` ⇒ **跨域**；
-   *      结果按**账号可见工厂范围**裁剪 ⇒ 可能不全）
-   *  - 为什么能用它配对：追溯查询第一段 `SELECT … StorageCode AS WarehouseCode FROM SupplyFact_Pipeline`
-   *    （`SupplyFactTraceRepository.cs:39-45`）⇒ 取到的 `warehouseCode` **就是**供给事实的存储地点，
-   *    与排产侧装载器（`TimedSupplyFactLoader`）读的是**同一张表同一列**
-   *    ⇒ 配出来的 (物料 × 存储地点) 与将来 `supply-combos` 的口径一致。
-   *  - ⚠️ 只在 `supply-combos` 取不到时启用；该端点部署后应**删掉这一档**（正式口径只有一条路）。
-   */
-  async searchSupplyCombosFromTrace(
-    poNo: string,
-    lineNo?: number
-  ): Promise<SupplyFactTraceRow[]> {
-    const po = String(poNo ?? '').trim()
-    if (!po) return []
-    const params: Record<string, unknown> = { sourceDocumentNo: po, activeOnly: true, take: 500 }
-    const ln = Number(lineNo)
-    if (Number.isFinite(ln) && ln > 0) params.take = 500
-    return apsHttp.get<SupplyFactTraceRow[]>({
-      url: '/api/supply-fact-trace',
       params,
       silent: true
     })

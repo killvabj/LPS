@@ -1,0 +1,22 @@
+[2026-11-18 08:12:49.483 INF] [] ========================================
+[2026-11-18 08:12:49.519 INF] [] LPS.APS 应用程序启动中...
+[2026-11-18 08:12:49.519 INF] [] ========================================
+[2026-11-18 08:12:50.843 INF] [] LPS.APS 应用程序启动完成
+[2026-11-18 08:12:50.847 DBG] [Microsoft.Extensions.Hosting.Internal.Host] Hosting starting
+[2026-11-18 08:12:51.034 INF] [Microsoft.Hosting.Lifetime] Now listening on: https://localhost:7044
+[2026-11-18 08:12:51.035 INF] [Microsoft.Hosting.Lifetime] Now listening on: http://localhost:5163
+[2026-11-18 08:12:51.110 INF] [Microsoft.Hosting.Lifetime] Application started. Press Ctrl+C to shut down.
+[2026-11-18 08:12:51.111 INF] [Microsoft.Hosting.Lifetime] Hosting environment: Development
+[2026-11-18 08:12:51.112 INF] [Microsoft.Hosting.Lifetime] Content root path: D:\WorkSpace_LocalLib\Windsurf WorkSpace\LPS_SVN\LPS.APS.Web
+[2026-11-18 08:12:51.115 DBG] [Microsoft.Extensions.Hosting.Internal.Host] Hosting started
+[2026-11-18 09:35:27.812 INF] [] ========================================
+[2026-11-18 09:35:27.844 INF] [] LPS.APS 应用程序启动中...
+[2026-11-18 09:35:27.845 INF] [] ========================================
+[2026-11-18 09:35:28.967 INF] [] LPS.APS 应用程序启动完成
+[2026-11-18 09:35:28.973 DBG] [Microsoft.Extensions.Hosting.Internal.Host] Hosting starting
+[2026-11-18 09:35:29.131 INF] [Microsoft.Hosting.Lifetime] Now listening on: https://localhost:7044
+[2026-11-18 09:35:29.132 INF] [Microsoft.Hosting.Lifetime] Now listening on: http://localhost:5163
+[2026-11-18 09:35:29.207 INF] [Microsoft.Hosting.Lifetime] Application started. Press Ctrl+C to shut down.
+[2026-11-18 09:35:29.207 INF] [Microsoft.Hosting.Lifetime] Hosting environment: Development
+[2026-11-18 09:35:29.208 INF] [Microsoft.Hosting.Lifetime] Content root path: D:\WorkSpace_LocalLib\Windsurf WorkSpace\LPS_SVN\LPS.APS.Web
+[2026-11-18 09:35:29.208 DBG] [Microsoft.Extensions.Hosting.Internal.Host] Hosting started

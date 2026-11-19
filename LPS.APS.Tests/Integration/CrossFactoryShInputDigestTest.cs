@@ -6,6 +6,7 @@ using System.Linq;
 using System.Reflection;
 using System.Security.Cryptography;
 using System.Text;
+using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using Xunit;
@@ -66,7 +67,7 @@ public class CrossFactoryShInputDigestTest
         long.TryParse(Environment.GetEnvironmentVariable("APS_CF18_PROBE_STRATEGY"), out var v) && v > 0 ? v : 1970L;
 
     private static int Rounds =>
-        int.TryParse(Environment.GetEnvironmentVariable("APS_CF18_PROBE_ROUNDS"), out var v) && v > 1 ? v : 2;
+        int.TryParse(Environment.GetEnvironmentVariable("APS_CF18_PROBE_ROUNDS"), out var v) && v >= 1 ? v : 2;
 
     private static DateTime SnapshotAt =>
         DateTime.TryParse(Environment.GetEnvironmentVariable("APS_CF18_PROBE_SNAPSHOT"), out var v) ? v : DateTime.Now;
@@ -218,6 +219,142 @@ public class CrossFactoryShInputDigestTest
         return h;
     }
 
+    /// <summary>
+    /// C02 证据 dump（只读）：把实际 `DomainSolveRequest` 的 links / material constraints /
+    /// stage chains 原样落文件，供 S01/S02 逐项举证。仅在 `APS_C02_DUMP=1` 时启用。
+    /// </summary>
+    private static void DumpC02Evidence(
+        DomainSolveRequest req,
+        PeggingResultVoucher voucher,
+        int round,
+        IReadOnlyDictionary<string, ProductionInstructionPositionResult>? piPositions = null)
+    {
+        var outDir = Environment.GetEnvironmentVariable("APS_CF18_PROBE_OUT") is { Length: > 0 } d ? d : @"D:/tmp";
+        Directory.CreateDirectory(outDir);
+        var stamp = DateTime.Now.ToString("yyyyMMdd_HHmmss");
+        var path = Path.Combine(outDir, $"C02_evidence_{PlanVersionId}_r{round}_{stamp}.tsv");
+
+        var lines = new List<string>();
+        lines.Add("# LINKS");
+        lines.Add("ConsumerLogicalDemandKey|ProducerLogicalDemandKey|ChildDemandKey|RequiredQty|LagMinutes|ConsumerMaterialId|ProducerMaterialId|ProducerAllocationSequence");
+        foreach (var l in req.MaterialRequirementLinks)
+        {
+            lines.Add(string.Join("|", new[]
+            {
+                l.ConsumerLogicalDemandKey ?? "",
+                l.ProducerLogicalDemandKey ?? "",
+                l.ChildDemandKey ?? "",
+                l.RequiredQty.ToString("G29", CultureInfo.InvariantCulture),
+                l.LagMinutes.ToString("G29", CultureInfo.InvariantCulture),
+                l.ConsumerMaterialId.ToString(CultureInfo.InvariantCulture),
+                l.ProducerMaterialId.ToString(CultureInfo.InvariantCulture),
+                l.ProducerAllocationSequence.ToString(CultureInfo.InvariantCulture)
+            }));
+        }
+
+        lines.Add("# SUPPLY_ALLOCATIONS");
+        // 2026-11-18：加 AllocationSequence —— 与下方 CONSTRAINTS 同键，才能把每笔分配落到
+        //   `MaterialAvailabilitySlice.SourceKey`（INVENTORY 时为 InventoryAvailableSupplyDetail.Id），
+        //   再回查仓码。否则「分配」与「约束」两张表接不上，仓码级归因做不了。
+        lines.Add("AllocationSequence|DemandKey|SourceType|SourceReference|ShippingInstructionNo|FactoryCode|AllocatedQuantity|AvailableAt|SourceFactoryId|SourceFactoryCode");
+        foreach (var a in voucher.SupplyAllocations)
+        {
+            lines.Add(string.Join("|", new[]
+            {
+                a.AllocationSequence.ToString(CultureInfo.InvariantCulture),
+                a.DemandKey ?? "",
+                a.SourceType.ToString(),
+                a.SourceReference ?? "",
+                a.ShippingInstructionNo ?? "",
+                a.FactoryCode ?? "",
+                a.AllocatedQuantity.ToString("G29", CultureInfo.InvariantCulture),
+                a.AvailableAt?.ToString("O", CultureInfo.InvariantCulture) ?? "",
+                a.SourceFactoryId?.ToString(CultureInfo.InvariantCulture) ?? "",
+                a.SourceFactoryCode ?? ""
+            }));
+        }
+
+        lines.Add("# CONSTRAINTS");
+        lines.Add("AllocationSequence|MaterialId|FactoryId|Quantity|AvailableTime|SourceType|SourceKey|Commitment|Confidence|TimeBasis");
+        foreach (var c in req.MaterialConstraints)
+        {
+            lines.Add(string.Join("|", new[]
+            {
+                c.AllocationSequence.ToString(CultureInfo.InvariantCulture),
+                c.MaterialId.ToString(CultureInfo.InvariantCulture),
+                c.FactoryId.ToString(CultureInfo.InvariantCulture),
+                c.Quantity.ToString("G29", CultureInfo.InvariantCulture),
+                c.AvailableTime.ToString("O", CultureInfo.InvariantCulture),
+                c.SourceType ?? "",
+                c.SourceKey ?? "",
+                c.Commitment ?? "",
+                c.Confidence ?? "",
+                c.TimeBasis ?? ""
+            }));
+        }
+
+        // PI Position（2026-11-18）：XC 是否成位、是否溢出降级，只能在**内存计算产物**里看；
+//   落库快照可能来自别的运行，不能当本轮的 Position 证据。
+        if (piPositions is { Count: > 0 })
+        {
+            lines.Add("# PI_POSITIONS");
+            lines.Add("PI|TotalRemainingQty|PositionType|Quantity|StageCode|SourceKey|IsUnlocated");
+            foreach (var kv in piPositions.OrderBy(k => k.Key, StringComparer.Ordinal))
+            {
+                var r = kv.Value;
+                if (r?.Positions == null) continue;
+                foreach (var p in r.Positions)
+                {
+                    lines.Add(string.Join("|", new[]
+                    {
+                        kv.Key,
+                        r.TotalRemainingQty.ToString("G29", CultureInfo.InvariantCulture),
+                        p.PositionType.ToString(),
+                        p.Quantity.ToString("G29", CultureInfo.InvariantCulture),
+                        p.StageCode ?? "",
+                        p.SourceKey ?? "",
+                        p.IsUnlocated ? "1" : "0"
+                    }));
+                }
+            }
+        }
+
+        // PI × 物料 × Stage 合法量（2026-11-18）：回答「需求 ≤ Stage 合法量」这一环。
+        //   StageFreeEligibleQty = min(Stage 待加工位置量, NextOperationContext 归该 Stage 的量)；
+        //   AlreadyCommittedQty = 入口已被既有 MES 执行份额占用的量。
+        if (req.PiStageQuantityBaselines is { Count: > 0 })
+        {
+            lines.Add("# PI_STAGE_BASELINES");
+            lines.Add("PI|MaterialId|StageCode|StageFreeEligibleQty|AlreadyCommittedQty");
+            foreach (var b in req.PiStageQuantityBaselines
+                         .OrderBy(x => x.ProductionInstructionNo, StringComparer.Ordinal)
+                         .ThenBy(x => x.StageCode, StringComparer.Ordinal))
+            {
+                lines.Add(string.Join("|", new[]
+                {
+                    b.ProductionInstructionNo,
+                    b.MaterialId.ToString(CultureInfo.InvariantCulture),
+                    b.StageCode,
+                    b.StageFreeEligibleQty.ToString("G29", CultureInfo.InvariantCulture),
+                    b.AlreadyCommittedQty.ToString("G29", CultureInfo.InvariantCulture)
+                }));
+            }
+        }
+
+        // Stage 链只 dump links 两端物料，控制体积；一条链一个 JSON 行。
+        var materialIds = req.MaterialRequirementLinks
+            .SelectMany(l => new[] { l.ConsumerMaterialId, l.ProducerMaterialId })
+            .Where(id => id > 0)
+            .ToHashSet();
+        lines.Add("# STAGE_CHAINS");
+        foreach (var chain in req.StageSequenceChains.Where(c => materialIds.Contains(c.MaterialId)))
+        {
+            lines.Add(JsonSerializer.Serialize(chain));
+        }
+
+        File.WriteAllLines(path, lines);
+    }
+
     private static string DigestStrings(IEnumerable<string> items)
     {
         var sb = new StringBuilder();
@@ -270,9 +407,55 @@ public class CrossFactoryShInputDigestTest
             "SELECT DomainKey, PlanHorizonStart, PlanHorizonEnd FROM PlanVersion WHERE Id=@p",
             new { p = PlanVersionId }, db: DatabaseId.APS);
 
-        var orderIds = (await conn.QueryAsync<long>(
+        var allOrderIds = (await conn.QueryAsync<long>(
             "SELECT Id FROM [Order] WHERE PlanVersionId=@p ORDER BY Id",
             new { p = PlanVersionId }, db: DatabaseId.APS)).ToList();
+        var orderIds = allOrderIds;
+        var explicitOrderIds = Environment.GetEnvironmentVariable("APS_CF18_PROBE_ORDER_IDS");
+        if (!string.IsNullOrWhiteSpace(explicitOrderIds))
+        {
+            var wanted = explicitOrderIds.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+                .Select(long.Parse).ToHashSet();
+            orderIds = allOrderIds.Where(wanted.Contains).ToList();
+
+            // 生产侧 `SchedulingOrchestrator` 不把 SH 单当普通 Demand；`RunPeggingOnlyAsync` 不执行该过滤。
+            // 探针若把 SH 单塞进 OrderIds，会生成 SH→SH 假分配（2026-11-17 已踩）。
+            // 只有显式 APS_CF18_ALLOW_SH_DEMAND=1 才允许，用于 SH 自身专项排查。
+            if (!string.Equals(Environment.GetEnvironmentVariable("APS_CF18_ALLOW_SH_DEMAND"), "1", StringComparison.Ordinal))
+            {
+                var shRequested = (await conn.QueryAsync<long>(
+                    @"SELECT Id FROM [Order]
+                      WHERE PlanVersionId=@p AND Id IN @Ids
+                        AND CustomerSegment=N'INTER_FACTORY' AND OrderType=N'SALES_ORDER'",
+                    new { p = PlanVersionId, Ids = orderIds }, db: DatabaseId.APS)).ToList();
+                if (shRequested.Count > 0)
+                    throw new InvalidOperationException(
+                        $"探针入口含 SH 单，不能当普通 Demand 跑：{string.Join(",", shRequested)}；" +
+                        "生产路径会剔除 SH。若确需排查 SH 自身，设 APS_CF18_ALLOW_SH_DEMAND=1。");
+            }
+        }
+
+        // ⚠ 2026-11-18：与生产一致，**必须把 SH 单从普通需求里剔除**。
+        //   生产侧 `SchedulingOrchestrator` 用 `NOT (OrderType='SALES_ORDER' AND CustomerSegment='INTER_FACTORY')`
+        //   把 SH 剔除出 OrderIds；`RunPeggingOnlyAsync` 本身不做该过滤。
+        //   若不剔除，同一张 SH 会既当普通 Demand（Round1）又当孤儿 SH（Round3）**各算一次**
+        //   ⇒ 其实测分配全部翻倍（Case5 实测：子件 34 笔变 60 笔、根 LPD 1 条变 2 条）。
+        //   需要专项诊断 SH 自身时用 `APS_CF18_ALLOW_SH_DEMAND=1` 关掉本剔除。
+        var allowShDemand =
+            string.Equals(Environment.GetEnvironmentVariable("APS_CF18_ALLOW_SH_DEMAND"), "1", StringComparison.Ordinal);
+        if (!allowShDemand && orderIds.Count > 0)
+        {
+            // ⚠ 不能把 9.7 万个 OrderId 塞进 `IN @Ids`（2100 参数上限）；按 PV 取全部 SH 再本地求差即可。
+            var shIds = (await conn.QueryAsync<long>(
+                @"SELECT Id FROM [Order]
+                  WHERE PlanVersionId=@p
+                    AND CustomerSegment=N'INTER_FACTORY' AND OrderType=N'SALES_ORDER'",
+                new { p = PlanVersionId }, db: DatabaseId.APS)).ToHashSet();
+            if (shIds.Count > 0)
+            {
+                orderIds = orderIds.Where(id => !shIds.Contains(id)).ToList();
+            }
+        }
 
         var lines = new List<string>
         {
@@ -298,8 +481,17 @@ public class CrossFactoryShInputDigestTest
         for (var round = 1; round <= Rounds; round++)
         {
             var now = SnapshotAt;
+            // ⚠ 2026-11-18：必须带上 PV 的 SourceScheduleRunId。
+            //   否则 `SupplyPool.ScheduleRunId = 0`，而 `NetAndAllocate` 的「SH 型缺口记 SH_MISSING、
+            //   不造本地生产」整段以 `ScheduleRunId > 0` 为前提 ⇒ **探针里 SH_MISSING 恒 0、
+            //   SH 型缺额会被误记为 NEW_REQUIREMENT（本地生产）**，与生产行为不一致。
+            var sourceRunId = await conn.QueryFirstOrDefaultAsync<int?>(
+                "SELECT SourceScheduleRunId FROM PlanVersion WHERE Id=@p",
+                new { p = PlanVersionId }, db: DatabaseId.APS) ?? 0;
+
             var schedulingContext = new SchedulingContext
             {
+                ScheduleRunId = sourceRunId,
                 StrategyProfileVersionId = StrategyProfileVersionId,
                 DataCutoffTime = DataCutoff,
                 PlanHorizonStart = pv?.PlanHorizonStart ?? now,
@@ -336,8 +528,15 @@ public class CrossFactoryShInputDigestTest
             await schedulingOrchestrator.LoadResourcesAndCalendarAsync(schedulingContext, cts.Token);
 
             // persistPositionSnapshot 默认 false ⇒ 不落库；不调 Solver。
-            var payload = await peggingOrchestrator.RunPeggingOnlyAsync(request, cts.Token, scopeBomToOrders: false);
+            var scopeBomToOrders =
+                !string.Equals(Environment.GetEnvironmentVariable("APS_CF18_PROBE_SCOPE_BOM"), "0", StringComparison.Ordinal)
+                && orderIds.Count < allOrderIds.Count;
+            var payload = await peggingOrchestrator.RunPeggingOnlyAsync(
+                request, cts.Token, scopeBomToOrders: scopeBomToOrders);
             var req = payload.SolveRequest;
+
+            if (string.Equals(Environment.GetEnvironmentVariable("APS_C02_DUMP"), "1", StringComparison.Ordinal))
+                DumpC02Evidence(req, payload.Voucher, round, payload.PiPositions);
 
             var rows = req.LogicalProductionDemands.Select(Row).ToList();
             var digest = DigestRows(rows);

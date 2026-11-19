@@ -13,6 +13,11 @@
  *  - publish / disable 返回**一句文本**，无结构化结果 ⇒ 前端不造结果对象
  *  - validate 返回 `PublishValidationResult`（isValid / errors / warnings / validatedAt）
  *  - 后端**没有** fork 端点 ⇒ fork = GET 源版本 → POST 新版本（5 主题 JSON 原样带走）
+ *
+ * 2026-11-18：跨厂LT 标准参数（`$.CrossFactoryLeadTimeRules`）改为**通用参数集版本的第 6 号内容子块**，
+ *   与 5 主题**共用同一条** `GET /version/{id}` / `PUT /version/{id}`；
+ *   原拟的专属端点（`…/cross-factory-lead-time-rules`）后端已删除（调用将 404）⇒ 本文件已移除该路径常量。
+ *   —— 依据 3号位《跨厂LT 走通用参数接口与快照保留_回执 v1.1_20261117》。
  */
 
 import { apsHttp } from './http'
@@ -91,6 +96,12 @@ export interface BackendParameterSetVersion extends ParameterSetVersion {
   procurementJson?: string | null
   solverStrategyJson?: string | null
   candidateGuardrailJson?: string | null
+  /**
+   * 跨厂LT 标准参数子块的原始 JSON（2026-11-18 通用参数接口；缺块 / 空 ⇒ `null`）
+   *
+   * 依据 3号位《跨厂LT 走通用参数接口与快照保留_回执 v1.1_20261117》。
+   */
+  crossFactoryLeadTimeRulesJson?: string | null
 }
 
 /** fork 时要原样带走的 5 个主题 JSON */
@@ -414,6 +425,10 @@ export const parameterSetApi = {
    * 后端无 fork 端点 ⇒ 前端 GET 源版本 → POST 新版本，**5 个主题 JSON 原样带走**
    * （`EnsureParameterSetNormalized` 会把五主题重建进 ContentSnapshotJson；
    *  BatchPolicy 子块由后端从既有快照回填保留，前端不用管）。
+   *
+   * ⚠️ 2026-11-18：跨厂LT 子块（`crossFactoryLeadTimeRulesJson`）**一并带走**——
+   *   后端 Create 支持带该子块（3号位 v1.1 V1）；不带的话新草稿的快照里就没有这一块
+   *   ⇒ 跨厂LT 规则在 fork 出的新版本里凭空消失。
    */
   async forkDraft(
     sourceParameterSetVersionId: number,
@@ -429,6 +444,9 @@ export const parameterSetApi = {
     for (const key of THEME_JSON_KEYS) {
       const v = source[key]
       if (v) body[key] = v
+    }
+    if (source.crossFactoryLeadTimeRulesJson) {
+      body.crossFactoryLeadTimeRulesJson = source.crossFactoryLeadTimeRulesJson
     }
     return this.createParameterSetDraft(body as unknown as CreateParameterSetDraftInput)
   }

@@ -1841,14 +1841,20 @@ public class GovernanceVersionService : IGovernanceVersionService
         version.ContentSnapshotJson = System.Text.Json.JsonSerializer.Serialize(blocks);
     }
 
-    /// <summary>归一化：把 ParameterSet 五主题 JSON（内存/API 字段）→ ContentSnapshotJson 五子块；全部为空则保持现有快照。</summary>
+    /// <summary>
+    /// 归一化：把 ParameterSet 五主题 + 跨厂LT 子块 JSON（内存/API 字段）→ ContentSnapshotJson 各子块；
+    /// 全部为空则保持现有快照（真实 DB 重读场景，避免覆盖已落库内容）。
+    /// R1（4号位 2026-11-18 回函）：早退判断须**纳入跨厂LT 第 6 子块**——否则「五主题全空、仅提交本块」时
+    /// （典型：新建一个版本只配跨厂LT）早退会把本次提交整块吞掉，接口却回显 200。现改为五主题 + 本块全空才早退。
+    /// </summary>
     private static void EnsureParameterSetNormalized(ParameterSetVersion version)
     {
         if (string.IsNullOrWhiteSpace(version.LockJson)
             && string.IsNullOrWhiteSpace(version.SupplyJson)
             && string.IsNullOrWhiteSpace(version.ProcurementJson)
             && string.IsNullOrWhiteSpace(version.SolverStrategyJson)
-            && string.IsNullOrWhiteSpace(version.CandidateGuardrailJson))
+            && string.IsNullOrWhiteSpace(version.CandidateGuardrailJson)
+            && string.IsNullOrWhiteSpace(version.CrossFactoryLeadTimeRulesJson))
         {
             return;
         }
@@ -1859,6 +1865,7 @@ public class GovernanceVersionService : IGovernanceVersionService
         TryAddBlock(blocks, "Procurement", version.ProcurementJson, version.Id);
         TryAddBlock(blocks, "SolverStrategy", version.SolverStrategyJson, version.Id);
         TryAddBlock(blocks, "CandidateGuardrail", version.CandidateGuardrailJson, version.Id);
+        TryAddBlock(blocks, SolverStrategyValidator.CrossFactoryLeadTimeRulesBlockName, version.CrossFactoryLeadTimeRulesJson, version.Id);
 
         // 第⑧块 Batch Policy：由发布投影/治理写路径直写 ContentSnapshotJson（独立写路径，不走主题 JSON），
         // 全量重建快照时须保留既有 BatchPolicy 子块，避免被五主题归一化覆盖（数据丢失，与 RuleSet 保留 SetupTransitionRules 同轨）。
@@ -1876,6 +1883,20 @@ public class GovernanceVersionService : IGovernanceVersionService
         {
             blocks[SolverStrategyValidator.StageHandoffWaitRulesBlockName] =
                 System.Text.Json.JsonSerializer.Deserialize<System.Text.Json.JsonElement>(stageBlockJson, JsonOptions);
+        }
+
+        // R3（4号位 2026-11-16 来文；2026-11-17 回执更正）跨厂LT 为「普通 6 号子块、同五主题走通用参数接口」。
+        // 刚经上方 TryAddBlock 把前端通用 PUT 提交的 CrossFactoryLeadTimeRulesJson 纳入快照（提交值优先）；
+        // 此处兜底保留：前端仅改其它主题（未带本子块）时，从既有快照保留本块，避免一次保存草稿静默清空
+        // （覆盖 2365 PS-PROD-V2.0 已注入 14 条场景）。
+        if (!blocks.ContainsKey(SolverStrategyValidator.CrossFactoryLeadTimeRulesBlockName))
+        {
+            var crossFactoryBlockJson = ExtractBlockJson(version.ContentSnapshotJson, SolverStrategyValidator.CrossFactoryLeadTimeRulesBlockName);
+            if (!string.IsNullOrWhiteSpace(crossFactoryBlockJson))
+            {
+                blocks[SolverStrategyValidator.CrossFactoryLeadTimeRulesBlockName] =
+                    System.Text.Json.JsonSerializer.Deserialize<System.Text.Json.JsonElement>(crossFactoryBlockJson, JsonOptions);
+            }
         }
 
         version.ContentSnapshotJson = System.Text.Json.JsonSerializer.Serialize(blocks);
@@ -2614,6 +2635,7 @@ public class GovernanceVersionService : IGovernanceVersionService
         return rules;
     }
 
+    
     /// <summary>
     /// 获取参数集版本详情（P0-01：五主题 JSON 投影，前端 API 兼容；方案 A 落点 2026-10-16：
     /// 改调仓储 DB 侧按块提取——五主题 JSON + 治理字段，ContentSnapshotJson 不读回，消除 SELECT * 大 LOB 搬运）

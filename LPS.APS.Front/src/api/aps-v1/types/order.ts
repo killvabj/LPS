@@ -239,6 +239,78 @@ export interface OrderSummaryDto {
   unscheduledCount: number
 }
 
+/**
+ * P02 交付 KPI 分区聚合（5号位 2026-11-17 B2，r14250～r14255 已落码；dev 实测 11-17）
+ *
+ * `GET /api/order-query/delivery-kpi?planVersionId=…[&与列表同名同义的全部筛选参数]`
+ *
+ * ⚠️ **与 `OrderSummaryDto` 是两套读法，别并排显示**（5号位 11-17 复函 §五）：
+ *   本端点 = 交付 KPI 唯一口径（计划派生、日期级、当天完成=按期、随筛选走）；
+ *   summary 三桶留给列表 `riskLevel` 筛选的同源用途，**不再当 KPI 展示**。
+ *
+ * ⚠️ 判定式 = 后端类级常量 `RiskCaseExpr`（与列表 `riskLevel` 列、summary **逐字同文**）
+ *   ⇒ 卡片与点开的行集逐位一致，不会出现「格子说按期、KPI 说延期」。
+ *
+ * dev 实测（PV 999473，11-17）：
+ *   总计 10,247 = 按期 941 + 延期 4,720 + 不可判定 4,586（恒等式逐位合）；
+ *   `targetPercent` **整键省略**（`decimal?` null + `WhenWritingNull`）⇒ 不出目标达成率；
+ *   `fgWipDimensionAvailable=false` ⇒ **不出 FG/WIP 卡片**（不是出空卡）。
+ */
+export interface DeliveryKpiResultDto {
+  planVersionId: number
+  domainKey?: string
+  /** `false` = 计划版本不存在（此时 `rows` 为空数组） */
+  versionExists?: boolean
+  /** `true` = 越权（域/工厂范围不足，fail-closed） */
+  scopeDenied?: boolean
+  /**
+   * 判定口径原文（后端写死一段话）。
+   * 页面**必须**展示它 —— 让人知道这是「计划预计按期率」而非「实际交付准交率」。
+   */
+  caliber?: string
+  /**
+   * 计划完成时刻来源：`readmodel_task_max`（读模型计算，同 PV Task MAX(PlannedEndTime)）
+   * → 将来 2号位正式归集列落库后切 `formal`。
+   * 页面按本位显示「口径来源」角标，切换**不需要前端改代码**。
+   */
+  plannedCompletionSource?: string
+  /**
+   * `false` = FG/WIP 维度拆分**当前不具备权威映射**（0号位最小裁决前）
+   * ⇒ 页面该维度不出卡（不是出空卡）。
+   */
+  fgWipDimensionAvailable?: boolean
+  /**
+   * 可配置目标准交率 —— 现**整键省略**（待 3号位 合同核对结论）。
+   * 键缺 ⇒ 页面**不渲染目标达成率**（不显 0、不显「未提供」）。
+   */
+  targetPercent?: number
+  /** 分区行 = 总计行（`orderType` 缺键）＋ PRODUCTION_INSTRUCTION ＋ SALES_ORDER */
+  rows?: DeliveryKpiRowDto[]
+}
+
+/** 交付 KPI 一行 = 一个统计分区 */
+export interface DeliveryKpiRowDto {
+  /**
+   * 订单类型分区码。
+   * ⚠️ **总计行的该键整键省略**（后端 `OrderType=null` + `WhenWritingNull`）⇒
+   *   前端用 `orderType == null` 认「总计」，**不要**用 `=== ''`。
+   * 值域实测只有 `PRODUCTION_INSTRUCTION` / `SALES_ORDER` 两个分区。
+   */
+  orderType?: string
+  /** 分母 = 本分区订单总数（**含未判定，不剔除**） */
+  totalOrders: number
+  /** 计划按期（日期级 ≤ 交期，当天完成算按期） */
+  onTimeOrders: number
+  /** 计划延期（日期级晚于交期） */
+  lateOrders: number
+  /** 日期/计划不可判定（无 Task 行／完成时刻缺／交期缺）—— **单列显示，不并进按期或延期** */
+  undeterminedOrders: number
+  /** 计划按期率%（按期 ÷ 分母）；分母为 0 ⇒ null（**不显 0%**） */
+  onTimeRatePct?: number | null
+  /** 计划延期率%（延期 ÷ 分母）；分母为 0 ⇒ null */
+  lateRatePct?: number | null
+}
+
 /** 列表查询条件 —— 全部对应 `OrderQueryController.QueryOrders` 的真实签名（`OrderQueryController.cs:55-72`） */
 export interface OrderQuery {
   /** 必填（漏传 code=400） */

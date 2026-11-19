@@ -205,6 +205,16 @@ public class BOMResultPullService : IBOMResultPullService
                 // Step 5c: 生成 OrderBomRequestLink（v5.0.31 Order→BOM追溯链闭合）
                 await GenerateOrderBomRequestLinkAsync(sqlConn, sqlTx, batchNo, planVersionIds);
 
+                // Step 5c-2（2026-11-17 P1）：仍 ACTIVE 的旧 PV，其 link 批必须跟随当前 BOM/Stage；
+                //   能按 ResolvedBOMNO 命中当前 ROOT Workset 的自动重绑；命不中的留给 LoadBomSnapshot fail-closed。
+                var rebound = await RebindActivePvLinksToCurrentBatchAsync(sqlConn, sqlTx, batchNo);
+                if (rebound > 0)
+                {
+                    _logger.LogInformation(
+                        "OrderBomRequestLink 旧 ACTIVE PV 重绑: BatchNo={BatchNo}, 更新={Count} 行",
+                        batchNo, rebound);
+                }
+
                 // Step 5d（O67，2026-11-10）：跨厂交接边 ODS → APS 本地缓存表，**同批同事务**。
                 //   冻结 `07 v5.0.46` 要求 APS 侧保留本地缓存（维护责任人＝2号位）、供 Pegging 直接读取；
                 //   此前该表从未创建，Pegging 每轮运行时跨库读 ODS 同义词。
@@ -524,6 +534,52 @@ public class BOMResultPullService : IBOMResultPullService
     /// 数据源：ODS.MES_API_BOM_Request_Detail + ODS.MES_APS_BOM_Workset
     /// 映射：APS.[Order] 跨本批全部 Domain PlanVersion（每顶层 Order 只归一个真实 Domain）按 OrderCanonicalId 查找 OrderId + PlanVersionId
     /// </summary>
+    /// <summary>
+    /// P1（2026-11-17）：BOM 接货事务内，把仍 `ACTIVE` 的旧 PV 的 OrderBomRequestLink
+    /// 重绑到当前 BOM/Stage 批。
+    ///
+    /// 规则：
+    ///   · 只动 `PlanVersion.Status='ACTIVE'` 的 PV；新 PV/失败 PV 不碰；
+    ///   · 只按 `ResolvedBOMNO` 命中当前 `APS_BOM_STAGE_PATH_RAW` 的 `ROOT` Workset 才更新；
+    ///   · 命中不了不猜、不删；留给 `LoadBomSnapshotAsync` 的 BatchMismatch fail-closed。
+    /// </summary>
+    private async Task<int> RebindActivePvLinksToCurrentBatchAsync(
+        SqlConnection connection, SqlTransaction transaction, string batchNo)
+    {
+        const string sql = @"
+            UPDATE r
+               SET r.BatchNo = @BatchNo,
+                   r.RepWorksetId = root.WorksetId,
+                   -- A（2026-11-17）：RequestDetailId 也必须跟当前批；优先取当前批同 OrderCanonical 的
+                   --   **其它 PV** 链接（避免拿本行旧值自证）；取不到则保留旧值并在接货日志留缺口。
+                   r.RequestDetailId = COALESCE(cur.RequestDetailId, r.RequestDetailId),
+                   r.SyncedAt = GETDATE()
+            FROM dbo.OrderBomRequestLink r
+            INNER JOIN (
+                SELECT BOMNO, MIN(WorksetId) AS WorksetId
+                FROM dbo.APS_BOM_STAGE_PATH_RAW
+                WHERE BatchNo = @BatchNo
+                  AND StageScopeType = N'ROOT'
+                GROUP BY BOMNO
+            ) root ON root.BOMNO = r.ResolvedBOMNO
+            INNER JOIN dbo.PlanVersion p
+                ON p.Id = r.PlanVersionId
+               AND p.Status = N'ACTIVE'
+            OUTER APPLY (
+                SELECT TOP 1 r2.RequestDetailId
+                FROM dbo.OrderBomRequestLink r2
+                WHERE r2.BatchNo = @BatchNo
+                  AND r2.OrderCanonicalId = r.OrderCanonicalId
+                  AND r2.PlanVersionId <> r.PlanVersionId
+                  AND r2.ResolvedBOMNO IS NOT NULL
+                ORDER BY r2.SyncedAt DESC, r2.Id DESC
+            ) cur
+            WHERE r.BatchNo <> @BatchNo;";
+
+        return await connection.ExecuteAsync(
+            sql, new { BatchNo = batchNo }, transaction: transaction);
+    }
+
     private async Task GenerateOrderBomRequestLinkAsync(
         SqlConnection connection, SqlTransaction transaction, string batchNo, IReadOnlyList<int> planVersionIds)
     {

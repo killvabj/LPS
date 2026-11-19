@@ -69,8 +69,9 @@
 import { computed, onMounted, reactive, ref, watch } from 'vue'
 import dayjs from 'dayjs'
 import { storeToRefs } from 'pinia'
-import { useRouter } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import { orderApi, domainApi } from '@/api/aps-v1'
+import type { PlanVersionSummaryDto } from '@/api/aps-v1/types/schedule'
 import { useExplanationStore } from '@/store/modules/aps/explanation'
 import { useScheduleStore } from '@/store/modules/aps/schedule'
 import { useDomainStore } from '@/store/modules/aps/domain'
@@ -82,6 +83,7 @@ import {
   ElEmpty,
   ElInput,
   ElOption,
+  ElOptionGroup,
   ElPagination,
   ElSelect,
   ElTag,
@@ -108,8 +110,11 @@ import {
   type ReasonCodeCount
 } from '@/api/aps-v1/types/explanation'
 import { stageLabelOf } from '@/api/aps-v1/types/stage'
+import { planVersionStatusLabel, planVersionStatusTag } from '@/api/aps-v1/types/common'
 
 const router = useRouter()
+/** 运行页「看异常解释」带过来的版本入参（?planVersionId=）；见 onMounted */
+const route = useRoute()
 
 const explanationStore = useExplanationStore()
 const scheduleStore = useScheduleStore()
@@ -138,10 +143,20 @@ const {
   bizFactoryCode,
   sortedBusinessFactIssues
 } = storeToRefs(explanationStore)
-const { versions, currentVersionId, displayedVersions } = storeToRefs(scheduleStore)
+const { currentVersionId } = storeToRefs(scheduleStore)
+/** 全量版本列表（解释页版本下拉用；与甘特页那套三档截断分开） */
+const { allVersions, allVersionsLoading, allVersionsError } = storeToRefs(scheduleStore)
+/** 各版本事实条数缓存 + 进度（懒取，见 explanation store） */
+const { versionFactCounts, factCountPending, factCountErrors } = storeToRefs(explanationStore)
 // actions 直接解构（Pinia 文档：storeToRefs 只包 state/getters；actions 直接解构）
 const { fetchBizPage, refreshBizIssues, changeBizPageSize, setBizFilters, loadMoreFacts } =
   explanationStore
+const { loadFactCounts } = explanationStore
+
+/** 事实总数的显示文本：未取到（Summary 失败）显「未提供」，不显 0（§0.2 ②） */
+const totalFactsText = computed(() =>
+  totalFacts.value === null ? '未提供' : String(totalFacts.value)
+)
 
 /* ===== 事实行的大白话渲染（2026-11-10） =====
  * 背景：原先行里显示 `需求 999472_1` + 「未标注原因码」，工厂用户看不懂，也不知道下一步做什么。
@@ -734,6 +749,124 @@ const unlabeledReasonCount = computed(() =>
     .reduce((s: number, c: ReasonCodeCount) => s + (c.count ?? 0), 0)
 )
 
+/* ===== 版本下拉（2026-11-17 重做）=====
+ * 用户口径：「为啥不列出来已经有的版本呢？需要哪个自己选的去看」⇒ 三件事一起做：
+ *   ① 列出**全量**版本 —— 不再用甘特页那套「生效 + 最近 3 条待确认 + 最多 2 条失败」截断
+ *      （那套截断是给甘特工具栏设计的；用它 ⇒ 失败批次里最有料的两版根本点不到）
+ *   ② 按**来源排产批次**分组 —— 用户心里想的是「批次 #999436 那批」，不是版本号
+ *   ③ 每版显示：排程域中文名 + 版本号 + 状态 + 事实条数
+ *
+ * ⚠️ 事实条数**懒取**（打开下拉才查、并发 3、查到即显示）：dev 实测 61 个版本一次拉完
+ *   要 60~90s（零条版本也要 ~2s/个，是固定成本），预取会把首屏拖死；
+ *   后端也**没有批量端点**（只有 /api/explanation、/summary、/demand-reconciliation）。
+ */
+
+/** 版本下拉的一行视图模型 */
+interface VersionOptionVm {
+  id: number
+  versionCode: string
+  /** 排程域中文名（域字典没登记的 key 回退原码，不猜） */
+  domainLabel: string
+  /** 原始状态值（判生效版本用）+ 中文名 + 标签色 */
+  status: string
+  statusLabel: string
+  statusTag: 'success' | 'primary' | 'warning' | 'info' | 'danger'
+  /** 来源排产批次 Id（null = 没有来源批次） */
+  sourceRunId: number | null
+  /** 事实条数（还没查到 = undefined，**不写 0**） */
+  factCount?: number
+}
+
+/** URL 入参 ?planVersionId=（运行页「看异常解释」带过来的那一版） */
+const incomingVersionId = computed<number | null>(() => {
+  const raw = route.query.planVersionId
+  const s = Array.isArray(raw) ? raw[0] : raw
+  if (!s) return null
+  const n = Number(s)
+  return Number.isFinite(n) && n > 0 ? n : null
+})
+
+const versionOptions = computed<VersionOptionVm[]>(() =>
+  allVersions.value.map((v: PlanVersionSummaryDto) => ({
+    id: v.id,
+    versionCode: v.versionCode,
+    domainLabel: domainLabelOf(v.domainKey),
+    status: v.status,
+    statusLabel: planVersionStatusLabel(v.status),
+    statusTag: planVersionStatusTag(v.status),
+    sourceRunId: v.sourceScheduleRunId ?? null,
+    factCount: versionFactCounts.value[v.id]
+  }))
+)
+
+/** 版本下拉分组：按来源排产批次；批次内保持后端给的顺序（创建时间倒序） */
+const versionGroups = computed<{ key: string; label: string; items: VersionOptionVm[] }[]>(() => {
+  const map = new Map<string, { key: string; label: string; items: VersionOptionVm[] }>()
+  for (const o of versionOptions.value) {
+    const key = o.sourceRunId == null ? 'no-source' : `run-${o.sourceRunId}`
+    let g = map.get(key)
+    if (!g) {
+      g = {
+        key,
+        label: o.sourceRunId == null ? '无来源批次' : `排产批次 #${o.sourceRunId}`,
+        items: []
+      }
+      map.set(key, g)
+    }
+    g.items.push(o)
+  }
+  const groups = [...map.values()]
+  // 运行页带过来的那一版：所在分组提到最前、版本提到组内最前（用户一眼看到自己落在哪一版）
+  const pinned = incomingVersionId.value
+  if (pinned != null) {
+    const gi = groups.findIndex((g) => g.items.some((it) => it.id === pinned))
+    if (gi > 0) {
+      const [g] = groups.splice(gi, 1)
+      groups.unshift(g)
+    }
+    for (const g of groups) {
+      const i = g.items.findIndex((it) => it.id === pinned)
+      if (i > 0) {
+        const [it] = g.items.splice(i, 1)
+        g.items.unshift(it)
+      }
+    }
+  }
+  return groups
+})
+
+/** 当前选中的版本（回显用：批次 / 状态 / 本版条数） */
+const selectedVersionOption = computed<VersionOptionVm | null>(
+  () => versionOptions.value.find((o) => o.id === currentVersionId.value) ?? null
+)
+
+/**
+ * 运行页带来的版本不在可见列表里（超出 take 上限，或不在当前用户的域授权范围内）。
+ * ⚠️ 此时**不静默改看别的版本**：页面要如实说「这一版看不到」，而不是让人以为看的就是它。
+ */
+const incomingVersionMissing = computed(
+  () =>
+    incomingVersionId.value != null &&
+    !allVersionsError.value &&
+    !versionOptions.value.some((o) => o.id === incomingVersionId.value)
+)
+
+/** 下拉里一行的文字（选中后也用它做回显） */
+function versionOptionLabel(o: VersionOptionVm): string {
+  return `${o.domainLabel} · ${o.versionCode}`
+}
+
+/** 打开下拉时按需查各版本事实条数（懒取、并发 3；查到即显示，不阻塞首屏） */
+function onVersionDropdownVisible(visible: boolean): void {
+  if (!visible) return
+  loadFactCounts(versionOptions.value.map((o) => o.id))
+}
+
+/** 下拉选中变化 */
+function onVersionChange(id: number): void {
+  selectVersion(id)
+}
+
 /* ===== 加载入口 ===== */
 function refresh(): void {
   explanationStore.load()
@@ -775,14 +908,44 @@ onMounted(async () => {
   void domainStore.load()
   // 工厂下拉（白名单过滤，不阻塞主数据）
   void loadFactoryOptions()
-  if (versions.value.length === 0) await scheduleStore.loadVersions()
-  // 联动：explanation 默认与 scheduleStore 的当前选中版本（一般是 ACTIVE）保持一致，
+  // 版本下拉要**全量**版本（用户 11-17 定调：已有版本都列出来，自己选）
+  // ⇒ 走 allVersions（take=200），不走甘特页那套三档截断的 versions
+  await scheduleStore.loadAllVersions()
+  // 选中态优先级：① URL 入参（运行页带来的那一版）② store 里已有的当前版本 ③ 第一个生效版本
+  const incoming = incomingVersionId.value
+  if (incoming != null && versionOptions.value.some((o) => o.id === incoming)) {
+    scheduleStore.setCurrentVersion(incoming)
+  } else if (
+    currentVersionId.value == null ||
+    !versionOptions.value.some((o) => o.id === currentVersionId.value)
+  ) {
+    const active = versionOptions.value.find((o) => o.status === 'ACTIVE')
+    scheduleStore.setCurrentVersion(active?.id ?? versionOptions.value[0]?.id ?? null)
+  }
+  // 联动：explanation 默认与 scheduleStore 的当前选中版本（一般是生效版本）保持一致，
   // 避免首次 mount summary 拿的是 store ref 默认值 1001，与 schedule 选中版本错位
-  await explanationStore.load(currentVersionId.value ?? undefined)
+  if (currentVersionId.value != null) await explanationStore.load(currentVersionId.value)
   // 业务事实问题走**独立端点** `/api/business-fact-issues`（Summary 端点不返这个数据，
   // dev 2026-11-10 实测响应只有 7 个字段）⇒ 这里必须单独拉第一页，否则表格永远是空的。
   void fetchBizPage(1, businessFactIssuesPageSize.value)
 })
+
+/**
+ * 运行页在**本页**再点一次「看异常解释」（带另一个 ?planVersionId=）时，
+ * 组件不会重新 mount ⇒ 这里盯着 query 变化重新选版本。
+ */
+watch(
+  () => route.query.planVersionId,
+  (raw) => {
+    const s = Array.isArray(raw) ? raw[0] : raw
+    const id = Number(s)
+    if (!s || !Number.isFinite(id) || id <= 0) return
+    if (id === currentVersionId.value) return
+    if (!versionOptions.value.some((o) => o.id === id)) return
+    scheduleStore.setCurrentVersion(id)
+    void explanationStore.load(id)
+  }
+)
 </script>
 
 <template>
@@ -801,22 +964,65 @@ onMounted(async () => {
     <!-- ===== 错误条 ===== -->
     <ElAlert v-if="error" type="error" :closable="false" show-icon :title="`加载失败：${error}`" />
 
-    <!-- ===== 版本切换（10-09 重构：按业务优先级渲染） =====
-         优先级：ACTIVE 置顶 → 最近 3 条 Computed → 失败（最多 2 条）→ 当前已选兜底
-         替代旧"取前三条"硬截（@see store/schedule.ts displayedVersions getter）
+    <!-- ===== 版本切换（2026-11-17 重做：全量版本下拉） =====
+         · 列出**所有**已有版本，按来源排产批次分组（用户 11-17：「需要哪个自己选的去看」）
+         · 替代旧的三按钮截断（ACTIVE + 最近 3 条待确认 + 最多 2 条失败）——
+           那套是甘特工具栏的设计，失败批次里最有料的两版在它下面根本点不到
+         · 运行页「看异常解释」带 ?planVersionId= 过来的，自动选中并置顶
     -->
     <div class="version-bar">
       <span class="bar-label">当前计划版本：</span>
-      <ElButton
-        v-for="v in displayedVersions"
-        :key="v.id"
+      <ElSelect
+        :model-value="currentVersionId ?? undefined"
+        filterable
         size="small"
-        :type="v.id === currentVersionId ? 'primary' : 'default'"
-        @click="selectVersion(v.id)"
+        class="version-select"
+        placeholder="选择计划版本"
+        :loading="allVersionsLoading"
+        @visible-change="onVersionDropdownVisible"
+        @change="onVersionChange"
       >
-        <span class="version-code">{{ v.versionCode }}</span>
-      </ElButton>
+        <ElOptionGroup v-for="g in versionGroups" :key="g.key" :label="g.label">
+          <ElOption v-for="v in g.items" :key="v.id" :label="versionOptionLabel(v)" :value="v.id">
+            <div class="version-option">
+              <span class="version-option-domain">{{ v.domainLabel }}</span>
+              <span class="version-option-code">{{ v.versionCode }}</span>
+              <ElTag size="small" :type="v.statusTag" effect="light">
+                {{ v.statusLabel }}
+              </ElTag>
+              <span class="version-option-count">
+                <template v-if="v.factCount !== undefined">事实 {{ v.factCount }} 条</template>
+                <template v-else-if="factCountErrors[v.id]">条数查询失败</template>
+              </span>
+            </div>
+          </ElOption>
+        </ElOptionGroup>
+      </ElSelect>
+      <ElTag v-if="incomingVersionId !== null" size="small" type="warning" effect="plain">
+        运行页带来的版本
+      </ElTag>
+      <span v-if="selectedVersionOption" class="muted small">
+        来源批次
+        {{
+          selectedVersionOption.sourceRunId == null ? '无' : `#${selectedVersionOption.sourceRunId}`
+        }}
+        · 本版事实 {{ totalFactsText }} 条
+      </span>
+      <span v-if="factCountPending > 0" class="muted small">
+        正在查各版本条数（还剩 {{ factCountPending }} 个）
+      </span>
+      <span v-if="incomingVersionMissing" class="muted small">
+        运行页带来的版本 #{{ incomingVersionId }}
+        不在可见版本列表里（可能超出显示上限或不在授权范围）
+      </span>
     </div>
+    <ElAlert
+      v-if="allVersionsError"
+      type="error"
+      :closable="false"
+      show-icon
+      :title="`版本列表加载失败：${allVersionsError}`"
+    />
 
     <!-- ===== 按对象分组（2026-11-10 用户口径：这条提到页面最上面，
          先回答"这次排产到底产生了哪几类事实"，再往下看订单清单） ===== -->
@@ -846,7 +1052,7 @@ onMounted(async () => {
                杜绝再出现「静默只显示 50 条」那种用户看不出被截断的情况 -->
           <div class="fact-count">
             <span class="hint-text">
-              共 {{ totalFacts }} 条 · 已显示 {{ loadedFactsCount }} 条
+              共 {{ totalFactsText }} 条 · 已显示 {{ loadedFactsCount }} 条
             </span>
             <ElButton
               v-if="factsHasMore"
@@ -1346,7 +1552,7 @@ onMounted(async () => {
       <div v-if="unlabeledReasonCount > 0" class="code-hint">
         另有
         {{ unlabeledReasonCount }}
-        条记录没写明原因，看不出属于哪一类取舍；逐条请看上面的「业务事实问题」清单。
+        条记录原因未提供，看不出属于哪一类取舍；逐条请看上面的「业务事实问题」清单。
       </div>
     </ElCard>
   </div>
@@ -1402,6 +1608,33 @@ onMounted(async () => {
 
   .version-code {
     font-size: 12px;
+  }
+
+  /* 版本下拉（2026-11-17） */
+  .version-select {
+    width: 340px;
+  }
+}
+
+/* 下拉里的一行：域中文名 + 版本号 + 状态 + 条数 */
+.version-option {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+
+  .version-option-domain {
+    font-weight: 600;
+    color: #1e293b;
+  }
+
+  .version-option-code {
+    color: #64748b;
+  }
+
+  .version-option-count {
+    margin-left: auto;
+    color: #94a3b8;
   }
 }
 

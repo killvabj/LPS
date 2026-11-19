@@ -551,22 +551,22 @@ public class DemandCompletionSolverExitTests
         // ① 不再 Fail Closed：部分落定是**合法**业务结果（`Success=true` + 未排量如实记录）。
         Assert.True(result.Success, result.ErrorMessage);
 
-        // ── ② 已排量 S（2026-10-15 第八轮锁定的批数量口径，沿用）──
-        //   批数量 = `BuildBatchFormation` 的**均分** `NetOutputQty / count`（`PhaseTwoInitialScheduler.cs:4206`），
-        //   而 `MaxExecutionBatchQty = 6` 只决定**批数**（`DecideExecutionBatchPlan:3476` `nMin = ceil(10/6) = 2`）。
-        //   实测批数 = **3**（非基线 nMin=2）⇒ 每批 `10 / 3 = 3.3333`；日历只容首批 ⇒ 只落定 1 个 Task。
+        // ── ② 已排量 S（2026-11-19 按 0号位 v1.2 §二.3 更新口径）──
+        //   批数量 = `BuildBatchFormation` 的切分；**新增可执行批净量必须整数** ⇒ 10 拆 3 批为 `4 / 3 / 3`
+        //   （余数逐批 +1 给第 1 批），不再是 `3.3333 / 3.3333 / 3.3334`（后者只可用于算术闭合）。
+        //   日历只容首批 ⇒ 只落定 1 个 Task（首批发 4）。
         var task = Assert.Single(result.FinalTasks);
-        Assert.Equal(3.3333m, task.Quantity);
+        Assert.Equal(4m, task.Quantity);
 
         // ③ 份额严格闭合到**已落定量**，不再被声明量撑破（第 3 项 `ΣShare ≤ Task.Quantity` 取等）。
         var totalShare = result.AllocationShares.Sum(s => s.ComponentQty);
-        Assert.Equal(3.3333m, totalShare);
+        Assert.Equal(4m, totalShare);
 
-        // ④ 未排量 U：`Q − S = 10 − 3.3333 = 6.6667`（= 0号位 受控例的第三个数）。
+        // ④ 未排量 U：`Q − S = 10 − 4 = 6`。
         //    `DraftId` 的值域是 **`LogicalDemandKey`**，不是 `FinalDraftId`（2号位 r13771 已写死注释）。
         var unscheduled = Assert.Single(result.UnscheduledTasks);
         Assert.Equal("D1", unscheduled.DraftId);
-        Assert.Equal(6.6667m, unscheduled.UnscheduledQty);
+        Assert.Equal(6m, unscheduled.UnscheduledQty);
 
         // ⑤ 三量守恒：`ΣShare + ΣU == ΣQ` —— 第 1 项新判据的端到端镜像。
         Assert.Equal(10m, totalShare + unscheduled.UnscheduledQty);

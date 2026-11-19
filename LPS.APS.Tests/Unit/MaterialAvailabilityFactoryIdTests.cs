@@ -46,6 +46,7 @@ public class MaterialAvailabilityFactoryIdTests
 
     /// <summary>计划期起点占位（仅 SH 时间待闭合分支使用；本组用例都带 AvailableAt，故不参与断言）。</summary>
     private static readonly DateTime PlanningStart = new(2026, 11, 13, 0, 0, 0);
+    private static readonly DateTime PlanningEnd = PlanningStart.AddDays(90);
 
     [Theory(DisplayName = "O62 文本厂码不再被反解：BJ/CN6厂/SH 都带出真实工厂主键")]
     [InlineData("BJ", 3)]
@@ -131,31 +132,35 @@ public class MaterialAvailabilityFactoryIdTests
         Assert.Equal(80m, slice.Quantity);
         Assert.Equal(PlanningStart, slice.AvailableTime);
         Assert.Equal("INTER_FACTORY_ORDER", slice.SourceType);
+        Assert.Equal("SH_LINKED", slice.TimeBasis);
     }
 
-    [Fact(DisplayName = "SH 无 link：落 0 量『时间未定』，不得冒充当前可用")]
-    public void ShWithoutLink_IsBlockingNotCurrent()
+    [Fact(DisplayName = "SH 无 link：保留真实数量，时间未定用计划期终点，不得冒充当前")]
+    public void ShWithoutLink_PreservesQuantityAndMarksUnresolved()
     {
-        var slices = PeggingOrchestrator.BuildMaterialConstraints(Voucher(ShAlloc()), PlanningStart);
+        var slices = PeggingOrchestrator.BuildMaterialConstraints(
+            Voucher(ShAlloc()), PlanningStart, PlanningEnd);
 
         var slice = Assert.Single(slices);
-        Assert.Equal(0m, slice.Quantity);
-        Assert.Equal("INTER_FACTORY_ORDER_TIME_UNRESOLVED", slice.SourceType);
-        Assert.Equal(PlanningStart, slice.AvailableTime);
-        Assert.NotEqual(DateTime.Now.Date, slice.AvailableTime.Date.AddYears(100));
+        Assert.Equal(80m, slice.Quantity);                 // 真实 SH 数量不丢
+        Assert.Equal("INTER_FACTORY_ORDER", slice.SourceType);
+        Assert.Equal(PlanningEnd, slice.AvailableTime);    // 不是当前
+        Assert.Equal("SH_TIME_UNRESOLVED", slice.TimeBasis);
     }
 
-    [Fact(DisplayName = "PIPELINE NULL 不冒充当前：落 0 量『时间未定』阻塞切片")]
-    public void PipelineWithNullAvailableAt_IsBlockingNotCurrent()
+    [Fact(DisplayName = "PIPELINE NULL：保留真实数量，时间未定，不得冒充当前")]
+    public void PipelineWithNullAvailableAt_PreservesQuantityAndMarksUnresolved()
     {
         var alloc = Alloc("TJ", 6, 5m, SupplySourceType.PIPELINE);
         alloc.AvailableAt = null;
 
-        var slices = PeggingOrchestrator.BuildMaterialConstraints(Voucher(alloc), PlanningStart);
+        var slices = PeggingOrchestrator.BuildMaterialConstraints(Voucher(alloc), PlanningStart, PlanningEnd);
 
         var slice = Assert.Single(slices);
-        Assert.Equal(0m, slice.Quantity);                 // 不把未来供给当当前数量
-        Assert.Equal("PIPELINE_TIME_UNRESOLVED", slice.SourceType);
+        Assert.Equal(5m, slice.Quantity);                  // 真实数量不丢
+        Assert.Equal("PIPELINE", slice.SourceType);
+        Assert.Equal(PlanningEnd, slice.AvailableTime);
+        Assert.Equal("UNRESOLVED", slice.TimeBasis);
     }
 
     [Fact(DisplayName = "O92 跨厂无合法SH：0量切片进父件约束，不被当『料够』")]
@@ -213,19 +218,22 @@ public class MaterialAvailabilityFactoryIdTests
         Assert.Equal("INVENTORY", slice.SourceType);
         Assert.Equal("COMMITTED", slice.Commitment);
         Assert.Equal("CONFIRMED", slice.Confidence);
+        Assert.Equal("CURRENT", slice.TimeBasis);
     }
 
-    [Fact(DisplayName = "S02 WIP 不是库存：AvailableAt=NULL 不得当当前现货，落 0 量『时间未定』")]
-    public void NullAvailableWip_IsBlockingNotCurrent()
+    [Fact(DisplayName = "S02 WIP 不是库存：保留真实数量、时间未定，不得当当前现货")]
+    public void NullAvailableWip_PreservesQuantityAndMarksUnresolved()
     {
         var alloc = Alloc("TJ", 6, 5m, SupplySourceType.WIP);
         alloc.AvailableAt = null;
 
-        var slices = PeggingOrchestrator.BuildMaterialConstraints(Voucher(alloc), PlanningStart);
+        var slices = PeggingOrchestrator.BuildMaterialConstraints(Voucher(alloc), PlanningStart, PlanningEnd);
 
         var slice = Assert.Single(slices);
-        Assert.Equal(0m, slice.Quantity);                 // 不把 WIP 当现货
-        Assert.Equal("WIP_TIME_UNRESOLVED", slice.SourceType);
+        Assert.Equal(5m, slice.Quantity);                  // 真实 WIP 数量不丢
+        Assert.Equal("WIP", slice.SourceType);
+        Assert.Equal(PlanningEnd, slice.AvailableTime);
+        Assert.Equal("UNRESOLVED", slice.TimeBasis);
     }
 
     [Fact(DisplayName = "S02 承诺状态随分配透传到 MaterialAvailabilitySlice")]

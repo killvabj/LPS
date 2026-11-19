@@ -23,8 +23,23 @@ import type {
   GanttBucketsDto,
   GanttCursor,
   GanttDataDto,
-  PlanVersionSummaryDto
+  PlanVersionSummaryDto,
+  ResourceLoadResultDto,
+  TaskDetailResultDto,
+  TaskListResultDto
 } from './types'
+
+/** 任务清单排序键白名单（后端非法值 ⇒ 真 400，禁静默回落） */
+const TASK_SORT_KEYS: readonly string[] = [
+  'plannedStart',
+  'quantity',
+  'materialCode',
+  'taskNo',
+  'id'
+]
+
+/** 任务清单页长上限（后端钳 200，前端同钳） */
+const TASK_PAGE_SIZE_CAP = 200
 
 export const scheduleApi = {
   /** 计划版本列表（默认 30 条） */
@@ -147,6 +162,142 @@ export const scheduleApi = {
       params,
       timeout: 30_000,
       signal: opts.signal
+    })
+  },
+
+  /**
+   * P12 资源负荷三率（5号位 2026-11-17 r14239；矩阵 A6/A7）
+   *
+   * `GET /api/schedule/resource-load/{planVersionId}?from=&to=[&resourceIds=…]`
+   * 一行 = **设备 × 业务日**；①②两率 + ③Setup（③现恒 null）。
+   *
+   * ⚠️ `from` / `to` **必填**（缺任一 ⇒ 真 HTTP 400）⇒ 类型上就是必填。
+   * ⚠️ **窗口上限 31 天**（后端 `spanDays > 30` ⇒ 抛错 ⇒ 真 400）⇒ 调用方自己夹。
+   * ⚠️ **任务过滤是闭区间重叠**（`PlannedEndTime >= from AND PlannedStartTime <= to`）
+   *   ⇒ 想覆盖某一天的任务，要传 `D ~ D+1`（只传 `D ~ D` ⇒ 命中不到当天白班的活）。
+   *   而**返回的日期网格是 `from..to` 两端都含**（后端 `for (off = 0; off <= spanDays; off++)`）
+   *   ⇒ 传 `D ~ D+1` 会多出 `D+1` 那一行（该行通常 0 工时），前端按自己要的末日裁掉。
+   * ⚠️ `resourceIds` 只认**重复键**（`resourceIds=1&resourceIds=2`）；`resourceIds[]` 后端真 400。
+   *   不传 = 窗内排产设备 TOP200（`resourcesTruncated=true` ⇒ 页面须提示收窄）。
+   */
+  async getResourceLoad(
+    planVersionId: number,
+    opts: {
+      /** 必填 */
+      from: string
+      /** 必填 */
+      to: string
+      /** 只用重复键下发；≤200 个 */
+      resourceIds?: number[]
+      /** 取消信号：切版本 / 切时间窗 / 离开页面时中止上一次请求 */
+      signal?: AbortSignal
+    }
+  ): Promise<ResourceLoadResultDto> {
+    const params = new URLSearchParams()
+    params.append('from', opts.from)
+    params.append('to', opts.to)
+    for (const id of opts.resourceIds ?? []) params.append('resourceIds', String(id))
+    return apsHttp.get<ResourceLoadResultDto>({
+      url: `/api/schedule/resource-load/${planVersionId}`,
+      params,
+      timeout: 30_000,
+      signal: opts.signal
+    })
+  },
+
+  /**
+   * P05 任务清单（5号位 2026-11-16 矩阵 A4 / r14237；dev 11-17 已部署）
+   *
+   * `GET /api/schedule/tasks/{planVersionId}`
+   *
+   * ⚠️ **窗口语义 = 甘特同一件**（`GanttWindowPredicate`）：
+   *   `PlannedEndTime >= from` 且 `PlannedStartTime <= to`，
+   *   **计划时刻为 NULL 的任务恒保留**（不被静默丢弃）。
+   *   ⇒ 这里的 from/to 必须传**与甘特体完全相同**的那一对，否则两个页面的行数会打架。
+   * ⚠️ `resourceIds` 只认**重复键**（`resourceIds=1&resourceIds=2`）；
+   *   `resourceIds[]` 后端真 400、逗号写法 422 ⇒ 前端只发重复键。
+   * ⚠️ `stageCodes` / `departmentIds` 是**逗号串**（后端自己 split），不是重复键。
+   * ⚠️ `hasWorkOrder` 是**工单号列过滤**三态（缺省=不过滤 / true=有工单号 / false=无工单号），
+   *   **不是「无需 MES」分类**（权威分类标志位未建立）⇒ 调用方文案禁等同。
+   * ⚠️ `sortBy` / `sortDir` 非法 ⇒ 后端真 400（参数即纪律）⇒ 这里先按白名单过滤再发。
+   * ⚠️ `pageSize` 缺省 50、钳 ≤200；`total` = 服务端全量命中，`items` = 本页已加载。
+   */
+  async getTasks(
+    planVersionId: number,
+    opts: {
+      /** 时间窗起（naive）；不传 = 不限 */
+      from?: string
+      /** 时间窗止（naive）；不传 = 不限 */
+      to?: string
+      /** 只用重复键下发 */
+      resourceIds?: number[]
+      /** 逗号分隔的阶段码 */
+      stageCodes?: string[]
+      /** 逗号分隔的部门 Id */
+      departmentIds?: number[]
+      /** 物料编码 / 物料名称 / 任务号 三路模糊 */
+      keyword?: string
+      /** APS 计划状态（原值等值） */
+      status?: string
+      /** 三态：undefined=不过滤 / true=有 MES 工单号 / false=无 MES 工单号 */
+      hasWorkOrder?: boolean
+      /** 白名单：plannedStart / quantity / materialCode / taskNo / id */
+      sortBy?: string
+      /** asc / desc */
+      sortDir?: string
+      pageIndex?: number
+      pageSize?: number
+      /** 取消信号：切版本 / 切时间窗 / 离开页面时中止上一次请求 */
+      signal?: AbortSignal
+    }
+  ): Promise<TaskListResultDto> {
+    const params = new URLSearchParams()
+    if (opts.from) params.append('from', opts.from)
+    if (opts.to) params.append('to', opts.to)
+    for (const id of opts.resourceIds ?? []) params.append('resourceIds', String(id))
+    if (opts.stageCodes?.length) params.append('stageCodes', opts.stageCodes.join(','))
+    if (opts.departmentIds?.length) params.append('departmentIds', opts.departmentIds.join(','))
+    if (opts.keyword) params.append('keyword', opts.keyword)
+    if (opts.status) params.append('status', opts.status)
+    if (opts.hasWorkOrder !== undefined) {
+      params.append('hasWorkOrder', opts.hasWorkOrder ? 'true' : 'false')
+    }
+    if (opts.sortBy && TASK_SORT_KEYS.includes(opts.sortBy)) {
+      params.append('sortBy', opts.sortBy)
+    }
+    if (opts.sortDir && (opts.sortDir === 'asc' || opts.sortDir === 'desc')) {
+      params.append('sortDir', opts.sortDir)
+    }
+    if (opts.pageIndex && opts.pageIndex > 0) params.append('pageIndex', String(opts.pageIndex))
+    if (opts.pageSize && opts.pageSize > 0) {
+      params.append('pageSize', String(Math.min(opts.pageSize, TASK_PAGE_SIZE_CAP)))
+    }
+    return apsHttp.get<TaskListResultDto>({
+      url: `/api/schedule/tasks/${planVersionId}`,
+      params,
+      timeout: 30_000,
+      signal: opts.signal
+    })
+  },
+
+  /**
+   * P06 单任务详情（5号位 2026-11-16 矩阵 A5 / r14237）
+   *
+   * `GET /api/schedule/task/{taskId}`
+   *
+   * ⚠️ **三态分报**（禁把「不存在」说成「无权限」，反之亦然）：
+   *  - `found=false` ⇒ 该 taskId **不存在**
+   *  - `found=true && scopeDenied=true` ⇒ 任务**存在但越权**（域/部门范围不足）
+   *  - `found=true && scopeDenied=false` ⇒ 可读
+   * ⚠️ 响应里的 `shares[]` 是**逐行全量**（共享 Task 多根订单逐行给）；
+   *   `sharesProvided=false` ⇒ 后端未下发份额；`sharesProvided=true` 且空数组 ⇒ **无份额记录**（≠ 0 需求）。
+   * ⚠️ **前后依赖边与 MES 执行事实未提供**（后端不投影）⇒ 页面显「未提供」，不造。
+   */
+  async getTaskDetail(taskId: number, signal?: AbortSignal): Promise<TaskDetailResultDto> {
+    return apsHttp.get<TaskDetailResultDto>({
+      url: `/api/schedule/task/${taskId}`,
+      timeout: 30_000,
+      signal
     })
   }
 }

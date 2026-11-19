@@ -106,9 +106,24 @@ export const useRunStore = defineStore('aps.run', () => {
   const runsPageSize = ref(20)
   const runsPagedAvailable = ref(false)
   const activeVersions = ref<ActiveVersionPanel[]>([])
+  /**
+   * **最近一次批次**的域状态 —— 主视图（批次卡）用，恒跟最新批次，不受用户切换影响。
+   *
+   * ⚠️ 2026-11-17：拆解卡改成「可跟随用户选中的批次」后，这里必须与卡片那份分开 ——
+   *    否则主卡写着 #999469、域状态分布却是 #999436 的数 ⇒ 用户会把两批的结论混成一批。
+   */
+  const latestDomainStatuses = ref<RunDomainStatusItem[]>([])
+  /** 「排程域状态拆解」卡当前展示的域状态（默认 = 最近一次；用户点表格行可切到别的批次） */
   const domainStatuses = ref<RunDomainStatusItem[]>([])
-  /** 域状态对应的 Run（取最近一次）；null = 尚无可取数的 Run */
+  /** 拆解卡当前对应的批次；null = 尚无可取数的批次 */
   const domainStatusRunId = ref<number | null>(null)
+  /**
+   * 用户显式选中的批次（拆解卡跟随它）；null = 跟最近一次批次。
+   *
+   * 存整行而不是只存 Id：算「这次排产有没有登记排程域」（分母）要用行上的
+   * `expectedDomainKeys`，翻页/刷新后列表里可能已没有这一行，只存 Id 会取不到分母。
+   */
+  const selectedDomainRun = ref<RunListItem | null>(null)
   /**
    * 取数的这次 Run 是否**登记过**预期域（分母）。
    *
@@ -201,6 +216,70 @@ export const useRunStore = defineStore('aps.run', () => {
   )
 
   // ===== actions =====
+  /** 单个数据面的失败信息（页面按块提示，而不是整页报错） */
+  const failed = (section: string, err: unknown, fallback: string) =>
+    errors.value.push({
+      section,
+      message:
+        err instanceof ApiError
+          ? `[${err.code}] ${err.message}`
+          : ((err as Error)?.message ?? fallback)
+    })
+
+  /**
+   * 取一个批次的域状态。
+   *
+   * @param target 'latest' 写进 `latestDomainStatuses`（主视图用）；'card' 写进 `domainStatuses`（拆解卡用）
+   *
+   * 后端对「该 Run 没登记 ExpectedDomainKeysJson」的 run 返 404（5号位 R3 裁定：**终态**，不是故障）
+   * ⇒ 只有「有分母还 404」才进 errors[]，否则页面会把一次真故障写成「没登记要跑哪些排程域」。
+   */
+  async function fetchDomainStatus(run: RunListItem, target: 'latest' | 'card'): Promise<void> {
+    const sink = target === 'latest' ? latestDomainStatuses : domainStatuses
+    const hasDenominator = Boolean(run.expectedDomainKeys?.length)
+    try {
+      sink.value = await overviewApi.getRunDomainStatus(run.id)
+    } catch (err) {
+      sink.value = []
+      const terminalNoDenominator = err instanceof ApiError && err.code === 404 && !hasDenominator
+      if (!terminalNoDenominator) {
+        failed('排程域状态', err, `加载批次 #${run.id} 的排程域状态失败`)
+      }
+    }
+  }
+
+  /**
+   * 装载「排程域状态拆解」卡当前该显示哪一批：用户显式选中优先，否则跟最近一次。
+   *
+   * 选中的就是最近一次 ⇒ 直接复用主视图已取过的那份，不再发第二次请求。
+   */
+  async function loadDomainStatusCard(): Promise<void> {
+    const target = selectedDomainRun.value ?? latestRun.value
+    if (!target) {
+      domainStatuses.value = []
+      domainStatusRunId.value = null
+      domainStatusHasDenominator.value = false
+      return
+    }
+    domainStatusRunId.value = target.id
+    domainStatusHasDenominator.value = Boolean(target.expectedDomainKeys?.length)
+    if (target.id === latestRun.value?.id) {
+      domainStatuses.value = latestDomainStatuses.value
+      return
+    }
+    await fetchDomainStatus(target, 'card')
+  }
+
+  /**
+   * 点「最近排产记录」里的某一行 ⇒ 拆解卡切到该批次的域状态。
+   *
+   * @param run 选中的批次行；传 null = 回到最近一次
+   */
+  async function selectDomainRun(run: RunListItem | null): Promise<void> {
+    selectedDomainRun.value = run
+    await loadDomainStatusCard()
+  }
+
   /**
    * 页面数据装载。
    *
@@ -211,14 +290,6 @@ export const useRunStore = defineStore('aps.run', () => {
     error.value = null
     errors.value = []
     const targetPage = page ?? runsPage.value
-    const failed = (section: string, err: unknown, fallback: string) =>
-      errors.value.push({
-        section,
-        message:
-          err instanceof ApiError
-            ? `[${err.code}] ${err.message}`
-            : ((err as Error)?.message ?? fallback)
-      })
 
     // ---- ① Run 列表（页面主体）----
     try {
@@ -257,30 +328,26 @@ export const useRunStore = defineStore('aps.run', () => {
       failed('生效版本', err, '加载生效版本失败')
     }
 
-    // ---- ③ 域状态拆解（5号位，入参取最近一次 Run）----
+    // ---- ③ 域状态（5号位）----
+    //  ③-1 最近一次批次的域状态 → 主视图「排程域状态」分布与失败警示（**恒跟最新批次**）
+    //  ③-2 拆解卡当前批次 → 默认最近一次；用户点「最近排产记录」某一行可切到别的批次
     //  没有 runId 就不发请求（路由是 {scheduleRunId:int}）。
     //  后端对「该 Run 没登记 ExpectedDomainKeysJson」的 run 返 404（实测 run 160 如此，
     //  45 条里 37 条属此类）⇒ 走卡片里的空态，不进 errors[]、不弹全局 toast。
     const latest = latestRun.value
     if (!latest) {
+      latestDomainStatuses.value = []
       domainStatuses.value = []
       domainStatusRunId.value = null
       domainStatusHasDenominator.value = false
     } else {
-      domainStatusRunId.value = latest.id
-      domainStatusHasDenominator.value = Boolean(latest.expectedDomainKeys?.length)
-      try {
-        domainStatuses.value = await overviewApi.getRunDomainStatus(latest.id)
-      } catch (err) {
-        domainStatuses.value = []
-        // 只豁免「本来就没分母」的 404（5号位 R3 裁定：夹具 Run 不回填，404 即终态）。
-        // 有分母还 404 = 新缺陷，必须进 errors[]，不能被空态文案盖成正常。
-        const terminalNoDenominator =
-          err instanceof ApiError && err.code === 404 && !domainStatusHasDenominator.value
-        if (!terminalNoDenominator) {
-          failed('排程域状态', err, '加载排程域状态失败')
-        }
+      // 选中的批次若还在当前列表里，用新行替换旧行（状态/登记域可能已变）
+      if (selectedDomainRun.value) {
+        const again = runs.value.find((r) => r.id === selectedDomainRun.value?.id)
+        if (again) selectedDomainRun.value = again
       }
+      await fetchDomainStatus(latest, 'latest')
+      await loadDomainStatusCard()
     }
 
     // ---- ④ 策略包版本码对照（3号位）----
@@ -391,9 +458,11 @@ export const useRunStore = defineStore('aps.run', () => {
     runsPagedAvailable.value = false
     latestRun.value = null
     activeVersions.value = []
+    latestDomainStatuses.value = []
     domainStatuses.value = []
     domainStatusRunId.value = null
     domainStatusHasDenominator.value = false
+    selectedDomainRun.value = null
     strategyProfileVersionCodes.value = {}
     strategyProfileVersionLookupOk.value = true
     error.value = null
@@ -411,9 +480,11 @@ export const useRunStore = defineStore('aps.run', () => {
     runsByStartedDesc,
     latestRun,
     activeVersions,
+    latestDomainStatuses,
     domainStatuses,
     domainStatusRunId,
     domainStatusHasDenominator,
+    selectedDomainRun,
     strategyProfileVersionCodes,
     strategyProfileVersionLookupOk,
     loading,
@@ -425,6 +496,7 @@ export const useRunStore = defineStore('aps.run', () => {
     attentionRuns,
     load,
     changePage,
+    selectDomainRun,
     recoverFailedRun,
     validateDomainKeys,
     reset,

@@ -481,6 +481,16 @@ internal class PhaseFiveCompression
             };
         }
 
+        // ── check #5 物料不足/未闭合的构成需求 → 追加进未排清单（U-003 不得丢数）；其余 Task 已正常保留 ──
+        //   2026-11-19：U 的数量已在 ValidateHardResult 内**按「被删 share 的 ComponentQty」算好**
+        //   （每 seq 的 ΔU == ΔShare，与删除份额严格对平）。此处**直接追加**——即便该需求也在
+        //   Phase2/4/日历未排清单里，也必须叠加上这批被删 share 的量，否则 ΣShare+ΣU 缺这块、
+        //   内存 Inv2（PeggingOrchestrator:12279）判不过。in-memory Inv2 是按 seq 求和（非 MAX），两条叠加正确。
+        if (validationResult.MaterialInsufficientUnscheduled is { Count: > 0 } materialInsufficient)
+        {
+            unscheduledTasks.AddRange(materialInsufficient);
+        }
+
         // P0-03+P0-15修复：区分技术失败与业务Unscheduled
         // 技术失败：Routing非法、数量闭合错误、硬资源约束破坏 → Success=false
         // 业务结果：产能不足、物料太晚、DueDate无法满足 → Success=true + Unscheduled
@@ -3386,7 +3396,7 @@ internal class PhaseFiveCompression
                 return new ValidationResult
                 {
                     IsValid = false,
-                    ErrorMessage = $"TaskDependency引用的上游Task {dep.UpstreamFinalDraftId} 不存在"
+                    ErrorMessage = $"UPMISS|up={dep.UpstreamFinalDraftId}|down={dep.DownstreamFinalDraftId} TaskDependency引用的上游Task {dep.UpstreamFinalDraftId} 不存在"
                 };
             }
 
@@ -3396,7 +3406,7 @@ internal class PhaseFiveCompression
                 return new ValidationResult
                 {
                     IsValid = false,
-                    ErrorMessage = $"TaskDependency引用的下游Task {dep.DownstreamFinalDraftId} 不存在"
+                    ErrorMessage = $"DOWNMISS|up={dep.UpstreamFinalDraftId}|down={dep.DownstreamFinalDraftId} TaskDependency引用的下游Task {dep.DownstreamFinalDraftId} 不存在"
                 };
             }
 
@@ -3413,7 +3423,10 @@ internal class PhaseFiveCompression
                     //   ②「依赖配对错位」（`GenerateTaskDependencies` 等数量按下标配对，而列表按压实后的
                     //      `PlannedStartTime` 重排 ⇒ 批间交叉）—— 后者两侧的批键必然不同。
                     //   原文本前缀一字未动（`grep LPS.APS.Tests` 证无测试钉该串）。
-                    ErrorMessage = $"TaskDependency违反时间约束: 下游Task {downstreamTask.FinalDraftId} 开始时间 {downstreamTask.PlannedStartTime:yyyy-MM-dd HH:mm:ss} 早于上游Task {upstreamTask.FinalDraftId} 结束时间 {upstreamTask.PlannedEndTime:yyyy-MM-dd HH:mm:ss} + Lag {dep.LagTime}分钟"
+                    ErrorMessage = $"DEPORD|down={downstreamTask.FinalDraftId}|downStart={downstreamTask.PlannedStartTime:yyyy-MM-dd HH:mm:ss}|downSrc={downstreamTask.SourceDraftId}|downBatch={downstreamTask.ExecutionBatchDraftKey ?? "-"}|downOp={downstreamTask.StageCode}/{downstreamTask.OperationCode}|downRoute={downstreamTask.RouteCode}/{downstreamTask.PathId}"
+                   + $"|up={upstreamTask.FinalDraftId}|upEnd={upstreamTask.PlannedEndTime:yyyy-MM-dd HH:mm:ss}|upSrc={upstreamTask.SourceDraftId}|upBatch={upstreamTask.ExecutionBatchDraftKey ?? "-"}|upOp={upstreamTask.StageCode}/{upstreamTask.OperationCode}|upRoute={upstreamTask.RouteCode}/{upstreamTask.PathId}"
+                   + $"|lag={dep.LagTime} "
+                   + $"TaskDependency违反时间约束: 下游Task {downstreamTask.FinalDraftId} 开始时间 {downstreamTask.PlannedStartTime:yyyy-MM-dd HH:mm:ss} 早于上游Task {upstreamTask.FinalDraftId} 结束时间 {upstreamTask.PlannedEndTime:yyyy-MM-dd HH:mm:ss} + Lag {dep.LagTime}分钟"
                                    + $"｜上游[{upstreamTask.StageCode}/{upstreamTask.OperationCode} 源={upstreamTask.SourceDraftId} 批={upstreamTask.ExecutionBatchDraftKey ?? "null"} 路线={upstreamTask.RouteCode}/{upstreamTask.PathId}]"
                                    + $"｜下游[{downstreamTask.StageCode}/{downstreamTask.OperationCode} 源={downstreamTask.SourceDraftId} 批={downstreamTask.ExecutionBatchDraftKey ?? "null"} 路线={downstreamTask.RouteCode}/{downstreamTask.PathId}]"
                 };
@@ -3523,7 +3536,9 @@ internal class PhaseFiveCompression
         List<FinalTaskDraft> tasks,
         DomainSolveRequest request,
         HashSet<string> unscheduledDemandKeys,
-        Dictionary<string, List<(string DemandKey, decimal ShareQty)>> mergeLineage)
+        Dictionary<string, List<(string DemandKey, decimal ShareQty)>> mergeLineage,
+        ConstraintContext constraints,
+        HashSet<string>? materialRemovedDemandKeys = null)
     {
         var demandByKey = request.LogicalProductionDemands
             .GroupBy(d => d.LogicalDemandKey)
@@ -3540,11 +3555,21 @@ internal class PhaseFiveCompression
         var batchMembers = new Dictionary<(string Demand, string Stage, string Seb), List<(FinalTaskDraft Task, decimal DemandQty)>>();
         var order = new List<(string Demand, string Stage, string Seb)>();
 
+        string? firstError = null;
+
         foreach (var task in tasks)
         {
             if (task.IsVirtual) continue;   // 虚拟节点（StageTimingNode）非生产载体
             var seb = task.StageExecutionBatchDraftKey ?? task.ExecutionBatchDraftKey ?? "(no-seb)";
-            foreach (var (compositionDemand, qty) in GetTaskDemandComposition(task, demandByKey, mergeLineage))
+            var composition = GetTaskDemandComposition(task, demandByKey, mergeLineage);
+            if (composition.Count == 0)
+            {
+                // P0-04-C（2026-11-17 0号位 v1.1 §3.1）：血缘不可证 —— SourceDraftId 未知且无 merge 份额
+                //   ⇒ 该 Task 数量无归属，不得静默消失、不得混批放行。
+                firstError ??= $"BATCH_LINEAGE_UNTRUSTED: Task {task.FinalDraftId} 血缘不可证（SourceDraftId={task.SourceDraftId} 未知且无 merge 份额），数量 {task.Quantity} 无归属";
+                continue;
+            }
+            foreach (var (compositionDemand, qty) in composition)
             {
                 var key = (compositionDemand.LogicalDemandKey, task.StageCode ?? string.Empty, seb);
                 if (!batchMembers.TryGetValue(key, out var list))
@@ -3560,7 +3585,6 @@ internal class PhaseFiveCompression
         // ── L2 第二步 + L3：逐批校验 Path 一致性、编制量一致性、工序份额闭合 ──
         //   batchNet = 该批的净产出（每批只计一次，供 L1 汇总）
         var batchNet = new Dictionary<(string Demand, string Stage, string Seb), decimal>();
-        string? firstError = null;
 
         foreach (var key in order)
         {
@@ -3623,6 +3647,75 @@ internal class PhaseFiveCompression
             }
         }
 
+        // ── P0-04-A/B（2026-11-17 0号位 v1.1 §3.1）：应有 Operation / Stage 完全缺失 ──
+        //   按选定 Route+Path、从需求 StartStage/StartOperation **裁剪后的工序集**检查「应有而缺失」
+        //   （不能直接枚举整张图：切片/延续需求在起点之前的工序本来就合法不排）。
+        //   无路由图（测试夹具 / 无 Routing 需求）⇒ 跳过，不误伤。
+        var requiredStagesByDemand = new Dictionary<string, HashSet<string>>(StringComparer.Ordinal);
+        var presentStagesByDemand = new Dictionary<string, HashSet<string>>(StringComparer.Ordinal);
+        var croppedOpsCache = new Dictionary<(string Demand, string Route, long Path), List<OperationNode>>();
+
+        foreach (var key in order)
+        {
+            var members = batchMembers[key];
+            var routeCode = members[0].Task.RouteCode;
+            var pathId = members[0].Task.PathId;
+            if (string.IsNullOrEmpty(routeCode) || pathId is null) continue;
+            if (!demandByKey.TryGetValue(key.Demand, out var graphDemand)) continue;
+            if (!constraints.TryGetRoutingGraph(graphDemand.MaterialId, routeCode, pathId, out var graph) || graph is null)
+            {
+                continue;
+            }
+
+            // 从需求起点裁剪后的必需工序集，按 (Demand, Route, Path) 缓存。
+            var cacheKey = (key.Demand, routeCode, pathId.Value);
+            if (!croppedOpsCache.TryGetValue(cacheKey, out var croppedOps))
+            {
+                croppedOps = PhaseTwoInitialScheduler.GetOperationsFromStage(
+                    graphDemand.StartStageCode ?? string.Empty,
+                    graphDemand.StartOperationCode,
+                    graph, constraints, out _);
+                croppedOpsCache[cacheKey] = croppedOps;
+            }
+
+            // A：本批 Stage 的必需工序都必须有 Task（多合法 Path 工序集合不同 ⇒ 只对照本路径）。
+            var presentOps = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var m in members) presentOps.Add(m.Task.OperationCode ?? string.Empty);
+            foreach (var op in croppedOps)
+            {
+                if (!string.Equals(op.StageCode ?? string.Empty, key.Stage, StringComparison.Ordinal)) continue;
+                if (presentOps.Contains(op.OperationCode ?? string.Empty)) continue;
+                firstError ??= $"BATCH_OP_MISSING: 需求 {key.Demand} Stage {key.Stage} 执行批 {key.Seb} 缺失应有工序 {op.OperationCode}（Route={routeCode} Path={pathId}）";
+            }
+
+            // B 准备：该需求选定路径的必需 Stage 全集 + 已有 Stage 全集。
+            if (!requiredStagesByDemand.TryGetValue(key.Demand, out var reqStages))
+            {
+                reqStages = new HashSet<string>(StringComparer.Ordinal);
+                requiredStagesByDemand[key.Demand] = reqStages;
+            }
+            if (!presentStagesByDemand.TryGetValue(key.Demand, out var presStages))
+            {
+                presStages = new HashSet<string>(StringComparer.Ordinal);
+                presentStagesByDemand[key.Demand] = presStages;
+            }
+            foreach (var op in croppedOps) reqStages.Add(op.StageCode ?? string.Empty);
+            presStages.Add(key.Stage);
+        }
+
+        // B：必需 Stage 缺失（未排需求由 Unscheduled 出口承担，已排需求缺失 Stage 即失败）。
+        foreach (var kv in requiredStagesByDemand)
+        {
+            if (unscheduledDemandKeys.Contains(kv.Key)
+                || (materialRemovedDemandKeys?.Contains(kv.Key) ?? false)) continue;   // 含 check#5 缺料剔除的需求，同样不验「缺失必需 Stage」
+            presentStagesByDemand.TryGetValue(kv.Key, out var ps);
+            var missingStages = kv.Value.Where(s => ps is null || !ps.Contains(s)).ToList();
+            if (missingStages.Count > 0)
+            {
+                firstError ??= $"DEMAND_STAGE_QTY_GAP: 需求 {kv.Key} 缺失必需 Stage [{string.Join(",", missingStages)}]";
+            }
+        }
+
         // ── L1：按 (Demand, Stage) 汇总**每批净产出一次**，与该 Stage 的合法量比 ──
         var netByDemandStage = new Dictionary<(string Demand, string Stage), decimal>();
         foreach (var kv in batchNet)
@@ -3661,7 +3754,8 @@ internal class PhaseFiveCompression
 
             netByDemandStage.TryGetValue((dk, stageCode), out var actual);
 
-            var demandUnscheduled = unscheduledDemandKeys.Contains(dk);
+            var demandUnscheduled = unscheduledDemandKeys.Contains(dk)
+                || (materialRemovedDemandKeys?.Contains(dk) ?? false);   // 含 check#5 缺料剔除的需求，同样按「未排定 ⇒ 允许 ≤」处置
 
             if (demandUnscheduled)
             {
@@ -3726,6 +3820,14 @@ internal class PhaseFiveCompression
         Dictionary<string, List<(string DemandKey, decimal ShareQty)>> mergeLineage,
         IReadOnlyList<UnscheduledTaskResult> unscheduledTasks)
     {
+        // ── check #5（物料时序）「缺料→单条未排、其余继续」的收集变量（冻结 v1.42/v2.7 / v1.7 §41）──
+        //   物料不足/未闭合的 Task 不整域废，而是整条剔除 + 其全部构成需求转未排（见下方 check #5 与末尾 `return true`）。
+        var materialInsufficientTaskIds = new HashSet<string>(StringComparer.Ordinal);
+        var materialInsufficientUnscheduled = new List<UnscheduledTaskResult>();
+        // 有缺料剔除 Task 的**需求集合**（按被删 Task 的 SourceDraftId 取，**不依赖 share 是否存在**）——
+        //   供三层数量闭合判「该需求已因缺料未排定 ⇒ 允许 Σ<NetOutput」。与 U 的数量（按被删 share 算）解耦。
+        var materialRemovedDemandKeys = new HashSet<string>(StringComparer.Ordinal);
+
         // 1. N8-02 整改（2026-10-17）：验证每个 Allocation 的 **ΣShareQty ＋ ΣUnscheduledQty == ΣNetOutputQty**
         //    （改前为 `ΣShareQty == ΣNetOutputQty`）。
         //
@@ -4041,7 +4143,7 @@ internal class PhaseFiveCompression
 
         foreach (var task in tasks)
         {
-            foreach (var (compositionDemand, _) in GetTaskDemandComposition(task, demandByKeyForMaterial, mergeLineage))
+            foreach (var (compositionDemand, compositionQty) in GetTaskDemandComposition(task, demandByKeyForMaterial, mergeLineage))
             {
                 if (!constraints.MaterialAvailability.TryGetValue(compositionDemand.AllocationSequence, out var segments)
                     || segments.Count == 0)
@@ -4054,8 +4156,12 @@ internal class PhaseFiveCompression
                 decimal cumulativeQty = 0m;
                 DateTime? materialReadyTime = null;
 
-                // 该**构成需求**所需的物料数量（与调度侧同口径：`demand.NetOutputQty`）
-                var requiredQty = compositionDemand.NetOutputQty;
+                // ── 该**构成需求**所需的物料数量 = 本 Task 对该需求占的**份额**，**不是**需求整单 NetOutputQty ──
+                //   `GetTaskDemandComposition` 的元组第二元就是份额（锚点 = task.Quantity − Σ合批血缘；合批成员 = 各自 ShareQty）。
+                //   旧实现丢弃份额、改用 `compositionDemand.NetOutputQty`（整单）⇒ 拆批/合批时每一条子 Task 都被要求
+                //   「物料累计凑满整单」才许开工 ⇒ 与调度侧（按该批份额查物料）口径不一致 ⇒ 物料稍不足整单即误判「早于物料」、
+                //   整域清空。整单不拆时二者相等（份额 == NetOutputQty）⇒ 本修正对未拆/未合批需求**零行为变化**。
+                var requiredQty = compositionQty;
 
                 foreach (var segment in sortedSegments)
                 {
@@ -4075,12 +4181,114 @@ internal class PhaseFiveCompression
 
                 if (materialReadyTime.HasValue && task.PlannedStartTime < materialReadyTime.Value)
                 {
-                    return new ValidationResult
+                    // ── 冻结 v1.42/v2.7「缺料→阻断该需求、其它独立 Task 继续」＋ v1.7 §41「物料不足=Success+未排」──
+                    //   不再「整域废」：标记该 Task 整条剔除；未排 U 的数量在下方统一按「被删 share 的
+                    //   ComponentQty」算（与删除的份额严格对平，见级联块注释）。
+                    materialInsufficientTaskIds.Add(task.FinalDraftId);
+                    break;   // 本 Task 已判不足，跳出其构成循环，继续下一个 Task
+                }
+            }
+        }
+
+        // ── check #5 把「物料不足」的 Task 整条剔除 + 对应份额剔除，其余 Task 继续参与后续 #6/#7/#8 校验 ──
+        //   2026-11-18（FAMILY_CYL 离线重放 UPMISS 定位）：原实现只删「本 Task」，但 `taskDependencies`
+        //   是在删 Task **之前**（行 96 GenerateTaskDependencies）生成的 —— 删掉某上游后，其下游的依赖边
+        //   悬空指向不存在的上游 ⇒ 第 7 项判 `UPMISS`（离线重放实测：up=d635e603 被删、down=15cf937b 悬空）。
+        //   修法两层：
+        //     ① **沿依赖边向下游级联剔除**——上游产不出 ⇒ 其所有下游也产不出（与「阻断该需求、其它独立继续」一致）；
+        //     ② 依赖边只保留**两端都在场**的，删掉一切碰到被删 Task 的边（真·损坏的边——两端本就不存在——
+        //        不受此影响，仍由 #7 判 UPMISS/DOWNMISS 拦下）。
+        if (materialInsufficientTaskIds.Count > 0)
+        {
+            var removed = new HashSet<string>(materialInsufficientTaskIds, StringComparer.Ordinal);
+            bool grew = true;
+            while (grew)
+            {
+                grew = false;
+                foreach (var dep in taskDependencies)
+                {
+                    if (removed.Contains(dep.UpstreamFinalDraftId) && removed.Add(dep.DownstreamFinalDraftId))
                     {
-                        IsValid = false,
-                        ErrorMessage = $"Task {task.FinalDraftId} 开始时间 {task.PlannedStartTime:yyyy-MM-dd HH:mm:ss} 早于物料累计可用时间 {materialReadyTime.Value:yyyy-MM-dd HH:mm:ss}"
-                            + $"（需求 {compositionDemand.LogicalDemandKey}，分配批 {compositionDemand.AllocationSequence}）"
-                    };
+                        grew = true;
+                    }
+                }
+            }
+
+            // ── 2026-11-19（逐条明细定位）：缺料剔除后，对**每个受影响的 AllocationSequence** 做 U 对账 ──
+            //   原实现按 cq / 按被删 share 的 SourceDraftId 归 U，遇合批/多切片归属错 ⇒ 一个 Net=20 的需求
+            //   记出 U=30（把别人的份额算它头上）、无 share 的需求又整条漏报（实测 seq=258628 U=30；
+            //   seq=654493 Net=20 却 0 share 0 U）。
+            //   修法（**数学保证闭合**）：对每个受影响 seq，
+            //     material U = Net(seq) − Σ存活Share(seq) − Σ已报U(seq)  （残余缺口；>0 才补）
+            //   ⇒ 该 seq 的 ΣShare + ΣU(已报U+material) == Net 恒成立；无 share 的也补得上。
+            var taskSourceById = new Dictionary<string, string>(StringComparer.Ordinal);
+            foreach (var t in tasks)
+            {
+                if (!string.IsNullOrEmpty(t.FinalDraftId) && !string.IsNullOrEmpty(t.SourceDraftId))
+                    taskSourceById[t.FinalDraftId] = t.SourceDraftId;
+            }
+            // 被删 Task 的所属需求 → 记入「缺料剔除需求集合」（供三层闭合判未排定，与 U 数量解耦）。
+            foreach (var tid in removed)
+            {
+                if (taskSourceById.TryGetValue(tid, out var removedDk) && !string.IsNullOrEmpty(removedDk))
+                    materialRemovedDemandKeys.Add(removedDk);
+            }
+
+            // 受影响 seq：被删 share 的 seq ∪ 被删 Task 所属需求的 seq。
+            var affectedSeq = new HashSet<long>();
+            foreach (var s in allocationShares)
+            {
+                if (removed.Contains(s.FinalDraftId)) affectedSeq.Add(s.AllocationSequence);
+            }
+            foreach (var tid in removed)
+            {
+                if (taskSourceById.TryGetValue(tid, out var dk2)
+                    && demandByKeyForMaterial.TryGetValue(dk2, out var dm2))
+                {
+                    affectedSeq.Add(dm2.AllocationSequence);
+                }
+            }
+
+            tasks.RemoveAll(t => removed.Contains(t.FinalDraftId));
+            allocationShares.RemoveAll(s => removed.Contains(s.FinalDraftId));
+            taskDependencies.RemoveAll(d =>
+                removed.Contains(d.UpstreamFinalDraftId) || removed.Contains(d.DownstreamFinalDraftId));
+
+            if (affectedSeq.Count > 0)
+            {
+                var netBySeq = request.LogicalProductionDemands
+                    .GroupBy(d => d.AllocationSequence).ToDictionary(g => g.Key, g => g.Sum(d => d.NetOutputQty));
+                var surviveShareBySeq = allocationShares
+                    .GroupBy(s => s.AllocationSequence).ToDictionary(g => g.Key, g => g.Sum(s => s.ComponentQty));
+                var keyToSeq = request.LogicalProductionDemands
+                    .Where(d => d.LogicalDemandKey is not null)
+                    .GroupBy(d => d.LogicalDemandKey!, StringComparer.Ordinal)
+                    .ToDictionary(g => g.Key, g => g.First().AllocationSequence, StringComparer.Ordinal);
+                var reportedUBySeq = new Dictionary<long, decimal>();
+                foreach (var u in unscheduledTasks)
+                {
+                    if (u.UnscheduledQty <= 0m) continue;
+                    if (keyToSeq.TryGetValue(u.DraftId, out var sq))
+                        reportedUBySeq[sq] = reportedUBySeq.GetValueOrDefault(sq) + u.UnscheduledQty;
+                }
+                var repKeyBySeq = request.LogicalProductionDemands
+                    .Where(d => d.LogicalDemandKey is not null)
+                    .GroupBy(d => d.AllocationSequence).ToDictionary(g => g.Key, g => g.First().LogicalDemandKey!);
+
+                foreach (var seq in affectedSeq)
+                {
+                    if (!netBySeq.TryGetValue(seq, out var net)) continue;
+                    var survShare = surviveShareBySeq.GetValueOrDefault(seq);
+                    var reportedU = reportedUBySeq.GetValueOrDefault(seq);
+                    var needed = net - survShare - reportedU;
+                    if (needed <= 0.001m) continue;
+                    if (!repKeyBySeq.TryGetValue(seq, out var repKey) || string.IsNullOrEmpty(repKey)) continue;
+                    materialInsufficientUnscheduled.Add(new UnscheduledTaskResult
+                    {
+                        DraftId = repKey,
+                        Reason = "PHASE5_MATERIAL_INSUFFICIENT",
+                        UnscheduledQty = needed,
+                    });
                 }
             }
         }
@@ -4161,6 +4369,13 @@ internal class PhaseFiveCompression
         string? firstClosureError = null;
         Dictionary<string, List<FinalTaskDraft>>? tasksByDemandForDiag = null;
 
+        // 2026-11-18（FAMILY_CYL 离线重放 DEMAND_STAGE_QTY_GAP 定位）：check#5 剔除的缺料 Task（含级联下游）
+        //   所属需求，实际已「未排」——但其键不在 `unscheduledDemandKeys`（那是剔除之前算的）。
+        //   不并入 ⇒ 第 8 项把「因缺料少排」误判成「已排却缺量」硬拒（实测 999561_256305/TJ_ASSY 10<20）。
+        //   并入后走「未排定 ⇒ 允许 ≤」（仍保留 `> expectedQty` 的超产拦截）。
+        //   ⚠ 集合 `materialRemovedDemandKeys` 在方法头声明、在 check#5 剔除块内按「被删 Task 的 SourceDraftId」
+        //     填充（不依赖 share 是否存在）——此处不再重复声明。
+
         foreach (var demandGroup in compositionByDemandOp.GroupBy(kvp => kvp.Key.DemandKey))
         {
             if (!demandByKeyForClosure.TryGetValue(demandGroup.Key, out var closureDemand))
@@ -4169,7 +4384,8 @@ internal class PhaseFiveCompression
             }
 
             var expectedQty = closureDemand.NetOutputQty;
-            var demandIsUnscheduled = unscheduledDemandKeys.Contains(demandGroup.Key);
+            var demandIsUnscheduled = unscheduledDemandKeys.Contains(demandGroup.Key)
+                || (materialRemovedDemandKeys?.Contains(demandGroup.Key) ?? false);
             SolverDiagnostics.ClosureBreakRecord? record = null;
 
             foreach (var opKvp in demandGroup)
@@ -4241,7 +4457,7 @@ internal class PhaseFiveCompression
         //     它把「一条需求拆多批、各批选不同合法 Path」误判成失败（FAMILY_CYL 200 条即此形态）。
         //     但仍保留收集，因为它能给出「哪些需求的工序量对不上」的清单，便于定位。
         //   ⇒ 真正的放行/拦截由 `ValidateDemandStageClosure` 的三层（L2 批完整链 / L1 需求Stage净量 / L3 工序份额）决定。
-        var threeLayerResult = ValidateDemandStageClosure(tasks, request, unscheduledDemandKeys, mergeLineage);
+        var threeLayerResult = ValidateDemandStageClosure(tasks, request, unscheduledDemandKeys, mergeLineage, constraints, materialRemovedDemandKeys);
         if (threeLayerResult is not null)
         {
             if (firstClosureError is not null)
@@ -4256,7 +4472,56 @@ internal class PhaseFiveCompression
             return threeLayerResult;
         }
 
-        return new ValidationResult { IsValid = true };
+        // ── check #9（0号位 v1.2 §二.3/§二.4，2026-11-19 落地）：**新增可执行批净量必须整数** ──
+        //   范围＝**非续作需求（`IsContinuation=false`）且需求净量为整数**：
+        //     这类需求若被拆出小数批（如 `1→0.5+0.5`、`13→4.3333`），一律硬拒，不得靠取整/放大容差掩盖。
+        //   豁免＝①A/B 续作需求的冻结小数剩余（如 13.5，不得篡改既存事实）；
+        //          ②`PlannedProcessQty`（Stage 良率投入侧）允许小数 —— 本项只看 `Quantity`（净产出侧）。
+        //   ⚠ **需求净量本身为小数**（经检测不是 n 等分伪影，如 14.7540）的处理口径冻结尚未给出，
+        //     本项**暂不判**该情形（另行提请 0号位 裁决），避免把真实跑批里那批任务一次性打红。
+        var integerNetDemandKeys = request.LogicalProductionDemands
+            .Where(d => !d.IsContinuation
+                        && d.NetOutputQty > 0m
+                        && d.NetOutputQty == decimal.Truncate(d.NetOutputQty))
+            .Select(d => d.LogicalDemandKey)
+            .ToHashSet(StringComparer.Ordinal);
+
+        foreach (var t in tasks)
+        {
+            if (string.IsNullOrEmpty(t.SourceDraftId) || !integerNetDemandKeys.Contains(t.SourceDraftId))
+                continue;
+            if (t.Quantity == decimal.Truncate(t.Quantity))
+                continue;
+            return new ValidationResult
+            {
+                IsValid = false,
+                ErrorMessage = $"FRACTIONAL_EXECUTION_BATCH_QTY|task={t.FinalDraftId}|demand={t.SourceDraftId}"
+                                + $"|batch={t.ExecutionBatchDraftKey ?? "-"}|qty={t.Quantity}"
+            };
+        }
+
+        // 2026-11-19：**按需求去重**——check#5 每删一个 Task 加一条、级联再各加一条，一个 N 工序需求全删
+        //   会产生 N 条同 DraftId 的未排行。§17.4 数量闭合是**需求级**（一需求一账行）；重复行被落库侧
+        //   按需求把 Q、S 各累加 N 次 ⇒ `uBase = N×(Q−S)` ⇒ U 放大成 N 倍 ⇒ Inv2 超（真库实测 3 工序需求
+        //   U 恰为 3×(Q−S)，且 check#5 逐 Task 追加、级联再追加，正是 3 条重复的来源）。
+        //   去重口径：同 DraftId 合并为一条，UnscheduledQty 求和（= 该需求被剔除份额总和）。
+        var dedupedMaterialUnscheduled = materialInsufficientUnscheduled.Count > 0
+            ? materialInsufficientUnscheduled
+                .GroupBy(u => u.DraftId, StringComparer.Ordinal)
+                .Select(g => new UnscheduledTaskResult
+                {
+                    DraftId = g.Key,
+                    Reason = g.First().Reason,
+                    UnscheduledQty = g.Sum(x => x.UnscheduledQty),
+                })
+                .ToList()
+            : null;
+
+        return new ValidationResult
+        {
+            IsValid = true,
+            MaterialInsufficientUnscheduled = dedupedMaterialUnscheduled
+        };
     }
 
     /// <summary>
@@ -4293,5 +4558,12 @@ internal class PhaseFiveCompression
     {
         public bool IsValid { get; set; }
         public string ErrorMessage { get; set; } = string.Empty;
+
+        /// <summary>
+        /// check #5（物料时序）判「物料不足/未闭合」时，不整域废，而是把涉事 Task 的**全部构成需求**转为未排
+        /// （冻结文档 v1.42/v2.7「缺料→阻断该需求、其它独立 Task 继续」＋ v1.7 §41「产能/物料不足=Success+未排」，U-003 不得丢数）。
+        /// Compress 据此在保留其它 Task 的前提下，把本集合追加进 `UnscheduledTasks`。
+        /// </summary>
+        public List<UnscheduledTaskResult>? MaterialInsufficientUnscheduled { get; set; }
     }
 }

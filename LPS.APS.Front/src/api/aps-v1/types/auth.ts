@@ -15,6 +15,10 @@
  * Phase A 范围：仅 DTO 类型对齐。消费方（store/permission.ts/views/Login）暂未切换，
  *   旧字段（username / displayName / dataScope.* 嵌套 / expiresIn）保留 @deprecated 别名，
  *   后续 Phase B（权限码迁移）+ Phase C（scope 扁平化）再统一替换。
+ *
+ * 2026-11-18：补「改自己资料 / 改密码」两组 DTO
+ *   （后端 `UpdateProfileRequest` / `UpdateProfileResponse` / `ChangePasswordRequest`）
+ *   —— 依据 3号位《个人中心改资料与改密码端点落码_回执 v1.0_20261117》。
  */
 
 import type { DomainKey, RoleKey } from './common'
@@ -82,6 +86,49 @@ export interface UserInfo {
   domains: DomainKey[]
   /** 业务范围：资源组织组范围值集合（兼容字段，V1 多为空） */
   resourceOrgGroups: string[]
+}
+
+// ==================== 改自己资料 / 改密码（2026-11-18） ====================
+
+/**
+ * 改自己资料请求 — 对齐后端 `LPS.APS.Web/Dto/Auth/UpdateProfileRequest.cs`
+ *
+ * ⚠️ 后端语义（`AuthService.UpdateProfileAsync`）：
+ *  - `userName`：**空 / 空白 ⇒ 保持原值**（不是清空！）；trim 后长度 ≤ 50，超了报 400
+ *    「姓名长度不能超过 50 位」；
+ *  - `email` / `phoneNumber`：**空白 ⇒ 清空（存 null）**，不做格式校验；
+ *  - 登录名 / 状态 / 角色 / 范围**不可自助改**（归 auth.manage 管理面）。
+ *
+ * 依据 3号位 2026-11-17《个人中心改资料与改密码端点落码_回执 v1.0_20261117》。
+ */
+export interface UpdateProfileRequest {
+  /** 显示名；空 = 保持原值 */
+  userName?: string | null
+  /** 邮箱；空 = 清空 */
+  email?: string | null
+  /** 手机号；空 = 清空 */
+  phoneNumber?: string | null
+}
+
+/** 改自己资料响应 — 对齐后端 `UpdateProfileResponse`（回显改后的三项） */
+export interface UpdateProfileResult {
+  userName: string
+  email?: string | null
+  phoneNumber?: string | null
+}
+
+/**
+ * 修改密码请求 — 对齐后端 `ChangePasswordRequest`
+ *
+ * ⚠️ 后端规则（`AuthService.ChangePasswordAsync`）：
+ *  - 旧密码必须正确（错 ⇒ 400「旧密码不正确」）；
+ *  - 新密码 8~128 位（错 ⇒ 400「新密码长度须为 8~128 位」）；
+ *  - 新密码 ≠ 旧密码、≠ 登录名；
+ *  - 成功后**清 RefreshToken**（旧会话失效）⇒ 前端必须清本地 token 并跳登录页。
+ */
+export interface ChangePasswordRequest {
+  oldPassword: string
+  newPassword: string
 }
 
 // ==================== 兼容层（Phase B/C 期间临时保留） ====================

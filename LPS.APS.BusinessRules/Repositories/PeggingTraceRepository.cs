@@ -246,12 +246,32 @@ ORDER BY COUNT(*) DESC";
             commitmentSql, summaryParams, CommandType.Text, DatabaseId.APS, commandTimeout: 10))
             .ToList();
 
+        // Q3（11-16 4号位矩阵回执 §四.Q3）：「源批缺」**追溯侧显式位**——判据=供给事实现批在否
+        // （D05 定稿：IsActive=现批代理）。姿势注记：现批恒为最新插入段（实库 MIN(active Id)=5.35M、
+        // 全表 85 万），**倒序 TOP 1=0ms**；正向 EXISTS 全扫 ≈217ms 禁用。探测失败= null（未判定），
+        // 不把故障说成"没批次"（三态纪律，同 isMatched 口径）。
+        bool? batchPresent = null;
+        string? batchNo = null;
+        try
+        {
+            batchNo = await _connectionManager.QueryFirstOrDefaultAsync<string>(
+                @"SELECT TOP 1 BatchNo FROM SupplyFact_Pipeline WHERE IsActive = 1 ORDER BY Id DESC",
+                null, CommandType.Text, DatabaseId.APS, commandTimeout: 5);
+            batchPresent = batchNo is not null;
+        }
+        catch
+        {
+            // 保持 null：前端此态显示"未判定"，不落"源批缺"文案。
+        }
+
         return new PeggingTraceSummaryDto
         {
             PlanVersionId = planVersionId,
             TotalAllocations = total,
             SupplyTypeCounts = supplyTypeCounts,
-            CommitmentStatusCounts = commitmentCounts
+            CommitmentStatusCounts = commitmentCounts,
+            SupplyBatchPresent = batchPresent,
+            SupplyBatchNo = batchNo
         };
     }
 }

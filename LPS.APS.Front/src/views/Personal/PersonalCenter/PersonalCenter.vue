@@ -1,97 +1,121 @@
 <script setup lang="ts">
+/**
+ * APS V1 4号位 — 个人中心
+ *
+ * 2026-11-18：整块换成后端真实数据（此前是**假数据**：写死的 admin / 18888888888 / 502431556@qq.com）
+ *   —— 依据 3号位《个人中心改资料与改密码端点落码_回执 v1.0_20261117》Q3 / §四。
+ *   - 左侧读 `GET /api/auth/me`（`userCode` / `userName` / `roles`），角色码翻中文（`roleLabelOf`）。
+ *   - Q3：**撤头像入口**（本轮后端不出头像端点，不留假按钮）⇒ 头像只作静态展示，不可点。
+ *   - §四-1：`/me` **仍不含** Email / PhoneNumber ⇒ 左侧这两项在页加载时显示「未提供」，
+ *     改完资料后用 R1 回包里的值刷新（刷新页面后又回到「未提供」——这是后端当前的能力边界，不是假数据）。
+ *   - §四-2：改完资料姓名来自 JWT claim ⇒ 已在 EditInfo 里重签 token，本页姓名按回包值立即刷新。
+ */
+
 import { ContentWrap } from '@/components/ContentWrap'
-import { ref, unref } from 'vue'
-import { ElDivider, ElImage, ElTag, ElTabPane, ElTabs, ElButton, ElMessage } from 'element-plus'
+import { onMounted, reactive, ref } from 'vue'
+import { ElAlert, ElDivider, ElImage, ElTag, ElTabPane, ElTabs } from 'element-plus'
 import defaultAvatar from '@/assets/imgs/avatar.jpg'
-import UploadAvatar from './components/UploadAvatar.vue'
-import { Dialog } from '@/components/Dialog'
 import EditInfo from './components/EditInfo.vue'
 import EditPassword from './components/EditPassword.vue'
+import { roleLabelOf, type RoleKey, type UpdateProfileResult } from '@/api/aps-v1'
+import { useApsAuthStore } from '@/store/modules/aps/auth'
 
-const userInfo = ref()
-const fetchDetailUserApi = async () => {
-  // 这里可以调用接口获取用户信息
-  const data = {
-    id: 1,
-    username: 'admin',
-    realName: 'admin',
-    phoneNumber: '18888888888',
-    email: '502431556@qq.com',
-    avatarUrl: '',
-    roleList: ['超级管理员']
+const apsAuth = useApsAuthStore()
+
+/** 左侧展示的资料（只放后端真值；没拿到的显示「未提供」） */
+const profile = reactive({
+  userCode: '',
+  userName: '',
+  email: '',
+  phoneNumber: '',
+  roles: [] as RoleKey[]
+})
+
+const loadError = ref('')
+
+async function loadProfile(): Promise<void> {
+  loadError.value = ''
+  await apsAuth.loadUserInfo()
+  const info = apsAuth.userInfo
+  if (!info) {
+    loadError.value = apsAuth.error || '没取到当前用户信息，请稍后刷新重试'
+    return
   }
-  userInfo.value = data
+  profile.userCode = info.userCode
+  profile.userName = info.userName
+  profile.roles = info.roles ?? []
+  // /me 不返回邮箱/手机号（3号位 §四-1）⇒ 页加载时留空，显示「未提供」
 }
-fetchDetailUserApi()
 
 const activeName = ref('first')
 
-const dialogVisible = ref(false)
+onMounted(() => {
+  void loadProfile()
+})
 
-const uploadAvatarRef = ref<ComponentRef<typeof UploadAvatar>>()
-const avatarLoading = ref(false)
-const saveAvatar = async () => {
-  try {
-    avatarLoading.value = true
-    const base64 = unref(uploadAvatarRef)?.getBase64()
-    console.log(base64)
-    // 这里可以调用修改头像接口
-    fetchDetailUserApi()
-    ElMessage.success('修改成功')
-    dialogVisible.value = false
-  } catch (error) {
-    console.log(error)
-  } finally {
-    avatarLoading.value = false
-  }
+/** 改资料成功：左栏用后端回包的三项刷新（邮箱/手机号只有这里才有真值） */
+function onProfileUpdated(result: UpdateProfileResult): void {
+  profile.userName = result.userName || profile.userName
+  profile.email = result.email ?? ''
+  profile.phoneNumber = result.phoneNumber ?? ''
 }
 </script>
 
 <template>
   <div class="flex w-100% h-100%">
     <ContentWrap title="个人信息" class="w-400px">
+      <ElAlert
+        v-if="loadError"
+        type="error"
+        :closable="false"
+        show-icon
+        title="加载失败"
+        class="mb-12px"
+      >
+        {{ loadError }}
+      </ElAlert>
+
       <div class="flex justify-center items-center">
-        <div
-          class="avatar w-[150px] h-[150px] relative cursor-pointer"
-          @click="dialogVisible = true"
-        >
-          <ElImage
-            class="w-[150px] h-[150px] rounded-full"
-            :src="userInfo?.avatarUrl || defaultAvatar"
-            fit="fill"
-          />
+        <div class="avatar w-[150px] h-[150px]">
+          <ElImage class="w-[150px] h-[150px] rounded-full" :src="defaultAvatar" fit="fill" />
         </div>
       </div>
       <ElDivider />
       <div class="flex justify-between items-center">
         <div>账号：</div>
-        <div>{{ userInfo?.username }}</div>
+        <div>{{ profile.userCode || '未提供' }}</div>
       </div>
       <ElDivider />
       <div class="flex justify-between items-center">
-        <div>昵称：</div>
-        <div>{{ userInfo?.realName }}</div>
+        <div>姓名：</div>
+        <div>{{ profile.userName || '未提供' }}</div>
       </div>
       <ElDivider />
       <div class="flex justify-between items-center">
         <div>手机号码：</div>
-        <div>{{ userInfo?.phoneNumber ?? '-' }}</div>
+        <div>{{ profile.phoneNumber || '未提供' }}</div>
       </div>
       <ElDivider />
       <div class="flex justify-between items-center">
         <div>用户邮箱：</div>
-        <div>{{ userInfo?.email ?? '-' }}</div>
+        <div>{{ profile.email || '未提供' }}</div>
       </div>
       <ElDivider />
       <div class="flex justify-between items-center">
         <div>所属角色：</div>
         <div>
-          <template v-if="userInfo?.roleList?.length">
-            <ElTag v-for="item in userInfo?.roleList || []" :key="item" class="ml-2 mb-w"
-              >{{ item }}
+          <template v-if="profile.roles.length">
+            <ElTag
+              v-for="item in profile.roles"
+              :key="item"
+              class="ml-2 mb-w"
+              type="primary"
+              effect="plain"
+            >
+              {{ roleLabelOf(item) }}
             </ElTag>
           </template>
-          <template v-else>-</template>
+          <template v-else>未提供</template>
         </div>
       </div>
       <ElDivider />
@@ -99,7 +123,7 @@ const saveAvatar = async () => {
     <ContentWrap title="基本资料" class="flex-[3] ml-20px">
       <ElTabs v-model="activeName">
         <ElTabPane label="基本信息" name="first">
-          <EditInfo :user-info="userInfo" />
+          <EditInfo :profile="profile" @updated="onProfileUpdated" />
         </ElTabPane>
         <ElTabPane label="修改密码" name="second">
           <EditPassword />
@@ -107,42 +131,10 @@ const saveAvatar = async () => {
       </ElTabs>
     </ContentWrap>
   </div>
-
-  <Dialog v-model="dialogVisible" title="修改头像" width="800px">
-    <UploadAvatar ref="uploadAvatarRef" :url="userInfo?.avatarUrl || defaultAvatar" />
-
-    <template #footer>
-      <ElButton type="primary" :loading="avatarLoading" @click="saveAvatar"> 保存 </ElButton>
-      <ElButton @click="dialogVisible = false">关闭</ElButton>
-    </template>
-  </Dialog>
 </template>
 
 <style lang="less" scoped>
 .avatar {
   position: relative;
-
-  &::after {
-    position: absolute;
-    top: 0;
-    left: 0;
-    display: flex;
-    width: 100%;
-    height: 100%;
-    font-size: 50px;
-    color: #fff;
-    background-color: rgb(0 0 0 / 40%);
-    border-radius: 50%;
-    content: '+';
-    opacity: 0;
-    justify-content: center;
-    align-items: center;
-  }
-
-  &:hover {
-    &::after {
-      opacity: 1;
-    }
-  }
 }
 </style>

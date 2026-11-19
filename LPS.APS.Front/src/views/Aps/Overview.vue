@@ -162,6 +162,26 @@ const domainLabel = (status: string): string =>
   RUN_DOMAIN_STATUS_LABELS[status as RunDomainStatus] ?? status
 const domainTag = (status: string) => RUN_DOMAIN_STATUS_TAG[status as RunDomainStatus] ?? 'info'
 
+/* ===== 三态第三类：已启用但当前无正式计划版本的排程域 =====
+ *
+ * 5号位 2026-11-17 复函B6 §三：CYL 的旧 ACTIVE 版已被归档、新版还在计算 ⇒ 该域
+ * **既没有正式计划版本，也不是失败**，属于第三态，必须显式说「该域当前无正式计划版本」，
+ * 不能拿 0 或空列表说成「没有任务」。
+ *
+ * 取域范围 = Domain 字典里**已启用**且在业务范围内的域（domainStore.activeDomains，已含 scope 过滤）
+ *   减去 active-plan 里带 ACTIVE 版本的域。
+ * ⚠ active-plan 取数失败时不许落到第三态（那会把「取不到」说成「没有」）⇒ 取失败即不显示本块，
+ *   顶部已有该端点的错误条。
+ */
+const activePlanFailed = computed(() => errors.value.some((e) => e.section === '生效版本'))
+const domainsWithoutFormalVersion = computed(() => {
+  if (activePlanFailed.value) return []
+  const withActive = new Set(activeVersions.value.map((v) => v.domainKey))
+  return domainStore.activeDomains
+    .filter((d) => !withActive.has(d.domainKey))
+    .map((d) => ({ domainKey: d.domainKey, name: humanLabel(d.domainKey) }))
+})
+
 /* ===== 资源 ===== */
 const bottleneckResources = computed(() => resources.value.filter((r) => r.isBottleneck))
 
@@ -287,6 +307,24 @@ onMounted(refresh)
                 <span class="field-scope">（整个计划区间内）</span>
               </ElDescriptionsItem>
             </ElDescriptions>
+          </div>
+        </div>
+        <!-- 三态第三类：已启用但当前无正式计划版本的排程域（5号位 11-17 复函B6 §三） -->
+        <div v-if="domainsWithoutFormalVersion.length" class="no-formal-version">
+          <p class="panel-hint">
+            以下
+            {{ domainsWithoutFormalVersion.length }}
+            个排程域当前没有正式计划版本，故未出现在上方版本卡里
+          </p>
+          <div class="no-formal-version-list">
+            <div
+              v-for="d in domainsWithoutFormalVersion"
+              :key="d.domainKey"
+              class="no-formal-version-item"
+            >
+              <span class="domain-name">{{ d.name }}</span>
+              <span class="domain-state">该域当前无正式计划版本</span>
+            </div>
           </div>
         </div>
       </ElCard>
@@ -553,6 +591,40 @@ onMounted(refresh)
   /* 口径标注（跟数值贴在一起，避免读者把它当成另一个字段名） */
   .field-scope {
     font-size: 12px;
+    color: #94a3b8;
+  }
+}
+
+/* 三态第三类：无正式计划版本的排程域 */
+.no-formal-version {
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px dashed #e2e8f0;
+
+  &-list {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-top: 8px;
+  }
+
+  &-item {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 10px;
+    background: #f8fafc;
+    border: 1px solid #e2e8f0;
+    border-radius: 4px;
+    font-size: 12px;
+  }
+
+  .domain-name {
+    color: #1e293b;
+    font-weight: 600;
+  }
+
+  .domain-state {
     color: #94a3b8;
   }
 }

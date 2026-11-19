@@ -312,7 +312,11 @@ public class GanttTaskDto
 
     /// <summary>
     /// 下发状态（TaskDispatch.DispatchStatus——"是否已正式下发 MES"的权威载体，解 07:3721 状态0 的 PLANNED/RELEASED 歧义）。
-    /// 无下发记录 ⇒ 缺键=未下发；dev 现况 TaskDispatch 0 行、键整体缺省属真实终态。11-05 B2② 定稿。
+    /// **11-18 注释校准（原 11-05 B2② 两处过期/违 Q-d）**：①"缺键=未下发"措辞作废——缺键=**不在下发队列**，
+    /// ≠「未下发」（队列资格权威未建=Q-a；消费环留痕缺口=Q-d，0号位明令禁由留痕反推）；
+    /// ②"dev 现况 0 行"过期——现 TaskDispatch 172,262 行（999473 域 2,694 Task 带 CREATED）。
+    /// 键名注记（R3″）：本字段=gantt 历史契约键 `dispatchStatus`（已消费不改名）；A4/P05 侧终名 `mesDispatchStatus`——
+    /// 同一权威 TaskDispatch.DispatchStatus 两键名，统一归 V1.1 破坏窗（0号位 核准），过渡期词典映射在案。
     /// </summary>
     public string? DispatchStatus { get; set; }
 

@@ -22,6 +22,12 @@
  *  - 供给构成整块下线；MES 资格只用 U16（`positionType === 'UNLOCATED'`）数据驱动判据
  *  - 位置问题码**原值展示**（冻结无值域 ⇒ 不自造中文词典，已出函 5号位要词典）
  *  - `sourceKey` 不渲染（5号位 10-17 更正：它是兜底过程标记，不是源单据键）
+ *
+ * 11-16 接 5号位《P01～P13＋采购协同 页面—接口实施矩阵 v0.1》A10 行：
+ *  - `INTERPLANT_TRANSIT`（跨厂在途）**整表 0 行**（D05-09：跨厂在途不走位置快照）
+ *    ⇒ 这一类**查不到是正常的**，不是故障、不报错；
+ *    页面如实写「不经位置快照承载」（在途事实由供给侧承载），并把这一类**不硬塞进分布卡**
+ *    （分布卡只画后端给的那几类；补一个 0 会把「明确零」说成「有这一类但没数据」）。
  */
 
 import { computed, onMounted } from 'vue'
@@ -66,6 +72,7 @@ const {
   detailLoading,
   error,
   detailError,
+  summaryFailed,
   totalPositions,
   unlocatedCount,
   unlocatedQty,
@@ -90,7 +97,11 @@ const POSITION_META: Record<
   STAGE_WIP: { label: '在制中（冻结名）', hint: '已经在车间里做着的货', tag: 'success' },
   FIRST_STAGE_PENDING: { label: '首工序待开始', hint: '还没开工，等着上线', tag: 'primary' },
   XC: { label: '线边仓', hint: '工位旁边的小仓', tag: 'info' },
-  INTERPLANT_TRANSIT: { label: '跨厂在途', hint: '从一个厂运到另一个厂的路上的货', tag: 'primary' },
+  INTERPLANT_TRANSIT: {
+    label: '跨厂在途',
+    hint: '从一个厂运到另一个厂的路上的货；这类货由供给侧承载，不进位置快照',
+    tag: 'primary'
+  },
   UNLOCATED: { label: '无法定位', hint: '找不到具体位置，这批货不能下发车间', tag: 'danger' },
   // 冻结有、后端未实现；实库 0 行，V1 可能恒不出现
   WAITING_INBOUND: { label: '等待入库', hint: '货已经到了，还没入库', tag: 'warning' }
@@ -120,10 +131,32 @@ function isUnlocated(t: string): boolean {
   return t === UNLOCATED
 }
 
+/* ===== 跨厂在途：不经位置快照承载（矩阵 A10）=====
+ * 这一类在位置快照里整表 0 行（D05-09）⇒ 筛它必然空，**不是故障**。
+ * 页面据此说清「这一类查不到是正常的」，不报错、不显示成「没有匹配的数据」。
+ */
+const INTERPLANT_TRANSIT = 'INTERPLANT_TRANSIT'
+const interplantSelected = computed(() => filter.value.positionType === INTERPLANT_TRANSIT)
+
 /* ===== 展示口径 ===== */
-/** 这个版本到底有没有位置数据（0 条 = 选错了版本，不是页面坏了） */
+/**
+ * 这个版本到底有没有位置数据（0 条 = 选错了版本，不是页面坏了）
+ *
+ * ⚠️ 汇总取不到时（`summaryFailed`）**不能说成「没有位置数据」**：
+ *   「取不到」是未知，「没有」是明确零（§0.2 ②）⇒ 空态分两句话说。
+ */
 const hasPositions = computed(() => (summary.value?.totalPositions ?? 0) > 0)
 const piCount = computed(() => summary.value?.piCount ?? 0)
+/** 指标条数字：汇总取不到时显「未提供」，不显 0（§0.2 ②） */
+const piCountText = computed(() =>
+  summary.value ? piCount.value.toLocaleString('zh-CN') : '未提供'
+)
+const unlocatedCountText = computed(() =>
+  summary.value ? unlocatedCount.value.toLocaleString('zh-CN') : '未提供'
+)
+const unlocatedQtyText = computed(() =>
+  summary.value ? unlocatedQty.value.toLocaleString('zh-CN') : '未提供'
+)
 /** 当前选中版本的版本码（抽屉里显示版本码，不显示内部 Id） */
 const currentVersionLabel = computed(() => {
   const v = versions.value.find((x) => x.id === planVersionId.value)
@@ -206,7 +239,7 @@ onMounted(async () => {
     <div v-if="showKpi" class="kpi-strip">
       <div class="kpi-pill">
         <span class="pill-label">生产指示</span>
-        <span class="pill-val">{{ piCount.toLocaleString() }}</span>
+        <span class="pill-val">{{ piCountText }}</span>
       </div>
       <button
         type="button"
@@ -215,9 +248,7 @@ onMounted(async () => {
         @click="onPositionTypeClick(UNLOCATED)"
       >
         <span class="pill-label">无法定位（条 / 数量）</span>
-        <span class="pill-val"
-          >{{ unlocatedCount.toLocaleString() }} / {{ unlocatedQty.toLocaleString() }}</span
-        >
+        <span class="pill-val">{{ unlocatedCountText }} / {{ unlocatedQtyText }}</span>
       </button>
       <span class="kpi-caption">数字按所选版本统计；点「无法定位」只看定位不到的那批。</span>
     </div>
@@ -274,13 +305,15 @@ onMounted(async () => {
       <ElEmpty description="请先选择一个计划版本" />
     </ElCard>
 
-    <!-- ===== 这个版本没有位置数据 ===== -->
+    <!-- ===== 这个版本没有位置数据（汇总取不到时另说，见 summaryFailed）===== -->
     <ElCard v-else-if="!hasPositions && !listLoading" class="panel">
       <ElEmpty
         :description="
-          currentVersionFailed
-            ? '这个计划版本排产失败，没有位置数据，换个版本看看'
-            : '这个计划版本还没有位置数据，换个版本看看'
+          summaryFailed
+            ? '这个计划版本的位置汇总没取到（上面有错误提示），所以不知道有没有位置数据；过一会儿再试，或换个版本看看'
+            : currentVersionFailed
+              ? '这个计划版本排产失败，没有位置数据，换个版本看看'
+              : '这个计划版本还没有位置数据，换个版本看看'
         "
       />
     </ElCard>
@@ -306,6 +339,10 @@ onMounted(async () => {
             <span class="position-qty">数量 {{ t.totalQuantity.toLocaleString() }}</span>
           </button>
         </div>
+        <!-- 跨厂在途不在位置快照里（矩阵 A10）：明说「查不到是正常的」，不补 0 也不报错 -->
+        <p class="position-note">
+          跨厂在途不经位置快照承载（在途货由供给侧承载），所以上面没有「跨厂在途」这一类。
+        </p>
       </ElCard>
 
       <!-- ===== 位置明细 ===== -->
@@ -323,7 +360,15 @@ onMounted(async () => {
         </template>
 
         <div v-if="!list.length && !listLoading" class="panel-empty">
-          <ElEmpty :description="hasFilter ? '当前筛选没有匹配的位置行' : '这个版本没有位置行'">
+          <ElEmpty
+            :description="
+              interplantSelected
+                ? '跨厂在途不经位置快照承载（在途货由供给侧承载），这一类在位置快照里查不到行'
+                : hasFilter
+                  ? '当前筛选没有匹配的位置行'
+                  : '这个版本没有位置行'
+            "
+          >
             <ElButton v-if="hasFilter" @click="resetFilters">清除筛选</ElButton>
           </ElEmpty>
         </div>
@@ -380,8 +425,9 @@ onMounted(async () => {
             列表端点不返回 total，「共 N 条」只能用 /summary 的全版本口径。
             筛选后真实命中数未知，故筛选态只给「上一页/下一页」，页数由满页判断 ——
             宁可少一个翻页入口，也不给一个算错的总页数。
+            汇总取不到时同理（总条数未知），不拿 0 当总条数。
           -->
-          <template v-if="hasFilter">
+          <template v-if="hasFilter || summaryFailed">
             <ElButton
               size="small"
               :disabled="pageIndex <= 1 || listLoading"
@@ -642,6 +688,13 @@ onMounted(async () => {
     font-size: 12px;
     color: #94a3b8;
   }
+}
+
+/* 跨厂在途说明（矩阵 A10） */
+.position-note {
+  margin: 10px 0 0;
+  font-size: 12px;
+  color: #64748b;
 }
 
 .pager {

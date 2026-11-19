@@ -10,6 +10,8 @@
 
   <ItemGroup>
     <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.8.0" />
+    <!-- 11-17：5号位测试曾拟双框架并存（NUnit+adapter），同日按 Owner 令"一步到位"全量转 xunit，
+         NUnit 包随转完即摘——本程序集现仅 xunit。 -->
     <PackageReference Include="xunit" Version="2.6.2" />
     <PackageReference Include="xunit.runner.visualstudio" Version="2.5.4">
       <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>

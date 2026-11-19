@@ -10,6 +10,10 @@
  *   import { flattenBlocks, applyEdit, buildPutBody } from '@/api/aps-v1/draftBuffer'
  *
  * 历史：v1.4 §二十 新增；B 设计稿 2026-09-21 落定
+ *
+ * 2026-11-18：`buildPutBody` 由「5 个 `*Json` 主题列」扩为「5 主题 + `crossFactoryLeadTimeRulesJson`」
+ *   —— 依据 3号位《跨厂LT 走通用参数接口与快照保留_回执 v1.1_20261117》。
+ *   ⚠️ 第三个参数**不给** ⇒ 该键**不进请求体**（后端语义＝「本次不维护本块，保留既有快照值」）。
  */
 
 import type {
@@ -268,16 +272,24 @@ export function removePath(blocks: ParameterSetBlocks, block: BlockKey, path: st
  *    回退到「读路径置空 + 写路径全量采纳」的旧实现，用户保存一次就会清空 DRAFT 上的全部换型规则。
  *    所以这里保持 spread 原样回传，是当前唯一正确的行为。
  *  - 泛型：G 继承 GovernanceVersionBase（RuleSetVersionGovernance / ParameterSetVersionGovernance 各自适用）
+ *
+ * 2026-11-18：跨厂LT 子块（`crossFactoryLeadTimeRulesJson`）
+ *  - 给了 ⇒ 进请求体（后端「提交值优先」，快照取这一份）；
+ *  - **不给** ⇒ 该键不进请求体（后端语义＝「前端本次不维护本块」⇒ 快照保留既有值）。
+ *    实现上必须**显式写 undefined**盖掉 `...governance` 里可能带来的旧值 ——
+ *    否则读回来的旧块会被当成「提交值」回传，把用户刚改的内容顶掉。
  */
 export function buildPutBody<G extends GovernanceVersionBase>(
   governance: Readonly<G>,
-  blocks: ParameterSetBlocks
+  blocks: ParameterSetBlocks,
+  crossFactoryLeadTimeRulesJson?: string
 ): G & {
   lockJson?: string
   supplyJson?: string
   procurementJson?: string
   solverStrategyJson?: string
   candidateGuardrailJson?: string
+  crossFactoryLeadTimeRulesJson?: string
 } {
   return {
     ...governance,
@@ -301,7 +313,9 @@ export function buildPutBody<G extends GovernanceVersionBase>(
     candidateGuardrailJson:
       blocks.candidateGuardrail && Object.keys(blocks.candidateGuardrail).length > 0
         ? JSON.stringify(blocks.candidateGuardrail)
-        : undefined
+        : undefined,
+    // 第 6 号内容子块：不给就不进请求体（显式 undefined 盖掉 governance 里的旧值）
+    crossFactoryLeadTimeRulesJson
   }
 }
 

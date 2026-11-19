@@ -35,7 +35,8 @@ import {
   useRunStore,
   RUN_STATUS_LABEL,
   RUN_STATUS_TAG,
-  RUN_TYPE_LABEL
+  RUN_TYPE_LABEL,
+  type RunListItem
 } from '@/store/modules/aps/run'
 import { useApsAuthStore } from '@/store/modules/aps/auth'
 import { useDomainStore } from '@/store/modules/aps/domain'
@@ -83,9 +84,11 @@ const {
   runsPageSize,
   runsPagedAvailable,
   activeVersions,
+  latestDomainStatuses,
   domainStatuses,
   domainStatusRunId,
   domainStatusHasDenominator,
+  selectedDomainRun,
   runStatusCounts,
   strategyProfileVersionCodes,
   strategyProfileVersionLookupOk,
@@ -201,13 +204,25 @@ function strategyProfileVersionMissingHint(id: number): string {
  * 会回落成登记总数 ⇒ 用户把「一个都看不到」误读成「就这 N 个域」。
  * 现在：可见数 > 0 → 显示可见数（不足登记数时写「可见 N 个」+ 悬停说明）；可见数 = 0 → 「—」。
  */
-const domainCountVisible = computed(() => domainStatuses.value.length)
-const domainCountRegistered = computed(() => latestRun.value?.expectedDomainKeys?.length ?? 0)
+const domainCountVisible = computed(() => latestDomainStatuses.value.length)
+/**
+ * 登记的排程域数
+ *
+ * ⚠️ **null = 未取到**（没有最近一次排产 / 后端没给 `expectedDomainKeys`），**不是 0**：
+ *   §0.2 ②「NULL=未知，不得转 0」——写 0 会说成「这次排产明确没登记排程域」。
+ */
+const domainCountRegistered = computed<number | null>(() => {
+  const run = latestRun.value
+  if (!run) return null
+  const keys = run.expectedDomainKeys
+  return Array.isArray(keys) ? keys.length : null
+})
 
 const domainCountText = computed(() => {
   const visible = domainCountVisible.value
   if (visible > 0) {
-    return domainCountRegistered.value > visible ? `可见 ${visible} 个` : `${visible} 个`
+    const registered = domainCountRegistered.value
+    return registered != null && registered > visible ? `可见 ${visible} 个` : `${visible} 个`
   }
   return '—'
 })
@@ -216,10 +231,11 @@ const domainCountHint = computed(() => {
   const visible = domainCountVisible.value
   const registered = domainCountRegistered.value
   if (visible > 0) {
-    return registered > visible
+    return registered != null && registered > visible
       ? `这次排产共登记 ${registered} 个排程域，当前只能看到其中 ${visible} 个的进展。`
       : undefined
   }
+  if (registered === null) return '最近一次排产的排程域登记情况取不到。'
   return registered > 0
     ? `这次排产登记了 ${registered} 个排程域，但当前看不到它们的进展。`
     : '这次排产没有登记排程域。'
@@ -356,21 +372,21 @@ const domainStatusGroups = computed(() =>
   }))
 )
 
-/** 主视图上的域状态分布（短名 + 计数） */
+/** 主视图上的域状态分布（短名 + 计数）—— 恒取**最近一次批次**的域状态 */
 const domainStatusSummary = computed(() =>
   DOMAIN_STATUS_GROUPS.map((g) => ({
     key: g.key,
     label: g.short,
     cls: g.chip,
-    count: domainStatuses.value.filter((d) => g.statuses.includes(d.status)).length
+    count: latestDomainStatuses.value.filter((d) => g.statuses.includes(d.status)).length
   }))
 )
 
 const hasDomainStatuses = computed(() => domainStatuses.value.length > 0)
 
-/** 域级失败 / 被阻断 */
+/** 域级失败 / 被阻断（主视图警示用 ⇒ 最近一次批次） */
 const failedDomains = computed(() =>
-  domainStatuses.value.filter((d) => d.status === 'FAILED' || d.status === 'BLOCKED')
+  latestDomainStatuses.value.filter((d) => d.status === 'FAILED' || d.status === 'BLOCKED')
 )
 const failedDomainNames = computed(() =>
   failedDomains.value.map((d) => humanLabel(d.domainKey)).join('、')
@@ -385,15 +401,45 @@ function isIssueStatus(status: string): boolean {
  * - 没取过数 → 还没有排产记录
  * - 取过数、这次 Run 确实没登记预期域 → 5号位 R3 裁定的终态，如实说
  * - 取过数、这次 Run 登记了预期域却没取到 → 取数出了问题，不冒充正常（错误横幅同时会亮）
+ *
+ * 拆解卡可跟随所选批次 ⇒ 空态文案要说清是**哪一批**（否则用户不知道在看谁）。
  */
 const domainStatusEmptyText = computed(() => {
   if (domainStatusRunId.value === null) {
     return '还没有排产记录，排产之后这里会显示每个排程域的进展。'
   }
+  const who = isShowingLatestRun.value ? '最近这次排产' : `批次 #${domainStatusRunId.value}`
   return domainStatusHasDenominator.value
-    ? '这次排产登记了要跑的排程域，但各域状态暂时取不到，请稍后再看。'
-    : '最近这次排产没有登记要跑哪些排程域，所以暂时看不出各域进展。'
+    ? `${who}登记了要跑的排程域，但各域状态暂时取不到，请稍后再看。`
+    : `${who}没有登记要跑哪些排程域，所以暂时看不出各域进展。`
 })
+
+/** 拆解卡当前显示的是否就是最近一次批次 */
+const isShowingLatestRun = computed(
+  () => domainStatusRunId.value !== null && domainStatusRunId.value === latestRun.value?.id
+)
+
+/** 表格里被选中（拆解卡正在看）的那一行 */
+function runRowClassName({ row }: { row: RunListItem }): string {
+  return selectedDomainRun.value?.id === row.id ? 'run-row-selected' : ''
+}
+
+/**
+ * 点「最近排产记录」里的一行 ⇒ 拆解卡切到该批次。
+ *
+ * 点在按钮/链接上不切（否则「人工恢复」会顺带把拆解卡切走）；点了就等于
+ * 「我现在要看这一批的域状态」，这是页面上唯一能查到**非最新批次**域状态的入口。
+ */
+function handleRunRowClick(row: RunListItem, _column: unknown, event: MouseEvent): void {
+  const target = event.target as HTMLElement | null
+  if (target?.closest('button, a, .el-tooltip__trigger, .el-switch, .el-select')) return
+  void runStore.selectDomainRun(row)
+}
+
+/** 拆解卡回到最近一次批次 */
+function resetDomainRun(): void {
+  void runStore.selectDomainRun(null)
+}
 
 const recentRunsSorted = computed(() =>
   [...visibleRuns.value].sort(
@@ -449,7 +495,21 @@ function handlePageSizeChange(size: number): void {
  */
 const canConfirmCandidate = computed(() => apsAuth.has('aps.candidate.confirm'))
 
-function goExplanation(): void {
+/**
+ * 「看异常解释」→ /aps/explanation
+ *
+ * ⚠️ **必须带上 planVersionId**（2026-11-17）：不带的话解释页只能落回「当前生效版本」，
+ *   用户点的域和看到的解释对不上（点 FAMILY_FRL 的失败，看到的却是别的域的版本）。
+ *   解释页读 `?planVersionId=` 后自动选中该版本并置顶（@see views/Aps/Explanation.vue）。
+ */
+function goExplanation(planVersionId?: number | null): void {
+  if (planVersionId) {
+    router.push({
+      path: '/aps/explanation',
+      query: { planVersionId: String(planVersionId) }
+    })
+    return
+  }
   router.push('/aps/explanation')
 }
 
@@ -589,7 +649,7 @@ async function handleRecoverFailedRun(row: {
           <span class="warn-text">
             本次排产有 {{ failedDomains.length }} 个排程域失败或被阻断：{{ failedDomainNames }}
           </span>
-          <ElButton type="danger" link size="small" @click="goExplanation">
+          <ElButton type="danger" link size="small" @click="goExplanation()">
             看异常解释 <Icon icon="vi-ep:arrow-right" />
           </ElButton>
         </div>
@@ -610,17 +670,28 @@ async function handleRecoverFailedRun(row: {
       </span>
     </div>
 
-    <!-- ===== 排程域状态拆解（最近一次 Run） ===== -->
+    <!-- ===== 排程域状态拆解（默认最近一次 Run，可点下方表格行切批次） ===== -->
     <ElCard class="partial-card">
       <template #header>
         <div class="panel-header">
           <span>
             排程域状态拆解
             <span v-if="domainStatusRunId !== null" class="muted">
-              （最近一次排产 #{{ domainStatusRunId }}）
+              （<template v-if="isShowingLatestRun">最近一次排产</template
+              ><template v-else>批次</template> #{{ domainStatusRunId }}）
             </span>
           </span>
-          <span class="hint-text">各排程域状态由后端按计划版本派生，此处只做展示</span>
+          <span class="panel-header-actions">
+            <span class="hint-text">点下方「最近排产记录」里的任意一行，可看那一批的各域进展</span>
+            <ElButton
+              v-if="domainStatusRunId !== null && !isShowingLatestRun"
+              size="small"
+              link
+              @click="resetDomainRun"
+            >
+              回到最近一次
+            </ElButton>
+          </span>
         </div>
       </template>
       <div v-if="!hasDomainStatuses" class="col-empty">{{ domainStatusEmptyText }}</div>
@@ -649,7 +720,7 @@ async function handleRecoverFailedRun(row: {
             </div>
             <div v-if="d.reason" class="err-msg">{{ d.reason }}</div>
             <div v-if="isIssueStatus(d.status)" class="col-actions">
-              <ElButton type="danger" link size="small" @click="goExplanation">
+              <ElButton type="danger" link size="small" @click="goExplanation(d.planVersionId)">
                 看异常解释 <Icon icon="vi-ep:arrow-right" />
               </ElButton>
             </div>
@@ -669,10 +740,20 @@ async function handleRecoverFailedRun(row: {
       <template #header>
         <div class="panel-header">
           <span> 最近排产记录 </span>
-          <span class="hint-text">人工恢复会新建一次运行，原失败运行状态保持失败</span>
+          <span class="hint-text"
+            >点一行即可在上方查看那一批的各域进展；人工恢复会新建一次运行，原失败运行状态保持失败</span
+          >
         </div>
       </template>
-      <ElTable v-if="recentRunsSorted.length" :data="recentRunsSorted" size="small" border stripe>
+      <ElTable
+        v-if="recentRunsSorted.length"
+        :data="recentRunsSorted"
+        size="small"
+        border
+        stripe
+        :row-class-name="runRowClassName"
+        @row-click="handleRunRowClick"
+      >
         <ElTableColumn prop="id" label="批次" width="64" fixed="left" />
         <ElTableColumn label="类型" width="92">
           <template #default="{ row }">{{ RUN_TYPE_LABEL[row.runType] }}</template>
@@ -879,6 +960,18 @@ async function handleRecoverFailedRun(row: {
     font-weight: 400;
     color: #94a3b8;
   }
+}
+
+/* 卡片头右侧：提示语 + 复位按钮 */
+.panel-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* 批次表：被选中（拆解卡正在看）的那一行 */
+:deep(.el-table__body tr.run-row-selected > td.el-table__cell) {
+  background-color: var(--el-color-primary-light-9);
 }
 
 .panel-empty {
@@ -1159,6 +1252,10 @@ async function handleRecoverFailedRun(row: {
     margin-top: 6px;
     font-size: 12px;
     color: #7f1d1d;
+    /* 失败原因里带一长串 Domain 编码（FAMILY_CYL,FAMILY_FRL,...）⇒ 不换行会横向溢出、
+       被列边界裁掉，用户读不到「到底是哪几个域失败」⇒ 强制按字符断行 */
+    word-break: break-word;
+    overflow-wrap: anywhere;
   }
 }
 

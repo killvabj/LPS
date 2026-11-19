@@ -23,7 +23,7 @@ import { storeToRefs } from 'pinia'
 import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import dayjs from 'dayjs'
-import { formatUtcDate, formatUtcDateTimeSec } from '@/utils/datetime'
+import { formatUtcDate, formatUtcDateTimeSec, formatLocalDateTimeSec } from '@/utils/datetime'
 import { resourceCodeNameParts } from '@/utils/apsResource'
 import { DhxGantt } from '@/components/DhxGantt'
 import type {
@@ -36,6 +36,7 @@ import type {
 import { useScheduleStore } from '@/store/modules/aps/schedule'
 import { useApsAuthStore } from '@/store/modules/aps/auth'
 import { useDomainStore } from '@/store/modules/aps/domain'
+import { useMesStatusStore } from '@/store/modules/aps/mesStatus'
 import { departmentLookupApi, domainApi, triggerBusinessEntry, scheduleApi } from '@/api/aps-v1'
 import type { BusinessEntrySubmission } from '@/api/aps-v1'
 import DomainUnavailableBadge from './components/DomainUnavailableBadge.vue'
@@ -51,14 +52,26 @@ import {
   type GanttResourceDto,
   type GanttTaskDelayReason,
   type GanttTaskDto,
+  type MesStatusBatchRowDto,
   type PlanVersionStatus,
   type PlanVersionSummaryDto,
+  type ResourceLoadRowDto,
   type RoleKey,
   type RunType,
+  type TaskDetailResultDto,
+  type TaskListItemDto,
+  type TaskShareDetailDto,
   type TaskStatus
 } from '@/api/aps-v1/types'
 import { SETUP_SOURCE_META, type SetupSource } from '@/api/aps-v1/types/setup'
 import { reasonLabelOf } from '@/api/aps-v1/types/explanation'
+import {
+  MES_DISPATCH_STATUS_OPTIONS,
+  mesDispatchStatusLabel,
+  mesFailureCodeLabel,
+  mesWorkOrderStatusLabel,
+  mesWorkOrderTypeLabel
+} from '@/api/aps-v1/types/mes'
 import { RUN_TYPE_LABEL } from '@/store/modules/aps/run'
 
 import {
@@ -85,8 +98,16 @@ import {
 } from 'element-plus'
 
 const scheduleStore = useScheduleStore()
-const { versions, displayedVersions, currentVersionId, ganttData, loading, error } =
-  storeToRefs(scheduleStore)
+const {
+  versions,
+  displayedVersions,
+  currentVersionId,
+  ganttData,
+  loading,
+  error,
+  taskListLoading,
+  taskListError
+} = storeToRefs(scheduleStore)
 
 /**
  * ElSelect v-model 不接受 null，用一个本地 ref 桥接 store.currentVersionId
@@ -195,25 +216,71 @@ function currentGanttWindow(): { from: string; to: string; resourceIds: number[]
   }
 }
 
-/* ===== 视图切换：甘特图 / 资源负荷 / 任务清单 =====
- *  三者看同一份数据、同一时间窗：
+/* ===== 视图切换：甘特图 / 资源负荷 / 任务清单 / MES 衔接 =====
+ *  前三者看同一份数据、同一时间窗：
  *    - 甘特图：任务条（排程结果，条 = 计划占用区间）
  *    - 资源负荷：资源 × 时间桶的**负荷量**（资源级聚合，不受甘特条已加载条数影响）
  *    - 任务清单：同一批任务的列表形态
+ *  第四个页签是 P11 MES 衔接（v0.2 §1.2 落位表：P11 = 生产排程工作空间 MES 衔接入口/Tab），
+ *  走**独立只读端点**（`/api/mes/status`），与甘特体不是同一份数据。
  *  ⇒ 同页 Tab：默认甘特占满整屏，切过去才出现，零额外请求。 */
-const viewTab = ref<'gantt' | 'load' | 'tasks'>('gantt')
+const viewTab = ref<'gantt' | 'load' | 'tasks' | 'mes'>('gantt')
 
 // 切回甘特时让 dhtmlx 重算尺寸：隐藏期间容器宽高归零，不重算会留下一张缩成 0 宽的图
 watch(viewTab, (v) => {
   if (v === 'gantt') nextTick(() => window.dispatchEvent(new Event('resize')))
+  // 切到资源负荷 ⇒ 补取 P12 负荷率（首屏未取过 / 上次失败时重试；store 同键单飞）
+  if (v === 'load') loadLoadRate()
+  // 切到任务清单 ⇒ 补取服务端第一页（首屏未取过 / 上次失败时重试；store 同键单飞）
+  if (v === 'tasks') loadTaskList()
+  // 切到 MES 衔接 ⇒ 补取 P11 清单（首屏未取过 / 上次失败时重试）
+  if (v === 'mes') loadMesStatus()
 })
 
-/* ===== 任务清单（冻结 09 §六 / 01:1914「今日/未来任务清单」）=====
- *  - 数据源 = 甘特体 `ganttData.tasks`（同一个已部署端点，不另造查询）
- *  - 时间窗与甘特时间轴同源（dateRange：由「时间尺度」决定）
- *  - 只做**列表形态**补齐；MES 下发/工单/执行状态后端尚未接入，不在此伪造 */
+/* ===== 任务清单（服务端分页；5号位 2026-11-16 矩阵 A4 / r14237）=====
+ *
+ * ⚠️ **数据源已从「甘特体本地切片」换成服务端读面** `GET /api/schedule/tasks/{planVersionId}`：
+ *   - 旧：行 = `ganttData.tasks` 本地过滤 + 本地翻页 ⇒ 只能看到**已加载**的那一部分；
+ *   - 新：行 = 服务端一页，`total` = 服务端全量命中（COUNT 与列表同一 WHERE）。
+ *
+ * ⚠️ **窗口与资源过滤仍与甘特体同源**（同一套 `GanttWindowPredicate`：
+ *   `PlannedEndTime >= from AND PlannedStartTime <= to`，计划时刻 NULL 的任务恒保留）
+ *   ⇒ 两个视图的条数天然对得上，不会出现「图上有、清单里没有」。
+ *   （2026-11-17 实测：该端点是**闭区间**，不是右开：`from=to=2026-11-09T08:00:00` ⇒ 236 条。）
+ *
+ * ⚠️ **面板自带筛选，与甘特工具栏筛选是两套**：
+ *   - 工具栏「只看延期 / 只看工序 / 搜索」只作用于**甘特图**（甘特体没有延期/工序的服务端过滤）；
+ *   - 本面板的筛选全部走服务端（阶段 / MES 工单三态 / 物料与任务号关键词 / 排序）。
+ *   两者不可互相顶替，页面上分别标注。
+ */
 const TASK_LIST_PAGE_SIZE = 50
 const taskListPage = ref(1)
+
+/** 本面板的服务端关键词（物料编码 / 物料名称 / 任务号 三路；dev 2026-11-17 实测口径） */
+const taskPaneKeyword = ref('')
+/** 防抖后的关键词（真正发请求用的值） */
+const taskPaneKeywordDebounced = ref('')
+/**
+ * MES 工单三态筛选。
+ *
+ * ⚠️ **三态是「工单号列有无」**，**不是**「无需 MES / 暂不可下发」分类
+ *   （矩阵 A4 明确：分类位仍空，`hasWorkOrder` 不承载该语义）⇒ 选项名禁写「无需 MES」。
+ */
+const taskPaneHasWorkOrder = ref<'all' | 'with' | 'without'>('all')
+/** 阶段多选（后端 `stageCodes` 逗号串） */
+const taskPaneStages = ref<string[]>([])
+/**
+ * 排序键（后端白名单：`plannedStart` / `quantity` / `materialCode` / `taskNo` / `id`）。
+ *
+ * 2026-11-18：**`id` 已放开**——5号位 复函 N1 认账是我方（后端）bug：`sortBy=id` 的
+ *   ORDER BY 把 `t.Id` 挂了两遍（主键 + tiebreaker）⇒ SQL Server 169 ⇒ 500；
+ *   修复已入 r14264（`id` 键单列收尾，主键本身全序，tiebreaker 无意义）。
+ *   dev 2026-11-18 实测：`sortBy=id` ⇒ **HTTP 200**（其余四键同条件 200）⇒ 前端放开该键。
+ */
+const taskPaneSortBy = ref<'plannedStart' | 'quantity' | 'materialCode' | 'taskNo' | 'id'>(
+  'plannedStart'
+)
+const taskPaneSortDir = ref<'asc' | 'desc'>('asc')
 
 /**
  * 当前窗口的文字标签：**一律显示实际起止日**。
@@ -281,8 +348,9 @@ watch([ganttWindow, () => ganttData.value?.planVersionId], () => {
 })
 
 /* ===== 导出任务清单（CSV）=====
- *  - 导出**当前看到的**那批任务（同一时间窗 + 同一关键词筛选 ⇒ 与清单页逐行一致）
- *  - 字段只取后端已给的字段（MES 执行状态未接入，不伪造列）
+ *  - 导出**当前页已加载**的那批任务（服务端分页 ⇒ 导出的就是这一页，不是全量）
+ *  - 字段只取服务端读面真有的字段（订单号 / 客户交期 / 延期 / 下发状态 **本读面没有**
+ *    ⇒ 不导出，也不从甘特体拼凑——两套口径混算）
  *  - 加 UTF-8 BOM（U+FEFF）：Excel 打开中文不乱码（无 BOM 时 Excel 按 ANSI 解码）
  */
 const EXPORT_COLUMNS = [
@@ -290,26 +358,21 @@ const EXPORT_COLUMNS = [
   '物料名称',
   '阶段',
   '部门',
-  '资源编码',
-  '资源名称',
+  '执行资源',
   '人工槽',
-  '工序',
+  '工序编码',
+  '工序名称',
   '计划数量',
   '单位',
   '计划加工量',
   '计划开始',
   '计划结束',
-  '时长(h)',
-  '状态',
+  '计划工时(h)',
+  'APS计划状态',
   'MES工单号',
-  '下发状态',
-  '客户交期',
-  '延期时长(h)',
-  '主要原因',
-  '延期',
-  '任务号',
-  '订单号',
-  '生产指示号'
+  'MES衔接分类',
+  '生产指示号',
+  '任务号'
 ] as const
 
 /** CSV 单元格转义：含分隔符/引号/换行时用双引号包起来，内部引号翻倍 */
@@ -321,45 +384,34 @@ function csvCell(value: unknown): string {
 function exportTaskList(): void {
   const rows = taskListRows.value
   if (rows.length === 0) {
-    ElMessage.warning('当前窗口内没有可导出的任务。')
+    ElMessage.warning('当前页没有可导出的任务。')
     return
   }
-  const resourceMap = ganttResourceMap.value
   const lines = [EXPORT_COLUMNS.join(',')]
   for (const t of rows) {
-    const r = t.resourceId == null ? undefined : resourceMap.get(t.resourceId)
     const start = t.plannedStartTime ? formatUtcDateTimeSec(t.plannedStartTime) : ''
     const end = t.plannedEndTime ? formatUtcDateTimeSec(t.plannedEndTime) : ''
-    const hours =
-      t.plannedStartTime && t.plannedEndTime
-        ? hoursBetween(t.plannedStartTime, t.plannedEndTime).toFixed(2)
-        : ''
     lines.push(
       [
-        t.materialCode ?? '',
-        t.materialName ?? '',
-        t.stageCode ?? '',
-        t.departmentName ?? '',
-        r?.resourceCode ?? '未分配',
-        r?.resourceName ?? '未分配',
-        t.manualSlotId != null ? '人工' : '',
+        t.materialCode ?? '未提供',
+        t.materialName ?? '未提供',
+        t.stageCode ?? '未提供',
+        t.productionDepartmentName ?? '未提供',
+        taskResourceText(t),
+        t.manualSlotCode ?? '',
         t.operationCode,
-        t.netQty,
+        t.operationName ?? '未提供',
+        t.quantity,
         t.uom,
-        t.plannedProcessQty ?? '',
+        t.plannedProcessQty ?? '未提供',
         start,
         end,
-        hours,
+        t.duration != null ? t.duration.toFixed(4) : '未提供',
         TASK_STATUS_LABELS[sanitizeStatus(t.status)] ?? t.status,
-        t.mesWorkOrderNo ?? '',
-        t.dispatchStatus ?? '',
-        t.customerDueDate ? formatUtcDate(t.customerDueDate) : '',
-        t.delayHours != null ? t.delayHours.toFixed(1) : '',
-        primaryDelayReasonText(t) ?? '',
-        t.isDelayed ? '是' : '',
-        t.taskNo,
-        t.orderNo ?? '',
-        t.mtS_InstructionNo ?? ''
+        t.mesWorkOrderNo ?? '未关联MES工单',
+        '未提供',
+        t.mtsInstructionNo ?? '',
+        t.taskNo
       ]
         .map(csvCell)
         .join(',')
@@ -369,12 +421,16 @@ function exportTaskList(): void {
   const url = URL.createObjectURL(blob)
   const a = document.createElement('a')
   a.href = url
-  a.download = `任务清单_${dayjs(dateRange.value.from).format('YYYYMMDD')}_${dayjs(
+  const versionCode =
+    scheduleStore.currentVersion?.versionCode ?? String(currentVersionId.value ?? '')
+  a.download = `任务清单_${versionCode}_${dayjs(dateRange.value.from).format('YYYYMMDD')}_${dayjs(
     dateRange.value.to
-  ).format('YYYYMMDD')}.csv`
+  ).format('YYYYMMDD')}_第${taskListPage.value}页.csv`
   a.click()
   URL.revokeObjectURL(url)
-  ElMessage.success(`已导出 ${rows.length} 条任务。`)
+  ElMessage.success(
+    `已导出 ${rows.length} 条（当前页；服务端全量命中 ${taskListTotalText.value} 条）。`
+  )
 }
 
 /* ===== 多维度切换（U01：资源 / Stage / 工厂 / 部门 / 订单 / 物料；Domain 维度暂隐藏） ===== */
@@ -426,6 +482,8 @@ const DOMAIN_PALETTE = [
 
 /** Domain 字典（v1.2 Domain专项：从 useDomainStore 派生） */
 const domainStore = useDomainStore()
+/** 登录态（含业务范围 dataScope）—— 域收敛统一走这里 */
+const apsAuth = useApsAuthStore()
 
 /**
  * domainKey → 展示色
@@ -436,7 +494,9 @@ const domainStore = useDomainStore()
 function domainColor(domainKey: string): string {
   const explicit = DOMAIN_COLORS[domainKey]
   if (explicit) return explicit
-  const keys = domainStore.definitions.map((d) => d.domainKey).sort((a, b) => a.localeCompare(b))
+  const keys: string[] = []
+  for (const d of domainStore.allDefinitions) keys.push(d.domainKey)
+  keys.sort((a, b) => a.localeCompare(b))
   const idx = keys.indexOf(domainKey)
   if (idx >= 0) return DOMAIN_PALETTE[idx % DOMAIN_PALETTE.length]
   let h = 0
@@ -444,14 +504,22 @@ function domainColor(domainKey: string): string {
   return DOMAIN_PALETTE[h % DOMAIN_PALETTE.length]
 }
 
-/** 当前数据中存在 + store 启用的 Domain 列表（domainKey 排序）
- *  用途只剩「域分项计数」与域染色/泳道；域筛选已撤（见 versionOptionLabel 注释）。 */
+/** 当前数据中真实存在的排程域（domainKey 排序）
+ *  用途只剩「域分项计数」与域染色/泳道；域筛选已撤（见 versionOptionLabel 注释）。
+ *
+ * ⚠️ **域字典漂移（5号位 2026-11-18 复函 §五）**：dev 域字典 16 行里 BJ_FAMILY_FRL /
+ *   TJ_FAMILY_FRL 是**停用态**（IsActive=false），却各自带着 ACTIVE 版本（999473 / 999447）
+ *   ——「停用域在产、启用域（三联件 FAMILY_FRL）反而无版本」。
+ *   停用语义（不再排？仅不入新 run？现有 ACTIVE 怎么办）**未定义，待 0号位 裁**
+ *   ⇒ 前端**不自行解释停用**；但也**不能把有数据的域从分布里抹掉**
+ *   ⇒ 这里**不再按域字典过滤**（启停、字典是否同步都不影响已加载数据的呈现），
+ *     只按业务范围（dataScope.domainKeys）收敛；范围为空＝不限制。 */
 const availableDomains = computed<DomainKey[]>(() => {
-  const storeSet = new Set(domainStore.activeDomains.map((d) => d.domainKey))
+  const allowed = apsAuth.dataScope.domainKeys as readonly string[]
   const set = new Set<string>()
   ganttData.value?.tasks.forEach((t) => set.add(t.domainKey))
   return Array.from(set)
-    .filter((k) => storeSet.has(k))
+    .filter((k) => allowed.length === 0 || allowed.includes(k))
     .sort() as DomainKey[]
 })
 
@@ -541,38 +609,114 @@ const filteredTasks = computed(() => {
 })
 
 /**
- * 任务清单行 = **甘特条同一份**过滤结果（filteredTasks）
+ * 任务清单行 = **服务端读面的一页**（矩阵 A4 / r14237）。
  *
- * 2026-11-04 改口径：数据源从 `ganttData.tasks` 改为 `filteredTasks`。
- *   改前清单只按「与窗口有交集 + 关键词」过滤，**不接**「只看延期 / 只看工序 / 排程域 / 受影响」，
- *   于是勾上「只看延期」后：图上 2431 条、KPI 域计数 2431，而清单仍是 3334 条 ⇒ 同页两个数打架。
- *   改后清单 = filteredTasks（域 / 只看延期 / 工序 / 受影响 / 关键词 全走一遍）
- *   ⇒ 清单行数 == KPI 各域计数之和 == 图上条数，三者恒等。
- * ⚠️ 后端 `/gantt?from&to` 已按窗口过滤 ⇒ 前端不再重复判窗口边界（重复判定会与后端口径差一条边界任务）。
- * ⚠️ 无计划时间的任务（后端「无计划时间的任务保留」）照常进清单，开始/结束留空 ⇒ 不被静默丢。
+ * ⚠️ 与甘特体是**两套读法、两个口径**，不合并：
+ *   - 甘特体 `/gantt`：整窗**图**（游标分页，已加载数 ≤ limit）
+ *   - 任务清单 `/tasks`：**列表**（offset 分页，`total` = 服务端全量命中）
+ *   ⇒ 同一批任务的两种表达；数字不同不是 bug，是两个口径，页面上必须分列。
+ * ⚠️ **行键 = `taskId`**（绝不按 `taskNo` 折叠：5号位 11-16 实测 TaskNo 混版，
+ *   一个 TaskNo 可对应多条 Operation Task）。
  */
-const taskListRows = computed(() =>
-  [...filteredTasks.value].sort(
-    (a: GanttTaskDto, b: GanttTaskDto) =>
-      (a.plannedStartTime ?? '').localeCompare(b.plannedStartTime ?? '') ||
-      a.taskNo.localeCompare(b.taskNo)
-  )
+const taskListResult = computed(() => scheduleStore.taskList)
+const taskListRows = computed<TaskListItemDto[]>(() => taskListResult.value?.items ?? [])
+/**
+ * 服务端全量命中数（= 分页器的「共 N 条」）
+ *
+ * ⚠️ **null = 未取到**（请求失败 / 还没回来），**不是 0**：
+ *   §0.2 ②「NULL=未知，不得转 0」——把「取不到」说成「服务端命中 0 条」，
+ *   还会和「该时间范围内没有任务」的空态撞车（既说失败、又说确定为零）。
+ */
+const taskListTotal = computed<number | null>(() => taskListResult.value?.total ?? null)
+/** 命中数的显示文本（未取到 ⇒ 「未提供」） */
+const taskListTotalText = computed(() =>
+  taskListTotal.value === null ? '未提供' : String(taskListTotal.value)
 )
+/** 本页已加载行数（与「全量命中」分开显示，不许混说） */
+const taskListLoadedCount = computed(() => taskListRows.value.length)
+/** 甘特图侧已加载条数（第三个口径：图上画出来的条数） */
+const ganttLoadedCount = computed(() => ganttData.value?.tasks?.length ?? 0)
 
-const taskListTotal = computed(() => taskListRows.value.length)
-const taskListPaged = computed(() => {
-  const start = (taskListPage.value - 1) * TASK_LIST_PAGE_SIZE
-  return taskListRows.value.slice(start, start + TASK_LIST_PAGE_SIZE)
+/** 阶段选项：取「已加载甘特体 ∪ 当前页行」的去重阶段码（读面本身不给阶段字典） */
+const taskPaneStageOptions = computed<string[]>(() => {
+  const set = new Set<string>()
+  for (const t of ganttData.value?.tasks ?? []) if (t.stageCode) set.add(t.stageCode)
+  for (const t of taskListRows.value) if (t.stageCode) set.add(t.stageCode)
+  return [...set].sort()
 })
 
 /**
- * 任务清单「资源」列文案：编码 + 名称（审核 B-01 要「设备号」；后端两个字段都给）。
- * 人工槽行（manualSlotId 有值）资源侧为空 ⇒ 显示「—」，不编设备号。
+ * 本面板的服务端请求参数（不含页码：页码在 `taskListRequest` 里合成一处）。
+ *
+ * ⚠️ `from` / `to` **必须与甘特体完全相同**（同一窗口谓词）⇒ 两个视图条数一致。
  */
-function taskResourceText(row: { resourceId?: number }): string {
-  const r = row.resourceId == null ? undefined : ganttResourceMap.value.get(row.resourceId)
-  if (!r) return '—'
-  return resourceCodeNameParts(r).join(' ') || '—'
+const taskPaneFilters = computed(() => ({
+  from: dateRange.value.from,
+  to: dateRange.value.to,
+  resourceIds: selectedResourceIds.value,
+  stageCodes: taskPaneStages.value,
+  keyword: taskPaneKeywordDebounced.value.trim() || undefined,
+  hasWorkOrder:
+    taskPaneHasWorkOrder.value === 'all'
+      ? undefined
+      : taskPaneHasWorkOrder.value === 'with'
+        ? true
+        : false,
+  sortBy: taskPaneSortBy.value,
+  sortDir: taskPaneSortDir.value
+}))
+
+/** 完整请求参数（筛选 + 页码）；唯一的 watch 源 ⇒ 任何变化只发一次请求 */
+const taskListRequest = computed(() => ({
+  ...taskPaneFilters.value,
+  pageIndex: taskListPage.value,
+  pageSize: TASK_LIST_PAGE_SIZE
+}))
+
+/** 取一次任务清单（store 内同键单飞 / 换参中止旧请求） */
+function loadTaskList(): void {
+  if (currentVersionId.value === null) return
+  void scheduleStore.loadTaskList(taskListRequest.value)
+}
+
+/** 筛选变化 ⇒ 回第一页（改筛选还停在第 7 页 ⇒ 看到的是空的第 7 页） */
+watch(taskPaneFilters, () => {
+  taskListPage.value = 1
+})
+/** 请求参数变化 ⇒ 取数（筛选 / 页码 / 窗口 / 资源，任一变化都只在这里发一次） */
+watch(taskListRequest, () => loadTaskList())
+
+/**
+ * 关键词防抖（400ms）：每敲一个字就发一次请求 ⇒ 后端白跑、页面闪。
+ * ⚠️ 关键词**只作用于本面板**（服务端三路：物料编码 / 物料名称 / 任务号；
+ *   dev 2026-11-17 实测：工序码 / 资源名 / MES 工单号都命中不了）；
+ *   甘特工具栏那个搜索是九路本地搜索（含订单号 / 工单号 / 资源）——两者口径不同，页面分开标注。
+ */
+let taskPaneKeywordTimer: ReturnType<typeof setTimeout> | null = null
+watch(taskPaneKeyword, () => {
+  if (taskPaneKeywordTimer) clearTimeout(taskPaneKeywordTimer)
+  taskPaneKeywordTimer = setTimeout(() => {
+    taskPaneKeywordTimer = null
+    taskPaneKeywordDebounced.value = taskPaneKeyword.value
+  }, 400)
+})
+
+/**
+ * 任务清单「执行资源」列文案。
+ *
+ * ✅ 2026-11-18：**读面自带 `resourceCode`**（5号位 复函 N2 补）⇒ 编码直接取本行，
+ *   不必再从甘特资源表借；行内缺键（资源主数据缺行）时回退旧路径，都拿不到就只显名称（不编编码）。
+ * ⚠️ 人工槽行（`manualSlotId` 有值）资源侧为空 ⇒ 显示「人工 · 槽编码」，
+ *   **不写「未分配」**（人工槽任务是有安排的，只是没有设备）。
+ */
+function taskResourceText(row: TaskListItemDto): string {
+  if (row.resourceName) {
+    const r = row.resourceId == null ? undefined : ganttResourceMap.value.get(row.resourceId)
+    const code = row.resourceCode ?? (r ? resourceCodeNameParts(r)[0] : '')
+    return code ? `${code} ${row.resourceName}` : row.resourceName
+  }
+  if (row.manualSlotCode) return `人工 · ${row.manualSlotCode}`
+  return '未提供'
 }
 
 /* ===== 泳道（Y 轴；按 groupBy 维度动态生成） ===== */
@@ -917,6 +1061,28 @@ const legendItems = computed<Array<{ label: string; color: string }>>(() => {
  * 5号位 2026-11-05 B7 裁决「不做、撤」：全部冻结文档无 Task「事实类型」定义
  * （07 的 ESTIMATED 属 Supply CommitmentStatus），故永久缺键 ⇒ 前端撤展示位、删死代码。 */
 
+/* ===== 版本徽标（状态 + 基线）=====
+ * 11-16 接 5号位《P01～P13＋采购协同 页面—接口实施矩阵 v0.1》A1 行：
+ * 「Candidate/Base 版本徽标用 `planVersionStatus`+`basePlanVersionId`，禁自算」。
+ *  - 状态与基线**全部取甘特端点自己返回的字段**（`GanttDataDto`），前端不比对版本号、不推断。
+ *  - 基线的**版本码**从版本列表里按 id 查（只是把 id 显示成人看的码，不改变任何判定）。
+ *  - ACTIVE（正式版）不挂徽标 —— 默认态不必标；CANDIDATE / ARCHIVED 才挂，避免噪声。
+ */
+const versionBadge = computed<{ text: string; type: 'warning' | 'info' | 'success' } | null>(() => {
+  const status = ganttData.value?.planVersionStatus
+  if (status === 'CANDIDATE') return { text: '候选版本', type: 'warning' }
+  if (status === 'ARCHIVED') return { text: '已归档版本', type: 'info' }
+  return null
+})
+
+/** 基线版本码（查不到就显示 id，不编版本码） */
+const baseVersionLabel = computed<string>(() => {
+  const id = ganttData.value?.basePlanVersionId
+  if (id == null) return ''
+  const code = versions.value?.find((x: PlanVersionSummaryDto) => x.id === id)?.versionCode
+  return code ?? `#${id}`
+})
+
 /* ===== 计划版本下拉标签（状态枚举中文映射 + 所属排程域） =====
  * 版本本身隶属一个排程域（`PlanVersion.DomainKey`），历史上另有一个「排程域」多选筛选；
  * 但任务域 = COALESCE(Order.DomainKey, 版本域)，现网版本全单域 ⇒ 该筛选恒只有 1 个选项、
@@ -959,12 +1125,15 @@ function versionOptionTitle(v: PlanVersionSummaryDto): string {
 }
 
 /**
- * 版本下拉分组（10-31 审计缺口 #3）
- *  - ①「常用版本」= store 的 `displayedVersions`：ACTIVE 置顶 → 最近 3 条 CANDIDATE → 2 条 FAILED → 当前已选兜底
+ * 版本下拉分组（10-31 审计缺口 #3；2026-11-17 按矩阵 §0.1 补 isDefault 锚表）
+ *  - ①「常用版本」= store 的 `displayedVersions`：**全部域内当前生效版本**（`isDefault`）
+ *    → 最近 3 条 CANDIDATE → 2 条 FAILED → 当前已选兜底
  *  - ②「其他版本」= 其余全部
  * ⚠️ **其余版本仍可达**：分组只是让"常用/失败/历史"分得开，不做版本裁剪
  *   （dev 实测 14 个版本，其中 10 个 FAILED —— 平铺时用户分不出哪条能看，
  *    但若只留 displayedVersions 就再也选不到 999334 等其它 ACTIVE 版本，属能力回退）。
+ * ⚠️ 列表条数变多（take=100 ⇒ dev 61 条）后下拉可**输入筛选**（`filterable`），
+ *   否则用户要在一屏里翻几十条。
  */
 const versionGroups = computed<{ key: string; label: string; items: PlanVersionSummaryDto[] }[]>(
   () => {
@@ -1517,6 +1686,263 @@ const loadGridCells = computed(() => {
   return out
 })
 
+/* ===== P12 负荷率（设备 × 业务日；5号位 2026-11-17 r14239；矩阵 A6/A7）=====
+ *
+ * 与上面的负荷**量**热力图是**两个端点、两套口径**，不合并：
+ *  - `/buckets` 给负荷**量**（无分母 ⇒ 算不出率）
+ *  - `/resource-load` 给**率**：①日历负荷率（分母＝三级继承解析出的当日可用小时）
+ *    ②固定 16h 负荷率（恒可算，**不是**真实可用时间）③Setup 换型损失率（现无持久列）
+ *
+ * ⚠️ **窗口口径**（后端源码 `ScheduleQueryService.GetResourceLoadAsync` 逐行实读 + dev 实测）：
+ *  - 任务过滤是**闭区间重叠**（`PlannedEndTime >= from AND PlannedStartTime <= to`）
+ *    ⇒ 只传 `D ~ D` 命中不到当天白班的活，**设备宇宙会空**（dev 实测 11-09 传 `D~D` ⇒ 0 行；
+ *      传 `D ~ D+1` 才有数据）⇒ 想看某一天 ⇒ 传 `D ~ D+1`。
+ *  - 返回的日期网格是 `from..to` **两端都含**（后端 `for (off = 0; off <= spanDays; off++)`）
+ *    ⇒ 传 `D ~ D+1` 会多出 D+1 那一行 ⇒ 前端按自己要的末日**裁掉**。
+ *  - 窗口上限 31 天（`spanDays > 30` ⇒ 后端抛错 ⇒ 真 400）⇒ 这里自己夹。
+ */
+const LOAD_RATE_MAX_DAYS = 30
+
+/** 负荷率查询窗：与甘特时间轴同窗；`to` 多给 1 天（闭区间重叠口径），展示时按末日裁 */
+const loadRateWindow = computed(() => {
+  const from = dayjs(dateRange.value.from).startOf('day')
+  const wantedLast = dayjs(dateRange.value.to).startOf('day')
+  const maxLast = from.add(LOAD_RATE_MAX_DAYS - 1, 'day')
+  const last = wantedLast.isAfter(maxLast) ? maxLast : wantedLast
+  return {
+    /** 请求用窗起 */
+    from: from.format('YYYY-MM-DD'),
+    /** 请求用窗止＝末日+1 天（否则命中不到末日的活） */
+    to: last.add(1, 'day').format('YYYY-MM-DD'),
+    /** 展示用末日（请求多出来的那一行要裁掉） */
+    lastDay: last.format('YYYY-MM-DD'),
+    /** 是否因为端点 31 天上限被截短 */
+    clamped: wantedLast.isAfter(last)
+  }
+})
+
+/** 负荷率行（裁掉请求多给的那一天，并按设备/日期排序） */
+const loadRateRows = computed<ResourceLoadRowDto[]>(() => {
+  const d = scheduleStore.resourceLoad
+  if (!d) return []
+  const from = loadRateWindow.value.from
+  const last = loadRateWindow.value.lastDay
+  return (d.rows ?? [])
+    .filter((r) => {
+      const day = String(r.businessDate).slice(0, 10)
+      return day >= from && day <= last
+    })
+    .sort((a, b) => {
+      const ra = a.resourceCode || a.resourceName || String(a.resourceId)
+      const rb = b.resourceCode || b.resourceName || String(b.resourceId)
+      if (ra !== rb) return ra.localeCompare(rb)
+      return String(a.businessDate).localeCompare(String(b.businessDate))
+    })
+})
+
+/** 设备筛选（编码/名称模糊；纯前端过滤，不重发请求） */
+const loadRateKeyword = ref('')
+const loadRateFiltered = computed(() => {
+  const kw = loadRateKeyword.value.trim().toLowerCase()
+  if (!kw) return loadRateRows.value
+  return loadRateRows.value.filter((r) =>
+    `${r.resourceCode ?? ''} ${r.resourceName ?? ''} ${r.resourceId}`.toLowerCase().includes(kw)
+  )
+})
+
+const LOAD_RATE_PAGE_SIZE = 50
+const loadRatePage = ref(1)
+const loadRateTotalPages = computed(() =>
+  Math.max(1, Math.ceil(loadRateFiltered.value.length / LOAD_RATE_PAGE_SIZE))
+)
+const loadRatePaged = computed(() => {
+  const start = (loadRatePage.value - 1) * LOAD_RATE_PAGE_SIZE
+  return loadRateFiltered.value.slice(start, start + LOAD_RATE_PAGE_SIZE)
+})
+watch([loadRateKeyword, () => loadRateRows.value.length], () => {
+  loadRatePage.value = 1
+})
+
+/** ①日历负荷率：**不适用 / 未判定 都不是 0**；0% 是「有可用小时、当日无排产」的明确零 */
+function loadRateCalendarText(row: ResourceLoadRowDto): string {
+  if (row.notApplicableReason) return '不适用'
+  if (row.calendarLoadRatePct == null) return '未判定'
+  return `${row.calendarLoadRatePct}%`
+}
+
+/** ①是「明确零」时的补充说明（有可用小时但当日没排产） */
+function loadRateCalendarHint(row: ResourceLoadRowDto): string {
+  if (row.notApplicableReason) return ''
+  if (row.calendarLoadRatePct === 0 && row.scheduledHours === 0 && row.taskCount === 0) {
+    return '当日无排产'
+  }
+  return ''
+}
+
+/** 日历依据：这一行用的是哪一级日历算出来的可用小时 */
+const CALENDAR_SOURCE_LABELS: Record<string, string> = {
+  Resource: '设备级',
+  Department: '部门级',
+  Factory: '工厂级'
+}
+function loadRateCalendarSourceText(row: ResourceLoadRowDto): string {
+  const s = row.calendarSource
+  if (!s) return '未提供'
+  return CALENDAR_SOURCE_LABELS[s] ?? s
+}
+
+/** ③Setup 换型损失率：现无持久列 ⇒ 恒「未具备数据条件」（0号位 Q-b 裁定；不是 0、不是未提供） */
+function loadRateSetupText(row: ResourceLoadRowDto): string {
+  return row.setupLossRatePct == null ? '未具备数据条件' : `${row.setupLossRatePct}%`
+}
+
+/** 设备显示名（列表不显示内部 ID） */
+function loadRateResourceText(row: ResourceLoadRowDto): string {
+  const code = row.resourceCode
+  const name = row.resourceName
+  if (code && name) return `${code} ${name}`
+  return code || name || `资源 #${row.resourceId}`
+}
+
+/** 负荷率取数（切版本 / 切窗口 / 换资源筛选时与甘特两链一起重取） */
+function loadLoadRate(): void {
+  const w = loadRateWindow.value
+  void scheduleStore.loadResourceLoad({
+    from: w.from,
+    to: w.to,
+    resourceIds: selectedResourceIds.value
+  })
+}
+
+/* ===== P11 MES 衔接清单（只读；5号位 2026-11-17 复函B6 / r14259；矩阵 B6）=====
+ *
+ * 落位：v0.2 §1.2 落位表「P11 = 生产排程工作空间 MES 衔接入口/Tab」⇒ 就在本页加页签，不另建页。
+ *
+ * **三层状态一行给全，互不冒充**（0号位 Q-d 第四项）：
+ *   ① APS 下发层（TaskDispatch 原词表分桶；「其它」桶＝建单中 + 未来新码，**不是失败**）
+ *   ② MES 工单层（工单号 + 四词表状态；批内多工单**不合并**）
+ *   ③ MES 报工层（数量 + `reported` 位；`reported=false` ⇒ **未判定**，不是零报工）
+ *
+ * ⚠️ dev 尚未部署 r14259（2026-11-17 实测 404）⇒ 现在切到该页签只会看到「取不到」的诚实提示，
+ *   **不写桩、不用别处端点拼**。
+ */
+const mesStore = useMesStatusStore()
+
+/** 面板筛选（服务端筛选，提交后生效；与甘特工具栏筛选是两套） */
+const mesKeyword = ref('')
+const mesPiNo = ref('')
+const mesWorkOrderNo = ref('')
+const mesDispatchStatus = ref('')
+
+/** 计划窗（与甘特时间轴同窗同源；`to` 为右开轴末端） */
+const mesWindow = computed(() => ({ from: dateRange.value.from, to: dateRange.value.to }))
+
+/** 服务端命中批数（取不到 ⇒ 「未提供」，**不用本页条数顶替**） */
+const mesTotalText = computed(() => (mesStore.total === null ? '未提供' : String(mesStore.total)))
+/** 本页已加载批数（≠ 总数） */
+const mesLoadedCount = computed(() => mesStore.rows.length)
+
+/** 取 P11 清单（服务端分页） */
+function loadMesStatus(): void {
+  const id = currentVersionId.value
+  if (id === null) return
+  void mesStore.load(id, mesWindow.value)
+}
+
+/** 提交筛选 ⇒ 回第一页并重取 */
+function applyMesFilter(): void {
+  mesStore.setFilter({
+    keyword: mesKeyword.value.trim(),
+    piNo: mesPiNo.value.trim(),
+    workOrderNo: mesWorkOrderNo.value.trim(),
+    dispatchStatus: mesDispatchStatus.value
+  })
+  loadMesStatus()
+}
+
+/** 换页（服务端分页，页码与筛选绑定） */
+function onMesPageChange(p: number): void {
+  mesStore.pageIndex = p
+  loadMesStatus()
+}
+
+/** 展开批 ⇒ 取批内工序行（一次只展开一批） */
+function onMesExpandChange(row: MesStatusBatchRowDto, expanded: unknown): void {
+  const isOpen = Array.isArray(expanded)
+    ? expanded.some((r) => (r as MesStatusBatchRowDto)?.taskNo === row.taskNo)
+    : expanded === true
+  if (!isOpen) {
+    if (mesStore.batchTaskNo === row.taskNo) mesStore.closeBatch()
+    return
+  }
+  const id = currentVersionId.value
+  if (id === null || !row.taskNo) return
+  void mesStore.loadBatch(id, row.taskNo)
+}
+
+/** ①下发层计数（后端 int 计数：0 是**明确零**，合法显示；缺键才「未提供」） */
+function mesCount(v: number | undefined | null): string {
+  return typeof v === 'number' ? String(v) : '未提供'
+}
+
+/**
+ * ③报工层三态（**NULL＝未知**，0号位 §0.2 ②）：
+ *  - `reported=false` ⇒ 快照里没有该 (Run,PI,Stage) 行 ⇒ 各量**未判定**（不是零报工）
+ *  - `reported=true` 但该量缺键 ⇒ **未提供**
+ *  - `reported` 缺键 ⇒ **未提供**
+ */
+function mesReportQty(
+  row: MesStatusBatchRowDto,
+  key: 'goodQty' | 'scrapQty' | 'reworkQty' | 'remainingQty'
+): string {
+  if (row.reported === false) return '未判定'
+  if (row.reported !== true) return '未提供'
+  const v = row[key]
+  return v == null ? '未提供' : String(v)
+}
+
+/**
+ * 批内工序行的报工量：**没有 reported 位**（工序级口径）⇒ 缺行＝null＝**未判定**
+ * （后端 DTO 契约注：报工侧「可缺=未判定」）。
+ */
+function mesOpQty(v: number | null | undefined): string {
+  return v == null ? '未判定' : String(v)
+}
+
+/**
+ * 时间显示：**按后端原值直显，不做时区换算**。
+ * ⚠️ r14259 契约未声明这批时间的时区口径（`ScheduleRun.DataCutoffTime` 是 APS 本地墙钟，
+ *   MES 快照的 `SourceUpdatedAt`/`LastReportTime` 由库内 SP 从 MES 源灌入）⇒ 我方不替后端
+ *   做位移（位移错了就是错 8 小时）。同一口径四列并排，用户可横向对照。
+ */
+function mesTime(v: string | null | undefined): string {
+  if (!v) return '未提供'
+  return formatLocalDateTimeSec(v)
+}
+
+/** 取数失败 ⇒ 大白话（不把后端 message 直抛给用户；原始信息留在悬停里） */
+function mesErrorText(msg: string): string {
+  if (/404|not\s*found|未找到/i.test(msg)) {
+    return '后端还没有上线这个读面，暂时读不到 MES 衔接信息'
+  }
+  if (/401|unauthorized|登录|token/i.test(msg)) return '登录状态已过期，请重新登录后再看'
+  if (/403|forbidden|无权|越权/i.test(msg)) return '当前账号没有查看这个版本 MES 信息的权限'
+  if (/timeout|超时/i.test(msg)) return '请求超时，请稍后重试'
+  return '读取失败，请稍后重试'
+}
+
+/** 面板顶部告警（取数失败 / 越权 / 版本不存在，三态互斥） */
+const mesAlert = computed<{ type: 'error' | 'warning'; text: string } | null>(() => {
+  if (mesStore.error) return { type: 'error', text: mesErrorText(mesStore.error) }
+  if (mesStore.scopeDenied) {
+    return { type: 'warning', text: '这个计划版本不在你的数据范围内，看不到 MES 衔接信息' }
+  }
+  if (mesStore.versionExists === false) {
+    return { type: 'warning', text: '这个计划版本不存在，换一版看看' }
+  }
+  return null
+})
+
 /* ===== 任务详情 Drawer ===== */
 const drawerVisible = ref(false)
 const selectedTaskId = ref<number | null>(null)
@@ -1525,17 +1951,92 @@ const selectedTask = computed<GanttTaskDto | null>(() => {
   return ganttData.value?.tasks.find((t) => t.taskId === selectedTaskId.value) ?? null
 })
 
-/** 换型时间来源标签（未知值降级原样显示，不查表硬取） */
-const selectedSetupSourceMeta = computed(() => setupSourceMetaOf(selectedTask.value?.setupSource))
+/**
+ * A5 单任务详情读面（5号位 2026-11-16 矩阵 A5 / r14237）
+ *
+ * `GET /api/schedule/task/{taskId}` —— P06 与 P04/P05 **共享同一详情组件**（v0.2 落位表），
+ * 所以抽屉不能只靠甘特体：P05 清单是服务端分页，行常常不在已加载的甘特体里
+ * ⇒ 详情必须走 A5 取，不能靠「在甘特体里找得到吗」来判断。
+ *
+ * ⚠️ **三态分报，禁混**（后端 `GetTaskDetailAsync`）：
+ *  - `found=false` ⇒ 该 taskId **不存在**（不是无权限）
+ *  - `found=true && scopeDenied=true` ⇒ 任务**存在但越权**（域/部门范围不足）
+ *  - `found=true && scopeDenied=false` ⇒ 可读
+ */
+type TaskDetailState = 'LOADING' | 'ERROR' | 'NOT_FOUND' | 'DENIED' | 'OK'
+const taskDetailState = ref<TaskDetailState>('LOADING')
+const taskDetail = ref<TaskDetailResultDto | null>(null)
+const taskDetailError = ref<string | null>(null)
+let taskDetailAbort: AbortController | null = null
+
+/** A5 行（服务端读面）；A5 不可读时整块不渲染，不拿甘特体顶替 */
+const detailRow = computed<TaskListItemDto | null>(() => taskDetail.value?.task ?? null)
+
+/** 排程域：A5 顶层优先，甘特体兜底（两个读面都有该字段） */
+const detailDomainKey = computed<string | null>(
+  () => taskDetail.value?.domainKey ?? selectedTask.value?.domainKey ?? null
+)
+
+/** 订单份额：A5 逐行全量；`sharesProvided=false` = 后端未下发（≠ 无份额记录） */
+const detailShares = computed<TaskShareDetailDto[]>(() => taskDetail.value?.shares ?? [])
+const detailSharesProvided = computed<boolean>(() => taskDetail.value?.sharesProvided === true)
+
+/** 抽屉标题的任务号：A5 行优先、甘特体兜底 */
+const drawerTaskNo = computed<string | null>(
+  () => detailRow.value?.taskNo ?? selectedTask.value?.taskNo ?? null
+)
+
+/** 版本身份四件（矩阵 A5：versionCode / domainKey / planVersionStatus / dataCutoffTime） */
+const detailVersionCode = computed<string | null>(() => taskDetail.value?.versionCode ?? null)
+const detailVersionStatus = computed<PlanVersionStatus | null>(
+  () => taskDetail.value?.planVersionStatus ?? null
+)
+const detailDataCutoffTime = computed<string | null>(() => taskDetail.value?.dataCutoffTime ?? null)
+
+function detailErrorText(err: unknown): string {
+  const msg = (err as { message?: string } | null)?.message
+  return typeof msg === 'string' && msg ? msg : '未知错误'
+}
+
+/** 拉 A5 详情（切任务时中止上一次；中止的旧响应不写状态） */
+async function loadTaskDetail(taskId: number): Promise<void> {
+  taskDetailAbort?.abort()
+  const ctrl = new AbortController()
+  taskDetailAbort = ctrl
+  taskDetailState.value = 'LOADING'
+  taskDetail.value = null
+  taskDetailError.value = null
+  try {
+    const res = await scheduleApi.getTaskDetail(taskId, ctrl.signal)
+    if (ctrl.signal.aborted) return
+    taskDetail.value = res
+    if (res.found === false) taskDetailState.value = 'NOT_FOUND'
+    else if (res.scopeDenied === true) taskDetailState.value = 'DENIED'
+    else taskDetailState.value = 'OK'
+  } catch (err) {
+    if (ctrl.signal.aborted) return
+    taskDetailState.value = 'ERROR'
+    taskDetailError.value = detailErrorText(err)
+  }
+}
+
+/** 换型时间来源标签（A5 行优先、甘特体兜底；未知值降级原样显示，不查表硬取） */
+const selectedSetupSourceMeta = computed(() =>
+  setupSourceMetaOf(detailRow.value?.setupSource ?? selectedTask.value?.setupSource)
+)
 
 /**
  * TaskShare 区块标题（审核 B-02 三态）：
- * 1 条 ⇒ 本任务由 1 个订单承接；多条 ⇒ 共担；0 条 ⇒ 不渲染本区块。
+ * 1 条 ⇒ 本任务由 1 个订单承接；多条 ⇒ 共担；0 条 ⇒ 「无份额记录」。
  * 措辞只说后端给的事实，不替后端断言「单订单任务」或「共担」。
+ *
+ * ⚠️ 2026-11-17 起数据源换成 **A5 `shares[]`（逐行全量）**，不再用甘特体的 `taskShare`
+ *   —— 两边是同一事实的两个读面，混排会成两套口径。
  */
 const taskShareTitle = computed(() => {
-  const n = selectedTask.value?.taskShare?.length ?? 0
-  if (n <= 1) return '订单份额 — 本任务由 1 个订单承接'
+  const n = detailShares.value.length
+  if (n === 0) return '订单份额'
+  if (n === 1) return '订单份额 — 本任务由 1 个订单承接'
   return `订单份额 — 一个任务承接 ${n} 个订单`
 })
 
@@ -1621,26 +2122,6 @@ function gridLabelOf(t: GanttTaskDto): string {
   return material ? `${barLabelOf(t)} | ${material}` : barLabelOf(t)
 }
 
-const SEVERITY_WEIGHT = { ERROR: 3, WARN: 2, INFO: 1 } as const
-
-/**
- * 任务清单「主要原因」：取 severity 最高的一条（冻结 01 §77A② 要求清单能看到主要原因）。
- * 无事实 ⇒ 返回 null，页面显「—」，不编造原因。
- *
- * 2026-11-05：5号位 Q2-a 放宽过滤后，订单级事实（`objectType='ORDER'`）会透传到该单的每个任务
- *   ⇒ 必须标「（订单级）」，否则用户会以为「这个任务自己的原因」。
- */
-function primaryDelayReasonText(t: GanttTaskDto): string | null {
-  const list = t.delayReasons ?? []
-  if (list.length === 0) return null
-  const top = [...list].sort(
-    (a, b) => (SEVERITY_WEIGHT[b.severity] ?? 0) - (SEVERITY_WEIGHT[a.severity] ?? 0)
-  )[0]
-  const label = reasonLabelOf(top.reasonCode)
-  const text = list.length > 1 ? `${label} 等 ${list.length} 项` : label
-  return top.objectType === 'ORDER' ? `${text}（订单级）` : text
-}
-
 /* ===== P5 §12 看板提示：扫所有任务，计算受设备故障影响的 ID 集合 =====
  * 文档第 12 节：故障事实 → ImpactAssessment → ScheduleExplanationFact → RescheduleRecommendation → 看板提示
  * 实现思路：
@@ -1713,29 +2194,23 @@ function openTaskDetail(taskId: string | number) {
 
   // U06：segment 子条 ID 形如 "{parentTaskId}_seg_{seq}"，点击时跳到父 Task
   const segIdx = raw.lastIndexOf('_seg_')
+  let parsedId: number
   if (segIdx > 0) {
-    selectedTaskId.value = Number(raw.slice(0, segIdx))
+    parsedId = Number(raw.slice(0, segIdx))
   } else {
-    selectedTaskId.value = Number(raw)
+    parsedId = Number(raw)
   }
-
-  // 3) 防御：selectedTaskId 拿不到对应任务（极少见；类型不匹配 / 数据未加载）
-  const matched = ganttData.value?.tasks.find((t) => t.taskId === selectedTaskId.value) ?? null
-  if (!matched) {
-    console.warn(
-      '[Gantt] selectedTaskId not matched. raw=',
-      raw,
-      'parsed=',
-      selectedTaskId.value,
-      'available taskIds=',
-      ganttData.value?.tasks.slice(0, 5).map((t) => t.taskId)
-    )
-    ElMessage.warning(`未找到任务 #${selectedTaskId.value}，数据可能尚未加载完成`)
-    drawerVisible.value = true
+  if (!Number.isFinite(parsedId)) {
+    ElMessage.warning(`任务号无法解析：${raw}`)
     return
   }
+  selectedTaskId.value = parsedId
 
+  // 3) 详情走 A5（`GET /api/schedule/task/{taskId}`），**不**再要求任务已在甘特体里：
+  //    P05 清单是服务端分页，行常常不在已加载的甘特体中 ⇒ 原来那句「未找到任务」会把
+  //    清单详情入口直接堵死。两态（不存在 / 越权）由 A5 自己在抽屉里分报。
   drawerVisible.value = true
+  void loadTaskDetail(parsedId)
 }
 
 /* ===== 事件处理 ===== */
@@ -1936,11 +2411,20 @@ function jumpToTaskSpan(): void {
 const hasMoreInWindow = computed(() => ganttData.value?.hasMore === true)
 
 /**
- * 任务清单空态文案（接 `emptyKind` 口径，版本级 / 窗口级不混说）
- * ⚠️ 旧文案恒为「该时间范围内没有任务」⇒ 版本本身没产出排程结果时也说成"时间范围里没有"，
- *   与画布顶部的 4 态提示（`EMPTY_TEXT`）自相矛盾（10-31 审计缺口 #3）。
+ * 任务清单空态文案。
+ *
+ * ⚠️ **服务端读面有自己的两态**（矩阵 A4：`versionExists` / `scopeDenied`）：
+ *   「版本不存在」与「无权查看」是两件事，不能混说（甘特体的 `emptyKind` 是另一套口径）。
+ * ⚠️ **「筛选后为空」与「本来就没有」也要分开**：本面板可带服务端筛选
+ *   （阶段 / MES 工单 / 关键词）⇒ 空是「被筛掉了」还是「本来就没有」要说清。
  */
 const taskListEmptyText = computed(() => {
+  const r = scheduleStore.taskList
+  if (r?.versionExists === false) return '该计划版本不存在'
+  if (r?.scopeDenied === true) return '当前账号无权查看该版本'
+  if (taskPaneFilters.value.keyword || taskPaneStages.value.length > 0) {
+    return '当前筛选条件下没有任务（可放宽筛选再试）'
+  }
   switch (emptyKind.value) {
     case 'scope-denied':
       return '当前账号无权查看该版本'
@@ -1982,6 +2466,10 @@ async function refresh() {
     await scheduleStore.loadCurrent(currentGanttWindow())
     // 负荷带与甘特本体是两个端点、两条独立取数链（store 内各自单飞/可中止）
     void scheduleStore.loadBuckets(currentBucketWindow())
+    // P12 负荷率是第三个端点（矩阵 A6/A7）
+    loadLoadRate()
+    // P05 任务清单是第四个端点（矩阵 A4）：服务端分页，与甘特体同窗同资源过滤
+    loadTaskList()
   }
 }
 
@@ -1993,6 +2481,19 @@ watch(currentVersionId, (id) => {
   selectedResourceIds.value = []
   void scheduleStore.loadCurrent(currentGanttWindow())
   void scheduleStore.loadBuckets(currentBucketWindow())
+  loadLoadRate()
+  // P05 任务清单：换版本 ⇒ 回第一页取新版本的第一页（请求源含版本外的参数，这里显式触发一次）
+  taskListPage.value = 1
+  loadTaskList()
+  // P11 MES 衔接：换版本 ⇒ 回第一页 + 收起展开行（批/工序都属于某个版本）
+  mesStore.resetPaging()
+  if (viewTab.value === 'mes') loadMesStatus()
+})
+
+// 计划窗变了（自定义窗或时间尺度档位）⇒ P11 端点按计划窗过滤 ⇒ 回第一页重取
+watch(mesWindow, () => {
+  mesStore.resetPaging()
+  if (viewTab.value === 'mes') loadMesStatus()
 })
 
 // 换尺度改了窗口 → 按新窗口重取（后端按窗口过滤，本页不再持有整版本数据）
@@ -2000,6 +2501,7 @@ watch(ganttWindow, () => {
   if (currentVersionId.value !== null) {
     void scheduleStore.loadCurrent(currentGanttWindow())
     void scheduleStore.loadBuckets(currentBucketWindow())
+    loadLoadRate()
   }
 })
 
@@ -2062,17 +2564,17 @@ function setZoomLevel(name: string): void {
   ganttRef.value?.setZoomLevelByName(name)
 }
 
-/** 按当前窗口重新取数（甘特本体 + 负荷带；两个端点各自单飞） */
+/** 按当前窗口重新取数（甘特本体 + 负荷带 + 负荷率；三个端点各自单飞） */
 function reloadCurrentWindow(): void {
   if (currentVersionId.value === null) return
   void scheduleStore.loadCurrent(currentGanttWindow())
   void scheduleStore.loadBuckets(currentBucketWindow())
+  loadLoadRate()
 }
 
 onMounted(refresh)
 
 /* ===== MANUAL_RESCHEDULE（文档第 6 节最后一句 / Section 12 / Section 17 审计） ===== */
-const apsAuth = useApsAuthStore()
 const router = useRouter()
 
 /** PMC 及以上才可发起重排（v1.2 §23.1 权限码门控）
@@ -2112,10 +2614,30 @@ type BusinessEntryKey =
 /** 端点权限码（aps.plan.run）——五入口统一门控 */
 const canPlanRun = computed(() => apsAuth.has('aps.plan.run'))
 
+/**
+ * §10A 四个入口的域选项。
+ *
+ * ⚠️ **域字典漂移（5号位 2026-11-18 复函 §五）**：BJ_FAMILY_FRL / TJ_FAMILY_FRL 在域字典里
+ *   是**停用态**却带着 ACTIVE 版本在产。若这里只按字典 isActive 过滤，当前版本所属域
+ *   就会选不中 ⇒ ElSelect 显示裸 key、弹窗默认落到别的域（用户还得自己再切一次）。
+ *   停用语义未定义（0号位 待裁）⇒ 前端**不判定停用域可否排产**，只保证「有数据就选得到」。
+ *   选项 = ①字典启用域 ②当前数据里真实出现的域 ③当前计划版本所属域（均须在业务范围内）。
+ */
 const BUSINESS_DOMAIN_OPTIONS = computed<DomainKey[]>(() => {
-  const all = domainStore.activeDomains.map((d) => d.domainKey)
   const allowed = apsAuth.dataScope.domainKeys as readonly string[]
-  return allowed.length === 0 ? all : all.filter((k) => allowed.includes(k))
+  const inScope = (k: string): boolean => allowed.length === 0 || allowed.includes(k)
+  const out: DomainKey[] = []
+  for (const d of domainStore.activeDomains) out.push(d.domainKey)
+  const push = (k: string | undefined | null): void => {
+    if (k && inScope(k) && !out.includes(k as DomainKey)) out.push(k as DomainKey)
+  }
+  push(
+    versions.value.find((v: PlanVersionSummaryDto) => v.id === currentVersionId.value)?.domainKey
+  )
+  for (const dk of (ganttData.value?.tasks ?? []).map((t: GanttTaskDto) => t.domainKey).sort()) {
+    push(dk)
+  }
+  return out
 })
 
 /**
@@ -2394,6 +2916,7 @@ function onContextMenuAction(action: CtxAction): void {
     case 'detail':
       selectedTaskId.value = t.taskId
       drawerVisible.value = true
+      void loadTaskDetail(t.taskId)
       break
     case 'copyTaskNo':
       void copyText(t.taskNo, '已复制 TaskNo')
@@ -2431,6 +2954,7 @@ function openDetailFromDblClickPopover(): void {
   if (!t) return
   selectedTaskId.value = t.taskId
   drawerVisible.value = true
+  void loadTaskDetail(t.taskId)
   closeDblClickPopover()
 }
 
@@ -2512,6 +3036,8 @@ function triggerRescheduleForResource(): void {
           style="width: 280px"
           :loading="loading"
           :disabled="versions.length === 0"
+          filterable
+          title="版本列表含全部域内当前生效版本（isDefault 锚表），可输入版本号筛选"
         >
           <ElOptionGroup v-for="g in versionGroups" :key="g.key" :label="g.label">
             <ElOption
@@ -2523,6 +3049,14 @@ function triggerRescheduleForResource(): void {
             />
           </ElOptionGroup>
         </ElSelect>
+
+        <!-- 版本徽标（矩阵 A1）：状态与基线取甘特端点返回的 planVersionStatus / basePlanVersionId -->
+        <ElTag v-if="versionBadge" :type="versionBadge.type" size="default" effect="dark">
+          {{ versionBadge.text }}
+        </ElTag>
+        <ElTag v-if="baseVersionLabel" type="info" size="default" effect="plain">
+          基线 {{ baseVersionLabel }}
+        </ElTag>
 
         <!-- 时间尺度：一档 = 一个 (看多少天, 一格多长) 组合 ⇒ 窗口与刻度合并成一个控件 -->
         <span class="label">时间尺度</span>
@@ -2721,8 +3255,23 @@ function triggerRescheduleForResource(): void {
           任务清单
           <span
             class="view-tab-count"
-            title="当前生效条数（已按排程域/只看延期/只看工序/搜索过滤，与图上条数一致）"
-            >{{ taskListTotal }}</span
+            title="服务端全量命中数（同一时间窗与资源筛选；清单分页显示，本页只加载一页）"
+            >{{ taskListTotalText }}</span
+          >
+        </button>
+        <button
+          type="button"
+          role="tab"
+          class="view-tab"
+          :class="{ 'is-active': viewTab === 'mes' }"
+          :aria-selected="viewTab === 'mes'"
+          @click="viewTab = 'mes'"
+        >
+          MES 衔接
+          <span
+            class="view-tab-count"
+            title="服务端全量命中批数（MES 衔接清单分页显示，本页只加载一页）"
+            >{{ mesTotalText }}</span
           >
         </button>
       </div>
@@ -2894,11 +3443,11 @@ function triggerRescheduleForResource(): void {
 
     <!-- ===== 资源负荷视图（行=资源 × 列=时间桶，色深=负荷量）=====
          数据源 = 5号位 `/buckets`（资源级聚合）。
-         ⚠️ 无产能口径 ⇒ 只呈现负荷量、不标超载（见 loadHeatmap 注释）。 -->
+         ⚠️ 上半张图是**负荷量**（无分母）；下半「负荷率」用 `/resource-load` 另取（矩阵 A6/A7）。 -->
     <div v-show="viewTab === 'load'" class="load-pane">
       <div class="load-note">
         深浅＝该时间桶内的任务数（资源级聚合，不受甘特条已加载条数影响）。
-        <span class="load-note-warn">暂无产能口径，暂不标超载。</span>
+        <span class="load-note-warn">负荷率见下方「负荷率（设备 × 日）」。</span>
       </div>
       <ElEmpty
         v-if="!loadHeatmap.columns.length"
@@ -2934,146 +3483,694 @@ function triggerRescheduleForResource(): void {
           </div>
         </div>
       </div>
-    </div>
 
-    <!-- ===== 任务清单（今日 / 未来）：冻结 09 §六 / 01:1914 =====
-         与甘特时间轴同窗；列表只展示后端已给字段，MES 下发/执行状态未接入不伪造 -->
-    <div v-show="viewTab === 'tasks'" class="task-list-pane">
-      <ElEmpty v-if="!taskListTotal" :description="taskListEmptyText" :image-size="60" />
-      <template v-else>
-        <div class="task-list-head">
-          <span>任务清单（{{ windowLabel }}）</span>
-          <!-- 导出按钮跟着任务清单走：导出内容就是这张表（与清单逐行一致） -->
-          <ElButton
+      <!-- ===== P12 负荷率（设备 × 业务日；5号位 2026-11-17 r14239；矩阵 A6/A7）===== -->
+      <div class="load-rate">
+        <div class="load-rate-head">
+          <span class="load-rate-title">负荷率（设备 × 日）</span>
+          <span class="load-rate-caliber">
+            ①日历负荷率＝当日已排 ÷
+            当日可用日历小时（分母按设备/部门/工厂三级继承，见「日历依据」）； ②16h 负荷率＝当日已排
+            ÷ 16 小时（固定口径，不等于实际可用时间）； ③Setup 换型损失率暂无数据条件。
+          </span>
+        </div>
+
+        <div class="load-rate-tools">
+          <ElInput
+            v-model="loadRateKeyword"
+            placeholder="按设备编码 / 名称筛选"
+            clearable
             size="small"
+            style="width: 220px"
+          />
+          <span class="load-rate-count">
+            共 {{ loadRateFiltered.length }} 行
+            <template v-if="loadRateRows.length !== loadRateFiltered.length">
+              （已按设备筛选，自 {{ loadRateRows.length }} 行）
+            </template>
+          </span>
+          <ElButton
+            v-if="scheduleStore.resourceLoad?.resourcesTruncated"
+            size="small"
+            type="warning"
             plain
-            title="导出当前时间窗内的任务清单（CSV，与任务清单页逐行一致）"
-            @click="exportTaskList"
+            title="窗内排产设备超过 200 台，后端只返回了前 200 台；用上方「资源」多选可收窄"
           >
-            <Icon icon="vi-ep:download" />
-            导出清单
+            设备已截断（只统计前 200 台）
           </ElButton>
         </div>
-        <ElTable :data="taskListPaged" size="small" border max-height="520" style="width: 100%">
-          <!-- 列序按「车间看单」的读法重排（0号位 2026-11-07 审核 B-01）：
-               物料 → 阶段 → 部门 → 资源/人工槽 → 工序 → 数量 → 时间 → 状态 → MES → 交期/延期/原因。
-               任务号 / 订单号 / 生产指示号是排产追溯主键，挪到表尾（高级列），不占前视线。
-               大工艺中文名待 5号位 出正式字典 ⇒ 阶段列仍显示 stageCode，前端不自造译名。 -->
-          <ElTableColumn label="物料" min-width="170" show-overflow-tooltip>
-            <template #default="{ row }">
-              <span>{{ row.materialCode ?? '—' }}</span>
-              <span v-if="row.materialName" class="task-list-muted">{{ row.materialName }}</span>
-            </template>
-          </ElTableColumn>
-          <ElTableColumn label="阶段" width="110" show-overflow-tooltip>
-            <template #default="{ row }">{{ row.stageCode ?? '—' }}</template>
-          </ElTableColumn>
-          <!-- 任务清单信息补全（5号位 2026-11-05 r14043/14044）：部门名 / 阶段 / 生产指示号
-               缺键=后端无值 ⇒ 显示「—」（旧版本接口不会带这三键） -->
-          <ElTableColumn label="部门" min-width="160" show-overflow-tooltip>
-            <template #default="{ row }">{{ row.departmentName ?? '—' }}</template>
-          </ElTableColumn>
-          <!-- 资源：编码 + 名称（后端两个字段都给；列表不显示内部 Id） -->
-          <ElTableColumn label="资源" min-width="150" show-overflow-tooltip>
-            <template #default="{ row }">{{ taskResourceText(row) }}</template>
-          </ElTableColumn>
-          <!-- 人工槽：有 manualSlotId 才是人工作业行（与设备资源互斥）；内部 id 不上列表 -->
-          <ElTableColumn label="人工槽" width="90" align="center">
-            <template #default="{ row }">
-              <span v-if="row.manualSlotId != null">人工</span>
-              <span v-else class="task-list-muted">—</span>
-            </template>
-          </ElTableColumn>
-          <ElTableColumn prop="operationCode" label="工序" width="100" />
-          <!-- 计划数量 = 净需求（netQty）；CSV 早就带这列、表格漏显示（审核 B-01） -->
-          <ElTableColumn label="计划数量" width="120" align="right">
-            <template #default="{ row }">
-              <span v-if="row.netQty != null">{{ row.netQty }} {{ row.uom ?? '' }}</span>
-              <span v-else class="task-list-muted">—</span>
-            </template>
-          </ElTableColumn>
-          <!-- 计划加工量 = 含良率补偿的加工数（后端可选键，缺键即「—」，不拿净需求顶替） -->
-          <ElTableColumn label="计划加工量" width="120" align="right">
-            <template #default="{ row }">
-              <span v-if="row.plannedProcessQty != null"
-                >{{ row.plannedProcessQty }} {{ row.uom ?? '' }}</span
-              >
-              <span v-else class="task-list-muted">—</span>
-            </template>
-          </ElTableColumn>
-          <ElTableColumn label="计划开始" width="160">
-            <template #default="{ row }">{{
-              row.plannedStartTime ? formatUtcDateTimeSec(row.plannedStartTime) : '—'
-            }}</template>
-          </ElTableColumn>
-          <ElTableColumn label="计划结束" width="160">
-            <template #default="{ row }">{{
-              row.plannedEndTime ? formatUtcDateTimeSec(row.plannedEndTime) : '—'
-            }}</template>
-          </ElTableColumn>
-          <ElTableColumn label="状态" width="100">
-            <template #default="{ row }">{{
-              TASK_STATUS_LABELS[row.status] ?? row.status
-            }}</template>
-          </ElTableColumn>
-          <!-- MES 工单号（源=Task.MESWorkOrderNo，JSON 键 mesWorkOrderNo；5号位 2026-11-05 B2①）
-               缺键 = 尚未建单 ⇒ 显示「—」，不编造工单号 -->
-          <ElTableColumn label="MES 工单号" min-width="160" show-overflow-tooltip>
-            <template #default="{ row }">
-              <code v-if="row.mesWorkOrderNo" class="code-tag">{{ row.mesWorkOrderNo }}</code>
-              <span v-else class="task-list-muted" title="该任务尚未关联 MES 工单">—</span>
-            </template>
-          </ElTableColumn>
-          <!-- 下发状态（源=TaskDispatch.DispatchStatus，JSON 键 dispatchStatus；5号位 2026-11-05 B2②）
-               缺键 = 没有下发记录 = 未下发；值域由写侧决定，后端自由字符串 ⇒ 原样展示 -->
-          <ElTableColumn label="下发状态" width="120">
-            <template #default="{ row }">
-              <span v-if="row.dispatchStatus">{{ row.dispatchStatus }}</span>
-              <span v-else class="task-list-muted" title="没有 MES 下发记录">未下发</span>
-            </template>
-          </ElTableColumn>
-          <ElTableColumn label="客户交期" width="110">
-            <template #default="{ row }">{{
-              row.customerDueDate ? formatUtcDate(row.customerDueDate) : '—'
-            }}</template>
-          </ElTableColumn>
-          <ElTableColumn label="延期时长" width="100" align="right">
-            <template #default="{ row }">{{
-              row.delayHours != null ? row.delayHours.toFixed(1) + ' h' : '—'
-            }}</template>
-          </ElTableColumn>
-          <ElTableColumn label="主要原因" min-width="180" show-overflow-tooltip>
-            <template #default="{ row }">
-              <span v-if="primaryDelayReasonText(row)">{{ primaryDelayReasonText(row) }}</span>
-              <span v-else class="task-list-muted" title="后端未下发延期原因事实">—</span>
-            </template>
-          </ElTableColumn>
-          <ElTableColumn label="延期" width="80" align="center">
-            <template #default="{ row }">
-              <ElTag v-if="row.isDelayed" type="danger" size="small">延期</ElTag>
-              <span v-else class="task-list-muted">-</span>
-            </template>
-          </ElTableColumn>
-          <!-- 高级列（审核 B-01：任务号 / 主订单 / PI 号挪到表尾，不占前视线） -->
-          <ElTableColumn prop="taskNo" label="任务号" min-width="150" show-overflow-tooltip />
-          <ElTableColumn label="订单号" min-width="140" show-overflow-tooltip>
-            <template #default="{ row }">{{ row.orderNo ?? '—' }}</template>
-          </ElTableColumn>
-          <ElTableColumn label="生产指示号" min-width="150" show-overflow-tooltip>
-            <template #default="{ row }">{{ row.mtS_InstructionNo ?? '—' }}</template>
-          </ElTableColumn>
-        </ElTable>
-        <div class="task-list-pager">
-          <ElPagination
-            v-model:current-page="taskListPage"
-            :page-size="TASK_LIST_PAGE_SIZE"
-            :total="taskListTotal"
-            layout="total, prev, pager, next, jumper"
-            small
-            background
+
+        <ElAlert
+          v-if="loadRateWindow.clamped"
+          type="warning"
+          :closable="false"
+          show-icon
+          title="负荷率端点窗口上限 31 天，这里只统计了前 30 天"
+          class="load-rate-alert"
+        />
+        <ElAlert
+          v-if="scheduleStore.resourceLoadError"
+          type="error"
+          :closable="false"
+          show-icon
+          :title="`负荷率取数失败：${scheduleStore.resourceLoadError}`"
+          class="load-rate-alert"
+        />
+        <ElAlert
+          v-else-if="scheduleStore.resourceLoad?.scopeDenied"
+          type="warning"
+          :closable="false"
+          show-icon
+          title="这个计划版本不在你的数据范围内（越权），看不到负荷率"
+          class="load-rate-alert"
+        />
+        <ElAlert
+          v-else-if="
+            scheduleStore.resourceLoad && scheduleStore.resourceLoad.versionExists === false
+          "
+          type="warning"
+          :closable="false"
+          show-icon
+          title="这个计划版本不存在，换一版看看"
+          class="load-rate-alert"
+        />
+
+        <div v-if="scheduleStore.resourceLoadLoading" class="load-rate-loading">负荷率加载中…</div>
+        <ElEmpty
+          v-else-if="!loadRateFiltered.length"
+          :description="
+            scheduleStore.resourceLoad
+              ? '这个时间窗里没有设备负荷数据。换个时间窗，或在上方选几台设备再试。'
+              : '负荷率暂无数据。'
+          "
+          :image-size="60"
+        />
+        <template v-else>
+          <ElTable :data="loadRatePaged" size="small" border max-height="420" style="width: 100%">
+            <ElTableColumn label="设备" min-width="170" show-overflow-tooltip>
+              <template #default="{ row }">
+                {{ loadRateResourceText(row) }}
+              </template>
+            </ElTableColumn>
+            <ElTableColumn label="日期" width="110">
+              <template #default="{ row }">
+                {{ String(row.businessDate).slice(0, 10) }}
+              </template>
+            </ElTableColumn>
+            <ElTableColumn label="排产工时" width="100" align="right">
+              <template #default="{ row }"> {{ row.scheduledHours }} h </template>
+            </ElTableColumn>
+            <ElTableColumn label="任务数" width="90" align="right">
+              <template #default="{ row }">
+                {{ row.taskCount }}
+              </template>
+            </ElTableColumn>
+            <ElTableColumn label="可用日历小时" width="120" align="right">
+              <template #default="{ row }">
+                {{
+                  row.calendarAvailableHours != null ? `${row.calendarAvailableHours} h` : '未提供'
+                }}
+              </template>
+            </ElTableColumn>
+            <ElTableColumn label="日历依据" width="100">
+              <template #default="{ row }">
+                {{ loadRateCalendarSourceText(row) }}
+              </template>
+            </ElTableColumn>
+            <ElTableColumn label="①日历负荷率" width="130" align="right">
+              <template #default="{ row }">
+                <span :title="row.notApplicableReason ?? ''">{{ loadRateCalendarText(row) }}</span>
+                <span v-if="loadRateCalendarHint(row)" class="load-rate-hint">
+                  {{ loadRateCalendarHint(row) }}
+                </span>
+              </template>
+            </ElTableColumn>
+            <ElTableColumn label="②16h 负荷率" width="110" align="right">
+              <template #default="{ row }">
+                {{ row.fixed16LoadRatePct != null ? `${row.fixed16LoadRatePct}%` : '未提供' }}
+              </template>
+            </ElTableColumn>
+            <ElTableColumn label="③Setup 换型损失率" width="150">
+              <template #default="{ row }">
+                {{ loadRateSetupText(row) }}
+              </template>
+            </ElTableColumn>
+          </ElTable>
+
+          <div class="load-rate-pager">
+            <ElButton :disabled="loadRatePage <= 1" @click="loadRatePage = 1">首页</ElButton>
+            <ElButton :disabled="loadRatePage <= 1" @click="loadRatePage = loadRatePage - 1">
+              上一页
+            </ElButton>
+            <span class="load-rate-count">第 {{ loadRatePage }} / {{ loadRateTotalPages }} 页</span>
+            <ElButton
+              :disabled="loadRatePage >= loadRateTotalPages"
+              @click="loadRatePage = loadRatePage + 1"
+            >
+              下一页
+            </ElButton>
+          </div>
+        </template>
+      </div>
+    </div>
+
+    <!-- ===== 任务清单（服务端读面；5号位 2026-11-16 矩阵 A4 / r14237）=====
+         与甘特时间轴同窗；行 = 服务端一页；只展示读面真有的字段，缺键显「未提供」 -->
+    <div v-show="viewTab === 'tasks'" class="task-list-pane">
+      <!-- 面板自带的服务端筛选（与甘特工具栏筛选是两套，页面上分开标注） -->
+      <div class="task-list-filters">
+        <ElInput
+          v-model="taskPaneKeyword"
+          class="task-pane-keyword"
+          size="small"
+          clearable
+          placeholder="物料编码 / 物料名称 / 任务号"
+          aria-label="任务清单关键词"
+        >
+          <template #prefix>
+            <Icon icon="vi-ep:search" />
+          </template>
+        </ElInput>
+        <ElSelect
+          v-model="taskPaneHasWorkOrder"
+          size="small"
+          style="width: 150px"
+          placeholder="MES 工单"
+          aria-label="MES 工单筛选"
+          title="按「有没有 MES 工单号」过滤（不是「无需 MES」分类——后端未提供该分类）"
+        >
+          <ElOption label="全部工单情况" value="all" />
+          <ElOption label="有 MES 工单号" value="with" />
+          <ElOption label="无 MES 工单号" value="without" />
+        </ElSelect>
+        <ElSelect
+          v-model="taskPaneStages"
+          multiple
+          collapse-tags
+          collapse-tags-tooltip
+          size="small"
+          style="width: 180px"
+          placeholder="全部阶段"
+          :disabled="taskPaneStageOptions.length === 0"
+          aria-label="阶段筛选"
+          title="阶段选项取已加载数据的去重阶段码（后端未给阶段字典）"
+        >
+          <ElOption v-for="code in taskPaneStageOptions" :key="code" :label="code" :value="code" />
+        </ElSelect>
+        <ElSelect
+          v-model="taskPaneSortBy"
+          size="small"
+          style="width: 130px"
+          aria-label="排序字段"
+          title="「按任务 ID」是内部任务序号（后端 2026-11-18 r14264 修复后可用）；业务排序用「按任务号」"
+        >
+          <ElOption label="按计划开始" value="plannedStart" />
+          <ElOption label="按计划数量" value="quantity" />
+          <ElOption label="按物料编码" value="materialCode" />
+          <ElOption label="按任务号" value="taskNo" />
+          <ElOption label="按任务 ID" value="id" />
+        </ElSelect>
+        <ElSelect v-model="taskPaneSortDir" size="small" style="width: 96px" aria-label="排序方向">
+          <ElOption label="升序" value="asc" />
+          <ElOption label="降序" value="desc" />
+        </ElSelect>
+        <span class="task-list-muted">
+          上方工具栏的「只看延期 / 只看工序 / 搜索」只作用于甘特图
+        </span>
+      </div>
+
+      <!-- 三个数分列（§0.2 ③）：服务端全量命中 / 本页已加载 / 甘特图已加载 -->
+      <div class="task-list-head">
+        <span>任务清单（{{ windowLabel }}）</span>
+        <span class="task-list-counts">
+          服务端命中 <strong>{{ taskListTotalText }}</strong> ｜ 本页已加载
+          <strong>{{ taskListLoadedCount }}</strong> ｜ 甘特图已加载
+          <strong>{{ ganttLoadedCount }}</strong>
+        </span>
+        <!-- 导出按钮跟着任务清单走：导出内容就是当前页这张表 -->
+        <ElButton
+          size="small"
+          plain
+          title="导出当前页已加载的任务（CSV；服务端是分页的，本页不等于全部）"
+          @click="exportTaskList"
+        >
+          <Icon icon="vi-ep:download" />
+          导出本页
+        </ElButton>
+      </div>
+
+      <ElAlert
+        v-if="taskListError"
+        :title="`任务清单加载失败：${taskListError}`"
+        type="error"
+        :closable="false"
+        show-icon
+        class="task-list-error"
+      />
+
+      <!-- 空态只在服务端明确说「命中 0 条」时出现；取数失败只留错误条，不说「没有任务」（§0.2 ②④） -->
+      <ElEmpty
+        v-if="!taskListLoading && !taskListError && taskListTotal === 0"
+        :description="taskListEmptyText"
+        :image-size="60"
+      />
+      <ElTable
+        v-else
+        :data="taskListRows"
+        size="small"
+        border
+        max-height="520"
+        v-loading="taskListLoading"
+        row-key="taskId"
+        style="width: 100%"
+      >
+        <!-- 列序按「车间看单」的读法重排（0号位 2026-11-07 审核 B-01）：
+             物料 → 阶段 → 部门 → 资源/人工槽 → 工序 → 数量 → 时间 → 状态 → MES。
+             ⚠️ 订单号 / 客户交期 / 延期 / 下发状态 **本读面没有**（矩阵 A4 的 25 字段里没有）
+             ⇒ 不显示，也不从甘特体拼凑（两套口径混算）。任务号 / 生产指示号挪到表尾。 -->
+        <ElTableColumn label="物料" min-width="170" show-overflow-tooltip>
+          <template #default="{ row }">
+            <span>{{ row.materialCode ?? '未提供' }}</span>
+            <span v-if="row.materialName" class="task-list-muted">{{ row.materialName }}</span>
+          </template>
+        </ElTableColumn>
+        <ElTableColumn label="阶段" width="110" show-overflow-tooltip>
+          <template #default="{ row }">{{ row.stageCode ?? '未提供' }}</template>
+        </ElTableColumn>
+        <ElTableColumn label="部门" min-width="160" show-overflow-tooltip>
+          <template #default="{ row }">{{ row.productionDepartmentName ?? '未提供' }}</template>
+        </ElTableColumn>
+        <!-- 执行资源：设备显「编码 名称」（编码从甘特资源表补），人工显「人工 · 槽编码」 -->
+        <ElTableColumn label="执行资源" min-width="150" show-overflow-tooltip>
+          <template #default="{ row }">{{ taskResourceText(row) }}</template>
+        </ElTableColumn>
+        <ElTableColumn label="工序" width="140" show-overflow-tooltip>
+          <template #default="{ row }">
+            <span>{{ row.operationCode }}</span>
+            <span v-if="row.operationName" class="task-list-muted">{{ row.operationName }}</span>
+          </template>
+        </ElTableColumn>
+        <!-- 计划数量 = 净需求（quantity）；缺键即「未提供」，不拿别的顶替 -->
+        <ElTableColumn label="计划数量" width="120" align="right">
+          <template #default="{ row }">
+            <span v-if="row.quantity != null">{{ row.quantity }} {{ row.uom ?? '' }}</span>
+            <span v-else class="task-list-muted">未提供</span>
+          </template>
+        </ElTableColumn>
+        <!-- 计划加工量 = 含良率补偿的加工数（后端可选键，缺键即「未提供」，不拿净需求顶替） -->
+        <ElTableColumn label="计划加工量" width="120" align="right">
+          <template #default="{ row }">
+            <span v-if="row.plannedProcessQty != null"
+              >{{ row.plannedProcessQty }} {{ row.uom ?? '' }}</span
+            >
+            <span v-else class="task-list-muted">未提供</span>
+          </template>
+        </ElTableColumn>
+        <ElTableColumn label="计划开始" width="160">
+          <template #default="{ row }">{{
+            row.plannedStartTime ? formatUtcDateTimeSec(row.plannedStartTime) : '未提供'
+          }}</template>
+        </ElTableColumn>
+        <ElTableColumn label="计划结束" width="160">
+          <template #default="{ row }">{{
+            row.plannedEndTime ? formatUtcDateTimeSec(row.plannedEndTime) : '未提供'
+          }}</template>
+        </ElTableColumn>
+        <!-- 计划工时：取后端 duration（小时），不用「结束−开始」重算 -->
+        <ElTableColumn label="计划工时" width="100" align="right">
+          <template #default="{ row }">{{
+            row.duration != null ? row.duration.toFixed(2) + ' h' : '未提供'
+          }}</template>
+        </ElTableColumn>
+        <ElTableColumn label="APS计划状态" width="110">
+          <template #default="{ row }">{{
+            TASK_STATUS_LABELS[sanitizeStatus(row.status)] ?? row.status
+          }}</template>
+        </ElTableColumn>
+        <!-- MES 工单号（源=Task.MESWorkOrderNo，JSON 键 mesWorkOrderNo）
+             缺键 = **未关联 MES 工单**；它不表示「无需 MES」也不表示「不可下发」 -->
+        <ElTableColumn label="MES 工单号" min-width="160" show-overflow-tooltip>
+          <template #default="{ row }">
+            <code v-if="row.mesWorkOrderNo" class="code-tag">{{ row.mesWorkOrderNo }}</code>
+            <span v-else class="task-list-muted" title="该任务尚未关联 MES 工单">未关联</span>
+          </template>
+        </ElTableColumn>
+        <!-- MES 下发状态（5号位 2026-11-18 复函 N2 补：TaskDispatch.DispatchStatus）
+             ⚠️ null 的语义 = **该 Task 不在下发队列**（≠「未下发」、≠「无需 MES」） -->
+        <ElTableColumn label="MES 下发" width="120">
+          <template #default="{ row }">
+            <ElTag v-if="row.mesDispatchStatus" size="small" type="info">
+              {{ mesDispatchStatusLabel(row.mesDispatchStatus) }}
+            </ElTag>
+            <ElTooltip
+              v-else
+              content="后端口径：没有下发记录 = 该任务不在下发队列（不等于未下发，也不等于无需 MES）"
+              placement="top"
+            >
+              <span class="task-list-muted">不在下发队列</span>
+            </ElTooltip>
+          </template>
+        </ElTableColumn>
+        <!-- MES 衔接分类位：**后端未提供**（矩阵 A4：分类位仍空，hasWorkOrder 不承载该语义） -->
+        <ElTableColumn label="MES 衔接分类" width="120">
+          <template #default>
+            <span class="task-list-muted" title="后端未提供「无需 MES / 暂不可下发」分类标志位"
+              >未提供</span
+            >
+          </template>
+        </ElTableColumn>
+        <!-- 高级列（审核 B-01：任务号 / 生产指示号挪到表尾，不占前视线） -->
+        <ElTableColumn prop="taskNo" label="任务号" min-width="150" show-overflow-tooltip />
+        <ElTableColumn label="生产指示号" min-width="150" show-overflow-tooltip>
+          <template #default="{ row }">{{ row.mtsInstructionNo ?? '未提供' }}</template>
+        </ElTableColumn>
+        <ElTableColumn label="操作" width="90" align="center" fixed="right">
+          <template #default="{ row }">
+            <ElButton size="small" text type="primary" @click="openTaskDetail(row.taskId)">
+              详情
+            </ElButton>
+          </template>
+        </ElTableColumn>
+      </ElTable>
+      <!-- 分页器只在拿到服务端命中数时才出现：总数未知时不摆「共 0 条」的假分页（§0.2 ②） -->
+      <div v-if="taskListTotal !== null" class="task-list-pager">
+        <ElPagination
+          v-model:current-page="taskListPage"
+          :page-size="TASK_LIST_PAGE_SIZE"
+          :total="taskListTotal"
+          layout="total, prev, pager, next, jumper"
+          small
+          background
+        />
+      </div>
+    </div>
+
+    <!-- ===== P11 MES 衔接清单（只读；5号位 2026-11-17 复函B6 / r14259；矩阵 B6）=====
+         行 = Stage 执行批（TaskNo）；三层状态一行给全、互不冒充；
+         点行展开批内工序行（工序级下发 + 失败码/原因原值 + 同键报工） -->
+    <div v-show="viewTab === 'mes'" class="mes-pane">
+      <div class="mes-head">
+        <span class="mes-title">MES 衔接清单（Stage 执行批 · {{ windowLabel }}）</span>
+        <!-- 两个数分列（§0.2 ③）：服务端全量命中 / 本页已加载 -->
+        <span class="mes-counts">
+          服务端命中 <strong>{{ mesTotalText }}</strong> ｜ 本页已加载
+          <strong>{{ mesLoadedCount }}</strong>
+        </span>
+      </div>
+
+      <!-- 快照同步面：四个源更新时间（后端原值直显，不做时区换算） -->
+      <div class="mes-sync" title="以下时间按后端返回的原值显示（未做时区换算）">
+        <span
+          >数据截至 <strong>{{ mesTime(mesStore.sync?.dataCutoffTime) }}</strong></span
+        >
+        <span
+          >工单源更新 <strong>{{ mesTime(mesStore.sync?.woSnapshotSourceUpdatedAt) }}</strong></span
+        >
+        <span
+          >工序源更新
+          <strong>{{ mesTime(mesStore.sync?.opsSnapshotSourceUpdatedAt) }}</strong></span
+        >
+        <span
+          >下发最近入队 <strong>{{ mesTime(mesStore.sync?.dispatchMaxCreatedAt) }}</strong></span
+        >
+      </div>
+
+      <!-- 面板自带的服务端筛选（与甘特工具栏筛选是两套，页面上分开标注） -->
+      <div class="mes-filters">
+        <ElInput
+          v-model="mesKeyword"
+          size="small"
+          clearable
+          placeholder="物料编码 / 任务号 / 生产指示号"
+          aria-label="MES 衔接关键词"
+          style="width: 230px"
+          @keyup.enter="applyMesFilter"
+          @clear="applyMesFilter"
+        />
+        <ElInput
+          v-model="mesPiNo"
+          size="small"
+          clearable
+          placeholder="生产指示号"
+          aria-label="生产指示号筛选"
+          style="width: 150px"
+          @keyup.enter="applyMesFilter"
+          @clear="applyMesFilter"
+        />
+        <ElInput
+          v-model="mesWorkOrderNo"
+          size="small"
+          clearable
+          placeholder="MES 工单号"
+          aria-label="MES 工单号筛选"
+          style="width: 150px"
+          @keyup.enter="applyMesFilter"
+          @clear="applyMesFilter"
+        />
+        <ElSelect
+          v-model="mesDispatchStatus"
+          size="small"
+          clearable
+          placeholder="全部下发状态"
+          aria-label="下发状态筛选"
+          title="按「批内含该态工序行」筛选（不是只看批汇总的计数）"
+          style="width: 150px"
+        >
+          <ElOption
+            v-for="code in MES_DISPATCH_STATUS_OPTIONS"
+            :key="code"
+            :label="mesDispatchStatusLabel(code)"
+            :value="code"
           />
-        </div>
-      </template>
+        </ElSelect>
+        <ElButton size="small" type="primary" @click="applyMesFilter">查询</ElButton>
+        <span class="mes-muted">筛选走服务端；甘特工具栏的筛选只作用于甘特图</span>
+      </div>
+
+      <!-- 取数失败 / 越权 / 版本不存在：三条各自说清楚，绝不拿「空列表」当答案 -->
+      <div v-if="mesAlert" :title="mesStore.error ?? ''">
+        <ElAlert
+          :type="mesAlert.type"
+          :closable="false"
+          show-icon
+          class="mes-alert"
+          :title="mesAlert.text"
+        />
+      </div>
+
+      <!-- 空态：只在服务端明确说「命中 0 批」时出现；取数失败只留错误条 -->
+      <ElEmpty
+        v-if="!mesStore.loading && !mesStore.error && mesStore.total === 0"
+        description="这个时间窗内没有 MES 衔接批记录。注意：本版只覆盖有下发集的批，无工艺路线的阶段级说明行还没纳入"
+        :image-size="60"
+      />
+      <ElTable
+        v-else
+        :data="mesStore.rows"
+        size="small"
+        border
+        max-height="520"
+        v-loading="mesStore.loading"
+        row-key="taskNo"
+        style="width: 100%"
+        @expand-change="onMesExpandChange"
+      >
+        <ElTableColumn type="expand" width="40">
+          <template #default="{ row }">
+            <div class="mes-expand">
+              <!-- 一次只展开一批：本行不是当前批时不显示别人的工序行 -->
+              <template v-if="mesStore.batchTaskNo === row.taskNo">
+                <div v-if="mesStore.batchLoading" class="mes-expand-loading">
+                  批内工序行加载中…
+                </div>
+                <ElAlert
+                  v-else-if="mesStore.batchError"
+                  type="warning"
+                  :closable="false"
+                  show-icon
+                  class="mes-expand-alert"
+                  :title="mesStore.batchError"
+                />
+                <ElTable v-else :data="mesStore.batchRows" size="small" border>
+                  <ElTableColumn label="工序" min-width="170" show-overflow-tooltip>
+                    <template #default="{ row: op }">
+                      <span>{{ op.operationCode || '未提供' }}</span>
+                      <span v-if="op.operationName" class="mes-muted">{{ op.operationName }}</span>
+                    </template>
+                  </ElTableColumn>
+                  <ElTableColumn label="下发状态" width="100">
+                    <template #default="{ row: op }">
+                      {{ mesDispatchStatusLabel(op.dispatchStatus) }}
+                    </template>
+                  </ElTableColumn>
+                  <ElTableColumn label="MES 工单号" min-width="150" show-overflow-tooltip>
+                    <template #default="{ row: op }">{{ op.mesWorkOrderNo || '未提供' }}</template>
+                  </ElTableColumn>
+                  <ElTableColumn label="数量" width="100" align="right">
+                    <template #default="{ row: op }">
+                      <span v-if="op.quantity != null">{{ op.quantity }} {{ op.uom ?? '' }}</span>
+                      <span v-else class="mes-muted">未提供</span>
+                    </template>
+                  </ElTableColumn>
+                  <ElTableColumn label="资源" min-width="130" show-overflow-tooltip>
+                    <template #default="{ row: op }">{{ op.resourceCode || '未提供' }}</template>
+                  </ElTableColumn>
+                  <ElTableColumn label="计划起止" width="200">
+                    <template #default="{ row: op }">
+                      <span>{{ op.plannedStart ? mesTime(op.plannedStart) : '未提供' }}</span>
+                      <span v-if="op.plannedEnd" class="mes-muted">
+                        ~ {{ mesTime(op.plannedEnd) }}</span
+                      >
+                    </template>
+                  </ElTableColumn>
+                  <ElTableColumn label="失败码" min-width="200" show-overflow-tooltip>
+                    <template #default="{ row: op }">
+                      <span v-if="op.failureCode">
+                        {{ mesFailureCodeLabel(op.failureCode) }}
+                        <span class="mes-muted">{{ op.failureCode }}</span>
+                      </span>
+                      <span v-else class="mes-muted">无</span>
+                    </template>
+                  </ElTableColumn>
+                  <ElTableColumn label="失败原因" min-width="180" show-overflow-tooltip>
+                    <template #default="{ row: op }">{{ op.failureReason || '无' }}</template>
+                  </ElTableColumn>
+                  <ElTableColumn label="报工（良品/废品/返工/剩余）" min-width="200">
+                    <template #default="{ row: op }">
+                      {{ mesOpQty(op.goodQty) }} / {{ mesOpQty(op.scrapQty) }} /
+                      {{ mesOpQty(op.reworkQty) }} / {{ mesOpQty(op.remainingQty) }}
+                    </template>
+                  </ElTableColumn>
+                  <ElTableColumn label="最后报工" width="160">
+                    <template #default="{ row: op }">
+                      {{ op.lastReportTime ? mesTime(op.lastReportTime) : '未判定' }}
+                    </template>
+                  </ElTableColumn>
+                </ElTable>
+              </template>
+              <div v-else class="mes-expand-loading">批内工序行正在按批加载，请点开要看的批</div>
+            </div>
+          </template>
+        </ElTableColumn>
+
+        <ElTableColumn label="批号（任务号）" min-width="180" show-overflow-tooltip>
+          <template #default="{ row }">
+            <code class="code-tag">{{ row.taskNo || '未提供' }}</code>
+          </template>
+        </ElTableColumn>
+        <ElTableColumn label="生产指示号" min-width="150" show-overflow-tooltip>
+          <template #default="{ row }">{{ row.piNo || '未提供' }}</template>
+        </ElTableColumn>
+        <ElTableColumn label="阶段" width="110" show-overflow-tooltip>
+          <template #default="{ row }">{{ row.stageCode || '未提供' }}</template>
+        </ElTableColumn>
+        <ElTableColumn label="物料编码" min-width="140" show-overflow-tooltip>
+          <template #default="{ row }">{{ row.materialCode || '未提供' }}</template>
+        </ElTableColumn>
+        <ElTableColumn label="工单类型" width="100">
+          <template #default="{ row }">{{ mesWorkOrderTypeLabel(row.workOrderType) }}</template>
+        </ElTableColumn>
+        <ElTableColumn label="批数量" width="100" align="right">
+          <template #default="{ row }">
+            <span v-if="row.batchQty != null">{{ row.batchQty }}</span>
+            <span v-else class="mes-muted">未提供</span>
+          </template>
+        </ElTableColumn>
+        <ElTableColumn label="工序数" width="80" align="right">
+          <template #default="{ row }">
+            <span v-if="row.operationCount != null">{{ row.operationCount }}</span>
+            <span v-else class="mes-muted">未提供</span>
+          </template>
+        </ElTableColumn>
+        <ElTableColumn label="计划起止" width="210">
+          <template #default="{ row }">
+            <span>{{ row.plannedStart ? mesTime(row.plannedStart) : '未提供' }}</span>
+            <span v-if="row.plannedEnd" class="mes-muted"> ~ {{ mesTime(row.plannedEnd) }}</span>
+          </template>
+        </ElTableColumn>
+        <!-- ① APS 下发层：四桶计数（后端原词表分桶；「其它」含建单中，不是失败） -->
+        <ElTableColumn label="① APS 下发层" min-width="210">
+          <template #default="{ row }">
+            <div class="mes-layer">
+              <span
+                >已建单 {{ mesCount(row.createdCount) }} ｜ 待下发
+                {{ mesCount(row.pendingCount) }}</span
+              >
+              <span>
+                建单中/其它 {{ mesCount(row.otherCount) }} ｜ 下发失败
+                {{ mesCount(row.failedCount) }}
+              </span>
+            </div>
+          </template>
+        </ElTableColumn>
+        <!-- ② MES 工单层：批内多工单**不合并** -->
+        <ElTableColumn label="② MES 工单层" min-width="200">
+          <template #default="{ row }">
+            <div class="mes-layer">
+              <span v-if="row.workOrderNo">
+                {{ row.workOrderNo }}（{{ mesWorkOrderStatusLabel(row.workOrderStatus) }}）
+              </span>
+              <span v-else class="mes-muted">工单号未提供</span>
+              <span v-if="row.workOrderStatusMixed" class="mes-warn">
+                批内多工单，状态不一致，未合并
+              </span>
+              <span
+                v-else-if="row.workOrderCount != null && row.workOrderCount > 1"
+                class="mes-warn"
+              >
+                批内 {{ row.workOrderCount }} 个工单
+              </span>
+            </div>
+          </template>
+        </ElTableColumn>
+        <!-- ③ MES 报工层：reported=false ⇒ 未判定（不是零报工） -->
+        <ElTableColumn label="③ MES 报工层" min-width="240">
+          <template #default="{ row }">
+            <div class="mes-layer">
+              <span>
+                良品 {{ mesReportQty(row, 'goodQty') }} ｜ 废品 {{ mesReportQty(row, 'scrapQty') }}
+              </span>
+              <span>
+                返工 {{ mesReportQty(row, 'reworkQty') }} ｜ 剩余
+                {{ mesReportQty(row, 'remainingQty') }}
+              </span>
+              <span class="mes-muted">
+                最后报工
+                {{
+                  row.lastReportTime
+                    ? mesTime(row.lastReportTime)
+                    : row.reported === false
+                      ? '未判定'
+                      : '未提供'
+                }}
+              </span>
+            </div>
+          </template>
+        </ElTableColumn>
+        <!-- MES 需求分类：后端恒 null（Q-a 未裁）⇒ 显示「未提供」，禁由工单号空反推 -->
+        <ElTableColumn label="MES 需求分类" width="120">
+          <template #default>
+            <span
+              class="mes-muted"
+              title="后端未提供「需MES / 无需MES / 暂不可下发」分类标志位，不能由工单号为空反推"
+              >未提供</span
+            >
+          </template>
+        </ElTableColumn>
+      </ElTable>
+
+      <!-- 分页器只在拿到服务端命中数时才出现：总数未知时不摆假分页 -->
+      <div v-if="mesStore.total !== null" class="mes-pager">
+        <ElPagination
+          :current-page="mesStore.pageIndex"
+          :page-size="mesStore.pageSize"
+          :total="mesStore.total"
+          layout="total, prev, pager, next, jumper"
+          small
+          background
+          @current-change="onMesPageChange"
+        />
+      </div>
     </div>
 
     <!-- ===== P3：双击任务条 → 轻量浮窗（Task 摘要 + 复制 TaskNo） ===== -->
@@ -3188,13 +4285,13 @@ function triggerRescheduleForResource(): void {
                 <Icon icon="vi-ep:tickets" class="aps-drawer-title-icon" />
                 任务详情
                 <ElTag
-                  v-if="selectedTask"
+                  v-if="drawerTaskNo"
                   size="small"
                   type="info"
                   effect="plain"
                   class="aps-drawer-taskno"
                 >
-                  {{ selectedTask.taskNo }}
+                  {{ drawerTaskNo }}
                 </ElTag>
               </span>
               <button
@@ -3210,40 +4307,109 @@ function triggerRescheduleForResource(): void {
 
             <!-- Drawer 主体（可滚动） -->
             <div class="aps-drawer-body">
-              <template v-if="selectedTask">
+              <!-- A5 状态条（5号位矩阵 A5：两态分报，禁混说） -->
+              <ElAlert
+                v-if="taskDetailState === 'LOADING'"
+                title="正在读取任务明细…"
+                type="info"
+                :closable="false"
+                show-icon
+                class="task-detail-state"
+              />
+              <ElAlert
+                v-else-if="taskDetailState === 'ERROR'"
+                :title="`任务明细读取失败：${taskDetailError ?? '未知错误'}`"
+                type="error"
+                :closable="false"
+                show-icon
+                class="task-detail-state"
+              />
+              <ElAlert
+                v-else-if="taskDetailState === 'NOT_FOUND'"
+                title="该任务不存在"
+                description="后端按该任务号未找到对应任务。请回到清单核对任务号，或确认计划版本是否已切换。"
+                type="warning"
+                :closable="false"
+                show-icon
+                class="task-detail-state"
+              />
+              <ElAlert
+                v-else-if="taskDetailState === 'DENIED'"
+                title="当前账号无权查看该任务"
+                description="该任务存在，但不在你所属排程域 / 部门的可见范围内。如需查看，请联系排程管理员调整授权范围。"
+                type="warning"
+                :closable="false"
+                show-icon
+                class="task-detail-state"
+              />
+
+              <template v-else>
+                <!-- 区块一：任务明细（服务端读面 A5 = GET /api/schedule/task/{taskId}）
+                     ⚠️ 本块只放 A5 真有的字段；订单号 / 客户交期 / 延期 / 下发状态
+                        **不在 A4/A5 读面里** ⇒ 归入下方「甘特视图补充」，不混排。 -->
                 <div class="detail-section">
                   <ElDescriptions :column="1" border size="small">
                     <ElDescriptionsItem label="任务编号">{{
-                      selectedTask.taskNo
+                      detailRow?.taskNo ?? '未提供'
                     }}</ElDescriptionsItem>
                     <ElDescriptionsItem label="排程域">
-                      <ElTag size="small" effect="plain">{{ selectedTask.domainKey }}</ElTag>
+                      <ElTag v-if="detailDomainKey" size="small" effect="plain">{{
+                        detailDomainKey
+                      }}</ElTag>
+                      <span v-else class="muted-text">未提供</span>
                     </ElDescriptionsItem>
-                    <ElDescriptionsItem label="主订单">{{
-                      selectedTask.orderNo ?? '-'
-                    }}</ElDescriptionsItem>
-                    <ElDescriptionsItem label="物料">{{
-                      selectedTask.materialName ?? '-'
-                    }}</ElDescriptionsItem>
+                    <ElDescriptionsItem label="计划版本">
+                      <span>{{ detailVersionCode ?? '未提供' }}</span>
+                      <ElTag
+                        v-if="detailVersionStatus"
+                        size="small"
+                        effect="plain"
+                        style="margin-left: 6px"
+                      >
+                        {{ PLAN_VERSION_STATUS_LABELS[detailVersionStatus] }}
+                      </ElTag>
+                    </ElDescriptionsItem>
+                    <ElDescriptionsItem label="快照数据截止">
+                      {{ detailDataCutoffTime ?? '未提供' }}
+                    </ElDescriptionsItem>
+                    <ElDescriptionsItem label="物料">
+                      <span>{{ detailRow?.materialCode ?? '未提供' }}</span>
+                      <span v-if="detailRow?.materialName" class="muted-text">
+                        {{ detailRow.materialName }}
+                      </span>
+                    </ElDescriptionsItem>
+                    <ElDescriptionsItem label="阶段">
+                      {{ detailRow?.stageCode ?? '未提供' }}
+                    </ElDescriptionsItem>
+                    <ElDescriptionsItem label="生产部门">
+                      {{ detailRow?.productionDepartmentName ?? '未提供' }}
+                    </ElDescriptionsItem>
+                    <ElDescriptionsItem label="执行资源">
+                      {{ detailRow ? taskResourceText(detailRow) : '未提供' }}
+                    </ElDescriptionsItem>
                     <ElDescriptionsItem label="工序">
-                      {{ selectedTask.operationCode }} (Seq {{ selectedTask.operationSeq }})
+                      <span>{{ detailRow?.operationCode ?? '未提供' }}</span>
+                      <span v-if="detailRow?.operationName" class="muted-text">
+                        {{ detailRow.operationName }}
+                      </span>
                     </ElDescriptionsItem>
-                    <ElDescriptionsItem label="数量">
+                    <ElDescriptionsItem label="计划数量">
                       <span class="qty-cell">
                         <span class="qty-net">
-                          净需求 <strong>{{ selectedTask.netQty }}</strong> {{ selectedTask.uom }}
+                          计划数量 <strong>{{ detailRow?.quantity ?? '未提供' }}</strong>
+                          {{ detailRow?.uom ?? '' }}
                         </span>
                         <!-- 2026-10-17：后端恒返 null（ScheduleQueryService.cs:158 CAST(NULL AS ...)），
                              拿不到就不展示这半段，避免出现「计划加工」后面空着、或被误读成"没有良率补偿" -->
-                        <template v-if="selectedTask.plannedProcessQty != null">
+                        <template v-if="detailRow?.plannedProcessQty != null">
                           <span class="qty-arrow">→</span>
                           <span class="qty-plan">
-                            计划加工 <strong>{{ selectedTask.plannedProcessQty }}</strong>
-                            {{ selectedTask.uom }}
+                            计划加工 <strong>{{ detailRow.plannedProcessQty }}</strong>
+                            {{ detailRow.uom ?? '' }}
                           </span>
                         </template>
                         <ElTooltip
-                          v-if="selectedTask.plannedProcessQty != null"
+                          v-if="detailRow?.plannedProcessQty != null"
                           :content="`计划加工 = 净需求 ÷ 良率；两者不可混用`"
                           placement="top"
                         >
@@ -3254,20 +4420,130 @@ function triggerRescheduleForResource(): void {
                       </span>
                     </ElDescriptionsItem>
                     <ElDescriptionsItem label="计划开始">
-                      {{ selectedTask.plannedStartTime }}
+                      {{ detailRow?.plannedStartTime ?? '未提供' }}
                     </ElDescriptionsItem>
                     <ElDescriptionsItem label="计划结束">
-                      {{ selectedTask.plannedEndTime }}
+                      {{ detailRow?.plannedEndTime ?? '未提供' }}
                     </ElDescriptionsItem>
-                    <ElDescriptionsItem label="状态">
+                    <ElDescriptionsItem label="计划工时">
+                      <span v-if="detailRow?.duration != null">{{ detailRow.duration }} 小时</span>
+                      <span v-else class="muted-text">未提供</span>
+                    </ElDescriptionsItem>
+                    <ElDescriptionsItem label="APS 计划状态">
                       <ElTag
-                        :color="STATUS_COLORS[sanitizeStatus(selectedTask.status)]"
+                        v-if="detailRow"
+                        :color="STATUS_COLORS[sanitizeStatus(detailRow.status)]"
                         size="small"
                         style="color: #fff"
                       >
-                        {{ TASK_STATUS_LABELS[sanitizeStatus(selectedTask.status)] }}
+                        {{ TASK_STATUS_LABELS[sanitizeStatus(detailRow.status)] }}
                       </ElTag>
+                      <span v-else class="muted-text">未提供</span>
                     </ElDescriptionsItem>
+                    <ElDescriptionsItem label="MES 工单号">
+                      <code v-if="detailRow?.mesWorkOrderNo" class="code-tag">{{
+                        detailRow.mesWorkOrderNo
+                      }}</code>
+                      <span v-else class="muted-text">未提供</span>
+                    </ElDescriptionsItem>
+                    <!-- MES 衔接分类：后端未建立权威分类标志位 ⇒ 显「未提供」，
+                         不得由「无工单号」反推成「无需 MES」（矩阵 A4 明确禁等同） -->
+                    <ElDescriptionsItem label="MES 衔接分类">
+                      <span class="muted-text">未提供</span>
+                    </ElDescriptionsItem>
+                    <ElDescriptionsItem label="生产指示号">
+                      {{ detailRow?.mtsInstructionNo ?? '未提供' }}
+                    </ElDescriptionsItem>
+                    <ElDescriptionsItem label="换型时间来源">
+                      <ElTag
+                        v-if="selectedSetupSourceMeta"
+                        :type="selectedSetupSourceMeta.tag"
+                        size="small"
+                        effect="dark"
+                      >
+                        {{ selectedSetupSourceMeta.label }}
+                      </ElTag>
+                      <ElTooltip
+                        v-if="detailRow?.setupSource === 'SETUP_RULE_MISSING_ZERO_FALLBACK'"
+                        content="有前后产品但没有换型规则 → 按 0 分钟兜底，属数据质量问题，已进入「缺失规则查询」"
+                        placement="top"
+                      >
+                        <ElTag size="small" type="info" effect="plain" style="margin-left: 6px">
+                          兜底
+                        </ElTag>
+                      </ElTooltip>
+                      <span v-else-if="!detailRow?.setupSource" class="muted-text">未提供</span>
+                      <ElTooltip
+                        v-if="detailRow?.setupSource === 'INITIAL_SETUP_STATE'"
+                        content="没有上一产品（班头首单 / 冷启动）按 0 分钟计，属正常生产事实，不是数据质量问题"
+                        placement="top"
+                      >
+                        <ElTag size="small" type="info" effect="plain" style="margin-left: 6px">
+                          说明
+                        </ElTag>
+                      </ElTooltip>
+                    </ElDescriptionsItem>
+                  </ElDescriptions>
+                </div>
+
+                <!-- 区块二：订单份额（A5 `shares[]` 逐行全量；矩阵 A5：共享 Task 多根订单逐行给全，
+                     禁贴单一订单为唯一需求来源） -->
+                <div class="taskshare-section">
+                  <div class="taskshare-title">
+                    <Icon icon="vi-mdi:share-variant" />
+                    {{ taskShareTitle }}
+                  </div>
+                  <!-- 三态（审核 B-02）：未下发 / 已下发但空 / 有行 -->
+                  <div v-if="!detailSharesProvided" class="muted-text">
+                    <Icon icon="vi-mdi:link-variant" /> 未提供订单份额数据
+                  </div>
+                  <div v-else-if="detailShares.length === 0" class="muted-text">
+                    <Icon icon="vi-mdi:information-outline" /> 无份额记录（不等于 0 需求）
+                  </div>
+                  <ElTable v-else :data="detailShares" size="small" border>
+                    <ElTableColumn prop="allocationSequence" label="分配顺序" width="100">
+                      <template #default="scope">
+                        <span v-if="scope?.row?.allocationSequence != null">{{
+                          scope.row.allocationSequence
+                        }}</span>
+                        <span v-else class="muted-text">未提供</span>
+                      </template>
+                    </ElTableColumn>
+                    <ElTableColumn prop="demandType" label="需求类型" width="110">
+                      <template #default="scope">
+                        <span v-if="scope?.row?.demandType">{{ scope.row.demandType }}</span>
+                        <span v-else class="muted-text">未提供</span>
+                      </template>
+                    </ElTableColumn>
+                    <ElTableColumn prop="rootOrderNo" label="根订单号" min-width="160">
+                      <template #default="scope">
+                        <code v-if="scope?.row?.rootOrderNo" class="code-tag">{{
+                          scope.row.rootOrderNo
+                        }}</code>
+                        <span v-else class="muted-text">未提供</span>
+                      </template>
+                    </ElTableColumn>
+                    <ElTableColumn prop="shareQty" label="份额数量" width="120" align="right">
+                      <template #default="scope">
+                        <span v-if="scope?.row?.shareQty != null">{{ scope.row.shareQty }}</span>
+                        <span v-else class="muted-text">未提供</span>
+                      </template>
+                    </ElTableColumn>
+                  </ElTable>
+                </div>
+
+                <!-- 区块三：甘特视图补充（**只有该任务在当前已加载的甘特数据里才有**）。
+                     订单号 / 客户交期 / 延期 / 关键路径 / 下发状态 / 原因解释 / MES 资格
+                     都在甘特读面里，不在 A4/A5 清单读面里 ⇒ 与上方 A5 读面分开摆，不混排。 -->
+                <div v-if="selectedTask" class="detail-section gantt-extra">
+                  <div class="gantt-extra-title">
+                    <Icon icon="vi-mdi:chart-timeline" />
+                    甘特视图补充（取自当前已加载的甘特数据）
+                  </div>
+                  <ElDescriptions :column="1" border size="small">
+                    <ElDescriptionsItem label="主订单">{{
+                      selectedTask.orderNo ?? '未提供'
+                    }}</ElDescriptionsItem>
                     <ElDescriptionsItem label="客户交期">
                       {{ formatUtcDate(selectedTask.customerDueDate) }}
                     </ElDescriptionsItem>
@@ -3302,46 +4578,11 @@ function triggerRescheduleForResource(): void {
                       </ElTag>
                       <span v-else class="muted-text">未判定</span>
                     </ElDescriptionsItem>
-                    <ElDescriptionsItem label="MES 工单号">
-                      <code v-if="selectedTask.mesWorkOrderNo" class="code-tag">{{
-                        selectedTask.mesWorkOrderNo
-                      }}</code>
-                      <span v-else class="muted-text">未建单</span>
-                    </ElDescriptionsItem>
                     <ElDescriptionsItem label="下发状态">
                       <span v-if="selectedTask.dispatchStatus">{{
                         selectedTask.dispatchStatus
                       }}</span>
-                      <span v-else class="muted-text">未下发</span>
-                    </ElDescriptionsItem>
-                    <ElDescriptionsItem label="换型时间来源">
-                      <ElTag
-                        v-if="selectedSetupSourceMeta"
-                        :type="selectedSetupSourceMeta.tag"
-                        size="small"
-                        effect="dark"
-                      >
-                        {{ selectedSetupSourceMeta.label }}
-                      </ElTag>
-                      <ElTooltip
-                        v-if="selectedTask.setupSource === 'SETUP_RULE_MISSING_ZERO_FALLBACK'"
-                        content="有前后产品但没有换型规则 → 按 0 分钟兜底，属数据质量问题，已进入「缺失规则查询」"
-                        placement="top"
-                      >
-                        <ElTag size="small" type="info" effect="plain" style="margin-left: 6px">
-                          兜底
-                        </ElTag>
-                      </ElTooltip>
-                      <span v-else-if="!selectedTask.setupSource">-</span>
-                      <ElTooltip
-                        v-if="selectedTask.setupSource === 'INITIAL_SETUP_STATE'"
-                        content="没有上一产品（班头首单 / 冷启动）按 0 分钟计，属正常生产事实，不是数据质量问题"
-                        placement="top"
-                      >
-                        <ElTag size="small" type="info" effect="plain" style="margin-left: 6px">
-                          说明
-                        </ElTag>
-                      </ElTooltip>
+                      <span v-else class="muted-text">未提供</span>
                     </ElDescriptionsItem>
                   </ElDescriptions>
 
@@ -3588,55 +4829,9 @@ function triggerRescheduleForResource(): void {
                        5号位 2026-11-05 答复：判定语义无冻结明文、`Pegging.IsCrossDomain` 是边属性非阻挡判定，
                        V1 不做（字段恒缺键）⇒ 与 B6/B7/B8 同判撤除，不留永不出现的告警位。 -->
 
-                  <!-- U04：TaskShare 三态（审核 B-02）：
-                       ① 有 1 条 ⇒ 该任务由 1 个订单承接（**不是**「没数据」）；
-                       ② 有多条 ⇒ 共担；
-                       ③ 后端没下发 ⇒ 才叫「未提供」。
-                       原判据 `length > 1` 把「恰好 1 条」误判成缺数据 ⇒ 单订单任务看不到自己的份额。 -->
-                  <div
-                    v-if="selectedTask.taskShare && selectedTask.taskShare.length > 0"
-                    class="taskshare-section"
-                  >
-                    <div class="taskshare-title">
-                      <Icon icon="vi-mdi:share-variant" />
-                      {{ taskShareTitle }}
-                    </div>
-                    <ElTable :data="selectedTask.taskShare" size="small" border>
-                      <ElTableColumn prop="orderNo" label="订单号" width="160">
-                        <template #default="scope">
-                          <code v-if="scope?.row" class="code-tag">{{ scope.row.orderNo }}</code>
-                        </template>
-                      </ElTableColumn>
-                      <ElTableColumn prop="shareQty" label="份额数量" width="120" align="right">
-                        <template #default="scope">
-                          <span v-if="scope?.row"
-                            >{{ scope.row.shareQty }} {{ selectedTask.uom }}</span
-                          >
-                        </template>
-                      </ElTableColumn>
-                      <ElTableColumn label="占比" min-width="180">
-                        <template #default="scope">
-                          <div v-if="scope?.row" class="share-bar-wrap">
-                            <div
-                              class="share-bar"
-                              :style="{
-                                width: ((scope.row.shareRatio ?? 0) * 100).toFixed(1) + '%'
-                              }"
-                            ></div>
-                            <span class="share-ratio"
-                              >{{ ((scope.row.shareRatio ?? 0) * 100).toFixed(1) }}%</span
-                            >
-                          </div>
-                        </template>
-                      </ElTableColumn>
-                    </ElTable>
-                  </div>
-                  <!-- 缺数据只陈述「未提供」：后端未下发 TaskShare 时无法断言该任务就是单订单 -->
-                  <div v-else class="taskshare-section">
-                    <span class="muted-text">
-                      <Icon icon="vi-mdi:link-variant" /> 未提供订单份额数据（TaskShare）
-                    </span>
-                  </div>
+                  <!-- U04：TaskShare 三态（审核 B-02）的展示位已上移 ——
+                       2026-11-17 起份额改用 **A5 `shares[]`（逐行全量）**，见上方「区块二：订单份额」。
+                       甘特体自带的 `taskShare`（带占比）不再单独渲染：同一事实两个读面并排 = 两套口径。 -->
 
                   <!-- 注：U06「数量-时间拆分」整块已撤（5号位 2026-11-05 B8 裁决「不做、撤」）：
                        无载体表，冻结 01 §76 的分段属 Supply 跨域事实、不是 Task 内拆分 ⇒ 永久缺键。
@@ -3754,9 +4949,28 @@ function triggerRescheduleForResource(): void {
                     </div>
                   </div>
                 </div>
-              </template>
-              <template v-else>
-                <div class="detail-empty">请选择任务查看详情</div>
+                <!-- 该任务不在当前已加载的甘特数据里（P05 清单是服务端分页，行常在窗口外） -->
+                <div v-else class="detail-section">
+                  <span class="muted-text">
+                    <Icon icon="vi-mdi:information-outline" />
+                    该任务不在当前已加载的甘特数据中，下方「甘特视图补充」暂无。
+                  </span>
+                </div>
+
+                <!-- 区块四：后端尚未提供的读面（矩阵 A5：前后依赖边、MES 执行事实=未提供，不造） -->
+                <div class="detail-section">
+                  <ElAlert
+                    title="以下内容后端尚未提供，页面不猜不填"
+                    type="info"
+                    :closable="false"
+                    show-icon
+                  >
+                    <ul class="not-provided-list">
+                      <li>前后依赖边（上游 / 下游工序关系）：未提供</li>
+                      <li>MES 执行事实（实际开工 / 完工 / 报工）：未提供</li>
+                    </ul>
+                  </ElAlert>
+                </div>
               </template>
             </div>
           </div>
@@ -4173,6 +5387,30 @@ function triggerRescheduleForResource(): void {
   background: #f8fafc;
   border: 1px solid #e2e8f0;
   border-radius: 6px;
+}
+
+/* A5：抽屉顶部状态条（读取中 / 失败 / 不存在 / 越权） */
+.task-detail-state {
+  margin-bottom: 12px;
+}
+
+/* A5：甘特视图补充块标题 */
+.gantt-extra-title {
+  display: flex;
+  font-size: 13px;
+  font-weight: 600;
+  color: #1e293b;
+  align-items: center;
+  gap: 6px;
+}
+
+/* A5：后端未提供位清单 */
+.not-provided-list {
+  padding-left: 18px;
+  margin: 4px 0 0;
+  font-size: 12px;
+  line-height: 1.9;
+  color: #475569;
 }
 
 .taskshare-title {
@@ -4851,6 +6089,8 @@ function triggerRescheduleForResource(): void {
   background: #fff;
   border-radius: 8px;
   box-shadow: 0 1px 4px rgb(0 0 0 / 6%);
+  /* 上下两块（负荷量热力图 + 负荷率表）⇒ 整块可滚，不再让热力图独占高度 */
+  overflow-y: auto;
 }
 
 .load-note {
@@ -4863,9 +6103,73 @@ function triggerRescheduleForResource(): void {
 }
 
 .load-grid-wrap {
-  flex: 1;
+  flex: none;
+  max-height: 45%;
   min-height: 0;
   overflow: auto;
+}
+
+/* ===== P12 负荷率（设备 × 日） ===== */
+.load-rate {
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding-top: 8px;
+  border-top: 1px solid #e2e8f0;
+}
+
+.load-rate-head {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.load-rate-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: #1e293b;
+}
+
+.load-rate-caliber {
+  font-size: 12px;
+  color: #64748b;
+  line-height: 1.6;
+}
+
+.load-rate-tools {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px 16px;
+}
+
+.load-rate-count {
+  font-size: 12px;
+  color: #64748b;
+}
+
+.load-rate-loading {
+  font-size: 13px;
+  color: #94a3b8;
+  padding: 8px 0;
+}
+
+.load-rate-alert {
+  margin: 0;
+}
+
+.load-rate-hint {
+  margin-left: 4px;
+  font-size: 12px;
+  color: #94a3b8;
+}
+
+.load-rate-pager {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding-top: 4px;
 }
 
 .load-grid {
@@ -4930,6 +6234,18 @@ function triggerRescheduleForResource(): void {
   border-radius: 8px;
   box-shadow: 0 1px 4px rgb(0 0 0 / 6%);
 
+  .task-list-filters {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    align-items: center;
+    margin-bottom: 8px;
+  }
+
+  .task-pane-keyword {
+    width: 240px;
+  }
+
   .task-list-head {
     display: flex;
     justify-content: space-between;
@@ -4937,6 +6253,20 @@ function triggerRescheduleForResource(): void {
     font-size: 14px;
     font-weight: 600;
     color: #1e293b;
+    margin-bottom: 8px;
+  }
+
+  /* 三个数分列：服务端全量命中 / 本页已加载 / 甘特图已加载（§0.2 ③） */
+  .task-list-counts {
+    flex: 1;
+    margin-left: 16px;
+    font-size: 12px;
+    font-weight: 400;
+    color: #64748b;
+  }
+
+  .task-list-error {
+    margin-bottom: 8px;
   }
 
   .task-list-pager {
@@ -4948,6 +6278,100 @@ function triggerRescheduleForResource(): void {
   .task-list-muted {
     color: #cbd5e1;
   }
+}
+
+/* ===== P11 MES 衔接清单 ===== */
+.mes-pane {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 12px 16px;
+  background: #fff;
+  border-radius: 8px;
+  box-shadow: 0 1px 4px rgb(0 0 0 / 6%);
+}
+
+.mes-head {
+  display: flex;
+  align-items: center;
+  font-size: 14px;
+  font-weight: 600;
+  color: #1e293b;
+  margin-bottom: 6px;
+}
+
+/* 两个数分列：服务端全量命中 / 本页已加载（§0.2 ③） */
+.mes-counts {
+  flex: 1;
+  margin-left: 16px;
+  font-size: 12px;
+  font-weight: 400;
+  color: #64748b;
+}
+
+/* 快照同步面：四个源更新时间（后端原值直显） */
+.mes-sync {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 20px;
+  padding: 6px 0 8px;
+  font-size: 12px;
+  color: #64748b;
+  border-bottom: 1px solid #f1f5f9;
+  margin-bottom: 8px;
+}
+
+.mes-filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  margin-bottom: 8px;
+}
+
+.mes-alert {
+  margin: 0 0 8px;
+}
+
+.mes-muted {
+  color: #94a3b8;
+  font-size: 12px;
+}
+
+/* 三层状态：每层一格多行 */
+.mes-layer {
+  display: flex;
+  flex-direction: column;
+  line-height: 1.7;
+  font-size: 12px;
+  color: #334155;
+}
+
+/* 多工单/状态不一致：提示但不合并 */
+.mes-warn {
+  color: #d97706;
+  font-size: 12px;
+}
+
+.mes-expand {
+  padding: 8px 12px;
+  background: #f8fafc;
+}
+
+.mes-expand-loading {
+  font-size: 13px;
+  color: #94a3b8;
+  padding: 6px 0;
+}
+
+.mes-expand-alert {
+  margin: 0;
+}
+
+.mes-pager {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 10px;
 }
 
 /* ===== §10A 入口 Dialog 已抽为独立组件（GanttAdjustDialog / ResourceRescheduleDialog /

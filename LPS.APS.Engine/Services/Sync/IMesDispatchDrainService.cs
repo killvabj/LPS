@@ -22,7 +22,11 @@ namespace LPS.APS.Engine.Services.Sync;
 public interface IMesDispatchDrainService
 {
     /// <summary>消费指定 Run 下的 `PENDING` 组合。`maxGroups` 限制单次处理的组合数（防一次跑爆）。</summary>
-    Task<MesDispatchDrainResult> DrainAsync(int scheduleRunId, int maxGroups = 50, CancellationToken ct = default);
+    Task<MesDispatchDrainResult> DrainAsync(
+        int scheduleRunId,
+        int maxGroups = 50,
+        string? workOrderType = null,
+        CancellationToken ct = default);
 }
 
 /// <summary>一次消费的汇总（供验收与日志）。</summary>

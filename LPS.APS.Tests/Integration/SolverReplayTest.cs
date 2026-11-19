@@ -119,11 +119,130 @@ public class SolverReplayTest
         }
 
         var finalTaskCount = result?.FinalTasks?.Count ?? 0;
+
+        // 2026-11-19 诊断（新增可执行批整数门禁落地后）：小数 Quantity 的实测条数与 Top5。
+        //   纯输出，不改求解逻辑、不做断言；UOM=PS 是离散件单位。
+        var fracTasks = result!.FinalTasks.Where(t => t.Quantity != decimal.Truncate(t.Quantity)).ToList();
+        var fracPs = fracTasks.Count(t => string.Equals(t.UOM, "PS", StringComparison.OrdinalIgnoreCase));
+        _output.WriteLine($"[INT] FinalTask={result.FinalTasks.Count}；小数 Quantity={fracTasks.Count}（其中 UOM=PS {fracPs}）；"
+            + $"Top5={string.Join("、", fracTasks.GroupBy(t => t.Quantity).OrderByDescending(g => g.Count()).Take(5).Select(g => $"{g.Key:G29}×{g.Count()}"))}");
+
+        // 2026-11-19 诊断（乙：查整数门禁带来的 FinalTask 变化去向）：
+        //   `APS_REPLAY_DUMP=<path>` ⇒ 逐需求导出 TSV，供两次重放（revert 前 / 打回 patch 后）按 LogicalDemandKey 对拍。
+        var dumpPath = Environment.GetEnvironmentVariable("APS_REPLAY_DUMP");
+        if (!string.IsNullOrWhiteSpace(dumpPath))
+        {
+            var unschedByDemand = result.UnscheduledTasks
+                .GroupBy(u => u.DraftId, StringComparer.Ordinal)
+                .ToDictionary(g => g.Key,
+                    g => (Qty: g.Sum(x => x.UnscheduledQty), Reason: g.First().Reason),
+                    StringComparer.Ordinal);
+            var taskByDemand = result.FinalTasks
+                .GroupBy(t => t.SourceDraftId, StringComparer.Ordinal)
+                .ToDictionary(g => g.Key,
+                    g => (Cnt: g.Count(), Qty: g.Sum(t => t.Quantity)),
+                    StringComparer.Ordinal);
+
+            using var dumpWriter = new System.IO.StreamWriter(dumpPath!, false, System.Text.Encoding.UTF8);
+            dumpWriter.WriteLine("demand\tnet\tisCont\tuom\ttaskCnt\ttaskQty\tuQty\tuReason");
+            foreach (var d in request.LogicalProductionDemands)
+            {
+                taskByDemand.TryGetValue(d.LogicalDemandKey, out var ta);
+                unschedByDemand.TryGetValue(d.LogicalDemandKey, out var ua);
+                dumpWriter.WriteLine(
+                    $"{d.LogicalDemandKey}\t{d.NetOutputQty:G29}\t{d.IsContinuation}\t{d.UOM ?? ""}\t{ta.Cnt}\t{ta.Qty:G29}\t{ua.Qty:G29}\t{ua.Reason}");
+            }
+            _output.WriteLine($"[DUMP] 逐需求去向已写：{dumpPath}（{request.LogicalProductionDemands.Count} 行）");
+        }
+
         _output.WriteLine($"[R] 求解返回：Success={result!.Success}, FinalTask={finalTaskCount}, "
             + $"求解耗时={sw.Elapsed.TotalSeconds:F1}s");
         if (!string.IsNullOrEmpty(result.ErrorMessage))
         {
             _output.WriteLine($"[R] ErrorMessage={result.ErrorMessage}");
+        }
+
+        // 2026-11-19 诊断（开门 APS_DEBUG_UNSCHED_DUP=1）：自查落库 Inv2「U 超额」是**我方产出重复**
+        //   还是**落库底座按 base-key（'/' 前）合并放大**。不 gate 时不打、不改判定。
+        if (Environment.GetEnvironmentVariable("APS_DEBUG_UNSCHED_DUP") == "1")
+        {
+            static string BaseKeyOf(string k)
+            {
+                if (string.IsNullOrEmpty(k)) return string.Empty;
+                var s = k.IndexOf('/');
+                return s > 0 ? k[..s] : k;
+            }
+
+            var un = result.UnscheduledTasks ?? Array.Empty<UnscheduledTaskResult>();
+            _output.WriteLine($"[DBG] UnscheduledTasks 总 {un.Count} 条；按 DraftId 去重 {un.Select(u => u.DraftId).Distinct().Count()} 个；"
+                + $"按 base-key('/'前)去重 {un.Select(u => BaseKeyOf(u.DraftId)).Distinct().Count()} 个");
+
+            var dupId = un.GroupBy(u => u.DraftId).Where(g => g.Count() > 1)
+                .OrderByDescending(g => g.Count()).Take(10).ToList();
+            _output.WriteLine($"[DBG] 同 DraftId 多条的键数={dupId.Count}");
+            foreach (var g in dupId)
+            {
+                _output.WriteLine($"[DBG-dupId] {g.Key} 条数={g.Count()} qtys=[{string.Join(",", g.Select(x => x.UnscheduledQty.ToString("G29")))}]");
+            }
+
+            var net = request.LogicalProductionDemands
+                .GroupBy(d => d.LogicalDemandKey)
+                .ToDictionary(g => g.Key!, g => g.First().NetOutputQty);
+            var over = un.GroupBy(u => BaseKeyOf(u.DraftId))
+                .Select(g => (Base: g.Key, Cnt: g.Count(), SumU: g.Sum(x => x.UnscheduledQty),
+                              Net: net.TryGetValue(g.Key, out var q) ? q : -1m))
+                .Where(x => x.Cnt > 1 || (x.Net >= 0m && x.SumU > x.Net + 0.001m))
+                .OrderByDescending(x => x.SumU - (x.Net < 0m ? 0m : x.Net)).Take(12).ToList();
+            _output.WriteLine($"[DBG] base-key 多条 或 ΣU>Net 的键数(取样12)={over.Count}");
+            foreach (var x in over)
+            {
+                _output.WriteLine($"[DBG-over] base={x.Base} 条数={x.Cnt} ΣU={x.SumU:G29} Net={x.Net:G29}");
+            }
+        }
+
+        // 2026-11-19：**精确复刻 2号位 内存 Inv2**（PeggingOrchestrator:12212-12286）——
+        //   逐 AllocationSequence：ΣShare(AllocationShares.ComponentQty) + ΣU(UnscheduledTasks 按需求→seq) vs ΣNetOutput。
+        //   验证「缺料 U 按被删 share 对平」修复后账是否平。开门 APS_DEBUG_INV2=1。
+        if (Environment.GetEnvironmentVariable("APS_DEBUG_INV2") == "1")
+        {
+            var allocNet = request.LogicalProductionDemands
+                .GroupBy(d => d.AllocationSequence).ToDictionary(g => g.Key, g => g.Sum(d => d.NetOutputQty));
+            var allocShare = (result.AllocationShares ?? Array.Empty<AllocationTaskShare>())
+                .GroupBy(s => s.AllocationSequence).ToDictionary(g => g.Key, g => g.Sum(s => s.ComponentQty));
+            var keyToSeq = request.LogicalProductionDemands
+                .GroupBy(d => d.LogicalDemandKey!).ToDictionary(g => g.Key, g => g.First().AllocationSequence);
+            var allocU = new Dictionary<long, decimal>();
+            foreach (var u in result.UnscheduledTasks ?? Array.Empty<UnscheduledTaskResult>())
+            {
+                if (u.UnscheduledQty <= 0m) continue;
+                if (keyToSeq.TryGetValue(u.DraftId, out var sq))
+                    allocU[sq] = allocU.GetValueOrDefault(sq) + u.UnscheduledQty;
+            }
+
+            var viol = allocNet
+                .Select(kv => (Seq: kv.Key, Q: kv.Value,
+                               S: allocShare.GetValueOrDefault(kv.Key), U: allocU.GetValueOrDefault(kv.Key)))
+                .Where(x => Math.Abs(x.S + x.U - x.Q) > 0.001m)
+                .OrderByDescending(x => Math.Abs(x.S + x.U - x.Q)).ToList();
+            _output.WriteLine($"[INV2] seq 总数={allocNet.Count}；ΣShare+ΣU≠ΣNetOutput 的 seq 数={viol.Count}");
+            foreach (var x in viol.Take(10))
+            {
+                _output.WriteLine($"[INV2-VIOL] seq={x.Seq} ΣShare={x.S:G29} + ΣU={x.U:G29} = {x.S + x.U:G29} vs Net={x.Q:G29}（差 {x.S + x.U - x.Q:G29}）");
+            }
+
+            // 逐条明细：对前 5 个违规 seq，打出其 demand / share / 未排 entry 的真实行——直接看 3 倍/漏排怎么凑出来。
+            foreach (var x in viol.Take(5))
+            {
+                var seq = x.Seq;
+                _output.WriteLine($"[DETAIL] ===== seq={seq}（S={x.S:G29} U={x.U:G29} Net={x.Q:G29}）=====");
+                foreach (var d in request.LogicalProductionDemands.Where(d => d.AllocationSequence == seq))
+                    _output.WriteLine($"[DETAIL-DEMAND] key={d.LogicalDemandKey} NetOutput={d.NetOutputQty:G29}");
+                foreach (var sh in (result.AllocationShares ?? Array.Empty<AllocationTaskShare>()).Where(s => s.AllocationSequence == seq))
+                    _output.WriteLine($"[DETAIL-SHARE] FinalDraftId={sh.FinalDraftId} ComponentQty={sh.ComponentQty:G29}");
+                foreach (var u in (result.UnscheduledTasks ?? Array.Empty<UnscheduledTaskResult>())
+                            .Where(u => keyToSeq.TryGetValue(u.DraftId, out var q) && q == seq))
+                    _output.WriteLine($"[DETAIL-U] DraftId={u.DraftId} qty={u.UnscheduledQty:G29} reason={u.Reason}");
+            }
         }
 
         Assert.True(result.Success, "重放求解未成功：" + (result.ErrorMessage ?? "(无错误信息)"));

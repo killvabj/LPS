@@ -34,6 +34,9 @@ public class AuthService : IAuthService
     private const int MaxFailedAttempts = 9999;
     private static readonly TimeSpan LockoutDuration = TimeSpan.FromSeconds(3);
 
+    /// <summary>改自己资料「姓名」（显示名 DisplayName）长度上限（R1，与前端 maxlength 提示一致）。</summary>
+    private const int UserNameMaxLength = 50;
+
     public AuthService(
         DatabaseConnectionManager connectionManager,
         IConfiguration configuration,
@@ -252,6 +255,97 @@ public class AuthService : IAuthService
 
         // U42 审计：登出即记；不序列化任何含密 DTO
         await WriteAuthAuditAsync("Logout", "Success", userCode ?? userId.ToString(), userId, null, clientIp, userAgent);
+    }
+
+    /// <inheritdoc />
+    public async Task<(string DisplayName, string? Email, string? PhoneNumber)?> GetProfileAsync(int userId, CancellationToken ct = default)
+    {
+        // R1（4号位 2026-11-18 来文）：/me 补 email/phoneNumber → 一次 [User] 主键查询。
+        // 显示名同样取自 DB（DisplayName），避免 JWT claim 至多 120 分钟延迟导致改资料后 /me 回旧名。
+        var user = await _connectionManager.QueryFirstOrDefaultAsync<User>(
+                "SELECT Id, DisplayName, Email, PhoneNumber FROM [User] WHERE Id = @Id AND IsDeleted = 0",
+                new { Id = userId }, db: DatabaseId.Auth);
+
+        return user is null
+            ? null
+            : (user.DisplayName, user.Email, user.PhoneNumber);
+    }
+
+    /// <inheritdoc />
+    public async Task<(string UserName, string? Email, string? PhoneNumber)> UpdateProfileAsync(
+        int userId, string? userName, string? email, string? phoneNumber,
+        string? clientIp = null, string? userAgent = null)
+    {
+        var user = await _connectionManager.QueryFirstOrDefaultAsync<User>(
+                "SELECT * FROM [User] WHERE Id = @Id AND IsDeleted = 0",
+                new { Id = userId }, db: DatabaseId.Auth)
+            ?? throw new InvalidOperationException("用户不存在或已删除");
+
+        // 自助仅改显示名/邮箱/手机号；登录名 LoginName / Status / 角色 / 范围不自助改（归 auth.manage）
+        var finalUserName = user.DisplayName;
+        if (!string.IsNullOrWhiteSpace(userName))
+        {
+            var name = userName.Trim();
+            if (name.Length > UserNameMaxLength)
+                throw new InvalidOperationException($"姓名长度不能超过 {UserNameMaxLength} 位");
+            finalUserName = name;
+        }
+
+        var finalEmail = string.IsNullOrWhiteSpace(email) ? null : email.Trim();
+        var finalPhone = string.IsNullOrWhiteSpace(phoneNumber) ? null : phoneNumber.Trim();
+
+        await _connectionManager.ExecuteAsync(
+            @"UPDATE [User] SET DisplayName = @DisplayName, Email = @Email, PhoneNumber = @PhoneNumber, UpdatedAt = GETDATE()
+              WHERE Id = @Id",
+            new { Id = userId, DisplayName = finalUserName, Email = finalEmail, PhoneNumber = finalPhone },
+            db: DatabaseId.Auth);
+
+        await WriteAuthAuditAsync("UpdateProfile", "Success", user.LoginName, userId, null, clientIp, userAgent,
+            remark: $"改前 DisplayName={user.DisplayName}/Email={user.Email}/Phone={user.PhoneNumber}");
+
+        _logger.LogInformation("用户改资料成功: UserId={UserId}", userId);
+
+        return (finalUserName, finalEmail, finalPhone);
+    }
+
+    /// <inheritdoc />
+    public async Task ChangePasswordAsync(
+        int userId, string oldPassword, string newPassword,
+        string? clientIp = null, string? userAgent = null)
+    {
+        var user = await _connectionManager.QueryFirstOrDefaultAsync<User>(
+                "SELECT * FROM [User] WHERE Id = @Id AND IsDeleted = 0",
+                new { Id = userId }, db: DatabaseId.Auth)
+            ?? throw new InvalidOperationException("用户不存在或已删除");
+
+        // 旧密码验身（PasswordHasher.Verify，恒定时间比较）；不记明文
+        if (!PasswordHasher.Verify(oldPassword, user.PasswordHash))
+        {
+            _logger.LogWarning("改密失败: 旧密码不正确 UserId={UserId}", userId);
+            throw new InvalidOperationException("旧密码不正确");
+        }
+
+        // 新密码规则：沿用建用户口径（8~128），并补不＝旧密码、不＝登录名
+        if (newPassword.Length < 8 || newPassword.Length > 128)
+            throw new InvalidOperationException("新密码长度须为 8~128 位");
+        if (string.Equals(newPassword, oldPassword, StringComparison.Ordinal))
+            throw new InvalidOperationException("新密码不能与旧密码相同");
+        if (string.Equals(newPassword, user.LoginName, StringComparison.OrdinalIgnoreCase))
+            throw new InvalidOperationException("新密码不得与用户编码相同");
+
+        // 重哈希 + 清 RefreshToken/Expiry（旧会话失效，Q1）
+        await _connectionManager.ExecuteAsync(
+            @"UPDATE [User] SET
+                PasswordHash = @PasswordHash,
+                RefreshToken = NULL,
+                RefreshTokenExpiry = NULL,
+                UpdatedAt = GETDATE()
+              WHERE Id = @Id",
+            new { Id = userId, PasswordHash = PasswordHasher.Hash(newPassword) },
+            db: DatabaseId.Auth);
+
+        await WriteAuthAuditAsync("ChangePassword", "Success", user.LoginName, userId, null, clientIp, userAgent);
+        _logger.LogInformation("改密成功: UserId={UserId}", userId);
     }
 
     #region Private Methods

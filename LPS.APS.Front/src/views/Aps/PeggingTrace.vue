@@ -59,11 +59,31 @@
  *  - 对方厂码取到（`supplyFactoryCode ≠ demandFactoryCode`）⇒ 显示「需求厂 → 对方厂码」+「跨厂」标
  *  - 取不到（源厂未得 / 后端未落码）⇒ 如实写「跨厂（对方工厂未提供）」，不拿目标厂冒充
  *  - **跨厂判定仍只看供给类型**（INTER_FACTORY_ORDER），不改成比两个厂码
+ *
+ * ---- 2026-11-16 5号位《P01～P13＋采购协同 页面—接口实施矩阵 v0.1》A8 行 ----
+ *
+ * 直连端点不变（`/api/pegging-trace` + `/count` + `/summary`），把**空态**拆成矩阵要的三态：
+ *  - total>0 但筛后空 → 「没有符合当前筛选条件的分配记录」
+ *  - total=0 → 「这一版没有可见的分配记录」（还没发令 / 排产失败 / 不在数据范围）
+ *  - **源批缺** → 这个版本没记录到来源排程批次（`sourceScheduleRunId` 为空）⇒
+ *    分配按「当前批次」代理归集，源批没了就归集不到 ⇒ 空态单独说清，不混进「没数据」
+ *
+ * ---- 2026-11-17 5号位 r14240/r14241：供给批次**显式位**已落码（A8 换判据）----
+ *
+ * 后端在 `/api/pegging-trace/summary` 给了 `supplyBatchPresent` / `supplyBatchNo`：
+ *  - `supplyBatchPresent=true` ⇒ 供给批次在 ⇒ 这一版 0 笔是**明确零**（供给在、只是还没归集到分配）
+ *  - `supplyBatchPresent=false` ⇒ **源批缺**（供给侧缺源）⇒ 空态说清「没有可用的供给事实批次」
+ *  - `supplyBatchPresent` 缺/null ⇒ **未判定** ⇒ 页面不替它下结论，**不落「源批缺」**
+ *
+ * 这层与「版本级 `sourceScheduleRunId` 为空」**并存、不合并**（两层说的不是一回事）：
+ * 前者＝供给事实批次在不在；后者＝这个版本有没有记到来源排程批次。
  */
 
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { storeToRefs } from 'pinia'
 import { usePeggingTraceStore, type PeggingGroupRow } from '@/store/modules/aps/peggingTrace'
+import { useDomainStore } from '@/store/modules/aps/domain'
+import { commitmentStatusLabel } from '@/api/aps-v1/codeLabels'
 import { formatUtcDateTime } from '@/utils/datetime'
 import type { PeggingTraceDto } from '@/api/aps-v1'
 import {
@@ -83,6 +103,7 @@ import {
 } from 'element-plus'
 
 const store = usePeggingTraceStore()
+const domainStore = useDomainStore()
 const {
   versions,
   planVersionId,
@@ -106,6 +127,53 @@ const {
   commitmentOptions,
   groupRows
 } = storeToRefs(store)
+
+/* ===== 三态（矩阵 A8）：total>0 / total=0 / 源批缺 =====
+ * 「源批缺」＝ 这个计划版本**没有记录到来源排程批次**（`sourceScheduleRunId` 为空）。
+ * 判据取后端给的版本字段，不自算；追调用例里的 `IsActive=现批代理` 正是这个意思：
+ * 分配行是按「当前批次」代理归集的，源批都没了 ⇒ 归集不到这一版的分配。
+ */
+const sourceBatchMissing = computed(() => {
+  const v = currentVersion.value
+  if (!v) return false
+  return v.sourceScheduleRunId == null
+})
+
+/* ===== 供给批次三态（2026-11-17 5号位 r14240/r14241 落码，矩阵 A8）=====
+ *
+ * 供给侧给的是**显式位** `summary.supplyBatchPresent`（三态，不是布尔）：
+ *   true ⇒ 供给批次在（有可归集的供给事实来源）；`supplyBatchNo` 给出批次号
+ *   false ⇒ **源批缺**：没有可用的供给事实批次 ⇒ 这一版归集不到分配记录
+ *   null / 键缺 ⇒ **未判定**：后端没给这一位 ⇒ 页面不得替它下结论（不落「源批缺」）
+ *
+ * ⚠️ 与上面的版本级 `sourceBatchMissing`（版本有没有记到来源排程批次）是**两层判据**：
+ *   一层说「供给事实批次在不在」，一层说「这个版本有没有源 Run」⇒ 两层并存，不合并成一句话。
+ */
+type SupplyBatchState = 'present' | 'absent' | 'unknown'
+
+const supplyBatchState = computed<SupplyBatchState>(() => {
+  const s = summary.value
+  if (!s) return 'unknown'
+  const p = s.supplyBatchPresent
+  if (p === true) return 'present'
+  if (p === false) return 'absent'
+  return 'unknown'
+})
+
+/** 供给批次号（后端给了才显示，不自己编） */
+const supplyBatchNo = computed<string | null>(() => summary.value?.supplyBatchNo ?? null)
+
+/** 供给批次这一行怎么说（三态各有各的话，不共用一句） */
+const supplyBatchText = computed(() => {
+  switch (supplyBatchState.value) {
+    case 'present':
+      return supplyBatchNo.value ? `供给批次 ${supplyBatchNo.value}` : '供给批次在'
+    case 'absent':
+      return '供给批次缺失（没有可用的供给事实批次）'
+    default:
+      return summary.value ? '供给批次未判定（后端未给这一位）' : '供给批次未判定（汇总暂不可用）'
+  }
+})
 
 /* ===== 字典（未知值原样显示）===== */
 const SUPPLY_TYPE_LABELS: Record<string, string> = {
@@ -148,15 +216,8 @@ const otherFactoryCode = (row: PeggingTraceDto): string | null => {
   return s && s !== d ? s : null
 }
 
-const COMMITMENT_LABELS: Record<string, string> = {
-  COMMITTED: '已承诺',
-  CONFIRMED: '已确认',
-  ESTIMATED: '估算',
-  NOT_COMMITTED: '未承诺',
-  UNKNOWN: '未标注'
-}
-const commitmentLabel = (v: string | null | undefined): string =>
-  v ? (COMMITMENT_LABELS[v] ?? v) : '未标注'
+/** 履约承诺文案走全站共用词典（订单页 / 采购协同页同源，不各造一份） */
+const commitmentLabel = (v: string | null | undefined): string => commitmentStatusLabel(v)
 const COMMITMENT_TAG_TYPE: Record<string, 'success' | 'warning' | 'danger' | 'info'> = {
   COMMITTED: 'success',
   CONFIRMED: 'success',
@@ -180,19 +241,34 @@ const VERSION_STATUS_LABELS: Record<string, string> = {
 const versionStatusLabel = (v: string | null | undefined): string =>
   v ? (VERSION_STATUS_LABELS[v] ?? v) : '状态未知'
 
-/** 版本下拉文案：版本号 · 状态 · 域（工厂用户靠域区分不同产品线） */
+/**
+ * 版本下拉文案：版本号 · 状态 · 域（工厂用户靠域区分不同产品线）
+ *
+ * 域显示中文名（内部 domainKey 不给用户看）；字典取不到时回退原码，
+ * 那是「后端没给中文名」的实情，不猜。
+ */
 function versionLabel(v: {
   versionCode: string
   status?: string | null
   domainKey?: string | null
 }): string {
   const parts = [v.versionCode, versionStatusLabel(v.status)]
-  if (v.domainKey) parts.push(v.domainKey)
+  if (v.domainKey) parts.push(domainStore.label(v.domainKey))
   return parts.join(' · ')
 }
 
 const num = (v: number | null | undefined): string =>
   v == null ? '-' : Number(v).toLocaleString('zh-CN', { maximumFractionDigits: 3 })
+
+/**
+ * 总分配笔数的显示文本
+ *
+ * ⚠️ null = **汇总取不到**（不是 0）：§0.2 ②「NULL=未知，不得转 0」。
+ *   汇总接口失败时写「未提供」，不写 0 笔（那会说成「这一版明确没有分配」）。
+ */
+const totalAllocationsText = computed(() =>
+  totalAllocations.value === null ? '未提供' : num(totalAllocations.value)
+)
 
 /** 数量（可能带小数，去掉无意义的尾零） */
 const qty = (v: number | null | undefined): string =>
@@ -280,7 +356,11 @@ async function onPageSizeChange(size: number): Promise<void> {
   await store.setPageSize(size)
 }
 
-onMounted(refresh)
+onMounted(() => {
+  // 域字典：版本下拉里显示中文域名；字典取不到时回退原码（实情，不猜）
+  if (!domainStore.loadedAt) void domainStore.load()
+  void refresh()
+})
 onBeforeUnmount(() => store.reset())
 </script>
 
@@ -320,7 +400,13 @@ onBeforeUnmount(() => store.reset())
         </div>
         <div class="target-facts">
           <span class="fact">
-            共 <strong>{{ num(totalAllocations) }}</strong> 笔分配
+            共 <strong>{{ totalAllocationsText }}</strong> 笔分配
+          </span>
+          <span
+            class="fact"
+            :class="{ muted: supplyBatchState !== 'present', warn: supplyBatchState === 'absent' }"
+          >
+            {{ supplyBatchText }}
           </span>
           <span v-if="allocWriteTime" class="fact">分配记录写入于 {{ allocWriteTime }}</span>
           <span class="fact muted">当前计划版本、当前账号可见的笔数，不随下面筛选变化</span>
@@ -600,15 +686,23 @@ onBeforeUnmount(() => store.reset())
         </ElTableColumn>
       </ElTable>
 
-      <!-- 空态：说清「为什么空」 -->
+      <!-- 空态：说清「为什么空」（矩阵 A8 三态 + 2026-11-17 供给批次显式位层） -->
       <ElEmpty
         v-if="!loading && !list.length"
         :description="
           isOrderScope
             ? '这张订单没有供需分配记录。可换订单号，或改用物料编码 / 来源单据号查。'
-            : totalAllocations
-              ? '没有符合当前筛选条件的分配记录。换个条件或点「重置」。'
-              : '当前账号在这一版没有可见的分配记录。可能是这一版还没发令、排产失败，或这些分配不在你的数据范围内，换一版看看。'
+            : totalAllocations === null
+              ? '这一版的分配汇总取不到，所以不知道它一共该有多少笔；下面查明细的结果是空的。换一版看看。'
+              : totalAllocations
+                ? '没有符合当前筛选条件的分配记录。换个条件或点「重置」。'
+                : supplyBatchState === 'absent'
+                  ? '这一版没有可用的供给事实批次（源批缺失），归集不到分配记录；也可能这些分配不在你的数据范围内。换一版看看。'
+                  : supplyBatchState === 'unknown'
+                    ? '这一版的供给批次未判定，无法确定是否有分配记录；也可能这些分配不在你的数据范围内。换一版看看。'
+                    : sourceBatchMissing
+                      ? '这个计划版本没有记录到来源排程批次（版本无源 Run），也就归集不到这一版的分配记录；也可能这些分配不在你的数据范围内。换一版看看。'
+                      : '当前账号在这一版没有可见的分配记录。可能是这一版还没发令、排产失败，或这些分配不在你的数据范围内，换一版看看。'
         "
       />
 
@@ -616,7 +710,7 @@ onBeforeUnmount(() => store.reset())
       <div v-if="!isOrderScope" class="pager">
         <span class="pager-total">
           <template v-if="filteredTotal !== null">
-            共 {{ num(filteredTotal) }} 笔
+            服务端命中 {{ num(filteredTotal) }} 笔 · 本页已显示 {{ list.length }} 笔
             <template v-if="totalPages !== null"> · 共 {{ totalPages }} 页</template>
           </template>
           <template v-else>
@@ -797,6 +891,11 @@ onBeforeUnmount(() => store.reset())
   .fact strong {
     font-size: 16px;
     color: #1e293b;
+  }
+
+  /* 源批缺失＝要提醒的异常态；未判定＝中性（不替后端下结论） */
+  .fact.warn {
+    color: #b45309;
   }
 }
 

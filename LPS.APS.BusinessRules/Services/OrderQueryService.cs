@@ -127,6 +127,72 @@ public class OrderQueryService
     }
 
     /// <summary>
+    /// B2（11-17，0号位 Q-c 裁）：P02 交付 KPI 分区聚合——校验与 summary 同规（planVersionId 必填、
+    /// riskLevel 白名单），参数语义=列表同名同义（统计随筛选走，点卡筛回同一集合）。
+    /// </summary>
+    public async Task<DeliveryKpiResultDto> GetDeliveryKpiAsync(
+        int planVersionId,
+        string? orderNo = null,
+        string? materialCode = null,
+        string? customerName = null,
+        string? factoryCode = null,
+        string? domainKey = null,
+        string? delayStatus = null,
+        string? status = null,
+        string? productionInstructionNo = null,
+        string? productFamilyCode = null,
+        DateTime? dueDateFrom = null,
+        DateTime? dueDateTo = null,
+        string? riskLevel = null,
+        IReadOnlySet<string>? allowedFactories = null,
+        IReadOnlySet<string>? allowedDomains = null,
+        CancellationToken ct = default)
+    {
+        if (planVersionId <= 0) throw new ArgumentException("planVersionId is required");
+        if (!string.IsNullOrWhiteSpace(riskLevel) && !RiskLevelFilterWhitelist.Contains(riskLevel))
+            throw new ArgumentException($"非法 riskLevel：{riskLevel}（允许：ON_TRACK/DELAYED/AT_RISK/UNSCHEDULED 或不传）");
+
+        return await _repository.GetDeliveryKpiAsync(
+            planVersionId, orderNo, materialCode, customerName,
+            factoryCode, domainKey, delayStatus, status,
+            productionInstructionNo, productFamilyCode, dueDateFrom, dueDateTo,
+            riskLevel, allowedFactories, allowedDomains, ct);
+    }
+
+    /// <summary>
+    /// B3/B4（11-17）：订单完整树（P02 展开=P03 深链同一出口）。参数校验=家族同规（必填⇒ArgumentException 真400）。
+    /// </summary>
+    public async Task<LPS.APS.Core.Dto.OrderTreeResultDto> GetOrderTreeAsync(
+        int planVersionId,
+        long orderId,
+        IReadOnlySet<string>? allowedDomains = null,
+        IReadOnlySet<string>? allowedFactories = null,
+        CancellationToken ct = default)
+    {
+        if (planVersionId <= 0) throw new ArgumentException("planVersionId 必填");
+        if (orderId <= 0) throw new ArgumentException("orderId 必填（[Order].Id 根订单身份）");
+        return await _repository.GetOrderTreeAsync(planVersionId, orderId, allowedDomains, allowedFactories, ct: ct);
+    }
+
+    /// <summary>
+    /// C2（11-18）：P09 选单池（参数校验同家族：participation 白名单在仓储抛⇒真400）。
+    /// </summary>
+    public async Task<LPS.APS.Core.Dto.OrderPoolResultDto> GetOrderPoolAsync(
+        int planVersionId,
+        string? participation = null,
+        string? keyword = null,
+        string? orderType = null,
+        int pageIndex = 1,
+        int pageSize = 50,
+        IReadOnlySet<string>? allowedDomains = null,
+        CancellationToken ct = default)
+    {
+        if (planVersionId <= 0) throw new ArgumentException("planVersionId 必填");
+        return await _repository.GetOrderPoolAsync(planVersionId, participation, keyword, orderType,
+            pageIndex, pageSize, allowedDomains, ct);
+    }
+
+    /// <summary>
     /// 订单口径可选值+条数（R4，11-12 新增只读端点）：与列表同筛选同范围；
     /// 六维（customerName/factoryCode/productFamilyCode/status/delayStatus/riskLevel）各按条数降序、截 200。
     /// </summary>

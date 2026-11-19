@@ -12,6 +12,10 @@
  *
  * 权限：aps.parameter.view / aps.parameter.edit / aps.parameter.publish
  *  （⚠️ 参数集发布是**独立权限**，`aps.rule.publish` 不覆盖它 —— 后端 Controller:228 挂 ParameterPublish）
+ *
+ * 2026-11-18：跨厂LT 标准参数改走**通用参数集版本接口**（第 6 号内容子块 `crossFactoryLeadTimeRulesJson`）；
+ *   专属读写端点已删除（调用会 404）⇒ 读通用版本详情、写通用版本 PUT，写完**回读核对**（后端未部署时会静默忽略）。
+ *   —— 依据 3号位《跨厂LT 走通用参数接口与快照保留_回执 v1.1_20261117》。
  */
 
 import { defineStore } from 'pinia'
@@ -77,6 +81,12 @@ import {
   isPlanningYieldRow,
   type PlanningYieldItem
 } from '@/api/aps-v1/parameterSetYields'
+import {
+  parseCrossFactoryLeadTimeRules,
+  serializeCrossFactoryLeadTimeRules,
+  validateCrossFactoryLeadTimeRules,
+  type CrossFactoryLeadTimeItem
+} from '@/api/aps-v1/crossFactoryLeadTime'
 import { mockActor } from '@/api/aps-v1/rule'
 import { normalizeRuleStatus } from '@/api/aps-v1/types/common'
 import { anchorHintMessage as buildAnchorHintMessage } from '@/api/aps-v1/validationMessages'
@@ -170,6 +180,23 @@ export const useParameterSetsStore = defineStore('aps.parameterSets', () => {
 
   /** 5 块缓冲（编辑态） */
   const buffer = ref(emptyBufferState())
+
+  /* ===== 跨厂LT 标准参数（参数集版本的第 6 号内容子块）===== */
+  /**
+   * 跨厂LT 规则行（编辑态）
+   *
+   * ⚠️ 2026-11-18 改口径（3号位《跨厂LT 走通用参数接口与快照保留_回执 v1.1_20261117》）：
+   *   这一块在快照**顶层**、不在 5 主题 JSON 里，但后端已把它并进**通用归一化**
+   *   ⇒ 读写**都走通用参数集版本接口**（`GET/PUT …/version/{id}` 的
+   *   `crossFactoryLeadTimeRulesJson` 字段），专属端点已删除（调用会 404）。
+   *   它仍有自己的编辑态与 dirty 标记（不占 5 主题的 dirty 位）。
+   */
+  const crossFactoryLtRows = ref<CrossFactoryLeadTimeItem[]>([])
+  /** 上次已保存的快照指纹（判断这块有没有未保存改动） */
+  const crossFactoryLtSavedJson = ref('[]')
+  const crossFactoryLtLoading = ref(false)
+  const crossFactoryLtSaving = ref(false)
+  const crossFactoryLtError = ref<string | null>(null)
 
   const actor = ref(mockActor.name)
   const apsAuth = useApsAuthStore()
@@ -356,6 +383,12 @@ export const useParameterSetsStore = defineStore('aps.parameterSets', () => {
   /** ⑤ 采购参数 → 计划良率（专属编辑器用） */
   const planningYields = computed<PlanningYieldItem[]>(() =>
     readPlanningYields(buffer.value.workingBlocks)
+  )
+  /** ⑥ 跨厂LT 标准参数（顶层独立块 `$.CrossFactoryLeadTimeRules`；专属编辑器用） */
+  const crossFactoryLtRules = computed<CrossFactoryLeadTimeItem[]>(() => crossFactoryLtRows.value)
+  /** 跨厂LT 那一块有没有未保存的改动（与 5 主题的 dirty 分开） */
+  const crossFactoryLtDirty = computed(
+    () => JSON.stringify(crossFactoryLtRows.value) !== crossFactoryLtSavedJson.value
   )
 
   /**
@@ -873,6 +906,141 @@ export const useParameterSetsStore = defineStore('aps.parameterSets', () => {
     buffer.value.dirty.procurement = true
   }
 
+  /* ===== 跨厂LT 标准参数（参数集版本第 6 号子块：走通用版本 GET/PUT）===== */
+
+  /**
+   * 读当前版本的跨厂LT 规则
+   *
+   * ⚠️ 2026-11-18：读**通用版本详情**的 `crossFactoryLeadTimeRulesJson`
+   *   （3号位《跨厂LT 走通用参数接口与快照保留_回执 v1.1_20261117》）。
+   *   缺块 / 空 ⇒ `null` ⇒ 这一版**没配**跨厂LT（不是「读不到」，两者业务含义不同）。
+   *   缓冲里已经是同一版时直接复用，不再单独发一次请求。
+   */
+  async function loadCrossFactoryLeadTimeRules(versionId?: number): Promise<void> {
+    crossFactoryLtLoading.value = true
+    crossFactoryLtError.value = null
+    if (!versionId) {
+      crossFactoryLtRows.value = []
+      crossFactoryLtSavedJson.value = '[]'
+      crossFactoryLtLoading.value = false
+      return
+    }
+    try {
+      const buffered = buffer.value.governance
+      const raw =
+        buffered && buffered.id === versionId
+          ? (buffered.crossFactoryLeadTimeRulesJson ?? null)
+          : ((await parameterSetApi.getParameterSetVersion(versionId))
+              .crossFactoryLeadTimeRulesJson ?? null)
+      const rows = parseCrossFactoryLeadTimeRules(raw)
+      crossFactoryLtRows.value = rows
+      crossFactoryLtSavedJson.value = JSON.stringify(rows)
+    } catch (err) {
+      crossFactoryLtRows.value = []
+      crossFactoryLtSavedJson.value = '[]'
+      crossFactoryLtError.value =
+        err instanceof ApiError ? err.message : '读取跨厂LT 标准参数失败，请稍后重试'
+    } finally {
+      crossFactoryLtLoading.value = false
+    }
+  }
+
+  /**
+   * 写完核对：重新读通用版本详情，看这一块是不是真的落下去了
+   *
+   * ⚠️ 为什么要有这一步：3号位 这一块**尚未部署**，未部署时通用 PUT 会**静默忽略**
+   *   这个不认识的键 ⇒ 接口报 200、页面提示「已保存」，实际一个字都没存。
+   *   读回来比对不一致 ⇒ 如实说「没存上」，不假装成功。
+   *   读不回来（网络/报错）⇒ **不臆断**成失败，返回 true（没证据说没存上）。
+   */
+  async function crossFactoryBlockPersisted(
+    versionId: number,
+    sent: CrossFactoryLeadTimeItem[]
+  ): Promise<boolean> {
+    try {
+      const version = await parameterSetApi.getParameterSetVersion(versionId)
+      const now = parseCrossFactoryLeadTimeRules(version.crossFactoryLeadTimeRulesJson ?? null)
+      return (
+        JSON.stringify(serializeCrossFactoryLeadTimeRules(now)) ===
+        JSON.stringify(serializeCrossFactoryLeadTimeRules(sent))
+      )
+    } catch {
+      return true
+    }
+  }
+
+  /**
+   * 保存跨厂LT 规则（走**通用参数集版本 PUT**；权限 aps.parameter.edit）
+   *
+   * ⚠️ 2026-11-18：专属写端点已被后端删除 ⇒ 改走 `PUT …/version/{id}`，
+   *   请求体带 `crossFactoryLeadTimeRulesJson`（3号位 v1.1）。
+   *  - **零行不能发**：后端发布校验把 `[]` 判非法（`CROSS_FACTORY_LT_BLOCK_EMPTY`），
+   *    新契约下也没有「删块」的表达方式 ⇒ 清空这一块被挡在门口，如实说明原因。
+   *  - 通用 PUT 是 full-object ⇒ 同时带上 5 主题（用**已保存**的那一份，
+   *    免得顺手把用户还没点「保存草稿」的主题改动一起存了）。
+   *  - 有校验问题时不提交（带病提交只会被发布校验拒回来）。
+   */
+  async function saveCrossFactoryLeadTimeRules(
+    items: CrossFactoryLeadTimeItem[]
+  ): Promise<boolean> {
+    const governance = buffer.value.governance
+    const versionId = governance?.id
+    if (!versionId || !governance) {
+      crossFactoryLtError.value = '版本标识缺失，无法保存跨厂LT 标准参数'
+      return false
+    }
+    if (!canWrite.value) {
+      crossFactoryLtError.value = '当前操作者无写权限（需权限码 aps.parameter.edit）'
+      return false
+    }
+    if (!items.length) {
+      crossFactoryLtError.value =
+        '这一块不能整块清空：后端把「零行」判非法（发布会被拦下）。要停用某条规则，请把那一行的「生效」关掉。'
+      return false
+    }
+    const problems = validateCrossFactoryLeadTimeRules(items)
+    if (problems.length) {
+      crossFactoryLtError.value = `还有 ${problems.length} 处要改，改完才能保存`
+      return false
+    }
+    const blocks = buffer.value.originalBlocks ?? buffer.value.workingBlocks
+    if (!blocks) {
+      crossFactoryLtError.value = '参数集草稿未载入，无法保存跨厂LT 标准参数'
+      return false
+    }
+    crossFactoryLtSaving.value = true
+    crossFactoryLtError.value = null
+    try {
+      const saved = serializeCrossFactoryLeadTimeRules(items)
+      const putBody = buildPutBody(governance, blocks, JSON.stringify(saved))
+      const result = await parameterSetApi.updateParameterSetDraft({
+        versionId,
+        body: putBody as ParameterSetVersion
+      })
+      buffer.value.governance = result
+      const persisted = await crossFactoryBlockPersisted(versionId, saved)
+      if (!persisted) {
+        crossFactoryLtError.value =
+          '这次改动没存上：后端还没接收这一块（跨厂LT 子块尚未部署），内容没变。'
+        return false
+      }
+      crossFactoryLtRows.value = saved
+      crossFactoryLtSavedJson.value = JSON.stringify(saved)
+      return true
+    } catch (err) {
+      crossFactoryLtError.value =
+        err instanceof ApiError ? err.message : '保存跨厂LT 标准参数失败，请稍后重试'
+      return false
+    } finally {
+      crossFactoryLtSaving.value = false
+    }
+  }
+
+  /** 本地编辑跨厂LT 规则行（只改内存，不落库） */
+  function setCrossFactoryLeadTimeRules(items: CrossFactoryLeadTimeItem[]): void {
+    crossFactoryLtRows.value = items
+  }
+
   /** 当前编辑态里引用到的仓库编码（按 Supply / Procurement 分组） */
   const currentWarehouseRefs = computed<WarehouseRefGroups>(() =>
     collectWarehouseRefs(buffer.value.workingBlocks)
@@ -928,6 +1096,13 @@ export const useParameterSetsStore = defineStore('aps.parameterSets', () => {
    * 保存草稿（PUT /api/governance/parameter-set/version/{id}）
    *  - full-object PUT：5 个主题 JSON 必须全量回传（后端五主题归一化会重建快照）
    *  - 后端 409（OCC 冲突）→ 提示用户刷新，**不丢**未保存状态
+   *
+   * 2026-11-18：跨厂LT 子块（第 6 号内容块）**随同一次 PUT 提交**
+   *   —— 3号位《跨厂LT 走通用参数接口与快照保留_回执 v1.1_20261117》。
+   *   规则：
+   *   - 这一块**有行** ⇒ 带上（后端「提交值优先」）；
+   *   - 这一块**没有行** ⇒ **不带这个键**（不传＝本次不维护本块 ⇒ 后端保留既有快照值；
+   *     发 `[]` 会被发布校验判非法，不能这么干）。
    */
   async function onSaveDraft(changeReason: string): Promise<boolean> {
     const buf = buffer.value
@@ -947,7 +1122,12 @@ export const useParameterSetsStore = defineStore('aps.parameterSets', () => {
     buf.saving = true
     error.value = null
     try {
-      const putBody = buildPutBody(buf.governance, buf.workingBlocks)
+      const ltRows = serializeCrossFactoryLeadTimeRules(crossFactoryLtRows.value)
+      const putBody = buildPutBody(
+        buf.governance,
+        buf.workingBlocks,
+        ltRows.length ? JSON.stringify(ltRows) : undefined
+      )
       putBody.remarks = changeReason
       const result = await parameterSetApi.updateParameterSetDraft({
         versionId,
@@ -956,6 +1136,16 @@ export const useParameterSetsStore = defineStore('aps.parameterSets', () => {
       buf.governance = result
       buf.originalBlocks = JSON.parse(JSON.stringify(buf.workingBlocks))
       buf.dirty = emptyDirtyFlags()
+      if (ltRows.length) {
+        // 这一块随草稿一起提交了 ⇒ 写完核对一次（后端未部署时会静默忽略这个键）
+        const persisted = await crossFactoryBlockPersisted(versionId, ltRows)
+        if (persisted) {
+          crossFactoryLtRows.value = ltRows
+          crossFactoryLtSavedJson.value = JSON.stringify(ltRows)
+        } else {
+          crossFactoryLtError.value = '跨厂LT 那一块没存上（后端尚未接收这一块），其余改动已保存。'
+        }
+      }
       // 草稿内容已落库 ⇒ 版本对比要按新内容重算（否则「我这次改了什么」还是旧值）
       await refreshDiff()
       return true
@@ -1214,6 +1404,9 @@ export const useParameterSetsStore = defineStore('aps.parameterSets', () => {
     lastValidation.value = null
     buffer.value = emptyBufferState()
     error.value = null
+    crossFactoryLtRows.value = []
+    crossFactoryLtSavedJson.value = '[]'
+    crossFactoryLtError.value = null
   }
 
   return {
@@ -1261,6 +1454,11 @@ export const useParameterSetsStore = defineStore('aps.parameterSets', () => {
     defaultPurchaseLt,
     arrivalToUsableOffsets,
     planningYields,
+    crossFactoryLtRules,
+    crossFactoryLtDirty,
+    crossFactoryLtLoading,
+    crossFactoryLtSaving,
+    crossFactoryLtError,
     currentWarehouseRefs,
     currentUnknownWarehouseCodes,
     forkSourceRefs,
@@ -1282,6 +1480,9 @@ export const useParameterSetsStore = defineStore('aps.parameterSets', () => {
     setDefaultPurchaseLt,
     setArrivalToUsableOffsets,
     setPlanningYields,
+    loadCrossFactoryLeadTimeRules,
+    saveCrossFactoryLeadTimeRules,
+    setCrossFactoryLeadTimeRules,
     checkForkSourceWarehouseRefs,
     onCancelDirty,
     onSaveDraft,

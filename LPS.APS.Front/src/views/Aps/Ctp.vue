@@ -16,6 +16,11 @@
  *  - 评估时间用**真实评估时刻**（不是渲染时刻）
  *  - 加「复制结论」：工厂用户要把结论直接发给客户
  *  - 撤页头大标题页头（2026-10-16 定调），标题进卡片头
+ *
+ * 2026-11-18：接 P09 选单池（5号位 2026-11-18《知会C2-P09选单池pool已落码》r14268～r14270）——
+ *  页面顶部加「选单池」卡片：新单 / 老单候选按 **ACTIVE PV 参与关系** 判定
+ *  （禁按创建时间 / 单号前缀猜新老，v0.2 点名禁令），选中的订单可一键带入评估表单
+ *  （订单号 / 物料 / 数量；工厂与客户请求交期仍由用户自己填，池里没有这两项）。
  */
 
 import { computed, onMounted, reactive, ref } from 'vue'
@@ -26,13 +31,15 @@ import { useCtpStore } from '@/store/modules/aps/ctp'
 import { useDomainStore } from '@/store/modules/aps/domain'
 import { domainApi } from '@/api/aps-v1/domain'
 import { materialLookupApi } from '@/api/aps-v1/materialLookup'
+import OrderPoolPanel from './components/OrderPoolPanel.vue'
 import type { MaterialLookupItem } from '@/api/aps-v1/types'
 import {
   BIZ_ISSUE_FACTORY_CODES,
   ESTIMATED_BADGE_TEXT,
   reasonLabelOf,
   type CtpInput,
-  type FactorySummaryDto
+  type FactorySummaryDto,
+  type OrderPoolItemDto
 } from '@/api/aps-v1/types'
 
 import {
@@ -138,6 +145,32 @@ function onMaterialSearch(query: string): void {
 function onMaterialChange(code: string): void {
   selectedMaterial.value = MATERIAL_OPTIONS.value.find((o) => o.code === code) ?? null
   materialNotice.value = null
+}
+
+/**
+ * 选单池选中的订单带入评估表单（2026-11-18，C2）
+ *
+ * 只带**池里真有的三项**：订单号 / 物料 / 数量。
+ * ⚠️ 工厂与客户请求交期**不带**：选单池没有工厂（要用户按自己厂选）；
+ *   客户请求交期是客户提出的期望日，≠ 订单自身交期 ⇒ 两者不互相顶替。
+ */
+function onPickOrder(row: OrderPoolItemDto): void {
+  form.orderCanonicalId = row.orderNo ?? ''
+  if (row.materialCode) {
+    form.materialCode = row.materialCode
+    // 物料是远程搜索下拉：把选中的物料并回选项列表，否则下拉里只剩裸编码
+    selectedMaterial.value = {
+      masterId: 0,
+      code: row.materialCode,
+      name: row.materialName ?? '',
+      spec: '',
+      uom: row.uom ?? '',
+      isActive: true
+    }
+    MATERIAL_OPTIONS.value = withSelectedMaterial(MATERIAL_OPTIONS.value)
+  }
+  if (row.quantity != null) form.quantity = row.quantity
+  ElMessage.success(`已带入订单 ${row.orderNo}，工厂和客户请求交期还需要你自己确认`)
 }
 
 /** P1-08 入口：Gantt/Workbench 可带 ?purpose=INSERT_IMPACT_ANALYSIS 跳转；Ctp 在挂载时读取并覆盖默认值 */
@@ -328,6 +361,9 @@ function onLoadHistory(entryId: number): void {
 
 <template>
   <div class="aps-ctp">
+    <!-- ===== 选单池（2026-11-18 C2：新单 / 老单候选，判据=ACTIVE PV 参与关系）===== -->
+    <OrderPoolPanel @pick="onPickOrder" />
+
     <!-- ===== 输入表单（2026-11-14：撤页头大标题页头，标题进卡片头）===== -->
     <ElCard class="panel">
       <template #header>

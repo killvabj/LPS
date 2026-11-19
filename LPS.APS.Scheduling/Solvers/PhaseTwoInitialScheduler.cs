@@ -7016,9 +7016,27 @@ internal class PhaseTwoInitialScheduler
         {
             bool last = ordinal == count;
 
-            decimal batchNet = last
-                ? demand.NetOutputQty - netAssigned
-                : decimal.Round(demand.NetOutputQty / count, 4, MidpointRounding.ToZero);
+            decimal batchNet;
+            if (!demand.IsContinuation
+                && demand.NetOutputQty > 0m
+                && demand.NetOutputQty == decimal.Truncate(demand.NetOutputQty))
+            {
+                // ── 0号位 v1.2 §二.3/§二.4（2026-11-19 落地）：**新增可执行批净量必须整数** ──
+                //   非续作（A/B 豁免）且需求净量为整数的，按「整除 + 余数逐批 +1」切分：
+                //     5 拆 2 批 ⇒ 2 + 3；13 拆 3 批 ⇒ 4 + 4 + 5；**绝不**产出 X.5 / 13.3333 这类小数批。
+                //   `PlannedProcessQty`（投入侧，含良率放大）仍按原算法可小数 —— 冻结明写投入侧允许小数。
+                var total = decimal.Truncate(demand.NetOutputQty);
+                var baseNet = decimal.Floor(total / count);
+                var remainder = total - baseNet * count;          // 0..count-1，整数
+                batchNet = baseNet + (ordinal <= remainder ? 1m : 0m);
+            }
+            else
+            {
+                batchNet = last
+                    ? demand.NetOutputQty - netAssigned
+                    : decimal.Round(demand.NetOutputQty / count, 4, MidpointRounding.ToZero);
+            }
+
             decimal batchProc = last
                 ? demand.PlannedProcessQty - procAssigned
                 : decimal.Round(demand.PlannedProcessQty / count, 4, MidpointRounding.ToZero);
@@ -10385,6 +10403,24 @@ internal class PhaseTwoInitialScheduler
         // 合并需求 = 锚点需求身份 + 两需求数量之和（其余字段逐字拷贝；`RequiredAvailableTime` 保留锚点值，
         //   非锚点一侧的交期保护由下方双重把关负责）。
         var combinedDemand = CloneDemandWithBatchQty(anchorDemand, combinedNet, combinedProc);
+
+        // ── R06（0号位 2026-11-10《Batch_Code_Review_and_Action_Plan v1.0》§4-A3；2026-11-09 :418 点名本方法用锚批 AllocationSequence）──
+        //   多工序 Stage 合批与单工序 `TryMergeDemandIntoTask`（`:10104`）同一条物料口径：
+        //   合并保留锚批起点，若**被合并需求**（`demand` 自己的 AllocationSequence）物料要到更晚才可用，
+        //   这次合批就把它提前消费了（锚批起点早于本条需求最早可用物料时刻 ⇒ 违反「缺料导致日期变晚」）⇒ 拒绝本次合批。
+        //   ⚠ 回落到 `out _`：物料总量不足时 `GetMaterialEarliestTime` 返回 `isSufficient=false`、时点为各分段最晚值，
+        //     同样会因「锚批起点早于该值时点」而拒绝，故无需单独判 `isSufficient`（与单工序同行一致）。
+        var materialEarliest = GetMaterialEarliestTime(
+            demand.AllocationSequence,   // 被合并需求自己的分配批，**不是**锚批
+            demand.NetOutputQty,
+            constraints,
+            planningStart,
+            dynamicMaterialFloor,
+            out _);
+        if (targetBatch[0].PlannedStartTime < materialEarliest)
+        {
+            return null;   // 锚批起点早于本条需求最早可用物料时刻 ⇒ 合并会把未到物料提前投入
+        }
 
         // ── 快照（用于失败回滚；试排阶段作用于克隆表，落定阶段作用于真实表，两处语义一致）──
         long swDetach = SolverDiagnostics.HotspotStart();

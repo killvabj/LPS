@@ -11,10 +11,11 @@
  *  - explanation.ts     异常与原因解释 DTO（占位）
  *  - pi.ts              PI Position / 供给追溯 DTO（占位）
  *  - peggingTrace.ts    Supply/Pegging 追溯 DTO（已对齐 5号位 PeggingTraceController）
+ *  - supplyFactTrace.ts 采购协同（供给事实）DTO（已对齐 5号位 SupplyFactTraceController，矩阵 A9/A11/A13）
  *  - rule.ts            规则集（RuleSet）DTO（已与后端 GovernanceController 对齐）
  *  - parameterSet.ts    参数集（ParameterSet）DTO（独立主表，与规则集平行）
  *  - run.ts             运行 / 版本 / MES 下发状态 DTO（占位）
- *  - mes.ts             （暂未单独拆分 MES，与 run.ts 中的 MesEligibilityDto 合用）
+ *  - mes.ts             P11 MES 衔接清单 DTO（5号位 2026-11-17 复函B6 / r14259 三层状态）
  *  - auth.ts            认证 DTO（已与后端对齐）
  *  - manualEta.ts       人工到货 ETA DTO（已与 5 号位对齐）
  *  - demandProtection.ts 需求保护释放 DTO（P1-11）
@@ -29,6 +30,10 @@
  *  - taskSplitRuleConfig.ts 执行批拆分规则 / Batch Policy 批量策略 DTO（3号位 2026-10-07 v1.0 契约）
  *  - stage.ts             大工艺阶段字典（StageDict，冻结 §1.9 29 码 → 中文阶段名）
  *  - backend-aligned.ts 后端 Core DTO 类型对齐（只读参考）
+ *  - orderTree.ts      P02 行展开 / P03 深链「订单完整树」DTO（5号位 2026-11-17 复函B3B4 / r14260-62）
+ *  - orderPool.ts      P09 选单池 DTO（5号位 2026-11-18 知会C2 / r14268-70；新老判据=ACTIVE PV 参与关系）
+ *
+ * 2026-11-18：新增 `orderPool.ts`（5号位 2026-11-18《知会C2-P09选单池pool已落码》r14268～r14270）。
  */
 
 export * from './common'
@@ -40,6 +45,7 @@ export * from './candidate'
 export * from './explanation'
 export * from './pi'
 export * from './peggingTrace'
+export * from './supplyFactTrace'
 export * from './rule'
 export * from './parameterSet'
 export * from './run'
@@ -58,3 +64,6 @@ export * from './material'
 export * from './taskSplitRuleConfig'
 export * from './stage'
 export * from './backend-aligned'
+export * from './mes'
+export * from './orderTree'
+export * from './orderPool'

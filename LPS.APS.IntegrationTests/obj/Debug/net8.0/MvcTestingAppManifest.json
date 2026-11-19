@@ -1,0 +1,9 @@
+{
+  "LPS.APS.Application, Version=1.0.0.0, Culture=neutral, PublicKeyToken=null": "D:\\WorkSpace_LocalLib\\Windsurf WorkSpace\\LPS_SVN\\LPS.APS.Application",
+  "LPS.APS.BusinessRules, Version=1.0.0.0, Culture=neutral, PublicKeyToken=null": "D:\\WorkSpace_LocalLib\\Windsurf WorkSpace\\LPS_SVN\\LPS.APS.BusinessRules",
+  "LPS.APS.Core, Version=1.0.0.0, Culture=neutral, PublicKeyToken=null": "D:\\WorkSpace_LocalLib\\Windsurf WorkSpace\\LPS_SVN\\LPS.APS.Core",
+  "LPS.APS.Engine, Version=1.0.0.0, Culture=neutral, PublicKeyToken=null": "D:\\WorkSpace_LocalLib\\Windsurf WorkSpace\\LPS_SVN\\LPS.APS.Engine",
+  "LPS.APS.Scheduling, Version=1.0.0.0, Culture=neutral, PublicKeyToken=null": "D:\\WorkSpace_LocalLib\\Windsurf WorkSpace\\LPS_SVN\\LPS.APS.Scheduling",
+  "LPS.APS.Shared, Version=1.0.0.0, Culture=neutral, PublicKeyToken=null": "D:\\WorkSpace_LocalLib\\Windsurf WorkSpace\\LPS_SVN\\LPS.APS.Shared",
+  "LPS.APS.Web, Version=1.0.0.0, Culture=neutral, PublicKeyToken=null": "D:\\WorkSpace_LocalLib\\Windsurf WorkSpace\\LPS_SVN\\LPS.APS.Web"
+}

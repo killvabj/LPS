@@ -131,6 +131,105 @@ public class ScheduleController : ControllerBase
     }
 
     /// <summary>
+    /// P05 任务清单（11-16 矩阵 A4，5号位）：<c>GET /api/schedule/tasks/{planVersionId}</c>——
+    /// 一行=一个真实 <c>Task.Id</c>（不按 TaskNo 折叠）；<c>total</c>=服务端全量命中、<c>items</c>=本页已加载，两数分开。
+    /// 筛选：<c>from/to</c>（naive 墙钟窗，NULL 计划时刻恒保留——同甘特窗口件）、<c>resourceIds</c>（重复键；
+    /// <c>resourceIds[]</c> 真 400）、<c>stageCodes</c>/<c>departmentIds</c>（逗号）、<c>keyword</c>（物料码/名/TaskNo 三路）、
+    /// <c>status</c>（原值等值）、<c>hasWorkOrder</c>（三态：缺省=不过滤 true=有工单 false=无工单，**只是工单号列过滤，
+    /// 不是"无需MES"分类**——分类权威未建，矩阵 Q-a）。
+    /// 排序：<c>sortBy=plannedStart|quantity|materialCode|taskNo|id</c>（缺省 plannedStart）+ <c>sortDir=asc|desc</c>，非法⇒真 400。
+    /// 分页 <c>pageIndex/pageSize</c>（缺省 50、钳 ≤200）。越权=200+<c>scopeDenied=true</c>；PV 不存在=<c>versionExists=false</c>。
+    /// 域/部门 Scope 与甘特**同一套解析件**（受限账号两页口径恒一致）。
+    /// </summary>
+    [Authorize(Policy = PermissionCodes.PlanView)]
+    [HttpGet("tasks/{planVersionId:int}")]
+    public async Task<ApiResponse<LPS.APS.Core.Dto.TaskListResultDto>> QueryTasks(
+        int planVersionId,
+        [FromQuery] DateTime? from = null,
+        [FromQuery] DateTime? to = null,
+        [FromQuery] int[]? resourceIds = null,
+        [FromQuery] string? stageCodes = null,
+        [FromQuery] string? departmentIds = null,
+        [FromQuery] string? keyword = null,
+        [FromQuery] string? status = null,
+        [FromQuery] bool? hasWorkOrder = null,
+        [FromQuery] string? sortBy = null,
+        [FromQuery] string? sortDir = null,
+        [FromQuery] int pageIndex = 1,
+        [FromQuery] int pageSize = 50,
+        CancellationToken cancellationToken = default)
+    {
+        if (Request.Query.ContainsKey("resourceIds[]") || Request.Query.ContainsKey("resourceIds[0]"))
+        {
+            throw new InvalidOperationException(
+                "resourceIds 不支持数组下标写法（resourceIds[]），请使用重复键：?resourceIds=1&resourceIds=2");
+        }
+
+        var stages = string.IsNullOrWhiteSpace(stageCodes)
+            ? null
+            : stageCodes.Split(',', StringSplitOptions.RemoveEmptyEntries).Select(x => x.Trim()).Where(x => x.Length > 0).ToList();
+        List<int>? depts = null;
+        if (!string.IsNullOrWhiteSpace(departmentIds))
+        {
+            depts = departmentIds.Split(',', StringSplitOptions.RemoveEmptyEntries)
+                .Select(x => int.Parse(x.Trim())).ToList();
+        }
+
+        var data = await _queryService.QueryTasksAsync(
+            GetCurrentUserId(), planVersionId, from, to, resourceIds, stages, depts,
+            keyword, status, hasWorkOrder, sortBy, sortDir, pageIndex, pageSize, cancellationToken);
+        return ApiResponse<LPS.APS.Core.Dto.TaskListResultDto>.Success(data);
+    }
+
+    /// <summary>
+    /// P06 单 Task 详情（11-16 矩阵 A5）：<c>GET /api/schedule/task/{taskId}</c>——
+    /// 列表行全字段 + 版本身份（versionCode/domainKey/planVersionStatus/dataCutoffTime）+
+    /// 份额明细（AllocationTaskShare 同 PV 逐行，根订单号=同 PV [Order] 反查）。
+    /// 共享 Task 多根订单**全量给**，页面不得贴单一订单为唯一需求来源；
+    /// <c>found=false</c>=不存在；<c>scopeDenied=true</c>=域外/部门外（两态不混报）。
+    /// 前后依赖边、MES 实际执行事实=未提供（挂 Q-a/Q-d，空位显式，不做推断）。
+    /// </summary>
+    [Authorize(Policy = PermissionCodes.PlanView)]
+    [HttpGet("task/{taskId:long}")]
+    public async Task<ApiResponse<LPS.APS.Core.Dto.TaskDetailResultDto>> GetTaskDetail(
+        long taskId,
+        CancellationToken cancellationToken = default)
+    {
+        var data = await _queryService.GetTaskDetailAsync(GetCurrentUserId(), taskId, cancellationToken);
+        return ApiResponse<LPS.APS.Core.Dto.TaskDetailResultDto>.Success(data);
+    }
+
+    /// <summary>
+    /// P12 资源负荷三率（11-17 矩阵 A6/A7；0号位 Q-b 已裁）：<c>GET /api/schedule/resource-load/{planVersionId}?from=&amp;to=&amp;resourceIds=</c>——
+    /// 一行=**设备×业务日**。①日历负荷率=当日已排 Task 小时÷三级继承解析可用小时×100；②固定 16h 负荷率=当日已排÷16×100
+    /// （恒可算，<b>不是</b>真实可用时间、不得代替①或当 MES 利用率）；③换型损失率=<b>暂不产出</b>——
+    /// Setup 权威=1号位 Solver 落库产物、现无持久列 ⇒ <c>setupHoursAvailable=false</c>、③全表 null（Q-b 禁读时重匹配/禁 Duration 代）。
+    /// 三态：<c>notApplicableReason</c> 非空=不适用（零合法可用小时/无日历/范围剔除三类文案，<b>禁显示 0</b>）；
+    /// 有可用小时且当日无排产=① 0%（明确零，合法值）。跨午夜 Task 按日切片。<c>from/to 必填</c>（缺→真400）、窗≤31天、设备≤200；
+    /// 不传 resourceIds=窗内有排产设备 TOP200（<c>resourcesTruncated=true</c> 须提示收窄）。域/部门 Scope 同甘特件；
+    /// 越权=200+<c>scopeDenied</c>，PV 缺=<c>versionExists=false</c>。
+    /// </summary>
+    [Authorize(Policy = PermissionCodes.PlanView)]
+    [HttpGet("resource-load/{planVersionId:int}")]
+    public async Task<ApiResponse<LPS.APS.Core.Dto.ResourceLoadResultDto>> GetResourceLoad(
+        int planVersionId,
+        [FromQuery] DateTime? from = null,
+        [FromQuery] DateTime? to = null,
+        [FromQuery] int[]? resourceIds = null,
+        CancellationToken cancellationToken = default)
+    {
+        if (Request.Query.ContainsKey("resourceIds[]") || Request.Query.ContainsKey("resourceIds[0]"))
+        {
+            throw new InvalidOperationException(
+                "resourceIds 不支持数组下标写法（resourceIds[]），请使用重复键：?resourceIds=1&resourceIds=2");
+        }
+
+        var data = await _queryService.GetResourceLoadAsync(
+            GetCurrentUserId(), planVersionId, from, to, resourceIds, cancellationToken);
+        return ApiResponse<LPS.APS.Core.Dto.ResourceLoadResultDto>.Success(data);
+    }
+
+    /// <summary>
     /// 获取指定计划版本的排程概要 KPI（越权返回空）
     /// </summary>
     [Authorize(Policy = PermissionCodes.PlanView)]

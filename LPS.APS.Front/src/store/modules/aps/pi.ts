@@ -59,6 +59,15 @@ export const usePiStore = defineStore('aps.pi', () => {
   const detailLoading = ref(false)
   const error = ref<string | null>(null)
   const detailError = ref<string | null>(null)
+  /**
+   * 汇总（`/api/pi-position/summary`）是否取失败
+   *
+   * 为什么要单独一个位：`summary === null` 有两种成因 ——
+   *  ① 取失败（**未知**，不能说成「这一版没有位置数据」）
+   *  ② 这个版本本来就是空的（**明确零**）
+   * §0.2 ② 要求分开说，故用这个位把两者区分开。
+   */
+  const summaryFailed = ref(false)
 
   /* ===== getters ===== */
   const currentVersion = computed(
@@ -93,7 +102,10 @@ export const usePiStore = defineStore('aps.pi', () => {
   async function loadVersions(): Promise<void> {
     versionsLoading.value = true
     try {
-      versions.value = await scheduleApi.getVersions(30)
+      // ⚠️ take 必须是 100 而不是 30：dev 实测 2026-11-17 最新 30 个版本里**没有一条 ACTIVE**
+      //   （ACTIVE 全在 31~61 位）⇒ take=30 时 `pickDefaultVersion` 只能落到 BUILDING/FAILED，
+      //   页面拿到的是没排完或失败的版本（矩阵 §0.1：禁按 MAX(PV)/MAX(Run) 选版）。
+      versions.value = await scheduleApi.getVersions(100)
       if (planVersionId.value == null) {
         planVersionId.value = pickDefaultVersion(versions.value)?.id ?? null
       }
@@ -117,12 +129,15 @@ export const usePiStore = defineStore('aps.pi', () => {
     const id = planVersionId.value
     if (id == null) {
       summary.value = null
+      summaryFailed.value = false
       return
     }
     try {
       summary.value = await piApi.summary(id)
+      summaryFailed.value = false
     } catch (err) {
       summary.value = null
+      summaryFailed.value = true
       handleError(err)
     }
   }
@@ -238,6 +253,7 @@ export const usePiStore = defineStore('aps.pi', () => {
     detailLoading,
     error,
     detailError,
+    summaryFailed,
     // getters
     currentVersion,
     totalPositions,

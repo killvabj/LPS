@@ -18,9 +18,14 @@
  *
  * 权限码（⚠️ 与规则集**独立**，`aps.rule.publish` 不覆盖参数集发布）：
  *  aps.parameter.view / aps.parameter.edit / aps.parameter.publish
+ *
+ * 2026-11-18：跨厂LT 标准参数（`$.CrossFactoryLeadTimeRules`）改为参数集版本的
+ *   **第 6 号内容子块**，读写走通用参数集版本 GET/PUT（专属端点已被后端删除）；
+ *   「保存草稿」会把它一起提交（有行才带；零行不发，保留既有块）。
+ *   —— 依据 3号位《跨厂LT 走通用参数接口与快照保留_回执 v1.1_20261117》。
  */
 
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { onBeforeRouteLeave } from 'vue-router'
 import { storeToRefs } from 'pinia'
 import {
@@ -62,6 +67,7 @@ import { lookupParameterEnum, lookupParameterStringDomain } from '@/api/aps-v1/p
 import { translateValidationError } from '@/api/aps-v1/validationMessages'
 import WarehouseRefEditor from './components/WarehouseRefEditor.vue'
 import PlanningYieldEditor from './components/PlanningYieldEditor.vue'
+import CrossFactoryLeadTimeEditor from './components/CrossFactoryLeadTimeEditor.vue'
 
 import {
   ElAlert,
@@ -736,10 +742,13 @@ async function onCreateDraft(): Promise<void> {
 
 /* ===== dirty 拦截（路由切换 + 浏览器关闭） ===== */
 async function confirmLeaveIfDirty(): Promise<boolean> {
-  if (!dirty.value) return true
+  const ltDirty = paramStore.crossFactoryLtDirty
+  if (!dirty.value && !ltDirty) return true
   try {
     await ElMessageBox.confirm(
-      '当前参数集有未保存的修改，离开将丢失。\n请先点击「保存草稿」或「取消未保存」。',
+      ltDirty
+        ? '当前参数集有未保存的修改，离开将丢失。\n请先点击「保存草稿」「保存这块」或「取消未保存」。'
+        : '当前参数集有未保存的修改，离开将丢失。\n请先点击「保存草稿」或「取消未保存」。',
       '未保存修改',
       {
         confirmButtonText: '确认离开',
@@ -768,6 +777,20 @@ onMounted(() => {
   void paramStore.loadWarehouseDict()
   window.addEventListener('beforeunload', handleBeforeUnload)
 })
+
+/**
+ * 跨厂LT 标准参数：跟着「当前展示的那一版」换版重读
+ *
+ * 该块在快照顶层、不在 5 主题 JSON 里 ⇒ 草稿缓冲的 5 块里没有它，
+ * 按版本 Id 从**通用版本详情**里单独取（2026-11-18 起是第 6 号内容子块）。
+ */
+watch(
+  () => paramStore.buffer.governance?.id,
+  (versionId) => {
+    void paramStore.loadCrossFactoryLeadTimeRules(versionId)
+  },
+  { immediate: true }
+)
 
 onBeforeUnmount(() => {
   window.removeEventListener('beforeunload', handleBeforeUnload)
@@ -1436,6 +1459,13 @@ onBeforeRouteLeave(async () => {
                   >
                     <Icon icon="vi-mdi:content-save" /> 保存草稿
                   </ElButton>
+                </div>
+
+                <!-- 跨厂LT 标准参数（快照顶层块 `$.CrossFactoryLeadTimeRules`：
+                     2026-11-18 起是参数集版本的第 6 号内容子块，随通用版本 GET/PUT 读写；
+                     编辑器自带保存入口，上面的「保存草稿」也会把它一起提交） -->
+                <div class="param-block-section">
+                  <CrossFactoryLeadTimeEditor :disabled="!actions.canEdit" />
                 </div>
               </template>
               <ElEmpty v-else description="该版本没有参数内容" />

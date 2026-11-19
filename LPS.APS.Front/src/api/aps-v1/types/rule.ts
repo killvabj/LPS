@@ -21,6 +21,10 @@
  *  - U22（Rule 发布：新 Version 生成，历史不覆盖）
  *
  * 注意：前端不能直接改 PUBLISHED 字段（4号位文档第 14 节）
+ *
+ * 2026-11-18：`ParameterSetVersion` 增 `crossFactoryLeadTimeRulesJson`
+ *   （跨厂LT 标准参数 = 参数集版本的**第 6 号内容子块**，与 5 主题共用通用 GET/PUT）
+ *   —— 依据 3号位《跨厂LT 走通用参数接口与快照保留_回执 v1.1_20261117》。
  */
 
 import type { DomainKey, IsoDateTime, RoleKey, RuleStatus } from './common'
@@ -454,6 +458,18 @@ export interface ParameterSetVersion extends ParameterSetVersionGovernance {
   candidateGuardrailJson?: string | null
   /** 发版落库的全量快照（前端可读不写） */
   contentSnapshotJson?: string | null
+  /**
+   * 2026-11-18 新增：跨厂LT 标准参数子块（`$.CrossFactoryLeadTimeRules`）的原始 JSON。
+   *
+   * 依据：3号位 2026-11-17《跨厂LT 走通用参数接口与快照保留_回执 v1.1》——
+   *   跨厂LT 已落为参数集版本的**普通 6 号内容子块**，与 5 主题**共用同一条**通用
+   *   `GET /api/governance/parameter-set/version/{id}` 与 `PUT …/version/{id}`；
+   *   原拟的专属端点已被后端删除（调用将 404）。
+   *
+   * ⚠️ 读：缺块 / 空 ⇒ `null`（= 这一版没配跨厂LT）。
+   * ⚠️ 写：**不传这个键** = 前端本次不维护本块 ⇒ 后端保留既有快照值（不会把块清掉）。
+   */
+  crossFactoryLeadTimeRulesJson?: string | null
 }
 
 /**

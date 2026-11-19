@@ -10,6 +10,11 @@
  *  - GET /api/schedule/versions?take=30
  *  - GET /api/schedule/gantt/{planVersionId}
  *  - GET /api/schedule/summary/{planVersionId}
+ *
+ * 2026-11-18：`TaskListItemDto.mesDispatchStatus` 补注**实测真值**（dev ≥r14276）：
+ *   该键在 P05 清单 / P06 详情**恒不出现**（999473 全量 28,021 行 = 0 次带键），
+ *   根因＝后端 SQL 已选该列、落码 DTO 无该属性（Dapper 丢列）⇒ 已去函请 5号位 补。
+ *   依据：5号位 2026-11-18《复函-R1三组投影补齐认账_R2裁a改bool_纠正你R3恒null读法》。
  */
 
 import type {
@@ -32,6 +37,16 @@ export interface PlanVersionSummaryDto {
   planHorizonStart: IsoDateTime
   planHorizonEnd: IsoDateTime
   status: PlanVersionStatus
+  /**
+   * **域内当前生效版本标志**（后端 `PlanVersionSummaryDto.IsDefault`，JSON `isDefault`）。
+   *
+   * ⚠️ **不存在全局唯一 isDefault**：后端 DB 约束 `UQ_PlanVersion_OneActivePerDomain`
+   *   保证**每域至多一条** ACTIVE ⇒ 跨域账号会看到**多条** `isDefault=true`。
+   * ⚠️ 跨域取页面默认时**按 `activatedAt` 最新者**（后端 DTO 注释明确要求），
+   *   禁按 `MAX(PV)` / `MAX(Run)` 选版（5号位 2026-11-16 矩阵 §0.1 给 4号位的硬条款）。
+   * ⚠️ 取不到 isDefault 行 ⇒ 该域「当前无正式计划版本」（**不是 0、不是失败**）。
+   */
+  isDefault?: boolean
   /** 实测后端返该字段（如 `SYN-DOMAIN` / `FAMILY_X`）；旧 DTO 漏了它 */
   domainKey?: string
   computedAt?: IsoDateTime
@@ -387,6 +402,12 @@ export interface GanttDataDto {
   versionCode: string
   /** 5号位 2026-10-17 R7 已补；版本不存在时缺键 */
   planVersionStatus?: PlanVersionStatus
+  /**
+   * Candidate 的**基线版本 Id**（仅 CANDIDATE 非 null；ACTIVE / ARCHIVED 为 null）
+   *  - 后端 `GanttDataDto.BasePlanVersionId`（v1.5 §16.3：Candidate 与 Base 比较所需）
+   *  - 页面用它挂「基线」徽标；**不自己算**基线是谁（矩阵 A1「禁自算」）
+   */
+  basePlanVersionId?: number | null
   planHorizonStart: IsoDateTime
   planHorizonEnd: IsoDateTime
   resources: GanttResourceDto[]
@@ -531,6 +552,270 @@ export interface GanttBucketRowDto {
   firstStart?: IsoDateTime
   /** 桶内最晚计划完成（naive；**如实可越窗**，不钳制） */
   lastEnd?: IsoDateTime
+}
+
+/**
+ * P12 资源负荷三率（5号位 2026-11-17 r14239 落码；矩阵 A6/A7）
+ *
+ * `GET /api/schedule/resource-load/{planVersionId}?from=&to=[&resourceIds=…]`
+ * 一行 = **设备 × 业务日**。
+ */
+export interface ResourceLoadResultDto {
+  planVersionId: number
+  domainKey?: string
+  /** `false` = 计划版本不存在（其余字段为空） */
+  versionExists?: boolean
+  /** `true` = 越权（域/部门范围不足，fail-closed） */
+  scopeDenied?: boolean
+  planVersionStatus?: string
+  /** 源批次的数据截止时间（naive） */
+  dataCutoffTime?: IsoDateTime
+  /** 窗口起（naive，后端按 `.Date` 取整） */
+  from?: IsoDateTime
+  /** 窗口止（naive，后端按 `.Date` 取整） */
+  to?: IsoDateTime
+  /** 本次返回的设备数（不传 `resourceIds` 时为窗内排产设备 TOP200） */
+  resourceCount?: number
+  /**
+   * `true` = 窗内排产设备 **> 200** 被截断（`resourcesTruncated`）。
+   * ⇒ 页面必须提示收窄（否则用户以为看全了）。
+   */
+  resourcesTruncated?: boolean
+  /** 行 = 设备 × 业务日（**全矩阵**：窗内每一天 × 每台设备都有行） */
+  rows?: ResourceLoadRowDto[]
+  /**
+   * `false` = **Setup 时长无持久列** ⇒ ③换型损失率整列 null（0号位 Q-b 裁定）。
+   * 前端该位显「未具备数据条件」，**不显 0、不显「未提供」**。
+   */
+  setupHoursAvailable?: boolean
+}
+
+/** 一行 = 一个 (设备, 业务日) */
+export interface ResourceLoadRowDto {
+  resourceId: number
+  resourceCode?: string
+  resourceName?: string
+  /** 业务日（naive，00:00:00） */
+  businessDate: IsoDateTime
+  /** 当日已排工时（跨午夜按日切片，秒级） */
+  scheduledHours: number
+  /** 当日排产任务条数 */
+  taskCount: number
+  /**
+   * ① **日历负荷率** = 当日已排 ÷ 三级继承解析可用小时 × 100。
+   * - 缺键/null ⇒ 分母未判定（**不显 0**；看 `notApplicableReason`）
+   * - `0` ⇒ **明确零**（有可用小时、当日无排产）
+   */
+  calendarLoadRatePct?: number | null
+  /**
+   * ② **固定 16h 负荷率** = 当日已排 ÷ 16 × 100。
+   * ⚠️ 恒可算，但**不是真实可用时间**（不得代替①、不得当 MES 利用率）。
+   */
+  fixed16LoadRatePct?: number
+  /**
+   * ③ **Setup 换型损失率** —— 现无持久列 ⇒ 恒 null（`setupHoursAvailable=false`）。
+   * ⇒ 前端显「未具备数据条件」。
+   */
+  setupLossRatePct?: number | null
+  /** Setup 工时（Q-b：恒 null，不代算） */
+  setupHours?: number | null
+  /** ①分母 = 当日三级继承解析出的可用小时（缺键 = 未解析出窗口） */
+  calendarAvailableHours?: number | null
+  /**
+   * ①分母**依据哪级日历**：`Resource` / `Department` / `Factory`。
+   * ⇒ 页面用它说明「这个可用小时数是按哪一级日历算出来的」。
+   */
+  calendarSource?: string | null
+  /**
+   * 该行**不适用**的原因（非空 ⇒ 该率显「不适用」，**禁显 0**）。三类：
+   *  - 当日合法可用小时=0（日历当日 OFF / 无 WORK 片）
+   *  - 当日未解析出合法 Calendar 窗口（**严禁按 8h/全天假设**）
+   *  - 该设备被日历解析件按授权范围剔除或无登记 ⇒ 分母未判定
+   */
+  notApplicableReason?: string | null
+}
+
+/**
+ * P05 任务清单（服务端分页；5号位 2026-11-16 矩阵 A4 / r14237）
+ *
+ * `GET /api/schedule/tasks/{planVersionId}`
+ *
+ * ⚠️ **total 与 items 是两个数**：`total` = 服务端全量命中（COUNT 与列表**同一段 WHERE**），
+ *   `items` = **本页已加载**。前端分页器的「共 N 条」必须用 `total`，页面上的表格只画 `items`
+ *   —— 把本页条数说成总数就是 v0.2 §P05「加载数≠全部数」红线。
+ * ⚠️ **版本不存在时 `page` / `pageSize` 返 0**（后端早退分支不填这两键）
+ *   ⇒ 空态文案不能拿 `page` 判「翻到了空页」。
+ */
+export interface TaskListResultDto {
+  /** `false` = 计划版本不存在（此时 items 空、total=0） */
+  versionExists?: boolean
+  /** `true` = 越权（域/部门范围不足，fail-closed）——是「无权限」不是「无数据」 */
+  scopeDenied?: boolean
+  /** 本页已加载的行 */
+  items?: TaskListItemDto[]
+  /** 服务端全量命中数（COUNT 与列表同一 WHERE） */
+  total?: number
+  /** 当前页码（后端回显） */
+  page?: number
+  /** 当前页长（后端回显；缺省 50、钳 ≤200） */
+  pageSize?: number
+}
+
+/**
+ * P05 任务清单一行 = **一个真实 Operation Task.Id**。
+ *
+ * ⚠️ **行键必须是 `taskId`**：`taskNo` 是 Stage 内执行批业务号，一个 TaskNo 可对应多条
+ *   Operation Task（5号位 11-16 实测：TaskNo 混版，PEGG-999432 系行也在 999473 内）
+ *   ⇒ 按 TaskNo 折叠会把两条工序任务并成一条。
+ * ⚠️ **带 `?` 的键 = 后端 NULL ⇒ 整键省略 = 未知**（`WhenWritingNull`）：
+ *   前端一律显「未提供」，**禁转 0 / 禁显「正常」/ 禁当空串**。
+ * ⚠️ 本 DTO **不含**订单号 / 客户交期 / 延期 / 延期原因（矩阵 A4 的 25 字段清单里没有）
+ *   ⇒ 这些列在本读面里**不存在**，不得从甘特体或别处拼凑补齐（两套口径混算）。
+ *   ⚠️ **下发状态已由 5号位 2026-11-18 复函 N2 补上**（`mesDispatchStatus`）⇒ 唯一例外。
+ */
+export interface TaskListItemDto {
+  /** 行身份（= `Task.Id`，Operation 级） */
+  taskId: number
+  /** Stage 内执行批业务号（**不是行键**） */
+  taskNo: string
+  planVersionId: number
+  materialId: number
+  materialCode?: string
+  materialName?: string
+  /** 阶段码（**无中文名**——后端未投影 StageName，前端不自造译名） */
+  stageCode?: string
+  operationCode: string
+  /** 工序名（可空 = 未判定 ⇒ 只显编码，不猜） */
+  operationName?: string
+  /**
+   * 设备资源 Id（与人工槽互斥：二者其一）。
+   *
+   * ⚠️ **恒投影，不是「按需投影」**（dev 2026-11-17 实测：不带 `resourceIds` 筛选时，
+   *   前 50 行里 29 行缺该键、21 行带该键 ⇒ 缺键 = **该 Task 真没有设备资源**，
+   *   多为人工槽任务；不是「没传 resourceIds 就少投影」）。
+   */
+  resourceId?: number
+  /**
+   * 设备资源编码（5号位 2026-11-18 复函 N2 补：v0.2 P05「设备/人工槽」列的标识位）。
+   *
+   * ⚠️ 缺键 = **主数据缺行**（该 Task 有资源但资源主数据没有编码），不是「没投影」。
+   */
+  resourceCode?: string
+  /** 设备资源名（缺键 = 无设备资源） */
+  resourceName?: string
+  /** 人工槽 Id（内部号，不上列表） */
+  manualSlotId?: number
+  /** 人工槽编码（**跨部门不唯一** ⇒ 须与部门名组合显示） */
+  manualSlotCode?: string
+  productionDepartmentId?: number
+  productionDepartmentName?: string
+  /** 计划净量（= `Task.Quantity`） */
+  quantity: number
+  /** 计划加工量（可空 = 未提供 ⇒ 不拿净量顶替） */
+  plannedProcessQty?: number
+  uom: string
+  plannedStartTime?: IsoDateTime
+  plannedEndTime?: IsoDateTime
+  /** 计划工时（小时；可空 = 未知） */
+  duration?: number
+  /** APS 计划状态（原值透传，后端不做白名单映射） */
+  status: string
+  /**
+   * 不可移动标识。
+   *
+   * ⚠️ **实库恒 false**（写方 `PeggingOrchestrator` 写死 false，`DemandSupplyHardLock` 0 行）
+   *   ⇒ 前端**不渲染**该列（显示「否」等于替系统断言「这条不是不可移动」）。
+   */
+  isLocked: boolean
+  /**
+   * 关键路径判定。
+   *
+   * ⚠️ 与甘特体的**三态**不同：本读面投影的是真实列 `Task.IsCriticalPath`（非空 bool）。
+   *   但实库同样恒 false（1号位 求解算法未落地）⇒ 前端**不渲染**该列。
+   */
+  isCriticalPath: boolean
+  /** 任务类型（现全库单值 PRODUCTION） */
+  taskType: string
+  /** 生产指示号（= `Task.MTS_InstructionNo`；JSON 键 `mtsInstructionNo`） */
+  mtsInstructionNo?: string
+  /**
+   * MES 工单号（= `Task.MESWorkOrderNo`；JSON 键 `mesWorkOrderNo`）。
+   *
+   * ⚠️ 缺键 = **未关联 MES 工单**；它**不**表示「无需 MES」也**不**表示「不可下发」
+   *   （权威分类标志位尚未建立，见矩阵 A4 与 Q-a）⇒ 前端不得由空值推断分类。
+   */
+  mesWorkOrderNo?: string
+  /**
+   * MES 下发状态（5号位 2026-11-18 复函 N2 补；源 = TaskDispatch.DispatchStatus，JSON 键 `mesDispatchStatus`）。
+   *
+   * ⚠️ **null 的语义是「该 Task 不在下发队列」**（5号位 契约护栏）——
+   *   **≠「未下发」**、**≠「无需 MES」**（队列资格权威位未建，别由空值推断分类）。
+   * ⚠️ 值域现只有 `CREATED` / `PENDING`（`PROCESSING` / `FAILED` 现不落痕）⇒
+   *   **别按四态全集解释它**；词典未收录的值原样显示后端码。
+   *
+   * ⚠️ **2026-11-18 实测（dev ≥r14276）**：本键在 P05 清单 / P06 详情**恒不出现**
+   *   （999473 全量 28,021 行扫描 = 0 次带键）——**根因不是稀疏段，是后端投影丢列**：
+   *   SQL 已选 `dpx.DispatchStatus AS MesDispatchStatus`（`ScheduleQueryService.cs:164`），
+   *   但落码 DTO `TaskListItemDto`（`LPS.APS.Core/Dto/TaskQueryDtos.cs`）**无该属性** ⇒ Dapper 丢列。
+   *   数据本身在（甘特行 `dispatchStatus`：首屏 8,000 行命中 891 条 `CREATED`）。
+   *   ⇒ 已去函请 5号位 补该属性；**键一补齐本列自动生效，前端零改动**。
+   */
+  mesDispatchStatus?: string
+  /** 换型来源标签（可空 = 未提供） */
+  setupSource?: string
+}
+
+/**
+ * P06 单任务详情（5号位 2026-11-16 矩阵 A5 / r14237）
+ *
+ * `GET /api/schedule/task/{taskId}`
+ *
+ * ⚠️ **三态分报，禁混**（后端源码 `GetTaskDetailAsync`）：
+ *  - `found=false` ⇒ 该 taskId 不存在（**不是**无权限）
+ *  - `found=true && scopeDenied=true` ⇒ 任务存在但**越权**（域/部门范围不足）
+ *  - `found=true && scopeDenied=false` ⇒ 可读
+ * ⚠️ **前后依赖边、MES 执行事实 = 未提供**（后端未投影）⇒ 前端显「未提供」，不造。
+ */
+export interface TaskDetailResultDto {
+  /** 该 taskId 是否存在 */
+  found?: boolean
+  /** 越权（true ⇒ 任务存在但当前账号不可读） */
+  scopeDenied?: boolean
+  /** 任务行（字段同 `TaskListItemDto`） */
+  task?: TaskListItemDto
+  /** 计划版本编码 */
+  versionCode?: string
+  /** 所属排程域 */
+  domainKey?: string
+  /** 版本状态（ACTIVE / CANDIDATE / ARCHIVED） */
+  planVersionStatus?: PlanVersionStatus
+  /** 快照数据截止时间（僵尸/失败源 Run 如实给原值） */
+  dataCutoffTime?: IsoDateTime
+  /** 订单份额（**逐行全量**：共享 Task 多根订单逐行给，不贴单一订单） */
+  shares?: TaskShareDetailDto[]
+  /** 份额是否由后端下发（false = 未提供；true = 已下发，即使为空数组） */
+  sharesProvided?: boolean
+}
+
+/**
+ * 任务份额一行（矩阵 A5：`AllocationTaskShare`）
+ *
+ * ⚠️ `shareQty` 为 0/缺键 = **「无份额记录」** ≠ 「0 需求」；
+ *   `rootOrderNo` 缺键 = 后端反查不到订单号（**不是**无订单）。
+ */
+export interface TaskShareDetailDto {
+  /** 分配顺序号（同一 Task 内唯一） */
+  allocationSequence?: number
+  /** 需求类型（如 ORDER） */
+  demandType?: string
+  /** 需求键 */
+  demandKey?: string
+  /** 根订单 Id（内部号，不上列表） */
+  rootOrderId?: number
+  /** 根订单号（列表显示用） */
+  rootOrderNo?: string
+  /** 份额数量（可空 = 未提供） */
+  shareQty?: number
 }
 
 /** 排程概要 KPI（顶部面板用） */

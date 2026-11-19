@@ -37,6 +37,9 @@ public sealed class RoutingOperationDto
     public long Id { get; init; }
     public int MaterialId { get; init; }
     public int ProductionDepartmentId { get; init; }
+
+    /// <summary>生产部门名称（LEFT JOIN ProductionDepartment 投影；无匹配时为 null，页面回退显示 Id）</summary>
+    public string? ProductionDepartmentName { get; init; }
     public string RouteCode { get; init; } = "DEFAULT";
     public int PathId { get; init; } = 1;
     public string OperationCode { get; init; } = string.Empty;

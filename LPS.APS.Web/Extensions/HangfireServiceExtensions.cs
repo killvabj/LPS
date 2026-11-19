@@ -89,27 +89,22 @@ public static class HangfireServiceExtensions
             mute ? NeverFireCron :"0 * * * *",
             new RecurringJobOptions { TimeZone = TimeZoneInfo.Local });
 
-        // BOM展开请求推送（生产：每日00:00）
-        // 从 Order_Canonical 划定活跃根集合，推送 BOMNO 到 ODS 库
-        // 后续：由下方 bom-batch-expand（00:05）调用 sp_ExpandBOMBatch_vNext 展开
-        RecurringJob.AddOrUpdate<IBOMRequestService>(
-            "bom-request-push",
-            service => service.PushBOMRequestToODSAsync(CancellationToken.None),
-            mute ? NeverFireCron :"0 0 * * *",
-            new RecurringJobOptions { TimeZone = TimeZoneInfo.Local });
-
-        // BOM批展开（生产：每日00:05）—— 调用 ODS 的 sp_ExpandBOMBatch_vNext，
-        // 展开**本次夜间**的推送批次（批号取自 APS_ETL_Log 的 BomRequestPush SUCCESS 记录，
-        // 恰好一条才算本次；0 条或多条一律 SKIPPED，不再扫描「最新 PENDING」猜选），供夜间链接货
-        // ⚠️ 排在 bom-request-push（00:00）之后、nightly-batch（00:30）之前 —— 接货依赖本步产出的 READY
-        // ⚠️ 调用具破坏性：该 SP 先清空四表再重建（2026-10-17 5号位 已将四条 TRUNCATE 移入 BEGIN TRAN）；
-        //    我方在调用前另查明细行数，0 条则拒绝调用（否则会清空四表）。失败转 Issue，不硬断。
-        // ⚠️ 该 SP 属 5号位 辖区，调用契约已于 2026-10-17 经其书面确认
-        RecurringJob.AddOrUpdate<IBomBatchExpandService>(
-            "bom-batch-expand",
-            service => service.ExpandNightBatchAsync(CancellationToken.None),
-            mute ? NeverFireCron :"5 0 * * *",
-            new RecurringJobOptions { TimeZone = TimeZoneInfo.Local });
+        // 🔴 2026-11-18：`bom-request-push`(00:00) 与 `bom-batch-expand`(00:05) **不再作为独立任务注册**。
+        //
+        // 原因（实测 PV999550，11-17）：原顺序为
+        //   push 00:00 → expand 00:05 → nightly 00:30（其中 Step 1 才做全量订单同步）
+        // ⇒ 推送明细取自「同步之前」的 Order_Canonical；Step 4 又把新订单装进 PV，
+        //   而 Step 5 只按旧明细建 `OrderBomRequestLink` ⇒ 推送之后进来的订单全部无链接。
+        //   后果不是漏算，而是「算歪」：BOM 退化成全量并集、跨厂目标厂回退成源厂
+        //   （FRL 实测 74 张 TJ 单直接扣了 BJ 库存）。
+        //
+        // 现由 `NightlyBatchOrchestrator` 在 Step 1（全量订单同步）之后依次执行：
+        //   Step 1.5 推送 → Step 1.6 展开 → Step 5 接货。
+        // ⚠️ 不再挂独立 job，否则一天会出现两次推送 ⇒ `BomNightBatchResolver` 判定「不唯一」⇒ 展开 SKIPPED。
+        //
+        // ⚠️ 已注册过的旧 job 会残留在 Hangfire 存储里继续按原 cron 触发 ⇒ 必须显式移除。
+        RecurringJob.RemoveIfExists("bom-request-push");
+        RecurringJob.RemoveIfExists("bom-batch-expand");
 
         // 主数据同步-ERP（生产：每日00:10）— §2.4.3
         // sp_SyncMasterData('ERP') → Material + MaterialMapping + MaterialSupplyContext
@@ -256,6 +251,27 @@ public static class HangfireServiceExtensions
             "scheduling-trigger",
             service => service.RunSchedulingAutoAsync(CancellationToken.None),
             mute ? NeverFireCron :"0 2 * * *",
+            new RecurringJobOptions { TimeZone = TimeZoneInfo.Local });
+
+        // ═══════════════════════════════════════════════════════════════
+        // O77 MES 下发消费环：**两条通道、两个 Job、手动期 NeverFireCron**
+        //   · assembly  → WorkOrderType=ASSEMBLY，组装 MES BaseUrl；
+        //   · machining → WorkOrderType=MACHINING，加工 MES BaseUrl（接口未就绪，先禁用）。
+        //   `DrainAsync` 自己做 PENDING→PROCESSING→三态回写；Job 只做 RunId 解析与触发。
+        //   ⚠ 当前 **不自动触发**：两个都写 NeverFireCron；上线前从 Dashboard 手动 Trigger Now。
+        //   ⚠ 首轮只允许 assembly；machining 等 5号位/MES 加工工单号生成与 BaseUrl 就绪后，
+        //     再把 machining 的 cron 从 NeverFireCron 改为正式周期。
+        // ═══════════════════════════════════════════════════════════════
+        RecurringJob.AddOrUpdate<IMesDispatchDrainJob>(
+            "mes-dispatch-drain-assembly",
+            job => job.RunAsync("ASSEMBLY", CancellationToken.None),
+            NeverFireCron,
+            new RecurringJobOptions { TimeZone = TimeZoneInfo.Local });
+
+        RecurringJob.AddOrUpdate<IMesDispatchDrainJob>(
+            "mes-dispatch-drain-machining",
+            job => job.RunAsync("MACHINING", CancellationToken.None),
+            NeverFireCron,
             new RecurringJobOptions { TimeZone = TimeZoneInfo.Local });
 
         return app;

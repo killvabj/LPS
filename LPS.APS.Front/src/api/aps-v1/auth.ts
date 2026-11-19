@@ -11,10 +11,22 @@
  *  - POST /api/auth/logout   → void
  *
  * APS_USE_MOCK=true 时仍走 mock（本地离线验证用）；false 时走真实 http.ts。
+ *
+ * 2026-11-18：新增「改自己资料 / 改密码」两个端点
+ *   （PUT /api/auth/profile、POST /api/auth/change-password）
+ *   —— 依据 3号位《个人中心改资料与改密码端点落码_回执 v1.0_20261117》。
  */
 
 import { apsHttp, APS_USE_MOCK } from './http'
-import type { LoginRequest, LoginResponse, RefreshTokenRequest, UserInfo } from './types'
+import type {
+  ChangePasswordRequest,
+  LoginRequest,
+  LoginResponse,
+  RefreshTokenRequest,
+  UpdateProfileRequest,
+  UpdateProfileResult,
+  UserInfo
+} from './types'
 
 /** mock 登录响应（与后端 LoginResponseDto 字段对齐）
  *  - 顶层 userId/userCode/userName/roles（不再嵌 userInfo）
@@ -83,5 +95,45 @@ export const apsAuthApi = {
   async logout(): Promise<void> {
     if (APS_USE_MOCK) return
     return apsHttp.post<void>({ url: '/api/auth/logout', data: {} })
+  },
+
+  /**
+   * 改自己资料（PUT /api/auth/profile）
+   *
+   * ⚠️ 只能改三项：显示名 / 邮箱 / 手机号（登录名、状态、角色、范围归管理面，不可自助改）。
+   * ⚠️ 后端语义：`userName` 空 ⇒ **保持原值**（不是清空）；email / phoneNumber 空 ⇒ **清空**。
+   * ⚠️ `silent + noErrorRedirect`：错误文案由页面自己呈现（后端已是大白话），
+   *   且**不跳 /500** —— 用户填好的表单不能因为一次校验失败就没了。
+   */
+  async updateProfile(req: UpdateProfileRequest): Promise<UpdateProfileResult> {
+    if (APS_USE_MOCK) {
+      return {
+        userName: req.userName ?? '',
+        email: req.email ?? null,
+        phoneNumber: req.phoneNumber ?? null
+      }
+    }
+    return apsHttp.put<UpdateProfileResult>({
+      url: '/api/auth/profile',
+      data: req,
+      silent: true,
+      noErrorRedirect: true
+    })
+  },
+
+  /**
+   * 修改密码（POST /api/auth/change-password）
+   *
+   * ⚠️ 成功后后端**清 RefreshToken**（旧会话失效）⇒ 调用方必须清本地 token 并跳登录页
+   *   （3号位 回执 v1.0 Q1）。
+   */
+  async changePassword(req: ChangePasswordRequest): Promise<void> {
+    if (APS_USE_MOCK) return
+    await apsHttp.post<void>({
+      url: '/api/auth/change-password',
+      data: req,
+      silent: true,
+      noErrorRedirect: true
+    })
   }
 }

@@ -155,7 +155,14 @@ export const usePeggingTraceStore = defineStore('aps.peggingTrace', () => {
     const n = Number(filter.value.rootOrderId)
     return Number.isFinite(n) && n > 0 ? n : null
   })
-  const totalAllocations = computed(() => summary.value?.totalAllocations ?? 0)
+  /**
+   * 分配总笔数（Summary 端点聚合）
+   *
+   * ⚠️ **null = 未取到**（Summary 失败/未加载），**不是 0**：
+   *   §0.2 ②「NULL=未知，不得转 0」——同页下方另有「汇总暂不可用」的提示，
+   *   若这里还显「共 0 笔分配」＝ 同时说「取不到」和「确定为零」，口径打架。
+   */
+  const totalAllocations = computed<number | null>(() => summary.value?.totalAllocations ?? null)
 
   /**
    * 明细视图的「总页数」——**算得准才显示**。
@@ -245,9 +252,10 @@ export const usePeggingTraceStore = defineStore('aps.peggingTrace', () => {
   async function loadVersions(): Promise<void> {
     versionsLoading.value = true
     try {
-      versions.value = await scheduleApi.getVersions(60)
-      // 默认取「已生效」的那一版（复用订单页同一套挑选规则）：
+      versions.value = await scheduleApi.getVersions(100)
+      // 默认取「域内当前生效版本」（复用订单页同一套挑选规则 = ACTIVE 锚表）：
       // 端点按时间倒序返回，最新一条常是 FAILED 的测试版 → 用户一进页面看到空版本，像系统坏了。
+      // take 必须是 100：dev 实测最新 30 个版本里没有一条 ACTIVE（矩阵 §0.1：禁 MAX(PV)/MAX(Run) 选版）。
       planVersionId.value = pickDefaultVersion(versions.value)?.id ?? null
     } catch (err) {
       handleError(err)

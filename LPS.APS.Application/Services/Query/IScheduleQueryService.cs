@@ -70,6 +70,53 @@ public interface IScheduleQueryService
         CancellationToken cancellationToken = default);
 
     /// <summary>
+    /// P05 任务清单（11-16 矩阵 A4）：PV 必填，一行=一个 Task.Id；服务端多条件筛选+分页+同式 COUNT。
+    /// 窗口/部门范围与甘特**同一套单源件**（GanttWindowPredicate/DepartmentPredicate/WithDepartmentScope）；
+    /// 越权=ScopeDenied 位（非空页），PV 不存在=VersionExists=false。非法 sortBy/sortDir ⇒ ArgumentException(真400)。
+    /// </summary>
+    Task<LPS.APS.Core.Dto.TaskListResultDto> QueryTasksAsync(
+        int userId,
+        int planVersionId,
+        DateTime? from = null,
+        DateTime? to = null,
+        IReadOnlyList<int>? resourceIds = null,
+        IReadOnlyList<string>? stageCodes = null,
+        IReadOnlyList<int>? departmentIds = null,
+        string? keyword = null,
+        string? status = null,
+        bool? hasWorkOrder = null,
+        string? sortBy = null,
+        string? sortDir = null,
+        int pageIndex = 1,
+        int pageSize = 50,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// P06 单 Task 详情（11-16 矩阵 A5）：Task.Id 入口，份额逐行给全（AllocationTaskShare×同PV [Order] 反查根订单号）。
+    /// 越权/不存在均显式位；前后依赖边与 MES 执行事实=本轮未提供（Q-a/Q-d 挂账），不造。
+    /// </summary>
+    Task<LPS.APS.Core.Dto.TaskDetailResultDto> GetTaskDetailAsync(
+        int userId,
+        long taskId,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// P12 资源负荷三率（11-16 矩阵 A6/A7；0号位 Q-b 已裁公式与 Setup 权威源）：
+    /// 一行=设备×业务日；①分子=当日切片 Task 小时、分母=三级继承解析可用小时（**复用 <c>IResourceCalendarService.ResolvePreviewAsync</c> 同一解析件**，不抄第二份）；
+    /// ②分母恒 16h（v0.2：休息日不改分母、非真实可用时间）；③=当日计划 Setup/当日 Task 小时——
+    /// **Setup 权威=1号位 Solver 落库产物；现无持久列 ⇒ SetupHoursAvailable=false、③按"未具备数据条件"不适用（禁重匹配/禁 Duration 代，Q-b 原文）**。
+    /// 零合法可用小时=不适用（禁 0、禁套 8h/全天）。from/to 必填（缺⇒ArgumentException 真400）、窗 ≤31 天、设备 ≤200。
+    /// 域/部门 Scope 与甘特同件；越权=ScopeDenied、PV 不存在=VersionExists=false。
+    /// </summary>
+    Task<LPS.APS.Core.Dto.ResourceLoadResultDto> GetResourceLoadAsync(
+        int userId,
+        int planVersionId,
+        DateTime? from,
+        DateTime? to,
+        IReadOnlyList<int>? resourceIds = null,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
     /// 甘特「资源×时间桶」聚合（三步走·第 2 步，2026-10-30 复函九条定稿）。
     /// 与明细体共用窗口谓词与资源口径；naive 不转时区；钳制归桶+未排桶 ⇒ Σ taskCount ≡ totalTasks。
     /// </summary>

@@ -350,6 +350,13 @@ public sealed class MaterialAvailabilitySlice
     public string? SourceKey { get; init; }
     public string? Commitment { get; init; }
     public string? Confidence { get; init; }
+
+    /// <summary>
+    /// 时间语义（S02，2026-11-17）：`KNOWN`=有真实可用时间；`CURRENT`=库存按计划期起点即时可用；
+    /// `SH_LINKED`=SH 已有硬依赖下界；`UNRESOLVED`=数量真实、时间未定/待制造交接依赖；
+    /// `SH_TIME_UNRESOLVED`=SH 无 link、时间未闭合。**未定不等于当前可用**。
+    /// </summary>
+    public string? TimeBasis { get; init; }
 }
 
 /// <summary>

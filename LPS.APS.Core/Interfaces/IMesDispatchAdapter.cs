@@ -47,7 +47,11 @@ public sealed record MesDispatchCommand(
     //   只加这两列，`interfaceVersion`／`dispatchedAt` **不加**：
     //   版本号与下发时刻的权威在出站实现方，写进 Command 会让两侧各改各的。
     string? InstructionType = null,         // 源＝`TaskDispatch.InstructionType`（PRODUCTION_INSTRUCTION／SHIPPING）
-    string? WorkOrderType = null);          // 源＝`TaskDispatch.WorkOrderType`（ASSEMBLY／MACHINING／NULL）
+    string? WorkOrderType = null,           // 源＝`TaskDispatch.WorkOrderType`（ASSEMBLY／MACHINING／NULL）
+    // ── 2026-11-16 5号位 会签（Command 第三列）──────────────────────────────
+    //   MES 组装端口用尾部部门名反查 Holon 六位码；缺列会 DEPT_NOT_MAPPED 拒绝整组。
+    //   源＝`TaskDispatch.ProductionDepartmentCode`；空串归一 null。
+    string? ProductionDepartmentCode = null);
 
 /// <summary>出站结果三态。</summary>
 public enum MesDispatchKind
