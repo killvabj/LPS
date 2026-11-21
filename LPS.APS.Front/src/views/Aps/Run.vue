@@ -1,6 +1,10 @@
 <script setup lang="ts">
 /**
- * APS V1 4号位 — 运行与下发（页面 9 / U01 / U02 / U19）
+ * APS V1 4号位 — 运行与版本管理（页面 9 / U01 / U02 / U19）
+ *
+ * 2026-11-20：**菜单改名**（依据 用户 2026-11-20 指示）：「运行与下发」→「运行与版本管理」
+ *   ⇒ 与 v0.2 稿 P10「运行与 PlanVersion 管理」叫法对齐（本页管的是 Run 与 PlanVersion，
+ *     MES 下发只是其中一格）；**页面逻辑零改动**。
  *
  * 2026-10-16 重整（依据《4号位致3号位/5号位·运行页联调缺口回执》）：
  *  - 数据源从自拟聚合体 `RunStatusDto` 换成三个真实数据面（见 store/run.ts）
@@ -24,6 +28,23 @@
  *  - R4：批次记录表接服务端分页端点 `GET /api/governance/runs/paged`（total 与列表同 where）；
  *    该端点尚未部署 ⇒ 自动降级到数组端点，页面照常有数据、只是不显示翻页控件
  *  - 主视图「最近一次排产」只跟第 1 页走（翻页不换主视图）
+ *
+ * 2026-11-20 按 v0.2 稿 §4 P10 收口（依据《APS_V1_P01-P13_全页面业务设计统一收口核对稿
+ *   v0.2_20261114_四项审核修订版.md》）：
+ *   - 「Domain 详情」按稿分列：**本次新版本**（本次 Run 生成的 PV）与
+ *     **当前生效版本**（可能仍是较早版本）两个独立字段，不再只给一个裸版本码
+ *     （稿：不能把旧 ACTIVE 标成本次成功版）。
+ *   - 人工恢复门控改口径：`aps.plan.run` → **系统管理员角色**（aps.plan.run 规划员也持有，
+ *     与稿「P10 只限系统管理员进入」「场景 10 整 Domain 重排是管理员专属」不符）。
+ *
+ * 2026-11-21（依据 APS_V1_3号位致4号位_P01-P13收口v0.2回执_H1-H10逐条核证裁决_回执_v1.0_20261120.md
+ *   H1 甲案，**本次只留注释、逻辑不动**）：3号位 将新增权限码 `aps.admin.run`（运行治理管理员），
+ *   计划员不持；普通候选创建（`run/candidate` 常规域）与局部重排**保持 `aps.plan.run` 不动**，
+ *   识别点在「整域 scope」的请求侧校验。该码落库前，前端仍以「系统管理员角色」作展示层分流
+ *   （`canRecoverRun = apsAuth.isAdmin`）—— 待 3号位 落码并回告后：
+ *   ① 4号位 在「角色管理→分配权限」把 `aps.admin.run` 绑到 `aps.admin.system`；
+ *   ② `canRecoverRun` 改判 `apsAuth.has('aps.admin.run')`。
+ *   ⚠️ 在该码落库前不得先改判（页面会全员禁用）。
  */
 
 import { computed, onMounted } from 'vue'
@@ -384,6 +405,26 @@ const domainStatusSummary = computed(() =>
 
 const hasDomainStatuses = computed(() => domainStatuses.value.length > 0)
 
+/**
+ * 当前生效版本（按排程域）——`GET /api/overview/active-plan`
+ *
+ * v0.2 稿 §4 P10：「Domain 详情：本次真实状态、新PV（若产生）、**当前ACTIVE PV**
+ * （可能仍为较早版本）、失败/依赖阻断事实；**不能把旧ACTIVE标成本次成功版**」。
+ * ⇒ 本次新版本与当前生效版本**分两列显式给**，不许只给一个裸版本码让人猜。
+ */
+const activeVersionCodeByDomain = computed<Record<string, string>>(() => {
+  const map: Record<string, string> = {}
+  for (const v of activeVersions.value) {
+    if (v.domainKey) map[v.domainKey] = v.versionCode
+  }
+  return map
+})
+
+/** 该域当前生效版本码（取不到 = 该域当前没有正式生效版本，不是「取数失败」） */
+function activeVersionCodeOf(domainKey: string): string | null {
+  return activeVersionCodeByDomain.value[domainKey] ?? null
+}
+
 /** 域级失败 / 被阻断（主视图警示用 ⇒ 最近一次批次） */
 const failedDomains = computed(() =>
   latestDomainStatuses.value.filter((d) => d.status === 'FAILED' || d.status === 'BLOCKED')
@@ -527,9 +568,18 @@ function goCandidate(planVersionId?: number | null): void {
 
 /* ===== U19：FAILED Run 人工恢复 =====
  * 4号位文档第 15 节：必须调用「新建 ScheduleRun」，不能把 FAILED 改回 RUNNING
- * 权限：aps.plan.run（v1.2 §23.1 权限码门控）
+ *
+ * 2026-11-20 门控改口径（依据 v0.2 稿 §4 P10「**只限系统管理员进入**」+ §4.9.1 场景 10
+ * 「整 Domain 人工重排是系统管理员专属」）：
+ *   原口径 `aps.plan.run` —— 该权限码 **aps.planner（PMC）也持有** ⇒ PMC 能进本页并点恢复。
+ *   现口径：**系统管理员角色**（aps.admin.system）。
+ *   ⚠️ 后端端点侧仍需落门控（前端只是展示层分流，见致 3号位函 H1）。
+ *
+ * 2026-11-21（H1 甲案待落地）：3号位 将新增 `aps.admin.run`（运行治理管理员，计划员不持）。
+ *   该码落库 + 4号位 绑定到 `aps.admin.system` 后，本判定改 `apsAuth.has('aps.admin.run')`；
+ *   在此之前保持角色判定（避免挂了没有的码 ⇒ 全员禁用）。
  */
-const canRecoverRun = computed(() => apsAuth.has('aps.plan.run'))
+const canRecoverRun = computed(() => apsAuth.isAdmin)
 
 async function handleRecoverFailedRun(row: {
   id: number
@@ -707,12 +757,16 @@ async function handleRecoverFailedRun(row: {
                 {{ humanLabel(d.domainKey) }}
               </ElTag>
               <span class="muted small">{{ domainStatusLabel(d.status) }}</span>
-              <span v-if="d.planVersionCode" class="muted small">{{ d.planVersionCode }}</span>
               <ElTooltip v-if="d.reasonKind" :content="d.reasonKind.hint" placement="top">
                 <ElTag size="small" effect="plain" :type="d.reasonKind.tag">
                   {{ d.reasonKind.label }}
                 </ElTag>
               </ElTooltip>
+            </div>
+            <!-- 本次新版本 / 当前生效版本 分列（v0.2 §4 P10：不许把旧生效版本当本次成功版） -->
+            <div class="col-item-meta">
+              <span>本次新版本 {{ d.planVersionCode || '未生成' }}</span>
+              <span>当前生效版本 {{ activeVersionCodeOf(d.domainKey) || '无正式生效版本' }}</span>
             </div>
             <div class="col-item-meta">
               <span>计划区间 {{ domainPlanHorizonText(d) }}</span>

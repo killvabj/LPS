@@ -40,6 +40,7 @@ async function ensureToken() {
   const r = await fetch(`${API}/api/auth/login`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
+    // ⚠️ 本脚本**保留 admin**：页面 /aps/candidate 的路由门要 aps.candidate.confirm，rule_admin 无此码（3号位 2026-11-19 回执 §3.2 过渡期乙：dev 与生产共用 APS_Auth，admin 登录会顶掉生产会话）
     body: JSON.stringify({ userCode: 'admin', password: 'Admin@123456' })
   })
   const j = await r.json().catch(() => null)

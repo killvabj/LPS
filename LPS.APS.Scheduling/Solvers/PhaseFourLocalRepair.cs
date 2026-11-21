@@ -734,6 +734,14 @@ internal class PhaseFourLocalRepair
                 continue;
             }
 
+            // ── 0号位 v1.7 Q4 / N-06（2026-11-19）：**PI/Stage 合法上限 = 0 ⇒ 整条未排** ──
+            //   正常业务未排，但 Phase4 **绝不能**拿原需求净量去「修复」（会直接突破法定上限）。
+            if (scheduleResult.IsPiLegalQuantityBlocked(demandKey))
+            {
+                result.StillUnscheduledKeys.Add(demandKey);
+                continue;
+            }
+
             // 块4：父件缺料（子件未排成）→ 保持 Unscheduled，不得被修复绕过。
             var dynamicMaterialFloor = GetDynamicMaterialFloor(
                 demandKey, constraints, demandCompletion, out bool childUnavailable);
@@ -954,6 +962,13 @@ internal class PhaseFourLocalRepair
                 continue;
             }
 
+            // 0号位 v1.7 Q4 / N-06：PI/Stage 合法上限 = 0 ⇒ 同样禁止绕过上限去修复。
+            if (scheduleResult.IsPiLegalQuantityBlocked(demandKey))
+            {
+                result.StillUnscheduledKeys.Add(demandKey);
+                continue;
+            }
+
             // 块4：父件缺料（子件未排成）→ 保持 Unscheduled，不得被修复绕过。
             var dynamicMaterialFloor = GetDynamicMaterialFloor(
                 demandKey, constraints, demandCompletion, out bool childUnavailable);
@@ -986,6 +1001,13 @@ internal class PhaseFourLocalRepair
             // 缺料原因码**需求级**去重：`ExpandRepairUnits` 会按执行批展开成多个单元，
             //   同一需求每个单元都缺料 ⇒ 不去重会在 TraceNotes 里堆出等价重复行。
             var materialShortReported = new HashSet<string>(StringComparer.Ordinal);
+            // 2026-11-20：Phase2 报过 `P2_NO_SLOT`（单窗装不下）的需求，若「常规修复 + 跨窗兜底」后仍 0 Task，
+            //   必须留一条**可定位**的 Phase4 明细 —— 否则最终只看得到 Phase2 的「单窗装不下」，
+            //   无法判断是 Phase4 没兜住、还是连跨窗也凑不够（本号位 实测：存在**单独跑也排不下**的样本）。
+            var noSlotAfterRepairReported = new HashSet<string>(StringComparer.Ordinal);
+            // 2026-11-20：跨窗探针明细单独去重（**不能**与上方 `noSlotAfterRepairReported` 共用 ——
+            //   共用会让探针那一行把键吃掉，下面真正的 `PHASE4_NO_TASK_AFTER_REPAIR` 再也不发）。
+            var crossWindowProbeReported = new HashSet<string>(StringComparer.Ordinal);
 
             foreach (var (unitBatchKey, unitDemand) in repairUnits)
             {
@@ -1011,26 +1033,52 @@ internal class PhaseFourLocalRepair
                 //   ⚠ 为什么不在常态找槽里开：14:18 全量 Unit 实测，无条件开跨窗会让 6 个既有用例变形
                 //     （`P0_01` 的「Phase2 排不下 → Phase4 拆 2×45」被跨窗整段排下成 1 个 Task；合批、批数、批血缘同源）。
                 //   ⚠ 只做**一次**重试，不递归：重试仍为 0 ⇒ 照旧进 `StillUnscheduledKeys`，原因码不变。
-                if (repairedTasks.Count == 0)
+                // 2026-11-20（本号位）：跨窗兜底**加探针**（纯观测）。同一次重试里逐资源记录
+                //   `CrossWindowSlotLocator` 的出口（命中／日历走到头／时长未超最长窗／无日历）
+                //   ⇒ 重试仍 0 Task 时能用一条 `PHASE4_XW_PROBE` 说明「到底哪条分支挡住的」，
+                //   而不是只看得到 Phase2 的「单窗装不下」。探针不改任何返回值。
+                var crossWindowProbe = repairedTasks.Count == 0 ? CrossWindowSlotLocator.BeginProbe() : null;
+                try
                 {
-                    var previousAllowCrossWindow = constraints.AllowCrossWindowSlot;
-                    constraints.AllowCrossWindowSlot = true;
-                    try
+                    if (repairedTasks.Count == 0)
                     {
-                        repairedTasks = TryResourceSwitch(
-                            unitDemand,
-                            unitBatchKey,
-                            constraints,
-                            resourceOccupancy,
-                            successorLookup,
-                            request,
-                            dynamicMaterialFloor,
-                            out materialInsufficient);
+                        var previousAllowCrossWindow = constraints.AllowCrossWindowSlot;
+                        constraints.AllowCrossWindowSlot = true;
+                        try
+                        {
+                            repairedTasks = TryResourceSwitch(
+                                unitDemand,
+                                unitBatchKey,
+                                constraints,
+                                resourceOccupancy,
+                                successorLookup,
+                                request,
+                                dynamicMaterialFloor,
+                                out materialInsufficient);
+                        }
+                        finally
+                        {
+                            constraints.AllowCrossWindowSlot = previousAllowCrossWindow;
+                        }
                     }
-                    finally
+                }
+                finally
+                {
+                    crossWindowProbe?.Dispose();
+                }
+
+                if (repairedTasks.Count == 0 && crossWindowProbe is not null
+                    && crossWindowProbeReported.Add(demandKey ?? string.Empty)
+                    && scheduleResult.Phase2BlockedDetails.TryGetValue(demandKey ?? string.Empty, out var probePhase2Detail)
+                    && probePhase2Detail.Contains("P2_NO_SLOT", StringComparison.Ordinal))
+                {
+                    constraints.TraceNotes.Add(new SolveTraceNote
                     {
-                        constraints.AllowCrossWindowSlot = previousAllowCrossWindow;
-                    }
+                        Key = demandKey ?? string.Empty,
+                        ReasonCode = "PHASE4_XW_PROBE",
+                        Message = $"跨窗兜底后仍 0 Task（批={unitBatchKey}）。{crossWindowProbe.Summary()}",
+                        Level = "Info"
+                    });
                 }
 
                 if (repairedTasks.Count == 0)
@@ -1040,6 +1088,23 @@ internal class PhaseFourLocalRepair
                     if (materialInsufficient && materialShortReported.Add(demandKey))
                     {
                         ReportPhase4MaterialInsufficient(constraints, demand, unitDemand);
+                    }
+
+                    // 2026-11-20：Phase2 单窗装不下的需求，Phase4「常规修复 + 跨窗兜底」后仍为 0 Task ⇒
+                    //   留一条可定位明细（真实成因要看这条，而不是 Phase2 的旧文案）。
+                    if (!materialInsufficient
+                        && noSlotAfterRepairReported.Add(demandKey ?? string.Empty)
+                        && scheduleResult.Phase2BlockedDetails.TryGetValue(demandKey ?? string.Empty, out var phase2Detail)
+                        && phase2Detail.Contains("P2_NO_SLOT", StringComparison.Ordinal))
+                    {
+                        constraints.TraceNotes.Add(new SolveTraceNote
+                        {
+                            Key = demandKey ?? string.Empty,
+                            ReasonCode = "PHASE4_NO_TASK_AFTER_REPAIR",
+                            Message = $"Phase4 常规修复与跨日历窗兜底后仍 0 Task（批={unitBatchKey}）。"
+                                    + $"Phase2 原始明细：{phase2Detail}",
+                            Level = "Warning"
+                        });
                     }
                     continue;
                 }
@@ -1275,6 +1340,54 @@ internal class PhaseFourLocalRepair
     ///
     /// <para>本方法**只保证有序与不含零时长窗**，不改任何判定与时间取值。</para>
     /// </summary>
+    /// <summary>
+    /// 2026-11-20（本号位）**失败尝试的回滚日志**：只服务于「失败批候选路径逐条重试」。
+    ///
+    /// <para><b>为什么必须回滚</b>：`TryResourceSwitchOnGraph` 在前几道工序落下后会写占用表与产品时间线；
+    ///   若后一道工序排不下而整体返回空表，那些写入**不会自动消失**。单路径时代这条路径原本就存在
+    ///   （失败的修复单元留下幽灵占用）；一旦改成"多条候选路径逐条重试"，幽灵占用会直接让**后一条路径**
+    ///   看到假冲突 ⇒ 必须撤干净再试下一条。</para>
+    ///
+    /// <para><b>回滚范围（如实声明边界）</b>：</para>
+    /// <list type="number">
+    ///   <item>本次写入占用表的新窗（`AddedOccupancy`）——按 (Start, End) **精确等值**定位后移除；</item>
+    ///   <item>本次写入产品时间线的登记（`Placed`）——按既有 `Remove(resourceId, occEnd, materialId)` 撤回；</item>
+    ///   <item><b>不撤</b>：R08 后继 Setup 变大的「窗口起点前移」——该改动只会让窗**更长**（更保守地挡住别人），
+    ///     不会造成重叠；且只在已放下一道 Task 之后才发生，机率极低。宁可多挡，绝不假装空闲。</item>
+    /// </list>
+    /// <para>单路径路径（`rollback == null`）行为与旧实现**逐字一致** —— 这里只是可选日志。</para>
+    /// </summary>
+    internal sealed class RepairRollbackJournal
+    {
+        private readonly List<(int ResourceId, TimeWindow Window)> _added = new();
+        private readonly List<(int ResourceId, DateTime OccEnd, int MaterialId)> _placed = new();
+
+        public void AddedOccupancy(int resourceId, TimeWindow window) => _added.Add((resourceId, window));
+
+        public void Placed(int resourceId, DateTime occEnd, int materialId) => _placed.Add((resourceId, occEnd, materialId));
+
+        public void Rollback(Dictionary<int, List<TimeWindow>> occupancy, ResourceProductTimeline timeline)
+        {
+            for (var i = _added.Count - 1; i >= 0; i--)
+            {
+                var (resourceId, window) = _added[i];
+                if (occupancy.TryGetValue(resourceId, out var windows))
+                {
+                    windows.RemoveAll(w => w.Start == window.Start && w.End == window.End);
+                }
+            }
+
+            for (var i = _placed.Count - 1; i >= 0; i--)
+            {
+                var (resourceId, occEnd, materialId) = _placed[i];
+                timeline.Remove(resourceId, occEnd, materialId);
+            }
+
+            _added.Clear();
+            _placed.Clear();
+        }
+    }
+
     private static void AddOccupancyWindowSorted(
         Dictionary<int, List<TimeWindow>> occupancy,
         int resourceId,
@@ -1326,8 +1439,18 @@ internal class PhaseFourLocalRepair
         {
             if (plans.Count == 1)
             {
-                // 单批：直接用原实例（零回归）。
-                return new[] { (plans[0].BatchKey, demand) };
+                // 单批：数量与需求一致时用原实例（零回归）。
+                // ── 0号位 v1.7 Q4 / N-05（2026-11-19）：被 PI/Stage 合法上限**截断**过的需求，
+                //    批方案数量 < 原需求净量 ⇒ 必须按**截断后的批数量**修复，否则一次局部修复就突破法定上限。
+                var singlePlan = plans[0];
+                return new[]
+                {
+                    (singlePlan.BatchKey,
+                     singlePlan.NetOutputQty == demand.NetOutputQty
+                         ? demand
+                         : PhaseTwoInitialScheduler.CloneDemandWithBatchQty(
+                             demand, singlePlan.NetOutputQty, singlePlan.PlannedProcessQty))
+                };
             }
 
             return plans
@@ -1336,7 +1459,25 @@ internal class PhaseFourLocalRepair
                 .ToList();
         }
 
-        return new[] { (PhaseTwoInitialScheduler.ExecutionBatchKey(demand.LogicalDemandKey), demand) };
+        // ── 0号位 v1.7（2026-11-19）：无批方案的回落单元同样不得产出小数执行批 ──
+        //   第二类（原生小数、非续作）⇒ 执行量 `ceil(Q_raw)`（一次圆整）；
+        //   原需求净量登记进 `RawBatchNetByExecutionBatchKey`，供 Phase5 需求份额仍按 Q_raw 闭合。
+        var fallbackKey = PhaseTwoInitialScheduler.ExecutionBatchKey(demand.LogicalDemandKey);
+        var fallbackDemand = demand;
+        if (!demand.IsContinuation && demand.NetOutputQty > 0m)
+        {
+            var execQty = demand.NetOutputQty == decimal.Truncate(demand.NetOutputQty)
+                ? demand.NetOutputQty
+                : decimal.Ceiling(demand.NetOutputQty);
+            if (execQty != demand.NetOutputQty)
+            {
+                var scaledProc = demand.PlannedProcessQty * execQty / demand.NetOutputQty;
+                fallbackDemand = PhaseTwoInitialScheduler.CloneDemandWithBatchQty(demand, execQty, scaledProc);
+            }
+            constraints.RawBatchNetByExecutionBatchKey[fallbackKey] = demand.NetOutputQty;
+        }
+
+        return new[] { (fallbackKey, fallbackDemand) };
     }
 
     /// <summary>
@@ -1406,6 +1547,14 @@ internal class PhaseFourLocalRepair
         });
     }
 
+    /// <summary>
+    /// P0-03 批级修复入口：**先取图，再修**。
+    ///
+    /// 2026-11-20（本号位）：新增「失败批候选路径重试」—— 取不到图时，若本批 Phase2 已登记过
+    /// **它自己试过的候选路径**（`FailedBatchAttemptedRoutePaths`），按**同一候选顺序**逐条重试。
+    /// 这不是"重选路径"：候选集合与顺序全部来自 Phase2 的试排记录（RT-002 下本就没有"被选中的路径"）。
+    /// 仍全部落空 ⇒ 与旧口径一致：Fail Closed、0 Task（**不猜**）。
+    /// </summary>
     private List<FinalTaskDraft> TryResourceSwitch(
         LogicalProductionDemand demand,
         string batchDraftKey,
@@ -1421,13 +1570,73 @@ internal class PhaseFourLocalRepair
         //   **无可用时间槽**、还是**无合格资源** —— 三者指向完全相反的方向（采购 / 产能日历 / 工艺主数据）。
         //   由本出参把「缺料」这一条因回传，调用方在需求级去重后登记原因码。
         materialInsufficient = false;
+
         // **批级**取图（P0-03；RT-002「局部修复不得换路径」）：本批选中路径 → 需求固定路径 → 唯一那条。
         //   多批时各批可能走不同 Path ⇒ 必须按**批键**取，不能按需求键取（否则串批）。
-        if (!constraints.TryGetBatchRoutingGraph(
+        if (constraints.TryGetBatchRoutingGraph(
                 batchDraftKey, demand.MaterialId, demand.RouteCode, demand.PathId, out var routingGraph))
         {
-            return new List<FinalTaskDraft>();
+            return TryResourceSwitchOnGraph(
+                demand, batchDraftKey, routingGraph, constraints, resourceOccupancy,
+                successorLookup, request, dynamicMaterialFloor, out materialInsufficient);
         }
+
+        // ── 2026-11-20 失败批候选路径重试（见方法注释）──
+        // RT-002（冻结规则清单 v1.11:127）逐字：「**A/B 固定真实 RouteCode + PathId，局部修复不得换路径**」。
+        //   正常情形下 A/B 的 `demand.RouteCode/PathId` 非空 ⇒ 上面第一个 `if` 已命中固定路径、
+        //   **到不了这里**。但若这两列为空（装载缺失的脏数据），本分支就会拿候选集换路径 ⇒ **违反 RT-002**。
+        //   ⇒ 显式拦下：A/B 续作批**一律不参与候选路径重试**，宁可 0 Task（Fail Closed）也不换路径。
+        if (!demand.IsContinuation
+            && constraints.TryGetFailedBatchRoutingGraphs(batchDraftKey, demand.MaterialId, out var attemptedGraphs))
+        {
+            CrossWindowSlotLocator.ActiveProbe?.RecordStep(
+                $"P4_FALLBACK_ATTEMPTED_PATHS:n={attemptedGraphs.Count}");
+            foreach (var attemptedGraph in attemptedGraphs)
+            {
+                // 每次尝试一份回滚日志：失败的尝试若已把前几道工序写进占用/时间线，必须撤回，
+                // 否则下一条候选路径会看到"幽灵 Task"占着资源（同一资源同一时刻两个 Task 的伪冲突）。
+                var rollback = new RepairRollbackJournal();
+                var attemptedTasks = TryResourceSwitchOnGraph(
+                    demand, batchDraftKey, attemptedGraph, constraints, resourceOccupancy,
+                    successorLookup, request, dynamicMaterialFloor, out var attemptedMaterialInsufficient,
+                    rollback);
+
+                // 缺料是**路径无关**的业务结论（同一物料的供给总量）⇒ 任一路径判缺料即如实回传。
+                if (attemptedMaterialInsufficient) materialInsufficient = true;
+
+                if (attemptedTasks.Count > 0)
+                {
+                    CrossWindowSlotLocator.ActiveProbe?.RecordStep("P4_FALLBACK_ATTEMPTED_PATHS_LANDED");
+                    return attemptedTasks;
+                }
+
+                rollback.Rollback(resourceOccupancy, constraints.ProductTimeline);
+            }
+        }
+
+        // 2026-11-20 探针（纯观测）：批级取图失败 —— 修复根本没开始，更谈不上找槽/跨窗。
+        CrossWindowSlotLocator.ActiveProbe?.RecordStep("P4_ROUTING_GRAPH_MISSING");
+        return new List<FinalTaskDraft>();
+    }
+
+    /// <summary>
+    /// 在**指定的**工艺图上跑一次「资源切换 / 有限 Split」修复（原 `TryResourceSwitch` 主体，逐字未动）。
+    /// 唯一新增：可选 <paramref name="rollback"/> —— 多次路径重试时，失败的那次要把自己写进占用/时间线的条目撤回，
+    /// 否则下一条候选路径会看到根本不存在的占用（同一资源被别人"幽灵 Task"挡住）。
+    /// </summary>
+    private List<FinalTaskDraft> TryResourceSwitchOnGraph(
+        LogicalProductionDemand demand,
+        string batchDraftKey,
+        RoutingGraph routingGraph,
+        ConstraintContext constraints,
+        Dictionary<int, List<TimeWindow>> resourceOccupancy,
+        SuccessorLookup successorLookup,
+        DomainSolveRequest request,
+        DateTime dynamicMaterialFloor,
+        out bool materialInsufficient,
+        RepairRollbackJournal? rollback = null)
+    {
+        materialInsufficient = false;
 
         // P0-01修复：复用 Phase2 的 GetOperationsFromStage，
         // 保证 Phase4 与 Phase2 使用同一套 Kahn 拓扑排序 + StartOperationCode/StartStageCode 裁剪逻辑，
@@ -1437,11 +1646,13 @@ internal class PhaseFourLocalRepair
             demand.StartOperationCode,
             routingGraph,
             constraints,
-            out var startFailureReason);
+            out var startFailureReason,
+            demand.RequiredStageCode);
 
         if (operations.Count == 0)
         {
             // StartStageCode/StartOperationCode 非法，或 Routing 有环，无法修复
+            CrossWindowSlotLocator.ActiveProbe?.RecordStep($"P4_OPERATIONS_EMPTY:{startFailureReason}");
             return new List<FinalTaskDraft>();
         }
 
@@ -1452,12 +1663,14 @@ internal class PhaseFourLocalRepair
             demand.NetOutputQty,
             constraints,
             request.PlanningStart,
-            out bool isMaterialSufficient);
+            out bool isMaterialSufficient,
+            dynamicMaterialFloor);
 
         // P0-05修复：物料总量不足时，标记为业务Unscheduled（不是技术失败）
         if (!isMaterialSufficient)
         {
             materialInsufficient = true;        // ← 原因回传（调用方据此登记 `PHASE4_MATERIAL_INSUFFICIENT`）
+            CrossWindowSlotLocator.ActiveProbe?.RecordStep("P4_MATERIAL_INSUFFICIENT");
             return new List<FinalTaskDraft>(); // 物料总量不足
         }
 
@@ -1487,6 +1700,12 @@ internal class PhaseFourLocalRepair
                 operation.OperationCode,
                 operation.StageCode);   // P1-02：软偏好仅作用于当前承接工序（身份 = StageCode + OperationCode）
 
+            // 2026-11-20 探针（纯观测）：先 `is { }` 判空再拼串，探针未开时**零分配**（本方法是热点）。
+            if (CrossWindowSlotLocator.ActiveProbe is { } probeForOp)
+            {
+                probeForOp.RecordStep($"P4_OP:{operation.StageCode}/{operation.OperationCode}:eligible={eligibleResources.Count}");
+            }
+
             FinalTaskDraft? scheduledTask = null;
 
             // 遍历合格资源，找第一个可用的
@@ -1506,6 +1725,10 @@ internal class PhaseFourLocalRepair
                 var capacityFactor = GetCapacityFactor(demand.MaterialId, operation, resourceId, constraints);
                 if (capacityFactor == null || capacityFactor <= 0)
                 {
+                    if (CrossWindowSlotLocator.ActiveProbe is { } probeNoCap)
+                    {
+                        probeNoCap.RecordStep($"P4_RES_NO_CAPACITY_FACTOR:{operation.StageCode}/{operation.OperationCode}");
+                    }
                     continue; // CapacityFactor缺失/非法，跳过该资源
                 }
                 var adjustedDuration = operation.StandardDuration * demand.PlannedProcessQty / capacityFactor.Value;
@@ -1521,6 +1744,12 @@ internal class PhaseFourLocalRepair
                     (f, total) => FindSlotAvoidingSuccessorSetup(
                         f, total, resourceId, demand.MaterialId, constraints, resourceOccupancy, successorLookup, request.PlanningEnd));
 
+                if (!found.HasValue && CrossWindowSlotLocator.ActiveProbe is { } probeMiss)
+                {
+                    // 2026-11-20 探针：本次「工序×资源」在**单窗 + （若已放行）跨窗**下都没找到槽。
+                    probeMiss.RecordStep($"P4_RES_NO_SLOT:{operation.StageCode}/{operation.OperationCode}");
+                }
+
                 if (found.HasValue)
                 {
                     var (occSlot, setupMinutes, setupResolution) = found.Value;
@@ -1533,6 +1762,9 @@ internal class PhaseFourLocalRepair
                     // 临时占用：从Setup开始（2026-11-16：改走有序写入，零时长窗不入表）
                     AddOccupancyWindowSorted(resourceOccupancy, resourceId, occSlot);
                     constraints.ProductTimeline.Place(resourceId, occSlot.End, demand.MaterialId);
+                    // 2026-11-20：多路径重试时，失败尝试必须撤回自己写下的占用/时间线（见 RepairRollbackJournal）。
+                    rollback?.AddedOccupancy(resourceId, occSlot);
+                    rollback?.Placed(resourceId, occSlot.End, demand.MaterialId);
 
                     // R11：靠 TopN 之外的资源才落下 ⇒ 记「TopN 配小了」的证据（不阻断、不回滚）。
                     if (beyondResourceTopN && !resourceTopNExceededReported)
@@ -1629,10 +1861,12 @@ internal class PhaseFourLocalRepair
                             // PlannedStartTime是Setup后的加工开始时间，资源占用要从Setup开始算
                             var setupDuration = TimeSpan.FromMinutes((double)splitTask.SetupTime);
                             var resourceStart = splitTask.PlannedStartTime - setupDuration;
-                            resourceOccupancy[ridSplit].Add(
-                                new TimeWindow(resourceStart, splitTask.PlannedEndTime));
+                            var splitWindow = new TimeWindow(resourceStart, splitTask.PlannedEndTime);
+                            resourceOccupancy[ridSplit].Add(splitWindow);
                             // item1 接线（阶段二）：拆分件逐个登记产品时间线（首件前产品=时间线邻接，后续件=前件同产品）
                             constraints.ProductTimeline.Place(ridSplit, splitTask.PlannedEndTime, splitTask.MaterialId);
+                            rollback?.AddedOccupancy(ridSplit, splitWindow);
+                            rollback?.Placed(ridSplit, splitTask.PlannedEndTime, splitTask.MaterialId);
                         }
 
                         tasks.AddRange(splitTasks);
@@ -1653,6 +1887,10 @@ internal class PhaseFourLocalRepair
                 }
 
                 // Split失败或不允许Split：修复失败
+                if (CrossWindowSlotLocator.ActiveProbe is { } probeOpFail)
+                {
+                    probeOpFail.RecordStep($"P4_OP_UNRESOLVED:{operation.StageCode}/{operation.OperationCode}");
+                }
                 return new List<FinalTaskDraft>();
             }
 
@@ -1662,6 +1900,10 @@ internal class PhaseFourLocalRepair
         // R08 §二.3：整只修复单元落定后才给邻居落值（单元失败 ⇒ 邻居旧对象原样保留）
         ApplySuccessorSetupRewrites(successorSetupRewrites, successorLookup, resourceOccupancy);
 
+        if (CrossWindowSlotLocator.ActiveProbe is { } probeOk)
+        {
+            probeOk.RecordStep($"P4_UNIT_LANDED:tasks={tasks.Count}");
+        }
         return tasks;
     }
 
@@ -1980,29 +2222,46 @@ internal class PhaseFourLocalRepair
         decimal requiredQuantity,
         ConstraintContext constraints,
         DateTime planningStart,
-        out bool isSufficient)
+        out bool isSufficient,
+        DateTime dynamicMaterialFloor = default)
     {
         isSufficient = true;
 
         if (constraints.MaterialAvailability.TryGetValue(allocationSequence, out var segments) && segments.Count > 0)
         {
+            // 0号位 v1.5（2026-11-19）：`UNRESOLVED` / `SH_TIME_UNRESOLVED` / `SH_LINKED` 的时点
+            //   必须由**已排 Task 推导**（`dynamicMaterialFloor`），不得把计划期末上界/计划期起点占位当可用；
+            //   下界不可得 ⇒ 显式判不足（缺边不得假齐套）。
+            DateTime Effective(MaterialAvailabilitySegment s)
+                => s.NeedsTaskDerivedTime
+                    ? (dynamicMaterialFloor > DateTime.MinValue ? dynamicMaterialFloor : DateTime.MaxValue)
+                    : s.AvailableTime;
+
             // P0-05修复：累计可用数量，找到满足需求数量的最早时间
             decimal accumulated = 0m;
-            foreach (var segment in segments.OrderBy(s => s.AvailableTime))
+            foreach (var segment in segments.OrderBy(Effective))
             {
                 accumulated += segment.Quantity;
                 if (accumulated >= requiredQuantity)
                 {
-                    // 累计数量满足需求，返回该段时间
-                    return segment.AvailableTime;
+                    var effective = Effective(segment);
+                    if (effective == DateTime.MaxValue)
+                    {
+                        isSufficient = false;
+                        return dynamicMaterialFloor > DateTime.MinValue ? dynamicMaterialFloor : planningStart;
+                    }
+                    return effective > dynamicMaterialFloor ? effective : dynamicMaterialFloor;
                 }
             }
 
             // P0-05修复：所有段累计仍不足需求量，标记不足并返回最后一段时间
             isSufficient = false;
-            return segments.Max(s => s.AvailableTime);
+            var lastTime = segments.Max(Effective);
+            if (lastTime == DateTime.MaxValue)
+                lastTime = dynamicMaterialFloor > DateTime.MinValue ? dynamicMaterialFloor : planningStart;
+            return lastTime > dynamicMaterialFloor ? lastTime : dynamicMaterialFloor;
         }
-        return planningStart;
+        return planningStart > dynamicMaterialFloor ? planningStart : dynamicMaterialFloor;
     }
 
     /// <summary>
@@ -2119,7 +2378,7 @@ internal class PhaseFourLocalRepair
         //   返回窗是真实墙钟一段，`End − Start` 大于有效加工；本文件与 Phase5 的**有效加工**消费点
         //   早已改走 `EffectiveProcessMinutes`（见 `:363` 注释），占用口径仍用原算式。
         return constraints.AllowCrossWindowSlot
-            ? CrossWindowSlotLocator.Locate(calendar, earliestStart, duration, occupied)
+            ? CrossWindowSlotLocator.Locate(calendar, earliestStart, duration, occupied, resourceId)
             : null;
     }
 
@@ -2406,11 +2665,14 @@ internal class PhaseFourLocalRepair
                         //   非续作 + 整数净量需求 ⇒ 「整除 + 余数逐份 +1」，与 Phase2 `BuildBatchFormation` 同口径；
                         //   续作（A/B 冻结事实）或小数净量需求维持原按比例拆分。
                         decimal splitQuantity;
-                        if (!demand.IsContinuation
-                            && demand.NetOutputQty > 0m
-                            && demand.NetOutputQty == decimal.Truncate(demand.NetOutputQty))
+                        if (!demand.IsContinuation && demand.NetOutputQty > 0m)
                         {
-                            var totalNet = decimal.Truncate(demand.NetOutputQty);
+                            // ── 0号位 v1.7（2026-11-19）：第二类原生小数同样按**整数目标**切分 ──
+                            //   逐字口径：「逐批净生产量 b_i 为正整数，且 Σb_i = Q_exec」「先圆整一次、再拆批」。
+                            //   整数需求：totalNet = Q；原生小数：totalNet = ceil(Q)（与 Phase2 同一 Q_target）。
+                            var totalNet = demand.NetOutputQty == decimal.Truncate(demand.NetOutputQty)
+                                ? decimal.Truncate(demand.NetOutputQty)
+                                : decimal.Ceiling(demand.NetOutputQty);
                             var baseNet = decimal.Floor(totalNet / splitCount);
                             var netRemainder = totalNet - baseNet * splitCount;
                             splitQuantity = baseNet + ((decimal)i < netRemainder ? 1m : 0m);

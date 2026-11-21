@@ -189,13 +189,18 @@ public class PiGateWiringTests
     ///   · `PiLegalQuantityGateUnevaluated` **= 0** —— 这一条**只能**由「生产入口真把 `piFacts` 传进来了」解释
     ///     （接线掉了 ⇒ 该早退重新命中 ⇒ 本断言红）；
     ///   · `PiLegalQuantityGateBlocked` **≥ 1** —— 门禁确实判了越限；
-    ///   · **零 FinalTask** —— 拦截真生效（不是只计数）。
+    ///   · **按合法上限部分排** —— 截断真生效（不是只计数、也不是整条丢弃）。
     ///
-    /// 说明：本夹具 `BatchPolicies` 为宽松策略 ⇒ 走**有策略路径**（`ApplyPiLegalQuantityGate`）而非 B-010 兜底，
-    ///   故断言的是 `PiLegalQuantityGateBlocked`；B-010 路径的计数由 `PiLegalQuantityGateTests` ⑮/⑮b 覆盖。
+    /// ── 2026-11-19 勘误（0号位 v1.7 Q4，就地在案，不静默替换）──
+    ///   原断言是「**零 FinalTask** / `Passed == 0`（两档互斥）」，那是 v1.2 期 Fail Closed 口径。
+    ///   0号位 v1.7 逐字推翻：「不得突破 PI/Stage 法定上限。**可缩减到本次合法的整数可排量**，必要时整条不排；
+    ///   只形成正常业务未排和原因，**不进入技术错误**」「取 14、原始需求剩余 0.754 作为明确未排」。
+    ///   ⇒ 现口径：需求级先按合法上限截断（此处 10→5），截断后的批再走同一门禁 ⇒ 会各记一次
+    ///     「拦截（需求级越限）」与「放行（截断后批级）」**两档并存**，不再互斥。
+    ///   接线守卫（`Unevaluated == 0` + `Blocked ≥ 1`）**原义保留**——它才是本用例要钉住的东西。
     /// </summary>
     [Fact]
-    public async Task 已投影_门禁强制_超Stage合法自由量则零Task且登记拦截()
+    public async Task 已投影_门禁强制_超Stage合法自由量按上限部分排且登记拦截()
     {
         var request = BuildRequest(
             qty: 10m,
@@ -205,11 +210,19 @@ public class PiGateWiringTests
         using var scope = SolverDiagnostics.BeginScope();
         var result = await _solver.SolveAsync(request);
 
-        Assert.Empty(result.FinalTasks);                                    // 门禁真生效
+        // 合法部分排：执行量严格不超过 Stage 合法自由 5（不得 10、不得 15）
+        Assert.NotEmpty(result.FinalTasks);
+        Assert.All(result.FinalTasks, t => Assert.Equal(5m, t.Quantity));
+
+        // 剩余 5 是**正常业务未排**（原因＝PI 合法量不足），不是技术失败
+        var uns = Assert.Single(result.UnscheduledTasks);
+        Assert.Equal(5m, uns.UnscheduledQty);
+        Assert.Equal("PI_LEGAL_QTY_OVER_LIMIT", uns.Reason);
+
         Assert.Equal(0, scope.Counters.PiLegalQuantityGateUnevaluated);     // ← 接线守卫：必须为 0
         Assert.True(scope.Counters.PiLegalQuantityGateBlocked >= 1,
-            "已投影且超量 ⇒ 门禁必须拦截并计数（接线掉了本断言会红）");
-        Assert.Equal(0, scope.Counters.PiLegalQuantityGatePassed);          // 拦截 ⇒ 不计放行（两档互斥）
+            "已投影且超量 ⇒ 门禁必须判越限并计数（接线掉了本断言会红）");
+        Assert.True(scope.Counters.PiLegalQuantityGatePassed >= 1);         // 截断后批级复核走同一门禁
     }
 
     // ══════════════════════════════════════════════════════════════════

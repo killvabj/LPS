@@ -29,6 +29,7 @@ public class BusinessFactIssueService
         string? reviewStatus = null,
         string? issueType = null,
         string? keyword = null,
+        DateTime? occurredFrom = null, DateTime? occurredTo = null,
         int skip = 0,
         int take = 100,
         CancellationToken ct = default,
@@ -39,8 +40,10 @@ public class BusinessFactIssueService
         if (take > 500) take = 500;
 
         return await _repository.QueryAllAsync(
-            source, materialCode, factoryCode, severity, reviewStatus,
-            issueType, keyword, skip, take, ct, allowedFactories);
+            source: source, materialCode: materialCode, factoryCode: factoryCode,
+            severity: severity, reviewStatus: reviewStatus, issueType: issueType,
+            keyword: keyword, occurredFrom: occurredFrom, occurredTo: occurredTo,
+            skip: skip, take: take, ct: ct, allowedFactories: allowedFactories);
     }
 
     /// <summary>
@@ -56,11 +59,14 @@ public class BusinessFactIssueService
         string? reviewStatus = null,
         string? issueType = null,
         string? keyword = null,
+        DateTime? occurredFrom = null, DateTime? occurredTo = null,
         CancellationToken ct = default,
         IReadOnlySet<string>? allowedFactories = null)
     {
         return await _repository.CountAllAsync(
-            source, materialCode, factoryCode, severity, reviewStatus,
-            issueType, keyword, ct, allowedFactories);
+            source: source, materialCode: materialCode, factoryCode: factoryCode,
+            severity: severity, reviewStatus: reviewStatus, issueType: issueType,
+            keyword: keyword, occurredFrom: occurredFrom, occurredTo: occurredTo,
+            ct: ct, allowedFactories: allowedFactories);
     }
 }

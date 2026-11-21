@@ -21,17 +21,42 @@
  *  页面顶部加「选单池」卡片：新单 / 老单候选按 **ACTIVE PV 参与关系** 判定
  *  （禁按创建时间 / 单号前缀猜新老，v0.2 点名禁令），选中的订单可一键带入评估表单
  *  （订单号 / 物料 / 数量；工厂与客户请求交期仍由用户自己填，池里没有这两项）。
+ *
+ * 2026-11-19：修「复制结论」里的**真缺陷**（`vue/no-ref-as-operand` 报出，非排版问题）——
+ *  `delayDays` 是 `computed`，此前在**脚本内**的模板字符串里写成 `${delayDays}`（少了 `.value`）
+ *  ⇒ 复制给客户/销售的结论文案会打出「（延期 [object Object] 天）」。
+ *  现改为 `${delayDays.value}`；模板里的 `{{ delayDays }}` 不用动（模板自动解包）。
+ *  另：本文件与 `DemandProtection.vue` 的 prettier 排版偏差一并自动修复（纯排版、无逻辑变化）。
+ *
+ * 2026-11-20：按 v0.2 稿 §4 P09 收口（依据《APS_V1_P01-P13_全页面业务设计统一收口核对稿
+ *   v0.2_20261114_四项审核修订版.md》）：
+ *   - §4.9.3 可点击步骤条（选订单→选模式→评估结果→正式纳入→确认/放弃）；
+ *     **未来未完成节点不可点击越过**（前置评估没出结果时「正式纳入/确认」禁用并给出提示）。
+ *   - §4.9.3 放弃/切换分支：「放弃本次评估」= 不点采用（当前生效版本不变）；
+ *     「改按另一模式重新评估」= 1↔2 重新走新 WHATIF（不叠加候选版本）。
+ *   - §4.9.1 场景 3/4：新增「正式纳入」入口（NEW_ORDER_INSERT，模式随评估结果，不可改），
+ *     只建候选版本，试算结果**不被直接激活**；确认/放弃到「候选版本」页做。
+ *   - §4.9.4 业务解释：模式口径（NORMAL / EXPEDITE）随当前用途显示。
+ *
+ * 2026-11-20：选单池带入**数值订单规范 Id**（依据 5号位-2026-11-20-复函-P01-P13收口v0.2清单十七项逐条裁决_三条可投影已落码B1F1J1_其余不可原因与后移给足-给4号位抄3号位.md
+ *   §一 J1「`Order_Canonical.Id` 已投影到选单池」r14322）：
+ *   选中订单时把池行的 `orderCanonicalId` 一并带入「正式纳入」弹窗 ⇒ 用户**不用再手填**。
+ *   ⚠️ 该值与 `form.orderCanonicalId`（**订单号字符串**）**不是同一个 ID 空间**，两者并存不互相覆盖。
  */
 
 import { computed, onMounted, reactive, ref } from 'vue'
 import dayjs from 'dayjs'
 import { storeToRefs } from 'pinia'
-import { useRoute } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import { useCtpStore } from '@/store/modules/aps/ctp'
 import { useDomainStore } from '@/store/modules/aps/domain'
+import { useApsAuthStore } from '@/store/modules/aps/auth'
 import { domainApi } from '@/api/aps-v1/domain'
 import { materialLookupApi } from '@/api/aps-v1/materialLookup'
+import { PRIORITY_MODE_EXPLAIN, TRIGGER_BUSINESS_EXPLAIN, triggerBusinessEntry } from '@/api/aps-v1'
+import type { BusinessEntrySubmission, DomainKey, PriorityMode } from '@/api/aps-v1'
 import OrderPoolPanel from './components/OrderPoolPanel.vue'
+import NewOrderInsertDialog from './components/NewOrderInsertDialog.vue'
 import type { MaterialLookupItem } from '@/api/aps-v1/types'
 import {
   BIZ_ISSUE_FACTORY_CODES,
@@ -60,8 +85,17 @@ import {
 } from 'element-plus'
 
 const ctpStore = useCtpStore()
-const { result, history, loading, error, errorCode, errorTraceId, evaluatedAt, hasResult, isOverThreshold } =
-  storeToRefs(ctpStore)
+const {
+  result,
+  history,
+  loading,
+  error,
+  errorCode,
+  errorTraceId,
+  evaluatedAt,
+  hasResult,
+  isOverThreshold
+} = storeToRefs(ctpStore)
 
 const domainStore = useDomainStore()
 function humanLabel(domainKey: string | undefined | null): string {
@@ -156,6 +190,8 @@ function onMaterialChange(code: string): void {
  */
 function onPickOrder(row: OrderPoolItemDto): void {
   form.orderCanonicalId = row.orderNo ?? ''
+  // 2026-11-20（J1）：数值订单规范 Id 一并带入，场景 3/4「正式纳入」不必再手填
+  pickedOrderCanonicalId.value = row.orderCanonicalId ?? undefined
   if (row.materialCode) {
     form.materialCode = row.materialCode
     // 物料是远程搜索下拉：把选中的物料并回选项列表，否则下拉里只剩裸编码
@@ -196,6 +232,149 @@ onMounted(() => {
     })
   void loadMaterials('')
 })
+
+/* ===== P09 §4.9.3 可点击步骤条 + 放弃/切换分支 =====
+ * 新订单路径：选单 → 选模式 → 评估结果 → 正式纳入 → 确认/放弃
+ *  - 已完成步骤可点击回看；**未来未完成节点不可点击越过**（前置计算/确认没做就禁用）
+ *  - 「确认/放弃」在候选版本页做（本页只负责跳过去）
+ *  - 放弃 = 不点采用、不调写端点 ⇒ 当前生效版本不变
+ */
+type StepKey = 'pick' | 'mode' | 'result' | 'insert' | 'decide'
+
+const router = useRouter()
+const apsAuth = useApsAuthStore()
+
+const STEP_LIST: Array<{ key: StepKey; title: string; desc: string }> = [
+  { key: 'pick', title: '选订单', desc: '未参与正式排产的新订单' },
+  { key: 'mode', title: '选模式', desc: '正常承诺 / 急单影响' },
+  { key: 'result', title: '评估结果', desc: '交期、影响与原因' },
+  { key: 'insert', title: '正式纳入', desc: '按原模式建候选版本' },
+  { key: 'decide', title: '确认或放弃', desc: '在候选版本页比较后决定' }
+]
+
+/** 正式纳入后拿到的候选版本（决定第 5 步是否可点） */
+const insertedCandidate = ref<{
+  runId: number
+  candidatePlanVersionId: number
+  basePlanVersionId?: number
+} | null>(null)
+
+const insertVisible = ref(false)
+const insertSubmitting = ref(false)
+/**
+ * 选单池带入的**数值**订单规范 Id（2026-11-20；J1：5号位 r14322 起池行带 `orderCanonicalId`）。
+ *
+ * ⚠️ 与 `form.orderCanonicalId`（**字符串**＝订单号，CTP 载荷自用）**不是同一个东西**：
+ *   本值 = `Order_Canonical.Id`（数值），与订单号**非同一 ID 空间** ⇒ 两者不互相顶替。
+ *   键缺（canonical 无该单号）⇒ undefined ⇒ 正式纳入弹窗退回手填兜底。
+ */
+const pickedOrderCanonicalId = ref<number | undefined>(undefined)
+
+/** 授权排程域（dataScope 收敛后的 active 域） */
+const insertDomainOptions = computed<DomainKey[]>(() =>
+  domainStore.activeDomains.map((d) => d.domainKey)
+)
+
+/** 评估结果里回带的排程域（单域即本域；跨域取第一个） */
+const evaluatedDomainKey = computed<DomainKey | undefined>(() => {
+  const list = result.value?.domainResults ?? []
+  return list.length ? list[0].domainKey : undefined
+})
+
+/** 模式：场景 1 = 正常承诺（NORMAL）；场景 2 = 急单影响（EXPEDITE） */
+const currentMode = computed<PriorityMode>(() => (form.purpose === 'CTP' ? 'NORMAL' : 'EXPEDITE'))
+
+/** 当前用途对应的触发码（取业务解释文案用） */
+const purposeTrigger = computed<'NEW_ORDER_CTP' | 'NEW_ORDER_IMPACT'>(() =>
+  form.purpose === 'CTP' ? 'NEW_ORDER_CTP' : 'NEW_ORDER_IMPACT'
+)
+
+/** 每步是否可达：未来未完成节点不可点击越过 */
+const stepReachable = computed<Record<StepKey, boolean>>(() => ({
+  pick: true,
+  mode: true,
+  result: hasResult.value,
+  insert: hasResult.value,
+  decide: insertedCandidate.value !== null
+}))
+
+/** 当前所处步骤（取最靠后的可达步骤） */
+const currentStepKey = computed<StepKey>(() => {
+  if (insertedCandidate.value) return 'decide'
+  if (hasResult.value) return 'result'
+  return 'mode'
+})
+
+const poolAnchor = ref<HTMLElement | null>(null)
+const modeAnchor = ref<HTMLElement | null>(null)
+const resultAnchor = ref<HTMLElement | null>(null)
+
+function scrollTo(el: HTMLElement | null): void {
+  el?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+}
+
+function onStepClick(step: StepKey): void {
+  if (!stepReachable.value[step]) return
+  if (step === 'pick') scrollTo(poolAnchor.value)
+  else if (step === 'mode') scrollTo(modeAnchor.value)
+  else if (step === 'result') scrollTo(resultAnchor.value)
+  else if (step === 'insert') insertVisible.value = true
+  else if (step === 'decide') {
+    router.push({
+      name: 'ApsCandidate',
+      query: insertedCandidate.value
+        ? {
+            candidatePlanVersionId: String(insertedCandidate.value.candidatePlanVersionId),
+            basePlanVersionId: insertedCandidate.value.basePlanVersionId
+              ? String(insertedCandidate.value.basePlanVersionId)
+              : undefined,
+            source: 'ctp-insert'
+          }
+        : undefined
+    })
+  }
+}
+
+/** 放弃本次评估（稿 §4.9.3「结束/放弃本次评估（ACTIVE 不变）」） */
+function onAbandonEval(): void {
+  ctpStore.reset()
+  insertedCandidate.value = null
+  ElMessage.info('本次试算已放弃，当前生效计划没有任何改变')
+}
+
+/** 放弃当前模式，改按另一模式重新评估（稿：1↔2，新 WHATIF、非候选叠加） */
+async function onSwitchMode(): Promise<void> {
+  form.purpose = form.purpose === 'CTP' ? 'INSERT_IMPACT_ANALYSIS' : 'CTP'
+  ctpStore.reset()
+  insertedCandidate.value = null
+  await onSubmit()
+}
+
+/** 正式纳入（场景 3/4）→ 新建候选版本 */
+async function submitInsert(payload: BusinessEntrySubmission): Promise<void> {
+  insertSubmitting.value = true
+  try {
+    const r = await triggerBusinessEntry({
+      trigger: payload.trigger,
+      domainKey: payload.domainKey,
+      draft: payload.draft,
+      actor: apsAuth.userInfo?.userCode ?? 'unknown'
+    })
+    insertedCandidate.value = {
+      runId: r.newRunId,
+      candidatePlanVersionId: r.candidatePlanVersionId,
+      basePlanVersionId: r.basePlanVersionId
+    }
+    insertVisible.value = false
+    ElMessage.success(
+      `已生成候选版本 #${r.candidatePlanVersionId}，当前生效版本未变；请到「候选版本」页比较后确认采用或放弃`
+    )
+  } catch (err) {
+    ElMessage.error(`正式纳入失败：${(err as Error)?.message ?? '未知错误'}`)
+  } finally {
+    insertSubmitting.value = false
+  }
+}
 
 /* ===== 字典 =====
  * 根因码复用冻结 `07 v5.1.13 §八.1` 权威 15 码（与甘特 / Explanation 页同一份
@@ -296,7 +475,7 @@ const verdictText = computed(() => {
     `客户请求交期：${form.requestedDueDate}`,
     `判定：${r.meetsRequestedDueDate ? '可按期完成' : '无法按期完成'}`,
     `最早完成日期：${dayjs(r.earliestCompletion).format('YYYY-MM-DD')}${
-      r.meetsRequestedDueDate ? '' : `（延期 ${delayDays} 天）`
+      r.meetsRequestedDueDate ? '' : `（延期 ${delayDays.value} 天）`
     }`,
     `主要瓶颈：${r.mainBottleneck}`,
     `受影响订单：${r.impactedOrderCount} 个`
@@ -323,8 +502,7 @@ async function onSubmit(): Promise<void> {
   }
   await ctpStore.evaluate({
     // 订单号可留空：生成一个**人能读**的本次评估编号（原来的 PO-<时间戳> 看不出是哪天）
-    orderCanonicalId:
-      form.orderCanonicalId || `PO-${dayjs().format('YYYYMMDD-HHmm')}`,
+    orderCanonicalId: form.orderCanonicalId || `PO-${dayjs().format('YYYYMMDD-HHmm')}`,
     materialCode: form.materialCode,
     quantity: form.quantity,
     factoryCode: form.factoryCode,
@@ -354,15 +532,44 @@ function onLoadHistory(entryId: number): void {
   void _drop
   Object.assign(form, rest)
   // 历史里的物料可能不在当前选项列表里（远程搜索后列表会被替换）⇒ 找回来，否则下拉只显示裸编码
-  selectedMaterial.value =
-    MATERIAL_OPTIONS.value.find((o) => o.code === form.materialCode) ?? null
+  selectedMaterial.value = MATERIAL_OPTIONS.value.find((o) => o.code === form.materialCode) ?? null
 }
 </script>
 
 <template>
   <div class="aps-ctp">
+    <!-- ===== 步骤条（v0.2 §4.9.3：可点击的业务导航；未来未完成节点不可点击越过）===== -->
+    <div class="step-bar">
+      <div v-for="(s, idx) in STEP_LIST" :key="s.key" class="step-item">
+        <ElTooltip
+          :disabled="stepReachable[s.key]"
+          :content="`需先完成前一步（${s.desc}）`"
+          placement="top"
+        >
+          <div
+            class="step-node"
+            :class="{
+              current: currentStepKey === s.key,
+              done: stepReachable[s.key],
+              locked: !stepReachable[s.key]
+            }"
+            @click="onStepClick(s.key)"
+          >
+            <span class="step-index">{{ idx + 1 }}</span>
+            <span class="step-text">
+              <span class="step-title">{{ s.title }}</span>
+              <span class="step-desc">{{ s.desc }}</span>
+            </span>
+          </div>
+        </ElTooltip>
+        <Icon v-if="idx < STEP_LIST.length - 1" class="step-arrow" icon="vi-mdi:chevron-right" />
+      </div>
+    </div>
+
     <!-- ===== 选单池（2026-11-18 C2：新单 / 老单候选，判据=ACTIVE PV 参与关系）===== -->
-    <OrderPoolPanel @pick="onPickOrder" />
+    <div ref="poolAnchor">
+      <OrderPoolPanel @pick="onPickOrder" />
+    </div>
 
     <!-- ===== 输入表单（2026-11-14：撤页头大标题页头，标题进卡片头）===== -->
     <ElCard class="panel">
@@ -410,9 +617,7 @@ function onLoadHistory(entryId: number): void {
           />
         </div>
         <div class="input-field">
-          <span class="field-label">
-            物料<span class="required-mark">*</span>
-          </span>
+          <span class="field-label"> 物料<span class="required-mark">*</span> </span>
           <ElSelect
             v-model="form.materialCode"
             filterable
@@ -437,9 +642,7 @@ function onLoadHistory(entryId: number): void {
           </ElSelect>
         </div>
         <div class="input-field">
-          <span class="field-label">
-            数量<span class="required-mark">*</span>
-          </span>
+          <span class="field-label"> 数量<span class="required-mark">*</span> </span>
           <ElInputNumber
             v-model="form.quantity"
             :min="1"
@@ -450,9 +653,7 @@ function onLoadHistory(entryId: number): void {
           />
         </div>
         <div class="input-field">
-          <span class="field-label">
-            工厂<span class="required-mark">*</span>
-          </span>
+          <span class="field-label"> 工厂<span class="required-mark">*</span> </span>
           <ElSelect
             v-model="form.factoryCode"
             filterable
@@ -468,9 +669,7 @@ function onLoadHistory(entryId: number): void {
           </ElSelect>
         </div>
         <div class="input-field">
-          <span class="field-label">
-            客户请求交期<span class="required-mark">*</span>
-          </span>
+          <span class="field-label"> 客户请求交期<span class="required-mark">*</span> </span>
           <ElDatePicker
             v-model="form.requestedDueDate"
             type="date"
@@ -479,7 +678,7 @@ function onLoadHistory(entryId: number): void {
             class="field-input"
           />
         </div>
-        <div class="input-field">
+        <div ref="modeAnchor" class="input-field">
           <span class="field-label">业务用途</span>
           <ElSelect v-model="form.purpose" class="field-input">
             <ElOption label="可靠交期判断" value="CTP" />
@@ -501,6 +700,19 @@ function onLoadHistory(entryId: number): void {
           </div>
         </div>
       </div>
+
+      <!-- 业务解释（v0.2 §4.9.4：模式口径随当前用途变） -->
+      <ElAlert type="info" :closable="false" show-icon class="mode-explain">
+        <template #title>
+          {{
+            form.purpose === 'CTP'
+              ? '当前模式：正常交期承诺评估（按正常优先）'
+              : '当前模式：急单插入影响分析（按急单优先）'
+          }}
+        </template>
+        <div class="explain-line">{{ PRIORITY_MODE_EXPLAIN[currentMode] }}</div>
+        <div class="explain-line">{{ TRIGGER_BUSINESS_EXPLAIN[purposeTrigger] }}</div>
+      </ElAlert>
     </ElCard>
 
     <!-- ===== 错误条（后端报文翻成大白话；内部编号/traceId 只放次要位置）===== -->
@@ -518,16 +730,39 @@ function onLoadHistory(entryId: number): void {
     </ElAlert>
 
     <!-- ===== 结果区 ===== -->
-    <div v-if="hasResult" class="result-area">
+    <div v-if="hasResult" ref="resultAnchor" class="result-area">
       <!-- 结果工具条：把结论复制走（工厂用户要直接发给客户/销售） -->
       <div class="result-toolbar">
         <span class="muted-tag">
           评估时刻：{{ evaluatedAt ? dayjs(evaluatedAt).format('YYYY-MM-DD HH:mm') : '-' }}
         </span>
-        <ElButton size="small" @click="copyVerdict">
-          <Icon icon="vi-ep:copy-document" /> 复制结论
-        </ElButton>
+        <div class="toolbar-btns">
+          <ElButton size="small" @click="copyVerdict">
+            <Icon icon="vi-ep:copy-document" /> 复制结论
+          </ElButton>
+          <!-- 放弃 / 切换分支（v0.2 §4.9.3） -->
+          <ElButton size="small" @click="onSwitchMode">
+            <Icon icon="vi-ep:refresh" />
+            改按{{ form.purpose === 'CTP' ? '急单影响' : '正常承诺' }}重新评估
+          </ElButton>
+          <ElButton size="small" @click="onAbandonEval">
+            <Icon icon="vi-ep:circle-close" /> 放弃本次评估
+          </ElButton>
+        </div>
       </div>
+
+      <!-- 已正式纳入：提示去候选版本页确认/放弃 -->
+      <ElAlert
+        v-if="insertedCandidate"
+        type="success"
+        :closable="false"
+        show-icon
+        class="inserted-alert"
+      >
+        <template #title>已生成候选版本</template>
+        候选版本 #{{ insertedCandidate.candidatePlanVersionId }} 已生成，当前生效版本没有改变。
+        请到「候选版本」页比较后<strong>确认采用</strong>或<strong>放弃</strong>。
+      </ElAlert>
       <!-- 顶部判定卡 -->
       <div class="verdict-row">
         <div class="verdict-card" :class="resultNN.meetsRequestedDueDate ? 'pass' : 'fail'">
@@ -820,6 +1055,20 @@ function onLoadHistory(entryId: number): void {
         </template>
       </ElEmpty>
     </ElCard>
+
+    <!-- ===== 正式纳入（场景 3/4）：按原模式建候选版本 ===== -->
+    <NewOrderInsertDialog
+      :visible="insertVisible"
+      @update:visible="insertVisible = $event"
+      :submitting="insertSubmitting"
+      :domain-options="insertDomainOptions"
+      :default-domain-key="evaluatedDomainKey"
+      :order-no="form.orderCanonicalId"
+      :order-canonical-id="pickedOrderCanonicalId"
+      :requested-due-date="form.requestedDueDate"
+      :mode="currentMode"
+      @submit="submitInsert"
+    />
   </div>
 </template>
 
@@ -1196,5 +1445,115 @@ function onLoadHistory(entryId: number): void {
   border: none;
   border-radius: 8px;
   box-shadow: none;
+}
+
+/* ===== 步骤条（v0.2 §4.9.3）===== */
+.step-bar {
+  display: flex;
+  padding: 10px 14px;
+  background: #fff;
+  border-radius: 8px;
+  box-shadow: 0 1px 4px rgb(0 0 0 / 6%);
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.step-item {
+  display: flex;
+  align-items: center;
+}
+
+.step-node {
+  display: flex;
+  padding: 6px 12px;
+  border: 1px solid #e2e8f0;
+  border-radius: 6px;
+  cursor: pointer;
+  align-items: center;
+  gap: 8px;
+
+  &.done {
+    border-color: #bfdbfe;
+  }
+
+  &.current {
+    border-color: #3b82f6;
+    background: #eff6ff;
+  }
+
+  &.locked {
+    background: #f8fafc;
+    cursor: not-allowed;
+
+    .step-index {
+      background: #cbd5e1;
+    }
+
+    .step-title {
+      color: #cbd5e1;
+    }
+  }
+}
+
+.step-index {
+  display: inline-flex;
+  width: 20px;
+  height: 20px;
+  font-size: 12px;
+  font-weight: 600;
+  color: #fff;
+  background: #94a3b8;
+  border-radius: 50%;
+  align-items: center;
+  justify-content: center;
+}
+
+.step-node.done .step-index {
+  background: #3b82f6;
+}
+
+.step-text {
+  display: flex;
+  line-height: 1.3;
+  flex-direction: column;
+}
+
+.step-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: #1e293b;
+}
+
+.step-desc {
+  font-size: 11px;
+  color: #94a3b8;
+}
+
+.step-arrow {
+  margin: 0 4px;
+  font-size: 16px;
+  color: #cbd5e1;
+}
+
+/* 工具条按钮组 */
+.toolbar-btns {
+  display: flex;
+  gap: 8px;
+}
+
+/* 业务解释块 */
+.mode-explain {
+  margin-top: 12px;
+
+  .explain-line {
+    margin-top: 4px;
+    font-size: 12px;
+    line-height: 1.6;
+    color: #475569;
+  }
+}
+
+.inserted-alert {
+  margin-bottom: 12px;
 }
 </style>

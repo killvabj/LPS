@@ -77,6 +77,14 @@
  *
  * 这层与「版本级 `sourceScheduleRunId` 为空」**并存、不合并**（两层说的不是一回事）：
  * 前者＝供给事实批次在不在；后者＝这个版本有没有记到来源排程批次。
+ *
+ * ---- 2026-11-20 5号位 复函 D1：仓库改走**供给事实行**（不再用 PSA 的 supplyWarehouseCode）----
+ *
+ * 依据 5号位-2026-11-20-复函-P01-P13收口v0.2清单十七项逐条裁决_三条可投影已落码B1F1J1_其余不可原因与后移给足-给4号位抄3号位.md §一 D1：
+ *  - PSA 的 `supplyWarehouseCode` 实测 **99,564/99,564 为空（全 0 填充）** ⇒ **不得**当仓库显示
+ *    （显示它等于凭空断言「这批货在 X 仓」）⇒ 抽屉里的「供给工厂 / 仓库」改走
+ *    `composables/useSupplyWarehouse.ts`（按 PO × 物料到供给事实行查仓码/仓名）。
+ *  - 查不到 / 同一 PO+物料命中**多个不同仓库** ⇒ 显「未提供」+ 说明，**不猜**。
  */
 
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
@@ -85,6 +93,7 @@ import { usePeggingTraceStore, type PeggingGroupRow } from '@/store/modules/aps/
 import { useDomainStore } from '@/store/modules/aps/domain'
 import { commitmentStatusLabel } from '@/api/aps-v1/codeLabels'
 import { formatUtcDateTime } from '@/utils/datetime'
+import { useSupplyWarehouse } from './composables/useSupplyWarehouse'
 import type { PeggingTraceDto } from '@/api/aps-v1'
 import {
   ElAlert,
@@ -99,7 +108,8 @@ import {
   ElSelect,
   ElTable,
   ElTableColumn,
-  ElTag
+  ElTag,
+  ElTooltip
 } from 'element-plus'
 
 const store = usePeggingTraceStore()
@@ -330,9 +340,19 @@ function applyNow(): void {
 /* ===== 详情 Drawer ===== */
 const selected = ref<PeggingTraceDto | null>(null)
 const drawerOpen = ref(false)
+/**
+ * 供给侧仓库解析（2026-11-20；D1）。
+ *
+ * ⚠️ **PSA 的 `supplyWarehouseCode` 全 0 填充**（5号位 11-20 复函 D1）⇒ 不再拿它当仓库显示；
+ *   仓库改由**供给事实行**（采购在途档案的存储地点）解析 ⇒ 查不到显「未提供」。
+ */
+const { resolve: resolveWarehouses, warehouseText, warehouseHint } = useSupplyWarehouse()
 function openDetail(row: PeggingTraceDto): void {
   selected.value = row
   drawerOpen.value = true
+  void resolveWarehouses([
+    { poNo: row.supplyDocumentNo, materialCode: row.materialCode, materialId: row.materialId }
+  ])
 }
 
 /** 齐套视图里点某一种物料 ⇒ 打开该物料第一笔分配的明细 */
@@ -767,7 +787,28 @@ onBeforeUnmount(() => store.reset())
             <template v-if="otherFactoryCode(selected)">{{ otherFactoryCode(selected) }}</template>
             <template v-else-if="isCrossSupply(selected)">跨厂（对方工厂未提供）</template>
             <template v-else>{{ selected.supplyFactoryCode ?? '-' }}</template>
-            / {{ selected.supplyWarehouseCode ?? '-' }}
+            /
+            <!-- 仓库（2026-11-20；D1）：改走供给事实行，**不再拿 PSA 的 supplyWarehouseCode**（全 0 填充） -->
+            <ElTooltip
+              :content="
+                warehouseHint({
+                  poNo: selected.supplyDocumentNo,
+                  materialCode: selected.materialCode,
+                  materialId: selected.materialId
+                })
+              "
+              placement="top"
+            >
+              <span>
+                {{
+                  warehouseText({
+                    poNo: selected.supplyDocumentNo,
+                    materialCode: selected.materialCode,
+                    materialId: selected.materialId
+                  })
+                }}
+              </span>
+            </ElTooltip>
           </ElDescriptionsItem>
           <ElDescriptionsItem label="供给方式">
             {{ selected.supplyMode ?? '-' }}

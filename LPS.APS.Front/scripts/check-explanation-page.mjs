@@ -42,8 +42,9 @@ function arg(name, fallback) {
 const BASE = arg('url', 'http://localhost:4001').replace(/\/$/, '')
 const SHOT_DIR = resolve(ROOT, arg('shot', '.tmp/explanation-page'))
 const CDP_PORT = 9500 + Math.floor(Math.random() * 90)
-const USER = process.env.EXPL_USER || 'admin'
-const PWD = process.env.EXPL_PWD || 'Admin@123456'
+// ⚠️ dev 联调用非 admin 账号（3号位 2026-11-19 回执 §3.2 过渡期乙：dev 与生产共用 APS_Auth，admin 会顶掉生产会话）
+const USER = process.env.EXPL_USER || 'rule_admin'
+const PWD = process.env.EXPL_PWD || 'Password@123'
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 

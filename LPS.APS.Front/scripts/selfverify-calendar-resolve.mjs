@@ -195,7 +195,7 @@ async function loginOnce() {
   const res = await fetch('https://localhost:7044/api/auth/login', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ userCode: 'admin', password: 'Admin@123456' })
+    body: JSON.stringify({ userCode: 'rule_admin', password: 'Password@123' })
   })
   const text = await res.text()
   let json = null

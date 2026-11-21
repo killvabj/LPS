@@ -25,12 +25,20 @@
  *  - 本脚本所有 PUT 都基于"先 GET 取当前完整态 → 合并目标态 → 全集 PUT"，但简化版做法是：
  *    直接 PUT 目标态完整集合（脚本里写死），后端 DELETE+INSERT 幂等
  *  - 如需多环境/多套测试用户并行，请复制本脚本改 seedUsers / seedRoles 数组
+ *
+ * 2026-11-21：`aps.planner`（计划员）**收回** `aps.manual_eta.edit` / `aps.manual_eta.cancel`
+ *   （依据 APS_V1_3号位致4号位_P01-P13收口v0.2回执_H1-H10逐条核证裁决_回执_v1.0_20261120.md
+ *    H10②「收回计划员写码；`manual_eta.view` 计划员保留只读；码本身保留，
+ *    变更＝角色-权限指派/种子，实施归 4号位」）。
+ *   ⚠️ 本脚本对角色权限是**覆盖式 PUT**（见上方红线）⇒ 重跑本脚本即在 dev 运行库
+ *      真正收回计划员的两个写码；本次**未重跑**（dev 数据变更待用户指令）。
  */
 
 /* ========== 配置 ========== */
 // dev 后端是 HTTPS 7044（dot net run 自签证书），必须用 https 直连避开 307 跨协议跳转
 // （Node fetch / Undici 拒绝跟 http→https 重定向，与 curl 默认行为不同）
 const BASE_URL = process.env.APS_BASE_URL || 'https://localhost:7044'
+// ⚠️ 本脚本**保留 admin**：种子脚本，它要**建** admin 等账号，绝不能改成用其它账号登录（3号位 2026-11-19 回执 §3.2 过渡期乙：dev 与生产共用 APS_Auth，admin 登录会顶掉生产会话）
 const ADMIN_USERCODE = 'admin'
 const ADMIN_PASSWORD = 'Admin@123456'
 // dev 自签证书容忍（仅 seed 脚本；前端 axios 不需要，由浏览器/HTTP 客户端处理）
@@ -80,13 +88,14 @@ const ROLE_PERMISSIONS = {
     'aps.parameter.view', 'aps.strategy.view', 'aps.manual_eta.view',
     'aps.demand_protection.view', 'aps.mes.view', 'aps.audit.view'
   ],
-  // aps.planner — PMC 17 码
+  // aps.planner — PMC 15 码
   'aps.planner': [
     'aps.plan.view', 'aps.plan.run', 'aps.plan.compare', 'aps.plan.export',
     'aps.ctp.view', 'aps.ctp.evaluate',
     'aps.insert.impact.evaluate', 'aps.reschedule.local', 'aps.reschedule.manual',
     'aps.candidate.view', 'aps.candidate.confirm', 'aps.candidate.activate',
-    'aps.manual_eta.view', 'aps.manual_eta.edit', 'aps.manual_eta.cancel',
+    // H10②（2026-11-21）：计划员在采购侧只读 —— 收回 edit/cancel，只留 view
+    'aps.manual_eta.view',
     'aps.demand_protection.view', 'aps.mes.view'
   ],
   // aps.admin.aps — 规则/参数/策略全集 8 码

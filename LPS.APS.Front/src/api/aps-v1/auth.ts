@@ -15,6 +15,11 @@
  * 2026-11-18：新增「改自己资料 / 改密码」两个端点
  *   （PUT /api/auth/profile、POST /api/auth/change-password）
  *   —— 依据 3号位《个人中心改资料与改密码端点落码_回执 v1.0_20261117》。
+ *
+ * 2026-11-18（第二封）：`GET /api/auth/me` 回包补 `email` / `phoneNumber`
+ *   —— 依据 3号位《个人中心me补邮箱手机号与显示名读库_回执 v1.0_20261118》R1。
+ *   · 字段形状在 `types/auth.ts` 的 `UserInfo`（本文件不另立类型）；
+ *   · mock 形状同步补两个 `null`（mock 不编造邮箱/手机号）。
  */
 
 import { apsHttp, APS_USE_MOCK } from './http'
@@ -78,6 +83,9 @@ export const apsAuthApi = {
         userId: 1,
         userCode: 'pmc',
         userName: 'PMC 演示账号',
+        // 邮箱/手机号：mock 不编造 ⇒ 显式 null（页面据此显「未提供」）
+        email: null,
+        phoneNumber: null,
         roles: ['aps.planner'],
         permissions: [],
         isGlobal: true,

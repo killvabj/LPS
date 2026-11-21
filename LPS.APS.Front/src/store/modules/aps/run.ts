@@ -1,5 +1,5 @@
 /**
- * APS V1 4号位 — 运行治理 Pinia store（页面 9：运行与下发）
+ * APS V1 4号位 — 运行治理 Pinia store（页面 9：运行与版本管理；2026-11-20 由「运行与下发」改名）
  *
  * 2026-10-16 重整（依据《4号位致3号位/5号位·运行页联调缺口回执》）：
  *  - 删掉自拟聚合体 `RunStatusDto`：后端 `GET /api/governance/runs` 只返 `ScheduleRunGov[]` 裸数组，

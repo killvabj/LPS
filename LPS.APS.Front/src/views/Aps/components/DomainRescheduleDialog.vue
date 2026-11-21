@@ -6,6 +6,10 @@
   载荷：无多对象载荷（范围 = 整 Domain 全部可移动计划）
 
   Dialog 只收集载荷；父组件持 loading 并调 triggerBusinessEntry。
+
+  2026-11-20：按 v0.2 稿 §4 P09 §4.9.4 补「这个入口在做什么」业务解释，
+    并把「不可移动计划（lockMarker）」旧措辞换成「全部允许移动的计划 + 执行锁/Firm/Frozen 由后端判定」
+    （依据《APS_V1_P01-P13_全页面业务设计统一收口核对稿_v0.2_20261114_四项审核修订版.md》）。
 -->
 <script setup lang="ts">
 import { ref, watch } from 'vue'
@@ -21,7 +25,7 @@ import {
   ElSelect,
   ElTag
 } from 'element-plus'
-import { TRIGGER_RUN_MATRIX, validateScopeDraft } from '@/api/aps-v1'
+import { TRIGGER_BUSINESS_EXPLAIN, TRIGGER_RUN_MATRIX, validateScopeDraft } from '@/api/aps-v1'
 import type { BusinessEntrySubmission, DomainKey, ScopeDraft } from '@/api/aps-v1'
 import { useDomainStore } from '@/store/modules/aps/domain'
 
@@ -103,9 +107,9 @@ function onSubmit(): void {
         <span class="field-hint">整排程域重排走既有正式优先规则，无需指定优先模式</span>
       </ElFormItem>
 
-      <ElFormItem label="不可移动计划">
+      <ElFormItem label="重排范围">
         <span class="field-hint no-margin">
-          已锁定（lockMarker）的计划不在重排范围；锁定判定由后端按 Task 锁执行，前端不计算。
+          范围 = 该排程域当前全部允许移动的计划；执行锁、Firm/Frozen 等约束由后端判定，前端不计算。
         </span>
       </ElFormItem>
 
@@ -127,6 +131,11 @@ function onSubmit(): void {
         <template #title>影响面</template>
         整排程域重排范围最大——产生的 Candidate 需在 Candidate 页逐版本比较确认后才可能激活； WHATIF
         / 影响分析类运行永不可激活（本入口不属该类）。
+      </ElAlert>
+
+      <ElAlert type="info" :closable="false" show-icon class="d-alert">
+        <template #title>这个入口在做什么</template>
+        {{ TRIGGER_BUSINESS_EXPLAIN[TRIGGER] }}
       </ElAlert>
 
       <ElAlert type="info" :closable="false" show-icon class="d-alert">

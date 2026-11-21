@@ -15,6 +15,10 @@
   仅作本次 Candidate 的手工目标。
 
   Dialog 只收集载荷；父组件持 loading 并调 triggerBusinessEntry。
+
+  2026-11-20：按 v0.2 稿 §4 P09 §4.9.4「必须在页面上显示的业务解释」补两条用户可见口径
+    （依据《APS_V1_P01-P13_全页面业务设计统一收口核对稿_v0.2_20261114_四项审核修订版.md》）：
+    优先模式随选随显（NORMAL / EXPEDITE 全文）+ 入口语义说明（已有订单提前=软目标、不改正式交期）。
 -->
 <script setup lang="ts">
 import { nextTick, ref, watch } from 'vue'
@@ -34,7 +38,12 @@ import {
   ElTable,
   ElTableColumn
 } from 'element-plus'
-import { TRIGGER_RUN_MATRIX, validateScopeDraft } from '@/api/aps-v1'
+import {
+  PRIORITY_MODE_EXPLAIN,
+  TRIGGER_BUSINESS_EXPLAIN,
+  TRIGGER_RUN_MATRIX,
+  validateScopeDraft
+} from '@/api/aps-v1'
 import type { BusinessEntrySubmission, DomainKey, PriorityMode, ScopeDraft } from '@/api/aps-v1'
 import { useDomainStore } from '@/store/modules/aps/domain'
 
@@ -193,6 +202,7 @@ function onSubmit(): void {
           <ElRadioButton value="NORMAL">普通（NORMAL）</ElRadioButton>
           <ElRadioButton value="EXPEDITE">加急（EXPEDITE）</ElRadioButton>
         </ElRadioGroup>
+        <div class="explain-text">{{ PRIORITY_MODE_EXPLAIN[priorityMode] }}</div>
       </ElFormItem>
 
       <ElFormItem label="订单目标" required>
@@ -272,6 +282,11 @@ function onSubmit(): void {
         「手工目标交期」只用于本次重排计算，<strong>不会修改订单的正式交期</strong>。
       </ElAlert>
 
+      <ElAlert type="info" :closable="false" show-icon class="d-alert">
+        <template #title>这个入口在做什么</template>
+        {{ TRIGGER_BUSINESS_EXPLAIN[TRIGGER] }}
+      </ElAlert>
+
       <ElAlert v-if="errors.length > 0" type="error" :closable="false" show-icon class="d-alert">
         <template #title>校验未通过（{{ errors.length }}）</template>
         <ul class="err-list">
@@ -308,6 +323,13 @@ function onSubmit(): void {
   padding-left: 18px;
 }
 .muted-text {
+  color: var(--el-text-color-secondary);
+}
+.explain-text {
+  width: 100%;
+  margin-top: 6px;
+  font-size: 12px;
+  line-height: 1.6;
   color: var(--el-text-color-secondary);
 }
 </style>

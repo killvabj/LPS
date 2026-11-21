@@ -33,6 +33,11 @@
  *  - setCurrentVersion(id)：仅更新 currentVersionId ref，**不触发** /api/schedule/gantt 拉取
  *  - selectVersion(id)：更新 + 触发 fetch（Schedule / Gantt 页用）
  *  - 拆分理由：Explanation 页只需要 currentVersionId 渲染高亮，不需要 gantt 数据（避免切版本无意义拖一份大甘特图）
+ *
+ * 2026-11-20：任务清单请求参数补 `departmentIds`（依据《APS_V1_P01-P13 全页面业务设计统一收口
+ * 核对稿 v0.2》§4 P05「第一屏：…授权部门、资源设备或人工槽、Stage/工序/品番、任务状态及 MES
+ * 查询条件」）。后端 `GET /api/schedule/tasks/{planVersionId}` 已支持 `departmentIds`（逗号串），
+ * 前端此前没暴露该筛选 ⇒ 补进 `TaskListRequest` / 单飞 key / 取数透传三处。
  */
 
 import { defineStore } from 'pinia'
@@ -106,6 +111,8 @@ export interface TaskListRequest {
   to?: string
   resourceIds?: number[]
   stageCodes?: string[]
+  /** 生产部门 Id（后端收逗号串）；2026-11-20 补：P05 第一屏要能按授权部门筛 */
+  departmentIds?: number[]
   keyword?: string
   status?: string
   /** 三态：undefined=不过滤 / true=有 MES 工单号 / false=无 MES 工单号（**非**「无需 MES」分类） */
@@ -219,6 +226,7 @@ export const useScheduleStore = defineStore('aps.schedule', () => {
       req.to ?? '',
       (req.resourceIds ?? []).join(','),
       (req.stageCodes ?? []).join(','),
+      (req.departmentIds ?? []).join(','),
       req.keyword ?? '',
       req.status ?? '',
       req.hasWorkOrder === undefined ? '' : String(req.hasWorkOrder),
@@ -739,6 +747,7 @@ export const useScheduleStore = defineStore('aps.schedule', () => {
         to: request.to,
         resourceIds: request.resourceIds,
         stageCodes: request.stageCodes,
+        departmentIds: request.departmentIds,
         keyword: request.keyword,
         status: request.status,
         hasWorkOrder: request.hasWorkOrder,

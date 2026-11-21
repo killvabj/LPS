@@ -1,5 +1,5 @@
 /**
- * APS V1 4号位 — 运行治理 API（页面 9：运行与下发）
+ * APS V1 4号位 — 运行治理 API（页面 9：运行与版本管理；2026-11-20 由「运行与下发」改名）
  *
  * @owner 3号位（runs 列表 / recover / run/candidate）+ 5号位（active-plan / domain-status）
  * @see 4号位文档第 15-16 节（页面 9）

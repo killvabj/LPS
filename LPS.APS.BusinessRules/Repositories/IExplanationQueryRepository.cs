@@ -17,6 +17,8 @@ public interface IExplanationQueryRepository
         long? taskId = null,
         string? reasonCode = null,
         string? severity = null,
+        DateTime? occurredFrom = null,
+        DateTime? occurredTo = null,
         int skip = 0,
         int take = 100,
         CancellationToken ct = default);

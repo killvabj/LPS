@@ -79,6 +79,18 @@ public sealed class FinalTaskDraft
     /// </summary>
     public int OperationSeq { get; init; }
     public string TaskType { get; init; } = "NEW_REQUIREMENT";
+
+    /// <summary>
+    /// 是否关键路径（1号位 计算并填值；2号位 只落库，不反推、不二次判定）。
+    ///
+    /// <para><b>载体依据</b>：冻结 `07 字段说明 v5.1.17 §4.4`，`Task.IsCriticalPath`（BIT，1=关键路径）；
+    /// 该表由 1号位 产出、2号位 落库 ⇒ 本字段是 `FinalTaskDraft` 此前**缺失**的透传位。</para>
+    ///
+    /// <para><b>语义（1号位 2026-11-21 定死并公开）</b>：
+    /// `false` = **算过、且在本 PlanVersion/域内不在关键链上**，**不是**「未算」。
+    /// 未产出时保持默认 `false`（与既有落库行为一致，零行为变化）。</para>
+    /// </summary>
+    public bool IsCriticalPath { get; init; }
     /// <summary>
     /// 排定资源（非资源工序 UNCONSTRAINED/WAIT_ONLY 产出的 Task 为 NULL；0号位 2026-09-22 裁决「非资源工序 Task 可有 Operation+Start/End、Resource 为空」）。
     /// </summary>

@@ -25,6 +25,7 @@ public class BusinessFactIssueRepository : IBusinessFactIssueRepository
         string? issueType = null,
         string? keyword = null,
         string? factoryCode = null,
+        DateTime? occurredFrom = null, DateTime? occurredTo = null,
         int skip = 0,
         int take = 50,
         CancellationToken ct = default,
@@ -64,6 +65,9 @@ WHERE 1=1
     AND (@Kw IS NULL OR Detail LIKE @Kw OR BOMNO LIKE @Kw OR ParentMaterialCode LIKE @Kw OR ChildMaterialCode LIKE @Kw)
     AND (@UserFactoryCode IS NULL OR COALESCE(ExpectedFactory, ActualFactory) = @UserFactoryCode)
     AND (@HasFactories = 0 OR COALESCE(ExpectedFactory, ActualFactory) IN @AllowedFactories)
+    -- H2（11-21 4号位件）：发生时间区间=CreatedAt 落库时刻（两端都含；打印片批内时刻，跨批可筛）
+    AND (@OccurredFrom IS NULL OR CreatedAt >= @OccurredFrom)
+    AND (@OccurredTo IS NULL OR CreatedAt <= @OccurredTo)
 ORDER BY
     CASE Severity
         WHEN 'ERROR' THEN 0
@@ -87,6 +91,8 @@ OFFSET @Skip ROWS FETCH NEXT @Take ROWS ONLY";
             UserFactoryCode = string.IsNullOrWhiteSpace(factoryCode) ? null : factoryCode.Trim(),
             HasFactories = hasFactories,
             AllowedFactories = allowedFactories,
+            OccurredFrom = occurredFrom,
+            OccurredTo = occurredTo,
             Skip = skip,
             Take = take
         };
@@ -108,6 +114,7 @@ OFFSET @Skip ROWS FETCH NEXT @Take ROWS ONLY";
         string? issueType = null,
         string? keyword = null,
         string? factoryCode = null,
+        DateTime? occurredFrom = null, DateTime? occurredTo = null,
         int skip = 0,
         int take = 50,
         CancellationToken ct = default,
@@ -149,6 +156,8 @@ WHERE 1=1
     AND (@Kw IS NULL OR m.Detail LIKE @Kw OR m.MaterialCode LIKE @Kw)   -- 本源无单据号列，keyword 只打 Detail/MaterialCode（4号位件 §2.2 如实口径）
     AND (@UserFactoryCode IS NULL OR pc.FactoryCode = @UserFactoryCode)
     AND (@HasFactories = 0 OR pc.FactoryCode IN @AllowedFactories)
+    AND (@OccurredFrom IS NULL OR CreatedAt >= @OccurredFrom)
+    AND (@OccurredTo IS NULL OR CreatedAt <= @OccurredTo)
 ORDER BY
     CASE m.Severity
         WHEN 'ERROR' THEN 0
@@ -172,6 +181,8 @@ OFFSET @Skip ROWS FETCH NEXT @Take ROWS ONLY";
             UserFactoryCode = string.IsNullOrWhiteSpace(factoryCode) ? null : factoryCode.Trim(),
             HasFactories = hasFactories,
             AllowedFactories = allowedFactories,
+            OccurredFrom = occurredFrom,
+            OccurredTo = occurredTo,
             Skip = skip,
             Take = take
         };
@@ -190,6 +201,7 @@ OFFSET @Skip ROWS FETCH NEXT @Take ROWS ONLY";
         string? reviewStatus = null,
         string? issueType = null,
         string? keyword = null,
+        DateTime? occurredFrom = null, DateTime? occurredTo = null,
         int skip = 0,
         int take = 100,
         CancellationToken ct = default,
@@ -212,7 +224,8 @@ OFFSET @Skip ROWS FETCH NEXT @Take ROWS ONLY";
                 materialCode: materialCode, severity: severity,
                 reviewStatus: reviewStatus, issueType: issueType, keyword: keyword,
                 factoryCode: factoryCode, take: innerTake, ct: ct,
-                allowedFactories: allowedFactories);
+                allowedFactories: allowedFactories,
+                occurredFrom: occurredFrom, occurredTo: occurredTo);
             allIssues.AddRange(bomIssues);
         }
 
@@ -223,7 +236,8 @@ OFFSET @Skip ROWS FETCH NEXT @Take ROWS ONLY";
                 materialCode: materialCode, severity: severity,
                 reviewStatus: reviewStatus, issueType: issueType, keyword: keyword,
                 factoryCode: factoryCode, take: innerTake, ct: ct,
-                allowedFactories: allowedFactories);
+                allowedFactories: allowedFactories,
+                occurredFrom: occurredFrom, occurredTo: occurredTo);
             allIssues.AddRange(mscIssues);
         }
 
@@ -247,6 +261,7 @@ OFFSET @Skip ROWS FETCH NEXT @Take ROWS ONLY";
         string? issueType = null,
         string? keyword = null,
         string? factoryCode = null,
+        DateTime? occurredFrom = null, DateTime? occurredTo = null,
         CancellationToken ct = default,
         IReadOnlySet<string>? allowedFactories = null)
     {
@@ -264,7 +279,10 @@ WHERE 1=1
     AND (@IssueType IS NULL OR IssueType = @IssueType)
     AND (@Kw IS NULL OR Detail LIKE @Kw OR BOMNO LIKE @Kw OR ParentMaterialCode LIKE @Kw OR ChildMaterialCode LIKE @Kw)
     AND (@UserFactoryCode IS NULL OR COALESCE(ExpectedFactory, ActualFactory) = @UserFactoryCode)
-    AND (@HasFactories = 0 OR COALESCE(ExpectedFactory, ActualFactory) IN @AllowedFactories)";
+    AND (@HasFactories = 0 OR COALESCE(ExpectedFactory, ActualFactory) IN @AllowedFactories)
+    -- H2（11-21 4号位件）：发生时间区间=CreatedAt 落库时刻（两端都含；打印片批内时刻，跨批可筛）
+    AND (@OccurredFrom IS NULL OR CreatedAt >= @OccurredFrom)
+    AND (@OccurredTo IS NULL OR CreatedAt <= @OccurredTo)";
 
         var parameters = new
         {
@@ -275,7 +293,9 @@ WHERE 1=1
             Kw = string.IsNullOrWhiteSpace(keyword) ? null : "%" + keyword.Trim() + "%",
             UserFactoryCode = string.IsNullOrWhiteSpace(factoryCode) ? null : factoryCode.Trim(),
             HasFactories = hasFactories,
-            AllowedFactories = allowedFactories
+            AllowedFactories = allowedFactories,
+            OccurredFrom = occurredFrom,
+            OccurredTo = occurredTo
         };
 
         return await _connectionManager.QueryFirstOrDefaultAsync<int>(
@@ -290,6 +310,7 @@ WHERE 1=1
         string? issueType = null,
         string? keyword = null,
         string? factoryCode = null,
+        DateTime? occurredFrom = null, DateTime? occurredTo = null,
         CancellationToken ct = default,
         IReadOnlySet<string>? allowedFactories = null)
     {
@@ -309,7 +330,9 @@ WHERE 1=1
     AND (@IssueType IS NULL OR m.IssueType = @IssueType)
     AND (@Kw IS NULL OR m.Detail LIKE @Kw OR m.MaterialCode LIKE @Kw)
     AND (@UserFactoryCode IS NULL OR pc.FactoryCode = @UserFactoryCode)
-    AND (@HasFactories = 0 OR pc.FactoryCode IN @AllowedFactories)";
+    AND (@HasFactories = 0 OR pc.FactoryCode IN @AllowedFactories)
+    AND (@OccurredFrom IS NULL OR CreatedAt >= @OccurredFrom)
+    AND (@OccurredTo IS NULL OR CreatedAt <= @OccurredTo)";
 
         var parameters = new
         {
@@ -320,7 +343,9 @@ WHERE 1=1
             Kw = string.IsNullOrWhiteSpace(keyword) ? null : "%" + keyword.Trim() + "%",
             UserFactoryCode = string.IsNullOrWhiteSpace(factoryCode) ? null : factoryCode.Trim(),
             HasFactories = hasFactories,
-            AllowedFactories = allowedFactories
+            AllowedFactories = allowedFactories,
+            OccurredFrom = occurredFrom,
+            OccurredTo = occurredTo
         };
 
         return await _connectionManager.QueryFirstOrDefaultAsync<int>(
@@ -336,16 +361,23 @@ WHERE 1=1
         string? reviewStatus = null,
         string? issueType = null,
         string? keyword = null,
+        DateTime? occurredFrom = null, DateTime? occurredTo = null,
         CancellationToken ct = default,
         IReadOnlySet<string>? allowedFactories = null)
     {
         var total = 0;
         if (string.IsNullOrEmpty(source) || source == "BOM_WORKSET")
-            total += await CountBomWorksetIssuesAsync(materialCode, severity, reviewStatus,
-                issueType, keyword, factoryCode, ct, allowedFactories);
+            total += await CountBomWorksetIssuesAsync(
+                materialCode: materialCode, severity: severity, reviewStatus: reviewStatus,
+                issueType: issueType, keyword: keyword, factoryCode: factoryCode,
+                ct: ct, allowedFactories: allowedFactories,
+                occurredFrom: occurredFrom, occurredTo: occurredTo);
         if (string.IsNullOrEmpty(source) || source == "MATERIAL_STAGE_CONTEXT")
-            total += await CountMaterialStageContextIssuesAsync(materialCode, severity, reviewStatus,
-                issueType, keyword, factoryCode, ct, allowedFactories);
+            total += await CountMaterialStageContextIssuesAsync(
+                materialCode: materialCode, severity: severity, reviewStatus: reviewStatus,
+                issueType: issueType, keyword: keyword, factoryCode: factoryCode,
+                ct: ct, allowedFactories: allowedFactories,
+                occurredFrom: occurredFrom, occurredTo: occurredTo);
         return total;
     }
 }

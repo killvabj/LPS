@@ -137,7 +137,8 @@ public class ScheduleQueryService : IScheduleQueryService
                 LEFT JOIN Resource r ON r.Id = t.ResourceId
                 LEFT JOIN ManualCapacitySlot ms ON ms.ManualSlotId = t.ManualSlotId
                 LEFT JOIN ProductionDepartment pd ON pd.Id = t.ProductionDepartmentId
-                LEFT JOIN TaskDispatch dpx ON dpx.SourceTaskId = t.Id";
+                LEFT JOIN TaskDispatch dpx ON dpx.SourceTaskId = t.Id
+                LEFT JOIN ext_MES_StageDict sd ON sd.StageCode = t.StageCode";
 
     /// <summary>P05 追加筛选片段（窗口/部门在 <see cref="GanttWindowPredicate"/>+DepartmentPredicate 里，不重复定义）。</summary>
     private const string TaskListFilterTail = @"
@@ -153,7 +154,8 @@ public class ScheduleQueryService : IScheduleQueryService
                 SELECT
                     t.Id AS TaskId, t.TaskNo, t.PlanVersionId,
                     t.MaterialId, m.MaterialCode, m.MaterialName,
-                    t.StageCode, t.OperationCode, t.OperationName,
+                    t.StageCode, sd.StageName, sd.CategoryName AS StageCategoryName,
+                    t.OperationCode, t.OperationName,
                     t.ResourceId, r.ResourceName, r.ResourceCode,
                     t.ManualSlotId, ms.SlotCode AS ManualSlotCode,
                     t.ProductionDepartmentId, pd.DeptName AS ProductionDepartmentName,
@@ -291,6 +293,7 @@ public class ScheduleQueryService : IScheduleQueryService
                 LEFT JOIN ManualCapacitySlot ms ON ms.ManualSlotId = t.ManualSlotId
                 LEFT JOIN ProductionDepartment pd ON pd.Id = t.ProductionDepartmentId
                 LEFT JOIN TaskDispatch dpx ON dpx.SourceTaskId = t.Id
+                LEFT JOIN ext_MES_StageDict sd ON sd.StageCode = t.StageCode
                 INNER JOIN PlanVersion pv ON pv.Id = t.PlanVersionId
                 LEFT JOIN ScheduleRun sr ON sr.Id = pv.SourceScheduleRunId
                 WHERE t.Id = @TaskId" + DepartmentPredicate("t"),
@@ -500,7 +503,11 @@ OPTION (MAXRECURSION 40)";
         // ── 组装：设备×日全矩阵（无排产无日历的日子=Calendar 未解析⇒①不适用；②恒 0） ──
         var sliceMap = slices.ToDictionary(s => (s.ResourceId, DateOnly.FromDateTime(s.BusinessDate)));
         var resMeta = (await _connectionManager.QueryAsync<ResourceLoadResMeta>(
-            "SELECT Id AS ResourceId, ResourceCode, ResourceName FROM Resource WHERE Id IN @Ids",
+            @"SELECT r.Id AS ResourceId, r.ResourceCode, r.ResourceName,
+                     r.ProductionDepartmentId, pd.DeptCode AS DepartmentCode, pd.DeptName AS DepartmentName
+              FROM Resource r
+              LEFT JOIN ProductionDepartment pd ON pd.Id = r.ProductionDepartmentId
+              WHERE r.Id IN @Ids",
             new { Ids = universe }, db: DatabaseId.APS)).ToDictionary(x => x.ResourceId);
         var resolvedIds = resolved.Select(x => x.ResourceId).ToHashSet();
 
@@ -532,6 +539,9 @@ OPTION (MAXRECURSION 40)";
                     ResourceId = rid,
                     ResourceCode = meta?.ResourceCode,
                     ResourceName = meta?.ResourceName,
+                    ProductionDepartmentId = meta?.ProductionDepartmentId,
+                    DepartmentCode = meta?.DepartmentCode,
+                    DepartmentName = meta?.DepartmentName,
                     BusinessDate = day,
                     ScheduledHours = sched,
                     TaskCount = hasSlice ? sc!.TaskCount : 0,
@@ -583,6 +593,9 @@ OPTION (MAXRECURSION 40)";
         public int ResourceId { get; init; }
         public string? ResourceCode { get; init; }
         public string? ResourceName { get; init; }
+        public int? ProductionDepartmentId { get; init; }
+        public string? DepartmentCode { get; init; }
+        public string? DepartmentName { get; init; }
     }
     // ─────────────────────────────── A6/A7 段结束 ───────────────────────────────
 
@@ -735,7 +748,11 @@ OPTION (MAXRECURSION 40)";
                 t.MTS_InstructionNo           AS MTS_InstructionNo,
                 t.StageExecutionBatchDraftKey AS StageExecutionBatchKey,
                 t.StageExecutionBatchQty      AS StageExecutionBatchQty,
-                CAST(NULL AS BIT)             AS IsCriticalPath,   -- B5(11-05) 未判定：列恒写死false，不拿假false冒充判定（真值归1号位，已标转办）
+                -- 2026-11-21 改：原 CAST(NULL AS BIT)（B5 未判定）会让「即使 DB 有真值、前端仍恒显示未判定」。
+                --   1号位 2026-11-21 来件 §5.2 指出读侧是对称的第二处（写侧在 PeggingOrchestrator）。
+                --   现直读 Task.IsCriticalPath（非空 bool）；语义由 1号位 定死：
+                --   false = 算过且不在关键链上，不是「未算」。
+                t.IsCriticalPath              AS IsCriticalPath,
                 -- Duration 库值单位=小时，与冻结 07 字段说明 `:3696`「单位：小时」一致（v5.1.16 `:3703` 同位同文）。
                 --   落库口径（2号位 PeggingOrchestrator，`Duration-2` 2026-10-26 起）：
                 --   命中＝`(EffectiveProcessMinutes + SetupTime) / 60`（工时，不含跨日历中断）；

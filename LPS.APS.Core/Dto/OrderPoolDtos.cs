@@ -35,6 +35,10 @@ public sealed class OrderPoolResultDto
 public sealed class OrderPoolItemDto
 {
     public string OrderNo { get; init; } = string.Empty;
+    /// <summary>J1（11-20 4号位件）：`Order_Canonical.Id`——与 `[Order].Id` **非同一 ID 空间**（禁互相顶替）。
+    /// 老单行取自 `[Order].OrderCanonicalId` 列（999473 实测 10,247/10,247 稠密）；新单行=canonical 行自身 Id。
+    /// 场景 3/4「正式纳入」按此键指认目标订单；canonical 无该单号 ⇒ null=未提供。</summary>
+    public long? OrderCanonicalId { get; init; }
     /// <summary>[Order].Id——**仅 ACTIVE 池行有**；纯新单返回 null（WHATIF 入口按 OrderNo+canonical 身份起，域内 Id 归 2号位 装载后才有）。</summary>
     public long? OrderId { get; init; }
     /// <summary>SALES_ORDER / PRODUCTION_INSTRUCTION（词表同 P02）。</summary>

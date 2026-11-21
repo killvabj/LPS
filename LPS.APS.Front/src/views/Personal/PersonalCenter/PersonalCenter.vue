@@ -6,9 +6,13 @@
  *   —— 依据 3号位《个人中心改资料与改密码端点落码_回执 v1.0_20261117》Q3 / §四。
  *   - 左侧读 `GET /api/auth/me`（`userCode` / `userName` / `roles`），角色码翻中文（`roleLabelOf`）。
  *   - Q3：**撤头像入口**（本轮后端不出头像端点，不留假按钮）⇒ 头像只作静态展示，不可点。
- *   - §四-1：`/me` **仍不含** Email / PhoneNumber ⇒ 左侧这两项在页加载时显示「未提供」，
- *     改完资料后用 R1 回包里的值刷新（刷新页面后又回到「未提供」——这是后端当前的能力边界，不是假数据）。
- *   - §四-2：改完资料姓名来自 JWT claim ⇒ 已在 EditInfo 里重签 token，本页姓名按回包值立即刷新。
+ *
+ * 2026-11-18（第二封）：`/me` **已补** `email` / `phoneNumber`，且**显示名改读 DB**
+ *   —— 依据 3号位《个人中心me补邮箱手机号与显示名读库_回执 v1.0_20261118》R1。
+ *   - 左侧「手机号码 / 用户邮箱」**页加载即读 `/me` 真值**；库里没填 ⇒ 显示「未提供」
+ *     （不编造、不推断成「已清空」）。
+ *   - 姓名取 `/me` 的 `userName`（后端已改读 `[User].DisplayName`）⇒ 改完资料**立即生效**，
+ *     不再等 token 重签（EditInfo 里的重签保留为保险，无害）。
  */
 
 import { ContentWrap } from '@/components/ContentWrap'
@@ -44,7 +48,9 @@ async function loadProfile(): Promise<void> {
   profile.userCode = info.userCode
   profile.userName = info.userName
   profile.roles = info.roles ?? []
-  // /me 不返回邮箱/手机号（3号位 §四-1）⇒ 页加载时留空，显示「未提供」
+  // 邮箱/手机号：3号位 R1 已补进 `/me` ⇒ 页加载即读真值；库里没填 ⇒ 留空显示「未提供」
+  profile.email = info.email ?? ''
+  profile.phoneNumber = info.phoneNumber ?? ''
 }
 
 const activeName = ref('first')
@@ -53,7 +59,7 @@ onMounted(() => {
   void loadProfile()
 })
 
-/** 改资料成功：左栏用后端回包的三项刷新（邮箱/手机号只有这里才有真值） */
+/** 改资料成功：左栏用后端回包的三项刷新（回包即落库后的真值） */
 function onProfileUpdated(result: UpdateProfileResult): void {
   profile.userName = result.userName || profile.userName
   profile.email = result.email ?? ''

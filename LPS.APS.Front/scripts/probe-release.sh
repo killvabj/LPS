@@ -1,5 +1,6 @@
 #!/bin/bash
 set -e
+# ⚠️ 本脚本**保留 admin**：要打 /api/demand-protection/release（仅 admin 可写）（3号位 2026-11-19 回执 §3.2 过渡期乙：dev 与生产共用 APS_Auth，admin 登录会顶掉生产会话）
 TOKEN=$(curl -sk -X POST https://localhost:7044/api/auth/login -H "Content-Type: application/json" -d '{"userCode":"admin","password":"Admin@123456"}' | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>console.log(JSON.parse(d).data.accessToken))")
 echo "TOKEN: ${TOKEN:0:20}..."
 

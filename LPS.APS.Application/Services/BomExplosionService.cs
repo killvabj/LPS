@@ -36,7 +36,7 @@ public interface IBomExplosionService
     /// 去重逐层结构（阶段2 Allocation 骨架）：共享子件合并为一行带父边列表，每物料取其最深出现层
     /// （LLC 语义，保证所有父件均已先净额），采购件即叶（对齐旧 TraverseBomNode 不下钻）。
     /// </summary>
-    IReadOnlyList<BomLevelNode> ExplodeOrderStructure(BomStructure structure, BomOrderDemand root);
+    IReadOnlyList<BomLevelNode> ExplodeOrderStructure(BomStructure structure, BomOrderDemand root, bool bomSourceProven = true);
 }
 
 /// <summary>BOM 结构展开纯函数层实现（无状态、无副作用）。</summary>
@@ -101,7 +101,8 @@ public sealed class BomExplosionService : IBomExplosionService
         }
     }
 
-    public IReadOnlyList<BomLevelNode> ExplodeOrderStructure(BomStructure structure, BomOrderDemand root)
+    public IReadOnlyList<BomLevelNode> ExplodeOrderStructure(
+        BomStructure structure, BomOrderDemand root, bool bomSourceProven = true)
     {
         ArgumentNullException.ThrowIfNull(structure);
         ArgumentNullException.ThrowIfNull(root);
@@ -231,6 +232,16 @@ public sealed class BomExplosionService : IBomExplosionService
             {
                 resolvedFactoryId = root.FactoryId;
                 source = BomFactorySource.SameAsParent;
+            }
+            // ★ 2026-11-21（0号位 v1.1 §7）：订单级 BOM 入口不可证（无锚点/锚点 BOMNO 本批无行 ⇒ 用并集展开）时，
+            //   **不得按并集 BOM 的 `ChildRequiredFactory` 改厂** —— 并集里的边可能来自别的订单的 BOM，
+            //   据此改厂＝0号位 明令禁止的「(Parent,Child) 全库反查推断跨厂」，会把别厂库存当本地现货、
+            //   并凭空产生别厂制造需求。此分支保持父厂、标记 `BomSourceUnproven`，由主链计数并进 Issue。
+            //   实测：本 PV 53,374 单中 9,472 单（17.7%）无 RESOLVED 锚点。
+            else if (!bomSourceProven && !string.IsNullOrWhiteSpace(requiredFactoryCode))
+            {
+                resolvedFactoryId = parentFactoryId;
+                source = BomFactorySource.BomSourceUnproven;
             }
             else if (string.IsNullOrWhiteSpace(requiredFactoryCode))
             {

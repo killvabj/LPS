@@ -14,8 +14,61 @@
  *  （⚠️ 参数集发布是**独立权限**，`aps.rule.publish` 不覆盖它 —— 后端 Controller:228 挂 ParameterPublish）
  *
  * 2026-11-18：跨厂LT 标准参数改走**通用参数集版本接口**（第 6 号内容子块 `crossFactoryLeadTimeRulesJson`）；
- *   专属读写端点已删除（调用会 404）⇒ 读通用版本详情、写通用版本 PUT，写完**回读核对**（后端未部署时会静默忽略）。
+ *   专属读写端点已删除（调用会 404）⇒ 读通用版本详情、写通用版本 PUT，写完**回读核对**。
  *   —— 依据 3号位《跨厂LT 走通用参数接口与快照保留_回执 v1.1_20261117》。
+ *
+ * 2026-11-18（第二封）：3号位《跨厂LT早退吞块修复与停用整块口径_回执 v1.0_20261118》
+ *   —— 回读核对**保留**（3号位 §三 R3：跨层正确性的最终防线）；**前端零行为改动**：
+ *   - 「吞块」的根因已由后端查明并修复（`EnsureParameterSetNormalized` 在「五主题皆空」时早退，
+ *     早退先于本块归一化 ⇒ 提交值无处落、读回是旧值/空）；3号位已把早退条件并入本块判空。
+ *   - 「本版不用本块」的唯一表达 = 全部行 `IsActive=false`（裁甲）⇒ 零行**不能发**，
+ *     停用请关掉那一行的「生效」（提示文案已如此，见 `crossFactoryLtError`）。
+ *
+ * 2026-11-19：3号位 r14280 合批**已部署到 dev**（跨厂LT 子块 + 个人中心三端点），
+ *   联调实测（4号位 × 3号位 V1~V8）：该块 PUT 带回读一致 ⇒ **不再是「读不到/写不进」**。
+ *   ⇒ 写后回读不通过时的提示**不再断言「子块尚未部署」**（那已是过时的原因），
+ *     改成中性说法：读回来还是原内容 ⇒ 没存上，让用户重试或找管理员。
+ *   —— 依据 3号位《两封回执认账收讫_合批已提交SVN_r14280_请按V1至V8与V1至V10联调回告_回执 v1.0_20261119》。
+ *
+ * 2026-11-19：3号位《两清单联调全通核证归档_口径补正认账_V6保持现行契约_归档回执 v1.0_20261119》
+ *   —— **前端零行为改动**；两条已裁定口径钉进注释（防后人误改）：
+ *   - **V6 拦截阶段＝发布期／装载期，PUT 期透传不拦**（该函 §二：「保持现行契约、不采 PUT 期拦截」）：
+ *     后端 PUT `[]` 会 200 写入并原样回读；`CROSS_FACTORY_LT_BLOCK_EMPTY` 只在**发布/校验期**与
+ *     **装载期** fail-closed ⇒ **不要**把文案或逻辑改成「保存时后端会拒 `[]`」——
+ *     保存期后端是**透传**的，错误出现在**校验/发布期**。
+ *     ⚠️ 2026-11-19（用户指示）本 store 的「零行不发」源头纪律**已作废**，见下条。
+ *   - **V3b 判据改写**（该函 §一 1.1 认账）：版本 GET 不回快照顶层键
+ *     ⇒「回读得到该块」＝「快照顶层已有该键」；写后回读核对仍是唯一可观测判据。
+ *
+ * 2026-11-19（用户指示，本轮）：跨厂LT 的拦截**从「保存草稿」挪到「校验草稿 / 发布」** ——
+ *   - 「保存草稿」**不再**因跨厂LT 被拦（行没填全、一行都没有，先都存下来）；
+ *   - 发送口径：本块**被改过**才带这个键（不带＝保留既有块）；带就以编辑态为准 ——
+ *     **零行也照发 `[]`**（后端 PUT 期透传 ⇒ 存下来了，服务器状态＝编辑态）；
+ *   - 拦截落在后端**校验/发布**期：`CROSS_FACTORY_LT_BLOCK_EMPTY`（键存在但零行）/
+ *     `INVALID_CROSS_FACTORY_LT`（逐条校验不过）⇒ 前端只做中文翻译（validationMessages.ts）；
+ *   - 另加一道**发布前**零行守卫（说人话，避免用户点到发布才吃技术错误）；
+ *   - 校验期若本地还有未保存改动，补一条提示「这次校验的是已保存的内容」。
+ *   ⚠️ 连带后果（已在编辑器里写进提示）：**这一块的键一旦存在就删不掉** ——
+ *   后端 `TryAddBlock` 空白即跳过 + 兜底保留既有快照块 ⇒ 零行存下去后，
+ *   只能加回一行（把「生效」关掉）才能恢复成可发布状态。
+ *
+ * 2026-11-19（用户指示，第二封）：**保存草稿不再弹「变更原因」框，点一下直接存**。
+ *   依据：后端保存草稿的 UPDATE 语句**没有 `Remarks` 列**（`ParameterSetVersionRepository.UpdateAsync`），
+ *   审计 `Remark` 写死「参数集版本更新」⇒ 用户填的变更原因**后端既不收也不存** ⇒ 弹框撤除。
+ *   ⚠️ **发布**的原因仍然要填：publish 端点把 `changeReason` 写进审计 `Remark`。
+ *
+ * 2026-11-19（第三封）：3号位《跨厂LT零行保存期不拦认可_键删不掉裁甲维持现状_回执_v1.0_20261119》
+ *   —— **前端零行为改动**（该函 §一 三块全部认可：保存期不拦照发 `[]`、发布前零行守卫 +
+ *     `validateDraft()` 的「校验的是已保存内容」提示 + 两个错误码汉化、`crossFactoryLtKeyPresent`
+ *     区分缺块 / 键存在零行）；本轮只把两条**已裁定**口径钉进注释（防后人误改）：
+ *   - **裁甲（维持现状）**：「键删不掉」是 11-18 R2 裁甲的**既定契约形态**、**非实现缺口**
+ *     （该函 §2.1 实读 `GovernanceVersionService.cs:1868-1900`：`TryAddBlock` 空白即跳过 +
+ *     兜底保留既有块 ⇒ 永不删除）⇒ 前端**不提供删键表达**（专属端点 / 传 `null` /
+ *     通用接口显式清空标记一律不做，沿续 R2 已否决方向；该函 §二.3 **乙不采**）。
+ *   - **前端体验定稿**：行删光时的**非阻断**提示「删掉最后一行没法撤回（这一块的键删不掉），
+ *     只能加回一行并把『生效』关掉」＝ 采纳 4号位 甲案，**即定稿**（该函 §2.2 第 3 条）。
+ *     ⚠️ 提示归提示，**保存期仍不拦**（拦截在「校验 / 发布」这一步）。
+ *   ⚠️ 若再遇用户「想删掉这一块」诉求：按「加回一行＋关生效」口径引导，**不另建表达**（该函 §四）。
  */
 
 import { defineStore } from 'pinia'
@@ -84,7 +137,6 @@ import {
 import {
   parseCrossFactoryLeadTimeRules,
   serializeCrossFactoryLeadTimeRules,
-  validateCrossFactoryLeadTimeRules,
   type CrossFactoryLeadTimeItem
 } from '@/api/aps-v1/crossFactoryLeadTime'
 import { mockActor } from '@/api/aps-v1/rule'
@@ -194,9 +246,34 @@ export const useParameterSetsStore = defineStore('aps.parameterSets', () => {
   const crossFactoryLtRows = ref<CrossFactoryLeadTimeItem[]>([])
   /** 上次已保存的快照指纹（判断这块有没有未保存改动） */
   const crossFactoryLtSavedJson = ref('[]')
+  /**
+   * 快照顶层**有没有**这个键（`$.CrossFactoryLeadTimeRules`）
+   *
+   * ⚠️ 2026-11-19：区分两种「0 条」——
+   *   - 缺块（键不存在）＝ 这一版没配跨厂LT ＝ 合法，后端校验不阻断；
+   *   - 键存在但零行（`[]`）＝ 配置形态非法，后端校验/发布期报 `CROSS_FACTORY_LT_BLOCK_EMPTY`。
+   *   两者在前端都显示「0 条」，只有本标记能区分 ⇒ 发布前的零行拦截靠它。
+   */
+  const crossFactoryLtKeyPresent = ref(false)
   const crossFactoryLtLoading = ref(false)
-  const crossFactoryLtSaving = ref(false)
   const crossFactoryLtError = ref<string | null>(null)
+
+  /**
+   * 跨厂LT 那一块有没有未保存的改动
+   *
+   * ⚠️ 2026-11-19：原先这个标记只喂给「离开页面」的拦截（不喂页面的 dirty），
+   *   因为那时块内还有独立的「保存这块」按钮；该按钮撤掉后（跨厂LT 只随「保存草稿」提交），
+   *   本标记**并入**页面的 `dirty` ⇒ 改了这一块，「保存草稿」就能点、也标「未保存」。
+   *
+   * ⚠️ 两边都取**序列化后**的形态再比：`parse` 出的行键序（From/To/族/工时/生效）
+   *   与 `serialize` 出的键序（From/To/工时/生效/族）**不一样**，
+   *   直接比 `JSON.stringify(rows)` 会让「刚存完也显示未保存」。
+   */
+  const crossFactoryLtDirty = computed(
+    () =>
+      JSON.stringify(serializeCrossFactoryLeadTimeRules(crossFactoryLtRows.value)) !==
+      crossFactoryLtSavedJson.value
+  )
 
   const actor = ref(mockActor.name)
   const apsAuth = useApsAuthStore()
@@ -301,8 +378,16 @@ export const useParameterSetsStore = defineStore('aps.parameterSets', () => {
     }
   })
 
-  /** 当前缓冲是否脏 */
-  const dirty = computed(() => BLOCK_KEYS.some((b) => buffer.value.dirty[b]))
+  /**
+   * 当前缓冲是否脏
+   *
+   * ⚠️ 2026-11-19：跨厂LT 那一块（第 6 号内容子块）**并入**本标记 ——
+   *   该块原有的块内「保存这块」入口已撤（跨厂LT 只随「保存草稿」一起提交），
+   *   若不并入，用户改了这一块却看不到「未保存」、「保存草稿」按钮仍是灰的 ⇒ 改动无处可存。
+   */
+  const dirty = computed(
+    () => BLOCK_KEYS.some((b) => buffer.value.dirty[b]) || crossFactoryLtDirty.value
+  )
 
   /** 扁平化参数行（表格渲染用） */
   const flattenedRows = computed<ParameterRow[]>(() => {
@@ -386,10 +471,6 @@ export const useParameterSetsStore = defineStore('aps.parameterSets', () => {
   )
   /** ⑥ 跨厂LT 标准参数（顶层独立块 `$.CrossFactoryLeadTimeRules`；专属编辑器用） */
   const crossFactoryLtRules = computed<CrossFactoryLeadTimeItem[]>(() => crossFactoryLtRows.value)
-  /** 跨厂LT 那一块有没有未保存的改动（与 5 主题的 dirty 分开） */
-  const crossFactoryLtDirty = computed(
-    () => JSON.stringify(crossFactoryLtRows.value) !== crossFactoryLtSavedJson.value
-  )
 
   /**
    * 非阻断提示：选了非自动锚点方式、却没填锚点资源编码 ⇒ 运行时按「自动判定」处理。
@@ -922,6 +1003,7 @@ export const useParameterSetsStore = defineStore('aps.parameterSets', () => {
     if (!versionId) {
       crossFactoryLtRows.value = []
       crossFactoryLtSavedJson.value = '[]'
+      crossFactoryLtKeyPresent.value = false
       crossFactoryLtLoading.value = false
       return
     }
@@ -934,10 +1016,15 @@ export const useParameterSetsStore = defineStore('aps.parameterSets', () => {
               .crossFactoryLeadTimeRulesJson ?? null)
       const rows = parseCrossFactoryLeadTimeRules(raw)
       crossFactoryLtRows.value = rows
-      crossFactoryLtSavedJson.value = JSON.stringify(rows)
+      // 指纹取**序列化后**的形态（与 dirty 判据、写入载荷同形 ⇒ 存完必然「已保存」）
+      crossFactoryLtSavedJson.value = JSON.stringify(serializeCrossFactoryLeadTimeRules(rows))
+      // 键在不在快照顶层：`null`/空 ⇒ 缺块（这一版没配跨厂LT，合法）
+      crossFactoryLtKeyPresent.value =
+        raw !== null && raw !== undefined && String(raw).trim() !== ''
     } catch (err) {
       crossFactoryLtRows.value = []
       crossFactoryLtSavedJson.value = '[]'
+      crossFactoryLtKeyPresent.value = false
       crossFactoryLtError.value =
         err instanceof ApiError ? err.message : '读取跨厂LT 标准参数失败，请稍后重试'
     } finally {
@@ -948,8 +1035,9 @@ export const useParameterSetsStore = defineStore('aps.parameterSets', () => {
   /**
    * 写完核对：重新读通用版本详情，看这一块是不是真的落下去了
    *
-   * ⚠️ 为什么要有这一步：3号位 这一块**尚未部署**，未部署时通用 PUT 会**静默忽略**
-   *   这个不认识的键 ⇒ 接口报 200、页面提示「已保存」，实际一个字都没存。
+   * ⚠️ 为什么要有这一步（3号位 §三 R3：认收并要求**保留**）：
+   *   通用 PUT 是**请求回显**（200 不等于已落库），且后端曾有「五主题皆空 ⇒ 早退 ⇒
+   *   本块被静默吞掉、库里还是旧值/空」的真缺口（3号位 R1 已修）。
    *   读回来比对不一致 ⇒ 如实说「没存上」，不假装成功。
    *   读不回来（网络/报错）⇒ **不臆断**成失败，返回 true（没证据说没存上）。
    */
@@ -966,73 +1054,6 @@ export const useParameterSetsStore = defineStore('aps.parameterSets', () => {
       )
     } catch {
       return true
-    }
-  }
-
-  /**
-   * 保存跨厂LT 规则（走**通用参数集版本 PUT**；权限 aps.parameter.edit）
-   *
-   * ⚠️ 2026-11-18：专属写端点已被后端删除 ⇒ 改走 `PUT …/version/{id}`，
-   *   请求体带 `crossFactoryLeadTimeRulesJson`（3号位 v1.1）。
-   *  - **零行不能发**：后端发布校验把 `[]` 判非法（`CROSS_FACTORY_LT_BLOCK_EMPTY`），
-   *    新契约下也没有「删块」的表达方式 ⇒ 清空这一块被挡在门口，如实说明原因。
-   *  - 通用 PUT 是 full-object ⇒ 同时带上 5 主题（用**已保存**的那一份，
-   *    免得顺手把用户还没点「保存草稿」的主题改动一起存了）。
-   *  - 有校验问题时不提交（带病提交只会被发布校验拒回来）。
-   */
-  async function saveCrossFactoryLeadTimeRules(
-    items: CrossFactoryLeadTimeItem[]
-  ): Promise<boolean> {
-    const governance = buffer.value.governance
-    const versionId = governance?.id
-    if (!versionId || !governance) {
-      crossFactoryLtError.value = '版本标识缺失，无法保存跨厂LT 标准参数'
-      return false
-    }
-    if (!canWrite.value) {
-      crossFactoryLtError.value = '当前操作者无写权限（需权限码 aps.parameter.edit）'
-      return false
-    }
-    if (!items.length) {
-      crossFactoryLtError.value =
-        '这一块不能整块清空：后端把「零行」判非法（发布会被拦下）。要停用某条规则，请把那一行的「生效」关掉。'
-      return false
-    }
-    const problems = validateCrossFactoryLeadTimeRules(items)
-    if (problems.length) {
-      crossFactoryLtError.value = `还有 ${problems.length} 处要改，改完才能保存`
-      return false
-    }
-    const blocks = buffer.value.originalBlocks ?? buffer.value.workingBlocks
-    if (!blocks) {
-      crossFactoryLtError.value = '参数集草稿未载入，无法保存跨厂LT 标准参数'
-      return false
-    }
-    crossFactoryLtSaving.value = true
-    crossFactoryLtError.value = null
-    try {
-      const saved = serializeCrossFactoryLeadTimeRules(items)
-      const putBody = buildPutBody(governance, blocks, JSON.stringify(saved))
-      const result = await parameterSetApi.updateParameterSetDraft({
-        versionId,
-        body: putBody as ParameterSetVersion
-      })
-      buffer.value.governance = result
-      const persisted = await crossFactoryBlockPersisted(versionId, saved)
-      if (!persisted) {
-        crossFactoryLtError.value =
-          '这次改动没存上：后端还没接收这一块（跨厂LT 子块尚未部署），内容没变。'
-        return false
-      }
-      crossFactoryLtRows.value = saved
-      crossFactoryLtSavedJson.value = JSON.stringify(saved)
-      return true
-    } catch (err) {
-      crossFactoryLtError.value =
-        err instanceof ApiError ? err.message : '保存跨厂LT 标准参数失败，请稍后重试'
-      return false
-    } finally {
-      crossFactoryLtSaving.value = false
     }
   }
 
@@ -1090,6 +1111,11 @@ export const useParameterSetsStore = defineStore('aps.parameterSets', () => {
       buffer.value.workingBlocks = JSON.parse(JSON.stringify(buffer.value.originalBlocks))
     }
     buffer.value.dirty = emptyDirtyFlags()
+    // 跨厂LT 那一块也一并还原（2026-11-19：撤掉块内「保存这块」后，这一块只能随草稿保存）
+    if (crossFactoryLtSavedJson.value) {
+      crossFactoryLtRows.value = parseCrossFactoryLeadTimeRules(crossFactoryLtSavedJson.value)
+    }
+    crossFactoryLtError.value = null
   }
 
   /**
@@ -1099,19 +1125,25 @@ export const useParameterSetsStore = defineStore('aps.parameterSets', () => {
    *
    * 2026-11-18：跨厂LT 子块（第 6 号内容块）**随同一次 PUT 提交**
    *   —— 3号位《跨厂LT 走通用参数接口与快照保留_回执 v1.1_20261117》。
-   *   规则：
-   *   - 这一块**有行** ⇒ 带上（后端「提交值优先」）；
-   *   - 这一块**没有行** ⇒ **不带这个键**（不传＝本次不维护本块 ⇒ 后端保留既有快照值；
-   *     发 `[]` 会被发布校验判非法，不能这么干）。
+   *
+   * 2026-11-19（用户指示）：跨厂LT 的拦截**从「保存」挪到「校验/发布」** ——
+   *   ① 保存草稿**不再**因这一块被拦（行没填全、一行都没有，先都存下来）；
+   *   ② 发送口径：本块**被改过**才带这个键（不带＝保留既有块）；带就以编辑态为准 ——
+   *      **零行也照发 `[]`**（后端 PUT 期透传不拦；「键存在但零行」由后端在**校验/发布**期
+   *      报 `CROSS_FACTORY_LT_BLOCK_EMPTY` 拒掉 ⇒ 拦截落在用户要的那一步）；
+   *   ③ 「零行」由发布前的 `publish()` 守卫（说人话）+ 后端校验共同兜住，
+   *      保存期不再拦 —— 别让用户以为行删掉了却其实没存上。
+   *
+   * 2026-11-19（用户指示）：**保存草稿不再弹「变更原因」框，点一下直接存**。
+   *   依据：后端保存草稿的 UPDATE 语句里**没有 `Remarks` 列**
+   *   （`ParameterSetVersionRepository.UpdateAsync`），审计 `Remark` 写死「参数集版本更新」
+   *   ⇒ 用户填的变更原因**后端既不收也不存**，弹框纯属仪式 ⇒ 直接去掉。
+   *   ⚠️ **发布**那一步的原因仍然要填：publish 端点把 `changeReason` 写进审计 `Remark`。
    */
-  async function onSaveDraft(changeReason: string): Promise<boolean> {
+  async function onSaveDraft(changeReason = ''): Promise<boolean> {
     const buf = buffer.value
     if (!buf.governance || !buf.workingBlocks) {
       error.value = '参数集草稿未载入'
-      return false
-    }
-    if (!changeReason.trim()) {
-      error.value = '请填写变更原因'
       return false
     }
     const versionId = buf.governance.id
@@ -1123,12 +1155,13 @@ export const useParameterSetsStore = defineStore('aps.parameterSets', () => {
     error.value = null
     try {
       const ltRows = serializeCrossFactoryLeadTimeRules(crossFactoryLtRows.value)
-      const putBody = buildPutBody(
-        buf.governance,
-        buf.workingBlocks,
-        ltRows.length ? JSON.stringify(ltRows) : undefined
-      )
-      putBody.remarks = changeReason
+      // 本块被改过才带这个键：带＝以编辑态为准（零行也照发 `[]`，由后端在校验/发布期判非法）；
+      // 不带＝本次不维护本块 ⇒ 后端保留既有快照值。
+      const ltJson = crossFactoryLtDirty.value ? JSON.stringify(ltRows) : undefined
+      const putBody = buildPutBody(buf.governance, buf.workingBlocks, ltJson)
+      // 变更原因：后端保存草稿不落 Remarks 列（UPDATE 无该列）⇒ 默认不带；
+      // 万一调用方仍传了原因就带上（不影响后端，但保持载荷语义完整）。
+      if (changeReason.trim()) putBody.remarks = changeReason
       const result = await parameterSetApi.updateParameterSetDraft({
         versionId,
         body: putBody as ParameterSetVersion
@@ -1136,14 +1169,17 @@ export const useParameterSetsStore = defineStore('aps.parameterSets', () => {
       buf.governance = result
       buf.originalBlocks = JSON.parse(JSON.stringify(buf.workingBlocks))
       buf.dirty = emptyDirtyFlags()
-      if (ltRows.length) {
-        // 这一块随草稿一起提交了 ⇒ 写完核对一次（后端未部署时会静默忽略这个键）
+      if (ltJson !== undefined) {
+        // 这一块随草稿一起提交了 ⇒ 写完核对一次（读回来的内容与提交的不一致 ⇒ 这一块没存上）
         const persisted = await crossFactoryBlockPersisted(versionId, ltRows)
         if (persisted) {
           crossFactoryLtRows.value = ltRows
           crossFactoryLtSavedJson.value = JSON.stringify(ltRows)
+          // 键已经存在于快照顶层（哪怕零行）⇒ 发布期会按「键存在但零行」判非法
+          crossFactoryLtKeyPresent.value = true
         } else {
-          crossFactoryLtError.value = '跨厂LT 那一块没存上（后端尚未接收这一块），其余改动已保存。'
+          crossFactoryLtError.value =
+            '跨厂LT 那一块没存上（读回来的还是原来的内容），其余改动已保存。'
         }
       }
       // 草稿内容已落库 ⇒ 版本对比要按新内容重算（否则「我这次改了什么」还是旧值）
@@ -1197,6 +1233,17 @@ export const useParameterSetsStore = defineStore('aps.parameterSets', () => {
         return false
       }
       const result = await parameterSetApi.validateDraft(versionId)
+      // 校验的是**已保存的草稿内容**（后端读快照）⇒ 有未保存改动时补一句提示，
+      // 免得用户拿「编辑中」的内容去对「已保存」的校验结果。
+      if (dirty.value) {
+        result.warnings = [
+          ...(result.warnings ?? []),
+          {
+            code: 'UNSAVED_LOCAL_CHANGES',
+            message: '当前还有未保存的修改，这次校验的是「已保存」的草稿内容。'
+          }
+        ]
+      }
       lastValidation.value = result
       return result.isValid
     } catch (err) {
@@ -1215,6 +1262,14 @@ export const useParameterSetsStore = defineStore('aps.parameterSets', () => {
     }
     if (dirty.value) {
       error.value = '存在未保存的修改，请先保存草稿再发布'
+      return false
+    }
+    // 跨厂LT 零行（键在快照顶层、但一行都没有）＝ 配置形态非法，后端**校验 / 发布**期会拒
+    // （CROSS_FACTORY_LT_BLOCK_EMPTY）⇒ 这里先拦一道并说人话。
+    // ⚠️ 保存期**不拦**（2026-11-19 用户指示）：拦截落在「校验 / 发布」这一步。
+    if (crossFactoryLtKeyPresent.value && crossFactoryLtRows.value.length === 0) {
+      error.value =
+        '跨厂LT 标准参数这一块一行都没有，这个形态不合法（校验和发布都会被拦）：要停用某条规则请把那一行的「生效」关掉（别把行删光）。'
       return false
     }
     const versionId = displayedDraftVersionId()
@@ -1457,8 +1512,8 @@ export const useParameterSetsStore = defineStore('aps.parameterSets', () => {
     crossFactoryLtRules,
     crossFactoryLtDirty,
     crossFactoryLtLoading,
-    crossFactoryLtSaving,
     crossFactoryLtError,
+    crossFactoryLtKeyPresent,
     currentWarehouseRefs,
     currentUnknownWarehouseCodes,
     forkSourceRefs,
@@ -1481,7 +1536,6 @@ export const useParameterSetsStore = defineStore('aps.parameterSets', () => {
     setArrivalToUsableOffsets,
     setPlanningYields,
     loadCrossFactoryLeadTimeRules,
-    saveCrossFactoryLeadTimeRules,
     setCrossFactoryLeadTimeRules,
     checkForkSourceWarehouseRefs,
     onCancelDirty,

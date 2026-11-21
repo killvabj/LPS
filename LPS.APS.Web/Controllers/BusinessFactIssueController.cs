@@ -74,6 +74,8 @@ public class BusinessFactIssueController : ControllerBase
         [FromQuery] string? reviewStatus = null,
         [FromQuery] string? issueType = null,
         [FromQuery] string? keyword = null,
+        [FromQuery] DateTime? occurredFrom = null,   // H2：问题发生时间区间（CreatedAt 落库时刻，两端都含）
+        [FromQuery] DateTime? occurredTo = null,
         [FromQuery] int pageIndex = 1,
         [FromQuery] int pageSize = 20,
         CancellationToken cancellationToken = default)
@@ -97,11 +99,15 @@ public class BusinessFactIssueController : ControllerBase
 
             var skip = (pageIndex - 1) * pageSize;
             var items = await _service.QueryAllAsync(
-                source, materialCode, factoryCode, severity, reviewStatus,
-                issueType, keyword, skip, pageSize, cancellationToken, allowedFactories);
+                source: source, materialCode: materialCode, factoryCode: factoryCode,
+                severity: severity, reviewStatus: reviewStatus, issueType: issueType,
+                keyword: keyword, occurredFrom: occurredFrom, occurredTo: occurredTo,
+                skip: skip, take: pageSize, ct: cancellationToken, allowedFactories: allowedFactories);
             var total = await _service.CountAllAsync(
-                source, materialCode, factoryCode, severity, reviewStatus,
-                issueType, keyword, cancellationToken, allowedFactories);
+                source: source, materialCode: materialCode, factoryCode: factoryCode,
+                severity: severity, reviewStatus: reviewStatus, issueType: issueType,
+                keyword: keyword, occurredFrom: occurredFrom, occurredTo: occurredTo,
+                ct: cancellationToken, allowedFactories: allowedFactories);
 
             return ApiResponse<PageResult<BusinessFactIssueDto>>.Success(new PageResult<BusinessFactIssueDto>
             {

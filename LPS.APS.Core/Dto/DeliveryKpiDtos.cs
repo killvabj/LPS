@@ -18,7 +18,7 @@ public sealed class DeliveryKpiResultDto
     public string Caliber { get; init; } = string.Empty;
     /// <summary>计划完成时刻来源=同 PV Task MAX(PlannedEndTime)（读模型计算）；2号位正式列落库后此位切 formal。</summary>
     public string PlannedCompletionSource { get; init; } = "readmodel_task_max";
-    /// <summary>FG/WIP 维度拆分当前不具备权威映射（ProductFamily 无该属性、订单物料含 SEMI_FINISHED、前缀禁作判据）——true 才出该层分区。</summary>
+    /// <summary>FG/WIP 维度=**已具备**（0号位 11-20 裁后按标准 MaterialType 出四组 GROUPING SETS：总计/SO-PI/类型/交叉）。</summary>
     public bool FgWipDimensionAvailable { get; init; }
     /// <summary>可配置目标准交率：待 3号位 合同核对结论（Q-c 禁我方自选配置源）——现为 null 占位。</summary>
     public decimal? TargetPercent { get; init; }
@@ -33,6 +33,13 @@ public sealed class DeliveryKpiResultDto
 public sealed class DeliveryKpiRowDto
 {
     public string? OrderType { get; init; }
+    /// <summary>
+    /// FG/WIP 分区维度=**标准 Material 分类**（`Material.MaterialType` 原值：FINISHED_GOOD/SEMI_FINISHED/ASSY/RAW_MATERIAL/MFG），
+    /// 0号位 2026-11-20 裁：**不得按品番前缀/ERP工序属性/Routing 自行推断**；全部标准类型逐行列出、不合并、不隐藏
+    /// （FG=FINISHED_GOOD、WIP=SEMI_FINISHED 为两个业务桶，其余类型以其标准类型名自成一行=如实）。
+    /// null=该行不是类型维度行（总计行/仅 SO-PI 行）。实库核（11-20）：ACTIVE 六域全部根订单 0 例无法归类（MaterialId 孤儿 0）。
+    /// </summary>
+    public string? MaterialType { get; init; }
 
     /// <summary>分母=去重根订单总数（含未判定）。</summary>
     public int TotalOrders { get; init; }

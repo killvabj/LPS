@@ -613,14 +613,19 @@ DROP TABLE #tc;";
         var sql = TcPreamble + @"
 SELECT
     GROUPING(o.OrderType) AS IsGrandTotal,
+    GROUPING(m.MaterialType) AS IsMT,
     o.OrderType,
+    m.MaterialType,
     COUNT(*) AS TotalOrders,
     SUM(CASE WHEN " + RiskCaseExpr + @" = 'ON_TRACK' THEN 1 ELSE 0 END) AS OnTimeOrders,
     SUM(CASE WHEN " + RiskCaseExpr + @" = 'DELAYED' THEN 1 ELSE 0 END) AS LateOrders,
     SUM(CASE WHEN " + RiskCaseExpr + @" = 'UNSCHEDULED' THEN 1 ELSE 0 END) AS UndeterminedOrders"
-            + FromJoin + "\nLEFT JOIN #tc tc ON tc.OrderId = o.Id" + WherePart + riskPred + @"
-GROUP BY GROUPING SETS ((o.OrderType), ())
-ORDER BY IsGrandTotal DESC, o.OrderType
+            + FromJoin + "\nLEFT JOIN #tc tc ON tc.OrderId = o.Id"
+            // 0号位 11-20 裁：FG/WIP=标准 Material 分类（MaterialType），四组 GROUPING SETS 逐行出全、不合并。
+            + "\nLEFT JOIN Material m ON m.Id = o.MaterialId"
+            + WherePart + riskPred + @"
+GROUP BY GROUPING SETS ((o.OrderType), (m.MaterialType), (m.MaterialType, o.OrderType), ())
+ORDER BY IsGrandTotal DESC, IsMT DESC, m.MaterialType, o.OrderType
 DROP TABLE #tc;";
 
         var raw = (await _connectionManager.QueryAsync<KpiRow>(
@@ -633,11 +638,12 @@ DROP TABLE #tc;";
             Caliber = "计划预计按期率（非实际交付准交率）；日期级判定、当天完成=按期（0号位裁）；"
                       + "计划完成=同PV Task MAX(PlannedEndTime) 读模型计算；分母=去重根订单含未判定",
             PlannedCompletionSource = "readmodel_task_max",
-            FgWipDimensionAvailable = false,
+            FgWipDimensionAvailable = true,   // 0号位 11-20 裁：标准 MaterialType 为唯一判据（禁前缀/ERP属性/Routing 推断）
             TargetPercent = null,   // 待 3号位 合同核对（Q-c：我方不自选配置源）
             Rows = raw.Select(r => new DeliveryKpiRowDto
             {
                 OrderType = r.IsGrandTotal == 1 ? null : r.OrderType,
+                MaterialType = r.IsMT == 1 ? null : r.MaterialType,
                 TotalOrders = r.TotalOrders,
                 OnTimeOrders = r.OnTimeOrders,
                 LateOrders = r.LateOrders,
@@ -658,7 +664,9 @@ DROP TABLE #tc;";
     private sealed class KpiRow
     {
         public int IsGrandTotal { get; set; }
+        public int IsMT { get; set; }
         public string? OrderType { get; set; }
+        public string? MaterialType { get; set; }
         public int TotalOrders { get; set; }
         public int OnTimeOrders { get; set; }
         public int LateOrders { get; set; }
@@ -916,7 +924,8 @@ ORDER BY AllocationSequence",
 
         var sqlBody = @"
 sched AS (
-    SELECT o.OrderNo, o.Id AS OrderId, o.OrderType, o.MaterialCode, m.MaterialName,
+    SELECT o.OrderNo, o.Id AS OrderId, o.OrderCanonicalId,
+           o.OrderType, o.MaterialCode, m.MaterialName,
            o.Quantity, o.UOM AS Uom, o.CustomerDueDate AS DueDate,
            NULLIF(o.CustomerName, '') AS CustomerName, o.Status,
            'SCHEDULED' AS Participation,
@@ -928,7 +937,8 @@ sched AS (
     WHERE o.PlanVersionId = @Pv AND (@P = 'all' OR @P = 'scheduled')
 ),
 fresh AS (
-    SELECT c.OrderNo, CAST(NULL AS bigint) AS OrderId, c.OrderType, c.MaterialCode, m.MaterialName,
+    SELECT c.OrderNo, CAST(NULL AS bigint) AS OrderId, c.Id AS OrderCanonicalId,
+           c.OrderType, c.MaterialCode, m.MaterialName,
            c.Quantity, c.UOM AS Uom, c.DueDate,
            NULLIF(c.CustomerName, '') AS CustomerName, CAST(NULL AS nvarchar(50)) AS Status,
            'NOT_IN_PLAN' AS Participation,
@@ -955,7 +965,7 @@ WHERE (@Kw IS NULL OR OrderNo LIKE @Kw OR MaterialCode LIKE @Kw OR ISNULL(Custom
 
         var items = (await _connectionManager.QueryAsync<OrderPoolItemDto>(
             "SET NOCOUNT ON; WITH " + sqlBody + @"
-SELECT OrderNo, OrderId, OrderType, MaterialCode, MaterialName, Quantity, Uom, DueDate, CustomerName, Status,
+SELECT OrderNo, OrderId, OrderCanonicalId, OrderType, MaterialCode, MaterialName, Quantity, Uom, DueDate, CustomerName, Status,
        Participation, HasPlanningTasks, ScheduledTime
 FROM pool" + sqlFilter + @"
 ORDER BY DueDate, OrderNo

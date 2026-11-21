@@ -36,6 +36,7 @@ const BASE = arg('url', 'http://localhost:4001').replace(/\/$/, '')
 const SHOT_DIR = resolve(ROOT, arg('shot', '.tmp/audit-ui'))
 const CDP_PORT = 8800 + Math.floor(Math.random() * 90)
 const MARK = 'auditui' + Date.now().toString(36)
+// ⚠️ 本脚本**保留 admin**：页面 /aps/candidate 的路由门要 aps.candidate.confirm，rule_admin 无此码（3号位 2026-11-19 回执 §3.2 过渡期乙：dev 与生产共用 APS_Auth，admin 登录会顶掉生产会话）
 const USER = process.env.ORDER_USER || 'admin'
 const PWD = process.env.ORDER_PWD || 'Admin@123456'
 const API = process.env.VERIFY_API || 'https://localhost:7044'

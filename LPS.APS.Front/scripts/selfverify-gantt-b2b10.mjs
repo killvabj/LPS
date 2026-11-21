@@ -14,6 +14,22 @@
  *   ② 一个 id 下有多行断言 ⇒ 判红看该 id 的所有行
  *   ③ 被搜字面量必须**彻底消失**（改名要改到调用形一起断，不能只加后缀）
  *   ④ 字面量出现多次时要一次全改（all）
+ *
+ * 2026-11-19：随 5号位《复函V…》§二 R3″（双键名过渡期）落地同步修锚点：
+ *   · GT113 类型层 `mesWorkOrderNo?: string`（2 处）/`dataCutoffTime?: IsoDateTime`（3 处）
+ *     ⇒ 改 `all: true`（否则残留处仍满足判据 ⇒ 假绿）；
+ *   · GT85/GT113/GT116/GT111 四条锚点随代码改版同步（列名「MES下发状态」、份额读面换 A5
+ *     `shares[]`、U14 注释为现锚点）；
+ *   · **新增基线红线**：判据在基线即红时，它对任何变异都会「看起来红了」⇒ 变异不构成自证
+ *     ⇒ 本脚本先跑一次基线，把这类 id 标 BASELINE-RED 并跳过变异（不报假绿）。
+ *
+ * 2026-11-19（依据 5号位 2026-11-19《复函R3三键全收录…》§二 **V1.1 映射表三键版**）：
+ *   · **新增 GT127 五条变异**（键③ = P11 批次工序行 `dispatchStatus`，**行驱动、语义差一拍**）：
+ *     ①P11 列退回裸英文码 ②P11 列套用键①②的「不在下发队列」分类文案
+ *     ③P11 列把缺键解释成「未下发」 ④类型层缺键语义登记被抹掉（`all: true`，字面量 2 处）
+ *     ⑤键③被提前改名成 `mesDispatchStatus`（V1.1 破坏窗未核准 ⇒ 不得改）。
+ *   · GT113 的「缺键中性」判据本轮**收紧**为「键①②同一句『不在下发队列』」，
+ *     既有那条 `不在下发队列 → 没有下发记录`（all）的变异现同时覆盖抽屉/清单列/CSV 三处落点。
  */
 import { readFileSync, writeFileSync } from 'node:fs'
 import { spawnSync } from 'node:child_process'
@@ -24,6 +40,7 @@ const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 
 const GANTT = 'src/views/Aps/Gantt.vue'
 const SCHEDULE_TYPES = 'src/api/aps-v1/types/schedule.ts'
+const MES_TYPES = 'src/api/aps-v1/types/mes.ts'
 const COMMON_TYPES = 'src/api/aps-v1/types/common.ts'
 const MOCK = 'src/api/aps-v1/__mocks__/fixtures.ts'
 
@@ -31,10 +48,13 @@ const cases = [
   /* ===== GT113：MES 工单号 / 下发状态（详情 + 清单 + CSV 三处同源）===== */
   {
     // 类型层去掉工单号键 ⇒ 应转红
+    //   ⚠️ `mesWorkOrderNo?: string` 在 schedule.ts 出现 **2 次**（甘特行 DTO + P05 清单 DTO）
+    //     ⇒ 必须一次全改（all），否则第二处仍满足判据 ⇒ 假绿。
     id: 'GT113',
     file: SCHEDULE_TYPES,
     from: 'mesWorkOrderNo?: string',
-    to: 'mesWorkOrderNoX?: string'
+    to: 'mesWorkOrderNoX?: string',
+    all: true
   },
   {
     // 类型层去掉下发状态键 ⇒ 应转红
@@ -45,10 +65,12 @@ const cases = [
   },
   {
     // 详情抽屉不再读工单号 ⇒ 应转红
+    // ⚠️ 2026-11-18：详情面板的工单号已改读 `detailRow`（P06 详情行），
+    //   原锚点 `selectedTask.mesWorkOrderNo` 已不存在（锚点缺失＝这条没验过）⇒ 同步为现锚点。
     id: 'GT113',
     file: GANTT,
-    from: 'selectedTask.mesWorkOrderNo',
-    to: 'selectedTask.mesWorkOrderNoX',
+    from: 'detailRow?.mesWorkOrderNo',
+    to: 'detailRow?.mesWorkOrderNoX',
     all: true
   },
   {
@@ -68,6 +90,22 @@ const cases = [
     all: true
   },
   {
+    // 任务清单不再读 **P05 位键** `mesDispatchStatus`（双键过渡期的终名）⇒ 应转红
+    id: 'GT113',
+    file: GANTT,
+    from: 'row.mesDispatchStatus',
+    to: 'row.mesDispatchStatusX',
+    all: true
+  },
+  {
+    // 详情退回显示**裸英文码**（不走共享词典）⇒ 应转红
+    //   （同一权威位在甘特位/P05 位/P11 位三处显示必须一致）
+    id: 'GT113',
+    file: GANTT,
+    from: 'mesDispatchStatusLabel(selectedTask.dispatchStatus)',
+    to: 'selectedTask.dispatchStatus'
+  },
+  {
     // CSV 不再导出工单号列 ⇒ 应转红
     id: 'GT113',
     file: GANTT,
@@ -75,11 +113,12 @@ const cases = [
     to: ''
   },
   {
-    // 缺键文案从中性「未建单」改成断言式 ⇒ 应转红
+    // 缺键文案从中性「不在下发队列」改成断言式 ⇒ 应转红
+    //   （⚠️ 原锚点「未建单」已随文案改版消失 ⇒ 同步为现锚点）
     id: 'GT113',
     file: GANTT,
-    from: '未建单',
-    to: '没有工单',
+    from: '不在下发队列',
+    to: '没有下发记录',
     all: true
   },
 
@@ -110,10 +149,13 @@ const cases = [
   /* ===== GT115：类型层新增键齐全 ===== */
   {
     // 版本三键少一个 ⇒ 应转红
+    //   ⚠️ `dataCutoffTime?: IsoDateTime` 在 schedule.ts 出现 **3 次**
+    //     ⇒ 必须一次全改（all），否则残留处仍满足判据 ⇒ 假绿。
     id: 'GT115',
     file: SCHEDULE_TYPES,
     from: 'dataCutoffTime?: IsoDateTime',
-    to: 'dataCutoffTimeX?: IsoDateTime'
+    to: 'dataCutoffTimeX?: IsoDateTime',
+    all: true
   },
   {
     // 触发方式键被改名 ⇒ 应转红
@@ -154,11 +196,13 @@ const cases = [
   },
   {
     // 跨 Domain 阻挡展示位复活（B4：后端 V1 不做、恒缺键 ⇒ 展示位不得复活）⇒ 应转红
+    //   ⚠️ 2026-11-19：原锚点 `<!-- U04：TaskShare 一个 Task 承接多 Order -->` 已随
+    //     11-17 份额改读 A5 `shares[]` 消失 ⇒ 同步为现锚点（U14「展示位已撤」注释）。
     id: 'GT116',
     file: GANTT,
-    from: '<!-- U04：TaskShare 一个 Task 承接多 Order -->',
+    from: '<!-- U14：跨 Domain 共享设备阻挡 —— 展示位已撤（B4）。',
     to:
-      '<ElAlert v-if="selectedTask.crossDomainBlocked" type="error" :closable="false">\n                    <template #title>外排程域共享设备阻挡</template>\n                  </ElAlert>\n\n                  <!-- U04：TaskShare 一个 Task 承接多 Order -->'
+      '<ElAlert v-if="selectedTask.crossDomainBlocked" type="error" :closable="false">\n                    <template #title>外排程域共享设备阻挡</template>\n                  </ElAlert>\n\n                  <!-- U14：跨 Domain 共享设备阻挡 —— 展示位已撤（B4）。'
   },
   {
     // 跨域阻挡的死样式被加回来 ⇒ 应转红
@@ -213,9 +257,10 @@ const cases = [
   },
   {
     // CSV 的下发状态列被摘掉 ⇒ 应转红
+    //   ⚠️ 2026-11-19：列名已随复函V 收口改为「MES下发状态」（原「下发状态」锚点已不存在）
     id: 'GT85',
     file: GANTT,
-    from: "  '下发状态',\n",
+    from: "  'MES下发状态',\n",
     to: ''
   },
 
@@ -245,9 +290,11 @@ const cases = [
   /* ===== GT111：TaskShare 中性文案 / TaskSegments 展示位已撤 ===== */
   {
     // TaskShare 缺数据改成断言式文案 ⇒ 应转红
+    //   ⚠️ 2026-11-19：份额读面 11-17 起换 A5 `shares[]`，中性文案随之从
+    //     「未提供订单份额数据（TaskShare）」改写为「未提供订单份额数据」⇒ 同步为现锚点。
     id: 'GT111',
     file: GANTT,
-    from: '未提供订单份额数据（TaskShare）',
+    from: '未提供订单份额数据',
     to: '单 Order 任务'
   },
   {
@@ -266,13 +313,6 @@ const cases = [
     file: SCHEDULE_TYPES,
     from: "objectType?: 'TASK' | 'ORDER'",
     to: "objectTypeX?: 'TASK' | 'ORDER'"
-  },
-  {
-    // 清单「主要原因」不再标订单级（退回裸原因码）⇒ 应转红
-    id: 'GT117',
-    file: GANTT,
-    from: "  return top.objectType === 'ORDER' ? `${text}（订单级）` : text",
-    to: '  return text'
   },
   {
     // 抽屉三处「订单级」标签全摘掉 ⇒ 应转红
@@ -296,6 +336,51 @@ const cases = [
     from: "objectType: 'TASK',",
     to: "objectTypeX: 'TASK',",
     all: true
+  },
+
+  /* ===== GT127：键③（P11 批次工序行 `dispatchStatus`）行驱动、语义差一拍 =====
+   * 依据：5号位 2026-11-19 复函 §二 V1.1 映射表（三键版）键③ + 护栏语义表 r14286 第 19 行。
+   * 键③ 与键①②**差一拍**：行在则值必在；「缺键」＝该行不在本批列表
+   *   ⇒ 前端**按行渲染**，**不把①②的分类文案（「不在下发队列」）套到③上**。
+   */
+  {
+    // P11 列退回显示裸英文码（不走共享词典）⇒ 应转红
+    id: 'GT127',
+    file: GANTT,
+    from: 'mesDispatchStatusLabel(op.dispatchStatus)',
+    to: 'op.dispatchStatus'
+  },
+  {
+    // P11 列套用键①②的分类文案「不在下发队列」⇒ 应转红
+    //   （否则把「行不存在」与「行在但未下发」混成一类）
+    id: 'GT127',
+    file: GANTT,
+    from: '{{ mesDispatchStatusLabel(op.dispatchStatus) }}',
+    to: "{{ op.dispatchStatus ? mesDispatchStatusLabel(op.dispatchStatus) : '不在下发队列' }}"
+  },
+  {
+    // P11 列把缺键解释成「未下发」（断言式状态）⇒ 应转红
+    id: 'GT127',
+    file: GANTT,
+    from: '{{ mesDispatchStatusLabel(op.dispatchStatus) }}',
+    to: "{{ op.dispatchStatus ? mesDispatchStatusLabel(op.dispatchStatus) : '未下发' }}"
+  },
+  {
+    // 类型层缺键语义登记被抹掉（不再写「该行不在本批列表」）⇒ 应转红
+    //   ⚠️ 该字面量在 mes.ts 出现 **2 处**（文件头变更日志 + DTO 缺键语义注）
+    //     ⇒ 必须一次全改（all），否则残留处仍满足判据 ⇒ 假绿。
+    id: 'GT127',
+    file: MES_TYPES,
+    from: '该行不在本批列表',
+    to: '该行没有',
+    all: true
+  },
+  {
+    // 键③被**提前改名**成 `mesDispatchStatus`（V1.1 破坏窗未核准 ⇒ 不得改）⇒ 应转红
+    id: 'GT127',
+    file: GANTT,
+    from: 'op.dispatchStatus',
+    to: 'op.mesDispatchStatus'
   }
 ]
 
@@ -308,8 +393,32 @@ function run() {
   return (r.stdout || '') + (r.stderr || '')
 }
 
+/**
+ * 基线先跑一次，算出**基线即红**的判据 id。
+ *
+ * ⚠️ 为什么必须查基线：判据本身在基线就红的话，它对**任何**变异都会「看起来红了」
+ *   ⇒ 该条变异不构成自证（这正是「假绿」的一种）。
+ *   这类条不跑变异，直接报 BASELINE-RED ⇒ 先修判据，再回来自证。
+ */
+const baselineOut = run()
+const baselineRedIds = new Set(
+  baselineOut
+    .split('\n')
+    .filter((l) => l.includes('❌'))
+    .map((l) => (l.match(/GT\d+/) || [])[0])
+    .filter(Boolean)
+)
+if (baselineRedIds.size) {
+  console.log(`⚠️ 基线即红的判据（变异对它们不构成自证）：${[...baselineRedIds].join(', ')}\n`)
+}
+
 let allOk = true
 for (const c of cases) {
+  if (baselineRedIds.has(c.id)) {
+    console.log(`${c.id}: BASELINE-RED ⚠️（该判据基线即红 ⇒ 本条变异不构成自证，先修判据）`)
+    allOk = false
+    continue
+  }
   const p = join(ROOT, c.file)
   const orig = readFileSync(p, 'utf8')
   const eol = orig.includes('\r\n') ? '\r\n' : '\n'

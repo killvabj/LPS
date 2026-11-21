@@ -64,6 +64,33 @@
  *    （后端主数据表另有 44 条测试夹具 `TF_*`，直接铺全表会把测试厂推给用户）；
  *    拉不到就空下拉 + 如实报错，不硬编码兜底
  *  - 选中工厂时给一句口径提示：跨厂问题不归单一工厂，选了某个工厂就看不到它们
+ *
+ * 2026-11-21：按 v0.2 稿 §P08「计划异常与原因查询」逐条核对后落码
+ *   （依据《APS_V1_P01-P13_全页面业务设计统一收口核对稿_v0.2_20261114_四项审核修订版.md》
+ *    §二 P08 + §三 角色/权限一致 + §五 UI-15/Q09）
+ *   - 「部分P08问题不能无依据呈现为0」：分组计数只统计**已加载**的事实（首屏最多 1000 条，
+ *     点「继续加载」最多 5000 条）⇒ 未加载完时不再把 0 说成"这次排产没产生该类事实"，改显「未加载完」。
+ *   - 「没有原因显示原因未提供/未判定」：订单级清单行在**后端没写原因码**时，行标签由「未归类」改「原因未提供」。
+ *   - 「行内详情…可证证据」：订单级清单补「说明」列（证据 summary，后端真值，不编）。
+ *   - 「导航：订单回P02/P03、供给回P07/采购协同、Run失败到P10（仅有管理员权限时）」：
+ *     订单号可点跳订单页；业务事实问题按来源跳 PI位置 / 采购协同；跳 P10 只对管理员显示。
+ *
+ * 2026-11-21（续）：按 v0.2 稿 §P08「**仅一页，一张异常列表＋行内展开详情**」改页面结构
+ *   （依据同上 §二 P08；用户 11-21 指令「先弄日期范围筛选 + 页面结构（单表 + 行内展开）」）
+ *   - 排程解释事实**并成一张异常清单**：订单级 / 任务级 / 资源级 / 工段级 / 排程域级 /
+ *     未入字典类型全在一张表里，用新增的「对象类型」列区分。
+ *     ⇒ 原「任务 / 资源 / 工段级事实」三块小表**撤除**（11-10 用户「分别列出来」的口径由
+ *     「对象类型」列 + 对象类型筛选下拉承接；本次按 11-14 稿的单表口径执行）。
+ *   - 行内展开（ElTable type="expand"）：异常对象身份（对象类型/对象/物料/排程域/严重度/记录时间/
+ *     技术标识）、数量与日期、可证证据、正式 Explanation（无原因显「原因未提供 / 未判定」）、
+ *     相关影响对象、去哪处理（按对象类型落到 P02/P03、P04/P06、P07、P10）。
+ *   - 业务事实问题表同样加行内展开：问题说明全文 + 来源/降级动作/单据/时间 + 去查。
+ *   - 「待核对（未入字典 ObjectType）」不再另起一块清单，改成一句说明 + 条数；
+ *     逐条仍在上面的清单里以「待核对·<原值>」标签露出（不丢弃）。
+ *   - 「业务事实问题」仍是**另一张表**：端点不带 planVersionId ⇒ 跨版本汇总，与排程解释事实
+ *     不是同一批（已在页面写明；统一清单端点已出函请 5号位）。
+ *   - 日期范围筛选：**前端不做**（后端列表端点无时间参数）⇒ 已出函请 5号位加
+ *     occurredFrom/occurredTo（@see docs/4号位致5号位_函_P08异常解释页_需日期范围参数与统一清单端点_请回执_v1.0_20261121.md）。
  */
 
 import { computed, onMounted, reactive, ref, watch } from 'vue'
@@ -75,11 +102,14 @@ import type { PlanVersionSummaryDto } from '@/api/aps-v1/types/schedule'
 import { useExplanationStore } from '@/store/modules/aps/explanation'
 import { useScheduleStore } from '@/store/modules/aps/schedule'
 import { useDomainStore } from '@/store/modules/aps/domain'
+import { useApsAuthStore } from '@/store/modules/aps/auth'
 
 import {
   ElAlert,
   ElButton,
   ElCard,
+  ElDescriptions,
+  ElDescriptionsItem,
   ElEmpty,
   ElInput,
   ElOption,
@@ -103,11 +133,11 @@ import {
   reasonLabelOf,
   classifyExplanationReason,
   isConfigGapReasonCode,
-  type ExplanationEvidence,
   type ExplanationReasonClassKey,
   type ExplanationReasonMeta,
   type ExplanationSeverity,
-  type ReasonCodeCount
+  type ReasonCodeCount,
+  type ScheduleExplanationFact
 } from '@/api/aps-v1/types/explanation'
 import { stageLabelOf } from '@/api/aps-v1/types/stage'
 import { planVersionStatusLabel, planVersionStatusTag } from '@/api/aps-v1/types/common'
@@ -119,8 +149,16 @@ const route = useRoute()
 const explanationStore = useExplanationStore()
 const scheduleStore = useScheduleStore()
 const domainStore = useDomainStore()
+const apsAuth = useApsAuthStore()
 /** domainKey → 中文域名称（后端主数据；取不到时回退原键，不猜） */
 const domainLabelOf = (key?: string | null): string => domainStore.label(key as never)
+/**
+ * 能否跳「运行与下发」(P10)。
+ *
+ * v0.2 稿 §P08「导航」：*Run失败到P10（仅有管理员权限时）* ⇒ 非管理员不给这个入口。
+ * P10 的日常管理角色是**系统管理员**（稿 §三 角色表「P10唯一管理角色」）。
+ */
+const canGoRun = computed(() => apsAuth.isAdmin)
 const {
   data,
   loading,
@@ -221,6 +259,36 @@ interface FactRow {
   /** 卡在哪个大工艺阶段（后端 stageCode；195/996 有值，其余空；展示走 stageLabelOf 翻中文名） */
   stageCode: string
   severity: ExplanationSeverity
+  /**
+   * 可证证据摘要（后端 `evidence.summary`，后端真值，不编）。
+   * 2026-11-21（v0.2 稿 §P08「行内详情…可证证据」）：订单级清单补这一列
+   * —— 此前证据只在任务/资源/工段级表和「待核对」清单里出现，订单级行看不到。
+   */
+  evidenceSummary: string
+  /**
+   * 这一行**没有正式原因**（后端没写原因码、证据里也没有可认的原因）。
+   * v0.2 稿 §P08「没有原因显示原因未提供/未判定」⇒ 行标签显「原因未提供」，不拿「未归类」充数。
+   */
+  reasonMissing: boolean
+  /* ---- 2026-11-21（v0.2 稿 §P08「一张异常列表＋行内展开详情」）：并表后补的字段 ---- */
+  /** 对象类型原始码（ORDER / TASK / RESOURCE / STAGE / DOMAIN，或未入冻结字典的值） */
+  objectType: string
+  /** 对象类型中文标签（未入冻结字典 → 「待核对·<码>」） */
+  objectTypeLabel: string
+  /** 对象标识（后端派生：ORDER=需求号 / TASK=任务Id / RESOURCE=资源Id / STAGE=阶段码 / DOMAIN=域键） */
+  objectRef: string
+  /** 中文可读对象（订单号 / 阶段中文名 / 排程域名 …；取不到留空） */
+  objectLabel: string
+  /** 排程域中文名（ORDER / DOMAIN 级事实有；取不到留空） */
+  domainName: string
+  /** 记录时间（= 后端 createdAt；**不是**业务发生时间，别当交期用） */
+  occurredAt: string
+  /** 影响小时数（后端给的值；量纲不可信，只作参考） */
+  impactHours?: number
+  /** 订单 Id（ORDER 级；跳 P03 订单详情用） */
+  orderId?: number
+  /** 相关影响对象（证据里能取到的关联对象；取不到留空） */
+  relatedObjects: string
 }
 
 /** 数值取真值（非有限数 / 空 → undefined，不显示 0 假值） */
@@ -243,22 +311,26 @@ function fmtQty(n?: number): string {
 const orderFacts = computed(() => factsByObjectType.value.ORDER ?? [])
 const domainFacts = computed(() => factsByObjectType.value.DOMAIN ?? [])
 
-/** 任务 / 资源 / 工段三类非订单级事实（dev v999472 为 0 条，其它版本可能有）
- *  2026-11-10 用户口径：有就按层级"分别列出来"，不混在一张流水里。 */
-const OTHER_LEVEL_GROUPS = [
-  { key: 'TASK', label: '任务级事实' },
-  { key: 'RESOURCE', label: '资源级事实' },
-  { key: 'STAGE', label: '工段级事实' }
-] as const
+/** 对象类型 → 清单列用的中文标签（未入冻结字典 → 「待核对·<码>」）
+ *
+ *  2026-11-21（v0.2 稿 §P08「一张异常列表＋行内展开详情」）：订单级 / 任务级 / 资源级 /
+ *  工段级 / 排程域级**同列一张异常清单**，用「对象类型」列区分、并提供对象类型筛选
+ *  ⇒ 原先「任务 / 资源 / 工段级事实」三块小表撤除，类型口径保留在此表。
+ */
+const OBJECT_TYPE_LEVEL_LABELS: Record<string, string> = {
+  ORDER: '订单级',
+  TASK: '任务级',
+  RESOURCE: '资源级',
+  STAGE: '工段级',
+  DOMAIN: '排程域级'
+}
 
-const otherLevelGroups = computed(() => {
-  const g = factsByObjectType.value
-  return OTHER_LEVEL_GROUPS.map((grp) => ({
-    key: grp.key,
-    label: grp.label,
-    facts: g[grp.key] ?? []
-  })).filter((grp) => grp.facts.length > 0)
-})
+/** 对象类型 → 中文标签（未入冻结字典的按「待核对·<码>」如实露出，不丢弃） */
+function objectTypeLabelOf(raw: string): string {
+  const key = (raw ?? '').trim()
+  if (!key) return '未提供'
+  return OBJECT_TYPE_LEVEL_LABELS[key] ?? `待核对·${key}`
+}
 
 /** 分类卡展示顺序（固定；先"要你动手的"，后"别人处理/告知的"） */
 const REASON_CLASS_ORDER: ExplanationReasonClassKey[] = [
@@ -376,15 +448,117 @@ const factRows = computed<FactRow[]>(() =>
       classKey: meta.key,
       classMeta: meta,
       stageCode: (f.stageCode ?? '').trim(),
-      severity: f.severity
+      severity: f.severity,
+      evidenceSummary: (f.evidenceSummary ?? '').trim(),
+      // 「未归类」= 后端既没写原因码、证据里也没有可认的原因 ⇒ 这一行**原因未提供**
+      reasonMissing: meta.key === 'OTHER',
+      // 2026-11-21 并表：订单级事实的对象类型固定是 ORDER
+      objectType: 'ORDER',
+      objectTypeLabel: OBJECT_TYPE_LEVEL_LABELS.ORDER,
+      objectRef: (f.objectRef ?? '').trim(),
+      objectLabel: orderNo,
+      domainName: domainLabelOf(f.domainKey),
+      occurredAt: f.occurredAt ?? '',
+      impactHours: f.impactHours,
+      orderId: f.orderId,
+      relatedObjects: ''
     }
   })
 )
 
+/* ===== 异常清单：一张表承载所有对象类型（2026-11-21，v0.2 稿 §P08） =====
+ *
+ * 稿原文：「仅一页，一张异常列表＋行内展开详情」⇒ 订单级 / 任务级 / 资源级 / 工段级 /
+ * 排程域级 / 未入字典的类型 全部并进同一张清单，用「对象类型」列区分，
+ * 行内展开给身份 / 数量 / 日期 / 可证证据 / 正式 Explanation / 相关影响对象。
+ *
+ * ⚠️ 「业务事实问题」按设计是**跨版本**的另一批数据（后端端点不带 planVersionId），
+ *    现在并不进来 ⇒ 它仍是另一张表，页面上写明口径（统一清单端点已出函请 5号位）。
+ */
+
+/** 已加载的全部事实（含未入冻结字典的对象类型） */
+const allFacts = computed<ScheduleExplanationFact[]>(() => data.value?.scheduleExplanationFacts ?? [])
+
+/** 证据里能取到的关联对象（域级事实带样例物料 / 需求键样例） */
+function relatedObjectsOf(f: ScheduleExplanationFact): string {
+  const e = f.evidence ?? {}
+  const pick = (v: unknown): string[] => (Array.isArray(v) ? v.filter(Boolean).map(String) : [])
+  const samples = [...pick(e.planningYieldMissingSamples), ...pick(e.uncertainSamples)]
+  return samples.length ? samples.join('、') : ''
+}
+
+/** 非订单级事实 → 清单行（与订单级同一张表） */
+function otherFactRow(f: ScheduleExplanationFact): FactRow {
+  const meta = classifyExplanationReason(f)
+  const rawType = (f.objectType ?? '').trim()
+  const stageName = (f.stageCode ?? '').trim() ? stageLabelOf(f.stageCode) : ''
+  const domainName = domainLabelOf(f.domainKey)
+  const objectLabel =
+    rawType === 'STAGE'
+      ? stageName || '工段'
+      : rawType === 'DOMAIN'
+        ? domainName || '排程域'
+        : rawType === 'TASK'
+          ? stageName
+            ? `任务 · ${stageName}`
+            : '任务'
+          : rawType === 'RESOURCE'
+            ? '资源'
+            : '其他对象'
+  const reasonCode = (f.reasonCode ?? '').trim()
+  return {
+    factId: f.factId,
+    orderNo: '',
+    materialCode: (f.materialCode ?? '').trim(),
+    dueDate: undefined,
+    demand: undefined,
+    scheduled: undefined,
+    unscheduled: undefined,
+    qtyLabels: { demand: '需求', scheduled: '已排', unscheduled: '未排' },
+    isPi: false,
+    decisionCodeLabel:
+      reasonCode && !isConfigGapReasonCode(reasonCode) ? reasonLabelOf(reasonCode) : '',
+    classKey: meta.key,
+    classMeta: meta,
+    stageCode: (f.stageCode ?? '').trim(),
+    severity: f.severity,
+    evidenceSummary: (f.evidenceSummary ?? '').trim(),
+    reasonMissing: meta.key === 'OTHER',
+    objectType: rawType,
+    objectTypeLabel: objectTypeLabelOf(rawType),
+    objectRef: (f.objectRef ?? '').trim(),
+    objectLabel,
+    domainName,
+    occurredAt: f.occurredAt ?? '',
+    impactHours: f.impactHours,
+    orderId: undefined,
+    relatedObjects: relatedObjectsOf(f)
+  }
+}
+
+/** 异常清单（一张表）：订单级 + 任务/资源/工段/排程域级 + 未入字典类型 */
+const anomalyRows = computed<FactRow[]>(() => {
+  const others = allFacts.value
+    .filter((f) => (f.objectType ?? '').trim() !== 'ORDER')
+    .map(otherFactRow)
+  return [...factRows.value, ...others]
+})
+
+/** 清单里出现过的对象类型（供对象类型筛选下拉；带条数） */
+const objectTypeOptions = computed(() => {
+  const counts = new Map<string, number>()
+  for (const r of anomalyRows.value) counts.set(r.objectType, (counts.get(r.objectType) ?? 0) + 1)
+  return [...counts.entries()].map(([key, count]) => ({
+    key,
+    label: objectTypeLabelOf(key),
+    count
+  }))
+})
+
 /** 分类卡（按原因归类聚合；只列有数的类） */
 const reasonClassCards = computed(() => {
   const groups = new Map<ExplanationReasonClassKey, FactRow[]>()
-  for (const r of factRows.value) {
+  for (const r of anomalyRows.value) {
     const g = groups.get(r.classKey)
     if (g) g.push(r)
     else groups.set(r.classKey, [r])
@@ -405,6 +579,8 @@ const reasonClassCards = computed(() => {
 const keyword = ref('')
 const filterClass = ref<ExplanationReasonClassKey | ''>('')
 const filterSeverity = ref<ExplanationSeverity | ''>('')
+/** 对象类型筛选（2026-11-21 并表后新增：一张表里按类型分开看） */
+const filterObjectType = ref('')
 const sortBy = ref<'qty' | 'due'>('qty')
 const factPage = ref(1)
 const factPageSize = ref(50)
@@ -412,19 +588,35 @@ const factPageSize = ref(50)
 /** 筛选后的清单 */
 const filteredRows = computed<FactRow[]>(() => {
   const kw = keyword.value.trim().toLowerCase()
-  const rows = factRows.value.filter((r) => {
+  const rows = anomalyRows.value.filter((r) => {
     if (filterClass.value && r.classKey !== filterClass.value) return false
     if (filterSeverity.value && r.severity !== filterSeverity.value) return false
+    if (filterObjectType.value && r.objectType !== filterObjectType.value) return false
     if (kw) {
-      const hit = r.orderNo.toLowerCase().includes(kw) || r.materialCode.toLowerCase().includes(kw)
+      const hit =
+        r.orderNo.toLowerCase().includes(kw) ||
+        r.materialCode.toLowerCase().includes(kw) ||
+        r.objectLabel.toLowerCase().includes(kw)
       if (!hit) return false
     }
     return true
   })
-  const byQty = (a: FactRow, b: FactRow) =>
-    (b.unscheduled ?? 0) - (a.unscheduled ?? 0) ||
-    (b.demand ?? 0) - (a.demand ?? 0) ||
-    a.orderNo.localeCompare(b.orderNo)
+  const byQty = (a: FactRow, b: FactRow) => {
+    if ((b.unscheduled ?? 0) !== (a.unscheduled ?? 0)) {
+      return (b.unscheduled ?? 0) - (a.unscheduled ?? 0)
+    }
+    if ((b.demand ?? 0) !== (a.demand ?? 0)) {
+      return (b.demand ?? 0) - (a.demand ?? 0)
+    }
+    // 无数量的行（任务/资源/工段/排程域级）排在订单级之后，避免混进未排清单里
+    const aOrder = a.objectType === 'ORDER' ? 0 : 1
+    const bOrder = b.objectType === 'ORDER' ? 0 : 1
+    if (aOrder !== bOrder) return aOrder - bOrder
+    return (
+      (b.occurredAt ?? '').localeCompare(a.occurredAt ?? '') ||
+      a.objectLabel.localeCompare(b.objectLabel)
+    )
+  }
   const byDue = (a: FactRow, b: FactRow) => {
     const da = a.dueDate ?? ''
     const db = b.dueDate ?? ''
@@ -443,7 +635,7 @@ const pagedRows = computed(() => {
 })
 
 /** 筛选一变就回第 1 页（否则会停在不存在的页码上） */
-watch([keyword, filterClass, filterSeverity, sortBy], () => {
+watch([keyword, filterClass, filterSeverity, filterObjectType, sortBy], () => {
   factPage.value = 1
 })
 
@@ -457,9 +649,94 @@ function toggleClass(key: ExplanationReasonClassKey): void {
   filterClass.value = filterClass.value === key ? '' : key
 }
 
-/** 这类问题有没有对应页面可去修 */
+/**
+ * 这类问题有没有对应页面可去修。
+ *
+ * 2026-11-21（v0.2 稿 §P08 导航）：ENGINE 类跳「运行与下发」(P10) **只对管理员**给入口
+ *   （稿原文：「Run失败到P10（仅有管理员权限时）」）⇒ 非管理员这一栏显示「—」。
+ */
 function reasonActionOf(key: ExplanationReasonClassKey): { text: string; to: string } | undefined {
+  if (key === 'ENGINE' && !canGoRun.value) return undefined
   return REASON_ACTION[key]
+}
+
+/** 跳订单页（P02）：订单号是业务真标识，订单页支持 `?orderNo=` 深链 */
+function goOrder(orderNo: string): void {
+  const no = (orderNo ?? '').trim()
+  if (!no) return
+  router.push({ name: 'ApsOrder', query: { orderNo: no } })
+}
+
+/**
+ * 能否跳「排程域配置」页。
+ *
+ * 该页路由门控是 `aps.admin.system` 角色（见 router/modules/aps.ts）⇒ 非系统管理员不给入口。
+ */
+const canGoDomain = computed(() => apsAuth.isAdmin)
+
+/** 行内「去哪处理」的一个入口 */
+interface NavItem {
+  text: string
+  /** 路由目标（深链用对象，普通页用路径） */
+  to: string | { path: string; query?: Record<string, string> }
+}
+
+/**
+ * 一行异常可以去哪些专业页（v0.2 稿 §P08 导航）。
+ *
+ * 稿原文：*订单回P02/P03、供给回P07/采购协同、任务到P04/P06、Run失败到P10（仅有管理员权限时）*。
+ * ⇒ 订单级给「订单详情」（P03 订单结构）、任务/工段级给甘特图（P04/P06）、
+ *    资源级给甘特图负荷图层（P12）、排程域级给域配置页（仅系统管理员）。
+ *    配置缺口类的原因处理入口（批策略 / 资源日历）也一并挂在行上。
+ */
+function navsOf(row: FactRow): NavItem[] {
+  const list: NavItem[] = []
+  if (row.objectType === 'ORDER') {
+    if (row.orderId != null) {
+      list.push({
+        text: '去订单详情',
+        to: {
+          path: '/aps/order',
+          query: {
+            orderId: String(row.orderId),
+            planVersionId: String(currentVersionId.value ?? '')
+          }
+        }
+      })
+    }
+  } else if (row.objectType === 'TASK' || row.objectType === 'STAGE') {
+    list.push({ text: '去甘特图查任务', to: '/aps/gantt' })
+  } else if (row.objectType === 'RESOURCE') {
+    list.push({ text: '去甘特图查资源负荷', to: '/aps/gantt' })
+  } else if (row.objectType === 'DOMAIN' && canGoDomain.value) {
+    list.push({ text: '去排程域配置', to: '/aps/domain' })
+  }
+  const act = reasonActionOf(row.classKey)
+  if (act) list.push({ text: act.text, to: act.to })
+  return list
+}
+
+/** 跳到某个专业页 */
+function goNav(item: NavItem): void {
+  void router.push(item.to)
+}
+
+/**
+ * 业务事实问题 → 对应专业页（2026-11-21；v0.2 稿 §P08「按真实结果回到原专业页面」）。
+ *
+ * 只挂**后端真实有来源**的两类：生产指示位置未定位 → PI位置页；人工到货时间 → 采购协同页。
+ * BOM / 生产部门上下文这两类没有对应的专业页面 ⇒ 不给假入口。
+ */
+const BIZ_ISSUE_NAV: Record<string, { text: string; to: string }> = {
+  PI_POSITION: { text: '去生产指示位置', to: '/aps/pi' },
+  MANUAL_ETA: { text: '去采购协同', to: '/aps/procurement' }
+}
+function bizNavOf(source: string): { text: string; to: string } | undefined {
+  return BIZ_ISSUE_NAV[(source ?? '').trim()]
+}
+function goBizNav(source: string): void {
+  const n = bizNavOf(source)
+  if (n) router.push(n.to)
 }
 
 /** 这类问题的「处理入口」按钮文案 */
@@ -471,14 +748,6 @@ function reasonActionText(key: ExplanationReasonClassKey): string {
 function goReasonAction(key: ExplanationReasonClassKey): void {
   const a = REASON_ACTION[key]
   if (a) router.push(a.to)
-}
-
-/** 任意事实 → 原因分类（非订单级事实用） */
-function reasonMetaOf(f: {
-  reasonCode?: string
-  evidence?: ExplanationEvidence
-}): ExplanationReasonMeta {
-  return classifyExplanationReason(f)
 }
 
 /** 「问题」列的色调：配置缺口=黄（要动手），引擎/数据问题=蓝（别人处理），空=灰 */
@@ -1036,10 +1305,14 @@ watch(
         effect="plain"
         class="group-summary-tag"
       >
-        {{ g.label }} {{ g.count }}
+        {{ g.count > 0 ? g.count : factsHasMore ? '未加载完' : 0 }}
       </ElTag>
       <span class="group-summary-hint">
-        没有数据的分组显示 0 —— 代表这次排产没产生该类事实，不是漏了
+        {{
+          factsHasMore
+            ? `本版事实还没加载完（已显示 ${loadedFactsCount} 条 / 共 ${totalFactsText} 条）—— 标「未加载完」的分组不代表没产生，只是还没加载到`
+            : '没有数据的分组显示 0 —— 代表这次排产没产生该类事实，不是漏了'
+        }}
       </span>
     </div>
 
@@ -1105,7 +1378,7 @@ watch(
       <div class="fact-filters">
         <ElInput
           v-model="keyword"
-          placeholder="订单号 / 物料编码"
+          placeholder="订单号 / 物料编码 / 对象"
           clearable
           size="small"
           class="filter-keyword"
@@ -1121,6 +1394,21 @@ watch(
           <ElOption label="警告" value="WARN" />
           <ElOption label="提示" value="INFO" />
         </ElSelect>
+        <!-- 对象类型筛选（2026-11-21 并表后新增）：一张清单里按类型分开看 -->
+        <ElSelect
+          v-model="filterObjectType"
+          placeholder="对象类型"
+          clearable
+          size="small"
+          class="filter-select"
+        >
+          <ElOption
+            v-for="o in objectTypeOptions"
+            :key="o.key"
+            :label="`${o.label}（${o.count}）`"
+            :value="o.key"
+          />
+        </ElSelect>
         <ElSelect v-model="sortBy" size="small" class="filter-select">
           <ElOption label="按未排数量从多到少" value="qty" />
           <ElOption label="按交期从早到晚" value="due" />
@@ -1129,16 +1417,109 @@ watch(
           清除分类筛选
         </ElButton>
         <span class="filter-stat">
-          共 {{ filteredRows.length }} 条需求 · 未排合计 {{ fmtQty(filteredUnscheduledQty) }} 件
+          共 {{ filteredRows.length }} 条异常 · 未排合计 {{ fmtQty(filteredUnscheduledQty) }} 件
           <template v-if="orderIndexState === 'skipped'">（订单太多，未取交期）</template>
         </span>
       </div>
 
       <!-- ④ 未排需求清单 -->
+      <!-- ④ 异常清单（一张表 + 行内展开详情；2026-11-21 v0.2 稿 §P08）
+           订单级 / 任务级 / 资源级 / 工段级 / 排程域级 / 未入字典类型 全在一张表里，
+           用「对象类型」列区分；点行首箭头展开看身份 / 数量 / 日期 / 可证证据 /
+           正式 Explanation / 相关影响对象 / 去哪处理。 -->
       <ElTable v-if="pagedRows.length" :data="pagedRows" size="small" border class="fact-table">
+        <ElTableColumn type="expand" width="36">
+          <template #default="{ row }">
+            <div class="anomaly-detail">
+              <div class="ad-title">异常对象身份</div>
+              <ElDescriptions :column="3" size="small" border class="ad-desc">
+                <ElDescriptionsItem label="对象类型">
+                  {{ row.objectTypeLabel }}
+                </ElDescriptionsItem>
+                <ElDescriptionsItem label="对象">
+                  {{ row.objectLabel || '未提供' }}
+                </ElDescriptionsItem>
+                <ElDescriptionsItem label="物料编码">
+                  {{ row.materialCode || '未提供' }}
+                </ElDescriptionsItem>
+                <ElDescriptionsItem label="排程域">
+                  {{ row.domainName || '未提供' }}
+                </ElDescriptionsItem>
+                <ElDescriptionsItem label="严重度">
+                  {{ EXPLANATION_SEVERITY_LABELS[row.severity] }}
+                </ElDescriptionsItem>
+                <ElDescriptionsItem label="记录时间">
+                  {{
+                    row.occurredAt ? dayjs(row.occurredAt).format('YYYY-MM-DD HH:mm') : '未提供'
+                  }}
+                </ElDescriptionsItem>
+                <ElDescriptionsItem label="技术标识">
+                  {{ row.objectRef || '未提供' }}
+                </ElDescriptionsItem>
+              </ElDescriptions>
+
+              <div class="ad-title">数量与日期</div>
+              <div class="ad-text">
+                交期：{{ row.dueDate ? dayjs(row.dueDate).format('YYYY-MM-DD') : '未提供' }}
+                <template v-if="row.demand !== undefined || row.unscheduled !== undefined">
+                  ；数量：{{ row.qtyLabels.demand }} {{ fmtQty(row.demand) }} /
+                  {{ row.qtyLabels.scheduled }} {{ fmtQty(row.scheduled) }} /
+                  {{ row.qtyLabels.unscheduled }} {{ fmtQty(row.unscheduled) }}
+                </template>
+              </div>
+
+              <div class="ad-title">可证证据</div>
+              <div class="ad-text">{{ row.evidenceSummary || '未提供' }}</div>
+
+              <div class="ad-title">正式 Explanation</div>
+              <div class="ad-text">
+                {{ row.decisionCodeLabel || '原因未提供 / 未判定' }}
+              </div>
+
+              <div class="ad-title">相关影响对象</div>
+              <div class="ad-text">{{ row.relatedObjects || '未提供' }}</div>
+
+              <div class="ad-title">去哪处理</div>
+              <div class="ad-nav">
+                <ElButton
+                  v-for="n in navsOf(row)"
+                  :key="n.text"
+                  link
+                  type="primary"
+                  size="small"
+                  @click="goNav(n)"
+                >
+                  {{ n.text }}
+                </ElButton>
+                <span v-if="!navsOf(row).length" class="muted-tag">—</span>
+              </div>
+            </div>
+          </template>
+        </ElTableColumn>
+        <ElTableColumn label="对象类型" width="100">
+          <template #default="{ row }">
+            <!-- 未入冻结字典的对象类型如实露出原值（5号位 10-12 §二：不丢弃） -->
+            <ElTag
+              v-if="row.objectTypeLabel.startsWith('待核对')"
+              size="small"
+              type="warning"
+              effect="plain"
+            >
+              待核对·{{ row.objectType }}
+            </ElTag>
+            <ElTag v-else size="small" effect="plain">{{ row.objectTypeLabel }}</ElTag>
+          </template>
+        </ElTableColumn>
         <ElTableColumn label="订单号" width="140">
           <template #default="{ row }">
-            <span class="cell-order">{{ row.orderNo || '—' }}</span>
+            <a
+              v-if="row.orderNo"
+              href="javascript:;"
+              class="cell-order"
+              @click="goOrder(row.orderNo)"
+              >{{ row.orderNo }}</a
+            >
+            <span v-else class="cell-order">—</span>
           </template>
         </ElTableColumn>
         <ElTableColumn label="物料编码" min-width="200" show-overflow-tooltip>
@@ -1158,18 +1539,19 @@ watch(
                 >{{ row.qtyLabels.unscheduled }} {{ fmtQty(row.unscheduled) }}</span
               >
             </span>
-            <template v-else>
+            <template v-else-if="row.demand !== undefined || row.unscheduled !== undefined">
               <span class="qty-demand">{{ fmtQty(row.demand) }}</span>
               <span class="qty-sep">/</span>
               <span class="qty-sched">{{ fmtQty(row.scheduled) }}</span>
               <span class="qty-sep">/</span>
               <span class="qty-unsched">{{ fmtQty(row.unscheduled) }}</span>
             </template>
+            <span v-else class="muted-tag">—</span>
           </template>
         </ElTableColumn>
         <ElTableColumn label="卡住阶段" width="130">
           <template #default="{ row }">
-            <span v-if="row.stageCode">{{ stageLabelOf(row.stageCode) }}</span>
+            <div v-if="row.stageCode">{{ stageLabelOf(row.stageCode) }}</div>
             <span v-else class="muted-tag">—</span>
           </template>
         </ElTableColumn>
@@ -1183,7 +1565,7 @@ watch(
                 {{ row.decisionCodeLabel }}
               </ElTag>
               <ElTag size="small" :type="REASON_TAG_TYPE[row.classKey]" effect="plain">
-                {{ row.classMeta.label }}
+                {{ row.reasonMissing ? '原因未提供' : row.classMeta.label }}
               </ElTag>
               <ElTag
                 v-if="row.severity !== 'ERROR'"
@@ -1196,23 +1578,31 @@ watch(
             </div>
           </template>
         </ElTableColumn>
-        <ElTableColumn label="处理入口" width="140">
+        <!-- 可证证据（后端 evidence.summary；2026-11-21 v0.2 稿 §P08「行内详情…可证证据」） -->
+        <ElTableColumn label="说明" min-width="220" show-overflow-tooltip>
           <template #default="{ row }">
-            <ElButton
-              v-if="reasonActionOf(row.classKey)"
-              link
-              type="primary"
-              size="small"
-              @click="goReasonAction(row.classKey)"
-            >
-              {{ reasonActionText(row.classKey) }}
-            </ElButton>
+            <span v-if="row.evidenceSummary">{{ row.evidenceSummary }}</span>
             <span v-else class="muted-tag">—</span>
           </template>
         </ElTableColumn>
+        <ElTableColumn label="处理入口" width="160">
+          <template #default="{ row }">
+            <ElButton
+              v-for="n in navsOf(row)"
+              :key="n.text"
+              link
+              type="primary"
+              size="small"
+              @click="goNav(n)"
+            >
+              {{ n.text }}
+            </ElButton>
+            <span v-if="!navsOf(row).length" class="muted-tag">—</span>
+          </template>
+        </ElTableColumn>
       </ElTable>
-      <div v-else-if="factRows.length" class="panel-empty">
-        <ElEmpty description="当前筛选条件下没有未排需求" />
+      <div v-else-if="anomalyRows.length" class="panel-empty">
+        <ElEmpty description="当前筛选条件下没有异常" />
       </div>
 
       <div v-if="filteredRows.length" class="fact-pagination">
@@ -1281,39 +1671,10 @@ watch(
         </ElTable>
       </div>
 
-      <!-- 任务 / 资源 / 工段级事实（不是订单级，按层级分别列开供排查；
-           2026-11-10 用户口径"有任务 资源 工段的话，在下面分别列出来"） -->
-      <div v-if="otherLevelGroups.length" class="other-facts">
-        <div class="other-facts-title"> 任务 / 资源 / 工段级事实（不是订单级，明细在这里） </div>
-        <div v-for="g in otherLevelGroups" :key="g.key" class="other-facts-group">
-          <div class="other-facts-group-title">{{ g.label }} {{ g.facts.length }} 条</div>
-          <ElTable :data="g.facts" size="small" border :max-height="420">
-            <ElTableColumn label="对象" min-width="180">
-              <template #default="{ row }">
-                <span class="fact-ref">{{ row.objectRef || '—' }}</span>
-              </template>
-            </ElTableColumn>
-            <ElTableColumn label="级别" width="90">
-              <template #default="{ row }">
-                <ElTag size="small" :type="EXPLANATION_SEVERITY_TAG[row.severity]">
-                  {{ EXPLANATION_SEVERITY_LABELS[row.severity] }}
-                </ElTag>
-              </template>
-            </ElTableColumn>
-            <ElTableColumn label="原因" width="200">
-              <template #default="{ row }">
-                <ElTag size="small" :type="REASON_TAG_TYPE[reasonMetaOf(row).key]" effect="plain">
-                  {{ reasonMetaOf(row).label }}
-                </ElTag>
-              </template>
-            </ElTableColumn>
-            <ElTableColumn label="说明" min-width="260" show-overflow-tooltip>
-              <template #default="{ row }">{{ row.evidenceSummary || '—' }}</template>
-            </ElTableColumn>
-          </ElTable>
-        </div>
-      </div>
-      <!-- 待核对：未入字典的 ObjectType（5号位 10-12 §二；Q1 DEMAND 待 0号位 最终确认） -->
+      <!-- 待核对：未入字典的 ObjectType（5号位 10-12 §二；Q1 DEMAND 待 0号位 最终确认）
+           2026-11-21（v0.2 稿 §P08「仅一页，一张异常列表＋行内展开详情」）：
+           这些行已在上面那张异常清单里（「对象类型」列标「待核对·原值」）
+           ⇒ 这里不再另起一块清单，只留一句说明 + 条数。 -->
       <ElAlert
         v-if="unrecognizedObjectTypeFacts.length"
         type="info"
@@ -1323,39 +1684,11 @@ watch(
       >
         <template #title>
           <span>
-            待核对：以下事实的 ObjectType 未在冻结字典（{{
+            待核对：{{ unrecognizedObjectTypeFacts.length }} 条事实的对象类型未在冻结字典（{{
               unrecognizedRawObjectTypes.join('、')
-            }}）
+            }}），已在上方清单里逐条标「待核对·原值」列出
           </span>
         </template>
-        <div class="fact-list">
-          <div
-            v-for="f in unrecognizedObjectTypeFacts"
-            :key="f.factId"
-            class="fact-item"
-            :class="{ error: f.severity === 'ERROR' }"
-          >
-            <div class="fact-head">
-              <ElTag size="small" effect="plain"> 待核对·{{ f.objectType }} </ElTag>
-              <ElTag size="small" :type="EXPLANATION_SEVERITY_TAG[f.severity]">
-                {{ EXPLANATION_SEVERITY_LABELS[f.severity] }}
-              </ElTag>
-              <span class="fact-ref">{{ f.objectRef }}</span>
-              <ElTag size="small" :type="REASON_TAG_TYPE[reasonMetaOf(f).key]" effect="plain">
-                {{ reasonMetaOf(f).label }}
-              </ElTag>
-              <span v-if="f.impactHours && f.impactHours > 0" class="fact-impact">
-                {{ f.impactHours }}h
-              </span>
-            </div>
-            <div v-if="f.evidenceSummary" class="fact-summary" :title="f.evidenceSummary">
-              {{ f.evidenceSummary }}
-            </div>
-            <div class="fact-time">
-              {{ dayjs(f.occurredAt).format('YYYY-MM-DD HH:mm') }}
-            </div>
-          </div>
-        </div>
       </ElAlert>
     </ElCard>
 
@@ -1371,6 +1704,13 @@ watch(
             >
           </div>
         </template>
+        <!-- 口径提示（2026-11-21；v0.2 稿 §P08 查询条件 + 「只有数据确有可查询结果才展示」）：
+             这一区的端点不带 planVersionId ⇒ 是跨版本的主数据问题汇总，
+             与上面按计划版本筛的「排程解释事实」不是同一批，别当成同一件事看。 -->
+        <div class="biz-filter-note">
+          这一区是<strong>跨版本</strong>的主数据问题汇总（不受上面的计划版本限制）；
+          上面「排程解释事实」才是当前所选版本的问题。两边不是同一批。
+        </div>
         <!-- ===== 筛选（2026-11-10 增三项；2026-11-12 再加三项）：后端已支持的参数 ===== -->
         <div class="biz-filters">
           <ElSelect
@@ -1462,6 +1802,56 @@ watch(
           <ElEmpty description="没有符合条件的问题" />
         </div>
         <ElTable v-else :data="sortedBusinessFactIssues" size="small" border>
+          <!-- 行内展开详情（2026-11-21 v0.2 稿 §P08「一张异常列表＋行内展开详情」）：
+               列表里已能看懂的字段不再重复展开，展开只放被省略的说明全文与处理入口。 -->
+          <ElTableColumn type="expand" width="36">
+            <template #default="{ row }">
+              <div class="anomaly-detail">
+                <div class="ad-title">问题说明</div>
+                <div class="ad-text">{{ row.detail || '未提供' }}</div>
+                <div class="ad-title">来源与降级</div>
+                <ElDescriptions :column="3" size="small" border class="ad-desc">
+                  <ElDescriptionsItem label="来源">
+                    {{ bizSourceLabelOf(row.source) }}
+                  </ElDescriptionsItem>
+                  <ElDescriptionsItem label="问题类型">
+                    {{ bizIssueTypeLabelOf(row.issueType) }}
+                  </ElDescriptionsItem>
+                  <ElDescriptionsItem label="降级动作">
+                    {{ row.degradeAction ? degradeActionLabelOf(row.degradeAction) : '无降级' }}
+                  </ElDescriptionsItem>
+                  <ElDescriptionsItem label="单据号">
+                    {{ row.documentNo || '未提供' }}
+                  </ElDescriptionsItem>
+                  <ElDescriptionsItem label="工段 / 工厂">
+                    {{
+                      row.stageCode
+                        ? stageLabelOf(row.stageCode)
+                        : row.factoryCode
+                          ? factoryLabel(row.factoryCode)
+                          : '未提供'
+                    }}
+                  </ElDescriptionsItem>
+                  <ElDescriptionsItem label="发生时间">
+                    {{ dayjs(row.occurredAt).format('YYYY-MM-DD HH:mm') }}
+                  </ElDescriptionsItem>
+                </ElDescriptions>
+                <div class="ad-title">去哪处理</div>
+                <div class="ad-nav">
+                  <ElButton
+                    v-if="bizNavOf(row.source)"
+                    link
+                    type="primary"
+                    size="small"
+                    @click="goBizNav(row.source)"
+                  >
+                    {{ bizNavOf(row.source)?.text }}
+                  </ElButton>
+                  <span v-else class="muted-tag">—</span>
+                </div>
+              </div>
+            </template>
+          </ElTableColumn>
           <ElTableColumn label="严重度" width="90">
             <template #default="{ row }">
               <ElTag size="small" :type="bizSeverityTag(row.severity)">
@@ -1506,6 +1896,22 @@ watch(
           <ElTableColumn label="发生时间" width="120">
             <template #default="{ row }">
               {{ dayjs(row.occurredAt).format('MM-DD HH:mm') }}
+            </template>
+          </ElTableColumn>
+          <!-- 去对应专业页（2026-11-21；v0.2 稿 §P08「按真实结果回到原专业页面」）：
+               只挂后端真实有来源的两类；BOM / 生产部门上下文没有对应专业页 ⇒ 不给假入口 -->
+          <ElTableColumn label="去查" width="130" align="center">
+            <template #default="{ row }">
+              <ElButton
+                v-if="bizNavOf(row.source)"
+                link
+                type="primary"
+                size="small"
+                @click="goBizNav(row.source)"
+              >
+                {{ bizNavOf(row.source)?.text }}
+              </ElButton>
+              <span v-else class="muted-tag">—</span>
             </template>
           </ElTableColumn>
         </ElTable>
@@ -1969,102 +2375,38 @@ watch(
   }
 }
 
-/* ===== 任务 / 资源 / 工段级事实（按层级分块） ===== */
-.other-facts {
-  margin-top: 16px;
-  padding-top: 12px;
-  border-top: 1px dashed #e2e8f0;
-
-  .other-facts-title {
-    margin-bottom: 8px;
-    font-size: 13px;
-    font-weight: 600;
-    color: #1e293b;
-  }
-
-  .other-facts-group {
-    & + & {
-      margin-top: 12px;
-    }
-
-    .other-facts-group-title {
-      margin-bottom: 6px;
-      font-size: 12px;
-      font-weight: 600;
-      color: #475569;
-    }
-  }
-}
-
 /* ===== 待核对：未入字典 ObjectType（5号位 10-12 §二） ===== */
 .unrecognized-alert {
   margin-top: 12px;
-  .fact-list {
-    margin-top: 8px;
-    display: flex;
-    flex-direction: column;
-    gap: 6px;
-  }
 }
 
-.fact-list {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  /* 分组内独立滚动：一个版本的事实可能几百条（dev 实测 527 条），
-     不加滚动条会把整页撑到几万像素长 */
-  max-height: 420px;
-  overflow-y: auto;
-  padding-right: 4px;
-}
+/* ===== 行内展开详情（2026-11-21 v0.2 稿 §P08「一张异常列表＋行内展开详情」） ===== */
+.anomaly-detail {
+  padding: 4px 8px 8px 8px;
 
-.fact-item {
-  padding: 10px 12px;
-  background: #fff;
-  border-left: 3px solid #f59e0b;
-  border-radius: 4px;
-
-  &.error {
-    background: #fef2f2;
-    border-left-color: #ef4444;
+  .ad-title {
+    margin: 10px 0 6px;
+    font-size: 12px;
+    font-weight: 600;
+    color: #475569;
   }
 
-  .fact-head {
+  .ad-text {
+    font-size: 12px;
+    line-height: 1.6;
+    color: #334155;
+    word-break: break-all;
+  }
+
+  .ad-desc {
+    margin-top: 4px;
+  }
+
+  .ad-nav {
     display: flex;
     flex-wrap: wrap;
     align-items: center;
-    gap: 6px;
-  }
-
-  .fact-ref {
-    font-family: 'Courier New', monospace;
-    font-size: 12px;
-    font-weight: 600;
-    color: #1e293b;
-  }
-
-  .fact-impact {
-    margin-left: auto;
-    font-size: 11px;
-    font-weight: 600;
-    color: #b45309;
-  }
-
-  .fact-time {
-    margin-top: 6px;
-    font-size: 11px;
-    color: #94a3b8;
-  }
-
-  /* 证据里的大白话摘要（2026-11-05） */
-  .fact-summary {
-    margin-top: 6px;
-    font-size: 12px;
-    color: #475569;
-    line-height: 1.5;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
+    gap: 12px;
   }
 }
 

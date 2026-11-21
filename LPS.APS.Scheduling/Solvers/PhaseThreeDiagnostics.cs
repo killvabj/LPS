@@ -139,10 +139,16 @@ internal class PhaseThreeDiagnostics
                     // 原仅写 RequiredTime/ActualTime 两个自定义键、缺外壳三字段 ⇒ 本次补齐。
                     // extraDetails（可空）= 该分支特有的细分证据键（如跨域阻挡的 SourceDomainKey/
                     // SourcePlanVersionId/ResourceId），以逗号前缀拼入 details，不改变既有两键。
+                    // EX-T06（0号位 2026-11-14 §七 清单，载体待裁）：本列的物理语义仍是
+                    //   「**需求级整单延期小时**」，不是「某原因造成的可归因影响小时」——两者不能相加。
+                    //   在 0号位 裁定新载体前，**不动物理列、不改旧 PV**，只在 details 内加一个可判标记，
+                    //   让消费端可以区分「不可归因的整单延期」与其它 ImpactHours 来源。
+                    //   标记是**纯增量**：details 原两键不动，前端/旧消费者不解析该键也不受影响。
                     EvidenceJson =
                         $"{{\"evidenceType\":\"{evidenceType}\"," +
                         $"\"summary\":\"需求 {demand.LogicalDemandKey} 延期 {delay.TotalHours:F2}h（{reasonCode}）\"," +
-                        $"\"details\":{{\"RequiredTime\":\"{effectiveDue:O}\",\"ActualTime\":\"{lastTask.PlannedEndTime:O}\"{extraDetails}}}}}"
+                        $"\"details\":{{\"RequiredTime\":\"{effectiveDue:O}\",\"ActualTime\":\"{lastTask.PlannedEndTime:O}\"," +
+                        $"\"impactType\":\"ORDER_DELAY_NOT_ATTRIBUTABLE\"{extraDetails}}}}}"
                 });
 
                 SolverDiagnostics.HotspotEnd(swDelayed, SolverDiagnostics.Hotspot.Phase3DelayedLoop);
@@ -334,6 +340,42 @@ internal class PhaseThreeDiagnostics
             return "FROZEN_ZONE_LOCK";
         }
 
+        // ── EX-T04（2026-11-21 1号位）：**并列紧因** —— 物料候选事实必须在**提前 return 的分支**里也留下。
+        //   改前实测：物料已齐（非绑定）但资源阻挡是主因时，第 2 步直接 return ⇒ `materialCandidate` **从不计算**，
+        //   证据只剩一条主因，"双因并列可查"形同虚设。
+        //   ⇒ 本处提前算一次**候选**（只算非绑定情形；真实缺料/绑定的 return 仍留给第 4 步，不抢归因）。
+        string? materialCandidate = null;
+        if (constraints.MaterialAvailability.TryGetValue(demand.AllocationSequence, out var earlySegments)
+            && earlySegments.Count > 0)
+        {
+            var earlyRequired = demand.NetOutputQty;
+            decimal earlyAcc = 0m;
+            DateTime? earlyReady = null;
+            foreach (var seg in earlySegments.OrderBy(s => s.AvailableTime))
+            {
+                earlyAcc += seg.Quantity;
+                if (earlyAcc >= earlyRequired)
+                {
+                    earlyReady = seg.AvailableTime;
+                    break;
+                }
+            }
+            if (earlyReady is not null)
+            {
+                var earlyStart = demandTasks.Min(t => t.PlannedStartTime);
+                var earlyGap = (earlyStart - earlyReady.Value).TotalMinutes;
+                if (earlyGap > MaterialBindingToleranceMinutes)
+                {
+                    var inv = System.Globalization.CultureInfo.InvariantCulture;
+                    materialCandidate =
+                        ",\"materialCandidate\":{\"bindingState\":\"CANDIDATE\""
+                        + ",\"materialReadyAt\":\"" + earlyReady.Value.ToString("O", inv) + "\""
+                        + ",\"actualStart\":\"" + earlyStart.ToString("O", inv) + "\""
+                        + ",\"slackMinutes\":" + earlyGap.ToString("0.###", inv) + "}";
+                }
+            }
+        }
+
         // 2. 共享资源/跨域可用性阻挡：**跨域与同域一律 RESOURCE_CAPACITY_WAIT**（0号位 2026-10-07 裁定）。
         //    `CROSS_DOMAIN_VERSION_MISMATCH_RISK` 在《字段说明 v5.1.9:4843》中专指**跨域版本不一致风险**
         //    （强制 ObjectType=DOMAIN + FailedDomainKeys/CurrentActivePlanVersions 等 Evidence）；
@@ -354,10 +396,12 @@ internal class PhaseThreeDiagnostics
                 var srcPlanVersion = matchedBlock.SourcePlanVersionId.HasValue
                     ? matchedBlock.SourcePlanVersionId.Value.ToString()
                     : "null";
+                // EX-T04（2026-11-21）：主因证据之后**追加**并列的物料候选事实（若有）。
                 extraDetails =
                     $",\"SourceDomainKey\":\"{matchedBlock.SourceDomainKey}\"," +
                     $"\"SourcePlanVersionId\":{srcPlanVersion}," +
-                    $"\"ResourceId\":{matchedBlock.ResourceId}";
+                    $"\"ResourceId\":{matchedBlock.ResourceId}"
+                    + (materialCandidate ?? string.Empty);
             }
             return "RESOURCE_CAPACITY_WAIT";
         }
@@ -387,7 +431,7 @@ internal class PhaseThreeDiagnostics
         //   ⚠ 不新增 ReasonCode：仍用既有 15 码 `MATERIAL_SHORTAGE`。
         //   EX-T01 收尾（2026-11-16）：物料被判「候选（非生效）」时，也把它的齐套时点与 slack 记进证据，
         //     让「最终原因=设备/日历，但物料其实已齐」这类并列事实可查，而不是只暴露单一原因。
-        string? materialCandidate = null;
+        // 候选已在第 2 步之前预先算好（并列紧因）；本步只负责**绑定/缺料**的归因。
         if (constraints.MaterialAvailability.TryGetValue(demand.AllocationSequence, out var segments)
             && segments.Count > 0)
         {
@@ -549,9 +593,50 @@ internal class PhaseThreeDiagnostics
             }
         }
 
-        // 8. 默认原因：前序延期或其他约束
-        evidenceType = "PRECEDENCE";
-        extraDetails = materialCandidate ?? string.Empty;
+        // 8. 兜底：**先判「是否真有前序证据」**，避免把"未识别"伪装成 PRECEDENCE_WAIT。
+        //    EX-T04（0号位 v1.8 §六）逐字：「未知原因不造15码、可核证证据等级」。
+        //    改前：无条件 evidenceType="PRECEDENCE" + PRECEDENCE_WAIT ⇒ 下游据此去查前序，
+        //      而该需求可能根本没有前序（无子件、无同需求串联等待）⇒ 证据是编的。
+        //    改后：两类**可观察**前序证据任一成立才算 PRECEDENCE；都不成立 ⇒ 明确标 UNRESOLVED/NONE。
+        //      ⚠ ReasonCode 仍投 15 码（`ScheduleExplanationFact.ReasonCode` 是硬值域、不允许空码），
+        //        但 `evidenceType` / `evidenceLevel` / `attribution` 三处都诚实说明"未识别"，不冒充已证。
+        var precedenceKeys = new List<string>(2);
+        if (constraints.CrossMaterialParentToChildren.TryGetValue(demand.LogicalDemandKey, out var precChildren)
+            && precChildren.Count > 0)
+        {
+            // 证据 A：跨物料子件存在（该需求确实有生产方要等）
+            foreach (var child in precChildren.Take(3)) precedenceKeys.Add(child);
+        }
+
+        // 证据 B：同需求内串联等待 —— 某 Task 的开工恰等于另一 Task 的完工（被上一道顶住）
+        foreach (var t in demandTasks)
+        {
+            if (precedenceKeys.Count >= 3) break;
+            foreach (var prev in demandTasks)
+            {
+                if (ReferenceEquals(prev, t)) continue;
+                if (Math.Abs((t.PlannedStartTime - prev.PlannedEndTime).TotalMinutes) <= MaterialBindingToleranceMinutes)
+                {
+                    precedenceKeys.Add(prev.FinalDraftId);
+                    break;
+                }
+            }
+        }
+
+        if (precedenceKeys.Count > 0)
+        {
+            evidenceType = "PRECEDENCE";
+            extraDetails = (materialCandidate ?? string.Empty)
+                + ",\"evidenceLevel\":\"OBSERVED\""
+                + ",\"precedenceKeys\":[\"" + string.Join("\",\"", precedenceKeys) + "\"]";
+            return "PRECEDENCE_WAIT";
+        }
+
+        // 无任何可观察前序证据 ⇒ 诚实标"未识别"，不冒充 PRECEDENCE。
+        evidenceType = "UNRESOLVED";
+        extraDetails = (materialCandidate ?? string.Empty)
+            + ",\"evidenceLevel\":\"NONE\""
+            + ",\"attribution\":\"UNATTRIBUTED\"";
         return "PRECEDENCE_WAIT";
     }
 

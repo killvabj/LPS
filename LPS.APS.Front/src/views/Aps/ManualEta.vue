@@ -52,6 +52,12 @@
  *    正式口径只有一条路：`supply-combos` → 取不到就如实说取不到（页面提示端点不可用）。
  *  - 未命中行文案统一为「未命中当前供货事实（暂不生效）」（列表标签与详情同口径）。
  *
+ * 2026-11-20：**接采购协同页的定位入口**（依据《APS_V1_P01-P13_全页面业务设计统一收口核对稿_v0.2_20261114_四项审核修订版.md》§采购协同 6）。
+ *   - 「采购协同」页 PO 行有「去维护」按钮 ⇒ 带 `?po=采购单号&line=行号` 跳本页。
+ *   - 本页 onMounted 读到这两个参数 ⇒ **直接开新增抽屉**并把采购订单号/行号填好；
+ *     物料候选按该 PO 行自动收窄（组合档自带仓库）⇒ 采购担当不用再从 258 个仓库里挑。
+ *   - ⚠️ 权限不变：仍是 `aps.manual_eta.edit` 才能新增/编辑，`aps.manual_eta.cancel` 才能取消。
+ *
  * RBAC（@see 审核报告 P1-14/15）：
  *  - aps.manual_eta.view：只读
  *  - aps.manual_eta.edit：新增 / 编辑
@@ -59,6 +65,7 @@
  */
 
 import { computed, onMounted, ref, watch } from 'vue'
+import { useRoute } from 'vue-router'
 import dayjs from 'dayjs'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { storeToRefs } from 'pinia'
@@ -98,6 +105,7 @@ import {
 
 const store = useManualEtaStore()
 const apsAuth = useApsAuthStore()
+const route = useRoute()
 const {
   list,
   currentDetail,
@@ -822,7 +830,14 @@ const formRules = {
   manualEta: [{ required: true, message: '请选择到货时间', trigger: 'change' }]
 }
 
-function openCreate(): void {
+/**
+ * 新增抽屉。
+ *
+ * `prefill` 用来接住「采购协同」页带来的定位参数（PO 号 + 行号）：
+ * 人工到货时间是**对供给事实的覆盖**，覆盖键 = PO＋行号＋物料＋收货仓库，
+ * 采购协同那一行已经带了 PO 号与行号 ⇒ 直接带过来，物料候选也会按这行自动收窄。
+ */
+function openCreate(prefill?: { poNo?: string; lineNo?: number }): void {
   drawerMode.value = 'new'
   // 物料候选不再预拉（远程搜索）⇒ 新增态从空开始，等用户输入关键字
   materialOptions.value = []
@@ -831,8 +846,8 @@ function openCreate(): void {
   materialSelected.value = null
   warehouseLockedByCombo.value = false
   form.value = {
-    poNo: '',
-    lineNo: 1,
+    poNo: prefill?.poNo ?? '',
+    lineNo: prefill?.lineNo ?? 1,
     materialId: 0,
     materialCode: '',
     materialKey: null,
@@ -957,6 +972,15 @@ onMounted(() => {
   void reload()
   void store.loadCandidates()
   void loadWarehouseOptions()
+  // 2026-11-20：从「采购协同」页带定位参数进来 ⇒ 直接开新增抽屉，采购订单号/行号已填好
+  //   （v0.2 稿 §采购协同 6：人工 ETA 按 PO＋行＋物料＋收货仓库 粒度维护）
+  const q = route.query
+  const po = typeof q.po === 'string' ? q.po.trim() : ''
+  if (po) {
+    const rawLine = Number(q.line)
+    const line = Number.isFinite(rawLine) && rawLine > 0 ? Math.floor(rawLine) : 1
+    openCreate({ poNo: po, lineNo: line })
+  }
 })
 </script>
 

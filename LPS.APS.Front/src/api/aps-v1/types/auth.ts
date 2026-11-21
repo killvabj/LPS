@@ -19,6 +19,12 @@
  * 2026-11-18：补「改自己资料 / 改密码」两组 DTO
  *   （后端 `UpdateProfileRequest` / `UpdateProfileResponse` / `ChangePasswordRequest`）
  *   —— 依据 3号位《个人中心改资料与改密码端点落码_回执 v1.0_20261117》。
+ *
+ * 2026-11-18（第二封）：`UserInfo`（= `GET /api/auth/me` 回包）补 `email` / `phoneNumber`
+ *   —— 依据 3号位《个人中心me补邮箱手机号与显示名读库_回执 v1.0_20261118》R1。
+ *   · 后端 `UserInfoDto` 增 `Email` / `PhoneNumber` 两个**可空**字段（库里空给 `null`）；
+ *   · 同一笔查询里**显示名也改读 DB**（`[User].DisplayName`）⇒ 消掉「改完资料姓名仍旧」的
+ *     claim 延迟（`userName` 字段名不变，只是取值来源从 JWT claim 换成 DB 真值）。
  */
 
 import type { DomainKey, RoleKey } from './common'
@@ -64,8 +70,26 @@ export interface UserInfo {
   userId: number
   /** 用户工号（对齐后端 UserCode；旧名 username 已废弃） */
   userCode: string
-  /** 用户姓名（对齐后端 UserName；旧名 displayName 已废弃） */
+  /**
+   * 用户姓名（对齐后端 UserName；旧名 displayName 已废弃）
+   *
+   * ⚠️ **2026-11-18 起取值来源是 DB**（3号位 R1：`[User].DisplayName`），
+   *   不再是 JWT claim ⇒ 改完资料**立即生效**，不必等 token 重签。
+   */
   userName: string
+  /**
+   * 用户邮箱（后端 `UserInfoDto.Email`；3号位 2026-11-18 R1 已补）
+   *
+   * ⚠️ **缺键 / null 语义**：库里没填 ⇒ `null` ⇒ 页面显「未提供」，
+   *   **禁**推断成「邮箱已清空」或「账号没邮箱」。
+   */
+  email?: string | null
+  /**
+   * 用户手机号（后端 `UserInfoDto.PhoneNumber`；3号位 2026-11-18 R1 已补）
+   *
+   * ⚠️ 缺键 / null 语义同 `email`。
+   */
+  phoneNumber?: string | null
   /** 角色列表（后端为 string[]，前端强类型为 RoleKey[]） */
   roles: RoleKey[]
   /**

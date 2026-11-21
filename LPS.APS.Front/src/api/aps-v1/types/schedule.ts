@@ -11,10 +11,42 @@
  *  - GET /api/schedule/gantt/{planVersionId}
  *  - GET /api/schedule/summary/{planVersionId}
  *
- * 2026-11-18：`TaskListItemDto.mesDispatchStatus` 补注**实测真值**（dev ≥r14276）：
- *   该键在 P05 清单 / P06 详情**恒不出现**（999473 全量 28,021 行 = 0 次带键），
- *   根因＝后端 SQL 已选该列、落码 DTO 无该属性（Dapper 丢列）⇒ 已去函请 5号位 补。
- *   依据：5号位 2026-11-18《复函-R1三组投影补齐认账_R2裁a改bool_纠正你R3恒null读法》。
+ * 2026-11-18（r14281 后）：`TaskListItemDto.mesDispatchStatus` 的**属性已由后端补上**
+ *   （5号位 r14281 入库 `LPS.APS.Core/Dto/TaskQueryDtos.cs`，增 `MesDispatchStatus`）
+ *   ⇒ 我方前端**零改动即生效**。
+ *   ⚠️ 我方 dev 复测时**环境未更新到 r14281**（本地 lps/ 工作副本 r14277、dev 进程 14:27 启动）
+ *   ⇒ 999473 全量 28,021 行仍 0 次带键 ⇒ **读不到键＝环境滞后，不是契约不符**。
+ *   依据：5号位 2026-11-18《复函R3-R3prime认账属性已补_第四次函码不一致根因与护栏机制》。
+ *   （此前同一日按 dev ≥r14276 测得的「恒不出现」为**当时事实**，根因＝后端投影丢列，已由 r14281 修掉。）
+ *
+ * 2026-11-18（复函V 后销账）：dev 已由 Owner 更新到 **r14282**（进程 PID 12044 / 19:34:02）
+ *   ⇒ 实测 28,021 行中 **2,694 行带 `mesDispatchStatus`**（值全 `CREATED`）、25,327 行不带键（队列外）；
+ *   P06 详情 `task.mesDispatchStatus = "CREATED"` ⇒ **键已到位**（上面的「环境滞后」结论作废）。
+ *
+ * 2026-11-19（依据 5号位 2026-11-18《复函V…》§二 R3″ 双键名过渡期）：钉死**同一权威位的
+ *   三个键名**与各消费点 —— 甘特位 `dispatchStatus`（本文件 `GanttTaskDto`）／P05 位
+ *   `mesDispatchStatus`（本文件 `TaskListItemDto`）／**P11 位 `dispatchStatus`**
+ *   （`MesStatusOperationRowDto`，见 `types/mes.ts`）。5号位 R3″ 的映射表只具名前两个
+ *   ⇒ 第三个键名已函告（等其映射表一并收口；破坏窗核准前前端不自行合并或改名）。
+ *
+ * 2026-11-19（依据 5号位 2026-11-19《复函R3三键全收录_映射表草案即本函…》§二）：
+ *   **V1.1 映射表（三键版）已出**（即刻生效的过渡契约）⇒ 本文件两个键**按表登记**：
+ *   · 键① `GanttTaskDto.dispatchStatus` ⇒ 统一目标 `mesDispatchStatus`；
+ *   · 键② `TaskListItemDto.mesDispatchStatus` ⇒ **终名，不变**；
+ *   · **收口批次 = V1.1 破坏窗**（0号位 核准后 5号位一批做①③改名，前端改词典＋三处取字段）
+ *     ⇒ **核准前我方不改名**，只登记不改键。
+ *   ⚠️ **键①②缺键语义 = 「该 Task 不在下发队列」**（护栏语义表 r14286 第 17/18 行）
+ *     ⇒ 页面显「不在下发队列」，**禁**解释成「未下发」/「无需 MES」；
+ *     原「缺键 ⇒ 显『未提供』」的写法**作废**（与 P05 列、CSV 拉齐同一句话）。
+ *   ⚠️ 键③（P11 工序行）**行驱动、语义差一拍**：行在则值必在，「缺键」＝该行不存在
+ *     ⇒ 我方**按行渲染**，不套用键①②的分类文案（详见 `types/mes.ts`）。
+ *
+ * 2026-11-20：补两处后端已落码的投影键（依据 5号位-2026-11-20-复函-P01-P13收口v0.2清单十七项逐条裁决_三条可投影已落码B1F1J1_其余不可原因与后移给足-给4号位抄3号位.md
+ *   §一 B1「阶段中文名 / 大工艺类目」与 §一 F1「负荷行部门三列」）：
+ *   · `TaskListItemDto` 增 `stageName` / `stageCategoryName`（源 = APS 内 `ext_MES_StageDict`，
+ *     字典缺码 ⇒ 后端给 null ⇒ **整键省略 = 「未提供」**，前端不造译名）。
+ *   · `ResourceLoadRowDto` 增 `productionDepartmentId` / `departmentCode` / `departmentName`
+ *     （源 = Resource→ProductionDepartment 直连；**缺键 = 该设备无归属部门** ⇒ 显「未提供」）。
  */
 
 import type {
@@ -284,7 +316,21 @@ export interface GanttTaskDto {
    * 解 `07:3721` 状态 0 的 PLANNED/RELEASED 歧义）。
    *
    * 5号位 2026-11-05 B2② 已落码（查询层批量富化后透出）：**无下发记录 ⇒ 缺键 = 未下发**。
-   * 值域由写侧决定、后端自由字符串 ⇒ 前端原样展示，不自造映射。
+   * 值域由写侧决定、后端自由字符串 ⇒ 未收录的值原样透出，不自造映射。
+   *
+   * ⚠️ **甘特位键名**（历史契约，11-05 起已消费，不擅改）：同一权威位另有
+   *   P05 位 `mesDispatchStatus`（终名）与 **P11 位 `dispatchStatus`**（批次工序行 DTO）
+   *   ⇒ 实为**三个键名**，统一归 V1.1 破坏窗，前端**不得自行合并或改名**。
+   *   · 消费点：`Gantt.vue` 的**详情抽屉**与**悬停提示**（两处均走词典 `mesDispatchStatusLabel`）。
+   *
+   * ✅ **V1.1 映射表（三键版）已出**（5号位 2026-11-19 复函 §二，即刻生效的过渡契约）：
+   *   · 本键 = 映射表 **键①**，统一目标 = `mesDispatchStatus`；
+   *   · **收口批次 = V1.1 破坏窗**（0号位 核准后 5号位一批做①③改名，前端改词典＋三处取字段）
+   *     ⇒ **核准前我方不改名**，仅按表登记。
+   *
+   * ⚠️ **缺键语义 = 「该 Task 不在下发队列」**（护栏语义表 r14286 第 18 行）
+   *   ⇒ 页面显「**不在下发队列**」；**禁**解释成「未下发」/「无需 MES」（不得断言成状态）。
+   *   （与 P05 清单列、清单 CSV 显示同一句话。）
    */
   dispatchStatus?: string
   /**
@@ -595,6 +641,16 @@ export interface ResourceLoadRowDto {
   resourceId: number
   resourceCode?: string
   resourceName?: string
+  /**
+   * 生产部门 Id（5号位 2026-11-20 复函 F1 / r14322 已落码；Resource→ProductionDepartment 直连）。
+   *
+   * ⚠️ 缺键 = **该设备无归属部门**（不是「没投影」）⇒ 前端显「未提供」。
+   */
+  productionDepartmentId?: number
+  /** 部门编码（缺键 = 未提供） */
+  departmentCode?: string
+  /** 部门名称（如「BJ机加_制造2-7课920HL」；缺键 = 未提供） */
+  departmentName?: string
   /** 业务日（naive，00:00:00） */
   businessDate: IsoDateTime
   /** 当日已排工时（跨午夜按日切片，秒级） */
@@ -682,8 +738,22 @@ export interface TaskListItemDto {
   materialId: number
   materialCode?: string
   materialName?: string
-  /** 阶段码（**无中文名**——后端未投影 StageName，前端不自造译名） */
+  /** 阶段码（Task.StageCode） */
   stageCode?: string
+  /**
+   * 阶段中文名（5号位 2026-11-20 复函 B1 / r14321 已落码）。
+   *
+   * - 源 = APS 内 `ext_MES_StageDict`（29 行主数据，同义于 ODS 直连）
+   * - **字典缺码 ⇒ 后端给 null ⇒ 整键省略 = 「未提供」**（前端不造译名）
+   * - 前端回落用冻结字典 `stageLabelOf`（同源，未命中码原样透出）
+   */
+  stageName?: string | null
+  /**
+   * 大工艺类目中文名（5号位 2026-11-20 复函 B1 / r14321）。
+   *
+   * ⚠️ 源字典缺码 ⇒ null = 未提供（**不是**「无类目」）
+   */
+  stageCategoryName?: string | null
   operationCode: string
   /** 工序名（可空 = 未判定 ⇒ 只显编码，不猜） */
   operationName?: string
@@ -746,19 +816,35 @@ export interface TaskListItemDto {
    */
   mesWorkOrderNo?: string
   /**
-   * MES 下发状态（5号位 2026-11-18 复函 N2 补；源 = TaskDispatch.DispatchStatus，JSON 键 `mesDispatchStatus`）。
+   * MES 下发状态（源 = TaskDispatch.DispatchStatus，JSON 键 `mesDispatchStatus`）。
    *
    * ⚠️ **null 的语义是「该 Task 不在下发队列」**（5号位 契约护栏）——
    *   **≠「未下发」**、**≠「无需 MES」**（队列资格权威位未建，别由空值推断分类）。
    * ⚠️ 值域现只有 `CREATED` / `PENDING`（`PROCESSING` / `FAILED` 现不落痕）⇒
    *   **别按四态全集解释它**；词典未收录的值原样显示后端码。
    *
-   * ⚠️ **2026-11-18 实测（dev ≥r14276）**：本键在 P05 清单 / P06 详情**恒不出现**
-   *   （999473 全量 28,021 行扫描 = 0 次带键）——**根因不是稀疏段，是后端投影丢列**：
-   *   SQL 已选 `dpx.DispatchStatus AS MesDispatchStatus`（`ScheduleQueryService.cs:164`），
-   *   但落码 DTO `TaskListItemDto`（`LPS.APS.Core/Dto/TaskQueryDtos.cs`）**无该属性** ⇒ Dapper 丢列。
-   *   数据本身在（甘特行 `dispatchStatus`：首屏 8,000 行命中 891 条 `CREATED`）。
-   *   ⇒ 已去函请 5号位 补该属性；**键一补齐本列自动生效，前端零改动**。
+   * ✅ **2026-11-18（r14281）该属性已由后端补上**（`TaskQueryDtos.cs` 增 `MesDispatchStatus`）
+   *   ⇒ 键一出现本列即生效，**前端零改动**。
+   *   ✅ **2026-11-18 复函V 后 dev 已更新到 r14282**（Owner 执行 update＋重建＋重启，
+   *   进程 PID 12044 / 19:34:02）⇒ 实测 999473 全量 28,021 行中 **2,694 行带键**（值全 `CREATED`）、
+   *   25,327 行不带键（**不在下发队列**）；P06 详情 `task.mesDispatchStatus = "CREATED"`。
+   *   （此前"读不到键"是**环境滞后**，非契约不符 —— 已销账。）
+   *
+   * ⚠️ **双键名过渡期（5号位 2026-11-18 R3″ 裁）**：同一权威位两个键名 ——
+   *   甘特行 `dispatchStatus`（11-05 起已消费，历史契约不擅改）／本 DTO `mesDispatchStatus`（终名）。
+   *   统一为一个键＝破坏性变更，归 V1.1 破坏窗 ⇒ **前端两处各自保留、不得自行合并或改名**，
+   *   值域与中文词典同源（`mesDispatchStatusLabel`）。
+   *
+   * ✅ **V1.1 映射表（三键版）已出**（5号位 2026-11-19 复函 §二，即刻生效的过渡契约）：
+   *   · 本键 = 映射表 **键②** = **终名，不变**；
+   *   · 键①（甘特位 `dispatchStatus`）与键③（P11 工序行 `dispatchStatus`）统一 → 本键；
+   *   · **收口批次 = V1.1 破坏窗**（0号位 核准后执行）⇒ **核准前我方不改名**，仅按表登记。
+   *
+   * ⚠️ **缺键语义 = 「该 Task 不在下发队列」**（护栏语义表 r14286 第 17 行）
+   *   ⇒ 页面显「**不在下发队列**」；**禁**解释成「未下发」/「无需 MES」。
+   *   ⚠️ **实为三个键名**（复函V 后我方核出）：另有 **P11 批次工序行** `dispatchStatus`
+   *   （`MesStatusOperationRowDto`，见 `types/mes.ts`）——该键**行驱动、语义差一拍**，
+   *   已在 5号位 2026-11-19 复函 §二 键③ 收录（我方按行渲染，**不套用本键的分类文案**）。
    */
   mesDispatchStatus?: string
   /** 换型来源标签（可空 = 未提供） */

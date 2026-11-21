@@ -37,6 +37,11 @@ public sealed class ResourceLoadRowDto
     public int ResourceId { get; init; }
     public string? ResourceCode { get; init; }
     public string? ResourceName { get; init; }
+    /// <summary>部门（F1，11-20 4号位件）：v0.2 P12 四级查询 Domain→部门→设备→日期 的部门键；
+    /// 设备未挂部门 ⇒ null=未提供。**部门级汇总请页面按同口径分子分母重算**（禁跨域平均百分率，v0.2 原文）。</summary>
+    public int? ProductionDepartmentId { get; init; }
+    public string? DepartmentCode { get; init; }
+    public string? DepartmentName { get; init; }
 
     /// <summary>业务日（date 级，naive 工厂墙钟）。</summary>
     public DateTime BusinessDate { get; init; }

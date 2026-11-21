@@ -54,9 +54,19 @@ internal static class CrossWindowSlotLocator
         List<TimeWindow> ascendingCalendar,
         DateTime earliestStart,
         TimeSpan duration,
-        List<TimeWindow>? occupied)
+        List<TimeWindow>? occupied,
+        int resourceId = -1)
     {
-        if (ascendingCalendar.Count == 0 || duration <= TimeSpan.Zero) return null;
+        // 2026-11-20（本号位）：**纯观测**探针 —— 未 `BeginProbe()` 时 `_probe` 为 null，
+        //   本方法行为与旧实现逐位一致（只多一次 ThreadStatic 读）。
+        var probe = _probe;
+
+        if (ascendingCalendar.Count == 0 || duration <= TimeSpan.Zero)
+        {
+            probe?.Record(resourceId, CrossWindowLocateOutcome.NoCalendarOrZeroDuration,
+                duration.TotalMinutes, 0d, 0, 0, 0, earliestStart, null, 0d);
+            return null;
+        }
 
         // 闸门：时长必须超过**每一个**窗，否则交回单窗路径（保证既有结果逐位不变）。
         var longest = TimeSpan.Zero;
@@ -65,7 +75,12 @@ internal static class CrossWindowSlotLocator
             var len = ascendingCalendar[i].End - ascendingCalendar[i].Start;
             if (len > longest) longest = len;
         }
-        if (duration <= longest) return null;
+        if (duration <= longest)
+        {
+            probe?.Record(resourceId, CrossWindowLocateOutcome.DurationNotLongerThanLongestWindow,
+                duration.TotalMinutes, 0d, 0, 0, 0, earliestStart, null, longest.TotalMinutes);
+            return null;
+        }
 
         var occ = occupied;
         if (occ is not null && occ.Count > 1 && !IsAscendingByStart(occ))
@@ -79,11 +94,16 @@ internal static class CrossWindowSlotLocator
         var accumulated = TimeSpan.Zero;
         var cursor = earliestStart;
         var oi = 0;
+        // 2026-11-20 探针计数（仅在 `probe` 非 null 时被写入并最终记录；纯观测，不参与判定）。
+        var resets = 0;
+        var usableWindows = 0;
+        var skippedWindows = 0;
 
         for (int wi = 0; wi < ascendingCalendar.Count; wi++)
         {
             var window = ascendingCalendar[wi];
-            if (window.End <= cursor) continue;
+            if (window.End <= cursor) { skippedWindows++; continue; }
+            usableWindows++;
 
             var pos = window.Start > cursor ? window.Start : cursor;
 
@@ -120,6 +140,7 @@ internal static class CrossWindowSlotLocator
                         //   （任何以它们起算的段都必须跨过本块），丢掉它们不损失任何可行解。
                         start = null;
                         accumulated = TimeSpan.Zero;
+                        resets++;
                         pos = occ[oi].End;           // 上面已保证 End > pos ⇒ pos 严格前移，不会原地打转
                         continue;
                     }
@@ -140,6 +161,10 @@ internal static class CrossWindowSlotLocator
                 {
                     // 完成点落在本段内 ⇒ 有效占用恰好等于 duration，`End − Start` 会更大（含窗间空档）。
                     // 这不是 bug —— 口径就是「Duration = 有效加工 ≠ End − Start」，消费端已按此改造。
+                    probe?.Record(resourceId, CrossWindowLocateOutcome.Found,
+                        duration.TotalMinutes, accumulated.TotalMinutes, resets,
+                        usableWindows, skippedWindows, earliestStart,
+                        ascendingCalendar[ascendingCalendar.Count - 1].End, longest.TotalMinutes);
                     return new TimeWindow(start.Value, pos + need);
                 }
 
@@ -151,6 +176,10 @@ internal static class CrossWindowSlotLocator
         }
 
         // 日历走到头还没累计够 ⇒ 如实返回 null（不许编造一个超出日历的完成点）。
+        probe?.Record(resourceId, CrossWindowLocateOutcome.CalendarExhausted,
+            duration.TotalMinutes, accumulated.TotalMinutes, resets,
+            usableWindows, skippedWindows, earliestStart,
+            ascendingCalendar[ascendingCalendar.Count - 1].End, longest.TotalMinutes);
         return null;
     }
 
@@ -169,4 +198,152 @@ internal static class CrossWindowSlotLocator
         }
         return true;
     }
+
+    // ────────────────────────────────────────────────────────────────────────
+    // 2026-11-20（本号位）**纯观测探针**：回答「Phase4 跨窗兜底为什么没兜住」
+    //   `ThreadStatic`：求解在本线程内跑，不跨线程；未 `BeginProbe()` 时 `_probe` 恒 null
+    //   ⇒ `Locate` 只多一次字段读，行为与旧实现逐位一致（不参与任何业务判定）。
+    // ────────────────────────────────────────────────────────────────────────
+    [ThreadStatic]
+    private static CrossWindowLocateProbe? _probe;
+
+    /// <summary>
+    /// 开启一次探针作用域（`using` 结束自动还原）。同线程嵌套时内层覆盖外层，外层 Dispose 后置 null。
+    /// </summary>
+    internal static CrossWindowLocateProbe BeginProbe()
+    {
+        var probe = new CrossWindowLocateProbe();
+        _probe = probe;
+        return probe;
+    }
+
+    /// <summary>仅当当前探针就是 <paramref name="probe"/> 时才清除（防嵌套 `using` 误清外层）。</summary>
+    internal static void EndProbe(CrossWindowLocateProbe probe)
+    {
+        if (ReferenceEquals(_probe, probe)) _probe = null;
+    }
+
+    /// <summary>当前线程上的探针（null = 未开启，调用方据此零开销跳过）。</summary>
+    internal static CrossWindowLocateProbe? ActiveProbe => _probe;
 }
+
+/// <summary>2026-11-20 跨窗定位的四种出口（纯诊断用）。</summary>
+internal enum CrossWindowLocateOutcome
+{
+    /// <summary>日历为空 / 时长非正 ⇒ 连单窗都没法比。</summary>
+    NoCalendarOrZeroDuration = 0,
+
+    /// <summary>时长没有超过该资源**最长**窗 ⇒ 内层闸门交回单窗路径（本类不跨）。</summary>
+    DurationNotLongerThanLongestWindow = 1,
+
+    /// <summary>真跨窗且累计够了 ⇒ 返回一整段连续占用。</summary>
+    Found = 2,
+
+    /// <summary>日历走到头仍未累计够 ⇒ 如实排不下（`earliestStart` 之后没有足够可用分钟）。</summary>
+    CalendarExhausted = 3
+}
+
+/// <summary>
+/// 2026-11-20（本号位）跨窗定位探针：逐次记录「哪条分支退出 + 累计到多少 + 被占用块重置几次」。
+/// **只读观测**，不改变 <see cref="CrossWindowSlotLocator"/> 的任何返回值。
+/// </summary>
+internal sealed class CrossWindowLocateProbe : IDisposable
+{
+    internal readonly List<CrossWindowLocateRecord> Records = new();
+
+    /// <summary>2026-11-20：`TryResourceSwitch` 的**分阶段出口**计数（`步骤 → 次数`）。
+/// 用来区分「根本没用跨窗」与「跨窗试了没成」—— 只记在探针开启期间。</summary>
+    private readonly Dictionary<string, int> _steps = new(StringComparer.Ordinal);
+
+    internal void RecordStep(string step)
+    {
+        _steps.TryGetValue(step, out var count);
+        _steps[step] = count + 1;
+    }
+
+    internal void Record(
+        int resourceId,
+        CrossWindowLocateOutcome outcome,
+        double needMinutes,
+        double accumulatedMinutes,
+        int resets,
+        int usableWindows,
+        int skippedWindows,
+        DateTime earliestStart,
+        DateTime? lastCalendarEnd,
+        double longestWindowMinutes)
+    {
+        Records.Add(new CrossWindowLocateRecord(
+            resourceId, outcome, needMinutes, accumulatedMinutes, resets,
+            usableWindows, skippedWindows, earliestStart, lastCalendarEnd, longestWindowMinutes));
+    }
+
+    /// <summary>
+    /// 一行（含换行的多行）汇总：按出口分桶 + 「最接近成功的那次」明细（累计最多的一次）。
+    /// 供 Phase4 写进 `TraceNotes`（`PHASE4_XW_PROBE`）。
+    /// </summary>
+    internal string Summary()
+    {
+        var stepText = _steps.Count == 0
+            ? "阶段=（无）"
+            : "阶段=" + string.Join(", ", _steps.OrderBy(kv => kv.Key, StringComparer.Ordinal)
+                .Select(kv => $"{kv.Key}={kv.Value}"));
+
+        if (Records.Count == 0) return $"跨窗定位 0 次（未走到 CrossWindowSlotLocator）；{stepText}";
+
+        int noCal = 0, notLonger = 0, found = 0, exhausted = 0;
+        foreach (var r in Records)
+        {
+            switch (r.Outcome)
+            {
+                case CrossWindowLocateOutcome.NoCalendarOrZeroDuration: noCal++; break;
+                case CrossWindowLocateOutcome.DurationNotLongerThanLongestWindow: notLonger++; break;
+                case CrossWindowLocateOutcome.Found: found++; break;
+                default: exhausted++; break;
+            }
+        }
+
+        // 「最接近成功」＝ 日历走到头那一档里累计最多的一次（对定位最有信息量）。
+        CrossWindowLocateRecord? best = null;
+        foreach (var r in Records)
+        {
+            if (r.Outcome != CrossWindowLocateOutcome.CalendarExhausted) continue;
+            if (best is null || r.AccumulatedMinutes > best.Value.AccumulatedMinutes) best = r;
+        }
+
+        var text = $"跨窗定位 {Records.Count} 次：命中={found}；日历走到头={exhausted}；"
+                 + $"时长未超最长窗={notLonger}；无日历/时长非正={noCal}；{stepText}";
+        if (best is not null)
+        {
+            var b = best.Value;
+            text += $" || 最接近成功：资源={b.ResourceId} 需 {b.NeedMinutes:0.##} 分钟 / 已累计 {b.AccumulatedMinutes:0.##} 分钟"
+                  + $"（缺口 {b.NeedMinutes - b.AccumulatedMinutes:0.##}）；"
+                  + $"可用窗 {b.UsableWindows} 个、起点前已过期窗 {b.SkippedWindows} 个；"
+                  + $"最长窗 {b.LongestWindowMinutes:0.##} 分钟；被已有占用重置 {b.Resets} 次；"
+                  + $"起点={b.EarliestStart:yyyy-MM-dd HH:mm}，日历末日={b.LastCalendarEnd:yyyy-MM-dd HH:mm}";
+        }
+        return text;
+    }
+
+    private bool _disposed;
+
+    public void Dispose()
+    {
+        if (_disposed) return;
+        _disposed = true;
+        CrossWindowSlotLocator.EndProbe(this);
+    }
+}
+
+/// <summary>2026-11-20 跨窗定位的单次记录（纯诊断）。</summary>
+internal readonly record struct CrossWindowLocateRecord(
+    int ResourceId,
+    CrossWindowLocateOutcome Outcome,
+    double NeedMinutes,
+    double AccumulatedMinutes,
+    int Resets,
+    int UsableWindows,
+    int SkippedWindows,
+    DateTime EarliestStart,
+    DateTime? LastCalendarEnd,
+    double LongestWindowMinutes);

@@ -18,7 +18,7 @@
  * 菜单分组（10-16 4号位）：本文件全部是 **6 个顶级节点**，侧边栏渲染为 6 个一级菜单：
  *   ① /aps             APS 排产 —— 只留 4 个直达页：排产总览 / 甘特图/资源计划 / 异常与原因解释 / 审计日志
  *   ② /aps-demand      需求与供给     订单/需求计划 · 人工到货时间 · 生产指示位置 · 需求保护释放
- *   ③ /aps-execution   排产执行       插单评估 · 候选版本确认 · 运行与下发
+ *   ③ /aps-execution   排产执行       插单评估 · 候选版本确认 · 运行与版本管理
  *   ④ /aps-master-data 基础数据与日历  排程域定义维护 · 工艺规划模式 · 资源日历维护 · 上级工作日历
  *   ⑤ /strategy-config 策略配置 —— 汇进同一份 FrozenStrategySnapshot 的 8 页，
  *                       组内顺序 = 实际操作顺序（规则集维护 → 参数集维护 → 批策略 → 换型两页 → 诊断 → 发布规则集 → 策略包版本）
@@ -40,6 +40,24 @@
  *  - noCache:true 是配套的：以前甘特图不在 visitedViews 里 ⇒ 从不进 keep-alive 缓存；
  *    进了页签后若参与缓存，切走再切回会命中 dhtmlx 未重算尺寸的旧实例。
  *    不缓存则每次进入都是全新实例，行为与改动前一致。
+ *
+ * 2026-11-21：两处 meta 调整（依据 APS_V1_3号位致4号位_P01-P13收口v0.2回执_H1-H10逐条核证裁决_
+ *   回执_v1.0_20261120.md）：
+ *   · `/aps/manual-eta` **追加** `apsRequiredPermissions: ['aps.manual_eta.view']`
+ *     —— H10②收回计划员写码后，回执「附带知悉」要求本页 meta **按权限码二次收敛**：
+ *     角色只当粗粒度入口，真正判据落到权限码（角色与权限码字段同时存在＝AND，见 guard.ts:48）。
+ *     ⇒ 计划员仍持 `manual_eta.view` ⇒ 仍可进页**只读**；admin.system 持三码 ⇒ 可写。
+ *   · `/aps/run` **不动 meta**，只加注释：H1 甲案要新增 `aps.admin.run`（运行治理管理员），
+ *     该码 3号位 尚未落 ⇒ 前端暂以「系统管理员角色」作展示层分流（详见该 meta 注释）。
+ *
+ * 2026-11-21：两处 meta 再调（依据 APS_V1_P01-P13_全页面业务设计统一收口核对稿_v0.2_20261114_四项审核修订版.md
+ *   §3 九类角色表 + §9 勾稽「P08 PMC＋管理员」）：
+ *   · `/aps/manual-eta` 角色门控 **加 `aps.coordinator.material`**（采购担当）——
+ *     稿 §3：采购担当「只维护合法 Manual ETA」⇒ 它持 edit/cancel 码，进页后可写；
+ *     计划员(PMC) 在采购侧仍只读（H10② 收回写码），管理员保留全权。
+ *   · `/aps/explanation` 追加角色门控 `['aps.planner','aps.admin.system']`——
+ *     车间计划员拿到 `aps.plan.run`（场景7～9 发起端点码）后，仅靠权限码会把它放进 P08；
+ *     稿 §9 勾稽写明 P08 = PMC＋管理员 ⇒ 角色与权限码 AND，双保险。
  */
 
 const Layout = () => import('@/layout/Layout.vue')
@@ -106,8 +124,15 @@ export const apsV1Routes: AppRouteRecordRaw[] = [
           icon: 'vi-mdi:alert-circle-outline',
           stage: 'A',
           acceptance: 'U09 / U20',
-          // 第三波 RBAC：只读页 - 需持有 aps.plan.view
-          apsRequiredPermissions: ['aps.plan.view']
+          // 2026-11-21（v0.2 稿 §P08 + §三 权限一致）：P08 = **Domain PMC + 系统管理员**
+          //   （角色表里 P08 只挂在系统管理员与 Domain PMC 名下；车间计划员/部门管理者/统计人员没有 P08）。
+          //   ⇒ 门控从 `aps.plan.view`（4 角色均持）收窄到 `aps.plan.run`
+          //      （dev 实测持有者 = planner〔即 Domain PMC〕+ admin.system〔系统管理员〕）。
+          //  - 2026-11-21 再收一层：车间计划员拿到 `aps.plan.run`（场景7～9 发起端点码）后，
+          //    单靠权限码会把他们放进 P08 ⇒ 按稿 §9 勾稽「P08 PMC＋管理员」补**角色**门控。
+          //    角色与权限码是 **AND**：域 PMC 与系统管理员都进得来，其余角色进不来。
+          apsRequiredRoles: ['aps.planner', 'aps.admin.system'],
+          apsRequiredPermissions: ['aps.plan.run']
         }
       },
 
@@ -175,10 +200,16 @@ export const apsV1Routes: AppRouteRecordRaw[] = [
           icon: 'vi-mdi:truck-delivery-outline',
           stage: 'D',
           acceptance: 'P1-7 / 4号位文档第 11 节',
-          // 第二波 RBAC：PMC 专属（人工到货 ETA 是计划员的领域操作）
+          // 第二波 RBAC：人工到货 ETA 的**写**属采购担当，读属计划员/管理员
           //  - 与 ManualEta.vue 内部权限码门控（has('aps.manual_eta.edit')）一致；路由级做粗粒度
           //  - v1.2 DDL：用后端系统角色码 aps.planner + aps.admin.system
-          apsRequiredRoles: ['aps.planner', 'aps.admin.system']
+          //  - 2026-11-21（H10② 附带知悉）：**按权限码二次收敛** —— 角色只当粗粒度入口，
+          //    判据落到 `aps.manual_eta.view`；计划员已收回 edit/cancel ⇒ 进页只剩只读。
+          //  - 2026-11-21（v0.2 核对稿 §3 采购担当「只维护合法 Manual ETA」）：
+          //    放开 `aps.coordinator.material`（采购担当）进本页 —— 它持 edit/cancel ⇒ 页内写按钮可见。
+          //    角色与权限码是 **AND**：缺任一项即拦下。
+          apsRequiredRoles: ['aps.planner', 'aps.admin.system', 'aps.coordinator.material'],
+          apsRequiredPermissions: ['aps.manual_eta.view']
         }
       },
       {
@@ -256,7 +287,7 @@ export const apsV1Routes: AppRouteRecordRaw[] = [
   },
 
   /* ===== 「排产执行」分组（与「APS 排产」平级）=====
-   *  - 插单评估（CTP 试算）→ 候选版本确认（真正激活一个排程结果）→ 运行与下发（落库 + 推 MES）
+   *  - 插单评估（CTP 试算）→ 候选版本确认（真正激活一个排程结果）→ 运行与版本管理（落库 + 推 MES）
    */
   {
     path: '/aps-execution',
@@ -302,13 +333,25 @@ export const apsV1Routes: AppRouteRecordRaw[] = [
         component: () => import('@/views/Aps/Run.vue'),
         name: 'ApsRun',
         meta: {
-          title: '运行与下发',
+          // 2026-11-20 菜单改名（依据 用户 2026-11-20 指示）：「运行与下发」→「运行与版本管理」
+          //   ⇒ 与 v0.2 稿 P10「运行与 PlanVersion 管理」叫法对齐（这一页管的是 Run 与 PlanVersion，
+          //     MES 下发只是它其中一格）。
+          title: '运行与版本管理',
           icon: 'vi-mdi:server-network',
           noCache: true,
           stage: 'A',
           acceptance: 'U01 / U02 / U19 / U16-U18',
-          // 第三波 RBAC：只读页 - 需持有 aps.plan.view
-          apsRequiredPermissions: ['aps.plan.view']
+          // 2026-11-20 门控改口径（v0.2 稿 §4 P10「**只限系统管理员进入**」）：
+          //   原口径 `aps.plan.view` —— PMC 也持有 ⇒ PMC 进得来也能点「人工恢复」。
+          //   现口径：**系统管理员角色**（本项目 aps.admin.system = 系统管理员）。
+          //   ⚠️ 这是**展示层分流**；端点侧门控仍待 3号位落（见致 3号位函 H1）。
+          // 2026-11-21（H1 甲案，**本次不动 meta**）：3号位 将新增权限码 `aps.admin.run`
+          //   （运行治理管理员；计划员不持；普通候选创建与局部重排仍挂 `aps.plan.run` 不动）。
+          //   ⇒ 落码后 4号位 的两步：①「角色管理→分配权限」把 `aps.admin.run` 绑到 `aps.admin.system`
+          //      （覆盖式 PUT：先 GET 全量 → 追加 → 全集 PUT）；② 本 meta 改挂
+          //      `apsRequiredPermissions: ['aps.admin.run']`（届时角色字段可退）。
+          //   在该码落库前保持现状（角色分流），不做半吊子改挂（挂了没码＝全员 403）。
+          apsRequiredRoles: ['aps.admin.system']
         }
       }
     ]

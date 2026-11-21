@@ -129,8 +129,55 @@ public class PhaseThreeMaterialBindingTests
             out var evidenceType, out var details);
 
         Assert.NotEqual("MATERIAL_SHORTAGE", code);
-        Assert.Equal("PRECEDENCE", evidenceType);
+        // EX-T01（2026-11-21 补）：**「最后必要片」判定** —— 多切片时齐套时点取「累计首次够量」那一片。
+        // EX-T04（2026-11-20）：本夹具无子件、无同需求串联等待 ⇒ 兜底不再冒充 PRECEDENCE，
+        //   证据如实标 `UNRESOLVED`（ReasonCode 仍取 15 码内最近者）。
+        Assert.Equal("UNRESOLVED", evidenceType);
         Assert.Equal("PRECEDENCE_WAIT", code);
         Assert.DoesNotContain("bindingState\":\"BINDING", details ?? string.Empty);   // 候选≠绑定：不得声称物料是绑定约束（CANDIDATE 态可留痕）
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // EX-T01（2026-11-21 补）：**多切片「最后必要片」正反例**
+    //   0号位 v1.8 §六 要求「物料各 Slice 时间与累计数量、**最后必要片**、Stage10 齐料的正反例」。
+    //   上面用例是单切片；这里用三切片锁「齐套时点 = 累计首次够量那一片」。
+    // ═══════════════════════════════════════════════════════════════════
+
+    [Fact(DisplayName = "EX-T01：三切片 30/40/40 需求 100 ⇒ 最后必要片是第 3 片，开工=该片时点")]
+    public void MultiSlice_LastNecessarySlice_IsThird()
+    {
+        var t0 = Base;
+        var t1 = Base.AddDays(1);
+        var t2 = Base.AddDays(2);
+
+        // 30 + 40 = 70 < 100；再加 40 = 110 ≥ 100 ⇒ 第 3 片(t2)是最后必要片。
+        var ctx = Context((30m, t0), (40m, t1), (40m, t2));
+        var code = Diagnose(100m, ctx,
+            new List<FinalTaskDraft> { Task(t2, t2.AddHours(1)) },
+            out _, out var details);
+
+        Assert.Equal("MATERIAL_SHORTAGE", code);
+        Assert.Contains("bindingState\":\"BINDING", details);
+        Assert.Contains($"materialReadyAt\":\"{t2:O}", details);   // 不是 t0/t1
+        Assert.Contains("accumulatedQty\":110", details);          // 累计到够量为止的总量
+    }
+
+    [Fact(DisplayName = "EX-T01：三切片 30/40/40 需求 70 ⇒ 最后必要片是第 2 片，第 3 片不参与")]
+    public void MultiSlice_SmallerDemand_LastNecessarySlice_IsSecond()
+    {
+        var t0 = Base;
+        var t1 = Base.AddDays(1);
+        var t2 = Base.AddDays(2);
+
+        // 需求 70：30 + 40 = 70 ⇒ 第 2 片(t1)就够，第 3 片(t2)不是必要片。
+        var ctx = Context((30m, t0), (40m, t1), (40m, t2));
+        var code = Diagnose(70m, ctx,
+            new List<FinalTaskDraft> { Task(t1, t1.AddHours(1)) },
+            out _, out var details);
+
+        Assert.Equal("MATERIAL_SHORTAGE", code);
+        Assert.Contains($"materialReadyAt\":\"{t1:O}", details);
+        Assert.DoesNotContain($"materialReadyAt\":\"{t2:O}", details);
+        Assert.Contains("accumulatedQty\":70", details);   // 恰好够，不多累计
     }
 }

@@ -81,6 +81,7 @@ process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0'
 
 const API_BASE = process.env.API_BASE || 'https://localhost:7044'
 const GROUP = process.env.GROUP || 'all' // all | domain | rbac | auth-negate | strategy-profile | setup | first-wave | audit
+// ⚠️ 本脚本**保留 admin**：要增删 /api/rbac/users，需 aps.auth.user.edit，rule_admin 无此码（3号位 2026-11-19 回执 §3.2 过渡期乙：dev 与生产共用 APS_Auth，admin 登录会顶掉生产会话）
 const ADMIN_CODE = 'admin'
 const ADMIN_PWD = 'Admin@123456'
 

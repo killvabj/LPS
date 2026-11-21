@@ -1,5 +1,7 @@
 using System.Diagnostics.CodeAnalysis;
+using System.Globalization;
 using LPS.APS.Core.Dto;
+using LPS.APS.Scheduling.Algorithms;
 using LPS.APS.Shared.Models;
 
 namespace LPS.APS.Scheduling.Solvers;
@@ -90,6 +92,51 @@ internal class PhaseFiveCompression
         }
         SolverDiagnostics.HotspotEnd(swP5Terminal, SolverDiagnostics.Hotspot.Phase5Terminal);
 
+        // ── 2026-11-20（本号位）**份额 / 末端构成 / Task 时刻电子账**（`APS_DUMP_SHARE_LEDGER=<path>`）──
+        //   0号位 v1.8 §二 特别提醒要求：47 条由有 Task 变零 Task 必须给「按真实 Demand/Allocation 的去向 +
+        //   **关联资源占用差异**」。`AllocationTaskShare` 属 Phase2 内部血缘、未在 DomainSolveResult 暴露 ⇒
+        //   之前只能给到「U=0 + check#1」级证据。本出口把**同一份**内存事实原样落成电子账：
+        //     · SHARE   行 = `AllocationTaskShare`（TaskId → DemandKey 份额）
+        //     · TERMINAL 行 = 末端 Task 构成（Demand 已落定量按 Allocation 归属）
+        //     · TASK    行 = 资源/工序/数量/起止（资源占用差异的原始依据）
+        //   ⚠ 纯观测：环境变量未设 ⇒ 第一行即返回；不改任何判定、不写库。
+        DumpShareAndTaskLedger(allScheduledTasks, terminalContributions, scheduleResult.AllocationTaskShare);
+
+        // ── 0号位 v1.7 Q2 / P6（2026-11-19）：**执行批圆整增量留痕**（只入 Trace）──
+        //   逐字口径：「V1 先使用已有的 Run/PV/执行批级诊断或 Trace 载体，记录正常生产圆整信息，
+        //   不新增专门的 Issue 类别、不把差额记作未排或错误」「记录 … 各成员原始净量、原始合计量、
+        //   向上圆整目标 …、实际排产量、圆整新增净量」。
+        //   实现口径：Q_round = **执行净量 − 本 Task 的需求构成合计**（构成已是原始净量口径，
+        //   含合批血缘；第二类独批时构成=Q_raw）。只在**末端 Task** 记一行 —— 同批 N 道工序共享同一净量，
+        //   逐工序记会 N 倍重复。
+        //   ⚠ 不写 `AllocationTaskShare`、不进 `UnscheduledTasks`、不产 Issue：圆整增量不是客户需求、
+        //     不是缺口、不是可售库存（v1.7 Q2 末段逐字）。
+        var compositionQtyByTask = new Dictionary<string, decimal>(StringComparer.Ordinal);
+        foreach (var c in terminalContributions)
+        {
+            compositionQtyByTask[c.TaskId] = compositionQtyByTask.GetValueOrDefault(c.TaskId) + c.Qty;
+        }
+
+        foreach (var traceTask in allScheduledTasks)
+        {
+            if (!compositionQtyByTask.TryGetValue(traceTask.FinalDraftId, out var rawComposition)) continue;
+            var roundQty = traceTask.Quantity - rawComposition;
+            if (roundQty <= 0.0001m) continue;   // 无圆整（或构成已等于执行量）⇒ 不留痕
+
+            constraints.TraceNotes.Add(new SolveTraceNote
+            {
+                Key = traceTask.SourceDraftId,
+                ReasonCode = "EXECUTION_QTY_ROUNDING",
+                Message = $"执行批圆整增量：Task={traceTask.FinalDraftId}"
+                        + $"｜批={traceTask.ExecutionBatchDraftKey ?? "-"}"
+                        + $"｜执行净量={traceTask.Quantity}"
+                        + $"｜原始需求承接={rawComposition}"
+                        + $"｜圆整增量={roundQty}"
+                        + "（只作生产量：不记需求份额、不记未排、不伪造库存；0号位 v1.7 Q2）",
+                Level = "Info"
+            });
+        }
+
         // 第5轮修复：TaskDependency必须在硬校验之前生成，以便校验Dependency约束
         // P0-13修复：生成 TaskDependency（基于 Routing 工序依赖关系）
         long swP5Deps = SolverDiagnostics.HotspotStart();
@@ -105,6 +152,9 @@ internal class PhaseFiveCompression
         var unscheduledDemandKeysForValidation = new HashSet<string>(
             scheduleResult.UnscheduledDemandKeys, StringComparer.Ordinal);
         unscheduledDemandKeysForValidation.UnionWith(repairResult.StillUnscheduledKeys);
+        // 0号位 v1.7 Q4 / N-05（2026-11-19）：被 PI/Stage 合法上限**部分排产**的需求 ——
+        //   已有 Task（Σ已排 < 声明量）⇒ 与「部分执行批失败」同款合法例外：允许 Σ<Q，绝不允许 Σ>Q。
+        unscheduledDemandKeysForValidation.UnionWith(scheduleResult.PiLegalQuantityCapped.Keys);
 
         // ── M-1（2026-10-16，2号位《Phase5 最小出口处理会签…》§1.2；我方同件答复 §二.3 接受）──
         //   未排程清单 `UnscheduledTasks` 的组装**整体前移**到硬校验**之前**。
@@ -268,6 +318,15 @@ internal class PhaseFiveCompression
         {
             if (!repairedSourceDraftIds.Contains(demandKey))
             {
+                // ── 0号位 v1.7 Q4 / N-06（2026-11-19）：PI/Stage 合法上限 = 0 ⇒ 整条未排 ──
+                //   这是**正常业务未排**，出口原因必须写真实根因（不得降格成「Phase 2 初始排程失败」），
+                //   也不得进 `BatchPolicyHardFailures`（那不是批次策略硬失败）。
+                if (scheduleResult.PiLegalQuantityBlocked.TryGetValue(demandKey, out var piBlockedDetail))
+                {
+                    ReportUnscheduled(demandKey, "PI_LEGAL_QTY_OVER_LIMIT", piBlockedDetail);
+                    continue;
+                }
+
                 // ── P0-01 / P0-02（0号位 2026-10-08 §四 / §五）：硬业务失败优先归属 ──
                 //   `BATCH_POLICY_MISSING` / `BATCH_POLICY_CONFLICT` 是**硬失败类别**，
                 //   不得被降格成「Phase 2 初始排程失败」这类泛化原因（§十二 要求 Reason 逐字可判）。
@@ -338,6 +397,17 @@ internal class PhaseFiveCompression
         }
 
         SolverDiagnostics.HotspotEnd(swP5UnschedP2, SolverDiagnostics.Hotspot.Phase5UnschedP2);
+
+        // ── 0号位 v1.7 Q4 / N-05（2026-11-19）：PI/Stage 合法上限导致的**部分排产** ──
+        //   与「Phase2 完全未排」分列：这些需求**有 Task 落定**，但原需求净量更大。
+        //   `UnscheduledQty = 声明量 − 已落定构成量`（原始净量口径，不是执行量口径）
+        //     ⇒ 例：原始 14.754、合法上限 14 ⇒ 已排 14、未排 0.754、圆整增量 0。
+        //   Reason 用门禁同一类别 `PI_LEGAL_QTY_OVER_LIMIT`（正常业务未排，非技术 ERROR）。
+        //   放在 Phase4 未排循环**之前**：同一需求的 Part4 泛化原因不得抢走本次真实根因。
+        foreach (var piCapped in scheduleResult.PiLegalQuantityCapped)
+        {
+            ReportUnscheduled(piCapped.Key, "PI_LEGAL_QTY_OVER_LIMIT", piCapped.Value);
+        }
 
         long swP5UnschedP4 = SolverDiagnostics.HotspotStart();
         // Phase 4 仍未排程的需求
@@ -543,12 +613,26 @@ internal class PhaseFiveCompression
         //   ⇒ CYL 的残差不是二次诊断，446 万条 Task 的对象构造才是主嫌。本槽用来证实/否证。
         //   注意：只把 `return new …` 改成「先赋本地再返回」，**求值次序与内容一字未改**。
         var swP5ResultAsm = SolverDiagnostics.HotspotStart();
+
+        // ── 2026-11-21（EX-T05；2号位 r14344 已在 `FinalTaskDraft` 加好字段）──
+        //   **关键路径判定**：口径见 `CriticalPathCalculator` 类注释（纯时序 CPM：同需求按 OperationSeq 串联 +
+        //   跨物料「子件末 Task → 父件首 Task（带 LagMinutes）」；基准 = 实测最晚 `PlannedEndTime`；
+        //   `slack ≤ 1s ⇒ 关键`，负 slack 也判关键；成环返回空集，宁可不判也不给假 true/false）。
+        //   ⚠ **只重建判为关键的少数 Task**：`IsCriticalPath` 默认即 `false`（=算过且不关键），
+        //     非关键 Task 保持原引用 ⇒ 大域（CYL 数百万 Task）不会因此多复制一份全表。
+        var criticalTaskIds = CriticalPathCalculator.Compute(allScheduledTasks, constraints.CrossMaterialLagMinutes);
+        IReadOnlyList<FinalTaskDraft> finalTasksWithCriticalPath = criticalTaskIds.Count == 0
+            ? allScheduledTasks
+            : allScheduledTasks
+                .Select(t => criticalTaskIds.Contains(t.FinalDraftId) ? WithCriticalPath(t, isCritical: true) : t)
+                .ToList();
+
         var finalResult = new DomainSolveResult
         {
             Success = !technicalFailure,
             ErrorMessage = composedErrorMessage,
             IsRoughCut = false,
-            FinalTasks = allScheduledTasks,
+            FinalTasks = finalTasksWithCriticalPath,
             AllocationShares = allocationShares,
             UnscheduledTasks = unscheduledTasks,
             PhysicalPeggingDrafts = taskDependencies,
@@ -1174,6 +1258,11 @@ internal class PhaseFiveCompression
             contextSnapshot.ExecutionBatchPlans[kv.Key] = entries;
         }
 
+        // 2026-11-20：原始净量映射（Phase2 登记，Phase1 无法重建）⇒ 必须随快照落盘，
+        //   否则 Phase5-only 重放会退回旧锚点（实测 999507 旧快照：ΣShare 478 > Quantity 41）。
+        foreach (var kv in constraints.RawBatchNetByExecutionBatchKey)
+            contextSnapshot.RawBatchNetByExecutionBatchKey[kv.Key] = kv.Value;
+
         using (var fs = new System.IO.FileStream(
                    System.IO.Path.Combine(dir, "context.json"),
                    System.IO.FileMode.Create, System.IO.FileAccess.Write,
@@ -1214,6 +1303,17 @@ internal class PhaseFiveCompression
 
         /// <summary>需求键 → 该需求下各执行批的计划量。</summary>
         public Dictionary<string, List<Phase5BatchPlanEntry>> ExecutionBatchPlans { get; set; } = new(StringComparer.Ordinal);
+
+        /// <summary>
+        /// 2026-11-20（本号位）：执行批键 → **本批原始净量**（0号位 v1.7 两类小数）。
+        ///
+        /// <para><b>为什么必须进快照</b>：Phase5 的构成锚点要用 `Q_raw`（原始净量），
+        ///   该映射由 **Phase2 落码时登记**、不是 Phase1 可从 DTO 重建的事实。
+        ///   缺它的 Phase5-only 重放会退回旧口径（锚点 = Task 自身 Quantity），
+        ///   实测形态即 `Task ΣShare=478 > Quantity=41`（缺口 437，11-14 旧快照正是此形态）。</para>
+        /// <para>空表 = 该快照产出时还没有本映射（旧快照）⇒ 回放按旧口径，**不猜**。</para>
+        /// </summary>
+        public Dictionary<string, decimal> RawBatchNetByExecutionBatchKey { get; set; } = new(StringComparer.Ordinal);
     }
 
     /// <summary>`context.json` 里的单个执行批计划项（对应 `ExecutionBatchPlanEntry`，字段一一对应）。</summary>
@@ -1263,6 +1363,10 @@ internal class PhaseFiveCompression
 
             constraints.ExecutionBatchPlans[kv.Key] = entries;
         }
+
+        // 2026-11-20：旧快照无此表 ⇒ 保持空表（按旧锚点回放，不猜）。
+        foreach (var kv in snapshot.RawBatchNetByExecutionBatchKey)
+            constraints.RawBatchNetByExecutionBatchKey[kv.Key] = kv.Value;
     }
 
     /// <summary>解析 `"RouteCode::PathId"`（口径同 `RoutePathKey.ToString()`）。</summary>
@@ -1600,6 +1704,25 @@ internal class PhaseFiveCompression
             .GroupBy(t => t.SourceDraftId)
             .ToDictionary(g => g.Key, g => g.Max(t => t.PlannedEndTime));
 
+        // 0号位 v1.5：时间未定/`SH_LINKED` 切片的时点 = 子件已排 Task 完工 + 跨物料 Lag（此处按压实后位置）
+        DateTime TaskDerivedFloorForCompaction(string demandKey)
+        {
+            if (!constraints.CrossMaterialParentToChildren.TryGetValue(demandKey, out var children)
+                || children.Count == 0)
+            {
+                return default;
+            }
+            var floor = default(DateTime);
+            foreach (var childKey in children)
+            {
+                if (!completionByDemand.TryGetValue(childKey, out var childEnd)) continue;
+                if (constraints.CrossMaterialLagMinutes.TryGetValue((demandKey, childKey), out var lagMinutes))
+                    childEnd = childEnd.AddMinutes((double)lagMinutes);
+                if (childEnd > floor) floor = childEnd;
+            }
+            return floor;
+        }
+
         // 全局按加工开始时间升序处理：Routing 前序/跨物料子件/同 PI 连续份额先于当前 Task 处理，
         // 它们的 floor 用压实后的最新位置（只提前 → 后继 floor 只会更低，安全）。
         var order = tasks
@@ -1639,7 +1762,8 @@ internal class PhaseFiveCompression
 
             // 1) 物料可用时间（多段 Quantity-Time）；总量不足 → 保持原位不动
             var materialFloor = PhaseFourLocalRepair.GetMaterialEarliestTime(
-                demand.AllocationSequence, demand.NetOutputQty, constraints, request.PlanningStart, out var sufficient);
+                demand.AllocationSequence, demand.NetOutputQty, constraints, request.PlanningStart, out var sufficient,
+                TaskDerivedFloorForCompaction(demand.LogicalDemandKey));
             if (!sufficient)
             {
                 if (materialShortReported.Add(task.SourceDraftId))
@@ -1842,6 +1966,46 @@ internal class PhaseFiveCompression
         }
         SolverDiagnostics.HotspotEnd(swCgLoop, SolverDiagnostics.Hotspot.Phase5CompactLoop);
     }
+
+    /// <summary>
+    /// 2026-11-21（EX-T05）：`FinalTaskDraft` 为 init-only ⇒ 只能重建。
+    /// 本方法**逐字带走 `FinalTaskDraft` 的全部 30 个属性**（含 `Duration` —— `WithTimes` 当年漏了它，
+    /// 只是 Scheduling 侧从未给该字段赋值、暂时无害；这里不再复制那个疏漏），只改 `IsCriticalPath`。
+    /// </summary>
+    private static FinalTaskDraft WithCriticalPath(FinalTaskDraft task, bool isCritical)
+        => new FinalTaskDraft
+        {
+            FinalDraftId = task.FinalDraftId,
+            SourceDraftId = task.SourceDraftId,
+            MaterialId = task.MaterialId,
+            FactoryId = task.FactoryId,
+            StageCode = task.StageCode,
+            OperationCode = task.OperationCode,
+            OperationSeq = task.OperationSeq,
+            TaskType = task.TaskType,
+            IsCriticalPath = isCritical,
+            ResourceId = task.ResourceId,
+            ResourceCode = task.ResourceCode,
+            RouteCode = task.RouteCode,
+            PathId = task.PathId,
+            Quantity = task.Quantity,
+            PlannedProcessQty = task.PlannedProcessQty,
+            UOM = task.UOM,
+            PlannedStartTime = task.PlannedStartTime,
+            PlannedEndTime = task.PlannedEndTime,
+            SetupTime = task.SetupTime,
+            EffectiveProcessMinutes = task.EffectiveProcessMinutes,
+            Duration = task.Duration,
+            SetupSource = task.SetupSource,
+            Priority = task.Priority,
+            IsVirtual = task.IsVirtual,
+            ExecutionBatchDraftKey = task.ExecutionBatchDraftKey,
+            ContinuationKey = task.ContinuationKey,
+            StageExecutionBatchDraftKey = task.StageExecutionBatchDraftKey,
+            StageExecutionBatchQty = task.StageExecutionBatchQty,
+            ExistingMESPlanReleaseId = task.ExistingMESPlanReleaseId,
+            ExecutionLockId = task.ExecutionLockId
+        };
 
     /// <summary>P1-05：FinalTaskDraft 为 init-only，移动时重建实例（除时间外全字段原样保留，含 OperationSeq）。</summary>
     private static FinalTaskDraft WithTimes(FinalTaskDraft task, DateTime newStart, DateTime newEnd)
@@ -2155,6 +2319,25 @@ internal class PhaseFiveCompression
         cancellationToken.ThrowIfCancellationRequested();
         var segmentIds = segment.Select(t => t.FinalDraftId).ToHashSet();
 
+        // 0号位 v1.5：时间未定/`SH_LINKED` 切片的时点 = 子件已排 Task 完工 + 跨物料 Lag
+        DateTime TaskDerivedFloorForSegment(string demandKey)
+        {
+            if (!constraints.CrossMaterialParentToChildren.TryGetValue(demandKey, out var children)
+                || children.Count == 0)
+            {
+                return default;
+            }
+            var floor = default(DateTime);
+            foreach (var childKey in children)
+            {
+                if (!completionByDemand.TryGetValue(childKey, out var childEnd)) continue;
+                if (constraints.CrossMaterialLagMinutes.TryGetValue((demandKey, childKey), out var lagMinutes))
+                    childEnd = childEnd.AddMinutes((double)lagMinutes);
+                if (childEnd > floor) floor = childEnd;
+            }
+            return floor;
+        }
+
         // P1-02 验收观测（0号位 2026-10-09《APS_V1_2_20261009.md》§五.5）：本段**确实进入**有界局部优化体。
         //   段由调用方保证「≥2 个 Task 且全部可移动（不含锚点）」⇒ 混合方向下 FORWARD 独立段可达此处；
         //   BACKWARD/MIXED 需求整体在 `immovable` 内 ⇒ 只会作**锚点**切分，不会形成本调用。纯观测，不参与判定。
@@ -2174,7 +2357,8 @@ internal class PhaseFiveCompression
 
             // floor：物料（不足则不早于原位）
             var floor = PhaseFourLocalRepair.GetMaterialEarliestTime(
-                demand.AllocationSequence, demand.NetOutputQty, constraints, request.PlanningStart, out var sufficient);
+                demand.AllocationSequence, demand.NetOutputQty, constraints, request.PlanningStart, out var sufficient,
+                TaskDerivedFloorForSegment(demand.LogicalDemandKey));
             if (!sufficient)
             {
                 floor = taskOccStart;   // 缺料 ⇒ 本段该 Task 不早于原位（行为不变，只补留痕）
@@ -2951,6 +3135,204 @@ internal class PhaseFiveCompression
     ///   ⚠ 这是**唯一**能拿到 Demand 级拆解的地方 —— `AllocationTaskShare`（`DomainSolveResult.cs:166-171`）
     ///   **不带 `DemandKey`**。
     /// </summary>
+    /// <summary>
+    /// 2026-11-20（本号位）**只在 `APS_DUMP_SHARE_LEDGER` 设了路径时**把三份内存事实原样落成 TSV：
+    /// SHARE（`AllocationTaskShare`）、TERMINAL（末端构成）、TASK（资源/工序/起止）。
+    /// 用途 = 0号位 v1.8 §二「47 条去向 + 关联资源占用差异」的逐键证据；**纯观测**，未设环境变量时零开销。
+    /// 不写库、不进 `DomainSolveResult`、不改任何判定。
+    /// </summary>
+    private static void DumpShareAndTaskLedger(
+        List<FinalTaskDraft> tasks,
+        List<(string TaskId, long AllocationSequence, string DemandKey, decimal Qty)> terminalContributions,
+        Dictionary<string, List<(string DemandKey, decimal ShareQty)>> allocationTaskShare)
+    {
+        // ── W1（0号位 任务包 §1.2）：**按「需求×Stage×Operation×执行批」的份额守恒账本** ──
+        //   与下面的原始电子账并列导出（`APS_DUMP_BATCH_SHARE_LEDGER=<path>`，默认不写）。
+        //   口径：同一需求的份额出现在该执行批的**每一道工序** Task 上（同额）⇒ 本账按
+        //     (demandKey, batchKey, stage, op) 聚合，并在末列给出该需求的**批级合计/需求合计**，
+        //   供审计直接判「同批各工序份额是否相等 / 各批合计是否等于该需求份额」。
+        //   纯导出：不写份额表、不改判定、不参与硬校验。
+        var batchLedgerPath = Environment.GetEnvironmentVariable("APS_DUMP_BATCH_SHARE_LEDGER");
+        if (!string.IsNullOrWhiteSpace(batchLedgerPath))
+        {
+            try
+            {
+                var taskById = tasks
+                    .GroupBy(t => t.FinalDraftId, StringComparer.Ordinal)
+                    .ToDictionary(g => g.Key, g => g.First(), StringComparer.Ordinal);
+                using var bw = new System.IO.StreamWriter(batchLedgerPath!, false, System.Text.Encoding.UTF8);
+                bw.WriteLine("demandKey\tbatchKey\tstage\top\tqty\tbatchQty\topsConsistent\tdemandQty");
+
+                // ⚠ **主源必须是 `terminalContributions`**，不是 `AllocationTaskShare`：
+                //   后者只登记**合批/拆批的显式份额**（实测本域仅 1 个需求有行），普通单需求 Task 不写。
+                //   `terminalContributions` 才是「该末端 Task 由哪些需求各占多少」的唯一运行期真相。
+                //   展开到工序：同一执行批内各工序共享同一净量 ⇒ 先按批取工序集合，再按需求×批×工序出账。
+                var opsByBatch = new Dictionary<string, List<(string Stage, string Op)>>(StringComparer.Ordinal);
+                foreach (var t in tasks)
+                {
+                    var bk = t.ExecutionBatchDraftKey ?? "-";
+                    if (!opsByBatch.TryGetValue(bk, out var list))
+                    {
+                        list = new List<(string, string)>();
+                        opsByBatch[bk] = list;
+                    }
+                    var pair = (t.StageCode ?? string.Empty, t.OperationCode ?? string.Empty);
+                    if (!list.Contains(pair)) list.Add(pair);
+                }
+
+                // ⚠ 三个坑（实测都踩过）：
+                //   ①`terminalContributions` **在每道工序各登记同额**（17 道工序 × 150 ⇒ 求和得 2550）；
+                //   ②同一 (需求,批) 可能有多个末端 Task ⇒ 也不能简单取首条；
+                //   ③`AllocationTaskShare` 只覆盖合批/拆批的显式份额，普通单需求 Task 不写。
+                //   ⇒ 正确口径：按 **(需求,批,工序)** 记账，同键多值必须相等（不等即真冲突，单独标出）；
+                //     批份额取该批任一工序的值（各工序应同额）；需求份额 = 各批批份额之和。
+                var perOpQty = new Dictionary<string, decimal>(StringComparer.Ordinal);
+                var opConflict = new HashSet<string>(StringComparer.Ordinal);
+                var conflictBatches = new HashSet<string>(StringComparer.Ordinal);
+                // 2026-11-21 修（本号位自查）：**同一 (需求,批,工序) 可有多条末端构成** ——
+                //   该工序被拆到多个 Task 上时（实测 `999597_36922` 的 J101 = 77+77+76），
+                //   旧写法「首条为准」把这条工序记成 77，又用 77 去补其它工序（实际 230）
+                //   ⇒ 批份额被低估成 1/3，两套账必然不闭合。
+                //   正确：**末端构成在同一 (需求,批,工序) 内累加**。
+                //   但 `AllocationTaskShare` 是**另一条口径**（合批/拆批的显式份额），与末端构成
+                //   在合批场景会描述同一笔 ⇒ 它对同一键**只补缺、不累加**，避免算两遍。
+                void RecordTerminal(string demandKey, string bk, string stage, string op, decimal qty)
+                {
+                    var key = $"{demandKey}\u0001{bk}\u0001{stage}\u0001{op}";
+                    perOpQty.TryGetValue(key, out var existing);
+                    perOpQty[key] = existing + qty;
+                }
+
+                void RecordShareIfAbsent(string demandKey, string bk, string stage, string op, decimal qty)
+                {
+                    var key = $"{demandKey}\u0001{bk}\u0001{stage}\u0001{op}";
+                    if (!perOpQty.ContainsKey(key))
+                    {
+                        perOpQty[key] = qty;
+                    }
+                }
+
+                foreach (var c in terminalContributions)
+                {
+                    if (!taskById.TryGetValue(c.TaskId, out var task)) continue;
+                    RecordTerminal(c.DemandKey, task.ExecutionBatchDraftKey ?? "-",
+                        task.StageCode ?? string.Empty, task.OperationCode ?? string.Empty, c.Qty);
+                }
+                foreach (var kv in allocationTaskShare)
+                {
+                    if (!taskById.TryGetValue(kv.Key, out var task)) continue;
+                    foreach (var (demandKey, shareQty) in kv.Value)
+                    {
+                        RecordShareIfAbsent(demandKey, task.ExecutionBatchDraftKey ?? "-",
+                            task.StageCode ?? string.Empty, task.OperationCode ?? string.Empty, shareQty);
+                    }
+                }
+
+                // 补全：同一 (需求,批) 内有工序没有构成记录时，用该批其它工序的值补齐（各工序同额）。
+                var rows = new List<(string Demand, string Batch, string Stage, string Op, decimal Qty)>();
+                foreach (var g in perOpQty.GroupBy(kv => kv.Key.Split('\u0001')[0] + "\u0001" + kv.Key.Split('\u0001')[1],
+                                                   StringComparer.Ordinal))
+                {
+                    var demandKey = g.Key.Split('\u0001')[0];
+                    var bk = g.Key.Split('\u0001')[1];
+                    var qty = g.Select(x => x.Value).First();
+                    var recorded = g.Select(x =>
+                    {
+                        var parts = x.Key.Split('\u0001');
+                        return (parts[2], parts[3]);
+                    }).ToHashSet();
+                    foreach (var (stage, op) in recorded)
+                        rows.Add((demandKey, bk, stage, op, qty));
+                    // 补齐该批的其它工序（无构成记录）
+                    if (opsByBatch.TryGetValue(bk, out var ops))
+                    {
+                        foreach (var (stage, op) in ops)
+                        {
+                            if (!recorded.Contains((stage, op)))
+                                rows.Add((demandKey, bk, stage, op, qty));
+                        }
+                    }
+                    // 2026-11-21：`opConflict` 已停用 —— 拆工序场景下同一 (需求,批,工序) **应累加**，
+                    //   不再视为冲突。各工序**汇总后**是否同额，由下面的 `batchConsistent` 列给出。
+                    _ = opConflict;
+                }
+
+                // ⚠ 份额在**每道工序各记一条**（同额）⇒ 直接求和会把批份额放大 N 倍（实测 11 道工序 ×5 = 55）。
+                //   ⇒ 批份额取「该批各工序的**单个值**」，一致性单独出列；需求份额 = 该需求**各批**的批份额之和。
+                var batchQty = new Dictionary<string, decimal>(StringComparer.Ordinal);
+                var batchConsistent = new Dictionary<string, bool>(StringComparer.Ordinal);
+                foreach (var g in rows.GroupBy(r => r.Demand + "\u0001" + r.Batch, StringComparer.Ordinal))
+                {
+                    var distinct = g.Select(x => x.Qty).Distinct().ToList();
+                    batchQty[g.Key] = distinct.Count > 0 ? distinct[0] : 0m;
+                    batchConsistent[g.Key] = distinct.Count <= 1;
+                }
+                var demandQty = new Dictionary<string, decimal>(StringComparer.Ordinal);
+                foreach (var g in rows.GroupBy(r => r.Demand, StringComparer.Ordinal))
+                {
+                    var sum = 0m;
+                    foreach (var b in g.Select(x => x.Batch).Distinct(StringComparer.Ordinal))
+                        sum += batchQty[g.Key + "\u0001" + b];
+                    demandQty[g.Key] = sum;
+                }
+
+                foreach (var r in rows.OrderBy(x => x.Demand, StringComparer.Ordinal)
+                                      .ThenBy(x => x.Batch, StringComparer.Ordinal)
+                                      .ThenBy(x => x.Stage, StringComparer.Ordinal)
+                                      .ThenBy(x => x.Op, StringComparer.Ordinal))
+                {
+                    var bk = r.Demand + "\u0001" + r.Batch;
+                    bw.WriteLine(string.Join('\t',
+                        r.Demand, r.Batch, r.Stage, r.Op,
+                        r.Qty.ToString("G29"),
+                        batchQty[bk].ToString("G29"),
+                        batchConsistent[bk] ? "Y" : "N",
+                        demandQty[r.Demand].ToString("G29")));
+                }
+            }
+            catch
+            {
+                // 埋点失败绝不影响求解（与既有诊断出口同一纪律）。
+            }
+        }
+
+        var path = Environment.GetEnvironmentVariable("APS_DUMP_SHARE_LEDGER");
+        if (string.IsNullOrWhiteSpace(path)) return;
+
+        try
+        {
+            using var writer = new System.IO.StreamWriter(path!, false, System.Text.Encoding.UTF8);
+            writer.WriteLine("kind\ttaskId\tdemandKey\tallocSeq\tqty\tsourceDraft\tmaterial\tresource\tstage\top\tstart\tend\tbatchKey");
+
+            foreach (var kv in allocationTaskShare)
+            {
+                foreach (var (demandKey, shareQty) in kv.Value)
+                {
+                    writer.WriteLine($"SHARE\t{kv.Key}\t{demandKey}\t\t{shareQty:G29}\t\t\t\t\t\t\t\t");
+                }
+            }
+
+            foreach (var c in terminalContributions)
+            {
+                writer.WriteLine($"TERMINAL\t{c.TaskId}\t{c.DemandKey}\t{c.AllocationSequence}\t{c.Qty:G29}\t\t\t\t\t\t\t\t");
+            }
+
+            foreach (var t in tasks)
+            {
+                var start = t.PlannedStartTime.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture);
+                var end = t.PlannedEndTime.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture);
+                writer.WriteLine(
+                    $"TASK\t{t.FinalDraftId}\t{t.SourceDraftId}\t\t{t.Quantity:G29}\t{t.SourceDraftId}"
+                    + $"\t{t.MaterialId}\t{(t.ResourceId.HasValue ? t.ResourceId.Value.ToString(CultureInfo.InvariantCulture) : "null")}"
+                    + $"\t{t.StageCode ?? ""}\t{t.OperationCode ?? ""}\t{start}\t{end}\t{t.ExecutionBatchDraftKey ?? ""}");
+            }
+        }
+        catch
+        {
+            // 埋点失败绝不影响求解（与既有诊断出口同一纪律）。
+        }
+    }
+
     private List<(string TaskId, long AllocationSequence, string DemandKey, decimal Qty)> BuildTerminalContributions(
         List<FinalTaskDraft> tasks,
         DomainSolveRequest request,
@@ -2973,39 +3355,87 @@ internal class PhaseFiveCompression
             //   ⇒ 末端集合算错 ⇒ AllocationTaskShare 归错 Task。
             foreach (var batchTasks in PartitionByExecutionBatch(demandGroup))
             {
-                if (!TryGetGraphForBatch(constraints, FirstBatchKey(batchTasks), demand, out var routingGraph))
-                    continue;
+                var batchKeyForLookup = FirstBatchKey(batchTasks);
+                if (!TryGetGraphForBatch(constraints, batchKeyForLookup, demand, out var routingGraph)
+                    || routingGraph.Dependencies.Count == 0)
+                {
+                    // 2026-11-21（本号位自查）：需求上 `RouteCode/PathId` 为 **null** 时（RT-003 多路径待选，
+                    //   实测 `999597_36704/FREE`：RouteCode=null / PathId=null），按需求取到的图**没有依赖边**，
+                    //   于是本批全部 Task 被当末端 ⇒ 构成合计 ≫ 声明量 ⇒ `声明量 − 已落定` 夹 0 ⇒ 未排量消失。
+                    //   **修法不是猜**：`FinalTaskDraft.RouteCode/PathId` 按冻结必须回传**真实选定**的 Route/Path，
+                    //   用 Task 上的这对值向同一批键**重取一次图**；取不到就保持原状（不臆造顺序）。
+                    //   ⚠ `OperationSeq` 恒为 0（契约明文「DAG 已废弃线性顺序号」）⇒ 绝不用它排序。
+                    var pathCarrier = batchTasks.FirstOrDefault(t =>
+                        !string.IsNullOrEmpty(t.RouteCode) || t.PathId.HasValue);
+                    // `FinalTaskDraft.PathId` 是 `long?`，而图查找键是 `int?` ⇒ 只在可容纳时转换
+                    int? pathIdForLookup = pathCarrier?.PathId is long pid && pid <= int.MaxValue && pid >= int.MinValue
+                        ? (int)pid
+                        : null;
+                    if (pathCarrier is not null && !string.IsNullOrEmpty(batchKeyForLookup)
+                        && constraints.TryGetBatchRoutingGraph(
+                               batchKeyForLookup, demand.MaterialId, pathCarrier.RouteCode, pathIdForLookup,
+                               out var graphFromTasks)
+                        && graphFromTasks.Dependencies.Count > 0)
+                    {
+                        routingGraph = graphFromTasks;
+                    }
+                    else
+                    {
+                        // 仍取不到 ⇒ 不判末端归属（保持旧行为：全部按末端），把差异留给两套账去暴露。
+                        continue;
+                    }
+                }
 
                 // 标记所有有downstream的Task（非末端）。
                 // 0号位 2026-09-29 裁决 §5.3：节点身份 = (StageCode, OperationCode)。
                 // 同一物料的不同 Stage 可能出现**相同 OperationCode**（2号位 实测 117 物料）。
                 // 边端点升维后 dep.From.StageCode 直接可用 ⇒ **取消**原先「Stage 不可得则退回单键匹配」
                 // 的兜底：那个兜底正是单键任取（会把别的 Stage 的同名 Task 误标为非末端 ⇒ AllocationTaskShare 归错 Task）。
+                var markedInBatch = 0;
                 foreach (var depList in routingGraph.Dependencies.Values)
                 {
                     foreach (var dep in depList)
                     {
-                        var upstreamTask = batchTasks.FirstOrDefault(t =>
-                            t.OperationCode == dep.From.OperationCode &&
-                            string.Equals(t.StageCode, dep.From.StageCode, StringComparison.Ordinal));
-
-                        if (upstreamTask != null)
+                        // 2026-11-21 修（本号位自查）：同一道工序**被拆成多个 Task** 时
+                        //   （实测 `999597_36922` 的 J101 = 77+77+76），旧写法 `FirstOrDefault`
+                        //   只把**第一个**标成"有下游"，其余两个被误判为末端 ——
+                        //   后果：被标中的那道**永远不计入任何末端构成**（该需求的 77 件凭空消失），
+                        //         另两道反而被算进份额 ⇒ 需求份额 153 ≠ 实排 230。
+                        //   ⇒ 必须把**所有**匹配该 (Stage, Operation) 的 Task 都标成非末端。
+                        foreach (var upstreamTask in batchTasks)
                         {
-                            downstreamTasks.Add(upstreamTask.FinalDraftId);
+                            if (upstreamTask.OperationCode == dep.From.OperationCode &&
+                                string.Equals(upstreamTask.StageCode, dep.From.StageCode, StringComparison.Ordinal))
+                            {
+                                if (downstreamTasks.Add(upstreamTask.FinalDraftId))
+                                {
+                                    markedInBatch++;
+                                }
+                            }
                         }
                     }
                 }
+
+                // 2026-11-21（本号位自查，**只留注释，不产 Trace**）：
+                //   `markedInBatch == 0` 表示**本批图仍没有一条可用的边**（上面按 Task 真实 Route/Path 重取后依然如此）。
+                //   此时的批量后果：本批全部 Task 按末端计构成 ⇒ 构成合计 ≫ 声明量
+                //   ⇒ `声明量 − 已落定` 夹到 0 ⇒ 未排量消失。**本处不再猜测**：
+                //     · `OperationSeq` 恒为 0（契约明文「DAG 路由已废弃线性顺序号」）；
+                //     · 按 `OperationCode` 字典序排是命名假设，不是排程事实。
+                //   ⇒ 交给两套账暴露，由回执报 0号位/2号位。
+                _ = markedInBatch;
             }
         }
 
         // 展开每个末端 Task 的真实 (Demand, Qty) 构成（含 merge 血缘）
         var result = new List<(string TaskId, long AllocationSequence, string DemandKey, decimal Qty)>();
+        var execQtyByBatchOp = BuildExecQtyByBatchOp(tasks, constraints);
         foreach (var t in tasks)
         {
             if (downstreamTasks.Contains(t.FinalDraftId))
                 continue;
 
-            foreach (var c in GetTaskDemandComposition(t, demandByKey, mergeLineage))
+            foreach (var c in GetTaskDemandComposition(t, demandByKey, mergeLineage, constraints.RawBatchNetByExecutionBatchKey, execQtyByBatchOp, constraints))
             {
                 result.Add((t.FinalDraftId, c.Demand.AllocationSequence, c.Demand.LogicalDemandKey, c.Qty));
             }
@@ -3032,16 +3462,65 @@ internal class PhaseFiveCompression
             unscheduledQtyByAllocation ?? new Dictionary<long, decimal>());
 
     /// <summary>
+    /// **执行批 × 工序 → 该批该工序的执行量合计**（0号位 v1.7，2026-11-19）。
+    /// 用途：Phase4 把同一批同一工序再拆成多个 Task 时，按占比把该批 `Q_raw` 分摊到各片
+    ///   —— 保证「逐工序 Σ构成 = Q_raw」，同时执行量仍是整数（`Σ 执行量 = Q_exec`）。
+    /// 虚拟节点不计（非生产载体）。
+    /// </summary>
+    private static Dictionary<(string BatchKey, string OperationCode), decimal> BuildExecQtyByBatchOp(
+        List<FinalTaskDraft> tasks,
+        ConstraintContext? constraints = null)
+    {
+        var map = new Dictionary<(string, string), decimal>();
+        foreach (var t in tasks)
+        {
+            if (t.IsVirtual) continue;
+            if (t.ExecutionBatchDraftKey is not { } batchKey) continue;
+            // 锁定锚点是**冻结事实**（既有执行身份），其数量不属于本批新增的 Q_raw ⇒ 不参与分摊分母。
+            if (constraints is not null
+                && constraints.LockedTasks.ContainsKey(
+                    (t.SourceDraftId, t.StageCode ?? string.Empty, t.OperationCode ?? string.Empty)))
+            {
+                continue;
+            }
+            var key = (batchKey, t.OperationCode ?? string.Empty);
+            map[key] = map.GetValueOrDefault(key) + t.Quantity;
+        }
+        return map;
+    }
+
+    /// <summary>
     /// P0-05修复：展开一个末端Task承载的真实 (Demand, Qty) 构成。
     /// 合并任务（M:N）会承载多个 Demand：merge 血缘里记录的份额 + SourceDraftId 锚点 Demand 的剩余份额。
     /// </summary>
     private List<(LogicalProductionDemand Demand, decimal Qty)> GetTaskDemandComposition(
         FinalTaskDraft task,
         Dictionary<string, LogicalProductionDemand> demandByKey,
-        Dictionary<string, List<(string DemandKey, decimal ShareQty)>> mergeLineage)
+        Dictionary<string, List<(string DemandKey, decimal ShareQty)>> mergeLineage,
+        IReadOnlyDictionary<string, decimal>? rawBatchNetByBatchKey = null,
+        IReadOnlyDictionary<(string BatchKey, string OperationCode), decimal>? execQtyByBatchOp = null,
+        ConstraintContext? constraints = null)
     {
         var composition = new List<(LogicalProductionDemand, decimal)>();
         decimal mergedTotal = 0m;
+
+        // ── 0号位 v1.7（2026-11-19）：**同一批同一工序被 Phase4 再拆时，血缘份额同样按执行量占比分摊** ──
+        //   只缩放锚点、不缩放血缘 ⇒ 每片都带**整份**血缘 ⇒ 逐工序 Σ 会按片数放大（合批 × 再拆的交集）。
+        //   占比分母 = 本批本工序执行量合计；单 Task 未拆 ⇒ 占比 1（零变化）。
+        decimal splitRatio = 1m;
+        var hasRawBatch = rawBatchNetByBatchKey is not null
+            && task.ExecutionBatchDraftKey is { } rawBatchKey
+            && rawBatchNetByBatchKey.TryGetValue(rawBatchKey, out var rawBatchQty)
+            && rawBatchQty > 0m;
+        if (hasRawBatch
+            && execQtyByBatchOp is not null
+            && execQtyByBatchOp.TryGetValue(
+                (task.ExecutionBatchDraftKey!, task.OperationCode ?? string.Empty), out var totalExecForTask)
+            && totalExecForTask > 0m
+            && totalExecForTask != task.Quantity)
+        {
+            splitRatio = task.Quantity / totalExecForTask;
+        }
 
         // 合并进来的 Demand（merge 血缘）
         if (mergeLineage.TryGetValue(task.FinalDraftId, out var merged))
@@ -3050,16 +3529,68 @@ internal class PhaseFiveCompression
             {
                 if (demandByKey.TryGetValue(demandKey, out var mergedDemand))
                 {
-                    composition.Add((mergedDemand, shareQty));
-                    mergedTotal += shareQty;
+                    var scaledShare = splitRatio == 1m ? shareQty : shareQty * splitRatio;
+                    composition.Add((mergedDemand, scaledShare));
+                    mergedTotal += scaledShare;
                 }
             }
         }
 
-        // 锚点 Demand（SourceDraftId）承担剩余份额
+        // ── 锚点 Demand（SourceDraftId）承担剩余份额 ──
+        //   0号位 v1.7（2026-11-19）两类小数：第二类的 `task.Quantity` 是**圆整后的执行量**（如 15），
+        //   原始需求净量是 14.754 ⇒ 直接用 `Quantity − Σ血缘` 会把 0.246 的圆整增量算成该需求的份额
+        //   （需求份额被夸大、`ΣShare` 也会超过 `ΣNetOutputQty`）。故锚点基数优先取
+        //   **本执行批的原始净量**（`RawBatchNetByExecutionBatchKey`，Phase2 批形成时登记、永不被圆整改写）：
+        //     · 独批未合批：锚点 = Q_raw（14.754），圆整增量不归属任何需求 ✓
+        //     · 合批：血缘已含锚点自身（`TryMergeDemandIntoTask` 显式登记）⇒ 锚点 = Q_raw目标 − Σ血缘 ≤ 0 ⇒ 不重复计 ✓
+        //     · 未登记（A/B、整数需求、测试夹具）⇒ 回落 `Quantity`，与补丁前逐字相同（零回归）。
         if (demandByKey.TryGetValue(task.SourceDraftId, out var anchorDemand))
         {
-            var anchorQty = task.Quantity - mergedTotal;
+            // 锚点量口径（0号位 v1.7，2026-11-19）：
+            //   · **有原始净量登记**（本任务执行批在 Phase2 批形成时有 Q_raw）⇒ 锚点量 = 本批 Q_raw 本身。
+            //     血缘只记**被并入成员**，锚点一直是隐式来源 ⇒ 不再用 `Quantity − Σ血缘`：
+            //     第二类的 Quantity 已是 `ceil(Q_raw_group)`，相减会把圆整增量算成锚点需求的份额。
+            //     例 N-03：Quantity=20、血缘=[B:4.7666]、Q_raw(锚批)=14.754 ⇒ 锚点 14.754（合计 19.5206，✓ 不是 20）；
+            //     合批后再合批：Q_raw(锚批) 不变 + 血缘累加其他成员 ⇒ 仍精确等于组原始合计。
+            //   · **无登记**（A/B、测试夹具、无批键 Task）⇒ 逐字回落旧式 `Quantity − Σ血缘`（零回归）。
+            decimal anchorQty;
+            // 锁定锚点 = 冻结事实：数量原样计入构成，**不**参与本批 Q_raw 分摊（其量不在本批 Q_raw 里）。
+            var isLockedAnchor = constraints is not null
+                && constraints.LockedTasks.ContainsKey(
+                    (task.SourceDraftId, task.StageCode ?? string.Empty, task.OperationCode ?? string.Empty));
+            if (isLockedAnchor)
+            {
+                anchorQty = task.Quantity - mergedTotal;
+            }
+            else if (rawBatchNetByBatchKey is not null
+                && task.ExecutionBatchDraftKey is { } anchorBatchKey
+                && rawBatchNetByBatchKey.TryGetValue(anchorBatchKey, out var rawBatchNet)
+                && rawBatchNet > 0m)
+            {
+                // ── 0号位 v1.7（2026-11-19）修正：**按本批本工序的执行量占比**分摊 Q_raw ──
+                //   背景（FAMILY_CYL 离线重放实测）：同一执行批被 Phase4 再拆成多个 Task 时，
+                //   若逐 Task 取 `min(Q_raw, Quantity)`，未拆工序得 Q_raw、拆分工序得「各片之和 = Q_exec」
+                //   ⇒ 同一批内两道工序的构成不一致（2400.12 vs 2401）⇒ L3 `BATCH_OP_QTY_MISMATCH` 硬拒。
+                //   正确口径：本批本工序的构成合计必须恒等于 Q_raw（需求账），
+                //   按 `Q_raw × 本 Task 执行量 ÷ 本批本工序执行量合计` 分摊 ⇒ 逐工序 Σ = Q_raw，
+                //   且与执行量成正比（不改变任何需求份额总量，只消除「谁承担圆整残差」的歧义）。
+                //   单 Task 未拆：占比 = 1 ⇒ 恰为 Q_raw（N-02 的 14.754 不受影响）。
+                if (execQtyByBatchOp is not null
+                    && execQtyByBatchOp.TryGetValue((anchorBatchKey, task.OperationCode ?? string.Empty), out var totalExecQty)
+                    && totalExecQty > 0m)
+                {
+                    anchorQty = rawBatchNet * task.Quantity / totalExecQty;
+                }
+                else
+                {
+                    anchorQty = Math.Min(rawBatchNet, task.Quantity);
+                }
+            }
+            else
+            {
+                anchorQty = task.Quantity - mergedTotal;
+            }
+
             if (anchorQty > 0)
             {
                 composition.Add((anchorDemand, anchorQty));
@@ -3532,6 +4063,23 @@ internal class PhaseFiveCompression
     ///   （该字段注释为「投入侧，已按现行良率口径放大」），缺失时回落 <c>Demand.NetOutputQty</c>。
     ///   良率 ≠ 100% 时两者存在口径差，**已登记为待 2号位 确认项**，本方法不自行放大或缩小。</para>
     /// </summary>
+    /// <summary>
+    /// 仅供 `LPS.APS.Tests`（`InternalsVisibleTo`）使用：直接暴露私有
+    /// <see cref="ValidateDemandStageClosure"/> —— C13「同一合法 A/B 批内两个 Operation 的**不同剩余量**」
+    /// 只能在 **Task 级夹具**上构造（请求 DTO 无逐 OP 字段），故需要本钩子。
+    /// 生产路径不变。
+    /// </summary>
+    internal string? ValidateDemandStageClosureForTest(
+        List<FinalTaskDraft> tasks,
+        DomainSolveRequest request,
+        HashSet<string> unscheduledDemandKeys,
+        Dictionary<string, List<(string DemandKey, decimal ShareQty)>> mergeLineage,
+        ConstraintContext constraints)
+    {
+        var r = ValidateDemandStageClosure(tasks, request, unscheduledDemandKeys, mergeLineage, constraints, null);
+        return r is null ? null : (r.IsValid ? null : r.ErrorMessage);
+    }
+
     private ValidationResult? ValidateDemandStageClosure(
         List<FinalTaskDraft> tasks,
         DomainSolveRequest request,
@@ -3543,6 +4091,10 @@ internal class PhaseFiveCompression
         var demandByKey = request.LogicalProductionDemands
             .GroupBy(d => d.LogicalDemandKey)
             .ToDictionary(g => g.Key, g => g.First());
+
+        // 0号位 v1.7（2026-11-19）：本层 L1/L3 的构成同样按「执行批 × 工序」占比分摊 Q_raw，
+        //   与 `BuildTerminalContributions` / check#8 同一口径（否则三道校验对同一 Task 给出不同数量）。
+        var execQtyByBatchOpForClosure = BuildExecQtyByBatchOp(tasks, constraints);
 
         // ⚠ `StageProcessQuantities` 不再参与本层计算：
         //   ① 它的 `PlannedProcessQty` 是**投入侧（含良率放大）**，不能当净需求量（实测 37.3737 vs 37）；
@@ -3561,7 +4113,7 @@ internal class PhaseFiveCompression
         {
             if (task.IsVirtual) continue;   // 虚拟节点（StageTimingNode）非生产载体
             var seb = task.StageExecutionBatchDraftKey ?? task.ExecutionBatchDraftKey ?? "(no-seb)";
-            var composition = GetTaskDemandComposition(task, demandByKey, mergeLineage);
+            var composition = GetTaskDemandComposition(task, demandByKey, mergeLineage, constraints.RawBatchNetByExecutionBatchKey, execQtyByBatchOpForClosure, constraints);
             if (composition.Count == 0)
             {
                 // P0-04-C（2026-11-17 0号位 v1.1 §3.1）：血缘不可证 —— SourceDraftId 未知且无 merge 份额
@@ -3628,21 +4180,87 @@ internal class PhaseFiveCompression
                 byOp[op] = acc + qty;
             }
 
-            // 该批对**本需求**的净产出 = 本需求在该批内各工序的份额（同批各工序应等量）。
-            //   ⚠ **不能**用 `StageExecutionBatchQty`：那是**整批**的量（合批时含其他需求的份额，
+            // ── L3：**A/B 既有执行批 与 C 新批必须分支**（0号位 v1.3 §2.1 第 4 条逐字：
+            //   「C桶完整Path原则与A/B真实起点/执行事实必须分支校验。**不得对A/B全部OP强制等于单一
+            //     `BatchNetOutputQty`**；也不能直接删除A/B的L3硬验算而造成静默放行。缺少可信OP份额时，
+            //     返回可定位的显式未验证/失败结果，**不能伪造相等或按0跳过**」）
+            //
+            //   · C 新批：本次新形成的可执行批，各工序承接同一份新净量 ⇒ **等量是构造事实**，照旧硬校验。
+            //   · A/B 既有批：同一执行批沿工序流动，各工序的**已完成/锁定/未来剩余量本就允许不同**
+            //     （v1.3 §二：「同批各Operation剩余加工量可因实际报工及良率不同；**不能为通过校验把每道OP改成同量**」）。
+            //     ⇒ 逐工序对照**该工序自己的**既有执行事实（`ExecutionConstraint` 按 (DraftId,Stage,Operation) 定位）；
+            //       任一工序缺可信份额 ⇒ 记 `BATCH_OP_QTY_UNVERIFIED` 显式未验证，**既不伪造相等也不按 0 跳过**。
+            //
+            //   ⚠ **不能**用 `StageExecutionBatchQty` 做量值：那是**整批**的量（合批时含其他需求的份额，
             //     M_01 实测：整批 50 = A30+B20，而需求 B 的净产出份额是 20）⇒ 拿它比会把合法合批判死。
-            //   `StageExecutionBatchQty` 只用于上面 L2-b 的「同批一致」校验，不参与量值。
-            decimal net = 0m;
-            foreach (var kv in byOp) { net = kv.Value; break; }
-            batchNet[key] = net;
+            //   桶身份只认 `IsContinuation` / `NoSplitMerge`（Phase2 `CanSplitOrMerge` 同源判据）。
+            var isAbBucket = demandByKey.TryGetValue(key.Demand, out var bucketDemand)
+                             && (bucketDemand.IsContinuation || bucketDemand.NoSplitMerge);
 
-            // L3：每个工序在该批内的份额必须等于该批净产出
-            foreach (var kv in byOp)
+            if (isAbBucket)
             {
-                if (Math.Abs(kv.Value - net) > 0.001m)
+                // 批净产出：按 P0-03 同一推导取**各工序持有量的最大值**
+                //   （单执行批数量 Q 沿工序流动时任一工序持有量 ≤ Q，且整批必在某工序被完整持有）
+                //   —— **不把某一道 OP 当作整批净量**（v1.3 §2.2 明判「最后一道OP=净量」无已冻依据）。
+                decimal abNet = 0m;
+                foreach (var kv in byOp) { if (kv.Value > abNet) abNet = kv.Value; }
+                batchNet[key] = abNet;
+
+                var expectedByOp = new Dictionary<string, decimal>(StringComparer.Ordinal);
+                var unverifiedOps = new List<string>();
+                foreach (var op in byOp.Keys)
                 {
-                    firstError ??= $"BATCH_OP_QTY_MISMATCH: 需求 {key.Demand} Stage {key.Stage} 执行批 {key.Seb} "
-                        + $"工序 {kv.Key} 份额={kv.Value} ≠ 该批净产出={net}";
+                    if (constraints.LockedTasks.TryGetValue((key.Demand, key.Stage, op), out var locked)
+                        && (locked.LockedNetOutputQty ?? locked.LockedQuantity) is { } fact)
+                    {
+                        expectedByOp[op] = fact;
+                    }
+                    else
+                    {
+                        unverifiedOps.Add(op);
+                    }
+                }
+
+                if (unverifiedOps.Count == 0)
+                {
+                    foreach (var kv in byOp)
+                    {
+                        if (Math.Abs(kv.Value - expectedByOp[kv.Key]) > 0.001m)
+                        {
+                            firstError ??= $"BATCH_OP_QTY_MISMATCH: 需求 {key.Demand} Stage {key.Stage} 执行批 {key.Seb} "
+                                + $"工序 {kv.Key} 份额={kv.Value} ≠ 该工序既有执行事实={expectedByOp[kv.Key]}"
+                                + "（A/B 批逐工序对照，不要求各工序等量）";
+                        }
+                    }
+                }
+                else
+                {
+                    constraints.TraceNotes.Add(new SolveTraceNote
+                    {
+                        Key = key.Demand,
+                        ReasonCode = "BATCH_OP_QTY_UNVERIFIED",
+                        Message = $"A/B 执行批逐工序份额**无法核证**：需求 {key.Demand}｜Stage {key.Stage}｜批 {key.Seb}"
+                                + $"｜已排份额=[{string.Join(",", byOp.Select(kv => $"{kv.Key}={kv.Value}"))}]"
+                                + $"｜缺既有执行事实的工序=[{string.Join(",", unverifiedOps)}]"
+                                + "（不伪造相等、不按 0 跳过；逐 OP 剩余量载体缺口见《1↔2 连续性输入合同核证单》）",
+                        Level = "Warning"
+                    });
+                }
+            }
+            else
+            {
+                // C 新批：本次新形成的批，各工序承接同一份新净量 ⇒ 等量校验成立。
+                decimal net = 0m;
+                foreach (var kv in byOp) { net = kv.Value; break; }
+                batchNet[key] = net;
+
+                foreach (var kv in byOp)
+                {
+                    if (Math.Abs(kv.Value - net) > 0.001m)
+                    {
+                        firstError ??= $"BATCH_OP_QTY_MISMATCH: 需求 {key.Demand} Stage {key.Stage} 执行批 {key.Seb} "
+                            + $"工序 {kv.Key} 份额={kv.Value} ≠ 该批净产出={net}";
+                    }
                 }
             }
         }
@@ -3674,7 +4292,8 @@ internal class PhaseFiveCompression
                 croppedOps = PhaseTwoInitialScheduler.GetOperationsFromStage(
                     graphDemand.StartStageCode ?? string.Empty,
                     graphDemand.StartOperationCode,
-                    graph, constraints, out _);
+                    graph, constraints, out _,
+                    graphDemand.RequiredStageCode);
                 croppedOpsCache[cacheKey] = croppedOps;
             }
 
@@ -3820,6 +4439,10 @@ internal class PhaseFiveCompression
         Dictionary<string, List<(string DemandKey, decimal ShareQty)>> mergeLineage,
         IReadOnlyList<UnscheduledTaskResult> unscheduledTasks)
     {
+        // 0号位 v1.7（2026-11-19）：执行批 × 工序 → 执行量合计（Phase4 再拆后按占比分摊 Q_raw）。
+        //   本方法内 check#5（物料）与 check#8（物理闭合）共用同一份，保证两处构成口径一致。
+        var execQtyByBatchOpForClosure = BuildExecQtyByBatchOp(tasks, constraints);
+
         // ── check #5（物料时序）「缺料→单条未排、其余继续」的收集变量（冻结 v1.42/v2.7 / v1.7 §41）──
         //   物料不足/未闭合的 Task 不整域废，而是整条剔除 + 其全部构成需求转未排（见下方 check #5 与末尾 `return true`）。
         var materialInsufficientTaskIds = new HashSet<string>(StringComparer.Ordinal);
@@ -4141,9 +4764,35 @@ internal class PhaseFiveCompression
             .GroupBy(d => d.LogicalDemandKey)
             .ToDictionary(g => g.Key, g => g.First());
 
+        // ── 0号位 v1.5（2026-11-19）：时间未定切片的时点改由「已排 Task 推导」 ──
+        //   子件需求的最晚 `PlannedEndTime` + 跨物料 Lag = 父件可用的任务推导下界。
+        //   下界不可得（无子件边 / 子件未排）⇒ 该切片**时间不可判**：不得据此删 Task，
+        //   也不得把计划期末上界当可用（调度侧 Phase2 已按同一规则处理）。
+        var maxEndByDemandForMaterial = tasks
+            .GroupBy(t => t.SourceDraftId, StringComparer.Ordinal)
+            .ToDictionary(g => g.Key, g => g.Max(t => t.PlannedEndTime), StringComparer.Ordinal);
+
+        DateTime TaskDerivedFloor(string demandKey)
+        {
+            if (!constraints.CrossMaterialParentToChildren.TryGetValue(demandKey, out var children)
+                || children.Count == 0)
+            {
+                return DateTime.MinValue;
+            }
+            var floor = DateTime.MinValue;
+            foreach (var childKey in children)
+            {
+                if (!maxEndByDemandForMaterial.TryGetValue(childKey, out var childEnd)) continue;
+                if (constraints.CrossMaterialLagMinutes.TryGetValue((demandKey, childKey), out var lagMinutes))
+                    childEnd = childEnd.AddMinutes((double)lagMinutes);
+                if (childEnd > floor) floor = childEnd;
+            }
+            return floor;
+        }
+
         foreach (var task in tasks)
         {
-            foreach (var (compositionDemand, compositionQty) in GetTaskDemandComposition(task, demandByKeyForMaterial, mergeLineage))
+            foreach (var (compositionDemand, compositionQty) in GetTaskDemandComposition(task, demandByKeyForMaterial, mergeLineage, constraints.RawBatchNetByExecutionBatchKey, execQtyByBatchOpForClosure, constraints))
             {
                 if (!constraints.MaterialAvailability.TryGetValue(compositionDemand.AllocationSequence, out var segments)
                     || segments.Count == 0)
@@ -4162,19 +4811,44 @@ internal class PhaseFiveCompression
                 //   「物料累计凑满整单」才许开工 ⇒ 与调度侧（按该批份额查物料）口径不一致 ⇒ 物料稍不足整单即误判「早于物料」、
                 //   整域清空。整单不拆时二者相等（份额 == NetOutputQty）⇒ 本修正对未拆/未合批需求**零行为变化**。
                 var requiredQty = compositionQty;
+                var floorForUnknownTime = TaskDerivedFloor(compositionDemand.LogicalDemandKey);
+                var unknownTimeUnjudgeable = false;
 
                 foreach (var segment in sortedSegments)
                 {
                     cumulativeQty += segment.Quantity;
                     if (cumulativeQty >= requiredQty)
                     {
-                        materialReadyTime = segment.AvailableTime;
+                        if (segment.NeedsTaskDerivedTime)
+                        {
+                            // 时点必须由已排 Task 推导（时间未定 / `SH_LINKED` 占位）
+                            if (floorForUnknownTime > DateTime.MinValue)
+                            {
+                                materialReadyTime = floorForUnknownTime;
+                            }
+                            else if (segment.IsTimeUnknown)
+                            {
+                                // 时间未定且无下界 ⇒ 时间不可判（不据此删 Task）
+                                unknownTimeUnjudgeable = true;
+                            }
+                            else
+                            {
+                                // `SH_LINKED` 却拿不到硬边下界 ⇒ **契约缺失**：不得把 planningStart 占位当可用
+                                //   （0号位 v1.5 §三 1-CF-B.4「硬边故意缺失时不得悄悄当即期可用」）
+                                materialReadyTime = DateTime.MaxValue;
+                            }
+                        }
+                        else
+                        {
+                            materialReadyTime = segment.AvailableTime;
+                        }
                         break;
                     }
                 }
 
                 // 如果累计数量仍不足，取最后一个Segment的时间（物料始终不足）
-                if (materialReadyTime == null && sortedSegments.Count > 0)
+                //   ⚠ 时间未定且无下界时**不判**（否则会把"时间未定"误当"缺料"删 Task）
+                if (materialReadyTime == null && !unknownTimeUnjudgeable && sortedSegments.Count > 0)
                 {
                     materialReadyTime = sortedSegments.Last().AvailableTime;
                 }
@@ -4354,7 +5028,7 @@ internal class PhaseFiveCompression
         {
             if (task.IsVirtual) continue;   // 虚拟节点（StageTimingNode）非生产载体，不参与数量闭合
 
-            foreach (var (compositionDemand, qty) in GetTaskDemandComposition(task, demandByKeyForClosure, mergeLineage))
+            foreach (var (compositionDemand, qty) in GetTaskDemandComposition(task, demandByKeyForClosure, mergeLineage, constraints.RawBatchNetByExecutionBatchKey, execQtyByBatchOpForClosure, constraints))
             {
                 var opKey = (compositionDemand.LogicalDemandKey, task.StageCode, task.OperationCode);
                 compositionByDemandOp.TryGetValue(opKey, out var accumulated);
@@ -4477,18 +5151,24 @@ internal class PhaseFiveCompression
         //     这类需求若被拆出小数批（如 `1→0.5+0.5`、`13→4.3333`），一律硬拒，不得靠取整/放大容差掩盖。
         //   豁免＝①A/B 续作需求的冻结小数剩余（如 13.5，不得篡改既存事实）；
         //          ②`PlannedProcessQty`（Stage 良率投入侧）允许小数 —— 本项只看 `Quantity`（净产出侧）。
-        //   ⚠ **需求净量本身为小数**（经检测不是 n 等分伪影，如 14.7540）的处理口径冻结尚未给出，
-        //     本项**暂不判**该情形（另行提请 0号位 裁决），避免把真实跑批里那批任务一次性打红。
+        //   ── 0号位 v1.7（2026-11-19）口径更新：**第二类原生小数同样必须整数执行** ──
+        //     逐字：「逐批净生产量 b_i 为正整数，且 Σb_i = Q_exec」「V1 按本次新成批原始需求净量是否为整数区分」。
+        //     ⇒ 判据由「需求净量为整数」扩为「**所有非续作、净量 > 0 的需求**」：
+        //        第一类拆批应得整数批；第二类应得 `ceil(Q_original)` 分配出的整数批；
+        //        任何仍为小数的执行批 Task 一律硬拒（含 Phase4 再拆、合批、资源补齐各路径的漏网）。
+        //     豁免不变：A/B 续作（`IsContinuation`）保持冻结事实；`PlannedProcessQty` 投入侧允许小数。
         var integerNetDemandKeys = request.LogicalProductionDemands
-            .Where(d => !d.IsContinuation
-                        && d.NetOutputQty > 0m
-                        && d.NetOutputQty == decimal.Truncate(d.NetOutputQty))
+            .Where(d => !d.IsContinuation && d.NetOutputQty > 0m)
             .Select(d => d.LogicalDemandKey)
             .ToHashSet(StringComparer.Ordinal);
 
         foreach (var t in tasks)
         {
             if (string.IsNullOrEmpty(t.SourceDraftId) || !integerNetDemandKeys.Contains(t.SourceDraftId))
+                continue;
+            // 0号位 v1.7 豁免（逐字）：「对 A/B 历史续作**或锁定批**，保持冻结身份/真实工序进度，不套新成批圆整」
+            //   ⇒ 锁定锚点（`constraints.LockedTasks` 的 (DraftId, Stage, Operation)）是既成事实，原值放行。
+            if (constraints.LockedTasks.ContainsKey((t.SourceDraftId, t.StageCode ?? string.Empty, t.OperationCode ?? string.Empty)))
                 continue;
             if (t.Quantity == decimal.Truncate(t.Quantity))
                 continue;

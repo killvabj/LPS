@@ -8,14 +8,18 @@
  * 它做什么（走真实登录表单 → 真实页面 → 真实点击）：
  *   ① B10 版本下拉悬停：选项 title 里应同时有「数据截止时间」「触发方式」「触发来源」三项
  *      （且数据截止时间/触发方式在 dev 上应是真实值，不是「未提供」）
- *   ② B2 详情抽屉：应有「MES 工单号」「下发状态」两行；dev 无 MES 工单/下发记录 ⇒ 显示
- *      「未建单」「未下发」（中性文案，不许显示成假值）
+ *   ② B2 详情抽屉：应有「MES 工单号」「下发状态」两行；**下发状态必须显示词典中文**
+ *      （已建单 / 待下发 / 建单中 / 下发失败），键缺显「**不在下发队列**」
+ *      —— **绝不能显示裸英文码**（CREATED/PENDING/…）：同一权威位在甘特位/P05 位/P11 位
+ *      三处显示必须一致（5号位 2026-11-18 复函V §二 R3″）
  *   ③ B5 关键路径：三态。后端整键缺省 ⇒ 必须显示「未判定」，
  *      **绝不能显示成「非关键路径」**（那等于拿恒 false 冒充判定结果）
  *   ④ B6/B7/B8 撤除位：抽屉里**不得再出现**「事实类型」「数量-时间拆分」「上游 Stage」
- *   ⑤ 任务清单表：表头应有「MES 工单号」「下发状态」两列
- *   ⑥ 缺键语义真值：应用内任务的 isCriticalPath/mesWorkOrderNo/dispatchStatus 必须是
- *      **缺键（undefined）**，不是 false —— 否则前端三态就是假的
+ *   ⑤ 任务清单表：表头应有「MES 工单号」「MES 下发」两列；行内下发状态显词典中文或
+ *      「不在下发队列」（键缺 ≠ 未下发）
+ *   ⑥ 缺键语义真值：应用内任务的 isCriticalPath/mesWorkOrderNo/dispatchStatus 若有值，
+ *      必须是**后端给的真值**（isCriticalPath 为 boolean、dispatchStatus 属受控词表四码），
+ *      不得由前端造
  *
  * 用法：
  *   node --experimental-websocket scripts/check-gantt-b2b10.mjs
@@ -26,6 +30,22 @@
  *   - 登录一次即可（dev 登录限流 5 次/分钟）
  *   - ⚠️ 必须 --no-proxy-server：本机系统代理会把 Chrome 绕到**已部署那套** ⇒ 假绿
  *     （见记忆 feedback_e2e_proxy_misroute）；并加「页面脚本来自本机 dev」的守卫
+ *
+ * 2026-11-19（依据 5号位 2026-11-18《复函V…》§二 R3″ 双键名过渡期）：判据按当前契约改写
+ *   · ②b/②c：抽屉「下发状态」须显**词典中文**（已建单/待下发/建单中/下发失败）或「未提供」，
+ *     **禁止裸英文码**（CREATED/PENDING/…）—— 本轮三读面统一走 `mesDispatchStatusLabel` 的实测点；
+ *   · ⑤/⑤b：清单列名现为「MES 工单号」「**MES 下发**」；行内值显词典中文或「不在下发队列」；
+ *   · ⑥：dev 已有带 `dispatchStatus` 的任务 ⇒ 由「必须缺键」改为「**若有值必须是后端真值**」；
+ *   · 修探针自身取表口径：表头/行样本必须限定在 `.task-list-pane` 内
+ *     （原 `document.querySelector('.el-table__body')` 取到的是**负荷带**那张表 ⇒ ⑤b 永远判红）。
+ *   实测：node --experimental-websocket scripts/check-gantt-b2b10.mjs --url http://localhost:4001 ⇒ 12/12
+ *
+ * 2026-11-19（依据 5号位 2026-11-19《复函R3三键全收录…》§二 **V1.1 映射表三键版**）：
+ *   · **键①②缺键语义 = 「该 Task 不在下发队列」**（护栏语义表 r14286 第 17/18 行）
+ *     ⇒ 抽屉「下发状态」键缺时**改显「不在下发队列」**（此前显「未提供」＝同一条件两套说法）；
+ *     判据同步：②c 接受「词典中文 **或**『不在下发队列』」，**新增 ②d** 锁死
+ *     「键缺时**不得**显『未提供』/『未下发』」；
+ *   · ⑤b 改用同一组常量（词典四中文 + 缺键那句），清单列与 CSV 已同句。
  */
 import { spawn, execFileSync } from 'node:child_process'
 import { existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'
@@ -43,8 +63,9 @@ function arg(name, fallback) {
 const BASE = arg('url', 'http://localhost:4001').replace(/\/$/, '')
 const SHOT_DIR = resolve(ROOT, arg('shot', '.tmp/gantt-b2b10'))
 const CDP_PORT = 9400 + Math.floor(Math.random() * 90)
-const USER = process.env.GANTT_USER || 'admin'
-const PWD = process.env.GANTT_PWD || 'Admin@123456'
+// ⚠️ dev 联调用非 admin 账号（3号位 2026-11-19 回执 §3.2 过渡期乙：dev 与生产共用 APS_Auth，admin 会顶掉生产会话）
+const USER = process.env.GANTT_USER || 'rule_admin'
+const PWD = process.env.GANTT_PWD || 'Password@123'
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 
@@ -335,11 +356,22 @@ async function main() {
   console.log('抽屉行：' + JSON.stringify(rows.map((r) => r.label + '=' + r.value)))
   await shot('02-drawer')
 
-  judge('②b 抽屉含「MES 工单号」行，且 dev 无工单时显示「未建单」（中性文案，不编造工单号）',
-    !!rowOf('MES 工单号') && rowOf('MES 工单号').value.includes('未建单'),
+  // 下发状态词典（与 types/mes.ts 同源）：页面只应显示这四个中文或缺键那句「不在下发队列」
+  const DISPATCH_ZH = ['已建单', '待下发', '建单中', '下发失败']
+  const DISPATCH_MISSING = '不在下发队列'
+  judge('②b 抽屉含「MES 工单号」行，且缺工单时显「未提供」（中性文案，不编造工单号）',
+    !!rowOf('MES 工单号') &&
+      (rowOf('MES 工单号').value === '未提供' || /^[\w-]+$/.test(rowOf('MES 工单号').value)),
     `行=${JSON.stringify(rowOf('MES 工单号'))}`)
-  judge('②c 抽屉含「下发状态」行，且 dev 无下发记录时显示「未下发」',
-    !!rowOf('下发状态') && rowOf('下发状态').value.includes('未下发'),
+  judge('②c 抽屉含「下发状态」行，且显示**词典中文或「不在下发队列」**（不得出现裸英文码 CREATED/PENDING/…）',
+    !!rowOf('下发状态') &&
+      (DISPATCH_ZH.includes(rowOf('下发状态').value) || rowOf('下发状态').value === DISPATCH_MISSING) &&
+      !/CREATED|PENDING|PROCESSING|FAILED/i.test(rowOf('下发状态').value),
+    `行=${JSON.stringify(rowOf('下发状态'))}`)
+  judge('②d 抽屉「下发状态」**键缺显「不在下发队列」**（不得显「未提供」，也不得说成「未下发」）',
+    !!rowOf('下发状态') &&
+      rowOf('下发状态').value !== '未提供' &&
+      !rowOf('下发状态').value.includes('未下发'),
     `行=${JSON.stringify(rowOf('下发状态'))}`)
   judge('③ B5 关键路径三态：缺键时显示「未判定」（不得显示「非关键路径」）',
     !!rowOf('关键路径') && rowOf('关键路径').value.includes('未判定')
@@ -348,9 +380,14 @@ async function main() {
   judge('④ B6/B7/B8 撤除位：抽屉里不再出现「事实类型」「数量-时间拆分」「上游 Stage」',
     !/事实类型/.test(rowText) && !/数量-时间拆分/.test(rowText) && !/上游\s*Stage/i.test(rowText),
     `命中事实类型=${/事实类型/.test(rowText)} 命中拆分=${/数量-时间拆分/.test(rowText)} 命中上游=${/上游\s*Stage/i.test(rowText)}`)
-  judge('⑥ 缺键语义真值：应用内任务里 isCriticalPath / mesWorkOrderNo / dispatchStatus 都是缺键（不是 false）',
-    !!st?.task0Keys && st.task0Keys.isCriticalPath === false && st.task0Keys.mesWorkOrderNo === false
-      && st.task0Keys.dispatchStatus === false,
+  judge('⑥ 缺键语义真值：应用内任务里 isCriticalPath / mesWorkOrderNo / dispatchStatus 若有值必须是后端真值',
+    !!st?.task0Keys &&
+      (st.task0Keys.isCriticalPath === false ||
+        typeof st.task0Keys.isCriticalPathVal === 'boolean') &&
+      (st.task0Keys.mesWorkOrderNo === false ||
+        typeof st.task0Keys.mesWorkOrderNoVal === 'string') &&
+      (st.task0Keys.dispatchStatus === false ||
+        ['CREATED', 'PENDING', 'PROCESSING', 'FAILED'].includes(st.task0Keys.dispatchStatusVal)),
     `task0Keys=${JSON.stringify(st?.task0Keys)}`)
 
   // 关抽屉
@@ -362,17 +399,25 @@ async function main() {
   const tabClicked = await safe(`(()=>{const b=[...document.querySelectorAll('button.view-tab')]
     .find(e=>(e.innerText||'').trim().startsWith('任务清单')); if(!b) return false; b.click(); return true})()`)
   await sleep(2000)
+  // ⚠️ 必须**限定在任务清单面板内**取表：页面上还有「资源负荷带」等别的 ElTable，
+  //   `document.querySelector('.el-table__body')` 取到的是**第一张表**（负荷带）⇒ 样本里
+  //   根本没有「MES 下发」列 ⇒ 断言永远判红（2026-11-19 实测踩到）。
   const tableInfo = await safe(`(()=>{
-    const ths=[...document.querySelectorAll('.el-table__header th')].map(e=>(e.innerText||'').replace(/\\s+/g,' ').trim());
-    const body=(document.querySelector('.el-table__body')||{}).innerText||'';
-    return {ths, bodySample:body.replace(/\\s+/g,' ').slice(0,600), bodyLen:body.length}})()`)
+    const pane=document.querySelector('.task-list-pane');
+    const scope=pane||document;
+    const ths=[...scope.querySelectorAll('.el-table__header th')].map(e=>(e.innerText||'').replace(/\\s+/g,' ').trim());
+    const body=(scope.querySelector('.el-table__body')||{}).innerText||'';
+    return {ths, bodySample:body.replace(/\\s+/g,' ').slice(0,3000), bodyLen:body.length}})()`)
   console.log('任务清单表头：' + JSON.stringify(tableInfo?.ths))
   const ths = Array.isArray(tableInfo?.ths) ? tableInfo.ths : []
-  judge('⑤ 任务清单表头含「MES 工单号」「下发状态」两列',
-    tabClicked && ths.includes('MES 工单号') && ths.includes('下发状态'),
+  judge('⑤ 任务清单表头含「MES 工单号」「MES 下发」两列',
+    tabClicked && ths.includes('MES 工单号') && ths.includes('MES 下发'),
     `表头=${JSON.stringify(ths)}`)
-  judge('⑤b 任务清单行里下发状态显示「未下发」（dev 无下发记录 ⇒ 中性文案）',
-    typeof tableInfo?.bodySample === 'string' && tableInfo.bodySample.includes('未下发'),
+  judge('⑤b 任务清单行里下发状态显词典中文或「不在下发队列」（不得是裸英文码）',
+    typeof tableInfo?.bodySample === 'string' &&
+      (tableInfo.bodySample.includes(DISPATCH_MISSING) ||
+        DISPATCH_ZH.some((z) => tableInfo.bodySample.includes(z))) &&
+      !/CREATED|PENDING|PROCESSING|FAILED/i.test(tableInfo.bodySample),
     `样本=${JSON.stringify(tableInfo?.bodySample?.slice(0, 200))}`)
   await shot('03-task-list')
 

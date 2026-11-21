@@ -39,8 +39,9 @@ function arg(name, fallback) {
 }
 const BASE = arg('url', 'http://localhost:4001').replace(/\/$/, '')
 const SHOT_DIR = resolve(ROOT, arg('shot', '.tmp/gantt'))
-const USER = process.env.GANTT_USER || 'admin'
-const PWD = process.env.GANTT_PWD || 'Admin@123456'
+// ⚠️ dev 联调用非 admin 账号（3号位 2026-11-19 回执 §3.2 过渡期乙：dev 与生产共用 APS_Auth，admin 会顶掉生产会话）
+const USER = process.env.GANTT_USER || 'rule_admin'
+const PWD = process.env.GANTT_PWD || 'Password@123'
 const API = process.env.VERIFY_API || 'https://localhost:7044'
 
 // dev 后端是自签证书 ⇒ 关掉校验（与其它脚本一致）

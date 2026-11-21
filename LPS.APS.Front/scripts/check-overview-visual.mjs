@@ -42,6 +42,7 @@ function arg(name, fallback) {
 const BASE = arg('url', 'http://localhost:4001').replace(/\/$/, '')
 const SHOT_DIR = resolve(ROOT, arg('shot', '.tmp/overview'))
 const API = process.env.VERIFY_API || 'https://localhost:7044'
+// ⚠️ 本脚本**保留 admin**：页面 /aps/candidate 的路由门要 aps.candidate.confirm，rule_admin 无此码（3号位 2026-11-19 回执 §3.2 过渡期乙：dev 与生产共用 APS_Auth，admin 登录会顶掉生产会话）
 const USER = process.env.OV_USER || 'admin'
 const PWD = process.env.OV_PWD || 'Admin@123456'
 const CDP_PORT = 8920 + Math.floor(Math.random() * 70)

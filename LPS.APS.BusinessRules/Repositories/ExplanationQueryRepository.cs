@@ -24,6 +24,7 @@ public class ExplanationQueryRepository : IExplanationQueryRepository
         long? taskId = null,
         string? reasonCode = null,
         string? severity = null,
+        DateTime? occurredFrom = null, DateTime? occurredTo = null,
         int skip = 0,
         int take = 100,
         CancellationToken ct = default)
@@ -54,6 +55,9 @@ WHERE f.PlanVersionId = @PlanVersionId
     AND (@TaskId IS NULL OR f.TaskId = @TaskId)
     AND (@ReasonCode IS NULL OR f.ReasonCode = @ReasonCode)
     AND (@Severity IS NULL OR f.Severity = @Severity)
+    -- H1（11-21 4号位件）：发生时间区间=落库时刻 CreatedAt（业务时间在 EvidenceJson 内非统一列，不做）
+    AND (@OccurredFrom IS NULL OR f.CreatedAt >= @OccurredFrom)
+    AND (@OccurredTo IS NULL OR f.CreatedAt <= @OccurredTo)
 ORDER BY
     CASE f.Severity WHEN 'ERROR' THEN 1 WHEN 'WARN' THEN 2 ELSE 3 END,
     f.ImpactHours DESC,
@@ -68,6 +72,8 @@ OFFSET @Skip ROWS FETCH NEXT @Take ROWS ONLY";
             TaskId = taskId,
             ReasonCode = reasonCode,
             Severity = severity,
+            OccurredFrom = occurredFrom,
+            OccurredTo = occurredTo,
             Skip = skip,
             Take = take
         };
@@ -114,6 +120,17 @@ ORDER BY COUNT(*) DESC";
             .ToList();
 
         // 查询ERROR级别的Explanation列表
+        // H4（11-21 4号位件）：objectType 维度权威计数（前端不再用"已加载子集+未加载完"近似）。
+        var objectTypeSql = @"
+SELECT ISNULL(ObjectType, 'UNKNOWN') AS ObjectType, COUNT(*) AS Count
+FROM ScheduleExplanationFact
+WHERE PlanVersionId = @PlanVersionId
+GROUP BY ObjectType
+ORDER BY COUNT(*) DESC";
+        var objectTypeCounts = (await _connectionManager.QueryAsync<ObjectTypeCountDto>(
+            objectTypeSql, summaryParams, CommandType.Text, DatabaseId.APS, commandTimeout: 10))
+            .ToList();
+
         var items = await QueryAsync(planVersionId, severity: "ERROR", take: 50, ct: ct);
 
         return new ExplanationSummaryDto
@@ -124,6 +141,7 @@ ORDER BY COUNT(*) DESC";
             WarnCount = summary.WarnCount,
             InfoCount = summary.InfoCount,
             ReasonCodeCounts = reasonCodeCounts,
+            ObjectTypeCounts = objectTypeCounts,
             Items = items
         };
     }

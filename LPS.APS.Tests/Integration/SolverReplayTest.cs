@@ -76,7 +76,86 @@ public class SolverReplayTest
         _output.WriteLine($"[R] 规模：需求 {demandCount} / 资源 {resourceCount} / 日历槽 {calendarCount} / 路由工序 {routingOpCount}");
         _output.WriteLine("[R] 规模若与捕获那一轮的日志不符，说明 JSON 走形（环被 IgnoreCycles 打断）⇒ 先别比耗时。");
 
+        // ── 2026-11-21（0号位 v1.8 §七 / W6）：`APS_REPLAY_DIGEST_DUMP=<path>` 落**输入指纹** ──
+        //   为什么要有它：W5/W6 要求「同输入」可证。光有文件路径不够——文件被替换过也看不出来。
+        //   这里落 sha256 + 逐集合条数；两次跑的数一对比，就能回答"是不是同一份输入"。
+        var digestPath = Environment.GetEnvironmentVariable("APS_REPLAY_DIGEST_DUMP");
+        if (!string.IsNullOrWhiteSpace(digestPath))
+        {
+            try
+            {
+                using var digestWriter = new System.IO.StreamWriter(digestPath!, false, System.Text.Encoding.UTF8);
+                var fi = new FileInfo(jsonPath!);
+                using (var hashStream = File.OpenRead(jsonPath!))
+                {
+                    var sha = System.Security.Cryptography.SHA256.HashData(hashStream);
+                    digestWriter.WriteLine($"sha256={Convert.ToHexString(sha).ToLowerInvariant()}");
+                }
+                digestWriter.WriteLine($"file={jsonPath}");
+                digestWriter.WriteLine($"sizeBytes={fi.Length}");
+                digestWriter.WriteLine($"planVersionId={request.PlanVersionId}");
+                digestWriter.WriteLine($"domainKey={request.DomainKey}");
+                digestWriter.WriteLine($"planningStart={request.PlanningStart:O}");
+                digestWriter.WriteLine($"planningEnd={request.PlanningEnd:O}");
+                digestWriter.WriteLine($"demands={demandCount}");
+                digestWriter.WriteLine($"resources={resourceCount}");
+                digestWriter.WriteLine($"calendarSlots={calendarCount}");
+                digestWriter.WriteLine($"routingOperations={routingOpCount}");
+                digestWriter.WriteLine($"routingDependencies={request.RoutingDependencies?.Count ?? 0}");
+                digestWriter.WriteLine($"operationResourceEligibility={request.OperationResourceEligibility?.Count ?? 0}");
+                digestWriter.WriteLine($"materialRequirementLinks={request.MaterialRequirementLinks?.Count ?? 0}");
+                digestWriter.WriteLine($"materialConstraints={request.MaterialConstraints?.Count ?? 0}");
+                digestWriter.WriteLine($"stageLeadTimes={request.StageLeadTimes?.Count ?? 0}");
+                digestWriter.WriteLine($"stageSequenceChains={request.StageSequenceChains?.Count ?? 0}");
+                digestWriter.WriteLine($"stageProcessQuantities={request.StageProcessQuantities?.Count ?? 0}");
+                digestWriter.WriteLine($"materialStageDepartmentContexts={request.MaterialStageDepartmentContexts?.Count ?? 0}");
+                digestWriter.WriteLine($"batchPolicies={request.StrategySnapshot?.BatchPolicies?.Count ?? 0}");
+                digestWriter.WriteLine($"piRemainingFacts={request.PiRemainingFacts?.Count ?? 0}");
+                digestWriter.WriteLine($"piStageQuantityBaselines={request.PiStageQuantityBaselines?.Count ?? 0}");
+                digestWriter.WriteLine($"executionConstraints={request.ExecutionConstraints?.Count ?? 0}");
+                _output.WriteLine($"[R] 输入指纹已写：{digestPath}");
+            }
+            catch (Exception ex)
+            {
+                // 指纹失败不得影响求解
+                _output.WriteLine($"[R] 输入指纹写入失败（不影响求解）：{ex.Message}");
+            }
+        }
+
         Skip.If(demandCount == 0, "入参 JSON 里一条需求都没有 —— 不是可重放的输入。");
+
+        // ── 2026-11-19 只读分析（1-CF-A）：`APS_REPLAY_ANALYZE_ONLY=1` ⇒ 加载后即输出 TimeBasis 账，不求解 ──
+        if (Environment.GetEnvironmentVariable("APS_REPLAY_ANALYZE_ONLY") == "1")
+        {
+            var slices = request.MaterialConstraints ?? Array.Empty<MaterialAvailabilitySlice>();
+            var byBasis = slices.GroupBy(s => s.TimeBasis ?? "(null)")
+                                .ToDictionary(g => g.Key, g => g.Count(), StringComparer.Ordinal);
+            var unknownAllocs = slices
+                .Where(s => s.TimeBasis is "UNRESOLVED" or "SH_TIME_UNRESOLVED")
+                .Select(s => s.AllocationSequence)
+                .ToHashSet();
+            var demandAllocs = request.LogicalProductionDemands
+                .Select(d => d.AllocationSequence)
+                .ToHashSet();
+            var coveredDemands = request.LogicalProductionDemands
+                .Count(d => unknownAllocs.Contains(d.AllocationSequence));
+            _output.WriteLine($"[ANA] MaterialConstraints 总 {slices.Count}；"
+                + string.Join(" / ", byBasis.OrderByDescending(kv => kv.Value).Select(kv => $"{kv.Key}={kv.Value}")));
+            _output.WriteLine($"[ANA] 时间未定切片覆盖 Allocation={unknownAllocs.Count}；"
+                + $"命中本请求需求 {coveredDemands}/{demandCount}（需求 Allocation 去重 {demandAllocs.Count}）");
+            _output.WriteLine($"[ANA] 示例需求：{string.Join("、", request.LogicalProductionDemands
+                .Where(d => unknownAllocs.Contains(d.AllocationSequence))
+                .Take(5).Select(d => $"{d.LogicalDemandKey}(alloc={d.AllocationSequence},net={d.NetOutputQty:G29})"))}");
+            _output.WriteLine($"[ANA] 切片 alloc 样例={string.Join(",", unknownAllocs.Take(5))}"
+                + $"；需求 alloc 样例={string.Join(",", demandAllocs.Take(5))}"
+                + $"；切片 alloc 范围={unknownAllocs.Min()}~{unknownAllocs.Max()}"
+                + $"；需求 alloc 范围={demandAllocs.Min()}~{demandAllocs.Max()}");
+
+            // 2026-11-20：D-04 分类只依赖 request DTO（与求解无关）⇒ 只读分析模式也顺手导出，
+            //   不必为了分类再跑一次 40 分钟全量。
+            DumpBatchPolicyClassification(request);
+            return;
+        }
 
         // ── 计时与采样工装：与全流程同一套（列的语义一致，才能前后对比）──────────────
         using var solverScope = SolverDiagnostics.BeginScope();
@@ -95,6 +174,48 @@ public class SolverReplayTest
         DomainSolveResult? result = null;
         var cancelled = false;
 
+        // ── 2026-11-20 进度信标（`APS_REPLAY_PROGRESS=<path>`）：每 10 秒把运行中进度写**文件**并落盘 ──
+        //   为什么要有它：`SolverLiveSampler` 只写 xUnit 输出，而命令行常带管道/重定向 ⇒ 中途看不到。
+        //   数据源就是既有的 public `SolverDiagnostics.LiveSnapshot`（Phase + Phase2 需求已处理/总数 +
+        //   Phase4 修复单元 + 关键计数器），**不新增任何生产打点、不改求解行为**。
+        var progressPath = Environment.GetEnvironmentVariable("APS_REPLAY_PROGRESS");
+        using var progressCts = new CancellationTokenSource();
+        Task? progressTask = null;
+        if (!string.IsNullOrWhiteSpace(progressPath))
+        {
+            progressTask = Task.Run(async () =>
+            {
+                var swp = Stopwatch.StartNew();
+                while (!progressCts.IsCancellationRequested)
+                {
+                    try
+                    {
+                        var s = SolverDiagnostics.LiveSnapshot;
+                        var p2 = s is null ? "-" : $"{s.Phase2DemandsProcessed}/{s.Phase2DemandsTotal}";
+                        var p4 = s is null ? "-" : $"{s.Phase4UnitsProcessed}/{s.Phase4UnitsTotal}";
+                        var pct2 = s is not null && s.Phase2DemandsTotal > 0
+                            ? $" ({100.0 * s.Phase2DemandsProcessed / s.Phase2DemandsTotal:0.0}%)"
+                            : string.Empty;
+                        var line =
+                            $"{DateTime.Now:HH:mm:ss} | elapsed {swp.Elapsed:hh\\:mm\\:ss}"
+                            + $" | phase={s?.CurrentPhase ?? "(null)"}"
+                            + $" | P2 {p2}{pct2} | P4 {p4}"
+                            + $" | routingTrials={s?.BatchPlanCandidateTrials ?? -1}"
+                            + $" | runBatchPlan={s?.RunBatchPlanInvocations ?? -1}"
+                            + $" | slots={s?.SlotSearchAttempts ?? -1}";
+                        File.AppendAllText(progressPath!, line + Environment.NewLine);
+                    }
+                    catch
+                    {
+                        // 埋点失败绝不影响求解
+                    }
+
+                    try { await Task.Delay(TimeSpan.FromSeconds(10), progressCts.Token).ConfigureAwait(false); }
+                    catch { }
+                }
+            });
+        }
+
         try
         {
             // 直调接口实现：与 DI 注册的 Singleton 是同一个类型，构造无参（见 SolverBenchmark 同款用法）。
@@ -108,6 +229,11 @@ public class SolverReplayTest
         {
             sw.Stop();
             sampler.Stop();
+            progressCts.Cancel();
+            if (progressTask is not null)
+            {
+                try { await progressTask.ConfigureAwait(false); } catch { }
+            }
             DumpPhaseAndHotspots(solverScope.Counters, sw.Elapsed);
         }
 
@@ -153,7 +279,85 @@ public class SolverReplayTest
                     $"{d.LogicalDemandKey}\t{d.NetOutputQty:G29}\t{d.IsContinuation}\t{d.UOM ?? ""}\t{ta.Cnt}\t{ta.Qty:G29}\t{ua.Qty:G29}\t{ua.Reason}");
             }
             _output.WriteLine($"[DUMP] 逐需求去向已写：{dumpPath}（{request.LogicalProductionDemands.Count} 行）");
+
+            // ── 2026-11-20：未排**明细**导出（`<dump>.notes.tsv`）──
+            //   用途：`PHASE2_INITIAL_SCHEDULE_FAILED` 这类**泛化标签**无法回答「算法问题还是数据问题」；
+            //   Phase2 的 `Phase2BlockedDetails` / 日历逐资源诊断 / 部门缺失明细都写在 `SolveTraceNotes`，
+            //   这里原样导出（脱敏：制表符/换行替换为空格），供按需求归因分类。纯导出，不改判定。
+            var notesPath = dumpPath + ".notes.tsv";
+            using var notesWriter = new System.IO.StreamWriter(notesPath, false, System.Text.Encoding.UTF8);
+            notesWriter.WriteLine("demand\treason\tlevel\tmessage");
+            foreach (var note in result.SolveTraceNotes)
+            {
+                var msg = (note.Message ?? string.Empty)
+                    .Replace('\t', ' ').Replace('\r', ' ').Replace('\n', ' ');
+                notesWriter.WriteLine($"{note.Key}\t{note.ReasonCode}\t{note.Level}\t{msg}");
+            }
+            _output.WriteLine($"[DUMP] Trace 明细已写：{notesPath}（{result.SolveTraceNotes.Count} 行）");
         }
+
+        // ── 2026-11-21（0号位 v1.8 §三「独立校验」）：`APS_REPLAY_TASK_DUMP=<path>` 导出**逐 Task 时间窗** ──
+        //   用途：用**测试侧独立实现的**校验器（`IndependentScheduleAuditTests` 的同一套判据）在真实结果上
+        //   复查「同资源重叠 / Setup 侵入 / 依赖逆序 / 锁漂移」，而不是只让 `ValidateHardResult` 自己证自己。
+        //   纯导出，不改判定、不写库。
+        var taskDumpPath = Environment.GetEnvironmentVariable("APS_REPLAY_TASK_DUMP");
+        if (!string.IsNullOrWhiteSpace(taskDumpPath))
+        {
+            using var tw = new System.IO.StreamWriter(taskDumpPath!, false, System.Text.Encoding.UTF8);
+            // 2026-11-21（EX-T05）：末列补 `isCritical` —— 2号位 r14344 已把字段加进 DTO，
+            //   本列用于「真实 PV 上关键路径是否合理」的核对（false = 算过且不关键，非未算）。
+            tw.WriteLine("taskId\tresourceId\tstart\tend\tsetupMinutes\tdemandKey\tstage\top\tisCritical");
+            foreach (var t in result.FinalTasks)
+            {
+                tw.WriteLine(string.Join('\t',
+                    t.FinalDraftId,
+                    t.ResourceId?.ToString() ?? "null",
+                    t.PlannedStartTime.ToString("yyyy-MM-dd HH:mm:ss"),
+                    t.PlannedEndTime.ToString("yyyy-MM-dd HH:mm:ss"),
+                    t.SetupTime.ToString("G29"),
+                    t.SourceDraftId,
+                    t.StageCode ?? string.Empty,
+                    t.OperationCode ?? string.Empty,
+                    t.IsCriticalPath ? "1" : "0"));
+            }
+            _output.WriteLine($"[DUMP] 逐 Task 时间窗已写：{taskDumpPath}（{result.FinalTasks.Count} 行）");
+        }
+
+        // ── 2026-11-21（EX-T01 / EX-T02 真实 PV 绑定）：`APS_REPLAY_FACTS_DUMP=<path>` 导出**解释事实** ──
+        //   用途：把 Phase3 的 `ScheduleExplanationFact`（原因码/证据类别/ImpactHours/EvidenceJson）
+        //   摊平成 TSV，供逐条核对「五类最终真紧约束」与「物料绑定证据（bindingState/materialReadyAt/slack）」。
+        //   纯导出，不改判定、不写库。
+        var factsDumpPath = Environment.GetEnvironmentVariable("APS_REPLAY_FACTS_DUMP");
+        if (!string.IsNullOrWhiteSpace(factsDumpPath))
+        {
+            using var fw = new System.IO.StreamWriter(factsDumpPath!, false, System.Text.Encoding.UTF8);
+            fw.WriteLine("finalDraftId\tobjectType\torderId\tresourceId\tstageCode\treasonCode\tseverity\timpactHours\tevidenceJson");
+            foreach (var f in result.ExplanationFacts)
+            {
+                var evidence = (f.EvidenceJson ?? string.Empty)
+                    .Replace('\t', ' ').Replace('\r', ' ').Replace('\n', ' ');
+                fw.WriteLine(string.Join('\t',
+                    f.FinalDraftId ?? string.Empty,
+                    f.ObjectType ?? string.Empty,
+                    f.OrderId?.ToString() ?? string.Empty,
+                    f.ResourceId?.ToString() ?? string.Empty,
+                    f.StageCode ?? string.Empty,
+                    f.ReasonCode ?? string.Empty,
+                    f.Severity ?? string.Empty,
+                    f.ImpactHours?.ToString("G29") ?? string.Empty,
+                    evidence));
+            }
+            _output.WriteLine($"[DUMP] 解释事实已写：{factsDumpPath}（{result.ExplanationFacts.Count} 行）");
+        }
+
+        // ── 2026-11-20 D-04 诊断：⑧块 Batch Policy **逐需求分类**（`APS_REPLAY_BATCHPOLICY=<path>`）──
+        //   0号位 v1.8 §四 要求把 VALID / MISSING / INVALID / UNKNOWN / UNAVAILABLE 与
+        //   「合法 B-010 Preferred 兜底」分开，并给出可定位样本与总数。
+        //   判定**复用生产同一函数** `ResolveExecutionBatchPolicyCore`（DTO 版）⇒ 不建第二套口径；
+        //   本块只读 request DTO：不建 ConstraintContext、不改求解、不写库。
+        // 2026-11-20 D-04 逐需求分类（`APS_REPLAY_BATCHPOLICY=<path>`）：参见 helper 注释；
+        //   只读 request DTO，与求解无关 ⇒ 也放进 `APS_REPLAY_ANALYZE_ONLY=1` 分支（不用跑全量）。
+        DumpBatchPolicyClassification(request);
 
         _output.WriteLine($"[R] 求解返回：Success={result!.Success}, FinalTask={finalTaskCount}, "
             + $"求解耗时={sw.Elapsed.TotalSeconds:F1}s");
@@ -267,6 +471,92 @@ public class SolverReplayTest
     }
 
     /// <summary>
+    /// **D-04：⑧块 Batch Policy 逐需求分类**（`APS_REPLAY_BATCHPOLICY=&lt;path&gt;`）。
+    /// 0号位 v1.8 §四 要求把 VALID / MISSING / INVALID / UNKNOWN / UNAVAILABLE 与「合法 B-010 Preferred 兜底」分开。
+    /// 判定**复用生产同一函数** <see cref="PhaseTwoInitialScheduler.ResolveExecutionBatchPolicyCore"/>（不建第二套口径）；
+    /// 只读 request DTO：不建 ConstraintContext、不改求解、不写库。
+    /// 未设环境变量 ⇒ 直接返回（零开销）。
+    /// </summary>
+    private void DumpBatchPolicyClassification(DomainSolveRequest request)
+    {
+        var path = Environment.GetEnvironmentVariable("APS_REPLAY_BATCHPOLICY");
+        if (string.IsNullOrWhiteSpace(path)) return;
+
+        // 部门反查表（与 `ResolveExecutionBatchPolicyCore` 同源：MaterialStageDepartmentContexts）。
+        var deptByMaterialStage = new Dictionary<(int, string), int?>();
+        foreach (var ctx in request.MaterialStageDepartmentContexts)
+        {
+            var key = (ctx.MaterialId, ctx.StageCode ?? string.Empty);
+            if (!deptByMaterialStage.ContainsKey(key)) deptByMaterialStage[key] = ctx.ProductionDepartmentId;
+        }
+
+        var carrierByKey = new Dictionary<(int, int?), BatchPolicyStateSnapshot>();
+        if (request.StrategySnapshot?.BatchPolicyStates is { } states)
+        {
+            foreach (var s in states)
+            {
+                var key = (s.MaterialId, s.ProductionDepartmentId);
+                if (!carrierByKey.ContainsKey(key)) carrierByKey[key] = s;
+            }
+        }
+
+        var policies = request.StrategySnapshot?.BatchPolicies
+            ?? (IReadOnlyList<BatchPolicyRuleSnapshot>)Array.Empty<BatchPolicyRuleSnapshot>();
+
+        var carrierCounts = new Dictionary<string, int>(StringComparer.Ordinal);
+        var effectiveCounts = new Dictionary<string, int>(StringComparer.Ordinal);
+        int b010Eligible = 0;
+
+        using var writer = new StreamWriter(path!, false, System.Text.Encoding.UTF8);
+        writer.WriteLine("demand\tmaterial\tstartStage\tdept\tcarrierState\teffectiveState\tb010Eligible\tmatchSource");
+        foreach (var d in request.LogicalProductionDemands)
+        {
+            int? dept = null;
+            if (!string.IsNullOrEmpty(d.StartStageCode))
+            {
+                var key = (d.MaterialId, d.StartStageCode!);
+                if (deptByMaterialStage.TryGetValue(key, out var resolved)) dept = resolved;
+            }
+
+            string carrierState;
+            if (request.StrategySnapshot?.BatchPolicyStates is null)
+            {
+                carrierState = "NO_CARRIER";
+            }
+            else if (carrierByKey.TryGetValue((d.MaterialId, dept), out var entry))
+            {
+                carrierState = entry.State.ToString();
+            }
+            else
+            {
+                carrierState = "NO_ENTRY";
+            }
+
+            var resolution = PhaseTwoInitialScheduler.ResolveExecutionBatchPolicyCore(
+                d.MaterialId, d.StartStageCode, request.MaterialStageDepartmentContexts,
+                request.StrategySnapshot, policies);
+
+            var effective = resolution.State.ToString();
+            // B-010 合法兜底只在「可信 Missing」时成立（Invalid/Unknown 均 Fail Closed，不启 Q_C）。
+            var eligible = resolution.State == PhaseTwoInitialScheduler.BatchPolicyMatchState.Missing;
+
+            carrierCounts[carrierState] = carrierCounts.TryGetValue(carrierState, out var c1) ? c1 + 1 : 1;
+            effectiveCounts[effective] = effectiveCounts.TryGetValue(effective, out var c2) ? c2 + 1 : 1;
+            if (eligible) b010Eligible++;
+
+            writer.WriteLine(
+                $"{d.LogicalDemandKey}\t{d.MaterialId}\t{d.StartStageCode ?? ""}\t{dept?.ToString() ?? "null"}"
+                + $"\t{carrierState}\t{effective}\t{eligible}\t"
+                + (resolution.MatchSource ?? "").Replace('\t', ' ').Replace('\r', ' ').Replace('\n', ' '));
+        }
+
+        _output.WriteLine($"[BP] Batch Policy 分类已写：{path}（{request.LogicalProductionDemands.Count} 行）；"
+            + $"载体状态={string.Join("、", carrierCounts.Select(kv => $"{kv.Key}={kv.Value}"))}；"
+            + $"生效判定={string.Join("、", effectiveCounts.Select(kv => $"{kv.Key}={kv.Value}"))}；"
+            + $"B-010合法兜底={b010Eligible}");
+    }
+
+    /// <summary>
     /// 打印分相耗时与本轮优化要盯的热点。**取的是同一个 `Counters`**，
     /// 所以与 `SolverLiveSampler` 的 CSV 末行应当能对上（对不上说明末拍之后又有读数，不是矛盾）。
     /// </summary>
@@ -356,5 +646,70 @@ public class SolverReplayTest
         _output.WriteLine($"   单工序路径：尝试 {c.MergeAttempts,12:N0} | 命中 {c.MergeHits,12:N0} | "
             + $"未命中 {c.MergeMisses,12:N0}");
         _output.WriteLine($"   无合法锚点 {c.MergeNotEligible,12:N0} | 被执行批身份守卫挡 {c.MergeIdentityUnrepresentable,12:N0}");
+
+        WritePhaseCsv(c, wall);
+    }
+
+    /// <summary>
+    /// 2026-11-21（0号位 v1.8 §七 / W5）：`APS_REPLAY_PHASE_DUMP=<path>` 把**分相耗时与热点**落成 CSV。
+    ///
+    /// <para><b>为什么要单独落文件</b>：`dotnet test` 默认**不把 <c>ITestOutputHelper</c> 写进日志**，
+    /// 所以在此之前，分相计时只在控制台一闪而过 ⇒ W5 的「P2/P3/P4/P5 分段」拿不到证据。
+    /// 本方法只把**已有计数器**写成文件，**不新增任何埋点、不改求解行为**。</para>
+    ///
+    /// <para>格式：两段，`[phase]` 与 `[hotspot]`，每行逗号分隔。跨两次跑对拍时直接按 name 对齐。</para>
+    /// </summary>
+    private static void WritePhaseCsv(SolverDiagnostics.Counters c, TimeSpan wall)
+    {
+        var path = Environment.GetEnvironmentVariable("APS_REPLAY_PHASE_DUMP");
+        if (string.IsNullOrWhiteSpace(path))
+        {
+            return;
+        }
+
+        try
+        {
+            var inv = CultureInfo.InvariantCulture;
+            using var w = new System.IO.StreamWriter(path!, false, System.Text.Encoding.UTF8);
+            w.WriteLine("kind,name,value");
+            w.WriteLine($"phase,wallSeconds,{wall.TotalSeconds.ToString("F3", inv)}");
+            w.WriteLine($"phase,P1Ms,{c.Phase1Ms.ToString(inv)}");
+            w.WriteLine($"phase,P2Ms,{c.Phase2Ms.ToString(inv)}");
+            w.WriteLine($"phase,P3Ms,{c.Phase3Ms.ToString(inv)}");
+            w.WriteLine($"phase,P4Ms,{c.Phase4Ms.ToString(inv)}");
+            w.WriteLine($"phase,P5Ms,{c.Phase5Ms.ToString(inv)}");
+
+            var rows = new (string Name, int Slot, long Calls)[]
+            {
+                ("batch_trial", SolverDiagnostics.Hotspot.BatchPlanTrial, c.BatchPlanCandidateTrials),
+                ("clone_task_list", SolverDiagnostics.Hotspot.CloneTaskList, c.CloneTaskList),
+                ("clone_shares", SolverDiagnostics.Hotspot.CloneShares, c.CloneShares),
+                ("clone_occ", SolverDiagnostics.Hotspot.CloneOccupancy, c.CloneOccupancy),
+                ("slot_search", SolverDiagnostics.Hotspot.SlotSearch, c.SlotSearches),
+                ("trial_prep", SolverDiagnostics.Hotspot.TrialPrep, 0),
+                ("prep_index", SolverDiagnostics.Hotspot.PrepIndex, 0),
+                ("occ_copy_real", SolverDiagnostics.Hotspot.OccCopyReal, 0),
+                ("batch_adopt", SolverDiagnostics.Hotspot.BatchAdopt, 0),
+                ("merge_anchor_scan", SolverDiagnostics.Hotspot.MergeAnchorScan, c.MergeScanCalls),
+                ("detach_tail", SolverDiagnostics.Hotspot.DetachTail, 0),
+            };
+            foreach (var (name, slot, calls) in rows)
+            {
+                var ms = c.HotspotMs(slot);
+                if (ms <= 0 && calls <= 0)
+                {
+                    continue;
+                }
+                w.WriteLine($"hotspot,{name}_ms,{ms.ToString("F0", inv)}");
+                if (calls > 0)
+                {
+                    w.WriteLine($"hotspot,{name}_calls,{calls.ToString(inv)}");
+                }
+            }
+        }
+        catch
+        {
+            // 埋点失败绝不影响求解
+        }
     }
 }

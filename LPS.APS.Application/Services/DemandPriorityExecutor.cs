@@ -24,6 +24,9 @@ namespace LPS.APS.Application.Services;
 /// </summary>
 public sealed class DemandPriorityExecutor : IDemandPriorityExecutor
 {
+    /// <inheritdoc />
+    public List<(string DemandKey, int SegmentOrder)>? SegmentTrace { get; set; }
+
     /// <summary>
     /// 当前执行器支持的业务字段白名单（大小写不敏感）。
     /// 3号位配置中出现白名单外的 FieldName 属于策略配置错误（P1-02），必须显式报错，不得静默当作空值继续排。
@@ -137,6 +140,7 @@ public sealed class DemandPriorityExecutor : IDemandPriorityExecutor
             {
                 sortedDemands.Add(demand);
                 assigned.Add(demand);
+                SegmentTrace?.Add((demand.DemandKey, segment.SegmentOrder));
             }
         }
 
@@ -151,6 +155,7 @@ public sealed class DemandPriorityExecutor : IDemandPriorityExecutor
             _logger.LogWarning(
                 "DemandPriority 当前层 {Count} 条 Demand 未命中任何 Segment，按稳定 DemandKey ASC 兜底",
                 unmatched.Count);
+            foreach (var d in unmatched) SegmentTrace?.Add((d.DemandKey, 0));   // 0 = 未命中任何段（DemandKey 兜底）
             sortedDemands.AddRange(unmatched);
         }
 

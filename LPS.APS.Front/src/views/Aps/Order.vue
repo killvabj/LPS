@@ -54,9 +54,63 @@
  *     「该版本共 N 单」仍是整版数量（summary 口径），两者不是同一个数，卡片下方已分别标注。
  *  ⑦ 版本状态大白话提示（失败 / 计算中 / 未发令 / 已被顶替 / 全版本都未排产）。
  *
+ * 2026-11-18 **交付 KPI 条工厂视角再改版**（用户：以工厂用户角度优化，不该有的提示去掉）：
+ *   - 撤下 `caliber` 原文回显与「口径来源：…（读模型）」角标（内部术语：0号位裁 / MAX(PlannedEndTime)
+ *     读模型计算 / 分母=去重根订单含未判定 ⇒ 工厂用户读不懂）；
+ *     口径**含义不丢** —— 改由标题「交付预测（按当前筛选）」+ 悬停说明承载（仍是预测，不是实际交付）。
+ *   - `plannedCompletionSource` 的**行为保留**（后端切 `formal` 前端不改代码，5号位 B2 要求），
+ *     只把文案换成短中文标签「计划完成时间取自排产任务 / 取自正式归集」；未知值原样透出。
+ *   - 第三桶「日期/计划不可判定」→「**未判定**」+ 悬停说明（还没排产 / 缺交期 / 缺计划完成时间）。
+ *     ⚠️ 不用列表行的「未排产」一词：那一桶还含「有 Task 但缺完成时刻」，说成未排产**不实**。
+ *   - 分区卡竖条撤掉绿/红（原 PI 绿 / SO 红，与卡内绿「按期」红「延期」同色 ⇒ 会被读成好/坏），
+ *     改中性灰蓝，只有「总计」深一档。
+ *   - 排版：标题独占第一行（横线分隔），三张卡**等宽三列**、卡内可折行
+ *     （1600 屏实测三卡内容合计 ≈1310px vs 容器内宽 1284px，差十几像素就会把「销售订单」
+ *     整张甩到第二行左端 ⇒ 改成等宽列 + 卡内折行，窄屏也不甩卡）；
+ *     订单数前的「共」去掉（卡名「总计」已含此义，省宽度）。
+ *
+ * 2026-11-18（5号位《复函V环境-更新重启归Owner执行…》§四 收讫条件）：
+ *   `plannedCompletionSource` 的语义切换（`readmodel_task_max` → `formal`）**用户须可感知** ——
+ *   两个已知值的中文标签**必须明显不同**（测算值 vs 正式结果），**禁静默升级**；
+ *   未知值仍**原样透出**（不得回落成任一已知标签）。
+ *   前端自证：`scripts/selfverify-order-kpi-source-label.mjs`（反向破坏 ⇒ 必须转红）。
+ *
  * 写接口：本页查询部分只读；**唯一写入口 = §10A.1「已有订单提前」**
  * （EXISTING_ORDER_ADVANCE → POST /api/governance/run/candidate，Policy aps.plan.run）
  * @see 4号位实施包 v1.4 §十A
+ *
+ * 2026-11-20 按《APS_V1_P01-P13 全页面业务设计统一收口核对稿 v0.2》§4 **P02** 补默认列：
+ *   - 新增 **排程域**（Domain 中文名）与 **订单类型（SO/PI）** —— 两项原 DTO 就有
+ *     （`domainKey` / `orderType`），此前没成列；稿 P02 默认列序为
+ *     「问题标记｜根订单号｜Domain｜SO/PI｜FG/WIP｜品番/品名｜客户/类别｜数量＋单位｜…」。
+ *   - 新增 **要求生产完成日期（入物流仓日期）** 列 —— 后端**尚未投影**该字段
+ *     （已出函 5号位 A1）⇒ 显「未提供」，**不用客户交期顶替**（两者是不同口径）。
+ *   - **预计延期天数** 从「交付状态」列里**分列**出来（稿：预计延期天数与交付状态分列，
+ *     且「不把 ERP 属性 DelayStatus 和 APS 预计延期混作一栏」）。
+ *     后端给自然小时差 ⇒ 前端折算成天；口径（自然小时差 / 工作日差）待 5号位确认（致 5号位函 A4）。
+ *   - 交付 KPI 区**不动**：三卡按 `delivery-kpi` 分区行（总计 / 生产指示 / 销售订单），
+ *     同一分母 + 「未判定」单列，已符合稿「同分母 + 未判定单列」；FG/WIP 维度后端未给
+ *     （`fgWipDimensionAvailable=false`）⇒ 该卡不出（已出函 A2）。
+ *
+ * 2026-11-20：接 5号位 2026-11-20 复函已落码的 **A2** 与 **D1** 两条
+ *   （依据 5号位-2026-11-20-复函-P01-P13收口v0.2清单十七项逐条裁决_三条可投影已落码B1F1J1_其余不可原因与后移给足-给4号位抄3号位.md §一）：
+ *   · **A2**（r14318）：`fgWipDimensionAvailable` 现为 **true** ⇒ 交付 KPI 区补
+ *     **「按物料大分类分区（FG/WIP）」**（每类一张卡）与 **FG/WIP × SO/PI 交叉表**
+ *     （判据 = 标准 `Material.MaterialType` 原值，禁由品番前缀推断）。
+ *     ⚠️ **定位分区行必须同时看两个键**：FG/WIP 上线后「仅物料大分类」的行 `orderType` 也是 null
+ *       ⇒ 只看 `orderType` 会把「组件」的数当成「总计」显示（已修）。
+ *   · **D1**：Pegging 承接表的「来源仓库」**不再取 PSA 的 `supplyWarehouseCode`**
+ *     （后端实测 99,564/99,564 **全 0 填充** ⇒ 拿它当仓库等于凭空断言），
+ *     改走 `composables/useSupplyWarehouse.ts`（按 PO × 物料到供给事实行查仓码/仓名）。
+ *     查不到 / 命中多仓 ⇒ 显「未提供」并给出说明，**不猜**。
+ *
+ * 2026-11-21：「已有订单提前」入口**按场景收窄到 Domain PMC**
+ *   （依据《APS_V1_P01-P13 全页面业务设计统一收口核对稿 v0.2》§4.9.1 场景5/6 + §7 UI-20
+ *    「车间计划员对 1～6 无权」）：
+ *   · 门控由 `canPlanRun`（仅 `aps.plan.run`）改为 `canAdvance`
+ *     = `aps.plan.run` **且** `aps.reschedule.local`（局部重排权）；
+ *     车间计划员不持 `aps.reschedule.local` ⇒ 进本页也看不到该入口、勾选框同样禁用。
+ *   · 其余行为不变：端点仍是 POST /api/governance/run/candidate（Policy `aps.plan.run`）。
  */
 
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
@@ -74,9 +128,15 @@ import {
   formatUtcMonthDayHM
 } from '@/utils/datetime'
 import type { BusinessEntrySubmission, OrderListItemDto } from '@/api/aps-v1'
-import { customerSegmentLabel, orderTypeLabel, supplyTypeLabel } from '@/api/aps-v1/codeLabels'
+import {
+  customerSegmentLabel,
+  materialTypeLabel,
+  orderTypeLabel,
+  supplyTypeLabel
+} from '@/api/aps-v1/codeLabels'
 import OrderAdvanceDialog from './components/OrderAdvanceDialog.vue'
 import OrderTreePanel from './components/OrderTreePanel.vue'
+import { useSupplyWarehouse } from './composables/useSupplyWarehouse'
 import {
   ORDER_STATUS_LABELS,
   ORDER_DELAY_STATUSES,
@@ -196,6 +256,20 @@ function delayHoursText(hours: number | undefined): string {
   const label = hours < 0 ? '提前' : '超期'
   if (abs < 24) return `${label} ${abs.toFixed(1)} 小时`
   return `${label} ${(abs / 24).toFixed(1)} 天`
+}
+
+/**
+ * 预计延期天数（列表独立列，稿 §4 P02「预计延期天数与交付状态」分列）。
+ *
+ * 后端给的是**自然小时差**（`delayHours`，只有延期才有值）⇒ 前端折算成天；
+ * ⚠️ 口径（自然小时差 / 工作日差）待 5号位确认（致 5号位函 A4），前端不自行解释。
+ * 负值 = 提前（正数提前天数）。
+ */
+function delayDaysText(hours: number | null | undefined): string {
+  if (hours == null) return '—'
+  const days = hours / 24
+  const label = days > 0 ? '延期' : days < 0 ? '提前' : ''
+  return `${label} ${Math.abs(days).toFixed(1)} 天`
 }
 
 /** 订单状态标签：按冻结 07:3611 六值词表渲染（实库 `Open` 归一回历史遗留 `OPEN`）；仍不认识则原样显示 */
@@ -544,16 +618,26 @@ const allUnscheduledNotice = computed<string | null>(() => {
 // ⚠️ FG/WIP 分区：`fgWipDimensionAvailable=false` ⇒ **不出该卡**（不是出空卡）。
 const totalCount = computed(() => summary.value?.totalCount ?? null)
 
-/** 分区行 → 卡片（总计行 `orderType` 缺键 ⇒ 用 `== null` 认，勿用 `=== ''`） */
+/** 分区行 → 卡片（总计行 `orderType` 缺键 ⇒ 用 `== null` 认，勿用 `=== ''`）
+ *
+ * ⚠️ 2026-11-20（A2：FG/WIP 分区上线后）**定位必须同时看两个键**：
+ *   后端现在有四组行（总计 / 仅 SO-PI / 仅物料大分类 / 交叉），
+ *   「仅物料大分类」那组的 `orderType` **也是 null** ⇒ 只判 `orderType == null`
+ *   会把「组件」那行误当总计 ⇒ 总计行 = 两个键都缺；SO-PI 行 = 有 orderType 且无 materialType。
+ */
 const kpiCards = computed(() => {
   const rows = deliveryKpi.value?.rows ?? []
-  const total = rows.find((r) => r.orderType == null)
-  const pi = rows.find((r) => r.orderType === 'PRODUCTION_INSTRUCTION')
-  const so = rows.find((r) => r.orderType === 'SALES_ORDER')
+  const total = rows.find((r) => r.orderType == null && r.materialType == null)
+  const pi = rows.find((r) => r.orderType === 'PRODUCTION_INSTRUCTION' && r.materialType == null)
+  const so = rows.find((r) => r.orderType === 'SALES_ORDER' && r.materialType == null)
+  /**
+   * 竖条颜色 2026-11-18 改中性：原 PI 绿 / SO 红，与卡内绿「按期」红「延期」同色，
+   * 工厂用户会把竖条读成「这单类型好/坏」⇒ 只留深浅（总计深一档）区分，不带好坏语义。
+   */
   const defs = [
-    { key: 'total', label: '总计', color: '#334155', row: total },
-    { key: 'pi', label: '生产指示', color: RISK_COLORS.ON_TRACK, row: pi },
-    { key: 'so', label: '销售订单', color: RISK_COLORS.DELAYED, row: so }
+    { key: 'total', label: '总计', color: '#64748b', row: total },
+    { key: 'pi', label: '生产指示', color: '#cbd5e1', row: pi },
+    { key: 'so', label: '销售订单', color: '#cbd5e1', row: so }
   ]
   return defs.filter((d) => d.row).map((d) => ({ ...d, row: d.row! }))
 })
@@ -564,13 +648,68 @@ function kpiRateText(v: number | null | undefined): string {
   return `${v}%`
 }
 
-/** 「口径来源」角标文案（后端切 formal 后自动改，前端不改代码） */
+/* ===== FG/WIP 分区（2026-11-20 补；A2：5号位 r14318 已落码）=====
+ *
+ * ✅ v0.2 P02：「分组层级 `DomainKey → FG/WIP → SALES_ORDER/PRODUCTION_INSTRUCTION`」、
+ *   「**FG/WIP与SO/PI正交分组**」、「不同Domain、FG/WIP 的业务数量和比率**禁止混算**」。
+ * ✅ 判据＝标准 `Material.MaterialType` 原值（0号位 11-20 裁）⇒ **禁**由品番前缀推断。
+ * ✅ 全部标准类型**逐行独立成区、不合并不隐藏**（ASSY/RAW_MATERIAL 与 FG/WIP 平级）。
+ * ⚠️ 行定位：`orderType == null && materialType != null` ⇒ **类型维度行**；
+ *   `orderType != null && materialType != null` ⇒ **交叉行**（FG/WIP × SO/PI）。
+ *   （两个键都缺 ⇒ 总计行；只有 orderType ⇒ 仅 SO-PI 行。）
+ */
+const fgWipAvailable = computed(() => deliveryKpi.value?.fgWipDimensionAvailable === true)
+
+/** FG/WIP 分区卡（类型维度行） */
+const fgWipCards = computed(() => {
+  if (!fgWipAvailable.value) return []
+  const rows = deliveryKpi.value?.rows ?? []
+  return rows
+    .filter((r) => r.orderType == null && r.materialType != null)
+    .map((r) => ({
+      key: r.materialType!,
+      label: materialTypeLabel(r.materialType),
+      row: r
+    }))
+    .sort((a, b) => b.row.totalOrders - a.row.totalOrders)
+})
+
+/** FG/WIP × SO/PI 交叉行（正交分组的叶子层） */
+const fgWipCrossRows = computed(() => {
+  if (!fgWipAvailable.value) return []
+  const rows = deliveryKpi.value?.rows ?? []
+  return rows
+    .filter((r) => r.orderType != null && r.materialType != null)
+    .map((r) => ({
+      materialType: r.materialType!,
+      materialLabel: materialTypeLabel(r.materialType),
+      orderTypeLabel: orderTypeLabel(r.orderType, '未提供'),
+      row: r
+    }))
+    .sort((a, b) => b.row.totalOrders - a.row.totalOrders)
+})
+
+/**
+ * 计划完成时间的取数来源角标（后端 `plannedCompletionSource`）。
+ *
+ * 2026-11-18 用户口径：内部术语不上页面（原文「口径来源：按本版任务的最晚完成时间算（读模型）」），
+ * 但 5号位 B2 要求的**行为**（后端切 `formal` 时前端不改代码）要保留 ⇒ 换成一句短中文。
+ * ⚠️ 未知值**原样透出**（不臆造中文），与其它词典口径一致。
+ *
+ * 2026-11-18（5号位 复函V §四 收讫条件）：`readmodel_task_max → formal` 的语义切换
+ *   **用户须可感知** ⇒ 两个已知值的中文标签**必须明显不同**（测算值 vs 正式结果），
+ *   **禁静默升级**；该条件已进后端护栏语义表第 10 行，我方两头夹
+ *   （前端自证：`scripts/selfverify-order-kpi-source-label.mjs`）。
+ */
 const kpiSourceText = computed(() => {
   const src = deliveryKpi.value?.plannedCompletionSource
   if (!src) return ''
-  if (src === 'readmodel_task_max') return '口径来源：按本版任务的最晚完成时间算（读模型）'
-  if (src === 'formal') return '口径来源：按正式归集的完成时间算'
-  return `口径来源：${src}`
+  // ⚠️ 两个已知来源的标签**必须明显不同**（5号位 2026-11-18 复函V §四 条件）：
+  //   值一变（读模型测算 → 正式归集结果）标签就换，**禁静默升级**（用户须可感知口径切换）。
+  if (src === 'readmodel_task_max') return '计划完成时间取自排产任务（测算值）'
+  if (src === 'formal') return '计划完成时间取自正式归集（正式结果）'
+  // 未知值：原样透出后端码，**不得**回落成上面任一标签（否则等于假装口径没变）
+  return `计划完成时间取自：${src}`
 })
 
 /** KPI 区的空态说明（版本不存在 / 越权 / 当前筛选无订单） */
@@ -620,7 +759,15 @@ function onRowClick(row: OrderListItemDto, column?: { type?: string }): void {
 // ===== §10A.1 已有订单提前（EXISTING_ORDER_ADVANCE）=====
 const router = useRouter()
 const route = useRoute()
+/**
+ * 场景5/6（已有订单提前 = LOCAL_RESCHEDULE + MANUAL_ADJUSTMENT）= **Domain PMC**
+ *  - `aps.plan.run`   ：端点 POST /api/governance/run/candidate 的权限码
+ *  - `aps.reschedule.local`：局部重排权（LOCAL_RESCHEDULE）⇒ 车间计划员不持此码，
+ *    故其进本页也看不到「已有订单提前」入口（v0.2 稿 §4.9.1 场景5/6 + §7 UI-20：
+ *    「车间计划员对 1～6 无权」；车间侧的对应能力是场景7～9，在甘特页）。
+ */
 const canPlanRun = computed(() => apsAuth.has('aps.plan.run'))
+const canAdvance = computed(() => canPlanRun.value && apsAuth.has('aps.reschedule.local'))
 
 /**
  * 当前版本是否只读（不可写）
@@ -754,6 +901,24 @@ const detailOrder = computed(() => currentDetail.value?.order ?? null)
 const detailPegging = computed(() => currentDetail.value?.pegging ?? [])
 const detailTasks = computed(() => currentDetail.value?.tasks ?? [])
 
+/**
+ * 供给侧仓库解析（2026-11-20；D1）。
+ *
+ * ⚠️ PSA 的 `supplyWarehouseCode` 全 0 填充（5号位 11-20 复函 D1 实测 99,564/99,564 为空）
+ *   ⇒ 承接表的「来源仓库」列**不再显示那一列**，改由供给事实行解析；查不到显「未提供」。
+ */
+const { resolve: resolveWarehouses, warehouseText, warehouseHint } = useSupplyWarehouse()
+watch(
+  detailPegging,
+  (rows) => {
+    if (!rows.length) return
+    void resolveWarehouses(
+      rows.map((r) => ({ poNo: r.supplyDocumentNo, materialCode: r.materialCode }))
+    )
+  },
+  { immediate: true }
+)
+
 // ===== P02 行展开 / P03 深链（同一端点、同一组件）=====
 /**
  * 订单结构（P02 行展开）＋ 深链定位（P03）
@@ -858,15 +1023,17 @@ onMounted(async () => {
       <div class="toolbar-meta">
         <span v-if="currentVersionLabel" class="muted">{{ currentVersionLabel }}</span>
       </div>
-      <!-- §10A.1 已有订单提前：5 个独立中文业务入口中的本页唯一入口 -->
+      <!-- §10A.1 已有订单提前：5 个独立中文业务入口中的本页唯一入口
+           2026-11-21：门控由 canPlanRun 收紧为 canAdvance（再加 aps.reschedule.local）
+           ⇒ 场景5/6 只归 Domain PMC，车间计划员在本页看不到该入口（v0.2 稿 §7 UI-20） -->
       <ElButton
         type="warning"
         plain
-        :disabled="!canPlanRun || !!versionReadOnlyReason || selectedOrders.length === 0"
+        :disabled="!canAdvance || !!versionReadOnlyReason || selectedOrders.length === 0"
         :title="
           versionReadOnlyReason
             ? versionReadOnlyReason
-            : canPlanRun
+            : canAdvance
               ? '已有订单提前 — 先在列表勾选订单'
               : '当前账号无排程执行权限'
         "
@@ -903,30 +1070,98 @@ onMounted(async () => {
     />
 
     <!-- ===== 交付 KPI（取 /api/order-query/delivery-kpi；5号位 2026-11-17 B2）===== -->
-    <!-- 2026-11-12 用户反馈：原先四张大卡片占掉大半屏首屏 ⇒ 保持一行紧凑指标条，
-         口径说明并到同一行右端（不必为说明单占一行）。
+    <!-- 2026-11-12 用户反馈：原先四张大卡片占掉大半屏首屏 ⇒ 保持一行紧凑指标条。
          2026-11-17：四卡（总数/按期/延迟/未排产）换成三张**分区卡**（总计/生产指示/销售订单），
-         每个分区里「日期/计划不可判定」单列，率由后端给，前端不自算。 -->
+         每个分区里「不可判定」单列，率由后端给，前端不自算。
+         2026-11-18 用户反馈（工厂视角）：撤下内部术语（`caliber` 原文 + 「口径来源…（读模型）」），
+         口径含义改由标题 + 悬停承载；第三桶文案改「未判定」；竖条改中性色。 -->
     <div v-if="kpiCards.length" class="kpi-row">
+      <span class="kpi-title">
+        交付预测（按当前筛选）
+        <span v-if="kpiSourceText" class="kpi-source">{{ kpiSourceText }}</span>
+        <ElTooltip
+          content="按 APS 排产计划算的预计按期情况：拿计划完成时间和交期比一比。这里是预测，不是已经发生的实际交付结果。"
+          placement="top"
+        >
+          <Icon class="kpi-title-q" icon="vi-ep:question-filled" />
+        </ElTooltip>
+      </span>
       <div v-for="c in kpiCards" :key="c.key" class="kpi-card">
         <span class="kpi-bar" :style="{ background: c.color }"></span>
         <span class="kpi-label">{{ c.label }}</span>
-        <span class="kpi-total">共 {{ c.row.totalOrders }} 单</span>
+        <span class="kpi-total">{{ c.row.totalOrders }} 单</span>
         <span class="kpi-metric" :style="{ color: RISK_COLORS.ON_TRACK }">
           按期 {{ c.row.onTimeOrders }}<em>（{{ kpiRateText(c.row.onTimeRatePct) }}）</em>
         </span>
         <span class="kpi-metric" :style="{ color: RISK_COLORS.DELAYED }">
           延期 {{ c.row.lateOrders }}<em>（{{ kpiRateText(c.row.lateRatePct) }}）</em>
         </span>
-        <span class="kpi-metric" :style="{ color: RISK_MISSING_COLOR }">
-          日期/计划不可判定 {{ c.row.undeterminedOrders }}
-        </span>
+        <ElTooltip content="还没排产，或缺交期/计划完成时间 ⇒ 算不出按期还是延期。" placement="top">
+          <span class="kpi-metric" :style="{ color: RISK_MISSING_COLOR }">
+            未判定 {{ c.row.undeterminedOrders }}
+          </span>
+        </ElTooltip>
       </div>
-      <span class="kpi-caption">
-        {{ kpiSourceText }}·交付指标按<b>当前筛选</b>统计；
-        {{ deliveryKpi?.caliber }}
-      </span>
     </div>
+
+    <!-- FG/WIP 分区（2026-11-20 补；A2：5号位 r14318 已落码 `fgWipDimensionAvailable=true`）
+         v0.2 P02：「FG/WIP与SO/PI正交分组」＋「FG/WIP 的业务数量和比率禁止混算」
+         ⇒ 每个物料大分类独立一区，不合并、不与 SO/PI 分区相加。 -->
+    <div v-if="fgWipCards.length" class="kpi-row kpi-row-fgwip">
+      <span class="kpi-title">
+        按物料大分类分区（FG/WIP）
+        <ElTooltip
+          content="按物料的标准大分类（成品／半成品／组件／原材料）分开统计。各分类的订单数和比率各自独立，不能相加或互相代替。"
+          placement="top"
+        >
+          <Icon class="kpi-title-q" icon="vi-ep:question-filled" />
+        </ElTooltip>
+      </span>
+      <div v-for="c in fgWipCards" :key="c.key" class="kpi-card">
+        <span class="kpi-bar" style="background: #cbd5e1"></span>
+        <span class="kpi-label">{{ c.label }}</span>
+        <span class="kpi-total">{{ c.row.totalOrders }} 单</span>
+        <span class="kpi-metric" :style="{ color: RISK_COLORS.ON_TRACK }">
+          按期 {{ c.row.onTimeOrders }}<em>（{{ kpiRateText(c.row.onTimeRatePct) }}）</em>
+        </span>
+        <span class="kpi-metric" :style="{ color: RISK_COLORS.DELAYED }">
+          延期 {{ c.row.lateOrders }}<em>（{{ kpiRateText(c.row.lateRatePct) }}）</em>
+        </span>
+        <ElTooltip content="还没排产，或缺交期/计划完成时间 ⇒ 算不出按期还是延期。" placement="top">
+          <span class="kpi-metric" :style="{ color: RISK_MISSING_COLOR }">
+            未判定 {{ c.row.undeterminedOrders }}
+          </span>
+        </ElTooltip>
+      </div>
+    </div>
+
+    <!-- FG/WIP × SO/PI 交叉分区（v0.2 P02 分组层级 Domain→FG/WIP→SO/PI 的叶子层） -->
+    <ElTable
+      v-if="fgWipCrossRows.length"
+      :data="fgWipCrossRows"
+      size="small"
+      border
+      class="fgwip-cross-table"
+    >
+      <ElTableColumn label="物料大分类" min-width="110" prop="materialLabel" />
+      <ElTableColumn label="订单类型" min-width="110" prop="orderTypeLabel" />
+      <ElTableColumn label="订单数" width="100" align="right">
+        <template #default="{ row }">{{ row.row.totalOrders }}</template>
+      </ElTableColumn>
+      <ElTableColumn label="按期" width="110" align="right">
+        <template #default="{ row }">
+          {{ row.row.onTimeOrders }}（{{ kpiRateText(row.row.onTimeRatePct) }}）
+        </template>
+      </ElTableColumn>
+      <ElTableColumn label="延期" width="110" align="right">
+        <template #default="{ row }">
+          {{ row.row.lateOrders }}（{{ kpiRateText(row.row.lateRatePct) }}）
+        </template>
+      </ElTableColumn>
+      <ElTableColumn label="未判定" width="100" align="right">
+        <template #default="{ row }">{{ row.row.undeterminedOrders }}</template>
+      </ElTableColumn>
+    </ElTable>
     <ElAlert
       v-else-if="deliveryKpiError"
       type="error"
@@ -1081,7 +1316,7 @@ onMounted(async () => {
         <ElTableColumn
           type="selection"
           width="44"
-          :selectable="() => canPlanRun && !versionReadOnlyReason"
+          :selectable="() => canAdvance && !versionReadOnlyReason"
         />
         <!-- ===== P02 行展开：订单结构（B3，5号位 2026-11-17 复函）=====
              与 P03 深链共用同一端点/同一组件（OrderTreePanel），不建第二套。 -->
@@ -1114,6 +1349,28 @@ onMounted(async () => {
           </template>
         </ElTableColumn>
         <ElTableColumn prop="materialCode" label="物料编码" min-width="140" show-overflow-tooltip />
+        <!-- 排程域 + 订单类型（SO/PI）：稿 §4 P02 建议默认列「根订单号｜Domain｜SO/PI｜…」
+             —— 两者原 DTO 就有（domainKey / orderType），此前未成列。 -->
+        <ElTableColumn label="排程域" width="120">
+          <template #default="{ row }">
+            <span v-if="row.domainKey">{{ domainStore.label(row.domainKey) }}</span>
+            <span v-else class="muted">—</span>
+          </template>
+        </ElTableColumn>
+        <ElTableColumn label="订单类型" width="104">
+          <template #default="{ row }">{{ orderTypeLabel(row.orderType) }}</template>
+        </ElTableColumn>
+        <!-- 要求生产完成日期（入物流仓日期）：稿 §4 P02 默认列；后端**尚未投影**该字段
+             （已出函 5号位 A1）⇒ 显「未提供」，**不用客户交期顶替**（两者口径不同）。 -->
+        <ElTableColumn label="要求生产完成日期" width="140">
+          <template #default>
+            <span
+              class="muted"
+              title="后端尚未投影「要求生产完成日期（入物流仓日期）」，已出函 5号位核对"
+              >未提供</span
+            >
+          </template>
+        </ElTableColumn>
         <ElTableColumn label="客户" min-width="110" show-overflow-tooltip>
           <template #default="{ row }">
             <span v-if="row.customerName">{{ row.customerName }}</span>
@@ -1144,7 +1401,7 @@ onMounted(async () => {
             <span v-else class="muted" title="该订单在当前版本没有排产任务">未排产</span>
           </template>
         </ElTableColumn>
-        <!-- 交付状态 = 计划派生判定 + 延期时长 + 主因（原来「延期原因」单列常年空，占 180px） -->
+        <!-- 交付状态 = 计划派生判定 + 主因；延期天数已按稿分列到「预计延期天数」列 -->
         <ElTableColumn label="交付状态" width="150">
           <template #default="{ row }">
             <ElTag
@@ -1159,9 +1416,6 @@ onMounted(async () => {
             >
               {{ riskLabel(row.riskLevel) }}
             </ElTag>
-            <div v-if="delayHoursText(row.delayHours)" class="muted delay-hours">
-              {{ delayHoursText(row.delayHours) }}
-            </div>
             <div
               v-if="row.primaryReasonCode"
               class="reason-unchecked"
@@ -1169,6 +1423,14 @@ onMounted(async () => {
             >
               {{ delayReasonLabel(row.primaryReasonCode) }}
             </div>
+          </template>
+        </ElTableColumn>
+        <!-- 预计延期天数：稿 §4 P02「预计延期天数与交付状态」**分列**（不混作一栏）。
+             后端给的是自然小时差 ⇒ 前端折算成天；口径（自然小时差 / 工作日差）待 5号位确认（致 5号位函 A4）。 -->
+        <ElTableColumn label="预计延期天数" width="110" align="right">
+          <template #default="{ row }">
+            <span v-if="row.delayHours != null">{{ delayDaysText(row.delayHours) }}</span>
+            <span v-else class="muted">—</span>
           </template>
         </ElTableColumn>
         <ElTableColumn label="订单状态" width="88" align="center">
@@ -1307,7 +1569,27 @@ onMounted(async () => {
             <ElTableColumn prop="materialCode" label="物料" min-width="140" show-overflow-tooltip />
             <ElTableColumn prop="allocatedQty" label="承接数量" width="90" align="right" />
             <ElTableColumn prop="supplyFactoryCode" label="来源工厂" width="90" />
-            <ElTableColumn prop="supplyWarehouseCode" label="来源仓库" width="100" />
+            <!-- 来源仓库（2026-11-20；D1）：PSA 的 supplyWarehouseCode 全 0 填充
+                 ⇒ 改走**供给事实行**（采购在途档案的存储地点），查不到显「未提供」 -->
+            <ElTableColumn label="来源仓库" min-width="150" show-overflow-tooltip>
+              <template #default="{ row }">
+                <ElTooltip
+                  :content="
+                    warehouseHint({
+                      poNo: row.supplyDocumentNo,
+                      materialCode: row.materialCode
+                    })
+                  "
+                  placement="top"
+                >
+                  <span>
+                    {{
+                      warehouseText({ poNo: row.supplyDocumentNo, materialCode: row.materialCode })
+                    }}
+                  </span>
+                </ElTooltip>
+              </template>
+            </ElTableColumn>
             <ElTableColumn label="单据" min-width="120" show-overflow-tooltip>
               <template #default="{ row }">
                 <span v-if="row.supplyDocumentNo">
@@ -1504,25 +1786,76 @@ onMounted(async () => {
 .kpi-row {
   display: flex;
   flex-wrap: wrap;
-  align-items: center;
+  align-items: stretch;
   padding: 6px 14px;
   background: #f8fafc;
   border: 1px solid #e2e8f0;
   border-radius: 8px;
 }
 
-/* 交付 KPI 分区卡（2026-11-17 B2）：三张卡并排，每张卡一行读完 */
+/* FG/WIP 分区行（2026-11-20；A2）：与上面一行同款，只是分区维度换成物料大分类 */
+.kpi-row-fgwip {
+  margin-top: 6px;
+}
+
+/* FG/WIP × SO/PI 交叉分区表（2026-11-20；A2）：v0.2 P02 分组层级最里层 */
+.fgwip-cross-table {
+  margin-top: 6px;
+  width: 100%;
+}
+
+/* 交付 KPI 分区卡（2026-11-17 B2）：三张卡并排，每张卡一行读完
+   —— 2026-11-18：三卡内容宽度合计 ~1300px，容器（1600 屏）内宽 ~1284px，
+      差十几像素就会把「销售订单」整张甩到第二行左端（看着像断了）。
+      ⇒ 改成**等宽三列**（flex: 1 1 0）+ 卡内可换行：窄了就卡内折行，绝不甩卡。 */
 .kpi-card {
   display: flex;
+  flex: 1 1 0;
+  flex-wrap: wrap;
+  align-content: center;
   align-items: center;
-  gap: 10px;
-  padding: 0 14px;
-  white-space: nowrap;
+  gap: 2px 6px;
+  min-width: 0;
+  padding: 0 10px;
   border-right: 1px solid #e2e8f0;
+
+  /* 卡内每个数不许自己折行（只允许在数与数之间折） */
+  > span {
+    white-space: nowrap;
+  }
 
   &:last-of-type {
     border-right: none;
   }
+}
+
+/* 标题（2026-11-18 工厂视角）：一句话说清「这是预测、按当前筛选」
+   —— 独占第一行（flex 1 1 100%）：三张分区卡的内容宽度接近容器宽，
+   标题若与卡并排会把「销售订单」挤到第二行左端，看着像断了 ⇒ 标题单独一行更整齐。 */
+.kpi-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 1 1 100%;
+  padding-bottom: 4px;
+  margin-bottom: 4px;
+  font-size: 12px;
+  font-weight: 600;
+  color: #334155;
+  white-space: nowrap;
+  border-bottom: 1px solid #e2e8f0;
+}
+
+.kpi-source {
+  font-size: 11px;
+  font-weight: 400;
+  color: #94a3b8;
+}
+
+.kpi-title-q {
+  font-size: 13px;
+  color: #94a3b8;
+  cursor: help;
 }
 
 .kpi-total {
@@ -1553,15 +1886,7 @@ onMounted(async () => {
   color: #64748b;
 }
 
-/* 口径说明独占一行（caliber 原文较长，挤在行尾会被裁） */
-.kpi-caption {
-  flex: 1 1 100%;
-  padding-top: 2px;
-  font-size: 12px;
-  line-height: 1.5;
-  color: #94a3b8;
-}
-
+/* 交付 KPI 加载中 */
 .kpi-loading {
   padding: 6px 14px;
   font-size: 12px;

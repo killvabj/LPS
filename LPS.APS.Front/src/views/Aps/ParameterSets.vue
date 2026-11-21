@@ -21,8 +21,34 @@
  *
  * 2026-11-18：跨厂LT 标准参数（`$.CrossFactoryLeadTimeRules`）改为参数集版本的
  *   **第 6 号内容子块**，读写走通用参数集版本 GET/PUT（专属端点已被后端删除）；
- *   「保存草稿」会把它一起提交（有行才带；零行不发，保留既有块）。
+ *   「保存草稿」会把它一起提交（**本块被改过才带这个键**；不带＝保留既有块）。
  *   —— 依据 3号位《跨厂LT 走通用参数接口与快照保留_回执 v1.1_20261117》。
+ *
+ * 2026-11-19：用户要求改版本页（跨厂LT 那一块换位置 + 撤掉块内保存按钮）——
+ *   ① 「跨厂LT 标准参数」从页面底部（保存条下方）**上移**到「求解器策略」卡片**上方**：
+ *      块循环外层包一层 `.block-iteration`，跨厂LT 编辑器插在 `solverStrategy` 那一轮里。
+ *   ② 跨厂LT 块内**不再有独立保存按钮**（见 CrossFactoryLeadTimeEditor.vue），
+ *      该块只随页面底部「保存草稿」一起提交 ⇒ 连带 store 侧：dirty 并入页面 dirty、
+ *      「取消未保存」一并还原本块（**校验拦截不在这里**，见第二封）。
+ *   ③ 离开拦截文案去掉「保存这块」；保存草稿失败时弹 `paramStore.error`。
+ *
+ * 2026-11-19（第二封）：用户指示「**保存草稿不要拦，校验草稿才拦**」——
+ *   保存草稿不再因跨厂LT 被拦（行没填全 / 一行都没有都照存）；
+ *   拦截落在「校验草稿」（后端报 CROSS_FACTORY_LT_BLOCK_EMPTY / INVALID_CROSS_FACTORY_LT，
+ *   前端翻成中文）与「发布」（store 侧零行守卫 + 后端发布链）；
+ *   连带：校验 / 发布失败时弹 `paramStore.error`（原来只有删除动作弹）。
+ *
+ * 2026-11-19（第三封）：用户指示「**保存草稿不弹框，点一下直接保存**」——
+ *   依据：后端保存草稿的 UPDATE 语句里**没有 `Remarks` 列**
+ *   （`ParameterSetVersionRepository.UpdateAsync`），审计 `Remark` 写死「参数集版本更新」
+ *   ⇒ 弹框里那个必填「变更原因」**后端既不收也不存** ⇒ 弹框撤除，按钮直接调 `onSaveDraft()`。
+ *   ⚠️ **发布**弹框保留：publish 端点把 `changeReason` 写进审计 `Remark`（有追溯价值）。
+ *
+ * 2026-11-19（第四封）：3号位《跨厂LT零行保存期不拦认可_键删不掉裁甲维持现状_回执_v1.0_20261119》
+ *   —— **前端零行为改动**（该函 §一 认可本轮改口：保存期不拦、拦截落在校验 / 发布、
+ *     两个错误码中文翻译、缺块 / 键存在零行分叉）；本轮只把已裁定口径钉进注释：
+ *   「键删不掉」＝ **既定契约形态**（该函 §二 裁甲维持现状、§二.3 乙不采）
+ *   ⇒ 页面**不提供**「删除这一块」入口；要停用某条规则请加回一行并把「生效」关掉。
  */
 
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
@@ -591,23 +617,16 @@ function onAddField(): void {
   ElMessage.success('已加上，记得保存草稿')
 }
 
-/* ===== [保存草稿] Dialog ===== */
-const saveDraftDialog = ref(false)
-const saveDraftForm = ref({ changeReason: '' })
-
-function openSaveDraftDialog(): void {
-  saveDraftForm.value = { changeReason: '' }
-  saveDraftDialog.value = true
-}
-
-async function onSaveDraftConfirm(): Promise<void> {
-  const ok = await paramStore.onSaveDraft(saveDraftForm.value.changeReason)
-  if (ok) saveDraftDialog.value = false
+/* ===== [保存草稿]（2026-11-19 起不弹框，点一下直接存） ===== */
+async function onSaveDraft(): Promise<void> {
+  const ok = await paramStore.onSaveDraft()
+  if (!ok && paramStore.error) ElMessage.error(paramStore.error)
 }
 
 /* ===== 校验 ===== */
 async function onValidate(): Promise<void> {
-  await paramStore.validateDraft()
+  const ok = await paramStore.validateDraft()
+  if (!ok && paramStore.error) ElMessage.error(paramStore.error)
 }
 
 /* ===== Publish Dialog ===== */
@@ -622,6 +641,7 @@ function openPublishDialog(): void {
 async function onPublish(): Promise<void> {
   const ok = await paramStore.publish(publishForm.value.changeReason)
   if (ok) publishDialog.value = false
+  else if (paramStore.error) ElMessage.error(paramStore.error)
 }
 
 /* ===== Disable Dialog ===== */
@@ -742,13 +762,10 @@ async function onCreateDraft(): Promise<void> {
 
 /* ===== dirty 拦截（路由切换 + 浏览器关闭） ===== */
 async function confirmLeaveIfDirty(): Promise<boolean> {
-  const ltDirty = paramStore.crossFactoryLtDirty
-  if (!dirty.value && !ltDirty) return true
+  if (!dirty.value && !paramStore.crossFactoryLtDirty) return true
   try {
     await ElMessageBox.confirm(
-      ltDirty
-        ? '当前参数集有未保存的修改，离开将丢失。\n请先点击「保存草稿」「保存这块」或「取消未保存」。'
-        : '当前参数集有未保存的修改，离开将丢失。\n请先点击「保存草稿」或「取消未保存」。',
+      '当前参数集有未保存的修改，离开将丢失。\n请先点击「保存草稿」或「取消未保存」。',
       '未保存修改',
       {
         confirmButtonText: '确认离开',
@@ -1165,282 +1182,298 @@ onBeforeRouteLeave(async () => {
                   发布时会报错，建议改成字典里的真实仓库。
                 </ElAlert>
 
-                <div v-for="blockKey in BLOCK_KEYS" :key="blockKey" class="param-block-section">
-                  <div class="block-header">
-                    <h4 class="block-title">{{ BLOCK_LABELS[blockKey] }}</h4>
-                    <ElTag v-if="buffer.dirty[blockKey]" type="warning" size="small" effect="dark">
-                      ● 未保存
-                    </ElTag>
-                    <ElTag v-else size="small" effect="plain">
-                      {{ rowsGrouped[blockKey].length }} 项
-                    </ElTag>
-                    <ElTag
-                      v-if="isFullyInertBlock(blockKey)"
-                      size="small"
-                      type="info"
-                      effect="plain"
-                    >
-                      暂未生效
-                    </ElTag>
-                    <ElButton
-                      plain
-                      type="primary"
-                      size="small"
-                      class="block-add-btn"
-                      :disabled="!actions.canEdit || !hasAddableFields(blockKey)"
-                      :title="
-                        hasAddableFields(blockKey)
-                          ? ''
-                          : '本块没有可新增的字段（参数以 0号位 工作簿为准）'
-                      "
-                      @click="openAddFieldDialog(blockKey)"
-                    >
-                      <Icon icon="vi-mdi:plus" /> 新增字段
-                    </ElButton>
+                <div v-for="blockKey in BLOCK_KEYS" :key="blockKey" class="block-iteration">
+                  <!-- 跨厂LT 标准参数（快照顶层块 `$.CrossFactoryLeadTimeRules`：
+                       2026-11-18 起是参数集版本的第 6 号内容子块，随通用版本 GET/PUT 读写；
+                       2026-11-19 用户要求：**排在「求解器策略」之前**，且不再自带保存按钮
+                       —— 改动随页面底部的「保存草稿」一起提交） -->
+                  <div v-if="blockKey === 'solverStrategy'" class="cfl-slot">
+                    <CrossFactoryLeadTimeEditor :disabled="!actions.canEdit" />
                   </div>
-                  <!-- 有专属编辑器的块（供应 / 采购）不显示空态插图，但**必须**留一句引导：
+                  <div class="param-block-section">
+                    <div class="block-header">
+                      <h4 class="block-title">{{ BLOCK_LABELS[blockKey] }}</h4>
+                      <ElTag
+                        v-if="buffer.dirty[blockKey]"
+                        type="warning"
+                        size="small"
+                        effect="dark"
+                      >
+                        ● 未保存
+                      </ElTag>
+                      <ElTag v-else size="small" effect="plain">
+                        {{ rowsGrouped[blockKey].length }} 项
+                      </ElTag>
+                      <ElTag
+                        v-if="isFullyInertBlock(blockKey)"
+                        size="small"
+                        type="info"
+                        effect="plain"
+                      >
+                        暂未生效
+                      </ElTag>
+                      <ElButton
+                        plain
+                        type="primary"
+                        size="small"
+                        class="block-add-btn"
+                        :disabled="!actions.canEdit || !hasAddableFields(blockKey)"
+                        :title="
+                          hasAddableFields(blockKey)
+                            ? ''
+                            : '本块没有可新增的字段（参数以 0号位 工作簿为准）'
+                        "
+                        @click="openAddFieldDialog(blockKey)"
+                      >
+                        <Icon icon="vi-mdi:plus" /> 新增字段
+                      </ElButton>
+                    </div>
+                    <!-- 有专属编辑器的块（供应 / 采购）不显示空态插图，但**必须**留一句引导：
                        否则用户只看到「采购仓库优先级」，不知道上面的普通参数从哪加。
                        没有可新增字段时不给这句（否则教用户点一个禁用的按钮）。 -->
-                  <div
-                    v-if="
-                      rowsGrouped[blockKey].length === 0 &&
-                      hasWarehouseEditor(blockKey) &&
-                      hasAddableFields(blockKey)
-                    "
-                    class="add-field-hintline"
-                  >
-                    这块还没有参数。点右上角「新增字段」添加，例如：{{ addFieldExamples(blockKey) }}
-                    。
-                  </div>
-                  <ElEmpty
-                    v-if="rowsGrouped[blockKey].length === 0 && !hasWarehouseEditor(blockKey)"
-                    :image-size="60"
-                  >
-                    <template #description>
-                      <div class="add-field-empty">
-                        <span>{{ BLOCK_LABELS[blockKey] }} 暂无参数</span>
-                        <ElButton
-                          link
-                          type="primary"
-                          size="small"
-                          :disabled="!actions.canEdit"
-                          @click="openAddFieldDialog(blockKey)"
-                        >
-                          点这里加第一个字段
-                        </ElButton>
-                      </div>
-                    </template>
-                  </ElEmpty>
-                  <ElTable
-                    v-else-if="rowsGrouped[blockKey].length > 0"
-                    :data="rowsGrouped[blockKey]"
-                    size="small"
-                    border
-                  >
-                    <ElTableColumn label="参数名" min-width="280">
-                      <template #default="{ row }">
-                        <div class="param-name">
-                          <ElTooltip v-if="row.hint" :content="row.hint" placement="top">
-                            <span class="param-label param-label-hint">{{
-                              row.label ?? row.path.join('.')
-                            }}</span>
-                          </ElTooltip>
-                          <span v-else class="param-label">{{
-                            row.label ?? row.path.join('.')
-                          }}</span>
-                          <code v-if="row.label" class="code-tag param-key">{{
-                            row.path.join('.')
-                          }}</code>
-                          <ElTooltip
-                            v-if="row.inert"
-                            :content="inertAnnotationOfRow(row).note"
-                            placement="top"
+                    <div
+                      v-if="
+                        rowsGrouped[blockKey].length === 0 &&
+                        hasWarehouseEditor(blockKey) &&
+                        hasAddableFields(blockKey)
+                      "
+                      class="add-field-hintline"
+                    >
+                      这块还没有参数。点右上角「新增字段」添加，例如：{{
+                        addFieldExamples(blockKey)
+                      }}
+                      。
+                    </div>
+                    <ElEmpty
+                      v-if="rowsGrouped[blockKey].length === 0 && !hasWarehouseEditor(blockKey)"
+                      :image-size="60"
+                    >
+                      <template #description>
+                        <div class="add-field-empty">
+                          <span>{{ BLOCK_LABELS[blockKey] }} 暂无参数</span>
+                          <ElButton
+                            link
+                            type="primary"
+                            size="small"
+                            :disabled="!actions.canEdit"
+                            @click="openAddFieldDialog(blockKey)"
                           >
-                            <ElTag size="small" type="info" effect="plain">
-                              {{ inertAnnotationOfRow(row).tag }}
-                            </ElTag>
-                          </ElTooltip>
-                          <ElTag v-if="row.fixed" size="small" type="warning" effect="plain">
-                            V1 固定
-                          </ElTag>
+                            点这里加第一个字段
+                          </ElButton>
                         </div>
                       </template>
-                    </ElTableColumn>
-                    <ElTableColumn label="类型" width="100" align="center">
-                      <template #default="{ row }">
-                        <ElTag size="small" effect="plain">{{
-                          row.stringDomain
-                            ? row.type === 'TEXT_LIST'
-                              ? '下拉多选'
-                              : '下拉单选'
-                            : row.options
-                              ? '枚举'
-                              : TYPE_LABELS[row.type]
-                        }}</ElTag>
-                      </template>
-                    </ElTableColumn>
-                    <ElTableColumn label="当前值" min-width="260">
-                      <template #default="{ row }">
-                        <!-- 只读：非草稿态 / 不可编辑行（数组整体不展开，避免误改） -->
-                        <span v-if="!actions.canEdit || !row.editable" class="readonly-val">
-                          {{ displayValueOf(row) }}
-                        </span>
-                        <ElSelect
-                          v-else-if="row.options"
-                          :model-value="typeof row.value === 'number' ? row.value : undefined"
-                          size="small"
-                          style="width: 100%"
-                          @change="(v) => onCellEdit(row, typeof v === 'number' ? v : 0)"
-                        >
-                          <ElOption
-                            v-for="opt in row.options"
-                            :key="opt.value"
-                            :label="opt.label"
-                            :value="opt.value"
-                          />
-                        </ElSelect>
-                        <!-- 值域多选（订单类型 / 需求成熟度…）：后端 Ordinal 精确比对，填错不报错也不命中
-                             ⇒ 只给下拉。存量脏值（如「振荡」）照原样显示出来，可直接删掉。 -->
-                        <ElSelect
-                          v-else-if="row.stringDomain && row.type === 'TEXT_LIST'"
-                          :model-value="stringListOf(row)"
-                          multiple
-                          size="small"
-                          style="width: 100%"
-                          placeholder="可多选"
-                          @change="(v) => onStringListEdit(row, v)"
-                        >
-                          <ElOption
-                            v-for="opt in stringDomainOptionsOf(row)"
-                            :key="opt.value"
-                            :label="opt.label"
-                            :value="opt.value"
-                          />
-                        </ElSelect>
-                        <!-- 值域单选（客户等级）：候选 VIP / GENERAL，仍允许手填（源字典可能扩展） -->
-                        <ElSelect
-                          v-else-if="row.stringDomain"
-                          :model-value="typeof row.value === 'string' ? row.value : ''"
-                          size="small"
-                          filterable
-                          :allow-create="stringDomainAllowsCustom(row)"
-                          style="width: 100%"
-                          placeholder="选择一项"
-                          @change="(v) => onCellEdit(row, typeof v === 'string' ? v : '')"
-                        >
-                          <ElOption
-                            v-for="opt in stringDomainOptionsOf(row)"
-                            :key="opt.value"
-                            :label="opt.label"
-                            :value="opt.value"
-                          />
-                        </ElSelect>
-                        <ElInputNumber
-                          v-else-if="row.type === 'PERCENT'"
-                          :model-value="typeof row.value === 'number' ? row.value : 0"
-                          :step="0.01"
-                          :precision="4"
-                          :min="row.min"
-                          :max="row.max"
-                          size="small"
-                          style="width: 100%"
-                          @change="(v) => onCellEdit(row, typeof v === 'number' ? v : 0)"
-                        />
-                        <ElInputNumber
-                          v-else-if="row.type === 'NUMBER'"
-                          :model-value="typeof row.value === 'number' ? row.value : 0"
-                          :step="row.step ?? 1"
-                          :min="row.min"
-                          :max="row.max"
-                          size="small"
-                          style="width: 100%"
-                          @change="(v) => onCellEdit(row, typeof v === 'number' ? v : 0)"
-                        />
-                        <ElInput
-                          v-else-if="row.type === 'TEXT_LIST'"
-                          :model-value="listTextOf(row)"
-                          type="textarea"
-                          :rows="3"
-                          size="small"
-                          placeholder="每行一项"
-                          @change="(v) => onTextListEdit(row, v)"
-                        />
-                        <ElSwitch
-                          v-else-if="row.type === 'BOOLEAN'"
-                          :model-value="row.value === true"
-                          size="small"
-                          @change="(v) => onCellEdit(row, Boolean(v))"
-                        />
-                        <ElInput
-                          v-else
-                          :model-value="String(row.value ?? '')"
-                          size="small"
-                          @change="(v) => onCellEdit(row, v)"
-                        />
-                      </template>
-                    </ElTableColumn>
-                    <ElTableColumn label="操作" width="70" align="center">
-                      <template #default="{ row }">
-                        <ElTooltip v-if="row.editable" content="删除这个参数" placement="top">
-                          <ElButton
+                    </ElEmpty>
+                    <ElTable
+                      v-else-if="rowsGrouped[blockKey].length > 0"
+                      :data="rowsGrouped[blockKey]"
+                      size="small"
+                      border
+                    >
+                      <ElTableColumn label="参数名" min-width="280">
+                        <template #default="{ row }">
+                          <div class="param-name">
+                            <ElTooltip v-if="row.hint" :content="row.hint" placement="top">
+                              <span class="param-label param-label-hint">{{
+                                row.label ?? row.path.join('.')
+                              }}</span>
+                            </ElTooltip>
+                            <span v-else class="param-label">{{
+                              row.label ?? row.path.join('.')
+                            }}</span>
+                            <code v-if="row.label" class="code-tag param-key">{{
+                              row.path.join('.')
+                            }}</code>
+                            <ElTooltip
+                              v-if="row.inert"
+                              :content="inertAnnotationOfRow(row).note"
+                              placement="top"
+                            >
+                              <ElTag size="small" type="info" effect="plain">
+                                {{ inertAnnotationOfRow(row).tag }}
+                              </ElTag>
+                            </ElTooltip>
+                            <ElTag v-if="row.fixed" size="small" type="warning" effect="plain">
+                              V1 固定
+                            </ElTag>
+                          </div>
+                        </template>
+                      </ElTableColumn>
+                      <ElTableColumn label="类型" width="100" align="center">
+                        <template #default="{ row }">
+                          <ElTag size="small" effect="plain">{{
+                            row.stringDomain
+                              ? row.type === 'TEXT_LIST'
+                                ? '下拉多选'
+                                : '下拉单选'
+                              : row.options
+                                ? '枚举'
+                                : TYPE_LABELS[row.type]
+                          }}</ElTag>
+                        </template>
+                      </ElTableColumn>
+                      <ElTableColumn label="当前值" min-width="260">
+                        <template #default="{ row }">
+                          <!-- 只读：非草稿态 / 不可编辑行（数组整体不展开，避免误改） -->
+                          <span v-if="!actions.canEdit || !row.editable" class="readonly-val">
+                            {{ displayValueOf(row) }}
+                          </span>
+                          <ElSelect
+                            v-else-if="row.options"
+                            :model-value="typeof row.value === 'number' ? row.value : undefined"
                             size="small"
-                            text
-                            type="danger"
-                            :disabled="!actions.canEdit"
-                            @click="onRemoveField(row)"
+                            style="width: 100%"
+                            @change="(v) => onCellEdit(row, typeof v === 'number' ? v : 0)"
                           >
-                            <Icon icon="vi-mdi:delete-outline" />
-                          </ElButton>
-                        </ElTooltip>
-                      </template>
-                    </ElTableColumn>
-                  </ElTable>
+                            <ElOption
+                              v-for="opt in row.options"
+                              :key="opt.value"
+                              :label="opt.label"
+                              :value="opt.value"
+                            />
+                          </ElSelect>
+                          <!-- 值域多选（订单类型 / 需求成熟度…）：后端 Ordinal 精确比对，填错不报错也不命中
+                             ⇒ 只给下拉。存量脏值（如「振荡」）照原样显示出来，可直接删掉。 -->
+                          <ElSelect
+                            v-else-if="row.stringDomain && row.type === 'TEXT_LIST'"
+                            :model-value="stringListOf(row)"
+                            multiple
+                            size="small"
+                            style="width: 100%"
+                            placeholder="可多选"
+                            @change="(v) => onStringListEdit(row, v)"
+                          >
+                            <ElOption
+                              v-for="opt in stringDomainOptionsOf(row)"
+                              :key="opt.value"
+                              :label="opt.label"
+                              :value="opt.value"
+                            />
+                          </ElSelect>
+                          <!-- 值域单选（客户等级）：候选 VIP / GENERAL，仍允许手填（源字典可能扩展） -->
+                          <ElSelect
+                            v-else-if="row.stringDomain"
+                            :model-value="typeof row.value === 'string' ? row.value : ''"
+                            size="small"
+                            filterable
+                            :allow-create="stringDomainAllowsCustom(row)"
+                            style="width: 100%"
+                            placeholder="选择一项"
+                            @change="(v) => onCellEdit(row, typeof v === 'string' ? v : '')"
+                          >
+                            <ElOption
+                              v-for="opt in stringDomainOptionsOf(row)"
+                              :key="opt.value"
+                              :label="opt.label"
+                              :value="opt.value"
+                            />
+                          </ElSelect>
+                          <ElInputNumber
+                            v-else-if="row.type === 'PERCENT'"
+                            :model-value="typeof row.value === 'number' ? row.value : 0"
+                            :step="0.01"
+                            :precision="4"
+                            :min="row.min"
+                            :max="row.max"
+                            size="small"
+                            style="width: 100%"
+                            @change="(v) => onCellEdit(row, typeof v === 'number' ? v : 0)"
+                          />
+                          <ElInputNumber
+                            v-else-if="row.type === 'NUMBER'"
+                            :model-value="typeof row.value === 'number' ? row.value : 0"
+                            :step="row.step ?? 1"
+                            :min="row.min"
+                            :max="row.max"
+                            size="small"
+                            style="width: 100%"
+                            @change="(v) => onCellEdit(row, typeof v === 'number' ? v : 0)"
+                          />
+                          <ElInput
+                            v-else-if="row.type === 'TEXT_LIST'"
+                            :model-value="listTextOf(row)"
+                            type="textarea"
+                            :rows="3"
+                            size="small"
+                            placeholder="每行一项"
+                            @change="(v) => onTextListEdit(row, v)"
+                          />
+                          <ElSwitch
+                            v-else-if="row.type === 'BOOLEAN'"
+                            :model-value="row.value === true"
+                            size="small"
+                            @change="(v) => onCellEdit(row, Boolean(v))"
+                          />
+                          <ElInput
+                            v-else
+                            :model-value="String(row.value ?? '')"
+                            size="small"
+                            @change="(v) => onCellEdit(row, v)"
+                          />
+                        </template>
+                      </ElTableColumn>
+                      <ElTableColumn label="操作" width="70" align="center">
+                        <template #default="{ row }">
+                          <ElTooltip v-if="row.editable" content="删除这个参数" placement="top">
+                            <ElButton
+                              size="small"
+                              text
+                              type="danger"
+                              :disabled="!actions.canEdit"
+                              @click="onRemoveField(row)"
+                            >
+                              <Icon icon="vi-mdi:delete-outline" />
+                            </ElButton>
+                          </ElTooltip>
+                        </template>
+                      </ElTableColumn>
+                    </ElTable>
 
-                  <!-- 仓库引用落点（专属编辑器：有序码列表 / 对象数组，通用单值控件表达不了）。
+                    <!-- 仓库引用落点（专属编辑器：有序码列表 / 对象数组，通用单值控件表达不了）。
                        供应 Inventory.WarehousePriority 按 3号位 2026-11-06 v1.1 改判隐藏；
                        值仍留在块 JSON 中并原样回写，载荷边界不变。 -->
-                  <template v-if="blockKey === 'procurement'">
-                    <!-- 0号位 11-04 工作簿只收「采购仓库优先级」与「采购良率」两项；
+                    <template v-if="blockKey === 'procurement'">
+                      <!-- 0号位 11-04 工作簿只收「采购仓库优先级」与「采购良率」两项；
                          「默认采购提前期 / 到货可用偏移」工作簿未收录 ⇒ 2026-11-09 撤除编辑器
                          （值仍在块 JSON 里，保存原样回写）。 -->
-                    <WarehouseRefEditor
-                      kind="procurement-priority"
-                      title="采购仓库优先级"
-                      :disabled="!actions.canEdit"
-                    />
-                    <!-- 采购良率（专属编辑器：物料 + 工序 + 良率，通用单值控件表达不了） -->
-                    <PlanningYieldEditor :disabled="!actions.canEdit" />
-                  </template>
+                      <WarehouseRefEditor
+                        kind="procurement-priority"
+                        title="采购仓库优先级"
+                        :disabled="!actions.canEdit"
+                      />
+                      <!-- 采购良率（专属编辑器：物料 + 工序 + 良率，通用单值控件表达不了） -->
+                      <PlanningYieldEditor :disabled="!actions.canEdit" />
+                    </template>
 
-                  <!-- 锚点资源编码（专属输入项：3号位 10-25 定调「自由文本补录入」，后端零改动） -->
-                  <div
-                    v-if="blockKey === 'solverStrategy' && solverStrategyHasContent"
-                    class="anchor-field"
-                  >
-                    <div class="anchor-field-label">锚点资源编码</div>
-                    <ElInput
-                      :model-value="anchorResourceCode"
-                      :disabled="!actions.canEdit"
-                      placeholder="填资源的业务编码（不是资源 ID）"
-                      size="small"
-                      @change="(v) => onAnchorCodeChange(v)"
-                    />
-                    <p class="field-note">
-                      填资源的业务编码。只有把「瓶颈锚点方式」选成非自动时它才生效，选「自动判定」时填了也不起作用。
-                      编码写错不会报错，运行时按自动处理。
-                    </p>
+                    <!-- 锚点资源编码（专属输入项：3号位 10-25 定调「自由文本补录入」，后端零改动） -->
+                    <div
+                      v-if="blockKey === 'solverStrategy' && solverStrategyHasContent"
+                      class="anchor-field"
+                    >
+                      <div class="anchor-field-label">锚点资源编码</div>
+                      <ElInput
+                        :model-value="anchorResourceCode"
+                        :disabled="!actions.canEdit"
+                        placeholder="填资源的业务编码（不是资源 ID）"
+                        size="small"
+                        @change="(v) => onAnchorCodeChange(v)"
+                      />
+                      <p class="field-note">
+                        填资源的业务编码。只有把「瓶颈锚点方式」选成非自动时它才生效，选「自动判定」时填了也不起作用。
+                        编码写错不会报错，运行时按自动处理。
+                      </p>
+                    </div>
+
+                    <!-- 非阻断提示：选了非自动锚点方式却没填锚点资源编码（3号位 10-25 §五；不拦截、不阻断发布） -->
+                    <ElAlert
+                      v-if="blockKey === 'solverStrategy' && anchorHintMessage"
+                      type="warning"
+                      :closable="false"
+                      show-icon
+                      class="tab-alert"
+                    >
+                      <template #title>{{ anchorHintMessage }}</template>
+                    </ElAlert>
                   </div>
-
-                  <!-- 非阻断提示：选了非自动锚点方式却没填锚点资源编码（3号位 10-25 §五；不拦截、不阻断发布） -->
-                  <ElAlert
-                    v-if="blockKey === 'solverStrategy' && anchorHintMessage"
-                    type="warning"
-                    :closable="false"
-                    show-icon
-                    class="tab-alert"
-                  >
-                    <template #title>{{ anchorHintMessage }}</template>
-                  </ElAlert>
                 </div>
 
                 <!-- 保存操作条（仅草稿态可见） -->
@@ -1455,17 +1488,10 @@ onBeforeRouteLeave(async () => {
                     type="primary"
                     :loading="buffer.saving"
                     :disabled="!dirty"
-                    @click="openSaveDraftDialog"
+                    @click="onSaveDraft"
                   >
                     <Icon icon="vi-mdi:content-save" /> 保存草稿
                   </ElButton>
-                </div>
-
-                <!-- 跨厂LT 标准参数（快照顶层块 `$.CrossFactoryLeadTimeRules`：
-                     2026-11-18 起是参数集版本的第 6 号内容子块，随通用版本 GET/PUT 读写；
-                     编辑器自带保存入口，上面的「保存草稿」也会把它一起提交） -->
-                <div class="param-block-section">
-                  <CrossFactoryLeadTimeEditor :disabled="!actions.canEdit" />
                 </div>
               </template>
               <ElEmpty v-else description="该版本没有参数内容" />
@@ -1848,40 +1874,6 @@ onBeforeRouteLeave(async () => {
       <template #footer>
         <ElButton @click="addFieldDialog = false">取消</ElButton>
         <ElButton type="primary" @click="onAddField">加上</ElButton>
-      </template>
-    </ElDialog>
-
-    <!-- ===== [保存草稿] Dialog ===== -->
-    <ElDialog
-      v-model="saveDraftDialog"
-      title="保存参数集草稿"
-      width="480px"
-      :close-on-click-modal="false"
-    >
-      <ElForm label-width="100px" size="default">
-        <ElFormItem label="参数集">
-          <span class="d-val">
-            {{ detailNN?.summary.parameterSetCode }} / {{ buffer.governance?.versionCode }}
-          </span>
-        </ElFormItem>
-        <ElFormItem label="变更原因 (必填)">
-          <ElInput
-            v-model="saveDraftForm.changeReason"
-            type="textarea"
-            :rows="3"
-            placeholder="必须填写；将出现在审计记录"
-          />
-        </ElFormItem>
-        <ElAlert type="warning" :closable="false" show-icon class="d-alert">
-          <template #title>草稿保存说明</template>
-          保存会用整份草稿覆盖该版本内容（5 个主题全部回传），不保留逐项修改历史。
-        </ElAlert>
-      </ElForm>
-      <template #footer>
-        <ElButton @click="saveDraftDialog = false">取消</ElButton>
-        <ElButton type="primary" :loading="buffer.saving" @click="onSaveDraftConfirm">
-          确认保存
-        </ElButton>
       </template>
     </ElDialog>
 
@@ -2364,6 +2356,15 @@ onBeforeRouteLeave(async () => {
 }
 
 /* 参数块 */
+.cfl-slot {
+  /* 跨厂LT 标准参数（排在「求解器策略」卡片之前） */
+  margin-bottom: 14px;
+
+  .cfl-editor {
+    margin-top: 0;
+  }
+}
+
 .param-block-section {
   margin-bottom: 20px;
   padding: 12px 14px;

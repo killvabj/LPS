@@ -14,6 +14,10 @@
  *  4. `triggerBusinessEntry()`：五入口统一出口 → runApi.triggerReschedule。
  *
  * ⚠️ 大小写敏感精确匹配（后端 Ordinal 比较）；scope 缺省 = 后端静默放行（旧调用兼容）。
+ *
+ * 2026-11-20：新增 §4.9.4 业务解释文案（依据《APS_V1_P01-P13_全页面业务设计统一收口核对稿
+ *   v0.2_20261114_四项审核修订版.md》§4 P09 §4.9.4「必须在页面上显示的业务解释」）：
+ *   PRIORITY_MODE_EXPLAIN（NORMAL / EXPEDITE）+ TRIGGER_BUSINESS_EXPLAIN（八码全量）。
  */
 
 import { runApi } from './run'
@@ -132,6 +136,43 @@ export const BUSINESS_ENTRIES: BusinessTriggerType[] = [
   'RESOURCE_CALENDAR_CHANGE',
   'DOMAIN_MANUAL_RESCHEDULE'
 ]
+
+/* ============================================================================
+ * §4.9.4 必须在页面上显示的业务解释（v0.2 稿 P09）
+ *
+ * ⚠️ 这些是**用户可见的业务口径**，措辞按稿逐条落，禁止前端自造简化说法
+ *    （例：不得把 EXPEDITE 说成「插队/插到最前面」——稿明确「不是突破一切约束的
+ *    最高绝对优先级」）。
+ * ⚠️ 集中放一处，避免四个入口 Dialog 各自写一遍后走样。
+ */
+
+/** 优先模式业务解释（PriorityMode 轴） */
+export const PRIORITY_MODE_EXPLAIN: Record<PriorityMode, string> = {
+  NORMAL:
+    '遵循当前正式业务优先规则，不额外将本次订单提高为急单；允许对合法可移动计划进行真实影响评估。',
+  EXPEDITE:
+    '仅将本次明确选择的订单及其派生需求提高到急单优先层级，在仍可移动且允许重新竞争的普通需求中优先；不是突破一切约束的最高绝对优先级，不得越过已执行、Firm/Frozen、严格绑定、需求保护、真实物料时间、资源资格、范围外或别的排程域已生效计划的阻挡。'
+}
+
+/**
+ * 各触发码的业务解释（入口语义 + 关键边界）。
+ * 键覆盖八码全量，取不到时页面显示「未提供」而非空白。
+ */
+export const TRIGGER_BUSINESS_EXPLAIN: Record<BusinessTriggerType, string> = {
+  NEW_ORDER_CTP:
+    '仅做交期试算评估，不改动正式计划；评估结果可以放弃，也可以按同一模式正式纳入排产。',
+  NEW_ORDER_IMPACT:
+    '仅做插单影响试算，不改动正式计划；评估结果可以放弃，也可以按同一模式正式纳入排产。',
+  NEW_ORDER_INSERT:
+    '按评估时选定的模式正式纳入，基于最新生效版本与最新真实事实另建候选版本，不是直接激活试算结果。',
+  EXISTING_ORDER_ADVANCE:
+    '输入的目标日期仅为本次候选版本的软目标，不改 ERP 正式客户交期；正常模式下不能偷换正式交期影响排序。',
+  GANTT_ADJUSTMENT: '拖拽目标是软目标，求解器可以返回真实可行的不同时间，不直接改变已生效任务。',
+  EQUIPMENT_FAILURE: '必须先成为正式的资源不可用事实，不是候选版本里的假设。',
+  RESOURCE_CALENDAR_CHANGE: '必须先成为日历已生效事实，不是候选版本里的假设。',
+  DOMAIN_MANUAL_RESCHEDULE:
+    '范围是该排程域当前全部允许移动的计划，不能绕过执行锁、Firm/Frozen 等约束。'
+}
 
 /** 草稿：Dialog 收集的原始输入（未校验） */
 export interface ScopeDraft {

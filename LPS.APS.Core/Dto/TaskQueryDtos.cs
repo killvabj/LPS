@@ -37,6 +37,11 @@ public class TaskListItemDto
     public string? MaterialName { get; init; }
 
     public string? StageCode { get; init; }
+    /// <summary>大工艺中文名（B1，11-20 4号位件）：`ext_MES_StageDict.StageName`（ODS 同义词，29 行主数据），
+    /// 字典缺该码 ⇒ null=未提供（**不自造译名**）。</summary>
+    public string? StageName { get; init; }
+    /// <summary>大工艺类目中文（`ext_MES_StageDict.CategoryName`，如"机加/组立/铸造"）——v0.2 P05 首列"大工艺"。</summary>
+    public string? StageCategoryName { get; init; }
     public string OperationCode { get; init; } = string.Empty;
     /// <summary>工序名（D05：99.07% 填充；null=未判定）。</summary>
     public string? OperationName { get; init; }

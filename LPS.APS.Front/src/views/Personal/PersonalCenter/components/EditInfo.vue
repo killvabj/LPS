@@ -14,6 +14,11 @@
  *   - Q2：姓名允许重名（显示名不是登录凭据），前端不做重名校验。
  *
  * ⚠️ 旧实现是「假成功」（改完只弹一句「修改成功」，一个字节都没落库）——本轮整块换成真实调用。
+ *
+ * 2026-11-18（第二封）：`/me` 补 `email`/`phoneNumber`、显示名改读 DB
+ *   —— 依据 3号位《个人中心me补邮箱手机号与显示名读库_回执 v1.0_20261118》R1。
+ *   本组件**行为不变**：表单三项照旧提交；左栏的值改由父级读 `/me` 真值刷新。
+ *   改完资料后的 token 重签**保留为保险**（`/me` 已读 DB ⇒ 姓名不再依赖它）。
  */
 
 import { Form, FormSchema } from '@/components/Form'
@@ -102,11 +107,14 @@ function plainError(error: unknown, fallback: string): string {
 }
 
 /**
- * 改完资料后重签一次 token
+ * 改完资料后重签一次 token（**保留为保险**，不再是"姓名生效"的必要条件）
  *
- * ⚠️ 3号位 回执 §四-2：`/me` 的「姓名」取自 **JWT claim**（签发时固化 DisplayName），
- *   改完资料不会立刻变 ⇒ 触发一次 `POST /api/auth/refresh` 重签带新姓名的 claim。
- *   失败不阻断保存（资料已经落库了，姓名晚点刷新也能对上）。
+ * ⚠️ 2026-11-18（3号位《个人中心me补邮箱手机号与显示名读库_回执 v1.0_20261118》R1）：
+ *   `/me` 的「姓名」已改读 **DB**（`[User].DisplayName`）⇒ 改完资料**立即生效**，
+ *   不再等 claim 重签 ⇒ 重签**非必需**。
+ *   仍保留的理由：claim 在签发时固化，其它消费 claim 的调用（操作人名等）
+ *   要等重签才拿到新名；3号位明示「保留即可、仍无害」。
+ *   失败不阻断保存（资料已经落库了）。
  */
 async function refreshTokenForNewName(): Promise<void> {
   if (APS_USE_MOCK) return

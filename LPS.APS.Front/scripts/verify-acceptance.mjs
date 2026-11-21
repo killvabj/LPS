@@ -170,6 +170,28 @@
  *              **未知值原样显示**（dev 实测 MSC 源 66,596 行是中文自由文本，加前缀会变怪字符串）；
  *              不新增 `reviewedBy`/`reviewedAt`/`affectedQuantity` 三列（0 值 / 硬编码 NULL ⇒ 空列）
  *  - Windows Git Bash：env 前缀可用；或直接改脚本末尾 GROUP 默认值
+ *
+ * 2026-11-19（依据 5号位 2026-11-18《复函V…》§二 R3″ 双键名过渡期）甘特段判据同步：
+ *   · GT113 / GT85 按**当前契约**重写（同一权威位 `TaskDispatch.DispatchStatus` 的**三个键名**：
+ *     甘特位 `dispatchStatus` / P05 位 `mesDispatchStatus` / P11 工序行 `dispatchStatus`；
+ *     三处显示统一走词典 `mesDispatchStatusLabel`；清单 CSV 已补「MES下发状态」列）；
+ *   · GT111 份额中性文案按 11-17 A5 `shares[]` 读面改写（「未提供订单份额数据（TaskShare）」
+ *     → 「未提供订单份额数据」）；
+ *   · GT117 去掉**随 11-07 清单改版作废**的「清单主要原因走 `top.objectType`」一条
+ *     （该列已按 0号位 B-01 撤除），改锁现存落点：抽屉三处「订单级」标签 + 类型位 + mock 同形。
+ *
+ * 2026-11-19（依据 5号位 2026-11-19《复函R3三键全收录…》§二 **V1.1 映射表三键版**）：
+ *   · GT113 中性文案判据**收紧**：键①②缺键统一一句「**不在下发队列**」
+ *     （抽屉 / P05 清单列 / CSV 三处逐处落点），不再接受「未提供」式另一句话；
+ *   · **新增 GT127**：键③（P11 批次工序行 `dispatchStatus`）**行驱动、语义差一拍** ——
+ *     按行渲染走词典 `mesDispatchStatusLabel(op.dispatchStatus)`、
+ *     **不套用**键①②的「不在下发队列」分类文案、类型层登记缺键语义、核准前**不改名**。
+ *
+ * 2026-11-21（依据 0号位 v0.2 稿 §P08「仅一页，一张异常列表＋行内展开详情」）：
+ *   · EX20 重写：对象类型改为「**列 + 筛选**」承接（原「任务/资源/工段级」三块分表已撤），
+ *     断言清单里出现「对象类型」列 + 对象类型筛选下拉，且页面上不再有 other-facts 分表块；
+ *   · EX07 追加「对象类型」筛选判据；EX15 / EX26 / E27 / E29 / E30 同步改口径
+ *     （统计行主体由「需求」改为「异常」、文案由「没写明原因」改为「原因未提供」）。
  */
 
 import { readFileSync, existsSync } from 'node:fs'
@@ -183,6 +205,7 @@ process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0'
 
 const API_BASE = process.env.API_BASE || 'https://localhost:7044'
 const GROUP = process.env.GROUP || 'all' // all | interfaces | rbac-negate | current-user | static | business-rules | j-10a | m-10a1 | v14-additions | parameter-set-drafts | o-opm | r-resource-calendar | d-domain | domain-permission | a-ctp-domainkey | me-eta | t-tsrc | dp-freeze | dplive | e-freeze | explanation-factory | setup | setup-unc | setup-unc-live | pwc | menu | overview | candidate | run | gantt | pi | pi-static | order | order-static | rules | version-rows | governance-delete | reason-code | icons | publish-concept | delivery | parameter-maintenance
+// ⚠️ 本脚本**保留 admin**：验收范围含 rbac-users/roles、/aps/domain 等仅 admin 可达的部分（3号位 2026-11-19 回执 §3.2 过渡期乙：dev 与生产共用 APS_Auth，admin 登录会顶掉生产会话）
 const ADMIN_CODE = 'admin'
 const ADMIN_PWD = 'Admin@123456'
 
@@ -10610,13 +10633,18 @@ function verifyExplanationFactoryView() {
     /\(b\.unscheduled \?\? 0\) - \(a\.unscheduled \?\? 0\)/.test(vVue)
   assert('EX06 静态：清单默认按未排数量从多到少（可切按交期）', ex06, ex06 ? 'qty 倒序 + due 可选' : '排序实现被改')
 
-  // EX07 筛选：关键词（订单号/物料）+ 级别 + 分类
+  // EX07 筛选：关键词（订单号/物料/对象）+ 级别 + 分类 + 对象类型（2026-11-21 并表后新增）
   const ex07 =
     /const keyword = ref\(''\)/.test(vVue) &&
     /const filterClass = ref<ExplanationReasonClassKey \| ''>\(''\)/.test(vVue) &&
     /const filterSeverity = ref<ExplanationSeverity \| ''>\(''\)/.test(vVue) &&
-    /placeholder="订单号 \/ 物料编码"/.test(vVue)
-  assert('EX07 静态：清单可按关键词/级别/原因分类筛选', ex07, ex07 ? '三类筛选齐全' : '筛选被改')
+    /const filterObjectType = ref\(''\)/.test(vVue) &&
+    /placeholder="订单号 \/ 物料编码 \/ 对象"/.test(vVue)
+  assert(
+    'EX07 静态：清单可按关键词/级别/原因分类/对象类型筛选',
+    ex07,
+    ex07 ? '四类筛选齐全' : '筛选被改'
+  )
 
   // EX08 分域体检：数量对账 + 完工时间确定性，且**必须是表格**（2026-11-10 用户口径"这块儿乱，改表格"）
   const ex08 =
@@ -10641,17 +10669,25 @@ function verifyExplanationFactoryView() {
     ex19 ? '分组条在最上' : '分组条又掉回面板里面'
   )
 
-  // EX20 任务 / 资源 / 工段级事实按层级分别列开（2026-11-10 用户口径"有就分别列出来"）
+  // EX20 对象类型（2026-11-21 v0.2 稿 §P08「仅一页，一张异常列表＋行内展开详情」）
+  //   旧口径（11-10 用户「有就分别列出来」）：任务/资源/工段级事实分三块小表。
+  //   新口径（11-14 稿 §P08）：**一张**异常列表，行内展开详情 ⇒ 三块小表撤除，
+  //   但「按类型分开看」的能力保留 = ①「对象类型」列 ②对象类型筛选下拉。
   const ex20 =
-    /const OTHER_LEVEL_GROUPS = \[/.test(vVue) &&
-    /\{ key: 'TASK', label: '任务级事实' \}/.test(vVue) &&
-    /\{ key: 'RESOURCE', label: '资源级事实' \}/.test(vVue) &&
-    /\{ key: 'STAGE', label: '工段级事实' \}/.test(vVue) &&
-    /v-for="g in otherLevelGroups"/.test(vVue)
+    /const OBJECT_TYPE_LEVEL_LABELS: Record<string, string> = \{/.test(vVue) &&
+    /TASK: '任务级'/.test(vVue) &&
+    /RESOURCE: '资源级'/.test(vVue) &&
+    /STAGE: '工段级'/.test(vVue) &&
+    /DOMAIN: '排程域级'/.test(vVue) &&
+    /<ElTableColumn label="对象类型" width="100">/.test(vVue) &&
+    /v-for="o in objectTypeOptions"/.test(vVue) &&
+    // 三块小表已撤（不许复活）
+    !/v-for="g in otherLevelGroups"/.test(vVue) &&
+    !/class="other-facts"/.test(vVue)
   assert(
-    'EX20 静态：任务/资源/工段级事实分三块分别列出',
+    'EX20 静态：一张异常列表（对象类型列 + 对象类型筛选；三块分表已撤）',
     ex20,
-    ex20 ? '三类分块渲染' : '层级分组被改回混排'
+    ex20 ? '单表 + 类型筛选齐全' : '单表结构被改'
   )
 
   // EX21 体检表不挂长悬停 + 口径原文彻底不在用户可见区
@@ -10813,11 +10849,12 @@ function verifyExplanationFactoryView() {
 
   // EX15 单位口径分离（2026-11-10 用户原话「这个数量和件分别是啥意思」）
   //   需求**条数**＝「条」；需求**数量**＝「件」。两者同屏出现，混用「张」必然看错。
+  //   2026-11-21（v0.2 稿 §P08）：清单改成「异常清单」⇒ 统计行的条数对象由「需求」改为「异常」。
   const ex15Bad = [/\}\s*张/, /张需求/, /张没排/, /一张/, /张生产指令/]
   const ex15Hit = ex15Bad.filter((re) => re.test(vVueNoComment)).map((re) => String(re))
   const ex15Ok =
     ex15Hit.length === 0 &&
-    vVue.includes('共 {{ filteredRows.length }} 条需求 · 未排合计') &&
+    vVue.includes('共 {{ filteredRows.length }} 条异常 · 未排合计') &&
     vVue.includes("label=\"数量（需求 / 已排 / 未排，单位：件）\"")
   assert(
     'EX15 静态：条数用「条」、数量用「件」，页面不混用「张」（清单/域体检全站一致）',
@@ -11002,11 +11039,11 @@ function verifyExplanationFactoryView() {
     !vVueNoComment.includes('原因代码分布') &&
     !/totalImpactHours/.test(vVue) &&
     /v-if="decisionReasonRows\.length \|\| unlabeledReasonCount > 0"/.test(vVue) &&
-    /另有 \{\{ unlabeledReasonCount \}\} 条记录没写明原因，看不出属于哪一类取舍/.test(vVueFlat)
+    /另有 \{\{ unlabeledReasonCount \}\} 条记录原因未提供，看不出属于哪一类取舍/.test(vVueFlat)
   assert(
     'EX26 静态：「排产决策原因」是小表格（原因 + 条数），不再显示影响小时数',
     ex26,
-    `标题=${vVue.includes('排产决策原因')} 表格=${vVue.includes('class="decision-reason-table"')} 旧块=${vVueNoComment.includes('原因代码分布')} 影响小时=${/totalImpactHours/.test(vVue)} 卡片条件=${/v-if="decisionReasonRows\.length \|\| unlabeledReasonCount > 0"/.test(vVue)} 未写原因码说明=${/另有 \{\{ unlabeledReasonCount \}\} 条记录没写明原因，看不出属于哪一类取舍/.test(vVueFlat)}`
+    `标题=${vVue.includes('排产决策原因')} 表格=${vVue.includes('class="decision-reason-table"')} 旧块=${vVueNoComment.includes('原因代码分布')} 影响小时=${/totalImpactHours/.test(vVue)} 卡片条件=${/v-if="decisionReasonRows\.length \|\| unlabeledReasonCount > 0"/.test(vVue)} 未写原因码说明=${/另有 \{\{ unlabeledReasonCount \}\} 条记录原因未提供，看不出属于哪一类取舍/.test(vVueFlat)}`
   )
 
   // EX27 静态：issueType / source 真码都有中文名（页面不裸奔英文码）
@@ -11873,14 +11910,13 @@ async function verifyExplanationFreeze(adminToken) {
   //   view 侧改看面板计数行「共 N 条 · 已显示 M 条」是否用 totalFacts（后端总数）
   const e27DtoTotalCount =
     /export\s+interface\s+ExplanationViewDto\s*\{[\s\S]*?totalCount\s*:\s*number\b/.test(eTypes)
-  const e27StoreTotalFromBackend = /const\s+totalFacts\s*=\s*computed\(\(\)\s*=>\s*data\.value\?\.totalCount/.test(
-    eStore
-  )
+  const e27StoreTotalFromBackend =
+    /const\s+totalFacts\s*=\s*computed(?:<[^>]*>)?\(\(\)\s*=>\s*data\.value\?\.totalCount/.test(eStore)
   const e27StoreNotLoadedLen =
-    !/const\s+totalFacts\s*=\s*computed\(\(\)\s*=>\s*data\.value\?\.scheduleExplanationFacts/.test(
+    !/const\s+totalFacts\s*=\s*computed(?:<[^>]*>)?\(\(\)\s*=>\s*data\.value\?\.scheduleExplanationFacts/.test(
       eStore
     )
-  const e27ViewUsesTotalFacts = /共\s*\{\{\s*totalFacts\s*\}\}\s*条/.test(eVue)
+  const e27ViewUsesTotalFacts = /共\s*\{\{\s*totalFactsText\s*\}\}\s*条/.test(eVue)
   const e27All =
     e27DtoTotalCount && e27StoreTotalFromBackend && e27StoreNotLoadedLen && e27ViewUsesTotalFacts
   assert(
@@ -11934,7 +11970,8 @@ async function verifyExplanationFreeze(adminToken) {
   const e29RefFromDomainKey = /evidenceStr\(evidence,\s*'DomainKey'\)/.test(eApi)
   const e29Summary = /evidenceSummary/.test(eApi) && /evidenceSummary/.test(eTypes)
   // 页面判据取**渲染条件**（`:title="f.evidenceSummary"` 只是悬停全文，不构成展示）
-  const e29ViewUsesEvidenceSummary = /v-if="f\.evidenceSummary"/.test(eVue)
+  //   2026-11-21（v0.2 稿 §P08 并表）：清单行变量统一为 `row` ⇒ 判据同步
+  const e29ViewUsesEvidenceSummary = /v-if="row\.evidenceSummary"/.test(eVue)
   const e29All =
     e29Mapper &&
     e29MapsFactId &&
@@ -11953,30 +11990,34 @@ async function verifyExplanationFreeze(adminToken) {
       : `mapper=${e29Mapper} factId=${e29MapsFactId} occurredAt=${e29MapsOccurredAt} derive=${e29DerivesRef} mapperUsesDerive=${e29MapperUsesDerive} demandKey=${e29RefFromDemandKey} domainKey=${e29RefFromDomainKey} summary=${e29Summary} viewSummary=${e29ViewUsesEvidenceSummary}`
   )
 
-  // E30 静态：面板计数行 + 继续加载 + 分组内滚动（把「一共多少 / 展示了多少」摆在明面上）
+  // E30 静态：面板计数行 + 继续加载 + 客户端分页（把「一共多少 / 展示了多少」摆在明面上）
+  //   2026-11-21（v0.2 稿 §P08 并表）：原先「分组内独立滚动」的 .fact-list 清单块已撤
+  //   （任务/资源/工段级事实并进一张表）⇒ 滚动判据换成**客户端分页**（分页条 + 每页条数）。
   const e30ViewCountLine =
-    /共\s*\{\{\s*totalFacts\s*\}\}\s*条\s*·\s*已显示\s*\{\{\s*loadedFactsCount\s*\}\}\s*条/.test(
+    /共\s*\{\{\s*totalFactsText\s*\}\}\s*条\s*·\s*已显示\s*\{\{\s*loadedFactsCount\s*\}\}\s*条/.test(
       eVue
     )
   const e30ViewMoreBtn = /@click="onLoadMoreFacts"/.test(eVue)
   const e30StoreHasMore = /const\s+factsHasMore\s*=\s*computed/.test(eStore)
   const e30StoreLoadedCount = /const\s+loadedFactsCount\s*=\s*computed/.test(eStore)
   const e30LoadMax = /EXPLANATION_FACT_LOAD_MAX\s*=\s*5000/.test(eApi)
-  const e30ScrollableList =
-    /\.fact-list\s*\{[^}]*max-height\s*:\s*\d+px[^}]*overflow-y\s*:\s*auto/.test(eVue)
+  const e30PagedList =
+    /class="fact-pagination"/.test(eVue) &&
+    /:total="filteredRows\.length"/.test(eVue) &&
+    /:page-sizes="\[20, 50, 100, 200\]"/.test(eVue)
   const e30All =
     e30ViewCountLine &&
     e30ViewMoreBtn &&
     e30StoreHasMore &&
     e30StoreLoadedCount &&
     e30LoadMax &&
-    e30ScrollableList
+    e30PagedList
   assert(
-    'E30 静态：排程解释事实面板计数行（共 N 条 · 已显示 M 条）+ 继续加载 + store factsHasMore/loadedFactsCount + 累计上限 5000 + 分组内滚动',
+    'E30 静态：排程解释事实面板计数行（共 N 条 · 已显示 M 条）+ 继续加载 + store factsHasMore/loadedFactsCount + 累计上限 5000 + 客户端分页',
     e30All,
     e30All
-      ? '计数行 / 继续加载 / 上限 / 滚动 齐全'
-      : `countLine=${e30ViewCountLine} moreBtn=${e30ViewMoreBtn} hasMore=${e30StoreHasMore} loadedCount=${e30StoreLoadedCount} loadMax=${e30LoadMax} scroll=${e30ScrollableList}`
+      ? '计数行 / 继续加载 / 上限 / 分页 齐全'
+      : `countLine=${e30ViewCountLine} moreBtn=${e30ViewMoreBtn} hasMore=${e30StoreHasMore} loadedCount=${e30StoreLoadedCount} loadMax=${e30LoadMax} paging=${e30PagedList}`
   )
 
   // E31 动态（可选）：真打后端核对「总数 = 三计数之和」且「Summary.items 仍是只 ERROR 的 50 条」
@@ -15693,8 +15734,11 @@ function verifyGantt() {
 
   // GT111 缺数据只说「未提供」，不再断言「单 Order 任务」「单段加工」
   //  2026-11-05 B8：TaskSegments 裁决「不做、撤」⇒ 中性占位文案整条撤掉（不再留「等它有」的预期位）
+  //  ⚠️ 2026-11-19：份额读面 11-17 起换成 A5 `shares[]`（逐行全量），
+  //    中性文案随之从「未提供订单份额数据（TaskShare）」改写为「未提供订单份额数据」
+  //    （不再点名已不读的甘特体 `taskShare`）⇒ 判据按**当前文案**跟写。
   const gt111Share =
-    /未提供订单份额数据（TaskShare）/.test(ganttVue) && !/单 Order 任务/.test(ganttVue)
+    /未提供订单份额数据/.test(ganttVue) && !/单 Order 任务/.test(ganttVue)
   const gt111Segments =
     !/未提供数量-时间拆分数据（TaskSegments）/.test(ganttVue) && !/单段加工/.test(ganttVue)
   assert(
@@ -15723,23 +15767,54 @@ function verifyGantt() {
    *   B6/B7/B8 三个展示位「不做、撤」（上游 Stage 阻挡 / 事实类型 / 数量-时间拆分）
    */
 
-  // ---- GT113：MES 工单号 + 下发状态（详情 + 清单 + CSV 三处同源，缺键中性）----
+  // ---- GT113：MES 工单号 + 下发状态（**双键名过渡期**：同一权威位三个键名）----
+  // ⚠️ 2026-11-18 改判：11-05 的「详情/清单/CSV 三处同源 + 未建单/未下发」判据已被后续变更取代
+  //   （清单列在双键迁移后读 `mesDispatchStatus`、中性文案改为「未关联 / 不在下发队列 / 未提供」、
+  //    CSV 列于 r14281 后补回）⇒ 旧判据长期判红。本条按**当前契约**重写：
+  //   · 工单号：详情 `detailRow.mesWorkOrderNo` / 清单 `row.mesWorkOrderNo` / CSV `t.mesWorkOrderNo`；
+  //   · 下发状态（权威位 `TaskDispatch.DispatchStatus`）：**三个键名**并存 ——
+  //     甘特位 `selectedTask.dispatchStatus`（详情 + 悬停）／P05 位 `row.mesDispatchStatus`（清单 + CSV）／
+  //     P11 位 `op.dispatchStatus`（批次工序行）⇒ 三处**显示统一走 `mesDispatchStatusLabel`**，
+  //     **不得自行合并或改名**（统一归 V1.1 破坏窗）；
+  //   · 缺键中性：清单「不在下发队列」/ 详情「未提供」（不得断言「无工单」，也不得留空）。
   const gt113Type =
-    /mesWorkOrderNo\?:\s*string/.test(typesSrc) && /dispatchStatus\?:\s*string/.test(typesSrc)
+    /mesWorkOrderNo\?:\s*string/.test(typesSrc) &&
+    /dispatchStatus\?:\s*string/.test(typesSrc) &&
+    /mesDispatchStatus\?:\s*string/.test(typesSrc)
   const gt113Drawer =
-    /selectedTask\.mesWorkOrderNo\b/.test(ganttVue) && /selectedTask\.dispatchStatus\b/.test(ganttVue)
-  const gt113List = /row\.mesWorkOrderNo\b/.test(ganttVue) && /row\.dispatchStatus\b/.test(ganttVue)
+    /detailRow\?\.mesWorkOrderNo\b/.test(ganttVue) && /selectedTask\.dispatchStatus\b/.test(ganttVue)
+  const gt113List = /row\.mesWorkOrderNo\b/.test(ganttVue) && /row\.mesDispatchStatus\b/.test(ganttVue)
+  const gt113Hover = /mesDispatchStatusLabel\(t\.dispatchStatus\)/.test(ganttCode)
   const gt113Csv =
     /'MES工单号'/.test(ganttCode) &&
-    /'下发状态'/.test(ganttCode) &&
-    /t\.mesWorkOrderNo \?\? ''/.test(ganttCode) &&
-    /t\.dispatchStatus \?\? ''/.test(ganttCode)
-  // 缺键中性文案：未建单 / 未下发（不得断言「无工单」，也不得留空）
-  const gt113Neutral = /未建单/.test(ganttVue) && /未下发/.test(ganttVue)
+    /'MES下发状态'/.test(ganttCode) &&
+    /t\.mesWorkOrderNo \?\?/.test(ganttCode) &&
+    /t\.mesDispatchStatus \? mesDispatchStatusLabel\(t\.mesDispatchStatus\)/.test(ganttCode)
+  // 缺键中性文案：**键①②同一句话「不在下发队列」**（抽屉 / 清单列 / CSV 三处）
+  //   ⚠️ 抽屉此前显「未提供」＝同一条件两套说法，本轮拉齐
+  //   （5号位 2026-11-19 复函 §二 键①② + 护栏语义表 r14286 第 17/18 行）
+  const gt113DrawerMissing = /<span v-else class="muted-text">不在下发队列<\/span>/.test(ganttVue)
+  const gt113ListMissing = /<span class="task-list-muted">不在下发队列<\/span>/.test(ganttVue)
+  const gt113CsvMissing =
+    /t\.mesDispatchStatus \? mesDispatchStatusLabel\(t\.mesDispatchStatus\) : '不在下发队列'/.test(
+      ganttCode
+    )
+  const gt113Neutral = gt113DrawerMissing && gt113ListMissing && gt113CsvMissing
+  // 同一权威位 ⇒ 三处显示同一词典（未知码原样透出）
+  const gt113Dict =
+    /mesDispatchStatusLabel\(row\.mesDispatchStatus\)/.test(ganttCode) &&
+    /mesDispatchStatusLabel\(selectedTask\.dispatchStatus\)/.test(ganttCode) &&
+    /mesDispatchStatusLabel\(op\.dispatchStatus\)/.test(ganttCode)
   assert(
-    'GT113 静态：MES 工单号（mesWorkOrderNo）+ 下发状态（dispatchStatus）在详情/清单/CSV 三处同源，缺键显示未建单/未下发',
-    gt113Type && gt113Drawer && gt113List && gt113Csv && gt113Neutral,
-    `类型=${gt113Type} 详情=${gt113Drawer} 清单=${gt113List} CSV=${gt113Csv} 中性文案=${gt113Neutral}`
+    'GT113 静态：MES 工单号（mesWorkOrderNo）+ 下发状态（三键过渡：甘特位 dispatchStatus / P05 位 mesDispatchStatus / P11 位 dispatchStatus）同源显示，键①②缺键同一句「不在下发队列」，CSV 带 MES 下发状态列',
+    gt113Type &&
+      gt113Drawer &&
+      gt113List &&
+      gt113Hover &&
+      gt113Csv &&
+      gt113Neutral &&
+      gt113Dict,
+    `类型=${gt113Type} 详情=${gt113Drawer} 清单=${gt113List} 悬停=${gt113Hover} CSV=${gt113Csv} 中性文案=${gt113Neutral}(抽屉=${gt113DrawerMissing} 列=${gt113ListMissing} CSV=${gt113CsvMissing}) 同词典=${gt113Dict}`
   )
 
   // ---- GT114：关键路径三态（true / false / 缺键=未判定）----
@@ -15805,19 +15880,23 @@ function verifyGantt() {
 
   // ---- GT117：delayReasons 行级 objectType（5号位 2026-11-05 Q2-a 放宽落码）----
   //   过滤由 `ObjectType='TASK'` 放宽为 TASK∪ORDER ⇒ 订单级事实按 TaskId 透传到该单每个任务，
-  //   页面**必须**标「订单级」；清单列走 `top.`，抽屉根因条目走 `r.`，两处都要锁。
+  //   页面**必须**标「订单级」。
+  //   ⚠️ 2026-11-19：清单「主要原因」列已于 0号位 2026-11-07 审核 B-01 改版中撤除
+  //     （订单号 / 客户交期 / 延期 / 主要原因 **本读面没有** ⇒ 不显示）⇒ 原「清单走 `top.`」
+  //     这一条随该列作废，判据改锁**现存的两个落点**：抽屉三个根因桶的 `r.objectType` 标签
+  //     + 类型层可选键 + mock 同形。清单若日后恢复该列，须把 `top.objectType` 判据加回。
   const gt117Clean = ganttCode.replace(/<!--[\s\S]*?-->/g, '')
   const gt117Type = /objectType\?:\s*'TASK'\s*\|\s*'ORDER'/.test(typesSrc)
-  const gt117List = /top\.objectType === 'ORDER'/.test(gt117Clean) && /（订单级）/.test(gt117Clean)
+  const gt117Label = /（订单级）/.test(gt117Clean)
   const gt117Drawer =
     /r\.objectType === 'ORDER'/.test(gt117Clean) &&
     (gt117Clean.match(/r\.objectType === 'ORDER'/g) || []).length >= 3
   const gt117Mock =
     /objectType: 'ORDER'/.test(mockSrc) && /objectType: 'TASK'/.test(mockSrc)
   assert(
-    'GT117 静态：delayReasons 行级 objectType（类型可选键 + 清单「主要原因」标（订单级）+ 抽屉三个根因桶标「订单级」+ mock 同形）',
-    gt117Type && gt117List && gt117Drawer && gt117Mock,
-    `类型=${gt117Type} 清单=${gt117List} 抽屉三处=${gt117Drawer} mock同形=${gt117Mock}`
+    'GT117 静态：delayReasons 行级 objectType（类型可选键 + 抽屉三个根因桶标「订单级」+ mock 同形）',
+    gt117Type && gt117Label && gt117Drawer && gt117Mock,
+    `类型=${gt117Type} 订单级文案=${gt117Label} 抽屉三处=${gt117Drawer} mock同形=${gt117Mock}`
   )
 
   // ---- GT118：甘特图可读性增强（条内完成✓ / 延期+Nh / 泳道浅绿；物料列已并入首列见 GT120）----
@@ -15888,6 +15967,44 @@ function verifyGantt() {
     'GT126 静态：已排产任务条填充色 = #7FB8B0（图例同源 STATUS_COLORS）',
     gt126PlannedColor,
     `PLANNED 色=${gt126PlannedColor}`
+  )
+
+  // ---- GT127：键③（P11 批次工序行 `dispatchStatus`）**行驱动、语义差一拍** ----
+  // 依据：5号位 2026-11-19《复函R3三键全收录…》§二 V1.1 映射表（三键版）键③
+  //   + 护栏语义表 r14286 第 19 行。
+  // ⚠️ 键③ 与键①②**差一拍**：本键非空 string、**行在则值必在**；
+  //   「缺键」＝该行不在本批列表（= 没有这一行），**≠**键①②的「队列外 Task」。
+  //   ⇒ 前端**按行渲染**，**不把①②的分类文案（「不在下发队列」）套到③上**
+  //   （否则把「行不存在」与「行在但未下发」混成一类）。
+  const gt127MesTypes = readSrc('api/aps-v1/types/mes.ts')
+  // P11 工序行那一列（`label="下发状态"` 在 P11 面板；抽屉用的是 ElDescriptionsItem，锚点不撞）
+  //   切片后剥掉 HTML 注释（注释里会写「不套用①②分类文案」等说明文字，不算渲染内容）
+  const gt127OpsCol = sliceFrom(ganttVue, '<ElTableColumn label="下发状态" width="100">', 320).replace(
+    /<!--[\s\S]*?-->/g,
+    ''
+  )
+  // ①按行渲染：值走词典
+  const gt127OpsRender = /mesDispatchStatusLabel\(op\.dispatchStatus\)/.test(gt127OpsCol)
+  // ②不套用键①②的分类文案（列内不得出现「不在下发队列」）
+  const gt127OpsNoQueueText = !/不在下发队列/.test(gt127OpsCol)
+  // ③不把缺键解释成「未下发」（禁断言状态）
+  const gt127OpsNoNotSent = !/未下发/.test(gt127OpsCol)
+  // ④类型层登记「行驱动」缺键语义（同后端护栏语义表第 19 行）
+  const gt127TypesRowDriven =
+    /行驱动/.test(gt127MesTypes) &&
+    /该行不在本批列表/.test(gt127MesTypes) &&
+    /不把①②的分类文案/.test(gt127MesTypes)
+  // ⑤核准前**不改名**：①③仍读原键名 `dispatchStatus`（统一归 V1.1 破坏窗）
+  const gt127NoRename =
+    /selectedTask\.dispatchStatus/.test(ganttCode) && /op\.dispatchStatus/.test(ganttCode)
+  assert(
+    'GT127 静态：键③（P11 批次工序行 dispatchStatus）行驱动——按行渲染走词典，不套用键①②「不在下发队列」分类文案；类型层登记缺键语义；核准前不改名',
+    gt127OpsRender &&
+      gt127OpsNoQueueText &&
+      gt127OpsNoNotSent &&
+      gt127TypesRowDriven &&
+      gt127NoRename,
+    `按行渲染=${gt127OpsRender} 无队列文案=${gt127OpsNoQueueText} 无未下发=${gt127OpsNoNotSent} 类型登记=${gt127TypesRowDriven} 未改名=${gt127NoRename}`
   )
 
   // ---- GT119：任务清单信息补全（5号位 2026-11-05 r14043/14044，tasks[] 新增 10 键）----
@@ -16139,9 +16256,12 @@ function verifyGantt() {
     !/(mesEligible|资格|执行状态|实际开始|实际结束|完成进度|锁定|冻结区)/.test(exportColsSrc)
   const gt85Mes =
     exportColsSrc.includes('MES工单号') &&
-    exportColsSrc.includes('下发状态') &&
-    /t\.mesWorkOrderNo \?\? ''/.test(ganttCode) &&
-    /t\.dispatchStatus \?\? ''/.test(ganttCode)
+    exportColsSrc.includes('MES下发状态') &&
+    /t\.mesWorkOrderNo \?\?/.test(ganttCode) &&
+    // ⚠️ 2026-11-18：CSV 导出源是 **P05 清单行**（`TaskListItemDto`）⇒ 下发状态取 **P05 位键**
+    //   `mesDispatchStatus`；**不是**甘特位键 `dispatchStatus`（那是甘特行的键，P05 行上没有）。
+    //   该列曾因「本读面没有下发状态」被略去，r14281 补上 `MesDispatchStatus` 后已恢复。
+    /t\.mesDispatchStatus \? mesDispatchStatusLabel\(t\.mesDispatchStatus\)/.test(ganttCode)
   assert(
     'GT85 静态：导出列只取后端已给字段（允许 MES工单号/下发状态，不含资格/执行状态等未接入列 ⇒ 不造假数据）',
     gt85Cols && gt85NoFake && gt85Mes,

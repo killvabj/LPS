@@ -8,6 +8,27 @@
  * @see 审核报告 §十七.17 认证与权限（3号位 V1 正式职责）
  * @see 审核报告 §十七.17.2 业务范围权限（Factory / ProductFamily / Department / Domain）
  * @see 审核报告 §二十五 7 项权限场景
+ *
+ * 2026-11-21：`aps.planner`（计划员）**收回** `aps.manual_eta.edit` / `aps.manual_eta.cancel`
+ *   （依据 APS_V1_3号位致4号位_P01-P13收口v0.2回执_H1-H10逐条核证裁决_回执_v1.0_20261120.md
+ *    H10②「收回计划员写码；`manual_eta.view` 计划员保留只读；V1 写仅 `aps.admin.system` 持；
+ *    码本身保留，变更＝角色-权限指派/种子，实施归 4号位」）。
+ *   ⇒ 计划员在「人工到货时间」页只剩查看：写按钮按 `aps.manual_eta.edit` 显隐 ⇒ 自然消失（回执「附带知悉」）。
+ *   ⚠️ 本表是 **mock 预设**（前端演示用）；运行库绑定见 scripts/seed-dev.mjs 与「角色管理→分配权限」。
+ *
+ * 2026-11-21：**按 v0.2 核对稿 §3 / §4.9.1 补两个业务角色的能力**（前端侧落地，运行库绑定见
+ *   docs/APS_V1_v0.2稿九类角色能力落地清单_4号位_20261121.md 的「角色管理」步骤）：
+ *   - `aps.coordinator.material`（**采购担当**）＋`aps.manual_eta.edit` / `aps.manual_eta.cancel`
+ *     ⇒ 稿 §3「采购担当：只维护合法 Manual ETA」；与 H10②「计划员在采购侧只读」互补
+ *       （计划员仍只有 view；PMC 在采购协同页**只读不维护人工ETA**）。
+ *   - `aps.supervisor.workshop`（**车间计划员/车间主任**）＋`aps.plan.run` / `aps.reschedule.manual`
+ *     / `aps.candidate.view` / `aps.candidate.confirm`
+ *     ⇒ 稿 §4.9.1 **场景7～9**（甘特拖拽 / 设备故障后重排 / 日历变更后重排）：
+ *       `aps.plan.run` = POST /api/governance/run/candidate 的端点权限码（发起本地重排）；
+ *       `aps.reschedule.manual` = 甘特拖拽门控；`aps.candidate.*` = 候选比较与确认/放弃。
+ *   ⚠️ 稿 §4.9.1 UI-20 的「PMC 对场景7/10 无权」**未在权限码层完全收口**：
+ *     PMC 仍持 `aps.reschedule.manual`（场景5/6 的 LOCAL+MANUAL_ADJUSTMENT 技术组合要用它），
+ *     故 PMC 在甘特页仍会看到场景7～9 入口 ⇒ 服务端按稿 §8 Q11 落码后再收口。
  */
 
 import { defineStore } from 'pinia'
@@ -19,14 +40,17 @@ import { MOCK_ROLE_SCOPE_PRESETS, normalizeScope, type BusinessScope } from './s
 /** mock 模式可选角色列表（P2 角色门控验证用；生产模式不会暴露此列表）
  *  - 与 dev seed 一致：viewer → aps.viewer.management，pmc → aps.planner，
  *    rule_admin / rule_publisher → aps.admin.aps，admin → aps.admin.system
- *  - 余下 3 个 DDL 角色（aps.supervisor.workshop / aps.coordinator.material / aps.service.api）
- *    dev 未 seed，mock 模式按 §二十五 场景补 viewer 级演示卡
+ *  - 2026-11-21：加入 aps.supervisor.workshop（车间计划员）/ aps.coordinator.material（采购担当）
+ *    —— 依据 v0.2 核对稿 §3 的两个业务角色；mock 模式下可直接切角色验证其能力边界。
+ *  - 余下 1 个 DDL 角色（aps.service.api）dev 未 seed，mock 模式按 §二十五 场景补 viewer 级演示卡
  */
 const MOCK_AVAILABLE_ROLES: RoleKey[] = [
   'aps.viewer.management',
   'aps.planner',
   'aps.admin.aps',
-  'aps.admin.system'
+  'aps.admin.system',
+  'aps.supervisor.workshop',
+  'aps.coordinator.material'
 ]
 
 /** 把 BusinessScope（前端 4 维度）转 UserInfo 后端 5 维度 + IsGlobal */
@@ -75,11 +99,13 @@ function fromBackendScope(u: UserInfo): BusinessScope {
  *  - roles / permissions：与 dev seed 段 D 一致（v1.2 §23.1 层次码 aps.* 前缀，对齐后端 PermissionCodes.cs 34 码）
  *  - scope：经 toBackendScope() 转后端 5 维度扁平字段（对齐 UserInfoDto）
  *
- * 权限码分布（与 3号位 dev seed 段 D 一致）：
- *  - aps.viewer.management  → 10 个只读（*.view）
- *  - aps.planner            → 17 个（日常排程 + 手动 ETA + Candidate 确认 + 局部 reschedule）
- *  - aps.admin.aps          → 8 个（规则/参数/策略 edit + publish；RULE_ADMIN/RULE_PUBLISHER 共用此 DDL 角色）
- *  - aps.admin.system       → 34 个全部（含 aps.auth.* / aps.mes.dispatch / aps.demand_protection.release）
+ * 权限码分布（**前端 mock 真值**；运行库绑定另见「角色管理→分配权限」，两者可能不一致）：
+ *  - aps.viewer.management  → 13 个只读（*.view）
+ *  - aps.planner            → 21 个（日常排程 + Candidate 确认 + 局部 reschedule；H10② 收回人工 ETA 写码）
+ *  - aps.admin.aps          → 19 个（规则/参数/策略 edit + publish；RULE_ADMIN/RULE_PUBLISHER 共用此 DDL 角色）
+ *  - aps.admin.system       → 43 个全部（含 aps.auth.* / aps.mes.dispatch / aps.demand_protection.release）
+ *  - aps.supervisor.workshop→ 6 个（车间计划员：场景7～9 + 候选比较/确认）
+ *  - aps.coordinator.material→ 4 个（采购担当：只维护合法 Manual ETA）
  *
  * 注：v1.2 DDL 把 RULE_ADMIN + RULE_PUBLISHER 合并为单一 aps.admin.aps 角色；
  *     原 §二十五.3「RULE_ADMIN 不能自动拥有发布权」不再由角色码表达，
@@ -143,9 +169,9 @@ const MOCK_ROLE_PRESETS: Record<
       'aps.resource_calendar.edit',
       'aps.manual_capacity.view',
       'aps.manual_capacity.edit',
+      // H10②（2026-11-21）：计划员在采购侧只读 —— 收回 edit/cancel，只保留 view。
+      //   「新增/编辑」按 edit 显隐、「取消」按 cancel 显隐 ⇒ 计划员两个写入口都消失。
       'aps.manual_eta.view',
-      'aps.manual_eta.edit',
-      'aps.manual_eta.cancel',
       'aps.demand_protection.view',
       'aps.mes.view',
       // rbac.md §1.2 audit 行：4 角色均持 aps.audit.view（2026-09-20 Audit 页落地时对齐补码）
@@ -239,12 +265,33 @@ const MOCK_ROLE_PRESETS: Record<
   // 余下 3 个 DDL 角色 dev 未 seed，mock 模式按 viewer 级分配演示卡
   'aps.supervisor.workshop': {
     roles: ['aps.supervisor.workshop'],
-    permissions: ['aps.plan.view', 'aps.audit.view'],
+    // 2026-11-21（v0.2 核对稿 §4.9.1 场景7～9 / §3 车间计划员）：
+    //   aps.plan.run          → POST /api/governance/run/candidate 端点权限码（发起本地重排）
+    //   aps.reschedule.manual → 甘特拖拽门控（场景7）
+    //   aps.candidate.view    → 候选版本比较（场景7～9 的 Candidate 甘特）
+    //   aps.candidate.confirm → 确认/放弃（**不含** aps.candidate.activate = 正式采用，见落地清单待核项）
+    permissions: [
+      'aps.plan.view',
+      'aps.audit.view',
+      'aps.plan.run',
+      'aps.reschedule.manual',
+      'aps.candidate.view',
+      'aps.candidate.confirm'
+    ],
     ...toBackendScope(MOCK_ROLE_SCOPE_PRESETS['aps.supervisor.workshop'])
   },
   'aps.coordinator.material': {
     roles: ['aps.coordinator.material'],
-    permissions: ['aps.plan.view', 'aps.manual_eta.view'],
+    // 2026-11-21（v0.2 核对稿 §3 采购担当「只维护合法 Manual ETA」）：
+    //   aps.manual_eta.edit   → 新增 / 编辑
+    //   aps.manual_eta.cancel → 取消
+    //   与 H10② 互补：计划员(PMC) 采购侧只读（view），采购担当才有写码。
+    permissions: [
+      'aps.plan.view',
+      'aps.manual_eta.view',
+      'aps.manual_eta.edit',
+      'aps.manual_eta.cancel'
+    ],
     ...toBackendScope(MOCK_ROLE_SCOPE_PRESETS['aps.coordinator.material'])
   },
   'aps.service.api': {

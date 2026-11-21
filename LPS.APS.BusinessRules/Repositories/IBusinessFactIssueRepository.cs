@@ -20,6 +20,7 @@ public interface IBusinessFactIssueRepository
         string? issueType = null,
         string? keyword = null,
         string? factoryCode = null,
+        DateTime? occurredFrom = null, DateTime? occurredTo = null,
         int skip = 0,
         int take = 50,
         CancellationToken ct = default,
@@ -37,6 +38,7 @@ public interface IBusinessFactIssueRepository
         string? issueType = null,
         string? keyword = null,
         string? factoryCode = null,
+        DateTime? occurredFrom = null, DateTime? occurredTo = null,
         int skip = 0,
         int take = 50,
         CancellationToken ct = default,
@@ -53,6 +55,7 @@ public interface IBusinessFactIssueRepository
         string? reviewStatus = null,
         string? issueType = null,
         string? keyword = null,
+        DateTime? occurredFrom = null, DateTime? occurredTo = null,
         int skip = 0,
         int take = 100,
         CancellationToken ct = default,
@@ -67,6 +70,7 @@ public interface IBusinessFactIssueRepository
         string? reviewStatus = null,
         string? issueType = null,
         string? keyword = null,
+        DateTime? occurredFrom = null, DateTime? occurredTo = null,
         CancellationToken ct = default,
         IReadOnlySet<string>? allowedFactories = null);
 }

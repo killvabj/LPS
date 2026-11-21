@@ -46,6 +46,8 @@ public class ExplanationController : ControllerBase
         [FromQuery] long? taskId = null,
         [FromQuery] string? reasonCode = null,
         [FromQuery] string? severity = null,
+        [FromQuery] DateTime? occurredFrom = null,   // H1：事实落库时间区间（两端都含）
+        [FromQuery] DateTime? occurredTo = null,
         [FromQuery] int skip = 0,
         [FromQuery] int take = 100,
         CancellationToken cancellationToken = default)
@@ -54,7 +56,7 @@ public class ExplanationController : ControllerBase
         {
             var result = await _service.QueryAsync(
                 planVersionId, objectType, orderId, taskId,
-                reasonCode, severity, skip, take, cancellationToken);
+                reasonCode, severity, occurredFrom, occurredTo, skip, take, cancellationToken);
 
             return ApiResponse<List<ExplanationDto>>.Success(result);
         }

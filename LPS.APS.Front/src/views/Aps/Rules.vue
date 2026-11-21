@@ -26,6 +26,15 @@
  *  - 前端不能直接 UPDATE Rule，所有写操作走 Controller（publish/disable/validate）
  *
  * 权限码：aps.rule.view / aps.rule.edit / aps.rule.publish
+ *
+ * 2026-11-19：用户指示「**保存段位不要弹框，点一下直接存**」——
+ *   撤掉「保存段位」弹框（`saveDraftDialog` / `saveDraftForm` / `openSaveDraftDialog`
+ *   与整个「保存段位」`ElDialog`），按钮直接调 `onSaveDraft()`。
+ *   依据：后端 `RuleSetVersionRepository.UpdateAsync` 的 UPDATE 语句里**没有 `Remarks` 列**
+ *   （INSERT 同样没有），`GovernanceVersionService.UpdateRuleSetVersionAsync`
+ *   也**不写审计日志** ⇒ 弹框里那个必填「变更说明」**后端既不收也不存** ⇒ 是个死字段。
+ *   弹框里那段「保存只影响这一版草稿…」的说明已由「优先级段位」页签顶部的提示条承担，未丢口径。
+ *   ⚠️ **发布**弹框保留：publish 端点把 `changeReason` 写进审计 `Remark`（有追溯价值）。
  */
 
 import { computed, onActivated, onMounted, ref, watch } from 'vue'
@@ -502,7 +511,7 @@ async function blockIfDirty(action: string): Promise<boolean> {
       '有未保存的修改',
       { type: 'warning', confirmButtonText: '去保存', cancelButtonText: '取消' }
     )
-    openSaveDraftDialog()
+    await onSaveDraft()
   } catch {
     // 用户选择取消：留在当前页
   }
@@ -577,23 +586,13 @@ async function onValidate(): Promise<void> {
   )
 }
 
-/* ===== 保存段位 Dialog ===== */
-const saveDraftDialog = ref(false)
-const saveDraftForm = ref({ changeReason: '' })
-
-function openSaveDraftDialog(): void {
-  saveDraftForm.value = { changeReason: currentDetail.value?.contentVersionRemarks ?? '' }
-  saveDraftDialog.value = true
-}
-
+/* ===== 保存段位（2026-11-19 起不弹框，点一下直接存） ===== */
 async function onSaveDraft(): Promise<void> {
-  const ok = await rulesStore.saveDraftSegments(
-    editorSegments.value,
-    saveDraftForm.value.changeReason
-  )
+  const ok = await rulesStore.saveDraftSegments(editorSegments.value)
   if (ok) {
-    saveDraftDialog.value = false
     segmentsDirty.value = false
+  } else if (rulesStore.error) {
+    ElMessage.error(rulesStore.error)
   }
 }
 
@@ -1332,7 +1331,7 @@ onActivated(() => {
                   size="small"
                   :loading="saving"
                   :disabled="!segmentsDirty"
-                  @click="openSaveDraftDialog"
+                  @click="onSaveDraft"
                 >
                   保存段位
                 </ElButton>
@@ -2102,35 +2101,6 @@ onActivated(() => {
       <template #footer>
         <ElButton @click="editRuleSetDialog = false">取消</ElButton>
         <ElButton type="primary" :loading="actionRunning" @click="onUpdateRuleSet"> 保存 </ElButton>
-      </template>
-    </ElDialog>
-
-    <!-- ===== [保存段位] Dialog（PUT /rule-set/version/{id}，只改 demandPriorityJson） ===== -->
-    <ElDialog
-      v-model="saveDraftDialog"
-      title="保存段位"
-      width="480px"
-      :close-on-click-modal="false"
-    >
-      <ElForm label-width="90px">
-        <ElFormItem label="变更说明">
-          <ElInput
-            v-model="saveDraftForm.changeReason"
-            type="textarea"
-            :rows="2"
-            maxlength="200"
-            placeholder="例如：把 VIP 订单提到最前"
-          />
-        </ElFormItem>
-        <ElAlert type="info" :closable="false" show-icon class="d-alert">
-          <template #title>保存只影响这一版草稿</template>
-          保存后不会自动发布，需要在页面上继续「校验草稿 →
-          发布」。没填完也能先存，缺的值会在「校验草稿」时提示。
-        </ElAlert>
-      </ElForm>
-      <template #footer>
-        <ElButton @click="saveDraftDialog = false">取消</ElButton>
-        <ElButton type="primary" :loading="saving" @click="onSaveDraft">保存</ElButton>
       </template>
     </ElDialog>
 

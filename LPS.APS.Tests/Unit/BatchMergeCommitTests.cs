@@ -550,4 +550,112 @@ public sealed class BatchMergeCommitTests
         Assert.True(counters.MergeMemberKeyMissing > 0,
             $"缺键应当被登记，实得 {counters.MergeMemberKeyMissing} 次。");
     }
+
+    // ────────────────────────────────────────────────────────────────────────
+    // W1（0号位 v1.8 §一／§七）：`discardAfterRun=true` —— **擂台试排跑完即整份还原**
+    //
+    // 为什么必须单独测：合并成功路径上的 `discardAfterRun` 是 Phase2 擂台每锚点都走的**生产路径**
+    //   （`PhaseTwoInitialScheduler.cs:8249` 传 `discardAfterRun: true`），但此前**没有任何测试覆盖**。
+    //   它一旦漏还原，失败候选的状态就会泄进下一个锚点 —— 这类污染不会让单测变红，只会让排程结果莫名偏。
+    //
+    // 本用例锁三件事：
+    //   ① 试排**成功**（`merged != null` 且产出 3 条链）——失败路径已由 C2-04 深度回滚覆盖；
+    //   ② 跑完**四项状态逐条还原**（Task 表 / 份额表 / 占用窗 / ProductTimeline 指纹）；
+    //   ③ 同一夹具再以 `discardAfterRun=false` 调用**能真正落定** ⇒ 证明上面的"没变"是 discard 造成的，
+    //      不是"本来就没改"。
+    // ────────────────────────────────────────────────────────────────────────
+    [Fact(DisplayName = "W1 · discardAfterRun=true：合并成功后四项状态逐条还原，且去掉它才落定")]
+    public void StageMerge_DiscardAfterRun_RestoresEverythingThenLandsWhenAsked()
+    {
+        var constraints = ThreeOpConstraints();
+        // 窗开够：合并后 3 道 × 60min = 180min ⇒ 给 400min，保证本用例走**成功**分支
+        constraints.ResourceCalendars[ResourceId] = new List<TimeWindow>
+        {
+            new TimeWindow(T0, T0.AddMinutes(400)),
+        };
+
+        var targetBatch = AnchorStageBatch();
+        var occupancy = new Dictionary<int, List<TimeWindow>>
+        {
+            [ResourceId] = targetBatch.Select(t => new TimeWindow(t.PlannedStartTime, t.PlannedEndTime)).ToList(),
+        };
+        var scheduled = new List<FinalTaskDraft>(targetBatch);
+        var shares = new Dictionary<string, List<(string DemandKey, decimal ShareQty)>>(StringComparer.Ordinal);
+        foreach (var t in targetBatch)
+        {
+            shares[t.FinalDraftId] = new List<(string, decimal)> { ("A", 30m), ("B", 20m) };
+        }
+        var demandByKey = new Dictionary<string, LogicalProductionDemand>(StringComparer.Ordinal)
+        {
+            ["A"] = Demand("A", 30m),
+            ["B"] = Demand("B", 20m),
+        };
+
+        constraints.ProductTimeline = ResourceProductTimeline.FromTasks(targetBatch);
+
+        // ── 进入前快照 ──
+        string TaskSig() => string.Join("|", scheduled
+            .Select(t => t.FinalDraftId + ":" + t.PlannedProcessQty)
+            .OrderBy(x => x, StringComparer.Ordinal));
+        string ShareSig() => string.Join("|", shares.OrderBy(k => k.Key, StringComparer.Ordinal)
+            .Select(k => k.Key + "=" + string.Join(";", k.Value.Select(x => x.DemandKey + ":" + x.ShareQty))));
+        string OccSig() => string.Join("|", occupancy[ResourceId]
+            .Select(w => w.Start.ToString("HH:mm") + "~" + w.End.ToString("HH:mm")));
+
+        var probes = new[]
+        {
+            T0.AddMinutes(-1), T0, T0.AddMinutes(50), T0.AddMinutes(100),
+            T0.AddMinutes(150), T0.AddMinutes(180), T0.AddMinutes(300),
+        };
+        string TimelineSig() => string.Join("|", probes.Select(x =>
+            x.ToString("HH:mm") + "=>" + (constraints.ProductTimeline.GetPrevMaterial(ResourceId, x)?.ToString() ?? "null")));
+
+        var taskBefore = TaskSig();
+        var shareBefore = ShareSig();
+        var occBefore = OccSig();
+        var timelineBefore = TimelineSig();
+        var scheduledCountBefore = scheduled.Count;
+
+        // ── ① 擂台试排（discardAfterRun = true）──
+        var discarded = Scheduler.TryMergeDemandIntoStageBatch(
+            Demand("C", 10m), ThreeOps(), ThreeOpGraph(), "FORWARD", targetBatch, constraints,
+            occupancy, scheduled, shares, demandByKey,
+            T0, T0.AddDays(30), T0, new StageOverlapParams(), null,
+            out var trialTasks,
+            detachTaskList: false,
+            discardAfterRun: true);
+
+        Assert.True(discarded is not null, "宽窗下合并应当成功；返回 null 说明夹具没构造出成功分支");
+        Assert.Equal(3, trialTasks.Count);   // 产出链**必须**外传（供候选比较），不能被一并丢掉
+
+        // ── ② 四项状态逐条还原 ──
+        Assert.Equal(scheduledCountBefore, scheduled.Count);
+        Assert.Equal(taskBefore, TaskSig());
+        Assert.Equal(shareBefore, ShareSig());
+        Assert.Equal(occBefore, OccSig());
+        Assert.Equal(timelineBefore, TimelineSig());
+
+        // ── ③ 同夹具改为**落定**（discardAfterRun 默认 false）⇒ 必须真落 ──
+        var landed = Scheduler.TryMergeDemandIntoStageBatch(
+            Demand("C", 10m), ThreeOps(), ThreeOpGraph(), "FORWARD", targetBatch, constraints,
+            occupancy, scheduled, shares, demandByKey,
+            T0, T0.AddDays(30), T0, new StageOverlapParams(), null,
+            out var landedTasks);
+
+        Assert.True(landed is not null, "去掉 discardAfterRun 后同一夹具应当落定成功");
+
+        // 合批是**替换**旧批（先摘原批再加新链），不是追加 ⇒ 条数不变，但**身份必须整体换掉**
+        Assert.Equal(landedTasks.Count, scheduled.Count);
+        Assert.Equal(
+            landedTasks.Select(t => t.FinalDraftId).OrderBy(x => x, StringComparer.Ordinal).ToList(),
+            scheduled.Select(t => t.FinalDraftId).OrderBy(x => x, StringComparer.Ordinal).ToList());
+        foreach (var t in landedTasks)
+        {
+            Assert.True(shares.ContainsKey(t.FinalDraftId), $"落定后 Task {t.FinalDraftId} 缺份额登记");
+        }
+
+        // 反向证据：原批的 Task 身份**不得**还留在任务表里
+        var oldIds = targetBatch.Select(t => t.FinalDraftId).ToHashSet(StringComparer.Ordinal);
+        Assert.DoesNotContain(scheduled, t => oldIds.Contains(t.FinalDraftId));
+    }
 }

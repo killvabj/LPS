@@ -52,6 +52,12 @@ namespace LPS.APS.Tests.Integration;
 ///   APS_CF18_PROBE_CUTOFF       SchedulingContext.DataCutoffTime，默认=跑批时刻
 ///   APS_CF18_PROBE_TIMEOUT_MIN  单轮超时分钟，默认 40
 ///   APS_CF18_PROBE_OUT          输出目录，默认 D:/tmp
+///   APS_CF18_PROBE_ORDER_IDS    仅跑指定 OrderId（逗号分隔）；见下方 SCOPE_BOM
+///   APS_CF18_ALLOW_SH_DEMAND=1  允许把 SH 单当普通需求（默认剔除，且剔除后直接抛错提醒）
+///   APS_CF18_PROBE_SCOPE_BOM=0  强制关闭 BOM 收窄
+///       ⚠ 默认行为有坑：探针剔除 SH 单后 `orderIds &lt; allOrderIds` ⇒ **自动进入 scoped**，
+///         而 scoped 只装「需求单自己的 BOMNO」⇒ **SH 单的 BOM 不会被装载**，其整单需求展不开。
+///         查 SH 相关必须显式设 0（= PV 全量装载，与生产口径一致）。
 /// </summary>
 public class CrossFactoryShInputDigestTest
 {

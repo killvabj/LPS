@@ -28,6 +28,7 @@ public class ExplanationQueryService
         long? taskId = null,
         string? reasonCode = null,
         string? severity = null,
+        DateTime? occurredFrom = null, DateTime? occurredTo = null,
         int skip = 0,
         int take = 100,
         CancellationToken ct = default)
@@ -39,7 +40,7 @@ public class ExplanationQueryService
 
         return await _repository.QueryAsync(
             planVersionId, objectType, orderId, taskId,
-            reasonCode, severity, skip, take, ct);
+            reasonCode, severity, occurredFrom, occurredTo, skip, take, ct);
     }
 
     /// <summary>

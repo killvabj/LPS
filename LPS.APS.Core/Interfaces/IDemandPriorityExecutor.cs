@@ -20,6 +20,14 @@ namespace LPS.APS.Core.Interfaces;
 public interface IDemandPriorityExecutor
 {
     /// <summary>
+    /// 探针专用（2026-11-21）：调用方置为非 null 时，执行器把**每条需求命中的段号**记进来
+    /// （段号 = `SegmentOrder`；**0 = 未命中任何段、走 DemandKey 兜底**）。
+    /// 默认 null ⇒ 生产零行为变化、零内存开销（仅多一次 null 判断）。
+    /// 用途＝「排序规则真实执行证据」：可逐段核对命中与段内顺序，不必事后猜段归属。
+    /// </summary>
+    List<(string DemandKey, int SegmentOrder)>? SegmentTrace { get; set; }
+
+    /// <summary>
     /// 执行「单个计算层」的 Demand 排序（config 已由调用方收敛为当前层 Segments），
     /// 返回有序列表并已赋值 DemandSequence = 1, 2, 3...
     /// S5（PM 0923）：expediteOrderCanonicalIds 非空时，命中的 Demand 作为 EXPEDITE 前置竞争层整体前置。

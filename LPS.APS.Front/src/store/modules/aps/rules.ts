@@ -17,6 +17,13 @@
  *
  * 权限（v1.2 §23.1 权限码门控）：
  *  - aps.rule.view / aps.rule.edit / aps.rule.publish
+ *
+ * 2026-11-19：用户指示「**保存段位不要弹框，点一下直接存**」——
+ *   `saveDraftSegments` 去掉 `changeReason` 参数，PUT body 不再带 `remarks`。
+ *   依据：后端 `RuleSetVersionRepository.UpdateAsync` 的 UPDATE 语句里**没有 `Remarks` 列**
+ *   （INSERT 同样没有），`GovernanceVersionService.UpdateRuleSetVersionAsync`
+ *   也**不写审计日志** ⇒ 「变更说明」既不收也不存，是个死字段。
+ *   ⚠️ 「发布」弹框保留：publish 端点把 `changeReason` 写进审计 `Remark`（有追溯价值）。
  */
 
 import { defineStore } from 'pinia'
@@ -685,18 +692,19 @@ export const useRulesStore = defineStore('aps.rules', () => {
    * 保存需求优先级段位到当前展示的**草稿版本**
    *
    *  - 只有 DRAFT 能改（后端 `EnsureUpdatable`）：PUBLISHED / DISABLED / ARCHIVED 一律拒绝
-   *  - PUT body 是整条 RuleSetVersion：带 versionCode + demandPriorityJson + remarks；
+   *  - PUT body 是整条 RuleSetVersion：带 versionCode + demandPriorityJson；
    *    **不带 contentSnapshotJson**（后端会强制回填库内既有快照，传了也无效，
    *    换型规则子块靠这个机制保留）
    *  - ⚠️ 2026-11-11：**保存不再做内容校验**（值没填、段名没写、空条件组等一律放过）。
    *    草稿的用途就是「先存下来、回头再填」；内容合不合格由「校验草稿」那一关把关，
    *    发布仍由后端校验兜底。**校验不过 ≠ 不能存**。
    *    保留的拦截只有权限、版本状态、版本存在性这三条（与内容无关）。
+   *  - ⚠️ 2026-11-19：原来的 `changeReason`（变更说明）**已撤**。
+   *    后端 `RuleSetVersionRepository.UpdateAsync` 的 UPDATE 语句里**没有 `Remarks` 列**
+   *    （INSERT 同样没有），`GovernanceVersionService.UpdateRuleSetVersionAsync`
+   *    也**不写审计日志** ⇒ 「变更说明」既不收也不存，是个死字段 ⇒ 前端不再弹框索取。
    */
-  async function saveDraftSegments(
-    segments: PrioritySegmentDto[],
-    changeReason?: string
-  ): Promise<boolean> {
+  async function saveDraftSegments(segments: PrioritySegmentDto[]): Promise<boolean> {
     if (!canWrite.value) {
       error.value = '当前操作者无写权限（需权限码 aps.rule.edit）'
       return false
@@ -724,8 +732,7 @@ export const useRulesStore = defineStore('aps.rules', () => {
           ruleSetId: detail.summary.ruleSetId,
           versionCode: detail.contentVersionCode,
           status: 'DRAFT',
-          demandPriorityJson: serializePrioritySegments(segments),
-          remarks: changeReason?.trim() || undefined
+          demandPriorityJson: serializePrioritySegments(segments)
         }
       })
       await loadDetail(detail.summary.ruleSetId, detail.contentVersionId)

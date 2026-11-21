@@ -70,6 +70,13 @@ public enum BomFactorySource
     UnknownFallback = 3,
 
     /// <summary>
+    /// **2026-11-21（0号位 v1.1 §7）**：订单级 BOM 入口不可证（无 `OrderBomRequestLink` 或锚点 BOMNO 在本批无行，
+    /// 走「全部边并集」展开）⇒ 该边上的 `ChildRequiredFactory` **不可信**，**拒绝改厂、保持父厂**。
+    /// 与 <see cref="MissingFallback"/>（字段为空）区分：这里字段**有值**，但**BOM 来源不可证**。
+    /// </summary>
+    BomSourceUnproven = 6,
+
+    /// <summary>
     /// 多条父边给该子件指定了**不同的**应归属厂。节点模型按物料唯一，只能取首个父边的厂；
     /// 此标记表示「这里被压过了」，必须被看见（真实业务上它意味着该物料要在两个厂各建一次需求，
     /// 现有 `BomLevelNode` 结构表达不了）。

@@ -41,11 +41,7 @@ import type {
   HardLockType,
   ReleaseDemandProtectionInput
 } from '@/api/aps-v1'
-import {
-  DEMAND_TYPE_LABELS,
-  HARD_LOCK_SUPPLY_TYPE_LABELS,
-  LOCK_TYPE_LABELS
-} from '@/api/aps-v1'
+import { DEMAND_TYPE_LABELS, HARD_LOCK_SUPPLY_TYPE_LABELS, LOCK_TYPE_LABELS } from '@/api/aps-v1'
 
 import {
   ElAlert,
@@ -94,7 +90,6 @@ function releaseBlockedReason(row: DemandProtectionDto): string {
   if (row.status === 'PARTIALLY_RELEASED') return '该需求已有明细被释放，只剩部分可放'
   if (row.lockIds.length === 0) return '没有可释放的供给明细'
   return ''
-
 }
 
 /* ===== 状态 / 类型 映射 ===== */
@@ -403,7 +398,9 @@ async function submitBatch(): Promise<void> {
     const releasedCount = result.perLock.filter(
       (r: DemandProtectionReleaseResult) => r.status === 'RELEASED'
     ).length
-    ElMessage.success(`已批量释放 ${result.succeeded.length} 条需求保护 / ${releasedCount} 条供给明细`)
+    ElMessage.success(
+      `已批量释放 ${result.succeeded.length} 条需求保护 / ${releasedCount} 条供给明细`
+    )
     selectedRows.value = []
     closeBatchModal()
   } else if (result.succeeded.length === 0) {
@@ -452,12 +449,7 @@ onMounted(refresh)
           clearable
           @keyup.enter="applyFilter"
         />
-        <ElSelect
-          v-model="filterLockType"
-          class="filter-select"
-          placeholder="保护类别"
-          clearable
-        >
+        <ElSelect v-model="filterLockType" class="filter-select" placeholder="保护类别" clearable>
           <ElOption label="需求保护" value="DEMAND_PROTECTION" />
           <ElOption label="严格绑定" value="STRICT_BINDING" />
         </ElSelect>
@@ -472,9 +464,7 @@ onMounted(refresh)
         </ElButton>
         <ElButton @click="resetFilters">重置</ElButton>
       </div>
-      <div v-if="appliedFilterText" class="filter-applied">
-        当前筛选：{{ appliedFilterText }}
-      </div>
+      <div v-if="appliedFilterText" class="filter-applied"> 当前筛选：{{ appliedFilterText }} </div>
     </ElCard>
 
     <!-- ===== 列表 ===== -->
@@ -484,7 +474,9 @@ onMounted(refresh)
           <div class="panel-title">
             <span>需求保护</span>
             <span class="muted small">{{ list.length }} 条</span>
-            <span v-if="releasableCount" class="muted small">· 其中 {{ releasableCount }} 条可释放</span>
+            <span v-if="releasableCount" class="muted small"
+              >· 其中 {{ releasableCount }} 条可释放</span
+            >
           </div>
           <div class="panel-actions">
             <ElButton size="small" plain :loading="loading" @click="refresh">

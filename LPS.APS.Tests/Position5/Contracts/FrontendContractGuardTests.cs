@@ -54,11 +54,26 @@ public class FrontendContractGuardTests
                                     "ManualSlotId", "ManualSlotCode",
                                     "ProductionDepartmentId", "ProductionDepartmentName",
                                     "MesWorkOrderNo", "MesDispatchStatus", "SetupSource",
-                                    "PlannedStartTime", "PlannedEndTime", "Duration" })
+                                    "PlannedStartTime", "PlannedEndTime", "Duration",
+                                    "StageName", "StageCategoryName" })
         {
             Assert.NotNull(Prop(t, key));
         }
         // A5 详情行=列表行子类（TaskDetailRow 在 Application 内，DTO 侧以 TaskListItemDto 为契约面）
+    }
+
+    [Fact]
+    public void ExplanationSummaryDto_ObjectTypeCounts_Present()
+    {
+        // H4（11-21）：objectType 权威计数维度——防止前端回退到"已加载子集"近似。
+        Assert.NotNull(Prop(typeof(ExplanationSummaryDto), "ObjectTypeCounts"));
+    }
+
+    [Fact]
+    public void OrderPoolItemDto_OrderCanonicalId_Present()
+    {
+        // J1（11-20）：canonical Id 与 [Order].Id 非同一空间——键面钉死，防被"顺手合并"。
+        Assert.NotNull(Prop(typeof(OrderPoolItemDto), "OrderCanonicalId"));
     }
 
     [Fact]
@@ -91,7 +106,7 @@ public class FrontendContractGuardTests
         var t = typeof(ResourceLoadRowDto);
         foreach (var key in new[] { "ScheduledHours", "CalendarAvailableHours", "CalendarSource",
                                     "CalendarLoadRatePct", "Fixed16LoadRatePct", "SetupLossRatePct",
-                                    "NotApplicableReason" })
+                                    "NotApplicableReason", "ProductionDepartmentId", "DepartmentCode", "DepartmentName" })
         {
             Assert.NotNull(Prop(t, key));
         }
@@ -126,7 +141,7 @@ public class FrontendContractGuardTests
         // B2（r14250）：KPI 行六数＋顶层三件口径位。
         var r = typeof(DeliveryKpiRowDto);
         foreach (var key in new[] { "TotalOrders", "OnTimeOrders", "LateOrders", "UndeterminedOrders",
-                                    "OnTimeRatePct", "LateRatePct" })
+                                    "OnTimeRatePct", "LateRatePct", "MaterialType" })
         {
             Assert.NotNull(Prop(r, key));
         }

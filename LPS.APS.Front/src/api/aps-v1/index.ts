@@ -104,6 +104,8 @@ export { runApi } from './run'
 export {
   BUSINESS_ENTRIES,
   TRIGGER_RUN_MATRIX,
+  PRIORITY_MODE_EXPLAIN,
+  TRIGGER_BUSINESS_EXPLAIN,
   buildScope,
   validateScopeDraft,
   triggerBusinessEntry

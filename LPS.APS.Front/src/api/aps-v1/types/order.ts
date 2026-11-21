@@ -36,6 +36,26 @@
  *
  * 注意：`Program.cs` 的 `JsonIgnoreCondition.WhenWritingNull` 会把 null 字段**整个键省略**，
  * 所以前端拿到的是 `undefined` 而不是 `null`，判空一律用 `== null`。
+ *
+ * 2026-11-18 交付 KPI 三个口径位**只改页面呈现，字段与契约不变**（用户：工厂用户读不懂内部术语）：
+ *  - `caliber`：页面不再逐字回显（原文含「0号位裁 / MAX(PlannedEndTime) 读模型计算」等内部口径）
+ *    ⇒ 口径含义改由页面标题「交付预测」+ 悬停说明承载；字段保留，后端若改成大白话可恢复展示。
+ *  - `plannedCompletionSource`：页面显示短中文标签，切换仍由后端驱动（前端不改代码）。
+ *  - `undeterminedOrders`：页面文案「日期/计划不可判定」→「未判定」（含义见该字段注释）。
+ *
+ * 2026-11-18（5号位《复函V环境-更新重启归Owner执行…》）：
+ *  - `plannedCompletionSource`：**值变 ⇒ 标签必变，禁静默升级**（该函 §四 收讫条件；
+ *    后端已把这条进护栏语义表第 10 行，我方两头夹）。
+ *  - `commitmentStatus` 补注**缺键语义**（后端护栏语义表要求「每键一行：缺键=什么、禁解释成什么」）。
+ *
+ * 2026-11-20：交付 KPI 行增 `materialType`（依据 5号位-2026-11-20-复函-P01-P13收口v0.2清单十七项逐条裁决_三条可投影已落码B1F1J1_其余不可原因与后移给足-给4号位抄3号位.md
+ *   §一 A2「FG/WIP 分区维度已落码」r14318）：
+ *   · 判据 = **标准 `Material.MaterialType` 原值**（FINISHED_GOOD / SEMI_FINISHED / ASSY / RAW_MATERIAL），
+ *     **禁**由品番前缀或工序属性推断。
+ *   · ⚠️ `materialType` 的 null 有**两种含义**（前端须按行区分，勿一律显「未提供」）：
+ *     ① 该行**不是**类型维度行（行类型维度 = null ⇒ 整键省略）⇒ 前端按 `orderType` 判定行别；
+ *     ② 是类型维度行但标准类型缺失 ⇒ 显「未提供」。
+ *   · `fgWipDimensionAvailable` 现为 **true**（r14318 起 FG/WIP 维度拆分已具备权威映射）。
  */
 
 import type { IsoDateTime, OrderRiskLevel } from './common'
@@ -160,6 +180,15 @@ export interface OrderPeggingDto {
   supplyDocumentType?: string
   eta?: IsoDateTime
   knownAvailableTime?: IsoDateTime
+  /**
+   * 履约承诺状态（值域见 `codeLabels.ts` 的 `COMMITMENT_STATUS_LABELS`：
+   * `COMMITTED` 已承诺／`CONFIRMED` 已确认／`ESTIMATED` 估算／`NOT_COMMITTED` 未承诺／`UNKNOWN` 未提供）。
+   *
+   * ⚠️ **缺键语义**（后端护栏语义表要求「每键一行：缺键=什么、禁解释成什么」）：
+   *   键缺 / 空值 ⇒ **后端没给这一位** ⇒ 页面显「未提供」，
+   *   **禁**解释成「未承诺」（那是 `NOT_COMMITTED` 的确定值）、**禁**解释成「已承诺」。
+   *   `UNKNOWN` 是后端**给了的**「未提供」值，与键缺同义显示，但**不得**互相推断。
+   */
   commitmentStatus?: string
   supplyMode?: string
 }
@@ -265,18 +294,35 @@ export interface DeliveryKpiResultDto {
   scopeDenied?: boolean
   /**
    * 判定口径原文（后端写死一段话）。
-   * 页面**必须**展示它 —— 让人知道这是「计划预计按期率」而非「实际交付准交率」。
+   *
+   * ⚠️ 2026-11-18 用户口径（工厂用户读不懂内部术语）：**页面不再逐字回显这一段**。
+   *   dev 实测原文＝「计划预计按期率（非实际交付准交率）；日期级判定、当天完成=按期（0号位裁）；
+   *   计划完成=同PV Task MAX(PlannedEndTime) 读模型计算；分母=去重根订单含未判定」
+   *   ⇒ 括号里的「0号位裁」「MAX(PlannedEndTime) 读模型计算」属内部口径，工厂用户读不懂。
+   *   口径**含义不丢**：改由页面标题「交付预测（按当前筛选）」+ 悬停说明承载
+   *   （让人知道这是预测的按期情况，不是实际交付准交率）。
+   *   字段保留（不删、不改契约）—— 若后端把该段改写成一句大白话，我方可恢复逐字展示。
    */
   caliber?: string
   /**
    * 计划完成时刻来源：`readmodel_task_max`（读模型计算，同 PV Task MAX(PlannedEndTime)）
    * → 将来 2号位正式归集列落库后切 `formal`。
-   * 页面按本位显示「口径来源」角标，切换**不需要前端改代码**。
+   * 页面按本位显示短中文标签（2026-11-18：「计划完成时间取自排产任务（测算值）」／
+   * 「计划完成时间取自正式归集（正式结果）」，原文「口径来源：…（读模型）」含内部术语，不上页面），
+   * 切换**不需要前端改代码**；未知值原样透出。
+   *
+   * ⚠️ **值变 ⇒ 标签必变，禁静默升级**（5号位 2026-11-18 复函V §四 收讫条件）：
+   *   语义切换（测算值 → 正式结果）**用户须可感知** ⇒ 两个已知值的中文标签必须明显不同；
+   *   未知值**不得**回落成任一已知标签（否则等于假装口径没变）。
+   *   自证：`scripts/selfverify-order-kpi-source-label.mjs`。
    */
   plannedCompletionSource?: string
   /**
-   * `false` = FG/WIP 维度拆分**当前不具备权威映射**（0号位最小裁决前）
-   * ⇒ 页面该维度不出卡（不是出空卡）。
+   * `true` = FG/WIP 维度拆分**已具备权威映射**（0号位 2026-11-20 裁）。
+   *
+   * ✅ 判据＝**标准 `Material.MaterialType` 原值**（FINISHED_GOOD / SEMI_FINISHED / ASSY /
+   *   RAW_MATERIAL / MFG），**禁**由品番前缀 / ERP 工序属性 / Routing 推断。
+   * ⚠️ 早期 dev 曾为 `false`（11-17 复函 B2），**现已翻转为 true**（r14318）。
    */
   fgWipDimensionAvailable?: boolean
   /**
@@ -297,13 +343,29 @@ export interface DeliveryKpiRowDto {
    * 值域实测只有 `PRODUCTION_INSTRUCTION` / `SALES_ORDER` 两个分区。
    */
   orderType?: string
+  /**
+   * FG/WIP 分区维度（5号位 2026-11-20 复函 A2 / r14318 已落码；源 = `Material.MaterialType` 原值）。
+   *
+   * - 值域实测：`FINISHED_GOOD`（成品）/ `SEMI_FINISHED`（半成品）/ `ASSY`（组件）/
+   *   `RAW_MATERIAL`（原材料）/ `MFG`。
+   * - **null = 该行不是类型维度行**（总计行 / 仅 SO-PI 行）⇒ 前端据此判分区，**不是「未提供」**。
+   * - ⚠️ **全部标准类型逐行列出、不合并且不隐藏**（FG/WIP 之外的类型以标准名自成一行=如实）。
+   * - ⚠️ 判据只认标准分类，**禁**由品番前缀 / ERP 工序属性 / Routing 推断。
+   */
+  materialType?: string | null
   /** 分母 = 本分区订单总数（**含未判定，不剔除**） */
   totalOrders: number
   /** 计划按期（日期级 ≤ 交期，当天完成算按期） */
   onTimeOrders: number
   /** 计划延期（日期级晚于交期） */
   lateOrders: number
-  /** 日期/计划不可判定（无 Task 行／完成时刻缺／交期缺）—— **单列显示，不并进按期或延期** */
+  /**
+   * 日期/计划不可判定（无 Task 行／完成时刻缺／交期缺）—— **单列显示，不并进按期或延期**。
+   *
+   * ⚠️ 页面文案 2026-11-18 由「日期/计划不可判定」改「**未判定**」+ 悬停说明
+   *   （工厂用户读不懂原词）。**不写「未排产」**：本桶还含「有 Task 但缺完成时刻」，
+   *   说成未排产不实（列表行的「未排产」是另一套语义，见 `common.ts` ORDER_RISK_MISSING_LABEL）。
+   */
   undeterminedOrders: number
   /** 计划按期率%（按期 ÷ 分母）；分母为 0 ⇒ null（**不显 0%**） */
   onTimeRatePct?: number | null

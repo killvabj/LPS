@@ -77,9 +77,11 @@ public class PhaseThreeMaterialCandidateEvidenceTests
             out var evidenceType,
             out var extraDetails);
 
-        // 物料是候选、不抢归因 ⇒ 最终原因仍是兜底的前序因。
+        // 物料是候选、不抢归因 ⇒ 落到兜底。
+        // EX-T04（2026-11-20）：兜底**不再无条件冒充 PRECEDENCE**——本夹具无子件、无同需求串联等待，
+        //   ⇒ 证据如实标 `UNRESOLVED`/`evidenceLevel=NONE`（ReasonCode 仍取 15 码内最近者）。
         Assert.Equal("PRECEDENCE_WAIT", code);
-        Assert.Equal("PRECEDENCE", evidenceType);
+        Assert.Equal("UNRESOLVED", evidenceType);
 
         // 主断言（整改前红）：候选物料的事实必须留在最终原因的证据里。
         Assert.Contains("materialCandidate", extraDetails);

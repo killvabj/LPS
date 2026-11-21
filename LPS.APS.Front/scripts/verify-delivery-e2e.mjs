@@ -268,6 +268,7 @@ async function main() {
   await evaluate(`(()=>{const ins=document.querySelectorAll('.el-input__inner');
     const set=(el,v)=>{Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set.call(el,v);
       el.dispatchEvent(new Event('input',{bubbles:true}))};
+    // ⚠️ 本脚本**保留 admin**：交付包端到端，账号覆盖面未知 ⇒ 保守留 admin（3号位 2026-11-19 回执 §3.2 过渡期乙：dev 与生产共用 APS_Auth，admin 登录会顶掉生产会话）
     set(ins[0],'admin');set(ins[1],'Admin@123456');
     const b=[...document.querySelectorAll('button')].find(e=>e.className.includes('el-button--primary'));b.click();return 1})()`)
 

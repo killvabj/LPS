@@ -12,6 +12,9 @@
  *
  * 新增/改写探针：E27 / E28 / E29 / E30（E31 动态）+ E23 的「加载更多」判据收窄到业务事实问题面板。
  *
+ * 2026-11-21（v0.2 稿 §P08「一张异常清单＋行内展开详情」）：E27/E29/E30 的变异锚点改挂
+ *   新落点（统计行主体由「需求」改为「异常」；滚动加载改为分页 ⇒ E30 变异锚点改成分页总数）。
+ *
  * 用法：node scripts/selfverify-explanation-kpi-facts.mjs
  *   逐条改坏 ⇒ 对应 E 必须转红 ⇒ 再还原。探针假绿比没探针更坏。
  *
@@ -43,16 +46,17 @@ const cases = [
   },
   {
     // store 的 totalFacts 退回「已加载条数」⇒ E27 转红（这正是原始 bug）
+    //   2026-11-17 起 totalFacts 允许为 null（后端没返 totalCount 时页面显示「未提供」）⇒ 锚点跟着改
     id: 'E27',
     file: STORE,
-    from: 'const totalFacts = computed(() => data.value?.totalCount ?? 0)',
+    from: 'const totalFacts = computed<number | null>(() => data.value?.totalCount ?? null)',
     to: 'const totalFacts = computed(() => data.value?.scheduleExplanationFacts?.length ?? 0)'
   },
   {
     // view 计数行改用已加载条数 ⇒ E27 转红（2026-11-10 KPI 移除后，计数行是总数唯一的落点）
     id: 'E27',
     file: VUE,
-    from: '共 {{ totalFacts }} 条 · 已显示 {{ loadedFactsCount }} 条',
+    from: '共 {{ totalFactsText }} 条 · 已显示 {{ loadedFactsCount }} 条',
     to: '共 {{ loadedFactsCount }} 条 · 已显示 {{ loadedFactsCount }} 条'
   },
 
@@ -134,20 +138,21 @@ const cases = [
   },
   {
     // 页面不再展示证据摘要 ⇒ E29 转红
+    //   2026-11-21（v0.2 稿 §P08 并表）：清单行变量统一为 `row` ⇒ 锚点跟着改
     id: 'E29',
     file: VUE,
-    from: 'v-if="f.evidenceSummary"',
+    from: 'v-if="row.evidenceSummary"',
     to: 'v-if="false"',
     all: true
   },
 
-  /* ===== E30：计数行 + 继续加载 + 分组滚动 ===== */
+  /* ===== E30：计数行 + 继续加载 + 客户端分页 ===== */
   {
     // 计数行被删（又变回静默截断，用户看不出被截断）⇒ E30 转红
     id: 'E30',
     file: VUE,
-    from: '共 {{ totalFacts }} 条 · 已显示 {{ loadedFactsCount }} 条',
-    to: '共 {{ totalFacts }} 条'
+    from: '共 {{ totalFactsText }} 条 · 已显示 {{ loadedFactsCount }} 条',
+    to: '共 {{ totalFactsText }} 条'
   },
   {
     // 「继续加载」按钮去掉 ⇒ E30 转红
@@ -157,11 +162,13 @@ const cases = [
     to: '@click="() => {}"'
   },
   {
-    // 分组内滚动去掉（几百条事实会把页面撑到几万像素）⇒ E30 转红
+    // 客户端分页失效（总数算 0 ⇒ 用户翻不动后面的事实）⇒ E30 转红
+    //   2026-11-21（v0.2 稿 §P08 并表）：原先判据是「分组内独立滚动」的 .fact-list，
+    //   该清单块已撤（任务/资源/工段级并进一张表）⇒ 改判「分页条总数」。
     id: 'E30',
     file: VUE,
-    from: '  max-height: 420px;\n  overflow-y: auto;',
-    to: '  max-height: none;'
+    from: ':total="filteredRows.length"',
+    to: ':total="0"'
   },
   {
     // 累计加载上限被撤（dev 最大版本 37 万条 ⇒ 会把浏览器拖死）⇒ E30 转红

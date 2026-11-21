@@ -1533,7 +1533,8 @@ internal class PhaseOneConstraintBuilder
                           Quantity = m.Quantity,
                           AvailableTime = m.AvailableTime,
                           SourceType = m.SourceType,
-                          SourceKey = m.SourceKey
+                          SourceKey = m.SourceKey,
+                          TimeBasis = m.TimeBasis
                       })
                       .ToList()
             );
@@ -1851,6 +1852,55 @@ internal class ConstraintContext
     public Dictionary<string, RoutePathKey> ChosenBatchRoutePaths { get; set; } = new(StringComparer.Ordinal);
 
     /// <summary>
+    /// **失败执行批 → Phase2 实际评过的候选路径**（2026-11-20，本号位）。
+    ///
+    /// <para><b>为什么需要</b>：`ChosenBatchRoutePaths` 只在**胜出**批登记（Phase2 `RunBatchPlan` 步骤 4）。
+    ///   批落不下 ⇒ 一条都不登记 ⇒ 多路径物料 + 需求无固定 `RouteCode/PathId` 时，
+    ///   <see cref="TryGetBatchRoutingGraph"/> 按 Q-3「多路径且未登记 ⇒ 不猜」返回 false ⇒
+    ///   Phase4 `TryResourceSwitch` 连工艺图都取不到，**修复永远 0 Task**（跨窗兜底根本没机会跑）。
+    ///   实测三条隔离样本（999561_135704 / 165555 / 185584）全是这形态。</para>
+    ///
+    /// <para><b>口径（不是"重选路径"）</b>：本表存的是 Phase2 **本来就已经试排过**的那组候选路径
+    ///   （按候选下标顺序、确定性）。Phase4 只按**同一顺序**逐条重试；不新增候选、不重排顺序、
+    ///   不跨物料 —— 与 RT-002「局部修复不得换路径」不冲突（此处本就没有"被选中的路径"）。</para>
+    ///
+    /// <para><b>不登记的情形</b>：单路径退化 / 需求自带固定路径（走既有回落链）/ 批在候选循环前被否 ⇒ 空表，
+    ///   行为与升维前**逐字一致**（零回归）。</para>
+    /// </summary>
+    public Dictionary<string, List<RoutePathKey>> FailedBatchAttemptedRoutePaths { get; set; } = new(StringComparer.Ordinal);
+
+    /// <summary>
+    /// 取**失败批**试过的候选图（按 Phase2 候选顺序，跳过本物料下不存在的路径键）。
+    /// 全部落空 ⇒ false（调用方仍按「取不到图」Fail Closed，**不猜**）。
+    /// </summary>
+    public bool TryGetFailedBatchRoutingGraphs(
+        string batchKey,
+        int materialId,
+        [NotNullWhen(true)] out List<RoutingGraph>? graphs)
+    {
+        graphs = null;
+        if (!FailedBatchAttemptedRoutePaths.TryGetValue(batchKey, out var attempted) || attempted.Count == 0)
+        {
+            return false;
+        }
+
+        if (!RoutingGraphs.TryGetValue(materialId, out var byPath) || byPath.Count == 0)
+        {
+            return false;
+        }
+
+        var list = new List<RoutingGraph>(attempted.Count);
+        foreach (var key in attempted)
+        {
+            if (byPath.TryGetValue(key, out var g) && g is not null) list.Add(g);
+        }
+
+        if (list.Count == 0) return false;
+        graphs = list;
+        return true;
+    }
+
+    /// <summary>
     /// **需求 → 本 Run 该需求的执行批清单（批键 + 本批数量）**（P0-03）。
     ///
     /// Phase4 局部修复的基本单位 = **执行批**（不是 `LogicalProductionDemand`）：据此**逐批**重建，
@@ -1977,8 +2027,16 @@ internal class ConstraintContext
 
         if (ChosenBatchRoutePaths.TryGetValue(batchKey, out var chosen))
         {
-            return RoutingGraphs.TryGetValue(materialId, out var byPath)
-                   && byPath.TryGetValue(chosen, out graph);
+            if (RoutingGraphs.TryGetValue(materialId, out var byPath) && byPath.TryGetValue(chosen, out graph))
+            {
+                return true;
+            }
+
+            // 2026-11-20 探针（纯观测）：批键**已登记**选中路径，但该路径的图不在 `RoutingGraphs` 里。
+            //   旧实现此处**直接 false**（不再回落需求固定路径/唯一路径）⇒ Phase4 整批无法修复。
+            CrossWindowSlotLocator.ActiveProbe?.RecordStep(
+                $"GR_CHOSEN_NO_GRAPH:mat={materialId}:chosen={chosen}");
+            return false;
         }
 
         if (TryGetRoutingGraph(materialId, demandRouteCode, demandPathId, out graph))
@@ -1986,7 +2044,18 @@ internal class ConstraintContext
             return true;
         }
 
-        return TryGetSingleRoutingGraph(materialId, out graph);
+        if (TryGetSingleRoutingGraph(materialId, out graph))
+        {
+            return true;
+        }
+
+        // 2026-11-20 探针：三条解析路径全落空（批键未登记 / 需求无固定路径 / 物料多路径「不猜」）。
+        {
+            var pathCount = RoutingGraphs.TryGetValue(materialId, out var byPathCount) ? byPathCount.Count : 0;
+            CrossWindowSlotLocator.ActiveProbe?.RecordStep(
+                $"GR_NO_GRAPH:mat={materialId}:route={demandRouteCode ?? "<null>"}:path={demandPathId?.ToString() ?? "<null>"}:paths={pathCount}");
+        }
+        return false;
     }
 
     /// <summary>
@@ -2297,6 +2366,13 @@ internal class ConstraintContext
         var clone = (ConstraintContext)MemberwiseClone();
         clone.ProductTimeline = new ResourceProductTimeline();
         clone.TraceNotes = new List<SolveTraceNote>();
+        // 0号位 v1.7：原始净量登记是「候选试排可写」状态 ⇒ 各候选一份副本（并行候选不得互相污染）。
+        clone.RawBatchNetByExecutionBatchKey = new Dictionary<string, decimal>(RawBatchNetByExecutionBatchKey, StringComparer.Ordinal);
+        // 2026-11-20：失败批候选路径表在候选试排里也会被写（同一批可能多次试排）⇒ 各候选各一份，不互相污染。
+        clone.FailedBatchAttemptedRoutePaths = new Dictionary<string, List<RoutePathKey>>(
+            FailedBatchAttemptedRoutePaths.ToDictionary(
+                kv => kv.Key, kv => new List<RoutePathKey>(kv.Value), StringComparer.Ordinal),
+            StringComparer.Ordinal);
         return clone;
     }
 
@@ -2355,6 +2431,22 @@ internal class ConstraintContext
     ///   会在建字典阶段抛重复 Key 异常。此前仅二维键 ⇒ 键域不足。
     /// </summary>
     public Dictionary<(string DraftId, string StageCode, string OperationCode), LockedTaskConstraint> LockedTasks { get; set; } = new();
+
+    /// <summary>
+    /// **执行批原始净量**登记（0号位 v1.7 两类小数，2026-11-19）。
+    ///
+    /// 键 = <c>ExecutionBatchDraftKey</c>（`EB|需求键|序号`），值 = 本批**未向上圆整**的原始净量。
+    ///   · 第一类（整数需求拆批）：值 == 执行批净量（整数），登记与不登记等价；
+    ///   · 第二类（原生小数）：执行批净量 = `ceil(原始合计)`，本表保留原始小数，供两处消费：
+    ///       ① Phase2 合批（`TryMergeDemandIntoTask`）按**组原始合计**一次 ceil（N-03/N-04，禁逐需求圆整）；
+    ///       ② Phase5 需求份额/三层闭合仍按**原始净量**核对（`Q_original = ΣShare + ΣU`），
+    ///          圆整增量 `Q_round` 只作生产量，不塞给任何需求。
+    ///   · 未登记（A/B 续作、测试夹具、无批键 Task）⇒ 消费方**一律回落** `FinalTaskDraft.Quantity`（零回归）。
+    ///
+    /// ⚠ 隔离：与 `ProductTimeline` / `TraceNotes` 同属「候选试排可写」状态 —— `ShallowCloneForTrial`
+    ///   必须**各给一份副本**，否则并行候选会互相污染原始量登记。
+    /// </summary>
+    public Dictionary<string, decimal> RawBatchNetByExecutionBatchKey { get; set; } = new(StringComparer.Ordinal);
 
     /// <summary>
     /// 共享资源占用块：ResourceId → 占用时间块列表
@@ -2615,6 +2707,30 @@ internal class MaterialAvailabilitySegment
     public DateTime AvailableTime { get; set; }
     public string? SourceType { get; set; }
     public string? SourceKey { get; set; }
+
+    /// <summary>
+    /// 时间语义（S02，2号位 `PeggingOrchestrator:18176-18237` 已发）：
+    /// `KNOWN`＝真实可用时间；`CURRENT`＝现货按计划期起点即时可用；
+    /// `SH_LINKED`＝SH 已有硬依赖下界（时间为计划期起点占位）；
+    /// **`UNRESOLVED` / `SH_TIME_UNRESOLVED`＝数量真实、时间未定**（`AvailableTime` 只是计划期末的**保守上界**，不是可用时间）。
+    ///
+    /// 0号位 v1.5（2026-11-19）：内制件/在制件的未来可用时间**必须由 Solver 排 Task 得出**，
+    /// 不得把"未定"当"当前可用"，也不得把上界当最早可用。消费侧据此改用**任务推导下界**。
+    /// </summary>
+    public string? TimeBasis { get; set; }
+
+    /// <summary>时间未定（不可直接当可用时间）。</summary>
+    public bool IsTimeUnknown =>
+        string.Equals(TimeBasis, "UNRESOLVED", StringComparison.Ordinal)
+        || string.Equals(TimeBasis, "SH_TIME_UNRESOLVED", StringComparison.Ordinal);
+
+    /// <summary>
+    /// 时点必须由**已排 Task 推导**的切片：时间未定，或 `SH_LINKED`（2号位 只在已建
+    /// `MaterialRequirementLink` 时发它，`AvailableTime=planningStart` 只是占位，真实可用时点 =
+    /// 末批源 Task 完工 + Lag）。⇒ 缺硬边时**不得**把占位当"当期可用"（0号位 v1.5 §三 1-CF-B.4）。
+    /// </summary>
+    public bool NeedsTaskDerivedTime =>
+        IsTimeUnknown || string.Equals(TimeBasis, "SH_LINKED", StringComparison.Ordinal);
 }
 
 /// <summary>

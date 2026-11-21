@@ -208,7 +208,7 @@
     apsOverview: '排产总览',
     apsOrder: '订单/需求计划',
     apsExplanation: '异常与原因解释',
-    apsRun: '运行与下发',
+    apsRun: '运行与版本管理',
     apsCandidate: '候选版本确认',
     apsRules: '规则集维护',
     apsParameterSets: '参数集维护',

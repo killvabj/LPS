@@ -233,6 +233,42 @@ internal class PhaseTwoInitialScheduler
     /// 登记一条需求在 Phase2 的自报出口正文（**纯诊断**，见 <see cref="_phase2BlockedDetails"/>）。
     ///   后写覆盖 —— 同一需求多次尝试只保留最后一次。
     /// </summary>
+    /// <summary>
+    /// **2026-11-21**：`P2_NO_ROUTING` 的**冻结分因**（只产诊断正文，不改官方 Reason 码）。
+    /// <para>依据：09 验收包 v2.3 G0-C-02「无Routing Stage 缺合法小时 LT ⇒ `STAGE_LEADTIME_MISSING`，
+    /// 受影响需求局部未排、其他需求继续」；废止覆盖清单 v1.11 O-009「只形成 StageTimingNode，不生成 Task」。</para>
+    /// <para>三档：①有 routeless 提前期片且**全部命中 LT** ⇒ 只做 StageTiming；②有片但**缺 LT** ⇒ `STAGE_LEADTIME_MISSING`；
+    /// ③连 Stage 链都没有 ⇒ StageTimingNode 也无从形成（缺 `StageSequenceChains`/StagePath）。</para>
+    /// </summary>
+    private static string ClassifyNoRouting(LogicalProductionDemand demand, DomainSolveRequest request)
+    {
+        // ⚠ 不能用 `RoutelessLeadStepsByDemand`：它只登记「**有 Routing 的物料**中间的无 Routing Stage」，
+        //   对「整个物料一条 Routing 都没有」**不生成条目**（实测 134/134 全落空 ⇒ 误判成"无 Stage 链"）。
+        //   ⇒ 直接读本次入参的两个原始载体：`StageSequenceChains`（链）与 `StageLeadTimes`（LT）。
+        var chain = request.StageSequenceChains.FirstOrDefault(c => c.MaterialId == demand.MaterialId);
+        var chainStages = chain?.Stages;
+        if (chainStages is null || chainStages.Count == 0)
+        {
+            return "［分因：**无 Stage 链**（缺 `StageSequenceChains`/StagePath）⇒ StageTimingNode 也无从形成］";
+        }
+
+        var ltStages = new HashSet<string>(
+            request.StageLeadTimes
+                .Where(f => f.MaterialId == demand.MaterialId)
+                .Select(f => f.StageCode),
+            StringComparer.Ordinal);
+        var missing = chainStages
+            .Select(s => s.StageCode)
+            .Where(s => !ltStages.Contains(s))
+            .Distinct()
+            .ToList();
+
+        return missing.Count > 0
+            ? $"［分因：无Routing Stage **缺合法小时 LT**（{string.Join("/", missing)}）"
+              + "⇒ 按冻结记 `STAGE_LEADTIME_MISSING`，本需求局部未排］"
+            : "［分因：无Routing Stage **有合法 LT** ⇒ 按冻结只形成 StageTimingNode、**不生成 Task**（O-009）］";
+    }
+
     private void RecordPhase2Block(string? demandKey, string text)
     {
         if (string.IsNullOrEmpty(demandKey)) return;
@@ -846,7 +882,13 @@ internal class PhaseTwoInitialScheduler
         //   在查清 `StageTimingNodeBuilder.Build` 到底改了什么之前，**保持关闭**（传 null = 旧行为）。
         // ⛔ 2026-11-04 关闭（甲案）：r18 实测本预计算把 MISSING_PRODUCTION_DEPARTMENT_CONTEXT
         //   从 2,178 炸到 35,818、FinalTask 归零。原因未查清前**不进主线**。
-        var leadTimeOnlyCompletion = (IReadOnlyDictionary<string, DateTime>?)null;
+        // ── 2026-11-21：改成**受控开关**（默认关闭、零行为变更），用于小域 A/B 复现 r18。
+        //   复现方法：`APS_P2_STAGETIMING_FLOOR=1` 时启用；同一入参跑「关/开」两轮对比未排与 Task 数。
+        //   `BuildLeadTimeOnlyCompletion` 已自带 TraceNotes 回滚（见其注释），因此 r18 的爆炸**不是**
+        //   注记重复导致 —— 真因仍需以两轮实测定位，不以推测代替证据。
+        var leadTimeOnlyCompletion = Environment.GetEnvironmentVariable("APS_P2_STAGETIMING_FLOOR") == "1"
+            ? (IReadOnlyDictionary<string, DateTime>?)BuildLeadTimeOnlyCompletion(request, constraints)
+            : null;
 
         // 原实现（待修复后恢复）：
         // var leadTimeOnlyCompletion = BuildLeadTimeOnlyCompletion(request, constraints);
@@ -1054,7 +1096,12 @@ internal class PhaseTwoInitialScheduler
                     + "［归因："
                     + (constraints.MaterialsWithRoutingInput.Contains(actualDemand.MaterialId)
                         ? "输入**含**本物料的工序行但未建出图（我方 BuildRoutingGraphs）］"
-                        : "输入**不含**本物料的任何工序行（上游装载/过滤）］"));
+                        : "输入**不含**本物料的任何工序行（上游装载/过滤）］")
+                    // ── 2026-11-21：按冻结**分因**（09 验收包 G0-C-02 / 废止清单 O-009）──
+                    //   冻结口径：无 Routing Stage 不生成 Task，只形成 StageTimingNode；
+                    //   「缺合法小时 LT」⇒ `STAGE_LEADTIME_MISSING`，**受影响需求局部未排、其他需求继续**。
+                    //   ⚠ 只改**诊断正文**，官方 `UnscheduledTasks.Reason` 仍是既有码（值域封闭，不自造新码）。
+                    + ClassifyNoRouting(actualDemand, request));
                 continue;
             }
 
@@ -1117,7 +1164,8 @@ internal class PhaseTwoInitialScheduler
                     actualDemand.StartOperationCode,
                     graph,
                     constraints,
-                    out var reason);
+                    out var reason,
+                    actualDemand.RequiredStageCode);
 
                 if (ops.Count == 0 && reason == null)
                 {
@@ -1413,14 +1461,88 @@ internal class PhaseTwoInitialScheduler
             //     是 0号位 判词（AUD-1-006 / V1_3 F-03）的设计口径，**非副作用**。
             //   ⚠ **回退** = 删掉这两个实参（单点、可逆）。
             var ledgerMark = piStageLedger.Mark();
+            var piStageContext = ResolvePiStageContext(
+                piStageIndex,
+                actualDemand.ProductionInstructionNo,
+                actualDemand.MaterialId,
+                actualDemand.StartStageCode);
+
+            // ══════════════════════════════════════════════════════════════════════════════
+            // 0号位 v1.7 Q4 / N-05 / N-06（2026-11-19）：**PI/Stage 硬上限 = 合法部分排**，
+            //   **不再**因「圆整/需求超过法定可新成批量」整条判技术冲突。
+            //   逐字口径：「不得突破 PI/Stage 法定上限。可缩减到本次合法的整数可排量，必要时整条不排；
+            //   只形成正常业务未排和原因，不进入技术错误」「合法物理整数上限可保守取 floor(本次真实剩余硬上限)」
+            //   「取 14、原始需求剩余 0.754 作为明确未排」「若合法上限 0 ⇒ 排 0、整条未排 14.754」。
+            //   实现：上限判定**复用同一门禁** `EvaluatePiLegalQuantityGate`（不复制上限公式）——
+            //     先以整数目标 `Q_target`（第一类 = Q_raw；第二类 = ceil(Q_raw)）判一次；
+            //     仅当原因是 `PI_LEGAL_QTY_OVER_LIMIT`（**合同前置全部成立、纯粹量超**）才截断；
+            //     `PI_LEGAL_QTY_CONTRACT_PENDING`（PI 行缺失/不唯一/Stage 位置不可信）仍走原 Fail Closed 分支
+            //     —— 那是**输入契约缺陷**，不得伪装成「正常容量不足」静默吞掉（v1.7 Q4 末段）。
+            //   截断只改「本次排产量」，**不改原需求净量**：剩余量由 Phase5 出口记 `UnscheduledQty`
+            //     （`PI_LEGAL_QTY_OVER_LIMIT`，正常业务未排，非 ERROR）。
+            // ══════════════════════════════════════════════════════════════════════════════
+            if (!actualDemand.IsContinuation && !actualDemand.NoSplitMerge)
+            {
+                var piTargetQty = actualDemand.NetOutputQty == decimal.Truncate(actualDemand.NetOutputQty)
+                    ? actualDemand.NetOutputQty
+                    : decimal.Ceiling(actualDemand.NetOutputQty);
+                // ⚠ 必须把**本 Run 已占用**并入 Stage 上下文（V1_4 NEW-04 同一口子）：
+                //   同一 PI × 同 Stage 的后续需求，可用量 = 基线 − 前面各需求已形成的批。
+                //   否则第 2 条需求会按「未扣减」的基线算出一个偏大的上限 ⇒ 批级门禁照样拒，
+                //   又退回「整条未排」，与 N-05 的部分排目标相悖。
+                var piStageContextForCap = MergeLedgerIntoStageContext(
+                    piStageContext,
+                    piStageLedger,
+                    actualDemand.ProductionInstructionNo,
+                    actualDemand.MaterialId,
+                    actualDemand.StartStageCode);
+                var piCap = ResolvePiLegalIntegerCapOrNull(
+                    piTargetQty,
+                    actualDemand.ProductionInstructionNo,
+                    actualDemand.MaterialId,
+                    actualDemand.FactoryId,
+                    actualDemand.StartStageCode,
+                    request.PiRemainingFacts,
+                    piStageContextForCap);
+
+                if (piCap.HasValue && piCap.Value < piTargetQty)
+                {
+                    // 观测口径（与 `ApplyPiLegalQuantityGate` 同源）：门禁**确实判了越限并生效**——
+                    //   区别只是本次按合法量部分排，而不是整条拒绝。计数器语义保持「门禁拦截次数」。
+                    SolverDiagnostics.CountPiLegalQuantityGateBlocked();
+                    var demandKey = demand.LogicalDemandKey;
+                    var unscheduledRaw = actualDemand.NetOutputQty - piCap.Value;
+                    if (unscheduledRaw < 0m) unscheduledRaw = 0m;
+                    var capDetail =
+                        $"PI_LEGAL_QTY_OVER_LIMIT：本次执行目标 {piTargetQty} 超出合法可用量 {piCap.Value}"
+                        + $"（= min(PI Original / PI Remaining / Stage 合法自由 − 同PI同Stage已占)，"
+                        + $"PI={actualDemand.ProductionInstructionNo} × 物料 {actualDemand.MaterialId}"
+                        + $" × Stage {actualDemand.StartStageCode}）"
+                        + $" ⇒ 按合法整数可排量 {piCap.Value} 排产，原始需求剩余 {unscheduledRaw} 记**正常业务未排**"
+                        + "（非技术 ERROR、不伪造虚拟 Task、不得突破法定上限）";
+
+                    if (piCap.Value <= 0m)
+                    {
+                        // N-06：合法上限 0 ⇒ 整条未排，不产任何 Task（Phase4 也不得绕过上限去修）。
+                        result.UnscheduledDemandKeys.Add(demandKey);
+                        result.PiLegalQuantityBlocked[demandKey] = capDetail;
+                        continue;
+                    }
+
+                    // N-05：按合法量排产。原始净量保持不动，只把**本次执行量**降到合法整数上限；
+                    //   投入侧按同一比例缩放（良率口径允许小数，不整字段 Round）。
+                    var scaledProc = actualDemand.NetOutputQty > 0m
+                        ? actualDemand.PlannedProcessQty * piCap.Value / actualDemand.NetOutputQty
+                        : actualDemand.PlannedProcessQty;
+                    actualDemand = CloneDemandWithBatchQty(actualDemand, piCap.Value, scaledProc);
+                    result.PiLegalQuantityCapped[demandKey] = capDetail;
+                }
+            }
+
             var formation = FormExecutionBatches(
                 actualDemand, batchPolicy,
                 piFacts: request.PiRemainingFacts,
-                piStageContext: ResolvePiStageContext(
-                    piStageIndex,
-                    actualDemand.ProductionInstructionNo,
-                    actualDemand.MaterialId,
-                    actualDemand.StartStageCode),
+                piStageContext: piStageContext,
                 piStageLedger: piStageLedger);
 
             // P0-02：**无合法批方案**（Min/Max/AllowSplit 冲突）⇒ 本需求 fail-closed（不排），与既有
@@ -1566,6 +1688,14 @@ internal class PhaseTwoInitialScheduler
                 .Select(b => new LPS.APS.Scheduling.Solvers.ExecutionBatchPlanEntry(
                     b.BatchDraftKey, b.NetOutputQty, b.PlannedProcessQty))
                 .ToList();
+
+            // ── 0号位 v1.7（2026-11-19）：登记**最终选中批方案**的原始净量（键 = 执行批键）──
+            //   必须登记在候选择优**之后**（此处）：试排候选会跑不同批数、同序号批的原始量不同，
+            //   若在 `RunBatchPlan` 内登记，落选的试排可能覆盖最终值 ⇒ 合批与 Phase5 会读到错的 Q_raw。
+            foreach (var b in batches)
+            {
+                constraints.RawBatchNetByExecutionBatchKey[b.BatchDraftKey] = b.EffectiveRawNet;
+            }
 
             // 多批时**禁止 Merge**（判据在 `RunBatchPlan` 内：`mergeAllowed && !multiBatch`）。
             // 2026-10-19 四次定位：这是 `RunBatchPlan` 的**第 2 个调用点**（另一个在 `SelectBestBatchPlan` 内、
@@ -1789,6 +1919,14 @@ internal class PhaseTwoInitialScheduler
                         failedPath = failedKey.PathId;
                     }
 
+                    // 2026-11-20：失败批**试过的候选路径**如实登记到上下文 —— Phase4 取图落空时按同一顺序重试。
+                    //   只对「本批」登记；已落定前序批不会进本循环（它们有 ChosenBatchRoutePaths 正式登记）。
+                    if (outcome.FailedBatchAttemptedPaths is { Count: > 0 } attemptedPaths)
+                    {
+                        constraints.FailedBatchAttemptedRoutePaths[failedBatch.BatchDraftKey] =
+                            new List<RoutePathKey>(attemptedPaths);
+                    }
+
                     result.FailedExecutionBatches.Add(new FailedExecutionBatch(
                         demand.LogicalDemandKey,
                         failedBatch.BatchDraftKey,
@@ -1989,7 +2127,11 @@ internal class PhaseTwoInitialScheduler
     /// 【语义边界】该时间属**计划层预计物料可用时间**，不代表实物已生产/报工/入库；
     ///   本方法只产出**时间**，不触碰库存、PI 可承接数量、MES 开工或领料资格。
     /// </summary>
-    private static Dictionary<string, DateTime> BuildLeadTimeOnlyCompletion(
+    /// <remarks>
+    /// 2026-11-21：`private` → **`internal`**，仅供 `LPS.APS.Tests` 直测（与同文件其它为测试开放的方法同口径）。
+    /// 生产调用链不变；测试要验两件事：①能算出时间片；②**TraceNotes 回滚**生效（不重复注入 Issue）。
+    /// </remarks>
+    internal static Dictionary<string, DateTime> BuildLeadTimeOnlyCompletion(
         DomainSolveRequest request,
         ConstraintContext constraints)
     {
@@ -2166,9 +2308,31 @@ internal class PhaseTwoInitialScheduler
         string? startOperationCode,
         RoutingGraph routingGraph,
         ConstraintContext constraints,
-        out string? failureReason)
+        out string? failureReason,
+        string? requiredStageCode = null)
     {
         failureReason = null;
+
+        // EX-T08（2026-11-20，1号位）：**按 `RequiredStageCode`（供给阈值 Stage）截断工序链**。
+        //   冻结依据（`LogicalProductionDemand.RequiredStageCode` 字段说明，源自 PM《BOM取用…》§八）：
+        //     「子件做到这个 Stage 以后，才成为当前父件可使用的 Supply。…
+        //       **本需求不必走完该物料全部 Stage，做到本阶段即为终点**。」
+        //   改前：本方法只裁「起点」、**完全没有终点裁剪** ⇒ 实测 `RequiredStageCode=STAGE2` 的 3 段工艺
+        //     仍排到 STAGE3（越过供给阈值继续生产，白占产能）。
+        //   口径：截断到**该 Stage 的最后一道工序**（该 Stage 内的多道工序仍要全部做完）；
+        //     若该 Stage 不在本路径图中（数据不一致）⇒ **保持原链不截断**（不据此静默删工序）。
+        List<OperationNode> CropToRequiredStage(List<OperationNode> ordered)
+        {
+            if (string.IsNullOrEmpty(requiredStageCode) || ordered.Count == 0) return ordered;
+            var cutIndex = -1;
+            for (var i = 0; i < ordered.Count; i++)
+            {
+                if (string.Equals(ordered[i].StageCode, requiredStageCode, StringComparison.Ordinal))
+                    cutIndex = i;   // 取**最后一道**属于该 Stage 的工序
+            }
+            if (cutIndex < 0 || cutIndex >= ordered.Count - 1) return ordered;
+            return ordered.Take(cutIndex + 1).ToList();
+        }
 
         // 构建邻接表和入度表。节点身份 = (StageCode, OperationCode)（0号位 2026-09-29 裁决 §5.3）
         var adjacency = new Dictionary<OperationNodeKey, List<OperationNodeKey>>();
@@ -2281,7 +2445,7 @@ internal class PhaseTwoInitialScheduler
             }
 
             // 从该 Operation 开始，找所有可达后续工序（含自己）
-            return CropToReachable(result, new[] { startKey }, routingGraph);
+            return CropToRequiredStage(CropToReachable(result, new[] { startKey }, routingGraph));
         }
 
         // P0-02修复 + 第4轮修复：根据StartStageCode裁剪已完成的Stage
@@ -2298,14 +2462,15 @@ internal class PhaseTwoInitialScheduler
             }
 
             // 从 StartStage 工序开始，找所有可达后续工序（含自己）
-            return CropToReachable(
-                result,
-                startOperations.Select(op => OperationNodeKey.Of(op.StageCode, op.OperationCode)),
-                routingGraph);
+            return CropToRequiredStage(
+                CropToReachable(
+                    result,
+                    startOperations.Select(op => OperationNodeKey.Of(op.StageCode, op.OperationCode)),
+                    routingGraph));
         }
 
         // 两者都空：返回完整 Routing（S23，从首工序开始）
-        return result;
+        return CropToRequiredStage(result);
     }
 
     /// <summary>
@@ -2402,7 +2567,15 @@ internal class PhaseTwoInitialScheduler
         //     ② 发起合批的需求整批无新 Task ⇒ 旧实现连条目都不登记（父件被当「缺料」）。
         //   本表 = 本次落定里所有「被延长过的目标」，外层据此把两者的完工时间都按**延长后**的值改写。
         //   空表 = 本次没有合批落定（与旧口径逐字等价）。
-        IReadOnlyList<(string DemandKey, DateTime Start, DateTime End)> MergedTargets);
+        IReadOnlyList<(string DemandKey, DateTime Start, DateTime End)> MergedTargets,
+        // ── 2026-11-20（本号位，0号位「排不下红线」口径下的信息闭环）：**首个未落定批**试过的候选路径 ──
+        //   只有**胜出**批才会登记 `ChosenBatchRoutePaths`（见 `RunBatchPlan` 步骤 4），失败批**一条都不登记**
+        //   ⇒ 多路径物料 + 需求无固定 Route/Path 时，Phase4 `TryGetBatchRoutingGraph`「多路径且未登记不猜」
+        //   ⇒ 修复连工艺图都取不到，永远 0 Task（实测：999561_135704/165555/185584 三条隔离样本同一形态）。
+        //   本字段 = **Phase2 自己已经评过的**那一组候选路径（按候选下标顺序），供 Phase4 **按同一顺序重试**，
+        //   不是重选路径、不引入任何新的猜测：候选集合与顺序完全来自 Phase2 的试排记录。
+        //   null/空 = 批在候选循环之前就被否（或单候选已登记）⇒ 调用方按既有口径处理（零回归）。
+        IReadOnlyList<RoutePathKey>? FailedBatchAttemptedPaths = null);
 
     /// <summary>
     /// 2026-10-20 性能：**单个 Routing 候选试排后的完整隔离状态**。
@@ -2569,6 +2742,8 @@ internal class PhaseTwoInitialScheduler
         var planCompletion = DateTime.MinValue;
         // 2026-10-28：合批落定的目标（被延长过的既有 Task 所属需求 + 其起止）。未合批 ⇒ 空表。
         var mergedTargets = new List<(string DemandKey, DateTime Start, DateTime End)>();
+        // 2026-11-20：首个未落定批**试过的候选路径**（按候选下标顺序；未失败 ⇒ null）。
+        IReadOnlyList<RoutePathKey>? failedBatchAttemptedPaths = null;
 
         for (int batchIndex = 0; batchIndex < batches.Count; batchIndex++)
         {
@@ -2594,7 +2769,12 @@ internal class PhaseTwoInitialScheduler
             var requireIdentityPreserving = multiBatch;
             var allowMergeForThisBatch = mergeAllowed;
             // 单批：直接用原实例（零回归）；多批才克隆并覆写本批数量。
-            var batchDemand = multiBatch
+            // ── 0号位 v1.7 两类小数（2026-11-19）：**第二类单批也必须用本批执行净量** ──
+            //   旧形态只在 `multiBatch` 时克隆 ⇒ `count==1` 直接沿用原始实例 ⇒ 14.754 仍是 14.754，
+            //   第二类的「ceil 一次」被静默丢掉（N-02 必红）。现改为：**本批净量与需求净量不等**（即发生圆整）
+            //   时同样克隆，让 Task.Quantity 取本批**整数执行量**；原始小数另存登记表，不丢。
+            var batchQtyDiffers = batch.NetOutputQty != actualDemand.NetOutputQty;
+            var batchDemand = (multiBatch || batchQtyDiffers)
                 ? CloneDemandWithBatchQty(actualDemand, batch.NetOutputQty, batch.PlannedProcessQty)
                 : actualDemand;
 
@@ -3018,6 +3198,11 @@ internal class PhaseTwoInitialScheduler
                 //   已落定的前序批**不得**再进入 Phase4 重新展开（否则重复生产）。
                 batchFailed = true;
                 failedBatchIndex = batchIndex;
+                // 2026-11-20：把**本批实际评过的候选路径**如实留痕（同一顺序）。
+                //   只用于「失败批 Phase4 重试同一组路径」，**不是**选路结果 —— 胜出批仍走下方 `:3118` 登记。
+                failedBatchAttemptedPaths = plannedCandidates.Count == 0
+                    ? null
+                    : plannedCandidates.Select(c => c.Key).ToList();
                 break;
             }
 
@@ -3189,7 +3374,8 @@ internal class PhaseTwoInitialScheduler
             }
         }
 
-        return new BatchPlanRunOutcome(batchFailed, newTasks, setupTotal, planCompletion, failedBatchIndex, landedDirection, batchDirections, mergedTargets);
+        return new BatchPlanRunOutcome(batchFailed, newTasks, setupTotal, planCompletion, failedBatchIndex,
+            landedDirection, batchDirections, mergedTargets, failedBatchAttemptedPaths);
     }
 
     /// <summary>
@@ -5102,22 +5288,41 @@ internal class PhaseTwoInitialScheduler
 
         if (constraints.MaterialAvailability.TryGetValue(allocationSequence, out var segments) && segments.Count > 0)
         {
+            // ── 0号位 v1.5（2026-11-19）：时间未定 ≠ 当前可用，也不是计划期末可用 ──
+            //   2号位 对 WIP/PI/PO 等发 `TimeBasis=UNRESOLVED`（`AvailableTime` 只是**计划期末保守上界**），
+            //   对无 link 的 SH 发 `SH_TIME_UNRESOLVED`。这些切片的真实可用时点**只能由 Solver 排出的子件 Task 推导**
+            //   （= `dynamicMaterialFloor`）。⇒ 本处把它们的时间换成该下界；下界不可得 ⇒ **显式判不足**，
+            //   不得把上界当最早可用、也不得静默当齐料（v1.5 §三.1）。
+            DateTime EffectiveTime(MaterialAvailabilitySegment s)
+                => s.NeedsTaskDerivedTime
+                    ? (dynamicMaterialFloor > DateTime.MinValue ? dynamicMaterialFloor : DateTime.MaxValue)
+                    : s.AvailableTime;
+
             // P0-05修复：累计可用数量，找到满足需求数量的最早时间
             decimal accumulated = 0m;
-            foreach (var segment in segments.OrderBy(s => s.AvailableTime))
+            foreach (var segment in segments.OrderBy(EffectiveTime))
             {
                 accumulated += segment.Quantity;
                 if (accumulated >= requiredQuantity)
                 {
-                    // 累计数量满足需求，返回该段时间
-                    staticEarliest = segment.AvailableTime;
+                    var effective = EffectiveTime(segment);
+                    if (effective == DateTime.MaxValue)
+                    {
+                        // 只能靠「时间未定且无任务下界」的切片满足 ⇒ 显式不足（缺边不得假齐套）
+                        isSufficient = false;
+                        staticEarliest = planningStart;
+                        return staticEarliest > dynamicMaterialFloor ? staticEarliest : dynamicMaterialFloor;
+                    }
+                    staticEarliest = effective;
                     return staticEarliest > dynamicMaterialFloor ? staticEarliest : dynamicMaterialFloor;
                 }
             }
 
             // P0-05修复：所有段累计仍不足需求量，标记不足并返回最后一段时间
             isSufficient = false;
-            staticEarliest = segments.Max(s => s.AvailableTime);
+            staticEarliest = segments.Max(EffectiveTime);
+            if (staticEarliest == DateTime.MaxValue)
+                staticEarliest = planningStart;
             return staticEarliest > dynamicMaterialFloor ? staticEarliest : dynamicMaterialFloor;
         }
 
@@ -5379,13 +5584,17 @@ internal class PhaseTwoInitialScheduler
                 return $"①无可用日历窗（{tooShort} 个有系数的资源一个日历窗都没有，本工序需 {maxNeededMinutes:0.##} 分钟）";
             }
 
-            // PV195 跨窗（2026-10-29）后改写：**单窗装不下 ≠ 排不下** —— 求解器现已按跨日历窗累计有效分钟
-            //   重试过（`CrossWindowSlotLocator`）。走到这里说明**连跨窗也没凑够**，真因只可能是
-            //   ①日历总覆盖不足，或 ②累计过程中被已有占用挡掉。写成「单窗容不下」会把②误报成①。
-            return "①单窗装不下且跨窗累计后仍凑不够（"
+            // ── 2026-11-20 更正（本号位 实测）：**Phase2 根本不做跨窗**，旧文案「已按跨日历窗重试」是假话 ──
+            //   事实：跨日历窗（`CrossWindowSlotLocator`）只在 **Phase4** 「常规修复一个 Task 都没排出」
+            //   之后临时置 `AllowCrossWindowSlot=true` 重试**一次**（见 `PhaseFourLocalRepair` 同名注释），
+            //   Phase2 的 `FindForwardSlot` **末尾没有**跨窗分支。
+            //   本行仍属**Phase2 的失败正文**，只能如实写「单窗装不下 ⇒ 交 Phase4 跨窗兜底」，
+            //   不得再宣称已经重试过（会把「Phase4 没兜住」误报成「日历总覆盖不足」）。
+            return "①单窗装不下（交 Phase4 跨窗兜底）："
                    + $"{tooShort} 个有系数的资源，其**最长**日历窗 {longestWindowMinutes:0.##} 分钟"
                    + $" < 本工序最长需 {maxNeededMinutes:0.##} 分钟"
-                   + "；现已按跨日历窗累计有效分钟重试，仍未凑够 ⇒ 日历总覆盖不足，或累计途中被占用挡掉）";
+                   + "；Phase2 不做跨窗，跨日历窗只在 Phase4『常规修复 0 Task』后重试一次 —— "
+                   + "若随后仍无 Task，见 Phase4 的 `PHASE4_NO_TASK_AFTER_REPAIR` 明细";
         }
 
         return "②日历窗够长但窗内无空档（"
@@ -5861,8 +6070,18 @@ internal class PhaseTwoInitialScheduler
         string BatchDraftKey,            // EB|{逻辑需求键}|{批序号:D3}
         string SourceLogicalDemandKey,
         int Ordinal,                     // 1 起、连续
-        decimal NetOutputQty,            // 本批净产出（各批求和 = 需求 NetOutputQty，逐分不丢）
-        decimal PlannedProcessQty);      // 本批计划加工量（各批求和 = 需求 PlannedProcessQty）
+        decimal NetOutputQty,            // 本批**执行**净产出（第二类向上圆整后的整数）
+        decimal PlannedProcessQty,       // 本批计划加工量（各批求和 = 需求 PlannedProcessQty）
+        // ── 0号位 v1.7（2026-11-19）两类小数：**原始净量**（永不改写，只读留痕）──
+        //   第一类（整数需求被拆批）：取整发生在批形成，`Q_raw` 仍是整数 ⇒ 与 NetOutputQty 一致（不需额外承载）；
+        //   第二类（原生小数）：`NetOutputQty` = 向上圆整后的**整数执行批净量**，`RawNetOutputQty` 保留原始小数，
+        //     供 ① 合批时按「组原始合计一次 ceil」（N-03/N-04，禁逐需求圆整）② Phase5 需求份额仍按原始净量闭合。
+        //   缺省 0 ⇒ 视同「无圆整」（回落 NetOutputQty），既有构造点逐字不变。
+        decimal RawNetOutputQty = 0m)
+    {
+        /// <summary>本批**原始**净量（未圆整）；未登记时回落 <see cref="NetOutputQty"/>（A/B、第一类、无圆整）。</summary>
+        public decimal EffectiveRawNet => RawNetOutputQty > 0m ? RawNetOutputQty : NetOutputQty;
+    }
 
     /// <summary>
     /// 解析需求对应的 ⑧块 Batch Policy（**P0-01 整改**，0号位 2026-10-07《未命名的Markdown文件 (7).md》§四）。
@@ -5937,15 +6156,37 @@ internal class PhaseTwoInitialScheduler
         DomainSolveRequest request,
         ConstraintContext constraints)
     {
+        // 2026-11-20（本号位）：**判定核心**抽成 DTO 版（`ResolveExecutionBatchPolicyCore`），供
+        //   D-04「10,225 条 Batch Policy 分类」诊断**离线复算**使用 —— 诊断出口在测试侧，不能再建第二套判定。
+        //   本方法 = 原实现逐字委托，行为**逐位不变**。
+        return ResolveExecutionBatchPolicyCore(
+            demand.MaterialId,
+            demand.StartStageCode,
+            request.MaterialStageDepartmentContexts,
+            request.StrategySnapshot,
+            constraints.ExecutionBatchPolicies);
+    }
+
+    /// <summary>
+    /// ⑧块 Batch Policy 判定的 **DTO 版核心**（2026-11-20 抽出，行为与 <see cref="ResolveExecutionBatchPolicy"/> 逐位一致）。
+    /// 用途：①生产路径（上面委托）；②D-04 离线诊断（测试侧直接按 request DTO 复算，**不复制判定公式**）。
+    /// </summary>
+    internal static BatchPolicyResolution ResolveExecutionBatchPolicyCore(
+        int materialId,
+        string? startStageCode,
+        IReadOnlyList<MaterialStageDepartmentContextDto> stageDeptContexts,
+        SolverStrategySnapshot? snapshot,
+        IReadOnlyList<BatchPolicyRuleSnapshot> policies)
+    {
         // 部门反查（两条路径共用）：与 2号位 `BuildStates` 推导键集**同源**
         //   （同查 `MaterialStageDepartmentContexts`）⇒ 按本载体查键**必命中**（贵件 v1.1 §2.4「键集」）。
         int? deptId = null;
-        if (!string.IsNullOrEmpty(demand.StartStageCode))
+        if (!string.IsNullOrEmpty(startStageCode))
         {
-            foreach (var ctx in request.MaterialStageDepartmentContexts)
+            foreach (var ctx in stageDeptContexts)
             {
-                if (ctx.MaterialId == demand.MaterialId
-                    && string.Equals(ctx.StageCode, demand.StartStageCode, StringComparison.Ordinal))
+                if (ctx.MaterialId == materialId
+                    && string.Equals(ctx.StageCode, startStageCode, StringComparison.Ordinal))
                 {
                     deptId = ctx.ProductionDepartmentId;
                     break;
@@ -5961,12 +6202,12 @@ internal class PhaseTwoInitialScheduler
         //     `null` 分支」；生产路径 `PeggingOrchestrator` 恒非 null，故该分支只对测试夹具生效）。
         //   ⚠ **键未命中 ⇒ 载体缺陷 ⇒ Fail Closed（判 `Unknown`），绝不推断 `Missing`** —— 我方 C-2 条件；
         //     贵件 §2.4 亦逐字「键未被覆盖 ⇒ 按『状态不可获得』处置（**不得推断**）」。
-        if (request.StrategySnapshot?.BatchPolicyStates is { } states)
+        if (snapshot?.BatchPolicyStates is { } states)
         {
-            return ResolveFromCarrier(demand, deptId, states, constraints);
+            return ResolveFromCarrier(materialId, deptId, states, policies);
         }
 
-        if (constraints.ExecutionBatchPolicies.Count == 0)
+        if (policies.Count == 0)
         {
             // ⚠ 2026-10-13 纠正：**不得**再按 06 §281 判 `Missing`（那需要「已可靠证明完全缺配」，本载荷给不出）。
             //   0号位 逐字：「接口把无效规则提前过滤，恰恰说明从空集合**无法区分**『真正无规则』和『存在无效规则
@@ -5979,12 +6220,12 @@ internal class PhaseTwoInitialScheduler
 
         if (deptId is int d)
         {
-            foreach (var p in constraints.ExecutionBatchPolicies)
+            foreach (var p in policies)
             {
-                if (p.MaterialId == demand.MaterialId && p.ProductionDepartmentId == d)
+                if (p.MaterialId == materialId && p.ProductionDepartmentId == d)
                 {
                     return new BatchPolicyResolution(
-                        BatchPolicyMatchState.Valid, p, $"精确命中 (Material={demand.MaterialId}, Dept={d})");
+                        BatchPolicyMatchState.Valid, p, $"精确命中 (Material={materialId}, Dept={d})");
                 }
             }
         }
@@ -6005,7 +6246,7 @@ internal class PhaseTwoInitialScheduler
             BatchPolicyMatchState.Unknown, null,
             deptId is null
                 ? "业务键不完整（StartStageCode 无法反查 ProductionDepartmentId）⇒ 状态不可获得"
-                : $"精确业务键无命中（Material={demand.MaterialId}, Dept={deptId}；⑧块有行）");
+                : $"精确业务键无命中（Material={materialId}, Dept={deptId}；⑧块有行）");
     }
 
     /// <summary>
@@ -6034,15 +6275,15 @@ internal class PhaseTwoInitialScheduler
     /// </list>
     /// </summary>
     private static BatchPolicyResolution ResolveFromCarrier(
-        LogicalProductionDemand demand,
+        int materialId,
         int? deptId,
         IReadOnlyList<BatchPolicyStateSnapshot> states,
-        ConstraintContext constraints)
+        IReadOnlyList<BatchPolicyRuleSnapshot> policies)
     {
         BatchPolicyStateSnapshot? entry = null;
         foreach (var s in states)
         {
-            if (s.MaterialId == demand.MaterialId && s.ProductionDepartmentId == deptId)
+            if (s.MaterialId == materialId && s.ProductionDepartmentId == deptId)
             {
                 entry = s;
                 break;
@@ -6054,7 +6295,7 @@ internal class PhaseTwoInitialScheduler
             // C-2：键未被载体覆盖 ⇒ **载体缺陷** ⇒ Fail Closed，**不得推断 `Missing`**。
             return new BatchPolicyResolution(
                 BatchPolicyMatchState.Unknown, null,
-                $"载体缺陷：BatchPolicyStates 未覆盖本业务键 (Material={demand.MaterialId}, "
+                $"载体缺陷：BatchPolicyStates 未覆盖本业务键 (Material={materialId}, "
                 + $"Dept={(deptId?.ToString() ?? "null")}) ⇒ 按「状态不可获得」Fail Closed（不推断 Missing）");
         }
 
@@ -6063,9 +6304,9 @@ internal class PhaseTwoInitialScheduler
             case BatchPolicyState.Valid:
                 if (deptId is int d)
                 {
-                    foreach (var p in constraints.ExecutionBatchPolicies)
+                    foreach (var p in policies)
                     {
-                        if (p.MaterialId == demand.MaterialId && p.ProductionDepartmentId == d)
+                        if (p.MaterialId == materialId && p.ProductionDepartmentId == d)
                         {
                             return new BatchPolicyResolution(
                                 BatchPolicyMatchState.Valid, p, entry.MatchSource);
@@ -6076,7 +6317,7 @@ internal class PhaseTwoInitialScheduler
                 // 状态说 Valid、参数行却取不到 ⇒ 载体与载荷不一致 ⇒ Fail Closed（不静默降级为空参数成批）。
                 return new BatchPolicyResolution(
                     BatchPolicyMatchState.Unknown, null,
-                    $"载体与载荷不一致：State=Valid 但 BatchPolicies 无同键参数行 (Material={demand.MaterialId}, "
+                    $"载体与载荷不一致：State=Valid 但 BatchPolicies 无同键参数行 (Material={materialId}, "
                     + $"Dept={(deptId?.ToString() ?? "null")}) ⇒ Fail Closed");
 
             case BatchPolicyState.Missing:
@@ -6505,6 +6746,59 @@ internal class PhaseTwoInitialScheduler
     ///
     /// ⚠ 本方法**不读** `Policy` 的任何其他业务旧列，也不以任何默认值顶替缺失量。
     /// </summary>
+    /// <summary>
+    /// 0号位 v1.7 Q4（2026-11-19）：**PI/Stage 合法整数可排量上限**（合法部分排的基数）。
+    ///
+    /// 语义：
+    ///   · 返回 `null` ⇒ **不截断**（无 PI 号 / 目标本身合法 / 或原因是 `PI_LEGAL_QTY_CONTRACT_PENDING`）；
+    ///   · 返回**整数** ⇒ 本次最多可排这么多（`floor(真实剩余硬上限)`），调用方按它降执行量、差额走正常未排。
+    ///
+    /// 【为什么不复制上限公式】上限 = `min(PI Original, PI Remaining, StageFree − 同PI同Stage已占, 配置 Max)`，
+    ///   以及「PI 行唯一 / Stage 位置可信 / 目标 Stage 一致」等前置 —— 全部已在
+    ///   <see cref="EvaluatePiLegalQuantityGate"/> 里逐条实现。此处**复用同一门禁**做有界二分
+    ///   （`log2(Q)` 次调用，Q 为整数目标；单需求级、每需求一次，成本可忽略），
+    ///   保证「截断口径」与「硬门禁口径」**永远不会两套**。
+    ///   单调性成立：某整数 q 合法 ⇒ 任何 q' ≤ q 也合法（上限判据是 `quantity > cap`）。
+    ///   只有**纯粹量超**（`PI_LEGAL_QTY_OVER_LIMIT`）才二分；合同前置缺陷一律返回 null，交原 Fail Closed 处理。
+    /// </summary>
+    internal static decimal? ResolvePiLegalIntegerCapOrNull(
+        decimal targetQuantity,
+        string? productionInstructionNo,
+        int materialId,
+        int factoryId,
+        string? targetStageCode,
+        IReadOnlyList<PiRemainingFact>? piFacts,
+        PiStageQuantityContext? stageContext)
+    {
+        if (string.IsNullOrWhiteSpace(productionInstructionNo)) return null;
+        if (targetQuantity <= 0m) return null;
+
+        var top = decimal.Floor(targetQuantity);
+        if (top <= 0m) return null;
+
+        var reasonAtTop = EvaluatePiLegalQuantityGate(
+            top, productionInstructionNo, materialId, factoryId, targetStageCode, piFacts, stageContext, null);
+        if (reasonAtTop is null) return null;                                   // 目标合法 ⇒ 不截断
+        if (!reasonAtTop.StartsWith("PI_LEGAL_QTY_OVER_LIMIT", StringComparison.Ordinal))
+        {
+            return null;                                                        // 合同前置缺陷 ⇒ 交原分支 Fail Closed
+        }
+
+        // 有界二分：最大合法整数 q ∈ [0, top)（top 已判非法）。
+        decimal lo = 0m;
+        decimal hi = top - 1m;
+        while (lo < hi)
+        {
+            var mid = decimal.Ceiling((lo + hi) / 2m);
+            var reason = EvaluatePiLegalQuantityGate(
+                mid, productionInstructionNo, materialId, factoryId, targetStageCode, piFacts, stageContext, null);
+            if (reason is null) lo = mid;
+            else hi = mid - 1m;
+        }
+
+        return lo;
+    }
+
     internal static string? EvaluatePiLegalQuantityGate(
         decimal quantity,
         string? productionInstructionNo,
@@ -6883,11 +7177,23 @@ internal class PhaseTwoInitialScheduler
         PiStageCommitLedger? ledger)
     {
         // 非正数量不构成合法批（与 `DecideExecutionBatchPlan` 同口径），不适用兜底。
+        // ── 0号位 v1.7（2026-11-19）：本兜底同样受「两类小数」约束 ──
+        //   第二类（原生小数、非续作）的**执行批净量 = ceil(Q_raw)**；原始小数另记 `RawNetOutputQty`，
+        //   供 Phase5 需求份额仍按 Q_raw 闭合。否则兜底批会产出 `13.2924` 这种小数执行批
+        //   （FAMILY_CYL 离线重放实测：整数门禁直接打红整个 Domain）。
         decimal qc = demand.NetOutputQty;
         if (qc <= 0m)
         {
             return null;
         }
+        if (!demand.IsContinuation && qc != decimal.Truncate(qc))
+        {
+            qc = decimal.Ceiling(qc);
+        }
+        // 投入侧按执行量等比缩放（允许小数，不整字段 Round）。
+        var qcProc = demand.NetOutputQty > 0m
+            ? demand.PlannedProcessQty * qc / demand.NetOutputQty
+            : demand.PlannedProcessQty;
 
         // ── 2026-11-02｜**合法无 PI 来源**的完全缺配 C 桶（v1.15 §1320）──────────────────────────
         //   旧实现把「有明确 PI」当成本兜底的**总前提**，无 PI 直接 `return null` ⇒ 回落
@@ -6916,7 +7222,8 @@ internal class PhaseTwoInitialScheduler
                     demand.LogicalDemandKey,
                     Ordinal: 1,
                     NetOutputQty: qc,
-                    PlannedProcessQty: demand.PlannedProcessQty)
+                    PlannedProcessQty: qcProc,
+                    RawNetOutputQty: demand.NetOutputQty)
             });
         }
 
@@ -6944,7 +7251,8 @@ internal class PhaseTwoInitialScheduler
                         demand.LogicalDemandKey,
                         Ordinal: 1,
                         NetOutputQty: qc,
-                        PlannedProcessQty: demand.PlannedProcessQty)
+                        PlannedProcessQty: qcProc,
+                        RawNetOutputQty: demand.NetOutputQty)
                 });
             }
         }
@@ -6989,7 +7297,8 @@ internal class PhaseTwoInitialScheduler
                 demand.LogicalDemandKey,
                 Ordinal: 1,
                 NetOutputQty: qc,
-                PlannedProcessQty: demand.PlannedProcessQty)
+                PlannedProcessQty: qcProc,
+                RawNetOutputQty: demand.NetOutputQty)
         });
     }
 
@@ -7010,6 +7319,7 @@ internal class PhaseTwoInitialScheduler
     {
         var batches = new List<ExecutionBatchDraft>(count);
         decimal netAssigned = 0m;
+        decimal rawAssigned = 0m;
         decimal procAssigned = 0m;
 
         for (int ordinal = 1; ordinal <= count; ordinal++)
@@ -7017,6 +7327,7 @@ internal class PhaseTwoInitialScheduler
             bool last = ordinal == count;
 
             decimal batchNet;
+            decimal rawBatchNet;
             if (!demand.IsContinuation
                 && demand.NetOutputQty > 0m
                 && demand.NetOutputQty == decimal.Truncate(demand.NetOutputQty))
@@ -7029,17 +7340,52 @@ internal class PhaseTwoInitialScheduler
                 var baseNet = decimal.Floor(total / count);
                 var remainder = total - baseNet * count;          // 0..count-1，整数
                 batchNet = baseNet + (ordinal <= remainder ? 1m : 0m);
+                rawBatchNet = batchNet;                           // 第一类：原始量本就是整数
+            }
+            else if (!demand.IsContinuation && demand.NetOutputQty > 0m)
+            {
+                // ── 0号位 v1.7（2026-11-19）：**第二类（原生小数）先圆整一次、再拆批** ──
+                //   逐字口径：「V1 按本次新成批原始需求净量是否为整数区分；原始为正且含小数 ⇒
+                //   先对本次实际成批的原始合计净量做一次向上圆整；不得在合批前逐需求圆整，
+                //   也不得在合批后逐子批分别圆整」＋「逐批净生产量 b_i 为正整数，且 Σb_i = Q_exec」。
+                //   实现：Q_target = ceil(NetOutputQty)，再按「整除 + 余数逐批 +1」分配到本需求各批
+                //   ⇒ 14.754 拆 3 批 = 5+5+5（Σ=15，**不是** 3×ceil(4.918)=15 碰巧相等就要靠这一步保证）；
+                //     14.754 拆 4 批 = 4+4+4+3（Σ=15，逐批各自 ceil 会得 16 —— 禁止）。
+                //   `RawNetOutputQty` 保留本批**未圆整**的原始量（= Net/count 末批补余），供合批时按组一次 ceil。
+                var target = decimal.Ceiling(demand.NetOutputQty);
+                var baseNet = decimal.Floor(target / count);
+                var remainder = target - baseNet * count;
+                batchNet = baseNet + (ordinal <= remainder ? 1m : 0m);
+                rawBatchNet = last
+                    ? demand.NetOutputQty - rawAssigned
+                    : decimal.Round(demand.NetOutputQty / count, 4, MidpointRounding.ToZero);
             }
             else
             {
                 batchNet = last
                     ? demand.NetOutputQty - netAssigned
                     : decimal.Round(demand.NetOutputQty / count, 4, MidpointRounding.ToZero);
+                rawBatchNet = batchNet;   // A/B 续作：冻结事实，原样（含 13.5 等历史小数）
             }
 
             decimal batchProc = last
                 ? demand.PlannedProcessQty - procAssigned
                 : decimal.Round(demand.PlannedProcessQty / count, 4, MidpointRounding.ToZero);
+
+            // ── 0号位 v1.7 N-11（2026-11-19）：第二类**投入侧按本批实际执行量分配** ──
+            //   「良率投入侧 `PlannedProcessQty` 按真实实际执行量及 Stage 规则计算，允许计算中的小数；
+            //     MES 实际执行净量及每个新增批为正整数」「不得全字段 Round」。
+            //   第二类各批执行量不等（4+4+4+3）时，投入量若仍等分，3 件批会拿到与 4 件批相同的投料
+            //   ⇒ 按 `PlannedProcessQty × 本批执行量 ÷ Q_target` 分配；**总量仍守恒**（Σ = 需求 PlannedProcessQty）。
+            if (!demand.IsContinuation
+                && demand.NetOutputQty > 0m
+                && demand.NetOutputQty != decimal.Truncate(demand.NetOutputQty))
+            {
+                var target = decimal.Ceiling(demand.NetOutputQty);
+                batchProc = last
+                    ? demand.PlannedProcessQty - procAssigned
+                    : decimal.Round(demand.PlannedProcessQty * batchNet / target, 4, MidpointRounding.ToZero);
+            }
 
             // ── BATCH-03（0号位 e31a6fb §3）：**批数量严格 > 0**，不得产出 0 件批 / 负尾差批 ──
             //   均分 + 末批补余量在「批数 > 可分辨数量」时会四舍五入出 0 批
@@ -7054,6 +7400,7 @@ internal class PhaseTwoInitialScheduler
             }
 
             netAssigned += batchNet;
+            rawAssigned += rawBatchNet;
             procAssigned += batchProc;
 
             batches.Add(new ExecutionBatchDraft(
@@ -7061,7 +7408,8 @@ internal class PhaseTwoInitialScheduler
                 demand.LogicalDemandKey,
                 ordinal,
                 batchNet,
-                batchProc));
+                batchProc,
+                rawBatchNet));
         }
 
         // ── R-1（2026-10-12，B-011 / 03 §60 / 07 §4651）：**删除**「切分后批数量越界 ⇒ Conflict」──
@@ -7385,6 +7733,24 @@ internal class PhaseTwoInitialScheduler
     /// 只在 `batches.Count &gt; 1` 时调用；`count == 1` 一律直接用原 `LogicalProductionDemand` 实例
     /// （保证单批路径与旧版**逐字一致**，零回归）。
     /// </summary>
+    /// <summary>
+    /// 0号位 v1.7（2026-11-19）：**合批后的执行净量** —— 对合批组**原始合计向上圆整一次**。
+    ///
+    /// 逐字口径：「先合批、后对合批总量向上圆整一次」「不得在合批前逐需求圆整，也不得在合批后逐子批分别圆整」。
+    ///   例 N-03：14.754 + 4.7666 = 19.5206 ⇒ **20**；
+    ///   例 N-04：14.4 + 14.4 = 28.8 ⇒ **29**（逐需求各 `ceil` 会得 15+15=30 —— 明确禁止）。
+    /// A/B（续作）不套本规则 ⇒ 原值相加（含 13.5 等历史小数，冻结事实不得改写）。
+    /// </summary>
+    internal static decimal MergeExecutionQuantity(
+        decimal targetExecQuantity,
+        decimal incomingExecQuantity,
+        decimal rawTarget,
+        decimal rawIncoming,
+        bool roundingEligible)
+        => roundingEligible
+            ? decimal.Ceiling(rawTarget + rawIncoming)
+            : targetExecQuantity + incomingExecQuantity;
+
     internal static LogicalProductionDemand CloneDemandWithBatchQty(
         LogicalProductionDemand demand,
         decimal netOutputQty,
@@ -7880,7 +8246,8 @@ internal class PhaseTwoInitialScheduler
                         planningStart, planningEnd, dynamicMaterialFloor, stageOverlap, mrgOccupancyPristine,
                         // 2026-10-19 性能：`mrgTasks` 是**丢弃副本**（`:4946` 建、`:4951` 传、此后零读取）⇒ 跳过列表摘除
                         //   （省 `DetachIndexBuild` 约 7% ΣPhase，业务结果不变，见 `TryMergeDemandIntoStageBatch` 注释）。
-                        out anchorCombinedTasks, detachTaskList: false, discardAfterRun: true);
+                        out anchorCombinedTasks, detachTaskList: false, discardAfterRun: true,
+                        incomingBatchKey: batchDraftKey);
                 }
                 finally
                 {
@@ -8298,7 +8665,7 @@ internal class PhaseTwoInitialScheduler
                     demand, operations, routingGraph, direction, stageBatches[bestAnchorIndex], constraints,
                     resourceOccupancy, scheduledTasks, allocationTaskShare, demandByKey,
                     planningStart, planningEnd, dynamicMaterialFloor, stageOverlap, occupancyPristine,
-                    out _);
+                    out _, incomingBatchKey: batchDraftKey);
 
                 if (landed is not null)
                 {
@@ -10061,6 +10428,45 @@ internal class PhaseTwoInitialScheduler
         // 计算合并后的总数量
         var mergedQty = targetTask.PlannedProcessQty + demand.PlannedProcessQty;
 
+        // ── 0号位 v1.7 Q3（2026-11-19）：**先合法合批、后对合批总量向上圆整一次** ──
+        //   逐字口径：「不得在合批前逐需求圆整，也不得在合批后逐子批分别圆整」；
+        //   例 N-04：14.4 + 14.4 = 28.8 ⇒ **29**（逐需求各 15 会得 30 —— 禁止）。
+        //   原始量取源（优先级固定，全部是我方已有载体，不新增字段）：
+        //     ① 本批原始净量登记表 `RawBatchNetByExecutionBatchKey`（Phase2 批形成时写入，值未被圆整改写）；
+        //     ② 目标既有份额血缘（`allocationTaskShare`，合批时记录的正是**原始**需求量）；
+        //     ③ 回落 `targetTask.Quantity`（无登记/无血缘：整数需求、A/B、测试夹具 ⇒ 与旧实现同值）。
+        var incomingBatchKey = batchDraftKey ?? ExecutionBatchKey(demand.LogicalDemandKey);
+        var rawIncoming = constraints.RawBatchNetByExecutionBatchKey.TryGetValue(incomingBatchKey, out var rawIn)
+            ? rawIn
+            : demand.NetOutputQty;
+        decimal rawTarget = targetTask.Quantity;
+        if (targetTask.ExecutionBatchDraftKey is { } targetEbKey
+            && constraints.RawBatchNetByExecutionBatchKey.TryGetValue(targetEbKey, out var rawAnchorBatch))
+        {
+            // 目标 = 锚点批原始净量（本批自己的 Q_raw，已在批形成时登记、不被圆整改写）
+            //      + 此前已并入成员的原始净量（份额血缘里记的正是原始量）
+            //   ⚠ 不能直接把 `targetTask.Quantity` 当原始量：第二类的 Quantity 已是 ceil(Q_raw)。
+            var absorbedRaw = allocationTaskShare.TryGetValue(targetTask.FinalDraftId, out var targetShares)
+                              && targetShares.Count > 0
+                ? targetShares.Sum(s => s.ShareQty)
+                : 0m;
+            rawTarget = rawAnchorBatch + absorbedRaw;
+        }
+
+        // A/B（续作或目标带 ContinuationKey）**不套新成批圆整**，保持冻结事实原值（含 13.5 等历史小数）。
+        var roundingEligible = !demand.IsContinuation && targetTask.ContinuationKey is null;
+        var mergedQuantity = MergeExecutionQuantity(
+            targetTask.Quantity, demand.NetOutputQty, rawTarget, rawIncoming, roundingEligible);
+
+        // ── 0号位 v1.7 N-11（2026-11-19）：投入侧按**实际执行量**重算，允许小数 ──
+        //   合批执行量 = ceil(组原始合计) ≥ 原始合计 ⇒ 投入量需按同一比例放大（良率放大是线性的）。
+        //   否则「执行 29 件、却只投 28.8 件的料」——与 N-11「投入侧按真实实际执行量计算」直接冲突。
+        var rawGroupQty = rawTarget + rawIncoming;
+        if (roundingEligible && rawGroupQty > 0m && mergedQuantity != rawGroupQty)
+        {
+            mergedQty = mergedQty * mergedQuantity / rawGroupQty;
+        }
+
         // 获取Operation信息
         // 0号位 2026-09-29 裁决 §5.3：节点身份 = (StageCode, OperationCode)。
         // FinalTaskDraft 侧两字段均已在建 Task 时落值（:1352/:1393 `StageCode = operation.StageCode ?? string.Empty`），
@@ -10257,7 +10663,7 @@ internal class PhaseTwoInitialScheduler
             ResourceCode = targetTask.ResourceCode,
             RouteCode = targetTask.RouteCode,
             PathId = targetTask.PathId,
-            Quantity = targetTask.Quantity + demand.NetOutputQty, // 合并数量
+            Quantity = mergedQuantity, // 合并数量（0号位 v1.7：按**组原始合计**一次 ceil，不是逐需求各取整）
             PlannedProcessQty = mergedQty, // 合并加工数量
             UOM = targetTask.UOM,
             PlannedStartTime = targetTask.PlannedStartTime,
@@ -10280,7 +10686,7 @@ internal class PhaseTwoInitialScheduler
             StageExecutionBatchDraftKey = mergedStageBatchKey,
             StageExecutionBatchQty = mergedStageBatchKey is null
                 ? null
-                : targetTask.Quantity + demand.NetOutputQty
+                : mergedQuantity
         };
 
         // 找到targetTask在scheduledTasks中的索引，替换为mergedTask
@@ -10311,8 +10717,11 @@ internal class PhaseTwoInitialScheduler
             return null;
         }
 
-        // 追加当前Demand的份额（原Task的份额已在之前记录）
-        mergedShareNext.Add((demand.LogicalDemandKey, demand.NetOutputQty));
+        // ── 0号位 v1.7（2026-11-19）：份额血缘只记**被并入需求的原始净量**（锚点需求保持隐式，见下）──
+        //   为什么锚点不显式登记：份额表既有契约是「被并入成员 + 历史成员」，锚点需求由 `SourceDraftId`
+        //   隐式承担剩余量；显式登记会让 `allocationTaskShare` 的既有语义与既有回归（C2-02 等 5 例）漂移。
+        //   圆整增量的归属问题在 Phase5 一侧解决：锚点量取**本执行批原始净量**（不是 `Quantity` 相减）。
+        mergedShareNext.Add((demand.LogicalDemandKey, rawIncoming));
         ShareSet(allocationTaskShare, mergedTask.FinalDraftId, mergedShareNext);
 
         // 第6轮Merge修复：更新资源占用，包含Setup时间
@@ -10385,7 +10794,9 @@ internal class PhaseTwoInitialScheduler
         //   旧写法为此把占用表**逐资源深拷**（16k 实测 `DetachCopy` 6,362 ms = 12.9%，40k 50,650 ms = 12.5%），
         //   而拷贝只为「改完能丢」。现改为：**直接改真表**，跑完在这里用**现成的身份回滚**原样还原 ——
         //   与失败路径（`:7052`/`:7077`）走的是**同一套**函数，不是新写的回滚逻辑。
-        bool discardAfterRun = false)
+        bool discardAfterRun = false,
+        // ── 0号位 v1.7（2026-11-19）两类小数：本需求**本批执行批键**（取原始净量用；null ⇒ 回落 demand.NetOutputQty）──
+        string? incomingBatchKey = null)
     {
         combinedTasks = new List<FinalTaskDraft>();
 
@@ -10397,8 +10808,49 @@ internal class PhaseTwoInitialScheduler
         if (!demandByKey.TryGetValue(anchorKey, out var anchorDemand)) return null;
 
         // 合批数量：锚点批**当前累计**数量（可能已含此前合批的份额）+ 本需求本批数量。
-        var combinedNet = targetBatch[0].Quantity + demand.NetOutputQty;
+        //   0号位 v1.7（2026-11-19）：两类小数下必须回到**原始净量**求和后**一次 ceil**：
+        //     · 锚点批原始量 = 本批 Q_raw（登记表）+ 已并入成员份额（血缘均为原始量）；
+        //     · 本需求原始量 = 本批 Q_raw（登记表）或 demand.NetOutputQty（未圆整）；
+        //     · A/B（续作）不套圆整 ⇒ 原值相加。
+        //   否则 14.4(已圆整为15) + 14.4(已圆整为15) 会得 30，而正确结果是 ceil(28.8)=29。
+        var rawIncomingQty = incomingBatchKey is not null
+                             && constraints.RawBatchNetByExecutionBatchKey.TryGetValue(incomingBatchKey, out var rawInQty)
+            ? rawInQty
+            : demand.NetOutputQty;
+
+        decimal combinedNet;
+        var roundingEligibleForBatch = !demand.IsContinuation && targetBatch[0].ContinuationKey is null;
+        if (roundingEligibleForBatch
+            && constraints.RawBatchNetByExecutionBatchKey.TryGetValue(targetKey, out var rawAnchorQty))
+        {
+            var absorbedRaw = allocationTaskShare.TryGetValue(targetBatch[0].FinalDraftId, out var anchorShares)
+                              && anchorShares.Count > 0
+                ? anchorShares.Sum(s => s.ShareQty)
+                : 0m;
+            // 锚批自身的原始量在登记表里；血缘里是此前并入成员的原始量 ⇒ 合计即组原始净量。
+            combinedNet = decimal.Ceiling(rawAnchorQty + absorbedRaw + rawIncomingQty);
+        }
+        else
+        {
+            combinedNet = targetBatch[0].Quantity + demand.NetOutputQty;
+        }
+
         var combinedProc = targetBatch[0].PlannedProcessQty + demand.PlannedProcessQty;
+
+        // 0号位 v1.7 N-11：投入侧按**实际执行量**同比例放大（与单工序 Merge 同一口径）。
+        if (roundingEligibleForBatch
+            && constraints.RawBatchNetByExecutionBatchKey.TryGetValue(targetKey, out var rawAnchorForProc))
+        {
+            var absorbedRawForProc = allocationTaskShare.TryGetValue(targetBatch[0].FinalDraftId, out var anchorSharesForProc)
+                                     && anchorSharesForProc.Count > 0
+                ? anchorSharesForProc.Sum(s => s.ShareQty)
+                : 0m;
+            var rawGroupForProc = rawAnchorForProc + absorbedRawForProc + rawIncomingQty;
+            if (rawGroupForProc > 0m && combinedNet != rawGroupForProc)
+            {
+                combinedProc = combinedProc * combinedNet / rawGroupForProc;
+            }
+        }
 
         // 合并需求 = 锚点需求身份 + 两需求数量之和（其余字段逐字拷贝；`RequiredAvailableTime` 保留锚点值，
         //   非锚点一侧的交期保护由下方双重把关负责）。
@@ -10755,11 +11207,12 @@ internal class PhaseTwoInitialScheduler
         if (currentShareIdx >= 0)
         {
             shareList[currentShareIdx] =
-                (demand.LogicalDemandKey, shareList[currentShareIdx].ShareQty + demand.NetOutputQty);
+                (demand.LogicalDemandKey, shareList[currentShareIdx].ShareQty + rawIncomingQty);
         }
         else
         {
-            shareList.Add((demand.LogicalDemandKey, demand.NetOutputQty));
+            // 0号位 v1.7：份额记**原始净量**（第二类的执行量已圆整，不能写进需求份额）
+            shareList.Add((demand.LogicalDemandKey, rawIncomingQty));
         }
 
         foreach (var combinedTask in combinedTasks)
@@ -11207,6 +11660,35 @@ internal class InitialScheduleResult
     ///   Phase5 读到即以本表值作为出口 `UnscheduledTaskResult.Reason`。
     /// </summary>
     public Dictionary<string, string> BatchPolicyHardFailures { get; set; } = new(StringComparer.Ordinal);
+
+    /// <summary>
+    /// 0号位 v1.7 Q4 / N-05（2026-11-19）：**已按 PI/Stage 合法量部分排产**的需求
+    /// （键 = `LogicalDemandKey`，值 = 可读明细）。
+    ///
+    /// 语义：本需求**有 Task 落定**（执行量已被压到 `floor(合法上限)`），但**原需求净量更大**
+    ///   ⇒ 差额是**正常业务未排**，不是技术 ERROR。Phase5 据此：
+    ///     ① 出口 `UnscheduledTaskResult.Reason = PI_LEGAL_QTY_OVER_LIMIT`，
+    ///        `UnscheduledQty = 声明量 − 已落定构成量`（原始净量口径，非执行量口径）；
+    ///     ② 该需求键纳入「允许 Σ<Q」的校验集合（P0-04 第 8 项与三层 L1 对部分落定的合法例外）。
+    /// ⚠ 与 `BatchPolicyHardFailures` **分列**：本列**不是**硬业务失败（Phase4 可继续按已登记批方案修复），
+    ///   但修复时**不得**放大到原需求净量（`ExecutionBatchPlans` 里登记的是**截断后**的批数量）。
+    /// </summary>
+    public Dictionary<string, string> PiLegalQuantityCapped { get; set; } = new(StringComparer.Ordinal);
+
+    /// <summary>
+    /// 0号位 v1.7 Q4 / N-06（2026-11-19）：**合法上限为 0 ⇒ 整条未排**的需求
+    /// （键 = `LogicalDemandKey`，值 = 可读明细）。
+    ///
+    /// 与 `PiLegalQuantityCapped` 分开：本列**不产任何 Task**（不得伪造虚拟 Task、不得超 PI 量），
+    ///   Phase4 **禁止**拿原需求净量去「修复」（那会直接突破法定上限）⇒ 由
+    ///   <see cref="IsPiLegalQuantityBlocked"/> 在局部修复入口挡掉；Phase5 出口同上记
+    ///   `PI_LEGAL_QTY_OVER_LIMIT` + 全额未排。
+    /// </summary>
+    public Dictionary<string, string> PiLegalQuantityBlocked { get; set; } = new(StringComparer.Ordinal);
+
+    /// <summary>本需求是否因「PI/Stage 合法上限 = 0」而整条未排（Phase4 入口据此跳过普通修复）。</summary>
+    public bool IsPiLegalQuantityBlocked(string logicalDemandKey)
+        => PiLegalQuantityBlocked.ContainsKey(logicalDemandKey);
 
     /// <summary>
     /// **未落定执行批身份**（P0-03，0号位 2026-10-08 §六 / §十一-2）。

@@ -99,7 +99,7 @@ function getToken() {
       '-H',
       'Content-Type: application/json',
       '-d',
-      '{"userCode":"admin","password":"Admin@123456"}'
+      '{"userCode":"rule_admin","password":"Password@123"}'
     ],
     { encoding: 'utf8' }
   )

@@ -31,7 +31,7 @@ async function ensureToken() {
   const r = await fetch(`${API}/api/auth/login`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ userCode: 'admin', password: 'Admin@123456' })
+    body: JSON.stringify({ userCode: 'rule_admin', password: 'Password@123' })
   })
   const j = await r.json().catch(() => null)
   const t = j?.data?.accessToken

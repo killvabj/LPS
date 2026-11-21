@@ -67,6 +67,23 @@ public class PeggingOrchestrator : IPeggingOrchestrator
     ///  不额外限定 StageCode；不得把 M 理解成品仓／CAST·MACH 制造能力／末道 RoutingStage 仓库；
     ///  确认无 M 是**正常业务结果**不是错误；无法判断只能标 UNKNOWN，不得与『确认无 M』混同、不得默认 TRUE」。
     /// </summary>
+
+
+
+    /// <summary>
+    /// 跨厂 SH 的「`FINAL_` 比较键」（0号位 v1.2 §2.2）：**仅当最左侧确有且只有既定 `FINAL_` 前缀时去掉这一层**。
+    /// 不 `LIKE`、不剥其它前缀、不改变任何 MaterialId —— 只用于候选定位后的受控比较。
+    /// </summary>
+    internal static class ShMaterialComparisonKey
+    {
+        private const string FinalPrefix = "FINAL_";
+
+        public static string StripOne(string code)
+            => code.StartsWith(FinalPrefix, StringComparison.Ordinal)
+                ? code[FinalPrefix.Length..]
+                : code;
+    }
+
     internal static FabricationType ClassifyFabricationType(
         bool hasCrossFactoryEdge, bool hasM, bool mDataIncomplete)
     {
@@ -977,6 +994,206 @@ public class PeggingOrchestrator : IPeggingOrchestrator
     /// （<see cref="RunPeggingOnlyAsync"/>），使整块载荷能被逐项核对，而不必调用 Solver 或落库。
     /// 与 <c>ExecutePeggingWorkflowAsync</c> 共用同一段代码，**杜绝验收路径与生产路径分叉**。
     /// </summary>
+    /// <summary>
+    /// **2-CF-03-A（0号位 2026-11-20 执行指令）**：共享 PI 的「生产源 → 消费方」硬边。
+    ///
+    /// <para>事实：一张 PI 的产出被多个订单共享。本 Run 实测（PV999595）：
+    /// 51,433 条有 WIP 供给的需求里 **51,157 条 Link 的生产方为空**，1号位 `TaskDerivedFloor` 因此拿不到下界。</para>
+    ///
+    /// <para>同时实测：**每个 PI 通常只有一条生产 LPD**（46,133 个 PI：45,895 单条 / 238 两条），
+    /// 也就是说"唯一真实生产来源"本来就存在，缺的只是把消费者指向它。</para>
+    ///
+    /// <para>做法：按 PI 号建「唯一生产 LPD」索引；对 `ProducerLogicalDemandKey` 为空的 Link，
+    /// 若其 `ChildDemandKey` 对应的需求是由该 PI（`SourceType=WIP`，`SourceReference=PI号`）承接的，
+    /// 就把生产方指向该 LPD。**不猜**：同一 PI 有 ≥2 条 LPD ⇒ 跳过并计数；PI 无 LPD ⇒ 保持为空（真正缺链）。</para>
+    /// </summary>
+    /// <summary>2-CF-03-B 用：`[Order]` 行（只取构造 LPD 键所需四列）。</summary>
+    private sealed class ShSourceLpdRow
+    {
+        public string OrderNo { get; set; } = string.Empty;
+        public long   OrderId { get; set; }
+        public string MaterialCode { get; set; } = string.Empty;
+        public int    FactoryId { get; set; }
+    }
+
+    /// <summary>
+    /// **2-CF-03-B（0号位 2026-11-20 执行指令）**：SH 号 → 它在本 Run 的**整单源需求**（Round2 LPD）键。
+    ///
+    /// <para>Round2 为每张**被上层真实承接**的 SH 生成「恰好一条」整单源厂需求，其 `DemandKey`
+    /// 形如 `ORDER_{SH订单Id}_{MaterialCode}_{FactoryId}`。本方法按 SH 号反查 `[Order]` 拿到四列，
+    /// 拼出该键并**只在它确实存在于本 Run 的 LPD 集合中**时才收进映射（否则视为无源需求，不猜）。</para>
+    ///
+    /// <para>用途：把「目标侧消费需求」与「源厂整单生产需求」接成有向边，
+    /// 使 1号位 `TaskDerivedFloor` 能让目标 Task 等源 Task 做完（含跨厂 LT）。</para>
+    /// </summary>
+    private async Task<IReadOnlyDictionary<string, string>> BuildShToSourceLpdMapAsync(
+        PeggingResultVoucher voucher, int planVersionId)
+    {
+        var shNos = voucher.SupplyAllocations
+            .Where(a => a.SourceType == Core.Enum.SupplySourceType.INTER_FACTORY_ORDER)
+            .Select(a => (a.ShippingInstructionNo ?? string.Empty).Trim())
+            .Where(n => n.Length > 0)
+            .Distinct(StringComparer.Ordinal)
+            .ToList();
+        if (shNos.Count == 0) return new Dictionary<string, string>(StringComparer.Ordinal);
+
+        // ⚠ 键类型：`MaterialRequirementLink.Consumer/Producer` 用的是 **LogicalDemandKey**
+        //   （形如 `999595_651391`），而 `ORDER_{OrderId}_{料}_{厂}` 是 **DemandKey**。
+        //   2026-11-20 首版误把 DemandKey 直接当 Producer ⇒ 全部对不上、SH 边 0 条。
+        var logicalByDemandKey = new Dictionary<string, string>(StringComparer.Ordinal);
+        foreach (var d in voucher.LogicalProductionDemands)
+        {
+            if (!string.IsNullOrEmpty(d.DemandKey))
+                logicalByDemandKey[d.DemandKey] = d.LogicalDemandKey;
+        }
+
+        var rows = await QueryChunkedInAsync(shNos, chunk =>
+            _connectionManager.QueryAsync<ShSourceLpdRow>(
+                @"SELECT o.OrderNo, o.Id AS OrderId, o.MaterialCode, o.FactoryId
+                  FROM [Order] o
+                  WHERE o.PlanVersionId = @Pv AND o.OrderNo IN @Nos",
+                new { Pv = planVersionId, Nos = chunk },
+                db: DatabaseId.APS),
+            tag: "2-CF-03-B SH→整单源需求");
+
+        var map = new Dictionary<string, string>(StringComparer.Ordinal);
+        foreach (var r in rows)
+        {
+            var demandKey = $"ORDER_{r.OrderId}_{r.MaterialCode}_{r.FactoryId}";
+            if (logicalByDemandKey.TryGetValue(demandKey, out var logicalKey) && !string.IsNullOrEmpty(logicalKey))
+                map[r.OrderNo.Trim()] = logicalKey;
+        }
+        return map;
+    }
+
+    private static (int Linked, int PiWithMultiLpd, int LinkNoPiLpd, int PiSourced, int ShSourced) LinkSharedPiProductionSource(
+        PeggingResultVoucher voucher,
+        IReadOnlyDictionary<string, string>? shNoToSourceLpd = null)
+    {
+        // ① PI 号 → 唯一生产 LPD 键
+        var piToLpd = new Dictionary<string, string>(StringComparer.Ordinal);
+        var multi = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var d in voucher.LogicalProductionDemands)
+        {
+            var pi = (d.ProductionInstructionNo ?? string.Empty).Trim();
+            if (pi.Length == 0) continue;
+            if (piToLpd.TryGetValue(pi, out var existed))
+            {
+                if (!string.Equals(existed, d.LogicalDemandKey, StringComparison.Ordinal)) multi.Add(pi);
+                continue;
+            }
+            piToLpd[pi] = d.LogicalDemandKey;
+        }
+        foreach (var pi in multi) piToLpd.Remove(pi);
+
+        // ② 需求键 → 其供给来源（一个需求可同时被多张 PI / 多张 SH 承接 ⇒ **按份额拆边**，不择一）
+        //    1号位 2026-11-20 回执 §二.4 明确：「应该按数量份额拆成两条边，每条带各自的 RequiredQty」。
+        var shLpdKeys = shNoToSourceLpd is { Count: > 0 }
+            ? new HashSet<string>(shNoToSourceLpd.Values, StringComparer.Ordinal) : null;
+        var piSourced = 0;
+        var shSourced = 0;
+        var demandToSources = new Dictionary<string, List<(string Key, decimal Qty)>>(StringComparer.Ordinal);
+        void AddSource(string demandKey, string producerKey, decimal qty)
+        {
+            if (!demandToSources.TryGetValue(demandKey, out var list))
+                demandToSources[demandKey] = list = new List<(string, decimal)>();
+            for (var i = 0; i < list.Count; i++)
+            {
+                if (string.Equals(list[i].Key, producerKey, StringComparison.Ordinal))
+                {
+                    list[i] = (producerKey, list[i].Qty + qty);
+                    return;
+                }
+            }
+            list.Add((producerKey, qty));
+        }
+
+        foreach (var a in voucher.SupplyAllocations)
+        {
+            string? producerKey = null;
+
+            if (a.SourceType == Core.Enum.SupplySourceType.WIP)
+            {
+                var pi = (a.SourceReference ?? string.Empty).Trim();
+                if (pi.Length == 0) continue;
+                if (!piToLpd.TryGetValue(pi, out producerKey)) continue;
+            }
+            else if (a.SourceType == Core.Enum.SupplySourceType.INTER_FACTORY_ORDER
+                     && shNoToSourceLpd is not null)
+            {
+                // 2-CF-03-B：SH 供给 ⇒ 其 Round2 整单源需求（LPD）。边缺失时目标侧无法等源厂做完。
+                var shNo = (a.ShippingInstructionNo ?? string.Empty).Trim();
+                if (shNo.Length == 0) continue;
+                if (!shNoToSourceLpd.TryGetValue(shNo, out producerKey)) continue;
+            }
+            else
+            {
+                continue;
+            }
+
+            AddSource(a.DemandKey, producerKey!, a.AllocatedQuantity);
+        }
+
+        // ③ 回填 Link 生产方（init-only ⇒ 重建列表）
+        var linked = 0; var linkNoPiLpd = 0;
+        var rebuilt = new List<Core.Dto.MaterialRequirementLink>(voucher.MaterialRequirementLinks.Count);
+        foreach (var l in voucher.MaterialRequirementLinks)
+        {
+            if (!string.IsNullOrEmpty(l.ProducerLogicalDemandKey))
+            {
+                rebuilt.Add(l);
+                continue;
+            }
+            if (!demandToSources.TryGetValue(l.ChildDemandKey, out var sources) || sources.Count == 0)
+            {
+                linkNoPiLpd++;
+                rebuilt.Add(l);
+                continue;
+            }
+
+            // 单源：原样只补 Producer，RequiredQty 沿用原值（= 该子件需求总量）
+            if (sources.Count == 1)
+            {
+                rebuilt.Add(new Core.Dto.MaterialRequirementLink
+                {
+                    ConsumerLogicalDemandKey   = l.ConsumerLogicalDemandKey,
+                    ProducerLogicalDemandKey   = sources[0].Key,
+                    ChildDemandKey             = l.ChildDemandKey,
+                    ConsumerMaterialId         = l.ConsumerMaterialId,
+                    ProducerMaterialId         = l.ProducerMaterialId,
+                    RequiredQty                = l.RequiredQty,
+                    ProducerAllocationSequence = l.ProducerAllocationSequence,
+                    LagMinutes                 = l.LagMinutes
+                });
+                linked++;
+                if (shLpdKeys is not null && shLpdKeys.Contains(sources[0].Key)) shSourced++; else piSourced++;
+                continue;
+            }
+
+            // 多源：**按份额拆成 N 条边**，各自 RequiredQty（1号位 2026-11-20 §二.4）
+            foreach (var (key, qty) in sources)
+            {
+                var share = qty > 0m ? qty : l.RequiredQty / sources.Count;
+                rebuilt.Add(new Core.Dto.MaterialRequirementLink
+                {
+                    ConsumerLogicalDemandKey   = l.ConsumerLogicalDemandKey,
+                    ProducerLogicalDemandKey   = key,
+                    ChildDemandKey             = l.ChildDemandKey,
+                    ConsumerMaterialId         = l.ConsumerMaterialId,
+                    ProducerMaterialId         = l.ProducerMaterialId,
+                    RequiredQty                = share,
+                    ProducerAllocationSequence = l.ProducerAllocationSequence,
+                    LagMinutes                 = l.LagMinutes
+                });
+                if (shLpdKeys is not null && shLpdKeys.Contains(key)) shSourced++; else piSourced++;
+            }
+            linked++;
+        }
+        voucher.MaterialRequirementLinks.Clear();
+        voucher.MaterialRequirementLinks.AddRange(rebuilt);
+        return (linked, multi.Count, linkNoPiLpd, piSourced, shSourced);
+    }
+
     private async System.Threading.Tasks.Task<(
         DomainSolveRequest SolveRequest,
         List<ContinuityOverCommitEvent> OverCommits,
@@ -1200,6 +1417,21 @@ public class PeggingOrchestrator : IPeggingOrchestrator
         // ③ StartStageCode 填值（2026-09-11，5号位 O3 回复划归 2号位）：Routing 图「无入边源结点」的
         // 大工艺阶段码 → LogicalProductionDemand.StartStageCode（原 BuildLogicalProductionDemand 写空）。
         FillStartStageCodes(voucher, routingOperations, routingDependencies);
+
+        // v1.3 §二-A B5：无 Routing 的需求，起点退回其 PI Position 的真实 Stage（详见方法注释）。
+        FillPiStartStageCodesFromPositions(voucher.LogicalProductionDemands, continuityFacts.PiPositions);
+
+        // ★ 2026-11-21（PM 已裁）：工艺卡挂在**别厂**（如工序记 BJ_MACH/BJ_SURF、Stage 链记 TJ_MACH/TJ_OUTS）
+        //   ⇒ 按「**该阶段无工序**」处理，走目标厂 `StageLeadTimeParam` 的 WORK 小时、产 TimingNode 不产 Task。
+        //   这要求 1号位 知道「从哪个 Stage 起算」；实测 B 类需求 1,804 行中 **1,716 行 StartStageCode 为空**
+        //   （`FillStartStageCodes` 只认 Routing 有向图，工序被 Stage 过滤整片剔光时直接早退）。
+        //   ⇒ 用本次 BOM 的 Stage 链首阶段补齐（链来自 StagePath，本身就是 BOM 事实，不是我方编造）。
+        var chainStartFilled = FillStartStageCodesFromStageChains(
+            voucher.LogicalProductionDemands, effectiveStages.OrderedChains);
+        if (chainStartFilled > 0)
+            _logger.LogInformation(
+                "[Pegging] StartStage 链首兜底（无工序/工序被 Stage 滤净）：回填 {Filled} 条需求（链数={Chains}）",
+                chainStartFilled, effectiveStages.OrderedChains.Count);
         MarkBuild("9 StartStage填值");
 
         // ③c 连续份额路径身份**只诊断、不回填**（2026-10-22 拆桥）。
@@ -1238,6 +1470,20 @@ public class PeggingOrchestrator : IPeggingOrchestrator
             effectiveStages.ByMaterial, routingOperations, voucher.LogicalProductionDemands,
             materialStageDeptContexts, stageLeadTimeCutoff);
         MarkBuild("12 无Routing阶段提前期");
+
+        // 2026-11-21 探针：STAGE_LEADTIME_MISSING 逐条落盘（回答 1号位 BJ_SURF 252 条之问）
+        var sltDumpDir = Environment.GetEnvironmentVariable("APS_SLT_DUMP");
+        if (!string.IsNullOrEmpty(sltDumpDir))
+        {
+            Directory.CreateDirectory(sltDumpDir);
+            var sltFile = Path.Combine(sltDumpDir, $"SLT_MISSING_{DateTime.Now:yyyyMMdd_HHmmss}.tsv");
+            using var sltSw = File.CreateText(sltFile);
+            sltSw.WriteLine("MaterialId	StageCode	FactoryCode	DeptCode");
+            var missing = _missingStageLeadTime ?? new List<(int, string, string?, string?)>();
+            foreach (var (mid, stage, fac, dept) in missing)
+                sltSw.WriteLine($"{mid}	{stage}	{fac ?? "NULL"}	{dept ?? "NULL"}");
+            Console.WriteLine($"[Pegging][SLT] STAGE_LEADTIME_MISSING 逐条落盘：{missing.Count} 条 → {sltFile}");
+        }
 
         if (demandMaterialIds.Count > 0 && routingOperations.Count == 0)
         {
@@ -1313,6 +1559,22 @@ public class PeggingOrchestrator : IPeggingOrchestrator
         var stageProcessQuantities = await BuildStageProcessQuantitiesAsync(
             voucher.LogicalProductionDemands, stageSequenceChains, frozenSnapshot, cancellationToken);
         MarkBuild($"17 逐Stage加工量投影(行={stageProcessQuantities.Count})");
+
+
+        // 2-CF-03-A：共享 PI 的生产源硬边（必须在 LPD 定稿之后、提交 Solver 之前）
+        // 2026-11-21 对账（1号位 §1.3）：同趟打印「回填前/后」，杜绝跨轮混引
+        var linksBeforeFill = voucher.MaterialRequirementLinks.Count(l => !string.IsNullOrEmpty(l.ProducerLogicalDemandKey));
+        var linksTotal = voucher.MaterialRequirementLinks.Count;
+        var shToSourceLpd = await BuildShToSourceLpdMapAsync(voucher, request.PlanVersionId);
+        var piLinkStat = LinkSharedPiProductionSource(voucher, shToSourceLpd);
+        if (piLinkStat.Linked > 0 || piLinkStat.PiWithMultiLpd > 0)
+        {
+            var linksAfterFill = voucher.MaterialRequirementLinks.Count(l => !string.IsNullOrEmpty(l.ProducerLogicalDemandKey));
+            Console.WriteLine(
+                $"[Pegging][2-CF-03-A] 对账（同趟）：Link总数={linksTotal} ｜ 回填前有生产方={linksBeforeFill} ｜ "
+                + $"本次回填={piLinkStat.Linked}（PI源={piLinkStat.PiSourced} / SH源={piLinkStat.ShSourced}，按边计）｜ "
+                + $"回填后有生产方={linksAfterFill} ｜ 多LPD的PI={piLinkStat.PiWithMultiLpd} 个（未猜）｜ 仍无生产源={piLinkStat.LinkNoPiLpd}");
+        }
 
         var solveRequest = new DomainSolveRequest
         {
@@ -2773,7 +3035,7 @@ public class PeggingOrchestrator : IPeggingOrchestrator
                             ManualSlotId     = persistManualSlotId,
                             Status           = "PLANNED",
                             IsLocked         = false,
-                            IsCriticalPath   = false,
+                            IsCriticalPath   = final.IsCriticalPath,   // 2026-11-21：1号位 产出后透传（语义 false=算过且不在关键链，非未算）
                             TaskType         = final.TaskType,
                             // W3：连续份额 / 自由份额 Task 回填 MTS_InstructionNo（无 PI 需求 = null，不得下发 MES）
                             MTS_InstructionNo = mtsInstructionNo,
@@ -3018,7 +3280,7 @@ public class PeggingOrchestrator : IPeggingOrchestrator
                         Duration         = durationHours,
                         Status           = "PLANNED",
                         IsLocked         = false,
-                        IsCriticalPath   = false,
+                        IsCriticalPath   = final.IsCriticalPath,   // 2026-11-21：1号位 产出后透传（语义 false=算过且不在关键链，非未算）
                         TaskType         = final.TaskType,
                         MTS_InstructionNo = mtsInstructionNo,
                         SetupSource      = final.SetupSource,
@@ -5188,6 +5450,16 @@ public class PeggingOrchestrator : IPeggingOrchestrator
         private readonly Dictionary<string, List<SupplyLedgerEntry>> _ledger
             = new(StringComparer.Ordinal);
 
+        // 2026-11-19（0号位 v1.2 §2.2／§3.1）：**SH 候选检索专用索引**。
+        //   键 = SH 订单的物料码，**外加**「去掉一层 FINAL_」的比较键（仅当最左侧确有且只有该前缀）。
+        //   为什么单开一张索引：SH 单在 ERP 上的 `FactoryCode`（=`ProcessCode`）装的是**出货仓所在厂**，
+        //   也就是跨厂边的 `FromFactoryCode`；而 BOM 需求落在边的 `ToFactoryCode`。
+        //   按 `(物料, 目标厂)` 的既有精确键去 `_ledger` 查，源厂、目标厂不同 ⇒ **必然查空**，
+        //   表现为"SH 池里明明有单却永远分配不到"。
+        //   索引只在 `GetInterFactoryEntries` 使用；`_ledger` 的既有键与 Round3／守恒校验一律不动。
+        private readonly Dictionary<string, List<SupplyLedgerEntry>> _shByMaterial
+            = new(StringComparer.Ordinal);
+
         /// <summary>冻结策略快照（Inventory/PI/Procurement 三类排序参数）；缺省时按稳定兜底排序</summary>
         private readonly FrozenStrategySnapshot? _snapshot;
 
@@ -5388,6 +5660,7 @@ public class PeggingOrchestrator : IPeggingOrchestrator
                 // 「与当前物料、边的真实源/目标及业务绑定一致」⇒ 下阶分流时必须按边的 FromFactory 过滤。
                 SourceFactoryId = sourceFactoryId,
                 SourceFactoryCode = sourceFactoryCode,
+                MaterialCode    = materialCode,
                 MaterialId      = materialId,
                 AvailableAt     = availableAt,
                 SourceType      = sourceType,
@@ -5420,8 +5693,39 @@ public class PeggingOrchestrator : IPeggingOrchestrator
 
             list.Add(entry);
             TotalEntries++;
+
+            // 2026-11-19：SH 额外进「按物料」索引（含 FINAL_ 比较键），供跨厂 SH 候选检索。
+            if (sourceType == Core.Enum.SupplySourceType.INTER_FACTORY_ORDER)
+                IndexInterFactoryByMaterial(materialCode, entry);
+
             return entry;
         }
+
+        /// <summary>
+        /// 把 SH 条目登记进按物料的索引。比较键口径严格按 0号位 v1.2 §2.2：
+        /// **仅当物料码最左侧确有且只有既定的 `FINAL_` 前缀时，去掉这一层**；
+        /// 不 `LIKE`、不剥 `ASSY/WIP/FG/RAW` 等其它前缀、不产生任何 MaterialId 合并。
+        /// </summary>
+        private void IndexInterFactoryByMaterial(string materialCode, SupplyLedgerEntry entry)
+        {
+            AddInterFactoryIndexKey(materialCode, entry);
+
+            if (materialCode.StartsWith(FinallStandardizationPrefix, StringComparison.Ordinal))
+                AddInterFactoryIndexKey(materialCode.Substring(FinallStandardizationPrefix.Length), entry);
+        }
+
+        private void AddInterFactoryIndexKey(string key, SupplyLedgerEntry entry)
+        {
+            if (!_shByMaterial.TryGetValue(key, out var entries))
+            {
+                entries = new List<SupplyLedgerEntry>();
+                _shByMaterial[key] = entries;
+            }
+            entries.Add(entry);
+        }
+
+        /// <summary>`FINAL_` 标准化前缀（《01 业务基线》v1.16「FINAL Material标准化」）。</summary>
+        private const string FinallStandardizationPrefix = "FINAL_";
 
         /// <summary>
         /// 返回指定物料+工厂在当前 Demand 业务身份下允许进入的供给条目（PM 2026-08-28 最终裁决：
@@ -5468,13 +5772,37 @@ public class PeggingOrchestrator : IPeggingOrchestrator
         /// </summary>
         public CrossFactoryFacts? CrossFactoryFacts { get; set; }
 
-        public IReadOnlyList<SupplyLedgerEntry> GetInterFactoryEntries(string materialCode, int factoryId)
+        /// <param name="allowedSourceFactoryIds">
+        /// 跨厂边给出的**源厂**集合（=`CrossFactoryEdge.FromFactoryCode` 解析出的 Id）。
+        /// 传入时走「按源厂检索」：从 `_shByMaterial`（含 `FINAL_` 比较键）取该物料的全部 SH，
+        /// 再按源厂过滤 —— 因为 SH 单的工厂字段是**出货厂（源厂）**，与需求所在的**目标厂**不同厂，
+        /// 用 `(物料, 目标厂)` 精确键必然查空（0号位 v1.2 §3.1）。
+        /// 传 null/空集合时保持改动前的精确键行为（Round3 等非 BOM 驱动路径不受影响）。
+        /// </param>
+        public IReadOnlyList<SupplyLedgerEntry> GetInterFactoryEntries(
+            string materialCode, int factoryId, IReadOnlySet<int>? allowedSourceFactoryIds = null)
         {
-            var key = BuildKey(materialCode, factoryId);
-            if (!_ledger.TryGetValue(key, out var list)) return Array.Empty<SupplyLedgerEntry>();
+            if (allowedSourceFactoryIds is null || allowedSourceFactoryIds.Count == 0)
+            {
+                var key = BuildKey(materialCode, factoryId);
+                if (!_ledger.TryGetValue(key, out var list)) return Array.Empty<SupplyLedgerEntry>();
 
-            return list
+                return list
+                    .Where(e => e.SourceType == Core.Enum.SupplySourceType.INTER_FACTORY_ORDER)
+                    .OrderBy(e => e.AvailableAt ?? DateTime.MaxValue)
+                    .ThenBy(e => e.SourceReference ?? string.Empty, StringComparer.Ordinal)
+                    .ThenBy(e => e.SupplyKey, StringComparer.Ordinal)   // CF-T18：最终全序
+                    .ToList();
+            }
+
+            if (!_shByMaterial.TryGetValue(materialCode, out var candidates))
+                return Array.Empty<SupplyLedgerEntry>();
+
+            return candidates
                 .Where(e => e.SourceType == Core.Enum.SupplySourceType.INTER_FACTORY_ORDER)
+                // 源厂未知（ERP 未给 RevInstrProcCode 或字典缺项）一律不承接：边已指明源厂，不能用来源不明的 SH 顶。
+                .Where(e => e.SourceFactoryId.HasValue
+                            && allowedSourceFactoryIds.Contains(e.SourceFactoryId.Value))
                 .OrderBy(e => e.AvailableAt ?? DateTime.MaxValue)
                 .ThenBy(e => e.SourceReference ?? string.Empty, StringComparer.Ordinal)
                 .ThenBy(e => e.SupplyKey, StringComparer.Ordinal)   // CF-T18：最终全序
@@ -5793,6 +6121,13 @@ public class PeggingOrchestrator : IPeggingOrchestrator
         // ═══════════════════════════════════════════════════════════════════════
         // 数量字段
         // ═══════════════════════════════════════════════════════════════════════
+
+        /// <summary>
+        /// 该供给条目的物料码（入池时原样记录）。用途：跨厂 SH 的「`FINAL_` 比较键」场景下，
+        /// 供给与需求的 **MaterialId 不同**（PM v1.2 §2.2 明令不合并 MaterialId），
+        /// 只能靠物料码做受控比对（见 <see cref="ValidateEligibility"/> 的 `allowComparisonKeyIdentity`）。
+        /// </summary>
+        public string MaterialCode                      { get; init; } = string.Empty;
 
         /// <summary>原始总量（初始值，不可变）</summary>
         public decimal OriginalQty                      { get; init; }
@@ -10656,6 +10991,21 @@ public class PeggingOrchestrator : IPeggingOrchestrator
         var rejectedMaterials = ComputeRejectedMaterials(
             aggregate.Conflicts.Keys, ambiguousMaterials, missingScopeMaterials, result);
 
+        // 2026-11-20（1号位 零 Routing 三问）：把**拒绝集的三类来源 + 样例物料**显性化。
+        //   1号位 只能看到 Solver 出口 `P2_NO_ROUTING`，看不到「为何无 Routing 图」；
+        //   此处按来源分因并给样例，双方据此对账，不必再靠猜。
+        if (rejectedMaterials.Count > 0)
+        {
+            var roleSet = new HashSet<int>(aggregate.Conflicts.Keys);
+            var ambSet  = new HashSet<int>(ambiguousMaterials);
+            var noChain = missingScopeMaterials.Where(m => !result.ContainsKey(m)).ToHashSet();
+            Console.WriteLine(
+                $"[Pegging][Routing 拒绝集] 合计 {rejectedMaterials.Count} 个物料：" +
+                $"角色冲突 {roleSet.Count} ／ 身份歧义 {ambSet.Count} ／ 首选 scope 无链 {noChain.Count}；" +
+                $"样例(前20)={string.Join(",", rejectedMaterials.OrderBy(x => x).Take(20))}（BatchNo={batchNo}）" +
+                "⇒ 这些物料**不产任何 Routing 图**，1号位 会看到 P2_NO_ROUTING");
+        }
+
         if (missingScopeMaterials.Count > 0)
         {
             var interceptCount = missingScopeMaterials.Count(m => !result.ContainsKey(m));
@@ -11067,6 +11417,13 @@ public class PeggingOrchestrator : IPeggingOrchestrator
     ///   现改为**复用调用方已整批装好的 `materialStageDeptContexts`** 建查表（其物料集 = 需求物料 ⊇ gapPairs 物料），
     ///   循环内零查询；本方法自身仍保留 5 次批量预取（参数表 / 物料 / 产品族 / 部门 / 工厂），无逐行查询。
     /// </summary>
+    /// <summary>
+    /// 探针专用（2026-11-21）：本轮 `STAGE_LEADTIME_MISSING` 的逐条 (物料, 阶段, 工厂, 部门)。
+    /// 用于回答 1号位「BJ_SURF 缺 StageLeadTimeParam 的 252 条」——三级为何都没命中。
+    /// 生产不读取；由探针在 Pegging 结束后落盘。
+    /// </summary>
+    private List<(int MaterialId, string StageCode, string? FactoryCode, string? DeptCode)>? _missingStageLeadTime;
+
     private async System.Threading.Tasks.Task<IReadOnlyList<StageLeadTimeFact>> LoadStageLeadTimesAsync(
         IReadOnlyDictionary<int, HashSet<string>> effectiveStages,
         List<RoutingOperation> operations,
@@ -11077,15 +11434,17 @@ public class PeggingOrchestrator : IPeggingOrchestrator
         if (effectiveStages.Count == 0)
             return Array.Empty<StageLeadTimeFact>();
 
-        // 1) 找出「有效 Stage 但零工序」的 (MaterialId, StageCode)
-        var opsByMatStage = operations
-            .Where(o => !string.IsNullOrEmpty(o.StageCode))
-            .Select(o => (o.MaterialId, o.StageCode!))
-            .ToHashSet();
-
+        // 1) 本次有效 Stage 的**全部** (MaterialId, StageCode)
+        //
+        // ⚠ 2026-11-21 改（1号位 来件 §一）：原实现**只发「零工序」的 Stage**，理由是
+        //   「有工序的 Stage 用工序时长，不需要 Stage LT」。但 1号位 指出该判据我方**无法预知**：
+        //   某 Stage 在该物料下有没有工序，**取决于它最终选中哪条 Route/Path**，而选路在 1号位。
+        //   其实测：252 条报 `BJ_SURF` 缺 LT 的需求共排出 922 个 Task，**全是 `BJ_MACH`、`BJ_SURF` 0 个**
+        //   ⇒ 这些需求选中的路径里 `BJ_SURF` 恰恰就是「无工序 Stage」，按 AE-004 只能消费本表 LT。
+        //   ⇒ 改为**全量发送**（`StageSequenceChains` 所载的全部 (物料,阶段)），由 1号位 按需取用；
+        //     多发的行它不消费即可，我方不做二次判定。
         var gapPairs = effectiveStages
             .SelectMany(kv => kv.Value.Select(stage => (MaterialId: kv.Key, StageCode: stage)))
-            .Where(p => !opsByMatStage.Contains((p.MaterialId, p.StageCode)))
             .ToList();
 
         if (gapPairs.Count == 0)
@@ -11253,6 +11612,8 @@ public class PeggingOrchestrator : IPeggingOrchestrator
                 // `MatchLevel` 取 `STAGE_LEADTIME_MISSING`（PM 原码逐字 = 1号位 回执 §四 定死的 4 值之一，
                 //   见 <see cref="MissingStageLeadTimeFallbackLevel"/> 的改名说明）。
                 missingCount++;
+                _missingStageLeadTime ??= new List<(int, string, string?, string?)>();
+                _missingStageLeadTime.Add((materialId, stageCode, factoryCode, deptCode));
                 matchLevelTally[MissingStageLeadTimeFallbackLevel] =
                     matchLevelTally.TryGetValue(MissingStageLeadTimeFallbackLevel, out var nm) ? nm + 1 : 1;
 
@@ -11384,6 +11745,7 @@ public class PeggingOrchestrator : IPeggingOrchestrator
         bool StageOk(StageLeadTimeParamRow r) =>
             string.Equals(r.StageCode, stageCode, StringComparison.Ordinal)
             || string.Equals(JoinFactoryStage(r.FactoryCode, r.StageCode), stageCode, StringComparison.Ordinal);
+
         bool SameFactory(StageLeadTimeParamRow r) => SameFactoryCode(r, factoryCode);
 
         // ⚠️ 2026-09-29 用户明确口径（**字面**）：第三层就是「Stage」，**不带 `IsDefault` 条件**。
@@ -12673,6 +13035,91 @@ public class PeggingOrchestrator : IPeggingOrchestrator
             {
                 demand.StartStageCode = startStage;
             }
+        }
+    }
+
+
+    /// <summary>
+    /// **2026-11-21 PM 裁决落地**：对 `StartStageCode` 仍为空的需求，用本次 BOM 的 **Stage 链首阶段**补齐。
+    ///
+    /// <para>适用场景：物料有自己的 `RoutingOperation`，但其 `StageCode` 与本次 BOM 的 Stage 链**完全不相交**
+    /// （典型：工序记 `BJ_MACH/BJ_SURF`，Stage 链记 `TJ_MACH/TJ_OUTS`）。PM 裁决＝按「该阶段无工序」处理，
+    /// 走目标厂 `StageLeadTimeParam.LeadTimeHours`（WORK 小时），产 `StageTimingNode`、不伪建 Task。</para>
+    ///
+    /// <para>前置：`FillStartStageCodes`（Routing 有向图）与 `FillPiStartStageCodesFromPositions`
+    /// （PI Position）都已跑过，本方法**只填空**、绝不覆盖既有值。</para>
+    ///
+    /// <para>多链口径：同一物料出现多条 Stage 链时取**第一条**（与 `BuildEffectiveStagePaths` /
+    /// `StageSequenceChains` 的既有口��一致，见 `:13853` 的同口径告警）。</para>
+    /// </summary>
+    internal static int FillStartStageCodesFromStageChains(
+        IEnumerable<LogicalProductionDemand> demands,
+        IReadOnlyList<StageSequenceChain> chains)
+    {
+        if (chains.Count == 0) return 0;
+
+        var firstStageByMaterial = new Dictionary<int, string>();
+        foreach (var c in chains)
+        {
+            if (c.MaterialId <= 0 || c.Stages.Count == 0) continue;
+            if (firstStageByMaterial.ContainsKey(c.MaterialId)) continue;   // 多链只取第一条
+            var first = c.Stages.FirstOrDefault(st => !string.IsNullOrEmpty(st.StageCode));
+            if (first is not null && !string.IsNullOrEmpty(first.StageCode))
+                firstStageByMaterial[c.MaterialId] = first.StageCode;
+        }
+        if (firstStageByMaterial.Count == 0) return 0;
+
+        var filled = 0;
+        foreach (var d in demands)
+        {
+            if (!string.IsNullOrEmpty(d.StartStageCode)) continue;
+            if (!firstStageByMaterial.TryGetValue(d.MaterialId, out var stage) || string.IsNullOrEmpty(stage)) continue;
+            d.StartStageCode = stage;
+            filled++;
+        }
+        return filled;
+    }
+
+    /// <summary>
+    /// **v1.3 §二-A B5 兜底**：`FillStartStageCodes`（只认 Routing 有向图）之后，对**仍为空**的
+    /// `LogicalProductionDemand.StartStageCode`，若该需求挂着 PI 号，取其 **PI Position 的 StageCode**。
+    ///
+    /// <para>B5 明写「无 Routing 的 Stage：**真实 Stage 仍保留**」。实测：
+    /// `WIP-AFM44P-010-04`（PI 17074499）与 `WIP-Y340P-040`（PI 17129709）StagePath 只有 EDGE 阈值行、
+    /// Routing **0 条** ⇒ 起点恒空；而 5号位 计算器按同一份 StagePath 已算出 `FIRST_STAGE_PENDING @ TJ_OUTS`。
+    /// 本方法把两边对齐，**不另造 Stage、不猜**。</para>
+    ///
+    /// <para>只取 `FIRST_STAGE_PENDING` / `STAGE_WAITING` 两类（真实待执行 Stage）；
+    /// `UNLOCATED` 不补（位置不可证，不得当可信起点）；无 Position ⇒ 保持空（真缺数据）。</para>
+    /// </summary>
+    private static void FillPiStartStageCodesFromPositions(
+        IReadOnlyList<LogicalProductionDemand> demands,
+        IReadOnlyDictionary<string, ProductionInstructionPositionResult> piPositions)
+    {
+        if (piPositions.Count == 0) return;
+
+        var startStageByPi = new Dictionary<string, string>(StringComparer.Ordinal);
+        foreach (var kv in piPositions)
+        {
+            var slice = kv.Value.Positions
+                .Where(p => (p.PositionType == PositionType.FIRST_STAGE_PENDING
+                             || p.PositionType == PositionType.STAGE_WAITING)
+                            && !string.IsNullOrWhiteSpace(p.StageCode))
+                .OrderBy(p => p.PositionType == PositionType.STAGE_WAITING ? 1 : 0)
+                .FirstOrDefault();
+            if (slice?.StageCode is { Length: > 0 } stage)
+                startStageByPi[kv.Key] = stage;
+        }
+
+        if (startStageByPi.Count == 0) return;
+
+        foreach (var d in demands)
+        {
+            if (!string.IsNullOrEmpty(d.StartStageCode)) continue;
+            var pi = (d.ProductionInstructionNo ?? string.Empty).Trim();
+            if (pi.Length == 0) continue;
+            if (startStageByPi.TryGetValue(pi, out var stage) && !string.IsNullOrEmpty(stage))
+                d.StartStageCode = stage;
         }
     }
 
@@ -14544,6 +14991,8 @@ public class PeggingOrchestrator : IPeggingOrchestrator
         //     重载会让 Round2 拿到全额供给，等于开了第二个 Run。
         //   空集保护：Round2 无需求时**不调用第二次**，行为与改动前逐字一致（受控对照的基线口径）。
         var round2Orders = await BuildRound2SourceFactoryDemandsAsync(round1Result, request, ct);
+        // 2026-11-21：段5（round=2）此前**配了但从没执行**；此处按冻结段排序，输入先按 DemandKey 固化。
+        round2Orders = await SortRound2ByDemandPriorityAsync(round2Orders, request, ct);
         var loopResult = round1Result;
 
         // AE-001 Round3：**Round1 结束那一刻**的「已被上层承接」快照 —— 孤儿判定只认这份，
@@ -14647,6 +15096,49 @@ var orphanShOrders = await BuildRound3OrphanShDemandsAsync(
     ///   而孤儿 MTS 今天已在 `ClassifyCompetitionRound` 落第 1 次 BFS ⇒ 单独把孤儿 SH 放后面会**打乱既定顺序**。
     ///   留待 Round3 与孤儿 MTS 顺序一并落地（见登记簿 `O87`）。
     /// </summary>
+    /// <summary>
+    /// **2-CF-04-B（0号位 2026-11-20 执行指令）**：权威源查不到 SH 时，按**需求侧真实承接份额**构造未闭合行。
+    ///
+    /// <para>门禁：`demandSideQty <= 0` ⇒ 返回 <c>null</c>（连承接份额都没有，属真无缺口，不编数量）。</para>
+    ///
+    /// <para>字段纪律：`SourceFactoryId` / `MaterialId` / `NeedByTime` 一律 **NULL**（不知道就不猜）；
+    /// 类别 `SH_MISSING`、承诺 `NOT_COMMITTED`；`RequiredQty = UnresolvedQty = demandSideQty`、
+    /// `LegallyAllocatedQty = 0`（份额来自未证实 SH，不算合法承接）。</para>
+    /// </summary>
+    internal static Core.Entities.APS.UnresolvedCrossFactorySupplyResult? BuildUnverifiedShShortageRow(
+        string shNo, decimal demandSideQty, int runId, int planVersionId, string domainKey)
+    {
+        if (string.IsNullOrWhiteSpace(shNo) || demandSideQty <= 0m) return null;
+
+        return new Core.Entities.APS.UnresolvedCrossFactorySupplyResult
+        {
+            ScheduleRunId     = runId,
+            PlanVersionId     = planVersionId,
+            ResultRecordKey   = $"UCFS_{runId}_{planVersionId}_SHMISS_{shNo}",
+            RootOrderId       = null,
+            RootDemandKey     = $"SH_{shNo}",
+            MaterialId        = null,
+            MaterialCode      = shNo,
+            TargetFactoryId   = 0,
+            DomainKey         = domainKey,
+            SourceFactoryId   = null,
+            SourceDomainKey   = null,
+            NeedByTime        = null,
+            EvidenceBasisCode = "SOURCE_UNVERIFIED",
+            IssueRemark       = $"被分配的 SH {shNo} 在本 PV `[Order]` 与权威 `Order_Canonical` 均查不到"
+                                + $"（或权威量<=0）⇒ 来源未证实；按需求侧承接份额 {demandSideQty} 记未闭合，不造源厂 Demand",
+            RequiredQty       = demandSideQty,
+            LegallyAllocatedQty = 0m,
+            UnresolvedQty     = demandSideQty,
+            UnresolvedCategory = Core.Entities.APS.UnresolvedCategoryCodes.ShMissing,
+            ActualSHOrderNo   = shNo,
+            ActualProductionInstructionNo = null,
+            SourceEvidenceJson = null,
+            CommitmentStatus  = Core.Entities.APS.UnresolvedCommitmentStatus.NotCommitted,
+            CreatedAt         = DateTime.Now
+        };
+    }
+
     private async Task<IReadOnlyList<OrderPeggingRow>> BuildRound2SourceFactoryDemandsAsync(
         PeggingResultVoucher voucher,
         PeggingExecutionRequest request,
@@ -14759,6 +15251,17 @@ var orphanShOrders = await BuildRound3OrphanShDemandsAsync(
             .Distinct(StringComparer.Ordinal)
             .ToList();
 
+        // 2-CF-04-B（0号位 2026-11-20）：权威源查不到时，用**需求侧真实承接份额**落未闭合结果，
+        //   不再「数量不可证就静默跳过」。份额取自本轮 Allocation（同一 SH 可能被多需求分片承接）。
+        var allocQtyBySh = new Dictionary<string, decimal>(StringComparer.Ordinal);
+        foreach (var a in voucher.SupplyAllocations)
+        {
+            if (a.SourceType != Core.Enum.SupplySourceType.INTER_FACTORY_ORDER) continue;
+            var no = (a.ShippingInstructionNo ?? string.Empty).Trim();
+            if (no.Length == 0) continue;
+            allocQtyBySh[no] = allocQtyBySh.GetValueOrDefault(no) + a.AllocatedQuantity;
+        }
+
         var missingClosedSkipped = 0;
         var missingRecorded = 0;
         // 2026-11-19：权威源也查不到 / 权威量为 0 ⇒ 需量不可证，不落库（CK_UCFS_Qty 要求 >0，禁止编造数量）
@@ -14799,12 +15302,31 @@ var orphanShOrders = await BuildRound3OrphanShDemandsAsync(
                 //   ⇒ 该行**不落库**，改由 WARN 逐条留证；不得用编造的数量去满足 CHECK。
                 if (oc is null || oc.Quantity <= 0m)
                 {
-                    missingUnverifiedSkipped++;
-                    _logger.LogWarning(
-                        "[Pegging][A-R2][CF-T04] SH {ShNo} 在本 PV `[Order]` 与权威 `Order_Canonical` 均查不到，"
-                        + "或权威量<=0 ⇒ 需量不可证，**不落未闭合行**（CK_UCFS_Qty 要求 RequiredQty>0，禁止编造数量）；"
-                        + "来源未证实，不造源厂 Demand。",
-                        shNo);
+                    // 2-CF-04-B（0号位 2026-11-20 执行指令）：
+                    //   「即使权威 SH 号/数量缺失或量化异常，只要真实合法的跨厂子件仍有**正数净缺**，
+                    //     不得静默跳过；按既有 SH_MISSING/NOT_COMMITTED 形成可追溯未闭合结果。」
+                    //   ⇒ 改用**需求侧真实承接份额**（本轮 Allocation 对该 SH 的合计）落库，
+                    //     不再用「权威单数量」这个拿不到的量。
+                    var demandSideQty = allocQtyBySh.GetValueOrDefault(shNo);
+                    if (demandSideQty <= 0m)
+                    {
+                        // 连承接份额都没有 ⇒ 才是真的无缺口，按 WARN 留证即可（不编数量）。
+                        missingUnverifiedSkipped++;
+                        _logger.LogWarning(
+                            "[Pegging][A-R2][CF-T04] SH {ShNo} 权威源查不到且本轮无任何承接份额 ⇒ 不落未闭合行。", shNo);
+                        continue;
+                    }
+
+                    var unverifiedRow = BuildUnverifiedShShortageRow(
+                        shNo, demandSideQty, runIdForUnresolved, request.PlanVersionId, request.DomainKey);
+                    if (unverifiedRow is not null)
+                    {
+                        voucher.UnresolvedCrossFactorySupplyResults.Add(unverifiedRow);
+                        missingRecorded++;
+                        unresolvedCount++;
+                    }
+                    missingRecorded++;
+                    unresolvedCount++;
                     continue;
                 }
 
@@ -15554,7 +16076,9 @@ var orphanShOrders = await BuildRound3OrphanShDemandsAsync(
                 supplyPool,
                 voucher,
                 visited,
-                traversalStats: traversalStats);
+                traversalStats: traversalStats,
+                // DFS 路径仅用于 A/B 对比自检（生产走 RunBfsLoop），不参与「BOM 来源不可证」门禁
+                bomSourceProven: true);
         }
 
         _logger.LogInformation(
@@ -15578,10 +16102,24 @@ var orphanShOrders = await BuildRound3OrphanShDemandsAsync(
 
         // O65（2026-11-10）：子件制造厂归属留痕。三类分开报，不许糊成一句「兜底了」。
         _logger.LogInformation(
-            "[Pegging][O65] 子件按自己的制造厂落需求：改厂 {Rehomed} 对｜空值缺值 {Missing} 对｜厂码查无 {Unknown} 对",
+            "[Pegging][O65] 子件按自己的制造厂落需求：改厂 {Rehomed} 对｜空值缺值 {Missing} 对｜厂码查无 {Unknown} 对"
+            + "｜**BOM来源不可证而拒绝改厂 {Unproven} 对**",
             traversalStats.ChildFactoryRehomed,
             traversalStats.ChildFactoryMissing,
-            traversalStats.ChildFactoryUnknown);
+            traversalStats.ChildFactoryUnknown,
+            traversalStats.ChildFactoryUnprovenBom);
+
+        Console.WriteLine(
+            $"[Pegging][O67] 子件厂归属：改厂={traversalStats.ChildFactoryRehomed} 空值={traversalStats.ChildFactoryMissing} "
+            + $"厂码查无={traversalStats.ChildFactoryUnknown} **BOM来源不可证拒绝改厂={traversalStats.ChildFactoryUnprovenBom}**");
+
+        if (traversalStats.ChildFactoryUnprovenBom > 0)
+            _logger.LogWarning(
+                "[Pegging][O67] 有 {N} 对 (子件|要求厂) 因**订单级 BOM 入口不可证**（无锚点 / 锚点 BOMNO 本批无行）"
+                + "而**拒绝按并集 BOM 改厂**，保持父厂并留痕（0号位 v1.1 §7：不得以并集反查推断跨厂）。"
+                + "样例={Sample}",
+                traversalStats.ChildFactoryUnprovenBom,
+                string.Join(",", traversalStats.ChildFactoryUnprovenBomSamples.Take(10)));
 
         if (traversalStats.ChildFactoryMissing > 0)
             _logger.LogWarning(
@@ -15787,6 +16325,10 @@ var orphanShOrders = await BuildRound3OrphanShDemandsAsync(
             var orderBomNo = bomNoByOrder is not null && bomNoByOrder.TryGetValue(order.OrderId, out var bn)
                 ? bn
                 : null;
+            // ★ 2026-11-21（0号位 v1.1 §7）：本单 BOM 来源是否**可证**（锚点存在且该 BOMNO 在本批有行）。
+            //   不可证 ⇒ 走的是「全部边并集」，其 `ChildRequiredFactory` 可能来自别的订单的 BOM，
+            //   **不得据此改厂**（否则等于全库反查推断跨厂），见 `ExplodeOrderStructure` 内同名分支。
+            var bomSourceProven = false;
             if (string.IsNullOrWhiteSpace(orderBomNo))
             {
                 noAnchorOrders++;
@@ -15796,6 +16338,7 @@ var orphanShOrders = await BuildRound3OrphanShDemandsAsync(
             {
                 structure = perBomStructure;
                 perBomNoOrders++;
+                bomSourceProven = true;
             }
             else
             {
@@ -15803,7 +16346,7 @@ var orphanShOrders = await BuildRound3OrphanShDemandsAsync(
             }
 
             var root = new BomOrderDemand(order.OrderId, order.MaterialId, order.MaterialCode, order.FactoryId, order.DemandQty);
-            var nodes = explosion.ExplodeOrderStructure(structure, root);
+            var nodes = explosion.ExplodeOrderStructure(structure, root, bomSourceProven);
 
             // 2026-11-10 O65：每个物料的**制造厂**（来自展开层按边解析）。此前所有节点一律 = 订单厂。
             //   ⚠ 下面父件产出查找必须用**父件自己的**厂，不能用 node.FactoryId —— 子件改厂后
@@ -15835,6 +16378,9 @@ var orphanShOrders = await BuildRound3OrphanShDemandsAsync(
                             break;
                         case BomFactorySource.UnknownFallback:
                             traversalStats.RecordChildFactoryUnknown(node.MaterialCode, node.MaterialCode);
+                            break;
+                        case BomFactorySource.BomSourceUnproven:
+                            traversalStats.RecordChildFactoryUnprovenBom(node.MaterialCode, order.FactoryCode);
                             break;
                         case BomFactorySource.ConflictFirstParentWins:
                             // C02 取证（2026-11-12）：多父冲突要交 5号位 判 (a)/(b)/(c)，只给物料码不够，
@@ -15968,11 +16514,18 @@ var orphanShOrders = await BuildRound3OrphanShDemandsAsync(
 
         // O65（2026-11-10）：子件制造厂归属留痕。四类分开报 —— 改厂、缺值、厂码查无、多父冲突。
         _logger.LogInformation(
-            "[Pegging][O65] 子件按自己的制造厂落需求：改厂 {Rerouted} 个｜空值缺值 {Missing} 个｜厂码查无 {Unknown} 个｜多父冲突 {Conflict} 个",
+            "[Pegging][O65] 子件按自己的制造厂落需求：改厂 {Rerouted} 个｜空值缺值 {Missing} 个｜厂码查无 {Unknown} 个｜多父冲突 {Conflict} 个"
+            + "｜**BOM来源不可证而拒绝改厂 {Unproven} 个**",
             traversalStats.ChildFactoryRehomed,
             traversalStats.ChildFactoryMissing,
             traversalStats.ChildFactoryUnknown,
-            traversalStats.ChildFactoryConflict);
+            traversalStats.ChildFactoryConflict,
+            traversalStats.ChildFactoryUnprovenBom);
+
+        // 2026-11-21（0号位 v1.1 §7）：BOM 入口不可证 ⇒ 拒绝改厂的可见化（探针走 Console，生产走上面日志）
+        Console.WriteLine(
+            $"[Pegging][O67] 子件厂归属：改厂={traversalStats.ChildFactoryRehomed} 空值={traversalStats.ChildFactoryMissing} "
+            + $"厂码查无={traversalStats.ChildFactoryUnknown} **BOM来源不可证拒绝改厂={traversalStats.ChildFactoryUnprovenBom}**");
 
         // C01（2026-11-13）：跨厂血缘边。改前这两个数恒 0（跨厂父边一律在 `continue` 处静默丢弃）；
         //   改后 `Links` 即真实接上的跨厂依赖边数。若 `Links=0` 而 O65 改厂节点 > 0，说明跨厂父件均无净产出（合法）或修复未生效。
@@ -16305,6 +16858,143 @@ var orphanShOrders = await BuildRound3OrphanShDemandsAsync(
     /// <summary>
     /// 将订单转换为 UpstreamDemand，消费3号位 DemandPriorityConfig 排序，返回 OrderId → DemandSequence 映射。
     /// </summary>
+    /// <summary>
+    /// 订单行 → `UpstreamDemand`（排序器输入）。**Round1/2/3 共用同一份投影**，
+    /// 避免各处字段口径漂移（2026-11-21 为「段5 Round2 排序」抽取）。
+    /// </summary>
+    private static UpstreamDemand ToUpstreamDemand(
+        OrderPeggingRow o,
+        IReadOnlyDictionary<string, decimal?>? stockConsumeDayByMaterial,
+        IReadOnlyDictionary<long, string>? protectionStatusByOrder)
+    {
+        return new UpstreamDemand
+        {
+            DemandKey        = o.OrderId.ToString(),
+            OrderCanonicalId = o.OrderCanonicalId,
+            OrderType        = o.OrderType,
+            CustomerTier     = o.CustomerTier,
+            DueDate          = o.DueDate,
+            IssueDate        = o.IssueDate,
+            CustomerSegment      = o.CustomerSegment,
+            CustomerDueDate      = o.DueDate,
+            TransportMode        = o.TransportMode,
+            SalesOrderCategory   = o.SalesOrderCategory,
+            DemandMaturityStatus = o.DemandMaturityStatus,
+            NonStockShipmentType = o.NonStockShipmentType,
+            MaterialCode         = o.MaterialCode,
+            Quantity             = o.OrderQuantity,
+            StockConsumeDay      = stockConsumeDayByMaterial is not null
+                                   && stockConsumeDayByMaterial.TryGetValue(o.MaterialCode, out var scd) ? scd : null,
+            DelayStatus      = o.DelayStatus,
+            ProtectionStatus = protectionStatusByOrder is not null
+                               && protectionStatusByOrder.TryGetValue(o.OrderId, out var ps)
+                ? ps : DemandProtectionTriggerEvaluator.UnprotectedStatus,
+            SourceDemand = o
+        };
+    }
+
+    /// <summary>
+    /// **2026-11-21 修**：Round2（SH 源厂整单）按 **`CompetitionRound=2` 的段**（本 Run 为段5
+    /// `SALES_ORDER + INTER_FACTORY`，段内按客户交期升序）跑一次 `ExecutePrioritySort`。
+    ///
+    /// <para><b>为什么之前没跑</b>：`BuildDemandSequenceMapAsync` 在 Round2 需求**尚不存在**时执行
+    /// （Round2 由 `BuildRound2SourceFactoryDemandsAsync` 在第一轮跑完后生成），后续只按构造顺序编号
+    /// ⇒ 3号位 发布的段5 **配置存在却从未被执行**（规则空转）；且构造顺序继承 SQL 行序，**不确定**。</para>
+    ///
+    /// <para><b>口径</b>：与 Round1/3 同一执行器、同一投影（<see cref="ToUpstreamDemand"/>）；
+    /// 输入先按 `DemandKey` 字典序固化 ⇒ 结果只取决于数据；EXPEDITE 只作用于第 1 轮（此处不传）。</para>
+    /// </summary>
+    private async Task<List<OrderPeggingRow>> SortRound2ByDemandPriorityAsync(
+        IReadOnlyList<OrderPeggingRow> orders, PeggingExecutionRequest request, CancellationToken ct)
+    {
+        if (orders.Count == 0) return orders.ToList();
+
+        var spvId = request.SchedulingContext?.StrategyProfileVersionId;
+        if (!spvId.HasValue || spvId.Value <= 0)
+        {
+            _logger.LogWarning(
+                "[Pegging][Round2-DP] 缺 StrategyProfileVersionId ⇒ Round2 按 DemandKey 字典序兜底（{Count} 单）",
+                orders.Count);
+            return orders.OrderBy(o => o.OrderId.ToString(), StringComparer.Ordinal).ToList();
+        }
+
+        var config = await _demandPriorityConfigProvider.GetPriorityConfigAsync(
+            spvId.Value,
+            request.SnapshotAt == default ? (DateTime?)null : request.SnapshotAt,
+            ct);
+
+        var roundConfig = new DemandPriorityConfig
+        {
+            Segments = config.Segments.Where(s => s.CompetitionRound == 2).ToList()
+        };
+
+        if (roundConfig.Segments.Count == 0)
+        {
+            _logger.LogWarning(
+                "[Pegging][Round2-DP] 冻结快照没有 CompetitionRound=2 的段 ⇒ Round2 按 DemandKey 字典序兜底（{Count} 单）",
+                orders.Count);
+            return orders.OrderBy(o => o.OrderId.ToString(), StringComparer.Ordinal).ToList();
+        }
+
+        var lockBlock = (await _frozenStrategySnapshotProvider
+            .GetFrozenStrategySnapshotAsync(spvId.Value, ct)).Lock;
+        var basis = request.SnapshotAt == default ? DateTime.Now : request.SnapshotAt;
+        var protection = DeriveDemandProtectionStatus(lockBlock, orders, basis);
+        var stockConsumeDay = await LoadStockConsumeDayByMaterialAsync(
+            orders.Select(o => o.MaterialCode).Distinct(StringComparer.Ordinal).ToList(), ct);
+
+        var demands = orders
+            .OrderBy(o => o.OrderId.ToString(), StringComparer.Ordinal)
+            .Select(o => ToUpstreamDemand(o, stockConsumeDay, protection))
+            .ToList();
+
+        var sorted = _demandPriorityExecutor.ExecutePrioritySort(demands, roundConfig);
+
+        var byKey = new Dictionary<string, OrderPeggingRow>(StringComparer.Ordinal);
+        foreach (var o in orders) byKey[o.OrderId.ToString()] = o;
+
+        var result = new List<OrderPeggingRow>(orders.Count);
+        foreach (var d in sorted)
+        {
+            if (byKey.TryGetValue(d.DemandKey, out var row)) result.Add(row);
+        }
+        // 防御：排序器不应丢单；若丢，补回末尾（不静默吞）
+        if (result.Count != orders.Count)
+        {
+            _logger.LogWarning(
+                "[Pegging][Round2-DP] 排序结果条数与原集合不符（{Sorted}/{Total}）⇒ 缺失的单补在末尾并留痕",
+                result.Count, orders.Count);
+            var seen = new HashSet<long>(result.Select(o => o.OrderId));
+            foreach (var o in orders) if (!seen.Contains(o.OrderId)) result.Add(o);
+        }
+
+        // 探针：把 Round2 的最终顺序落盘（供逐段核对，与 DP_round1/3 同格式）
+        var dpDir = Environment.GetEnvironmentVariable("APS_DP_DUMP");
+        if (!string.IsNullOrEmpty(dpDir))
+        {
+            Directory.CreateDirectory(dpDir);
+            using var sw = File.CreateText(
+                Path.Combine(dpDir, $"DP_round2_{DateTime.Now:yyyyMMdd_HHmmss}.tsv"));
+            sw.WriteLine("Round	SeqInRound	DemandKey	OrderId	MaterialCode	DueDate	CustomerTier	CustomerSegment	OrderType	CustomerDueDate	TransportMode	StockConsumeDay	IssueDate	Segment");
+            var i = 0;
+            foreach (var o in result)
+            {
+                i++;
+                sw.WriteLine($"2	{i}	{o.OrderId}	{o.OrderId}	{o.MaterialCode}	"
+                    + $"{o.DueDate.ToString("yyyy-MM-dd HH:mm:ss")}	{o.CustomerTier ?? "-"}	{o.CustomerSegment ?? "-"}	"
+                    + $"{o.OrderType ?? "-"}	{o.DueDate.ToString("yyyy-MM-dd HH:mm:ss")}	{o.TransportMode ?? "-"}	"
+                    + $"NULL	{o.IssueDate?.ToString("yyyy-MM-dd HH:mm:ss") ?? "-"}	"
+                    + $"{roundConfig.Segments.Select(x => x.SegmentOrder).FirstOrDefault()}");
+            }
+        }
+
+        var segHit = roundConfig.Segments.Select(s => s.SegmentOrder).FirstOrDefault();
+        _logger.LogInformation(
+            "[Pegging][Round2-DP] Round2 按段{Seg}排序完成：{Count} 单", segHit, result.Count);
+
+        return result;
+    }
+
     private async Task<Dictionary<long, int>> BuildDemandSequenceMapAsync(
         IReadOnlyList<OrderPeggingRow> orders,
         PeggingExecutionRequest request,
@@ -16371,6 +17061,7 @@ var orphanShOrders = await BuildRound3OrphanShDemandsAsync(
 
         var map = new Dictionary<long, int>();
         var offset = 0;
+        var dpDumpDir = Environment.GetEnvironmentVariable("APS_DP_DUMP");
 
         foreach (var round in rounds)
         {
@@ -16378,39 +17069,9 @@ var orphanShOrders = await BuildRound3OrphanShDemandsAsync(
             if (roundOrders.Count == 0)
                 continue;
 
-            var roundDemands = roundOrders.Select(o => new UpstreamDemand
-            {
-                DemandKey    = o.OrderId.ToString(),
-                OrderCanonicalId = o.OrderCanonicalId,
-                OrderType    = o.OrderType,
-                CustomerTier = o.CustomerTier,
-                DueDate      = o.DueDate,
-                IssueDate    = o.IssueDate,
-                // 2026-11-06 V1.1 新增字段（3号位 实施包 §四.1/§四.2）
-                CustomerSegment      = o.CustomerSegment,
-                // 出荷指示入物流日（会随返信/延迟变化）= `v_APS_SalesOrder.DueDate` ← `V_AllSalesInstr.ReceiveDate`
-                // ⇒ `[Order].CustomerDueDate`，本处即 `o.DueDate`。
-                // （`[Order].OriginalDueDate` 是**原始订单入物流日**= Requisition.ReceiveDate，永不变化；
-                //   3号位 实施包 §一.1 已将它剔除、不进排序，故本 DTO 不承载。）
-                // 用户 2026-11-06 两次确认该链路。
-                CustomerDueDate      = o.DueDate,
-                TransportMode        = o.TransportMode,
-                SalesOrderCategory   = o.SalesOrderCategory,
-                DemandMaturityStatus = o.DemandMaturityStatus,
-                NonStockShipmentType = o.NonStockShipmentType,
-                MaterialCode         = o.MaterialCode,
-                Quantity             = o.OrderQuantity,
-                // 库存消耗日（天，小数，越小越紧急）；null = 无可信日均 ⇒ 排序置末
-                StockConsumeDay      = stockConsumeDayByMaterial.TryGetValue(o.MaterialCode, out var scd) ? scd : null,
-                DelayStatus  = o.DelayStatus,   // 01 v1.13 :536 / Pegging v1.6 :257 需求排序可用条件
-                // 需求保护资格（B4 §3.1）：`PROTECTED` / `UNPROTECTED`，由冻结快照 `$.Lock.Trigger` 派生。
-                // 2026-11-07 起不再是 null —— 之前 `$.Lock` 装进快照零消费，导致执行器 `KnownFields`
-                // 里的 `PROTECTIONSTATUS` 恒 `null`、排序静默落 `DemandKey ASC` 兜底（B4 §二 #16）。
-                ProtectionStatus = protectionStatusByOrder.TryGetValue(o.OrderId, out var protectionStatus)
-                    ? protectionStatus
-                    : DemandProtectionTriggerEvaluator.UnprotectedStatus,
-                SourceDemand = o
-            }).ToList();
+            var roundDemands = roundOrders
+                .Select(o => ToUpstreamDemand(o, stockConsumeDayByMaterial, protectionStatusByOrder))
+                .ToList();
 
             var roundConfig = new DemandPriorityConfig
             {
@@ -16431,10 +17092,51 @@ var orphanShOrders = await BuildRound3OrphanShDemandsAsync(
                 ? expediteOrderCanonicalIds
                 : null;
 
-            var sorted = _demandPriorityExecutor.ExecutePrioritySort(roundDemands, roundConfig, roundExpedite);
+            // 2026-11-21：排序前先按 `DemandKey` 字典序固化输入顺序。
+            //   原因：`roundDemands` 来自 SQL（无 ORDER BY）⇒ 行序不承诺；LINQ `OrderBy` 是**稳定排序**，
+            //   输入序一变、并列项的名次就变 ⇒ 同一 PV/批次两轮跑出不同分配（实测 SH 消费需求 12,731 vs 13,763）。
+            //   `DemandKey` 全序且与业务无关 ⇒ 排序结果只取决于数据本身。
+            System.Collections.Generic.List<(string DemandKey, int SegmentOrder)>? segTrace = null;
+            if (!string.IsNullOrEmpty(dpDumpDir))
+            {
+                segTrace = new System.Collections.Generic.List<(string, int)>();
+                _demandPriorityExecutor.SegmentTrace = segTrace;
+            }
 
+            var sorted = _demandPriorityExecutor.ExecutePrioritySort(
+                roundDemands.OrderBy(d => d.DemandKey, StringComparer.Ordinal).ToList(),
+                roundConfig, roundExpedite);
+
+            if (segTrace is not null)
+            {
+                System.IO.Directory.CreateDirectory(dpDumpDir!);
+                using var sw = System.IO.File.CreateText(
+                    System.IO.Path.Combine(dpDumpDir!, $"DP_seg_round{round}_{DateTime.Now:yyyyMMdd_HHmmss}.tsv"));
+                sw.WriteLine("DemandKey	SegmentOrder");
+                foreach (var (k, seg) in segTrace) sw.WriteLine($"{k}	{seg}");
+                _demandPriorityExecutor.SegmentTrace = null;
+            }
+
+            // 2026-11-21（排序规则真实执行证据）：探针专用，把**本轮最终顺序**原样落盘，
+            //   供离线与 3号位 已发布规则逐段对账（哪些由规则定序、哪些落到 DemandKey 兜底）。
+            //   仅 `APS_DP_DUMP=1` 时写文件，生产环境不触发。
+            // 探针目录（循环外声明，供轮内 trace 使用）
+            System.IO.TextWriter? dpDump = null;
+            if (!string.IsNullOrEmpty(dpDumpDir))
+            {
+                System.IO.Directory.CreateDirectory(dpDumpDir);
+                dpDump = System.IO.File.CreateText(
+                    System.IO.Path.Combine(dpDumpDir, $"DP_round{round}_{DateTime.Now:yyyyMMdd_HHmmss}.tsv"));
+                dpDump.WriteLine("Round	SeqInRound	DemandKey	OrderId	MaterialCode	DueDate	CustomerTier	CustomerSegment	OrderType	CustomerDueDate	TransportMode	StockConsumeDay	IssueDate");
+            }
+
+            var seqInRound = 0;
             foreach (var demand in sorted)
             {
+                seqInRound++;
+                dpDump?.WriteLine($"{round}	{seqInRound}	{demand.DemandKey}	"
+                    + $"{(long.TryParse(demand.DemandKey, out var pid) ? pid.ToString() : "-")}	"
+                    + $"{demand.MaterialCode}	{demand.DueDate?.ToString("yyyy-MM-dd HH:mm:ss") ?? "NULL"}	{demand.CustomerTier ?? "-"}	{demand.CustomerSegment ?? "-"}	{demand.OrderType ?? "-"}	{demand.CustomerDueDate?.ToString("yyyy-MM-dd HH:mm:ss") ?? "NULL"}	{demand.TransportMode ?? "-"}	{demand.StockConsumeDay?.ToString("F4") ?? "NULL"}	{demand.IssueDate?.ToString("yyyy-MM-dd HH:mm:ss") ?? "NULL"}");
                 if (long.TryParse(demand.DemandKey, out var orderId))
                 {
                     // 不用 demand.DemandSequence：那个序号在每轮内从 1 重新开始，
@@ -16442,6 +17144,8 @@ var orphanShOrders = await BuildRound3OrphanShDemandsAsync(
                     map[orderId] = ++offset;
                 }
             }
+            dpDump?.Flush();
+            dpDump?.Dispose();
         }
 
         return map;
@@ -16696,7 +17400,8 @@ var orphanShOrders = await BuildRound3OrphanShDemandsAsync(
         DemandBalance demand,
         int bomLevel,
         PeggingResultVoucher voucher,
-        decimal requestedQty)
+        decimal requestedQty,
+        bool allowComparisonKeyIdentity = false)
     {
         // ══════════════════════════════════════════════════════════════════════
         // 第一阶段：校验（所有校验必须通过才能进入扣减阶段）
@@ -16717,7 +17422,7 @@ var orphanShOrders = await BuildRound3OrphanShDemandsAsync(
             return AllocationResult.Failed("Calculated allocation quantity is zero");
 
         // Step 3: 校验资格（Eligibility）
-        if (!ValidateEligibility(supply, demand))
+        if (!ValidateEligibility(supply, demand, allowComparisonKeyIdentity))
             return AllocationResult.Failed($"Eligibility violation: Supply {supply.SupplyKey} (material {supply.MaterialId}) cannot serve demand (material {demand.MaterialId})");
 
         // Step 4: 校验Strict Binding
@@ -16844,10 +17549,14 @@ var orphanShOrders = await BuildRound3OrphanShDemandsAsync(
     /// 注入点在此方法内扩展，2号位不发明规则语义。
     /// 跨厂 INTER_FACTORY_ORDER 的工厂归属由入池装载层归一（落 ShippingInstructionNo），此处不做工厂相等推导，避免与分域口径冲突。
     /// </summary>
-    private static bool ValidateEligibility(SupplyLedgerEntry supply, DemandBalance demand)
+    private static bool ValidateEligibility(SupplyLedgerEntry supply, DemandBalance demand,
+        bool allowComparisonKeyIdentity = false)
     {
-        // 红线1：物料身份一致（防御性；正常已在 LoadSupplyPoolAsync/LoadDemandPoolAsync 按 Material 归池）
-        if (supply.MaterialId != demand.MaterialId)
+        // 红线1：物料身份一致（防御性；正常已在 LoadSupplyPoolAsync/LoadDemandPoolAsync 按 Material 归池）。
+        // 例外（0号位 v1.2 §2.2）：跨厂 SH 的 `FINAL_` 比较键场景 —— 销售层 `FINAL_ASSY-*` 与目标厂 BOM
+        //   的 `ASSY-*` 是**两个 MaterialId**（不合并），候选定位只比"去掉一层 FINAL_"后的物料码。
+        //   此时 MaterialId 必然不等，但物料码（去前缀后）严格相等且已由调用方校验 ⇒ 允许按比较键承接。
+        if (supply.MaterialId != demand.MaterialId && !allowComparisonKeyIdentity)
             return false;
 
         // 扩展点（V1验收前）：待 5号位规则引擎接入复杂资格规则，例如：
@@ -17181,6 +17890,20 @@ var orphanShOrders = await BuildRound3OrphanShDemandsAsync(
         /// <summary>厂码在 `Factory` 主档查无的 (子件|厂码) 去重对数。</summary>
         public long ChildFactoryUnknown => _childFactoryUnknownKeys.Count;
 
+        // ── 2026-11-21（0号位 v1.1 §7）：BOM 来源不可证 ⇒ 不改厂 ──
+        private readonly HashSet<string> _childFactoryUnprovenBomKeys = new(StringComparer.Ordinal);
+
+        /// <summary>
+        /// 订单级 BOM 入口不可证（无 `OrderBomRequestLink` 或锚点 BOMNO 在本批无行，走并集展开）时，
+        /// 子件**本应改到别的厂**但被我方拒绝改厂的 (子件|目标厂) 去重对数。
+        /// 按 0号位 §7：不得用并集 BOM 的 `ChildRequiredFactory` 推断跨厂，必须按缺事实处理。
+        /// </summary>
+        public long ChildFactoryUnprovenBom => _childFactoryUnprovenBomKeys.Count;
+        public IReadOnlyCollection<string> ChildFactoryUnprovenBomSamples => _childFactoryUnprovenBomKeys;
+
+        public void RecordChildFactoryUnprovenBom(string childCode, string requiredCode)
+            => _childFactoryUnprovenBomKeys.Add($"{childCode}|要求厂{requiredCode}");
+
         private readonly HashSet<string> _childFactoryConflictKeys = new(StringComparer.Ordinal);
         /// <summary>多父边给出**不同**应归属厂的子件数（节点按物料唯一，只能取首个父边的厂）。</summary>
         public long ChildFactoryConflict => _childFactoryConflictKeys.Count;
@@ -17290,7 +18013,8 @@ var orphanShOrders = await BuildRound3OrphanShDemandsAsync(
         HashSet<string> visited,
         string? consumerLogicalDemandKey = null,
         int consumerMaterialId = 0,
-        BomTraversalStats? traversalStats = null)
+        BomTraversalStats? traversalStats = null,
+        bool bomSourceProven = true)
     {
         var nodeKey = SupplyPool.BuildKey(materialCode, factoryId);
         if (!visited.Add(nodeKey)) return null;
@@ -17316,7 +18040,7 @@ var orphanShOrders = await BuildRound3OrphanShDemandsAsync(
                     //   此前 `factoryId/factoryCode` 原样下传 ⇒ BOM 说"该子件在 BJ 做"，需求建在 TJ，
                     //   在制 PI 在 BJ、需求键在 TJ，供给池键 `物料|工厂` 对不上 ⇒ 全转新增生产 ⇒ 无 PI。
                     var (childFactoryId, childFactoryCode) =
-                        ResolveChildFactory(bom, edge, factoryId, factoryCode, traversalStats);
+                        ResolveChildFactory(bom, edge, factoryId, factoryCode, traversalStats, bomSourceProven);
 
                     TraverseBomNode(
                         order,
@@ -17333,7 +18057,8 @@ var orphanShOrders = await BuildRound3OrphanShDemandsAsync(
                         visited,
                         consumerLogicalDemandKey: outcome.ProducerLogicalDemandKey,
                         consumerMaterialId: materialId,
-                        traversalStats: traversalStats);
+                        traversalStats: traversalStats,
+                        bomSourceProven: bomSourceProven);
                 }
             }
 
@@ -17363,9 +18088,24 @@ var orphanShOrders = await BuildRound3OrphanShDemandsAsync(
         BomEdge edge,
         int parentFactoryId,
         string parentFactoryCode,
-        BomTraversalStats? stats)
+        BomTraversalStats? stats,
+        bool bomSourceProven = true)
     {
         var required = edge.ChildRequiredFactoryCode;
+
+        // ★ 2026-11-21（0号位 v1.1 §7）：订单级 BOM 入口不可证时**不得按并集 BOM 改厂**。
+        //   原实现「订单无锚点 / 锚点在本批无行 ⇒ 用全部边的并集展开」，并集里的
+        //   `ChildRequiredFactory` 可能来自**别的订单的 BOM**，据此把子件改到别的厂
+        //   ＝ 0号位 明令禁止的「(Parent,Child) 全库反查推断跨厂」。
+        //   实测影响：本 PV 53,374 单中 **9,472 单（17.7%）无 RESOLVED 锚点**走并集。
+        //   ⇒ 此分支**不改厂**（保持父厂），只计数留痕，由 Issue 暴露；
+        //     不改厂就不会凭空产出「BJ 库存 28＋BJ 制造 22」那类跨厂制造需求。
+        if (!bomSourceProven && !string.IsNullOrWhiteSpace(required))
+        {
+            stats?.RecordChildFactoryUnprovenBom(edge.ChildCode, required!.Trim());
+            return (parentFactoryId, parentFactoryCode);
+        }
+
         if (string.IsNullOrWhiteSpace(required))
         {
             stats?.RecordChildFactoryMissing(edge.ChildCode, parentFactoryCode);
@@ -17566,7 +18306,7 @@ var orphanShOrders = await BuildRound3OrphanShDemandsAsync(
 
         if (demand.RemainingQty > 0m && fabricationType == FabricationType.ShFulfilment)
         {
-            foreach (var shEntry in supplyPool.GetInterFactoryEntries(materialCode, factoryId))
+            foreach (var shEntry in supplyPool.GetInterFactoryEntries(materialCode, factoryId, allowedShSourceFactoryIds))
             {
                 if (demand.RemainingQty <= 0m) break;
 
@@ -17591,12 +18331,19 @@ var orphanShOrders = await BuildRound3OrphanShDemandsAsync(
                     continue;
                 }
 
+                // 2026-11-19（0号位 v1.2 §2.2）：SH 供给是 `FINAL_ASSY-*`、需求是 `ASSY-*` 时两个 MaterialId 不同；
+                //   只有当「供给物料码去掉一层 FINAL_ 后与需求物料码严格相等」才允许按比较键承接。
+                var byComparisonKey = shEntry.MaterialId != materialId
+                    && string.Equals(ShMaterialComparisonKey.StripOne(shEntry.MaterialCode),
+                                     materialCode, StringComparison.Ordinal);
+
                 var shResult = TryAtomicAllocation(
                     supply: shEntry,
                     demand: demand,
                     bomLevel: bomLevel,
                     voucher: voucher,
-                    requestedQty: demand.RemainingQty);
+                    requestedQty: demand.RemainingQty,
+                    allowComparisonKeyIdentity: byComparisonKey);
 
                 if (!shResult.Success)
                 {

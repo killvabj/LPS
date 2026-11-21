@@ -51,6 +51,13 @@ public sealed class ExplanationDto
 /// <summary>
 /// Explanation查询汇总DTO
 /// </summary>
+/// <summary>objectType 维度计数行（H4）。</summary>
+public sealed class ObjectTypeCountDto
+{
+    public string ObjectType { get; init; } = string.Empty;
+    public int Count { get; init; }
+}
+
 public sealed class ExplanationSummaryDto
 {
     /// <summary>PlanVersionId</summary>
@@ -66,6 +73,10 @@ public sealed class ExplanationSummaryDto
 
     /// <summary>按ReasonCode分组统计</summary>
     public List<ReasonCodeCountDto> ReasonCodeCounts { get; init; } = new();
+
+    /// <summary>H4（11-21 4号位件）：按 objectType 的权威计数（ORDER/RESOURCE/DOMAIN/…，NULL 归 UNKNOWN）；
+    /// 前端分组计数以此为权威，**不再用"已加载子集"近似**（v0.2 §P08"不能无依据呈现为0"）。</summary>
+    public List<ObjectTypeCountDto> ObjectTypeCounts { get; init; } = new();
 
     /// <summary>Explanation列表</summary>
     public List<ExplanationDto> Items { get; init; } = new();

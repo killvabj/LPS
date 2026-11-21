@@ -1,0 +1,243 @@
+10:45:31 | elapsed 00:00:00 | phase=Idle | P2 0/0 | P4 0/0 | routingTrials=0 | runBatchPlan=0 | slots=0
+11:55:29 | elapsed 00:00:00 | phase=Idle | P2 0/0 | P4 0/0 | routingTrials=0 | runBatchPlan=0 | slots=0
+11:55:39 | elapsed 00:00:10 | phase=Phase1 | P2 0/0 | P4 0/0 | routingTrials=0 | runBatchPlan=0 | slots=0
+11:55:49 | elapsed 00:00:20 | phase=Phase1 | P2 0/0 | P4 0/0 | routingTrials=0 | runBatchPlan=0 | slots=0
+11:55:59 | elapsed 00:00:30 | phase=Phase1 | P2 0/0 | P4 0/0 | routingTrials=0 | runBatchPlan=0 | slots=0
+11:56:09 | elapsed 00:00:40 | phase=Phase1 | P2 0/0 | P4 0/0 | routingTrials=0 | runBatchPlan=0 | slots=0
+11:56:19 | elapsed 00:00:50 | phase=Phase1 | P2 0/0 | P4 0/0 | routingTrials=0 | runBatchPlan=0 | slots=0
+11:56:29 | elapsed 00:01:00 | phase=Phase1 | P2 0/0 | P4 0/0 | routingTrials=0 | runBatchPlan=0 | slots=0
+11:56:39 | elapsed 00:01:10 | phase=Phase1 | P2 0/0 | P4 0/0 | routingTrials=0 | runBatchPlan=0 | slots=0
+11:56:49 | elapsed 00:01:20 | phase=Phase1 | P2 0/0 | P4 0/0 | routingTrials=0 | runBatchPlan=0 | slots=0
+11:56:59 | elapsed 00:01:30 | phase=Phase1 | P2 0/0 | P4 0/0 | routingTrials=0 | runBatchPlan=0 | slots=0
+11:57:09 | elapsed 00:01:40 | phase=Phase1 | P2 0/0 | P4 0/0 | routingTrials=0 | runBatchPlan=0 | slots=0
+11:57:19 | elapsed 00:01:50 | phase=Phase1 | P2 0/0 | P4 0/0 | routingTrials=0 | runBatchPlan=0 | slots=0
+11:57:29 | elapsed 00:02:00 | phase=Phase1 | P2 0/0 | P4 0/0 | routingTrials=0 | runBatchPlan=0 | slots=0
+11:57:39 | elapsed 00:02:10 | phase=Phase1 | P2 0/0 | P4 0/0 | routingTrials=0 | runBatchPlan=0 | slots=0
+11:57:49 | elapsed 00:02:20 | phase=Phase1 | P2 0/0 | P4 0/0 | routingTrials=0 | runBatchPlan=0 | slots=0
+11:57:59 | elapsed 00:02:30 | phase=Phase1 | P2 0/0 | P4 0/0 | routingTrials=0 | runBatchPlan=0 | slots=0
+11:58:09 | elapsed 00:02:40 | phase=Phase1 | P2 0/0 | P4 0/0 | routingTrials=0 | runBatchPlan=0 | slots=0
+11:58:20 | elapsed 00:02:50 | phase=Phase1 | P2 0/0 | P4 0/0 | routingTrials=0 | runBatchPlan=0 | slots=0
+11:58:30 | elapsed 00:03:00 | phase=Phase1 | P2 0/0 | P4 0/0 | routingTrials=0 | runBatchPlan=0 | slots=0
+11:58:40 | elapsed 00:03:10 | phase=Phase1 | P2 0/0 | P4 0/0 | routingTrials=0 | runBatchPlan=0 | slots=0
+11:58:50 | elapsed 00:03:20 | phase=Phase1 | P2 0/0 | P4 0/0 | routingTrials=0 | runBatchPlan=0 | slots=0
+11:59:00 | elapsed 00:03:30 | phase=Phase1 | P2 0/0 | P4 0/0 | routingTrials=0 | runBatchPlan=0 | slots=0
+11:59:10 | elapsed 00:03:40 | phase=Phase1 | P2 0/0 | P4 0/0 | routingTrials=0 | runBatchPlan=0 | slots=0
+11:59:20 | elapsed 00:03:50 | phase=Phase1 | P2 0/0 | P4 0/0 | routingTrials=0 | runBatchPlan=0 | slots=0
+11:59:30 | elapsed 00:04:00 | phase=Phase1 | P2 0/0 | P4 0/0 | routingTrials=0 | runBatchPlan=0 | slots=0
+11:59:40 | elapsed 00:04:10 | phase=Phase1 | P2 0/0 | P4 0/0 | routingTrials=0 | runBatchPlan=0 | slots=0
+11:59:50 | elapsed 00:04:20 | phase=Phase1 | P2 0/0 | P4 0/0 | routingTrials=0 | runBatchPlan=0 | slots=0
+12:00:00 | elapsed 00:04:30 | phase=Phase1 | P2 0/0 | P4 0/0 | routingTrials=0 | runBatchPlan=0 | slots=0
+12:00:10 | elapsed 00:04:40 | phase=Phase1 | P2 0/0 | P4 0/0 | routingTrials=0 | runBatchPlan=0 | slots=0
+12:00:20 | elapsed 00:04:50 | phase=Phase1 | P2 0/0 | P4 0/0 | routingTrials=0 | runBatchPlan=0 | slots=0
+12:00:30 | elapsed 00:05:00 | phase=Phase1 | P2 0/0 | P4 0/0 | routingTrials=0 | runBatchPlan=0 | slots=0
+12:00:40 | elapsed 00:05:10 | phase=Phase1 | P2 0/0 | P4 0/0 | routingTrials=0 | runBatchPlan=0 | slots=0
+12:00:50 | elapsed 00:05:20 | phase=Phase1 | P2 0/0 | P4 0/0 | routingTrials=0 | runBatchPlan=0 | slots=0
+12:01:00 | elapsed 00:05:30 | phase=Phase1 | P2 0/0 | P4 0/0 | routingTrials=0 | runBatchPlan=0 | slots=0
+12:01:10 | elapsed 00:05:40 | phase=Phase1 | P2 0/0 | P4 0/0 | routingTrials=0 | runBatchPlan=0 | slots=0
+12:01:20 | elapsed 00:05:50 | phase=Phase1 | P2 0/0 | P4 0/0 | routingTrials=0 | runBatchPlan=0 | slots=0
+12:01:30 | elapsed 00:06:00 | phase=Phase1 | P2 0/0 | P4 0/0 | routingTrials=0 | runBatchPlan=0 | slots=0
+12:01:40 | elapsed 00:06:10 | phase=Phase1 | P2 0/0 | P4 0/0 | routingTrials=0 | runBatchPlan=0 | slots=0
+12:01:50 | elapsed 00:06:20 | phase=Phase1 | P2 0/0 | P4 0/0 | routingTrials=0 | runBatchPlan=0 | slots=0
+12:02:00 | elapsed 00:06:30 | phase=Phase1 | P2 0/0 | P4 0/0 | routingTrials=0 | runBatchPlan=0 | slots=0
+12:02:10 | elapsed 00:06:40 | phase=Phase2 | P2 585/100431 (0.6%) | P4 0/0 | routingTrials=444 | runBatchPlan=745 | slots=6178
+12:02:20 | elapsed 00:06:50 | phase=Phase2 | P2 3622/100431 (3.6%) | P4 0/0 | routingTrials=2907 | runBatchPlan=4707 | slots=52311
+12:02:30 | elapsed 00:07:00 | phase=Phase2 | P2 6281/100431 (6.3%) | P4 0/0 | routingTrials=5318 | runBatchPlan=8225 | slots=148778
+12:02:40 | elapsed 00:07:10 | phase=Phase2 | P2 8013/100431 (8.0%) | P4 0/0 | routingTrials=7633 | runBatchPlan=10994 | slots=261564
+12:02:50 | elapsed 00:07:20 | phase=Phase2 | P2 9928/100431 (9.9%) | P4 0/0 | routingTrials=9288 | runBatchPlan=13487 | slots=394515
+12:03:00 | elapsed 00:07:30 | phase=Phase2 | P2 11178/100431 (11.1%) | P4 0/0 | routingTrials=10760 | runBatchPlan=15352 | slots=545934
+12:03:10 | elapsed 00:07:40 | phase=Phase2 | P2 12048/100431 (12.0%) | P4 0/0 | routingTrials=11795 | runBatchPlan=16630 | slots=822770
+12:03:20 | elapsed 00:07:50 | phase=Phase2 | P2 12857/100431 (12.8%) | P4 0/0 | routingTrials=13224 | runBatchPlan=18122 | slots=885118
+12:03:30 | elapsed 00:08:00 | phase=Phase2 | P2 13593/100431 (13.5%) | P4 0/0 | routingTrials=14486 | runBatchPlan=19448 | slots=1059519
+12:03:40 | elapsed 00:08:10 | phase=Phase2 | P2 14436/100431 (14.4%) | P4 0/0 | routingTrials=15834 | runBatchPlan=20943 | slots=1197139
+12:03:50 | elapsed 00:08:20 | phase=Phase2 | P2 15122/100431 (15.1%) | P4 0/0 | routingTrials=17025 | runBatchPlan=22185 | slots=1329270
+12:04:00 | elapsed 00:08:30 | phase=Phase2 | P2 15540/100431 (15.5%) | P4 0/0 | routingTrials=17581 | runBatchPlan=22798 | slots=1598617
+12:04:10 | elapsed 00:08:40 | phase=Phase2 | P2 16052/100431 (16.0%) | P4 0/0 | routingTrials=18471 | runBatchPlan=23727 | slots=1726040
+12:04:20 | elapsed 00:08:50 | phase=Phase2 | P2 16821/100431 (16.7%) | P4 0/0 | routingTrials=19772 | runBatchPlan=25114 | slots=1787384
+12:04:30 | elapsed 00:09:00 | phase=Phase2 | P2 17624/100431 (17.5%) | P4 0/0 | routingTrials=21245 | runBatchPlan=26622 | slots=1833759
+12:04:40 | elapsed 00:09:10 | phase=Phase2 | P2 18366/100431 (18.3%) | P4 0/0 | routingTrials=22571 | runBatchPlan=28005 | slots=1892211
+12:04:50 | elapsed 00:09:20 | phase=Phase2 | P2 18988/100431 (18.9%) | P4 0/0 | routingTrials=23675 | runBatchPlan=29146 | slots=1936719
+12:05:00 | elapsed 00:09:30 | phase=Phase2 | P2 19624/100431 (19.5%) | P4 0/0 | routingTrials=24790 | runBatchPlan=30322 | slots=1949130
+12:05:10 | elapsed 00:09:40 | phase=Phase2 | P2 20397/100431 (20.3%) | P4 0/0 | routingTrials=25966 | runBatchPlan=31628 | slots=2007844
+12:05:20 | elapsed 00:09:50 | phase=Phase2 | P2 21014/100431 (20.9%) | P4 0/0 | routingTrials=27010 | runBatchPlan=32718 | slots=2118549
+12:05:30 | elapsed 00:10:00 | phase=Phase2 | P2 21578/100431 (21.5%) | P4 0/0 | routingTrials=27865 | runBatchPlan=33694 | slots=2236944
+12:05:40 | elapsed 00:10:10 | phase=Phase2 | P2 22098/100431 (22.0%) | P4 0/0 | routingTrials=28708 | runBatchPlan=34625 | slots=2381792
+12:05:50 | elapsed 00:10:20 | phase=Phase2 | P2 22708/100431 (22.6%) | P4 0/0 | routingTrials=29681 | runBatchPlan=35703 | slots=2496457
+12:06:00 | elapsed 00:10:30 | phase=Phase2 | P2 23279/100431 (23.2%) | P4 0/0 | routingTrials=30632 | runBatchPlan=36723 | slots=2600247
+12:06:10 | elapsed 00:10:40 | phase=Phase2 | P2 23725/100431 (23.6%) | P4 0/0 | routingTrials=31391 | runBatchPlan=37530 | slots=2730541
+12:06:20 | elapsed 00:10:50 | phase=Phase2 | P2 24018/100431 (23.9%) | P4 0/0 | routingTrials=31859 | runBatchPlan=38019 | slots=2933381
+12:06:30 | elapsed 00:11:00 | phase=Phase2 | P2 24336/100431 (24.2%) | P4 0/0 | routingTrials=32234 | runBatchPlan=38444 | slots=3126098
+12:06:40 | elapsed 00:11:10 | phase=Phase2 | P2 24869/100431 (24.8%) | P4 0/0 | routingTrials=32977 | runBatchPlan=39309 | slots=3263149
+12:06:50 | elapsed 00:11:20 | phase=Phase2 | P2 25319/100431 (25.2%) | P4 0/0 | routingTrials=33435 | runBatchPlan=39931 | slots=3440861
+12:07:00 | elapsed 00:11:30 | phase=Phase2 | P2 25783/100431 (25.7%) | P4 0/0 | routingTrials=34113 | runBatchPlan=40695 | slots=3581920
+12:07:10 | elapsed 00:11:40 | phase=Phase2 | P2 26208/100431 (26.1%) | P4 0/0 | routingTrials=34539 | runBatchPlan=41275 | slots=3739333
+12:07:20 | elapsed 00:11:50 | phase=Phase2 | P2 26558/100431 (26.4%) | P4 0/0 | routingTrials=34949 | runBatchPlan=41795 | slots=3902948
+12:07:30 | elapsed 00:12:00 | phase=Phase2 | P2 26681/100431 (26.6%) | P4 0/0 | routingTrials=35111 | runBatchPlan=41984 | slots=4039416
+12:07:40 | elapsed 00:12:10 | phase=Phase2 | P2 27031/100431 (26.9%) | P4 0/0 | routingTrials=35491 | runBatchPlan=42479 | slots=4188279
+12:07:50 | elapsed 00:12:20 | phase=Phase2 | P2 27387/100431 (27.3%) | P4 0/0 | routingTrials=35879 | runBatchPlan=42982 | slots=4386488
+12:08:00 | elapsed 00:12:30 | phase=Phase2 | P2 27690/100431 (27.6%) | P4 0/0 | routingTrials=36210 | runBatchPlan=43397 | slots=4574788
+12:08:10 | elapsed 00:12:40 | phase=Phase2 | P2 27993/100431 (27.9%) | P4 0/0 | routingTrials=36513 | runBatchPlan=43804 | slots=4719584
+12:08:20 | elapsed 00:12:50 | phase=Phase2 | P2 28096/100431 (28.0%) | P4 0/0 | routingTrials=36642 | runBatchPlan=43949 | slots=4907588
+12:08:30 | elapsed 00:13:00 | phase=Phase2 | P2 28293/100431 (28.2%) | P4 0/0 | routingTrials=36842 | runBatchPlan=44216 | slots=5059320
+12:08:40 | elapsed 00:13:10 | phase=Phase2 | P2 28523/100431 (28.4%) | P4 0/0 | routingTrials=37075 | runBatchPlan=44516 | slots=5188162
+12:08:50 | elapsed 00:13:20 | phase=Phase2 | P2 28913/100431 (28.8%) | P4 0/0 | routingTrials=37483 | runBatchPlan=45075 | slots=5342627
+12:09:00 | elapsed 00:13:30 | phase=Phase2 | P2 29188/100431 (29.1%) | P4 0/0 | routingTrials=37793 | runBatchPlan=45479 | slots=5486055
+12:09:10 | elapsed 00:13:40 | phase=Phase2 | P2 29326/100431 (29.2%) | P4 0/0 | routingTrials=37943 | runBatchPlan=45662 | slots=5637621
+12:09:20 | elapsed 00:13:50 | phase=Phase2 | P2 29949/100431 (29.8%) | P4 0/0 | routingTrials=38461 | runBatchPlan=46459 | slots=5760649
+12:09:30 | elapsed 00:14:00 | phase=Phase2 | P2 30120/100431 (30.0%) | P4 0/0 | routingTrials=38697 | runBatchPlan=46730 | slots=5948830
+12:09:40 | elapsed 00:14:10 | phase=Phase2 | P2 30610/100431 (30.5%) | P4 0/0 | routingTrials=39172 | runBatchPlan=47405 | slots=6080665
+12:09:50 | elapsed 00:14:20 | phase=Phase2 | P2 31001/100431 (30.9%) | P4 0/0 | routingTrials=39439 | runBatchPlan=47860 | slots=6178019
+12:10:00 | elapsed 00:14:30 | phase=Phase2 | P2 31511/100431 (31.4%) | P4 0/0 | routingTrials=39793 | runBatchPlan=48439 | slots=6309386
+12:10:10 | elapsed 00:14:40 | phase=Phase2 | P2 31740/100431 (31.6%) | P4 0/0 | routingTrials=39955 | runBatchPlan=48703 | slots=6405590
+12:10:20 | elapsed 00:14:50 | phase=Phase2 | P2 32375/100431 (32.2%) | P4 0/0 | routingTrials=40323 | runBatchPlan=49362 | slots=6558214
+12:10:30 | elapsed 00:15:00 | phase=Phase2 | P2 33018/100431 (32.9%) | P4 0/0 | routingTrials=41220 | runBatchPlan=50384 | slots=6624690
+12:10:40 | elapsed 00:15:10 | phase=Phase2 | P2 33639/100431 (33.5%) | P4 0/0 | routingTrials=42180 | runBatchPlan=51447 | slots=6669933
+12:10:50 | elapsed 00:15:20 | phase=Phase2 | P2 34299/100431 (34.2%) | P4 0/0 | routingTrials=43248 | runBatchPlan=52630 | slots=6704938
+12:11:00 | elapsed 00:15:30 | phase=Phase2 | P2 34710/100431 (34.6%) | P4 0/0 | routingTrials=43923 | runBatchPlan=53367 | slots=6786928
+12:11:10 | elapsed 00:15:40 | phase=Phase2 | P2 35290/100431 (35.1%) | P4 0/0 | routingTrials=44803 | runBatchPlan=54353 | slots=6830915
+12:11:20 | elapsed 00:15:50 | phase=Phase2 | P2 35892/100431 (35.7%) | P4 0/0 | routingTrials=45690 | runBatchPlan=55351 | slots=6873488
+12:11:30 | elapsed 00:16:00 | phase=Phase2 | P2 36436/100431 (36.3%) | P4 0/0 | routingTrials=46511 | runBatchPlan=56258 | slots=6945051
+12:11:40 | elapsed 00:16:10 | phase=Phase2 | P2 36982/100431 (36.8%) | P4 0/0 | routingTrials=47357 | runBatchPlan=57189 | slots=6994096
+12:11:50 | elapsed 00:16:20 | phase=Phase2 | P2 37619/100431 (37.5%) | P4 0/0 | routingTrials=48027 | runBatchPlan=57954 | slots=7080324
+12:12:00 | elapsed 00:16:30 | phase=Phase2 | P2 37939/100431 (37.8%) | P4 0/0 | routingTrials=48468 | runBatchPlan=58479 | slots=7208319
+12:12:10 | elapsed 00:16:40 | phase=Phase2 | P2 38941/100431 (38.8%) | P4 0/0 | routingTrials=49292 | runBatchPlan=59604 | slots=7227644
+12:12:20 | elapsed 00:16:50 | phase=Phase2 | P2 39912/100431 (39.7%) | P4 0/0 | routingTrials=50122 | runBatchPlan=60643 | slots=7235404
+12:12:30 | elapsed 00:17:00 | phase=Phase2 | P2 40940/100431 (40.8%) | P4 0/0 | routingTrials=50857 | runBatchPlan=61627 | slots=7244783
+12:12:40 | elapsed 00:17:10 | phase=Phase2 | P2 42168/100431 (42.0%) | P4 0/0 | routingTrials=51740 | runBatchPlan=62821 | slots=7255541
+12:12:50 | elapsed 00:17:20 | phase=Phase2 | P2 43921/100431 (43.7%) | P4 0/0 | routingTrials=52244 | runBatchPlan=64106 | slots=7265583
+12:13:00 | elapsed 00:17:30 | phase=Phase2 | P2 45408/100431 (45.2%) | P4 0/0 | routingTrials=52988 | runBatchPlan=65236 | slots=7277505
+12:13:10 | elapsed 00:17:40 | phase=Phase2 | P2 46396/100431 (46.2%) | P4 0/0 | routingTrials=54034 | runBatchPlan=66436 | slots=7294469
+12:13:20 | elapsed 00:17:50 | phase=Phase2 | P2 47211/100431 (47.0%) | P4 0/0 | routingTrials=55050 | runBatchPlan=67584 | slots=7309130
+12:13:30 | elapsed 00:18:00 | phase=Phase2 | P2 48167/100431 (48.0%) | P4 0/0 | routingTrials=55969 | runBatchPlan=68692 | slots=7321949
+12:13:40 | elapsed 00:18:10 | phase=Phase2 | P2 48977/100431 (48.8%) | P4 0/0 | routingTrials=56858 | runBatchPlan=69737 | slots=7362389
+12:13:50 | elapsed 00:18:20 | phase=Phase2 | P2 49793/100431 (49.6%) | P4 0/0 | routingTrials=57782 | runBatchPlan=70791 | slots=7375606
+12:14:00 | elapsed 00:18:30 | phase=Phase2 | P2 50572/100431 (50.4%) | P4 0/0 | routingTrials=58591 | runBatchPlan=71762 | slots=7386061
+12:14:10 | elapsed 00:18:40 | phase=Phase2 | P2 51272/100431 (51.1%) | P4 0/0 | routingTrials=59514 | runBatchPlan=72764 | slots=7409049
+12:14:20 | elapsed 00:18:50 | phase=Phase2 | P2 51951/100431 (51.7%) | P4 0/0 | routingTrials=60341 | runBatchPlan=73655 | slots=7423415
+12:14:30 | elapsed 00:19:00 | phase=Phase2 | P2 52702/100431 (52.5%) | P4 0/0 | routingTrials=61162 | runBatchPlan=74586 | slots=7434396
+12:14:40 | elapsed 00:19:10 | phase=Phase2 | P2 53535/100431 (53.3%) | P4 0/0 | routingTrials=62069 | runBatchPlan=75661 | slots=7447597
+12:14:50 | elapsed 00:19:20 | phase=Phase2 | P2 54355/100431 (54.1%) | P4 0/0 | routingTrials=62952 | runBatchPlan=76690 | slots=7461795
+12:15:00 | elapsed 00:19:30 | phase=Phase2 | P2 55067/100431 (54.8%) | P4 0/0 | routingTrials=63811 | runBatchPlan=77654 | slots=7473272
+12:15:10 | elapsed 00:19:40 | phase=Phase2 | P2 55871/100431 (55.6%) | P4 0/0 | routingTrials=64700 | runBatchPlan=78706 | slots=7485273
+12:15:20 | elapsed 00:19:50 | phase=Phase2 | P2 56602/100431 (56.4%) | P4 0/0 | routingTrials=65594 | runBatchPlan=79706 | slots=7497595
+12:15:30 | elapsed 00:20:00 | phase=Phase2 | P2 57317/100431 (57.1%) | P4 0/0 | routingTrials=66449 | runBatchPlan=80681 | slots=7507561
+12:15:40 | elapsed 00:20:10 | phase=Phase2 | P2 58039/100431 (57.8%) | P4 0/0 | routingTrials=67312 | runBatchPlan=81660 | slots=7520897
+12:15:50 | elapsed 00:20:20 | phase=Phase2 | P2 58849/100431 (58.6%) | P4 0/0 | routingTrials=68182 | runBatchPlan=82674 | slots=7533125
+12:16:00 | elapsed 00:20:30 | phase=Phase2 | P2 59518/100431 (59.3%) | P4 0/0 | routingTrials=69028 | runBatchPlan=83607 | slots=7544229
+12:16:10 | elapsed 00:20:40 | phase=Phase2 | P2 60222/100431 (60.0%) | P4 0/0 | routingTrials=69859 | runBatchPlan=84529 | slots=7559940
+12:16:20 | elapsed 00:20:50 | phase=Phase2 | P2 60904/100431 (60.6%) | P4 0/0 | routingTrials=70665 | runBatchPlan=85424 | slots=7569748
+12:16:30 | elapsed 00:21:00 | phase=Phase2 | P2 61670/100431 (61.4%) | P4 0/0 | routingTrials=71464 | runBatchPlan=86348 | slots=7581276
+12:16:40 | elapsed 00:21:10 | phase=Phase2 | P2 62288/100431 (62.0%) | P4 0/0 | routingTrials=72158 | runBatchPlan=87143 | slots=7588627
+12:16:50 | elapsed 00:21:20 | phase=Phase2 | P2 62910/100431 (62.6%) | P4 0/0 | routingTrials=72983 | runBatchPlan=88068 | slots=7600706
+12:17:00 | elapsed 00:21:30 | phase=Phase2 | P2 63608/100431 (63.3%) | P4 0/0 | routingTrials=73708 | runBatchPlan=88927 | slots=7608557
+12:17:10 | elapsed 00:21:40 | phase=Phase2 | P2 64304/100431 (64.0%) | P4 0/0 | routingTrials=74473 | runBatchPlan=89806 | slots=7618029
+12:17:20 | elapsed 00:21:50 | phase=Phase2 | P2 65021/100431 (64.7%) | P4 0/0 | routingTrials=75272 | runBatchPlan=90717 | slots=7627987
+12:17:30 | elapsed 00:22:00 | phase=Phase2 | P2 65704/100431 (65.4%) | P4 0/0 | routingTrials=76021 | runBatchPlan=91578 | slots=7636167
+12:17:40 | elapsed 00:22:10 | phase=Phase2 | P2 66483/100431 (66.2%) | P4 0/0 | routingTrials=76824 | runBatchPlan=92525 | slots=7645267
+12:17:50 | elapsed 00:22:20 | phase=Phase2 | P2 67118/100431 (66.8%) | P4 0/0 | routingTrials=77570 | runBatchPlan=93382 | slots=7653061
+12:18:00 | elapsed 00:22:30 | phase=Phase2 | P2 67779/100431 (67.5%) | P4 0/0 | routingTrials=78327 | runBatchPlan=94230 | slots=7661342
+12:18:10 | elapsed 00:22:40 | phase=Phase2 | P2 68432/100431 (68.1%) | P4 0/0 | routingTrials=79116 | runBatchPlan=95116 | slots=7671427
+12:18:20 | elapsed 00:22:50 | phase=Phase2 | P2 69083/100431 (68.8%) | P4 0/0 | routingTrials=79803 | runBatchPlan=95887 | slots=7678075
+12:18:30 | elapsed 00:23:00 | phase=Phase2 | P2 69744/100431 (69.4%) | P4 0/0 | routingTrials=80546 | runBatchPlan=96757 | slots=7685793
+12:18:40 | elapsed 00:23:10 | phase=Phase2 | P2 70372/100431 (70.1%) | P4 0/0 | routingTrials=81344 | runBatchPlan=97653 | slots=7696462
+12:18:50 | elapsed 00:23:20 | phase=Phase2 | P2 71020/100431 (70.7%) | P4 0/0 | routingTrials=81989 | runBatchPlan=98419 | slots=7703123
+12:19:00 | elapsed 00:23:30 | phase=Phase2 | P2 71745/100431 (71.4%) | P4 0/0 | routingTrials=82672 | runBatchPlan=99262 | slots=7709594
+12:19:10 | elapsed 00:23:40 | phase=Phase2 | P2 72398/100431 (72.1%) | P4 0/0 | routingTrials=83426 | runBatchPlan=100108 | slots=7716885
+12:19:20 | elapsed 00:23:50 | phase=Phase2 | P2 73015/100431 (72.7%) | P4 0/0 | routingTrials=84152 | runBatchPlan=100915 | slots=7725327
+12:19:30 | elapsed 00:24:00 | phase=Phase2 | P2 73677/100431 (73.4%) | P4 0/0 | routingTrials=84807 | runBatchPlan=101685 | slots=7732439
+12:19:40 | elapsed 00:24:10 | phase=Phase2 | P2 74243/100431 (73.9%) | P4 0/0 | routingTrials=85394 | runBatchPlan=102398 | slots=7738704
+12:19:50 | elapsed 00:24:20 | phase=Phase2 | P2 74819/100431 (74.5%) | P4 0/0 | routingTrials=86034 | runBatchPlan=103124 | slots=7744346
+12:20:00 | elapsed 00:24:30 | phase=Phase2 | P2 75440/100431 (75.1%) | P4 0/0 | routingTrials=86702 | runBatchPlan=103908 | slots=7750335
+12:20:10 | elapsed 00:24:40 | phase=Phase2 | P2 76063/100431 (75.7%) | P4 0/0 | routingTrials=87339 | runBatchPlan=104684 | slots=7756583
+12:20:20 | elapsed 00:24:50 | phase=Phase2 | P2 76578/100431 (76.2%) | P4 0/0 | routingTrials=87942 | runBatchPlan=105385 | slots=7781552
+12:20:30 | elapsed 00:25:00 | phase=Phase2 | P2 77182/100431 (76.9%) | P4 0/0 | routingTrials=88626 | runBatchPlan=106187 | slots=7788800
+12:20:40 | elapsed 00:25:10 | phase=Phase2 | P2 77774/100431 (77.4%) | P4 0/0 | routingTrials=89264 | runBatchPlan=106961 | slots=7795293
+12:20:50 | elapsed 00:25:20 | phase=Phase2 | P2 78276/100431 (77.9%) | P4 0/0 | routingTrials=89932 | runBatchPlan=107712 | slots=7802808
+12:21:00 | elapsed 00:25:30 | phase=Phase2 | P2 78844/100431 (78.5%) | P4 0/0 | routingTrials=90598 | runBatchPlan=108476 | slots=7809979
+12:21:10 | elapsed 00:25:40 | phase=Phase2 | P2 79352/100431 (79.0%) | P4 0/0 | routingTrials=91232 | runBatchPlan=109176 | slots=7817314
+12:21:20 | elapsed 00:25:50 | phase=Phase2 | P2 79882/100431 (79.5%) | P4 0/0 | routingTrials=91933 | runBatchPlan=109947 | slots=7825290
+12:21:30 | elapsed 00:26:00 | phase=Phase2 | P2 80412/100431 (80.1%) | P4 0/0 | routingTrials=92572 | runBatchPlan=110670 | slots=7832876
+12:21:40 | elapsed 00:26:10 | phase=Phase2 | P2 80965/100431 (80.6%) | P4 0/0 | routingTrials=93144 | runBatchPlan=111341 | slots=7838069
+12:21:50 | elapsed 00:26:20 | phase=Phase2 | P2 81499/100431 (81.1%) | P4 0/0 | routingTrials=93745 | runBatchPlan=112043 | slots=7843636
+12:22:00 | elapsed 00:26:31 | phase=Phase2 | P2 82031/100431 (81.7%) | P4 0/0 | routingTrials=94366 | runBatchPlan=112768 | slots=7849218
+12:22:10 | elapsed 00:26:41 | phase=Phase2 | P2 82561/100431 (82.2%) | P4 0/0 | routingTrials=94984 | runBatchPlan=113462 | slots=7856026
+12:22:20 | elapsed 00:26:51 | phase=Phase2 | P2 83296/100431 (82.9%) | P4 0/0 | routingTrials=95542 | runBatchPlan=114129 | slots=7863371
+12:22:30 | elapsed 00:27:01 | phase=Phase2 | P2 83717/100431 (83.4%) | P4 0/0 | routingTrials=95994 | runBatchPlan=114649 | slots=7867473
+12:22:40 | elapsed 00:27:11 | phase=Phase2 | P2 84320/100431 (84.0%) | P4 0/0 | routingTrials=96576 | runBatchPlan=115293 | slots=7872838
+12:22:50 | elapsed 00:27:21 | phase=Phase2 | P2 85244/100431 (84.9%) | P4 0/0 | routingTrials=97134 | runBatchPlan=116036 | slots=7881915
+12:23:00 | elapsed 00:27:31 | phase=Phase2 | P2 86617/100431 (86.2%) | P4 0/0 | routingTrials=97484 | runBatchPlan=116792 | slots=7888403
+12:23:10 | elapsed 00:27:41 | phase=Phase2 | P2 87153/100431 (86.8%) | P4 0/0 | routingTrials=97962 | runBatchPlan=117458 | slots=7897105
+12:23:20 | elapsed 00:27:51 | phase=Phase2 | P2 87924/100431 (87.5%) | P4 0/0 | routingTrials=98542 | runBatchPlan=118312 | slots=7907268
+12:23:30 | elapsed 00:28:01 | phase=Phase2 | P2 88421/100431 (88.0%) | P4 0/0 | routingTrials=99082 | runBatchPlan=118979 | slots=7919137
+12:23:40 | elapsed 00:28:11 | phase=Phase2 | P2 88775/100431 (88.4%) | P4 0/0 | routingTrials=99637 | runBatchPlan=119564 | slots=7930431
+12:23:50 | elapsed 00:28:21 | phase=Phase2 | P2 89483/100431 (89.1%) | P4 0/0 | routingTrials=100288 | runBatchPlan=120428 | slots=7943740
+12:24:00 | elapsed 00:28:31 | phase=Phase2 | P2 90027/100431 (89.6%) | P4 0/0 | routingTrials=100871 | runBatchPlan=121134 | slots=7952193
+12:24:10 | elapsed 00:28:41 | phase=Phase2 | P2 90684/100431 (90.3%) | P4 0/0 | routingTrials=101694 | runBatchPlan=122056 | slots=7964874
+12:24:21 | elapsed 00:28:51 | phase=Phase2 | P2 91066/100431 (90.7%) | P4 0/0 | routingTrials=102328 | runBatchPlan=122690 | slots=7972291
+12:24:31 | elapsed 00:29:01 | phase=Phase2 | P2 91372/100431 (91.0%) | P4 0/0 | routingTrials=102902 | runBatchPlan=123263 | slots=7980224
+12:24:41 | elapsed 00:29:11 | phase=Phase2 | P2 91745/100431 (91.4%) | P4 0/0 | routingTrials=103542 | runBatchPlan=123904 | slots=7987649
+12:24:51 | elapsed 00:29:21 | phase=Phase2 | P2 92241/100431 (91.8%) | P4 0/0 | routingTrials=104265 | runBatchPlan=124627 | slots=7996147
+12:25:01 | elapsed 00:29:31 | phase=Phase2 | P2 92583/100431 (92.2%) | P4 0/0 | routingTrials=104836 | runBatchPlan=125198 | slots=8002479
+12:25:11 | elapsed 00:29:41 | phase=Phase2 | P2 92895/100431 (92.5%) | P4 0/0 | routingTrials=105363 | runBatchPlan=125725 | slots=8008176
+12:25:21 | elapsed 00:29:51 | phase=Phase2 | P2 93230/100431 (92.8%) | P4 0/0 | routingTrials=105880 | runBatchPlan=126242 | slots=8013090
+12:25:31 | elapsed 00:30:01 | phase=Phase2 | P2 93503/100431 (93.1%) | P4 0/0 | routingTrials=106341 | runBatchPlan=126703 | slots=8018787
+12:25:41 | elapsed 00:30:11 | phase=Phase2 | P2 93895/100431 (93.5%) | P4 0/0 | routingTrials=107080 | runBatchPlan=127442 | slots=8029729
+12:25:51 | elapsed 00:30:21 | phase=Phase2 | P2 94330/100431 (93.9%) | P4 0/0 | routingTrials=107826 | runBatchPlan=128188 | slots=8039070
+12:26:01 | elapsed 00:30:31 | phase=Phase2 | P2 94996/100431 (94.6%) | P4 0/0 | routingTrials=108715 | runBatchPlan=129121 | slots=8050374
+12:26:11 | elapsed 00:30:41 | phase=Phase2 | P2 95814/100431 (95.4%) | P4 0/0 | routingTrials=109737 | runBatchPlan=130269 | slots=8067859
+12:26:21 | elapsed 00:30:51 | phase=Phase2 | P2 96835/100431 (96.4%) | P4 0/0 | routingTrials=110959 | runBatchPlan=131626 | slots=8090491
+12:26:31 | elapsed 00:31:01 | phase=Phase2 | P2 97717/100431 (97.3%) | P4 0/0 | routingTrials=111868 | runBatchPlan=132675 | slots=8110766
+12:26:41 | elapsed 00:31:11 | phase=Phase2 | P2 98090/100431 (97.7%) | P4 0/0 | routingTrials=112510 | runBatchPlan=133317 | slots=8116600
+12:26:51 | elapsed 00:31:21 | phase=Phase2 | P2 98466/100431 (98.0%) | P4 0/0 | routingTrials=113184 | runBatchPlan=133990 | slots=8122864
+12:27:01 | elapsed 00:31:31 | phase=Phase2 | P2 98864/100431 (98.4%) | P4 0/0 | routingTrials=113776 | runBatchPlan=134595 | slots=8127946
+12:27:11 | elapsed 00:31:41 | phase=Phase2 | P2 99265/100431 (98.8%) | P4 0/0 | routingTrials=114379 | runBatchPlan=135221 | slots=8134754
+12:27:21 | elapsed 00:31:51 | phase=Phase4 | P2 100431/100431 (100.0%) | P4 9931/30819 | routingTrials=114848 | runBatchPlan=135729 | slots=8141434
+12:27:31 | elapsed 00:32:01 | phase=Phase5 | P2 100431/100431 (100.0%) | P4 30819/30819 | routingTrials=114848 | runBatchPlan=135729 | slots=8141434
+12:27:41 | elapsed 00:32:11 | phase=Phase5 | P2 100431/100431 (100.0%) | P4 30819/30819 | routingTrials=114848 | runBatchPlan=135729 | slots=8141434
+12:27:51 | elapsed 00:32:21 | phase=Phase5 | P2 100431/100431 (100.0%) | P4 30819/30819 | routingTrials=114848 | runBatchPlan=135729 | slots=8141434
+12:28:01 | elapsed 00:32:31 | phase=Phase5 | P2 100431/100431 (100.0%) | P4 30819/30819 | routingTrials=114848 | runBatchPlan=135729 | slots=8141434
+12:28:11 | elapsed 00:32:41 | phase=Phase5 | P2 100431/100431 (100.0%) | P4 30819/30819 | routingTrials=114848 | runBatchPlan=135729 | slots=8141434
+12:28:21 | elapsed 00:32:51 | phase=Phase5 | P2 100431/100431 (100.0%) | P4 30819/30819 | routingTrials=114848 | runBatchPlan=135729 | slots=8141434
+12:28:31 | elapsed 00:33:01 | phase=Phase5 | P2 100431/100431 (100.0%) | P4 30819/30819 | routingTrials=114848 | runBatchPlan=135729 | slots=8141434
+12:28:41 | elapsed 00:33:11 | phase=Phase5 | P2 100431/100431 (100.0%) | P4 30819/30819 | routingTrials=114848 | runBatchPlan=135729 | slots=8141434
+12:28:51 | elapsed 00:33:21 | phase=Phase5 | P2 100431/100431 (100.0%) | P4 30819/30819 | routingTrials=114848 | runBatchPlan=135729 | slots=8141434
+12:29:01 | elapsed 00:33:31 | phase=Phase5 | P2 100431/100431 (100.0%) | P4 30819/30819 | routingTrials=114848 | runBatchPlan=135729 | slots=8141434
+12:29:11 | elapsed 00:33:41 | phase=Phase5 | P2 100431/100431 (100.0%) | P4 30819/30819 | routingTrials=114848 | runBatchPlan=135729 | slots=8141434
+12:29:21 | elapsed 00:33:51 | phase=Phase5 | P2 100431/100431 (100.0%) | P4 30819/30819 | routingTrials=114848 | runBatchPlan=135729 | slots=8141434
+12:29:31 | elapsed 00:34:01 | phase=Phase5 | P2 100431/100431 (100.0%) | P4 30819/30819 | routingTrials=114848 | runBatchPlan=135729 | slots=8141434
+12:29:41 | elapsed 00:34:11 | phase=Phase5 | P2 100431/100431 (100.0%) | P4 30819/30819 | routingTrials=114848 | runBatchPlan=135729 | slots=8141434
+12:29:51 | elapsed 00:34:21 | phase=Phase5 | P2 100431/100431 (100.0%) | P4 30819/30819 | routingTrials=114848 | runBatchPlan=135729 | slots=8141434
+12:30:01 | elapsed 00:34:31 | phase=Phase5 | P2 100431/100431 (100.0%) | P4 30819/30819 | routingTrials=114848 | runBatchPlan=135729 | slots=8141434
+12:30:11 | elapsed 00:34:41 | phase=Phase5 | P2 100431/100431 (100.0%) | P4 30819/30819 | routingTrials=114848 | runBatchPlan=135729 | slots=8141434
+12:30:21 | elapsed 00:34:51 | phase=Phase5 | P2 100431/100431 (100.0%) | P4 30819/30819 | routingTrials=114848 | runBatchPlan=135729 | slots=8141434
+12:30:31 | elapsed 00:35:01 | phase=Phase5 | P2 100431/100431 (100.0%) | P4 30819/30819 | routingTrials=114848 | runBatchPlan=135729 | slots=8141434
+12:30:41 | elapsed 00:35:11 | phase=Phase5 | P2 100431/100431 (100.0%) | P4 30819/30819 | routingTrials=114848 | runBatchPlan=135729 | slots=8141434
+12:30:51 | elapsed 00:35:21 | phase=Phase5 | P2 100431/100431 (100.0%) | P4 30819/30819 | routingTrials=114848 | runBatchPlan=135729 | slots=8141434
+12:31:01 | elapsed 00:35:31 | phase=Phase5 | P2 100431/100431 (100.0%) | P4 30819/30819 | routingTrials=114848 | runBatchPlan=135729 | slots=8141434
+12:31:11 | elapsed 00:35:41 | phase=Phase5 | P2 100431/100431 (100.0%) | P4 30819/30819 | routingTrials=114848 | runBatchPlan=135729 | slots=8141434
+12:31:21 | elapsed 00:35:51 | phase=Phase5 | P2 100431/100431 (100.0%) | P4 30819/30819 | routingTrials=114848 | runBatchPlan=135729 | slots=8141434
+12:31:31 | elapsed 00:36:01 | phase=Phase5 | P2 100431/100431 (100.0%) | P4 30819/30819 | routingTrials=114848 | runBatchPlan=135729 | slots=8141434
+12:31:41 | elapsed 00:36:11 | phase=Phase5 | P2 100431/100431 (100.0%) | P4 30819/30819 | routingTrials=114848 | runBatchPlan=135729 | slots=8141434
+12:31:51 | elapsed 00:36:21 | phase=Phase5 | P2 100431/100431 (100.0%) | P4 30819/30819 | routingTrials=114848 | runBatchPlan=135729 | slots=8141434
+12:32:01 | elapsed 00:36:31 | phase=Phase5 | P2 100431/100431 (100.0%) | P4 30819/30819 | routingTrials=114848 | runBatchPlan=135729 | slots=8141434
+12:32:11 | elapsed 00:36:41 | phase=Phase5 | P2 100431/100431 (100.0%) | P4 30819/30819 | routingTrials=114848 | runBatchPlan=135729 | slots=8141434
+12:32:21 | elapsed 00:36:51 | phase=Phase5 | P2 100431/100431 (100.0%) | P4 30819/30819 | routingTrials=114848 | runBatchPlan=135729 | slots=8141434
+12:32:31 | elapsed 00:37:01 | phase=Phase5 | P2 100431/100431 (100.0%) | P4 30819/30819 | routingTrials=114848 | runBatchPlan=135729 | slots=8141434
+12:32:41 | elapsed 00:37:11 | phase=Phase5 | P2 100431/100431 (100.0%) | P4 30819/30819 | routingTrials=114848 | runBatchPlan=135729 | slots=8141434
+12:32:51 | elapsed 00:37:21 | phase=Phase5 | P2 100431/100431 (100.0%) | P4 30819/30819 | routingTrials=114848 | runBatchPlan=135729 | slots=8141434
+12:33:01 | elapsed 00:37:31 | phase=Phase5 | P2 100431/100431 (100.0%) | P4 30819/30819 | routingTrials=114848 | runBatchPlan=135729 | slots=8141434
+12:33:11 | elapsed 00:37:41 | phase=Phase5 | P2 100431/100431 (100.0%) | P4 30819/30819 | routingTrials=114848 | runBatchPlan=135729 | slots=8141434
+12:33:21 | elapsed 00:37:51 | phase=Phase5 | P2 100431/100431 (100.0%) | P4 30819/30819 | routingTrials=114848 | runBatchPlan=135729 | slots=8141434
+12:33:31 | elapsed 00:38:01 | phase=Phase5 | P2 100431/100431 (100.0%) | P4 30819/30819 | routingTrials=114848 | runBatchPlan=135729 | slots=8141434
+12:33:41 | elapsed 00:38:11 | phase=Phase5 | P2 100431/100431 (100.0%) | P4 30819/30819 | routingTrials=114848 | runBatchPlan=135729 | slots=8141434
+12:33:51 | elapsed 00:38:21 | phase=Phase5 | P2 100431/100431 (100.0%) | P4 30819/30819 | routingTrials=114848 | runBatchPlan=135729 | slots=8141434
+12:34:01 | elapsed 00:38:31 | phase=Phase5 | P2 100431/100431 (100.0%) | P4 30819/30819 | routingTrials=114848 | runBatchPlan=135729 | slots=8141434
+12:34:11 | elapsed 00:38:41 | phase=Phase5 | P2 100431/100431 (100.0%) | P4 30819/30819 | routingTrials=114848 | runBatchPlan=135729 | slots=8141434
+12:34:21 | elapsed 00:38:51 | phase=Phase5 | P2 100431/100431 (100.0%) | P4 30819/30819 | routingTrials=114848 | runBatchPlan=135729 | slots=8141434
+12:34:31 | elapsed 00:39:01 | phase=Phase5 | P2 100431/100431 (100.0%) | P4 30819/30819 | routingTrials=114848 | runBatchPlan=135729 | slots=8141434
+12:34:41 | elapsed 00:39:11 | phase=Phase5 | P2 100431/100431 (100.0%) | P4 30819/30819 | routingTrials=114848 | runBatchPlan=135729 | slots=8141434
+12:34:51 | elapsed 00:39:21 | phase=Phase5 | P2 100431/100431 (100.0%) | P4 30819/30819 | routingTrials=114848 | runBatchPlan=135729 | slots=8141434
+12:35:01 | elapsed 00:39:31 | phase=Phase5 | P2 100431/100431 (100.0%) | P4 30819/30819 | routingTrials=114848 | runBatchPlan=135729 | slots=8141434
+12:35:11 | elapsed 00:39:41 | phase=Phase5 | P2 100431/100431 (100.0%) | P4 30819/30819 | routingTrials=114848 | runBatchPlan=135729 | slots=8141434
+12:35:21 | elapsed 00:39:51 | phase=Phase5 | P2 100431/100431 (100.0%) | P4 30819/30819 | routingTrials=114848 | runBatchPlan=135729 | slots=8141434
+12:35:31 | elapsed 00:40:01 | phase=Phase5 | P2 100431/100431 (100.0%) | P4 30819/30819 | routingTrials=114848 | runBatchPlan=135729 | slots=8141434
+12:35:41 | elapsed 00:40:11 | phase=Phase5 | P2 100431/100431 (100.0%) | P4 30819/30819 | routingTrials=114848 | runBatchPlan=135729 | slots=8141434
