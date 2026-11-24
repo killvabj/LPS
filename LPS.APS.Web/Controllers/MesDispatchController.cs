@@ -58,6 +58,8 @@ public class MesDispatchController : ControllerBase
         [FromQuery] string? workOrderNo = null,
         [FromQuery] string? keyword = null,
         [FromQuery] string? dispatchStatus = null,
+        [FromQuery] string? resourceIds = null,        // P11 H3：设备 Id 逗号多值
+        [FromQuery] string? workOrderStatuses = null,  // P11 H3：MES 工单状态逗号多值（批内任一工单命中）
         [FromQuery] int pageIndex = 1,
         [FromQuery] int pageSize = 50,
         CancellationToken cancellationToken = default)
@@ -72,13 +74,22 @@ public class MesDispatchController : ControllerBase
                 ? null
                 : departmentCodes.Split(',', StringSplitOptions.RemoveEmptyEntries).Select(x => x.Trim()).Where(x => x.Length > 0).ToList();
 
+            var resIds = string.IsNullOrWhiteSpace(resourceIds)
+                ? null
+                : resourceIds.Split(',', StringSplitOptions.RemoveEmptyEntries).Select(x => int.TryParse(x.Trim(), out var v) ? v : -1).ToList();
+            var woSt = string.IsNullOrWhiteSpace(workOrderStatuses)
+                ? null
+                : workOrderStatuses.Split(',', StringSplitOptions.RemoveEmptyEntries).Select(x => x.Trim()).Where(x => x.Length > 0).ToList();
+
             var scope = await _dataScopeService.ResolveScopeAsync(GetCurrentUserId(), cancellationToken);
             var result = await _statusRepository.QueryAsync(
-                planVersionId, from, to, stages, piNo, workOrderNo, keyword, dispatchStatus, depts,
-                scope.IsGlobal ? null : scope.GetValues(DataScopeTypes.Domain),
-                scope.IsGlobal ? null : scope.GetValues(DataScopeTypes.Factory),
-                scope.IsGlobal ? null : scope.GetValues(DataScopeTypes.Department),
-                pageIndex, pageSize, cancellationToken);
+                planVersionId: planVersionId, from: from, to: to, stageCodes: stages,
+                piNo: piNo, workOrderNo: workOrderNo, keyword: keyword, dispatchStatus: dispatchStatus,
+                departmentCodes: depts, resourceIds: resIds, workOrderStatuses: woSt,
+                allowedDomains: scope.IsGlobal ? null : scope.GetValues(DataScopeTypes.Domain),
+                allowedFactories: scope.IsGlobal ? null : scope.GetValues(DataScopeTypes.Factory),
+                allowedDepartments: scope.IsGlobal ? null : scope.GetValues(DataScopeTypes.Department),
+                pageIndex: pageIndex, pageSize: pageSize, ct: cancellationToken);
             return ApiResponse<LPS.APS.Core.Dto.MesStatusListResultDto>.Success(result);
         }
         catch (Exception ex) when (ex is not ArgumentException)

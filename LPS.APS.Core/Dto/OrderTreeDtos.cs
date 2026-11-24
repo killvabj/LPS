@@ -38,6 +38,10 @@ public sealed class OrderTreeResultDto
     public List<OrderTreeNodeDto> Nodes { get; init; } = new();
     public List<OrderTreeEdgeDto> Edges { get; init; } = new();
     public List<OrderTreeDemandDto> Demands { get; init; } = new();
+    /// <summary>H2：关键词命中的闭包全量前 200 行（keyword 未传=空数组）。JSON: keywordHits</summary>
+    public List<OrderTreeHitDto> KeywordHits { get; init; } = new();
+    /// <summary>H2：服务端全量命中总数（keyword 未传=键省略 null≠0——三态纪律）。JSON: keywordHitCount</summary>
+    public int? KeywordHitCount { get; init; }
 
     public bool NodesTruncated { get; init; }
     public bool EdgesTruncated { get; init; }
@@ -116,8 +120,26 @@ public sealed class OrderTreeEdgeDto
 /// NeedBy 列当前**不存在**（PSA 无需用日期列——如实缺位，前端显示"未提供"，禁拿 ETA 顶替）。
 /// GapQty = DemandQty − AllocatedQty（后端算式单点；禁 min/max 掩盖超排——D05 FULL-01 读侧纪律）。
 /// </summary>
+/// <summary>P03 H2（11-23 4号位件）：深层检索命中行——闭包全量（不受树截断）六路 LIKE 命中。
+/// 定位键：taskId（树节点行主键）；前端点命中行即滚动定位。JSON: keywordHits[]</summary>
+public sealed class OrderTreeHitDto
+{
+    public long TaskId { get; set; }
+    public string? TaskNo { get; set; }
+    public string? MaterialCode { get; set; }
+    public string? MaterialName { get; set; }
+    public string? DepartmentName { get; set; }
+    /// <summary>MES 工单号（命中路之一；可空=未提供）。</summary>
+    public string? WorkOrderNo { get; set; }
+    /// <summary>PI/出荷指示号（命中路之一）。</summary>
+    public string? InstructionNo { get; set; }
+}
+
 public sealed class OrderTreeDemandDto
 {
+    /// <summary>H3（11-23 4号位件）：PeggingSupplyAllocation.Id 稳定主键——跨页定位第一键（与 P07 列表 id 同源同键）。
+    /// JSON: id</summary>
+    public long Id { get; init; }
     public long AllocationSequence { get; init; }
     public int MaterialId { get; init; }
     public string? MaterialCode { get; init; }

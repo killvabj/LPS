@@ -58,6 +58,8 @@ public class OrderQueryController : ControllerBase
         [FromQuery] string? status = null,
         [FromQuery] string? productionInstructionNo = null,
         [FromQuery] string? productFamilyCode = null,
+        [FromQuery] string? orderType = null,        // A5：PRODUCTION_INSTRUCTION/SALES_ORDER（缺省不过滤）
+        [FromQuery] string? materialType = null,     // A5：标准 MaterialType 原值（缺省不过滤）
         [FromQuery] DateTime? dueDateFrom = null,
         [FromQuery] DateTime? dueDateTo = null,
         [FromQuery] string? riskLevel = null,
@@ -94,12 +96,14 @@ public class OrderQueryController : ControllerBase
             var allowedDomains = scope.GetValues(DataScopeTypes.Domain);
 
             var result = await _service.QueryOrdersAsync(
-                planVersionId, orderNo, materialCode, customerName,
-                factoryCode, domainKey, delayStatus, status,
-                productionInstructionNo, productFamilyCode, dueDateFrom, dueDateTo,
-                riskLevel, sortBy, sortDir,
-                skip, take, cancellationToken,
-                allowedFactories, allowedDomains);
+                planVersionId: planVersionId, orderNo: orderNo, materialCode: materialCode, customerName: customerName,
+                factoryCode: factoryCode, domainKey: domainKey, delayStatus: delayStatus, status: status,
+                productionInstructionNo: productionInstructionNo, productFamilyCode: productFamilyCode,
+                orderType: orderType, materialType: materialType,
+                dueDateFrom: dueDateFrom, dueDateTo: dueDateTo,
+                riskLevel: riskLevel, sortBy: sortBy, sortDir: sortDir,
+                skip: skip, take: take, ct: cancellationToken,
+                allowedFactories: allowedFactories, allowedDomains: allowedDomains);
 
             return ApiResponse<PageResult<OrderListItemDto>>.Success(result);
         }
@@ -157,6 +161,7 @@ public class OrderQueryController : ControllerBase
     public async Task<ApiResponse<LPS.APS.Core.Dto.OrderTreeResultDto>> GetOrderTree(
         long orderId,
         [FromQuery] int planVersionId,
+        [FromQuery] string? keyword = null,   // P03 H2：深层检索关键词（闭包全量六路 LIKE）
         CancellationToken cancellationToken = default)
     {
         try
@@ -164,10 +169,10 @@ public class OrderQueryController : ControllerBase
             if (planVersionId <= 0) throw new ArgumentException("planVersionId 必填");
             var scope = await _dataScopeService.ResolveScopeAsync(GetCurrentUserId(), cancellationToken);
             var result = await _service.GetOrderTreeAsync(
-                planVersionId, orderId,
-                scope.IsGlobal ? null : scope.GetValues(DataScopeTypes.Domain),
-                scope.IsGlobal ? null : scope.GetValues(DataScopeTypes.Factory),
-                cancellationToken);
+                planVersionId: planVersionId, orderId: orderId, keyword: keyword,
+                allowedDomains: scope.IsGlobal ? null : scope.GetValues(DataScopeTypes.Domain),
+                allowedFactories: scope.IsGlobal ? null : scope.GetValues(DataScopeTypes.Factory),
+                ct: cancellationToken);
             return ApiResponse<LPS.APS.Core.Dto.OrderTreeResultDto>.Success(result);
         }
         catch (ArgumentException ex)
@@ -238,6 +243,8 @@ public class OrderQueryController : ControllerBase
         [FromQuery] string? status = null,
         [FromQuery] string? productionInstructionNo = null,
         [FromQuery] string? productFamilyCode = null,
+        [FromQuery] string? orderType = null,        // A5：PRODUCTION_INSTRUCTION/SALES_ORDER（缺省不过滤）
+        [FromQuery] string? materialType = null,     // A5：标准 MaterialType 原值（缺省不过滤）
         [FromQuery] DateTime? dueDateFrom = null,
         [FromQuery] DateTime? dueDateTo = null,
         [FromQuery] string? riskLevel = null,
@@ -257,10 +264,12 @@ public class OrderQueryController : ControllerBase
             var allowedDomains = scope.GetValues(DataScopeTypes.Domain);
 
             var result = await _service.GetSummaryAsync(
-                planVersionId, orderNo, materialCode, customerName,
-                factoryCode, domainKey, delayStatus, status,
-                productionInstructionNo, productFamilyCode, dueDateFrom, dueDateTo,
-                riskLevel, allowedFactories, allowedDomains, cancellationToken);
+                planVersionId: planVersionId, orderNo: orderNo, materialCode: materialCode, customerName: customerName,
+                factoryCode: factoryCode, domainKey: domainKey, delayStatus: delayStatus, status: status,
+                productionInstructionNo: productionInstructionNo, productFamilyCode: productFamilyCode,
+                orderType: orderType, materialType: materialType,
+                dueDateFrom: dueDateFrom, dueDateTo: dueDateTo,
+                riskLevel: riskLevel, allowedFactories: allowedFactories, allowedDomains: allowedDomains, ct: cancellationToken);
 
             return ApiResponse<OrderSummaryDto>.Success(result);
         }
@@ -296,6 +305,8 @@ public class OrderQueryController : ControllerBase
         [FromQuery] string? status = null,
         [FromQuery] string? productionInstructionNo = null,
         [FromQuery] string? productFamilyCode = null,
+        [FromQuery] string? orderType = null,        // A5：PRODUCTION_INSTRUCTION/SALES_ORDER（缺省不过滤）
+        [FromQuery] string? materialType = null,     // A5：标准 MaterialType 原值（缺省不过滤）
         [FromQuery] DateTime? dueDateFrom = null,
         [FromQuery] DateTime? dueDateTo = null,
         [FromQuery] string? riskLevel = null,
@@ -310,11 +321,13 @@ public class OrderQueryController : ControllerBase
                 return ApiResponse<DeliveryKpiResultDto>.Fail(403, "Domain 范围越界");
 
             var result = await _service.GetDeliveryKpiAsync(
-                planVersionId, orderNo, materialCode, customerName,
-                factoryCode, domainKey, delayStatus, status,
-                productionInstructionNo, productFamilyCode, dueDateFrom, dueDateTo,
-                riskLevel, scope.GetValues(DataScopeTypes.Factory), scope.GetValues(DataScopeTypes.Domain),
-                cancellationToken);
+                planVersionId: planVersionId, orderNo: orderNo, materialCode: materialCode, customerName: customerName,
+                factoryCode: factoryCode, domainKey: domainKey, delayStatus: delayStatus, status: status,
+                productionInstructionNo: productionInstructionNo, productFamilyCode: productFamilyCode,
+                orderType: orderType, materialType: materialType,
+                dueDateFrom: dueDateFrom, dueDateTo: dueDateTo,
+                riskLevel: riskLevel, allowedFactories: scope.GetValues(DataScopeTypes.Factory),
+                allowedDomains: scope.GetValues(DataScopeTypes.Domain), ct: cancellationToken);
 
             return ApiResponse<DeliveryKpiResultDto>.Success(result);
         }
@@ -346,6 +359,8 @@ public class OrderQueryController : ControllerBase
         [FromQuery] string? status = null,
         [FromQuery] string? productionInstructionNo = null,
         [FromQuery] string? productFamilyCode = null,
+        [FromQuery] string? orderType = null,        // A5：PRODUCTION_INSTRUCTION/SALES_ORDER（缺省不过滤）
+        [FromQuery] string? materialType = null,     // A5：标准 MaterialType 原值（缺省不过滤）
         [FromQuery] DateTime? dueDateFrom = null,
         [FromQuery] DateTime? dueDateTo = null,
         [FromQuery] string? riskLevel = null,
@@ -363,10 +378,12 @@ public class OrderQueryController : ControllerBase
             var allowedDomains = scope.GetValues(DataScopeTypes.Domain);
 
             var result = await _service.GetFacetsAsync(
-                planVersionId, orderNo, materialCode, customerName,
-                factoryCode, domainKey, delayStatus, status,
-                productionInstructionNo, productFamilyCode, dueDateFrom, dueDateTo,
-                riskLevel, allowedFactories, allowedDomains, cancellationToken);
+                planVersionId: planVersionId, orderNo: orderNo, materialCode: materialCode, customerName: customerName,
+                factoryCode: factoryCode, domainKey: domainKey, delayStatus: delayStatus, status: status,
+                productionInstructionNo: productionInstructionNo, productFamilyCode: productFamilyCode,
+                orderType: orderType, materialType: materialType,
+                dueDateFrom: dueDateFrom, dueDateTo: dueDateTo,
+                riskLevel: riskLevel, allowedFactories: allowedFactories, allowedDomains: allowedDomains, ct: cancellationToken);
 
             return ApiResponse<OrderFacetsDto>.Success(result);
         }

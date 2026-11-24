@@ -52,7 +52,7 @@ public class ManualEtaMetadataTests
                 It.IsAny<List<string>?>(), It.IsAny<DateTime?>(), It.IsAny<DateTime?>(),
                 It.IsAny<DateTime?>(), It.IsAny<bool>(), It.IsAny<bool>(), It.IsAny<string?>(),
                 It.IsAny<string?>(), It.IsAny<string?>(), It.IsAny<int>(), It.IsAny<int>(),
-                It.IsAny<bool>(), It.IsAny<CancellationToken>()))
+                It.IsAny<bool>(), It.IsAny<IReadOnlySet<string>?>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(expected);
 
         // Act
@@ -77,7 +77,7 @@ public class ManualEtaMetadataTests
             ManualEta = new DateTime(2026, 9, 1),
             IsActive = true
         };
-        _mockRepo.Setup(r => r.GetByBusinessKeyAsync("PO001", 1, 100, "WH01", It.IsAny<CancellationToken>()))
+        _mockRepo.Setup(r => r.GetByBusinessKeyAsync("PO001", 1, 100, "WH01", It.IsAny<IReadOnlySet<string>?>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(expected);
 
         // Act
@@ -138,7 +138,7 @@ public class ManualEtaMetadataTests
         };
         _mockRepo.Setup(r => r.GetByBusinessKeyAsync(
                 It.IsAny<string>(), It.IsAny<int>(), It.IsAny<int>(), It.IsAny<string>(),
-                It.IsAny<CancellationToken>()))
+                It.IsAny<IReadOnlySet<string>?>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync((ProcurementManualEtaOverride?)null);
         _mockRepo.Setup(r => r.UpsertAsync(eta, It.IsAny<CancellationToken>()))
             .ReturnsAsync(eta);

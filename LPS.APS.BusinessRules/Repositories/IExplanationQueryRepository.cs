@@ -19,6 +19,7 @@ public interface IExplanationQueryRepository
         string? severity = null,
         DateTime? occurredFrom = null,
         DateTime? occurredTo = null,
+        IReadOnlySet<string>? allowedDomains = null,
         int skip = 0,
         int take = 100,
         CancellationToken ct = default);
@@ -28,6 +29,7 @@ public interface IExplanationQueryRepository
     /// </summary>
     Task<ExplanationSummaryDto> GetSummaryAsync(
         int planVersionId,
+        IReadOnlySet<string>? allowedDomains = null,
         CancellationToken ct = default);
 
     /// <summary>

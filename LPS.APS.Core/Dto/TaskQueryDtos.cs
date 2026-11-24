@@ -106,6 +106,24 @@ public sealed class TaskDetailResultDto
     /// <summary>数据截至=源 Run 的 DataCutoffTime；僵尸/失败 Run 如实给原值。</summary>
     public DateTime? DataCutoffTime { get; init; }
 
+    // ── P06 H4（11-23 4号位件）：源 Run 身份（PV→SourceScheduleRunId→ScheduleRun；无源=未提供键省略）──
+    public long? SourceRunId { get; init; }
+    /// <summary>JSON: sourceRunType</summary>
+    public string? SourceRunType { get; init; }
+    /// <summary>JSON: runTriggeredBy</summary>
+    public string? RunTriggeredBy { get; init; }
+
+    // ── P06 H3（11-23 4号位件）：MES 真实执行事实（P11 同键单源；UI-22：与下发态分列不互冒）──
+    public string? MesWorkOrderStatus { get; init; }
+    /// <summary>null=未提供（无源 Run）；true=有报工行；false=快照 Run 有效但零报工行（未判定≠未开工）。</summary>
+    public bool? MesReported { get; init; }
+    public decimal? MesPlannedQtyReported { get; init; }
+    public decimal? MesGoodQty { get; init; }
+    public decimal? MesScrapQty { get; init; }
+    public decimal? MesReworkQty { get; init; }
+    public decimal? MesRemainingQty { get; init; }
+    public DateTime? MesLastReportTime { get; init; }
+
     public List<TaskShareDto> Shares { get; init; } = new();
     /// <summary>份额表无行=事实为"无份额记录"（≠0 需求，≠未提供——页面文案分三态）。</summary>
     public bool SharesProvided { get; init; } = true;

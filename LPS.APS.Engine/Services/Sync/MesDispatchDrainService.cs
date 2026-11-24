@@ -97,7 +97,23 @@ public class MesDispatchDrainService : IMesDispatchDrainService
             return new MesDispatchDrainResult { GroupsSeen = 0, AdapterMissing = adapterMissing };
         }
 
+        // ── P11-0（0号位 2026-11-23）：**出站前最后一道不可绕过的服务端门禁** ──────────────
+        //   动机：仅靠「上游只给 ACTIVE 建队列」不充分——队列是历史数据，PV/任务/供给在入队后仍可能变化；
+        //   必须在**真正调用 MES 之前**再核一次，不满足即**拒发并显性挂起**（保持 PENDING + 写 FailureCode），
+        //   绝不进入 5号位 的真实建单调用。
+        //   判据（0号位 P11-0 清单的可实现子集，逐条对应）：
+        //     ① PV 仍 ACTIVE 且非 Candidate/Sim
+        //     ② 组内任务真实属于本 PV（TaskDispatch.SourceTaskId → Task 同 PV 存在）
+        //     ③ 路径身份齐全：Task.RouteCode/PathId/OperationCode 非空，且**组内一致**（一条执行批一条 Route+Path）
+        //     ④ PI 位置快照存在，且**存在已定位（非 UNLOCATED）的行**（纯 UNLOCATED 才拒）
+        //     ⑤ 该 Stage 的**已定位**可执行自由量 > 0
+        //     ⑥ 该 PV 无未闭合 SH（UnresolvedCategory='SH_MISSING'）
+        //   暂未覆盖（在文档与本方法注释中显式留缺口，不装作已实现）：
+        //     · Domain/Scope/发布窗口、采购占位（非承诺规划采购）——缺权威表，待与 0号位/5号位 确认落点
+        var gateVerdicts = await EvaluateOutboundGateAsync(groups, ct);
+
         int accepted = 0, rejected = 0, unknown = 0, rowsCreated = 0, rowsFailed = 0, rowsPending = 0;
+        int gateBlocked = 0;
 
         // 2026-11-12（`O77`）：`FactoryId → Factory.Code`（附录 A 的 `factoryCode` 必填）。
         //   为什么在此之前一直是空串：`TaskDispatch.FactoryId` 落库侧**从未写过**（实测 89,261 行全 NULL，
@@ -123,6 +139,25 @@ public class MesDispatchDrainService : IMesDispatchDrainService
             ct.ThrowIfCancellationRequested();
             var pi = g.PI ?? string.Empty;
             var stage = g.StageCode ?? string.Empty;
+
+            // P11-0：门禁不过 ⇒ 拒发并显性挂起（保持 PENDING，写 FailureCode/FailureReason 供审计与筛选）
+            if (gateVerdicts.TryGetValue((g.Pv, pi, stage), out var verdict) && !verdict.Passed)
+            {
+                gateBlocked++;
+                await _connectionManager.ExecuteAsync(
+                    @"UPDATE TaskDispatch
+                      SET    FailureCode = @Code, FailureReason = @Reason
+                      WHERE  DispatchStatus = @Pending
+                        AND  SourcePlanVersionId = @Pv
+                        AND  ISNULL(ProductionInstructionNo, N'') = @Pi
+                        AND  ISNULL(StageCode, N'') = @Stage",
+                    new { Code = verdict.Code, Reason = verdict.Reason, Pending = StatusPending, g.Pv, Pi = pi, Stage = stage },
+                    db: DatabaseId.APS, commandTimeout: 120);
+                _logger.LogWarning(
+                    "[MesDispatch][P11-0 拒发] PV={Pv} PI={Pi} Stage={Stage} ⇒ {Code}：{Reason}（保持 PENDING，不调用 MES）",
+                    g.Pv, pi, stage, verdict.Code, verdict.Reason);
+                continue;
+            }
 
             // ── 附录 A 必填字段闸（2026-11-12，`O77`）────────────────────────────────
             //   `factoryCode` 与 `materialCode` 都是必填。缺一个就**不发**：送出去只能拿到 MES 拒收，
@@ -272,6 +307,259 @@ public class MesDispatchDrainService : IMesDispatchDrainService
             GroupsSkippedMissingField = skippedMissing,
             AdapterMissing = adapterMissing
         };
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // P11-0 出站门禁（2026-11-23，0号位 指令）
+    // ══════════════════════════════════════════════════════════════════════════
+
+    /// <summary>门禁结论：`Passed=false` 时带 `Code`（稳定机读码）与 `Reason`（人读）。</summary>
+    private readonly record struct GateVerdict(bool Passed, string? Code, string? Reason)
+    {
+        public static readonly GateVerdict Ok = new(true, null, null);
+    }
+
+    /// <summary>
+    /// **出站前最后一次服务端校验**（0号位 P11-0）。批量取数，避免逐组往返。
+    ///
+    /// <para>不满足 ⇒ 调用方**保持 PENDING 并写 FailureCode**（显性挂起），绝不进入 MES 建单。</para>
+    /// </summary>
+    private async Task<Dictionary<(int Pv, string Pi, string Stage), GateVerdict>> EvaluateOutboundGateAsync(
+        IReadOnlyList<DispatchGroupRow> groups, CancellationToken ct)
+    {
+        var result = new Dictionary<(int, string, string), GateVerdict>();
+        if (groups.Count == 0) return result;
+
+        var pvs = groups.Select(g => g.Pv).Distinct().ToList();
+        var pis = groups.Select(g => g.PI ?? string.Empty).Where(x => x.Length > 0).Distinct().ToList();
+
+        // ① PV 状态 / 类别
+        var pvRows = (await _connectionManager.QueryAsync<PvGateRow>(
+            @"SELECT Id, Status, VersionCategory FROM PlanVersion WHERE Id IN @Ids",
+            new { Ids = pvs }, db: DatabaseId.APS, commandTimeout: 120))
+            .ToDictionary(r => r.Id);
+
+        // ② + ③ 任务真实性与路径身份：TaskDispatch → Task（同 PV）
+        var taskRows = (await _connectionManager.QueryAsync<TaskPathRow>(
+            @"SELECT d.SourcePlanVersionId AS Pv,
+                     ISNULL(d.ProductionInstructionNo, N'') AS Pi,
+                     ISNULL(d.StageCode, N'') AS StageCode,
+                     d.SourceTaskId AS TaskId,
+                     t.Id AS MatchedTaskId,
+                     t.RouteCode, t.PathId, t.OperationCode,
+                     ro.Id AS RoutingMatchedId
+              FROM TaskDispatch d
+              LEFT JOIN [Task] t ON t.Id = d.SourceTaskId AND t.PlanVersionId = d.SourcePlanVersionId
+              LEFT JOIN RoutingOperation ro
+                     ON ro.MaterialId = t.MaterialId
+                    AND ro.RouteCode  = t.RouteCode
+                    AND ro.PathId     = t.PathId
+                    AND ro.OperationCode = t.OperationCode
+                    AND ro.IsActive = 1
+              WHERE d.DispatchStatus = @Pending
+                AND d.SourcePlanVersionId IN @Pvs
+                AND ISNULL(d.ProductionInstructionNo, N'') IN @Pis",
+            new { Pending = StatusPending, Pvs = pvs, Pis = pis },
+            db: DatabaseId.APS, commandTimeout: 300)).ToList();
+
+        var tasksByGroup = taskRows
+            .GroupBy(r => (r.Pv, r.Pi ?? string.Empty, r.StageCode ?? string.Empty))
+            .ToDictionary(g => g.Key, g => g.ToList());
+
+        // ④ + ⑤ PI 位置快照（UNLOCATED 与可执行自由量）
+        var posRows = (await _connectionManager.QueryAsync<PiPositionGateRow>(
+            @"SELECT PlanVersionId AS Pv, ProductionInstructionNo AS Pi, PositionType,
+                     Quantity, CurrentStageCode, NextStageCode
+              FROM ProductionInstructionPositionSnapshot
+              WHERE PlanVersionId IN @Pvs AND ProductionInstructionNo IN @Pis",
+            new { Pvs = pvs, Pis = pis }, db: DatabaseId.APS, commandTimeout: 300)).ToList();
+
+        var posByPi = posRows.GroupBy(r => (r.Pv, r.Pi ?? string.Empty))
+            .ToDictionary(g => g.Key, g => g.ToList());
+
+        // ⑥-前置：**PI → 订单类型**（B-01 身份闸门把 `SALES_ORDER` 行排除在 PI 供给事实之外，
+        //   ⇒ 客户订单的 PI **本就不会有 Position 快照**；门禁不能拿"PI 位置"作为它们的开工条件）。
+        var piOrderType = (await _connectionManager.QueryAsync<PiOrderTypeRow>(
+            @"SELECT DISTINCT o.MTS_InstructionNo AS Pi, o.OrderType
+              FROM [Order] o
+              WHERE o.PlanVersionId IN @Pvs
+                AND o.MTS_InstructionNo IN @Pis",
+            new { Pvs = pvs, Pis = pis },
+            db: DatabaseId.APS, commandTimeout: 300))
+            .Where(r => !string.IsNullOrEmpty(r.Pi))
+            .GroupBy(r => r.Pi!, StringComparer.Ordinal)
+            .ToDictionary(g => g.Key, g => g.First().OrderType, StringComparer.Ordinal);
+
+        // ⑥ 未闭合 SH（按 PV）
+        var shUnclosed = (await _connectionManager.QueryAsync<int>(
+            @"SELECT DISTINCT PlanVersionId FROM APS_UnresolvedCrossFactorySupplyResult
+              WHERE PlanVersionId IN @Pvs AND UnresolvedCategory = N'SH_MISSING'",
+            new { Pvs = pvs }, db: DatabaseId.APS, commandTimeout: 300)).ToHashSet();
+
+        foreach (var g in groups)
+        {
+            ct.ThrowIfCancellationRequested();
+            var key = (g.Pv, g.PI ?? string.Empty, g.StageCode ?? string.Empty);
+
+            // ① PV
+            if (!pvRows.TryGetValue(g.Pv, out var pvRow))
+            { result[key] = new GateVerdict(false, "PV_NOT_FOUND", $"PlanVersion {g.Pv} 不存在"); continue; }
+            if (!string.Equals(pvRow.Status, "ACTIVE", StringComparison.OrdinalIgnoreCase))
+            { result[key] = new GateVerdict(false, "PV_NOT_ACTIVE", $"PlanVersion {g.Pv} 状态={pvRow.Status}，非 ACTIVE"); continue; }
+            if (pvRow.VersionCategory is { Length: > 0 } vc &&
+                (vc.Contains("CANDIDATE", StringComparison.OrdinalIgnoreCase) ||
+                 vc.Contains("SIM", StringComparison.OrdinalIgnoreCase)))
+            { result[key] = new GateVerdict(false, "PV_CANDIDATE", $"PlanVersion {g.Pv} 类别={vc}（Candidate/Sim 不得下发）"); continue; }
+
+            // ⑥ 未闭合 SH
+            if (shUnclosed.Contains(g.Pv))
+            { result[key] = new GateVerdict(false, "SH_UNCLOSED", $"PlanVersion {g.Pv} 存在未闭合 SH（SH_MISSING），不得下发"); continue; }
+
+            // ② 任务真实性 + ③ 路径身份
+            if (!tasksByGroup.TryGetValue(key, out var rows) || rows.Count == 0)
+            { result[key] = new GateVerdict(false, "TASK_MISSING", "组内无对应的 TaskDispatch/Task"); continue; }
+
+            var missingTask = rows.Where(r => r.MatchedTaskId is null).ToList();
+            if (missingTask.Count > 0)
+            { result[key] = new GateVerdict(false, "TASK_NOT_IN_PV", $"{missingTask.Count} 个 SourceTaskId 在同 PV 的 Task 中不存在（任务已撤销或跨 PV）"); continue; }
+
+            var noPath = rows.Where(r => string.IsNullOrWhiteSpace(r.RouteCode) || r.PathId is null || r.PathId <= 0
+                                      || string.IsNullOrWhiteSpace(r.OperationCode)).ToList();
+            if (noPath.Count > 0)
+            { result[key] = new GateVerdict(false, "PATH_IDENTITY_MISSING", $"{noPath.Count} 个 Task 缺 RouteCode/PathId/OperationCode，无法组成唯一路径身份"); continue; }
+
+            // ★ 2026-11-23：**只拦真占位，不拦逗号串**。
+            //   核实结论（纠正我方当日早前的错误判断）：
+            //     · `Task.RouteCode = 'DEFAULT'` 的 7,478,746 行**全部是历史 PV**（999423/999328/999437…，
+            //       均早于 2026-11-09 删除 `NormalizeToSingleRoute` 之前）；
+            //     · 近期 PV（999633/999634）**527,620 行中 DEFAULT 为 0**，RouteCode 是 `'NC,,'`／`'ASSY,,'`／`'MB'`
+            //       这类**逗号串——这就是 APS 的真实格式**（工序名序列，非"脏值"）；
+            //     · `RoutingOperation.RouteCode` 同形态（源视图 `MES_APS_Routing_Operation_View` 原样提供）。
+            //   ⇒ 仅 `null/空`、`'DEFAULT'`、`'NULL'` 视为占位；**含逗号必须放行**。
+            var placeholder = rows.Where(r => IsPlaceholderRoute(r.RouteCode)).ToList();
+            if (placeholder.Count > 0)
+            {
+                result[key] = new GateVerdict(false, "PATH_IDENTITY_PLACEHOLDER",
+                    $"RouteCode 为占位/脏值（如 DEFAULT 或含逗号）：'{placeholder[0].RouteCode}'；真实 Route+Path 尚不可得");
+                continue;
+            }
+
+            // ★ 2026-11-23（用户口径纠正）：**同一执行批出现多条 Route+Path 是合法的**——
+            //   3号位 提供、我方装载的工艺可能有多套（如 963 部门同时有 J1xx / J2xx 两组），
+            //   1号位 按实际选哪套、Task 如实体现。实测 PV999633 的 249,386 条 MACH 任务
+            //   **100% 命中** `RoutingOperation`（物料+RouteCode+PathId+OperationCode）。
+            //   故判据不是「组内一致」，而是「**每个 Task 的路线必须是我们装载过的那套**」。
+            var notInRouting = rows.Where(r => r.RoutingMatchedId is null).ToList();
+            if (notInRouting.Count > 0)
+            {
+                var sample0 = notInRouting[0];
+                result[key] = new GateVerdict(false, "PATH_NOT_IN_LOADED_ROUTING",
+                    $"{notInRouting.Count} 个 Task 的 RouteCode/PathId/OperationCode 在 RoutingOperation 中不存在" +
+                    $"（例：{sample0.RouteCode}/{sample0.PathId}/{sample0.OperationCode}）");
+                continue;
+            }
+
+            // ④ 位置 / UNLOCATED
+            //   ★ 2026-11-23（A29）：**客户订单（SALES_ORDER）的 PI 本就没有 Position 快照**——
+            //     B-01 身份闸门规定「客户订单行不得作为 Supply」，其 PI 不进 `PiRemainingFacts`
+            //     ⇒ 计算器不产位置行（实测 PV999633：队列 40,509 个 PI 中 10,056 个无位置，**全部是 SALES_ORDER**）。
+            //     这类任务的"可开工量"是**订单/任务自身数量**，不是 PI 剩余 ⇒ **不做 PI 位置校验**。
+            //     其它来源（非客户订单）的 PI 若无位置，仍按 `PI_POSITION_MISSING` 拒发（原行为不变）。
+            var isSalesOrderPi = piOrderType.TryGetValue(key.Item2, out var ot) &&
+                                 string.Equals(ot, "SALES_ORDER", StringComparison.OrdinalIgnoreCase);
+
+            if (!isSalesOrderPi)
+            {
+                if (!posByPi.TryGetValue((g.Pv, key.Item2), out var posGuard) || posGuard.Count == 0)
+                { result[key] = new GateVerdict(false, "PI_POSITION_MISSING", $"PI {key.Item2} 在本 PV 无位置快照"); continue; }
+            }
+
+            if (isSalesOrderPi)
+            {
+                // 客户订单：只要求组本身有正数量（已由分组 SQL 保证），不做 PI 位置/可执行量校验。
+                result[key] = GateVerdict.Ok;
+                continue;
+            }
+
+            var posList = posByPi[(g.Pv, key.Item2)];
+
+            // ④/⑤ 合判：**只拦「纯 UNLOCATED」**，部分有位置照发（2026-11-23 口径）
+            //   业务含义（01 业务基线 v1.14 §31.3）：`Located + UNLOCATED = RemainingQty`；
+            //   `UNLOCATED` = 该部分余量**对不上位置**（ERP 说还有、MES 工序进度/库位无法闭合），
+            //   开工找不到料 ⇒ **这部分不能发**；但**已定位的部分可以发**。
+            //   实测 PV999633：含 UNLOCATED 的 PI 共 4,874，其中**纯 UNLOCATED 仅 1,647**，
+            //   3,227 条是「有位置 ＋ 有 UNLOCATED」——原实现「存在任一即拒」会把这 3,227 条全误拦。
+            var located = posList
+                .Where(x => !string.Equals(x.PositionType, "UNLOCATED", StringComparison.OrdinalIgnoreCase))
+                .ToList();
+
+            if (located.Count == 0)
+            { result[key] = new GateVerdict(false, "PI_UNLOCATED", $"PI {key.Item2} 全部位置为 UNLOCATED（无可开工部分），不得出站"); continue; }
+
+            var execQty = located
+                .Where(x => string.Equals(x.CurrentStageCode, key.Item3, StringComparison.OrdinalIgnoreCase)
+                         || string.Equals(x.NextStageCode, key.Item3, StringComparison.OrdinalIgnoreCase))
+                .Sum(x => x.Quantity);
+            if (execQty <= 0m)
+            { result[key] = new GateVerdict(false, "PI_NO_EXECUTABLE_QTY", $"PI {key.Item2} 在 Stage {key.Item3} 的**已定位**可执行量 <= 0"); continue; }
+
+            result[key] = GateVerdict.Ok;
+        }
+
+        return result;
+    }
+
+    /// <summary>
+    /// **路径身份占位判定**：`DEFAULT`／空／含逗号的拼接脏值都**不是**合法 RouteCode。
+    /// （0号位 P11-1：不得默认 `PathId=1`／`RouteCode='DEFAULT'`；真库 `Task.RouteCode` 747 万行全 DEFAULT。）
+    /// </summary>
+    private static bool IsPlaceholderRoute(string? routeCode)
+    {
+        if (string.IsNullOrWhiteSpace(routeCode)) return true;
+        var v = routeCode.Trim();
+        if (v.Equals("DEFAULT", StringComparison.OrdinalIgnoreCase)) return true;
+        if (v.Equals("NULL", StringComparison.OrdinalIgnoreCase)) return true;
+        // ⚠ **含逗号不是占位**：APS 的 `RouteCode` 本形态就是「工序名逗号序列」（如 'NC,,'／',ASSY,,'）。
+        //   2026-11-23 核实：该形态同样出现在 MES 源视图与近期 PV 的 Task 上，是真实值。
+        return false;
+    }
+
+    /// <summary>A29：PI → 订单类型（客户订单的 PI 不产位置快照，门禁需区别对待）。</summary>
+    private sealed class PiOrderTypeRow
+    {
+        public string? Pi { get; set; }
+        public string? OrderType { get; set; }
+    }
+
+    private sealed class PvGateRow
+    {
+        public int Id { get; set; }
+        public string? Status { get; set; }
+        public string? VersionCategory { get; set; }
+    }
+
+    private sealed class TaskPathRow
+    {
+        public int Pv { get; set; }
+        public string? Pi { get; set; }
+        public string? StageCode { get; set; }
+        public long TaskId { get; set; }
+        public long? MatchedTaskId { get; set; }
+        public string? RouteCode { get; set; }
+        public int? PathId { get; set; }
+        public string? OperationCode { get; set; }
+        /// <summary>该 Task 的 (物料, RouteCode, PathId, OperationCode) 在本库 `RoutingOperation`(IsActive=1) 中的命中行；NULL＝不在我们装载的路由里。</summary>
+        public long? RoutingMatchedId { get; set; }
+    }
+
+    private sealed class PiPositionGateRow
+    {
+        public int Pv { get; set; }
+        public string? Pi { get; set; }
+        public string? PositionType { get; set; }
+        public decimal Quantity { get; set; }
+        public string? CurrentStageCode { get; set; }
+        public string? NextStageCode { get; set; }
     }
 
     private sealed class DispatchGroupRow

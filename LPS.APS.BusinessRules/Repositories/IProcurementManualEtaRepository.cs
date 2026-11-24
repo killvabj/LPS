@@ -38,6 +38,7 @@ public interface IProcurementManualEtaRepository
         int pageIndex = 1,
         int pageSize = 20,
         bool withMatched = false,
+        IReadOnlySet<string>? allowedFactories = null,
         CancellationToken ct = default);
 
     /// <summary>指标条五数一批（R3，11-12：与列表同 WHERE 单源；overdue/dueSoon 按服务器墙钟日界半开）。</summary>
@@ -49,11 +50,13 @@ public interface IProcurementManualEtaRepository
         DateTime? etaBefore = null,
         DateTime? etaAfter = null,
         DateTime? updatedAfter = null,
+        IReadOnlySet<string>? allowedFactories = null,
         CancellationToken ct = default);
 
     /// <summary>本表 distinct 候选（R4，11-12：含已取消行；search 两维同打；每维顶 500+Truncated）。</summary>
     Task<ProcurementManualEtaFacetsDto> GetFacetsAsync(
         string? search = null,
+        IReadOnlySet<string>? allowedFactories = null,
         CancellationToken ct = default);
 
     /// <summary>
@@ -72,11 +75,14 @@ public interface IProcurementManualEtaRepository
     /// <param name="receivingWarehouse">接收仓库</param>
     /// <param name="ct">取消令牌</param>
     /// <returns>Manual ETA覆盖，不存在时返回null</returns>
+    Task<string?> ResolvePoFactoryAsync(string poNo, CancellationToken ct = default);
+
     Task<ProcurementManualEtaOverride?> GetByBusinessKeyAsync(
         string poNo,
         int lineNo,
         int materialId,
         string receivingWarehouse,
+        IReadOnlySet<string>? allowedFactories = null,
         CancellationToken ct = default);
 
     /// <summary>

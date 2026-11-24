@@ -1,5 +1,6 @@
 using LPS.APS.BusinessRules.Services;
 using LPS.APS.Core.Authorization;
+using LPS.APS.Core.Interfaces;
 using LPS.APS.Core.Dto;
 using LPS.APS.Core.DTOs.Setup;
 using LPS.APS.Engine.Data;
@@ -30,19 +31,25 @@ namespace LPS.APS.Web.Controllers;
 [Route("api/procurement-manual-eta")]
 public class ProcurementManualEtaController : ControllerBase
 {
+    private readonly IDataScopeService _dataScopeService;
     private readonly ProcurementManualEtaService _service;
     private readonly DatabaseConnectionManager _connectionManager;
     private readonly ILogger<ProcurementManualEtaController> _logger;
 
     public ProcurementManualEtaController(
         ProcurementManualEtaService service,
+        IDataScopeService dataScopeService,
         DatabaseConnectionManager connectionManager,
         ILogger<ProcurementManualEtaController> logger)
     {
         _service = service ?? throw new ArgumentNullException(nameof(service));
+        _dataScopeService = dataScopeService ?? throw new ArgumentNullException(nameof(dataScopeService));
         _connectionManager = connectionManager ?? throw new ArgumentNullException(nameof(connectionManager));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
     }
+
+    private int GetCurrentUserId()
+        => int.TryParse(User.FindFirst(System.Security.Claims.ClaimTypes.NameIdentifier)?.Value, out var id) ? id : 0;
 
     /// <summary>
     /// 收货仓库下拉（数据源：ext_MES_ProcessCode_View，processcode→code、processname→name）
@@ -202,6 +209,9 @@ ORDER BY processcode";
             if (pageIndex <= 0) pageIndex = 1;
             if (pageSize <= 0 || pageSize > 200) pageSize = 20;
 
+            var scope = await _dataScopeService.ResolveScopeAsync(GetCurrentUserId(), cancellationToken);
+            var allowedFactories = scope.IsGlobal ? null : scope.GetValues(DataScopeTypes.Factory);
+
             var result = await _service.QueryAsync(
                 materialIds: materialIdList,
                 materialCodes: materialCodeList,
@@ -218,6 +228,7 @@ ORDER BY processcode";
                 pageIndex: pageIndex,
                 pageSize: pageSize,
                 withMatched: withMatched,
+                allowedFactories: allowedFactories,
                 ct: cancellationToken);
 
             return ApiResponse<PageResult<ProcurementManualEtaOverride>>.Success(result);
@@ -251,9 +262,11 @@ ORDER BY processcode";
     {
         try
         {
+            var scope = await _dataScopeService.ResolveScopeAsync(GetCurrentUserId(), cancellationToken);
             var result = await _service.GetSummaryAsync(
                 SplitIds(materialIds), SplitList(materialCodes), SplitList(poNos), SplitList(receivingWarehouses),
-                etaBefore, etaAfter, updatedAfter, cancellationToken);
+                etaBefore, etaAfter, updatedAfter,
+                scope.IsGlobal ? null : scope.GetValues(DataScopeTypes.Factory), cancellationToken);
 
             return ApiResponse<ProcurementManualEtaSummaryDto>.Success(result);
         }
@@ -275,7 +288,9 @@ ORDER BY processcode";
     {
         try
         {
-            var result = await _service.GetFacetsAsync(search, cancellationToken);
+            var scope = await _dataScopeService.ResolveScopeAsync(GetCurrentUserId(), cancellationToken);
+            var result = await _service.GetFacetsAsync(search,
+                scope.IsGlobal ? null : scope.GetValues(DataScopeTypes.Factory), cancellationToken);
             return ApiResponse<ProcurementManualEtaFacetsDto>.Success(result);
         }
         catch (Exception ex)
@@ -306,7 +321,9 @@ ORDER BY processcode";
     {
         try
         {
-            var result = await _service.GetByBusinessKeyAsync(poNo, lineNo, materialId, receivingWarehouse, cancellationToken);
+            var scope = await _dataScopeService.ResolveScopeAsync(GetCurrentUserId(), cancellationToken);
+            var result = await _service.GetByBusinessKeyAsync(poNo, lineNo, materialId, receivingWarehouse,
+                scope.IsGlobal ? null : scope.GetValues(DataScopeTypes.Factory), cancellationToken);
             if (result == null)
                 return ApiResponse<ProcurementManualEtaOverride?>.Fail(404, "Record not found");
 
@@ -334,6 +351,18 @@ ORDER BY processcode";
     {
         try
         {
+            // G-04 裁一/裁二（3号位 11-23）：写侧 Scope——判据=PO 工厂归属 ∈ 授权工厂集合；
+            // **不以"存在供给事实"为准**（先录后补 J01/J03=合法场景）；归属不可解析⇒403 fail-closed。
+            var scope = await _dataScopeService.ResolveScopeAsync(GetCurrentUserId(), cancellationToken);
+            if (!scope.IsGlobal)
+            {
+                var poFactory = await _service.ResolvePoFactoryAsync(etaOverride?.PONo ?? "", cancellationToken);
+                if (string.IsNullOrWhiteSpace(poFactory))
+                    return ApiResponse<ProcurementManualEtaOverride>.Fail(403, "PO 工厂归属不可解析（在途视图与供给事实均无），拒绝写入");
+                if (!scope.Allows(DataScopeTypes.Factory, poFactory))
+                    return ApiResponse<ProcurementManualEtaOverride>.Fail(403, $"Factory 范围越界（PO 归属={poFactory}）");
+            }
+
             var saved = await _service.UpsertAsync(etaOverride, cancellationToken);
             return ApiResponse<ProcurementManualEtaOverride>.Success(saved, "Manual ETA saved successfully");
         }
@@ -361,6 +390,17 @@ ORDER BY processcode";
     {
         try
         {
+            // G-04 裁一/裁二（3号位 11-23）：取消同判据（PO 归属解析，非事实存在）。
+            var scope = await _dataScopeService.ResolveScopeAsync(GetCurrentUserId(), cancellationToken);
+            if (!scope.IsGlobal)
+            {
+                var poFactory = await _service.ResolvePoFactoryAsync(poNo, cancellationToken);
+                if (string.IsNullOrWhiteSpace(poFactory))
+                    return ApiResponse<CancelManualEtaResponse>.Fail(403, "PO 工厂归属不可解析（在途视图与供给事实均无），拒绝取消");
+                if (!scope.Allows(DataScopeTypes.Factory, poFactory))
+                    return ApiResponse<CancelManualEtaResponse>.Fail(403, $"Factory 范围越界（PO 归属={poFactory}）");
+            }
+
             var success = await _service.CancelAsync(
                 poNo, lineNo, request.MaterialId, request.ReceivingWarehouse,
                 request.UpdatedBy, cancellationToken);
@@ -369,7 +409,7 @@ ORDER BY processcode";
             {
                 // 可能是记录不存在，也可能是已经inactive（幂等）
                 var existing = await _service.GetByBusinessKeyAsync(
-                    poNo, lineNo, request.MaterialId, request.ReceivingWarehouse, cancellationToken);
+                    poNo, lineNo, request.MaterialId, request.ReceivingWarehouse, null, cancellationToken);
 
                 if (existing == null)
                     return ApiResponse<CancelManualEtaResponse>.Fail(404, "Record not found");

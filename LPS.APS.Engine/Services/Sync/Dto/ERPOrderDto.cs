@@ -12,6 +12,8 @@ public class ERPOrderDto
     public string BOMNO { get; set; } = string.Empty;
     public string FactoryCode { get; set; } = string.Empty;
     public string? SourceWarehouseProcessCode { get; set; }
+    /// <summary>完成工序码（ERP `ProdFinshProcCode`，2026-11-21 A12）。BOM 请求的 FactoryCode 取它翻译后的厂。</summary>
+    public string? ProdFinshProcCode { get; set; }
     public decimal Quantity { get; set; }
     public string UOM { get; set; } = string.Empty;
     public DateTime DueDate { get; set; }

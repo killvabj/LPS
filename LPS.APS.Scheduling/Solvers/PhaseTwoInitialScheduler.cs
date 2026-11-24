@@ -37,6 +37,15 @@ internal class PhaseTwoInitialScheduler
 
     internal static void OverrideAnchorModeForTest(string? mode) => _p2AnchorModeOverride = mode;
 
+    /// <summary>
+    /// 仅供 `LPS.APS.Tests`（`InternalsVisibleTo`）：暴露批形成结果，供 **P0-01** 直接反证
+    /// 「整数拆批时投入侧不得均分」（需读到逐批 `PlannedProcessQty`，下游 Task 已被圆整/换算，读不出来）。
+    /// 生产路径不变。
+    /// </summary>
+    internal static ExecutionBatchFormation BuildBatchFormationForTest(
+        LogicalProductionDemand demand, BatchPolicyRuleSnapshot? policy, int count)
+        => BuildBatchFormation(demand, policy, count);
+
     private static string P2AnchorMode => _p2AnchorModeOverride ?? P2AnchorModeFromEnv;
     private static bool P2FilterByPi => P2AnchorMode is "PI_ONLY" or "PI_SORT" or "PI_FIRST";
     private static bool P2SortAnchors => P2AnchorMode is "PI_SORT" or "PI_FIRST";
@@ -267,6 +276,100 @@ internal class PhaseTwoInitialScheduler
             ? $"［分因：无Routing Stage **缺合法小时 LT**（{string.Join("/", missing)}）"
               + "⇒ 按冻结记 `STAGE_LEADTIME_MISSING`，本需求局部未排］"
             : "［分因：无Routing Stage **有合法 LT** ⇒ 按冻结只形成 StageTimingNode、**不生成 Task**（O-009）］";
+    }
+
+    /// <summary>
+    /// **O-009 判定**（0号位 2026-11-23 §二A）：该需求是否属于「**合法无 Routing、只形成 StageTimingNode**」。
+    ///
+    /// <para>三条**同时**成立才返回 true：
+    /// ① 本次输入含该物料的 `StageSequenceChains` 且链非空；
+    /// ② 链上**每个** Stage 都有合法小时 LT（`StageLeadTimes` 命中 MaterialId+StageCode）；
+    /// ③ 输入**不含**该物料的任何工序行（`MaterialsWithRoutingInput` 未命中）——真·无 Routing。</para>
+    ///
+    /// <para><b>为什么 ③ 必须是硬条件</b>：若输入含工序行却未建出图，那是**我方 `BuildRoutingGraphs`** 的问题，
+    /// 借"无 Routing"放行会把它掩盖成合法计时；这类仍按未排，留待单独整改。</para>
+    ///
+    /// <para><b>为什么不能只按链放行</b>：缺 LT 时按冻结是 `STAGE_LEADTIME_MISSING`、本需求局部未排；
+    /// 没有链时 StageTimingNode 也无从形成（`StageTimingNodeBuilder.Build` 需要链与 LT 才能产段）。</para>
+    /// </summary>
+    private static bool IsRoutelessTimingOnly(
+        LogicalProductionDemand demand,
+        DomainSolveRequest request,
+        ConstraintContext constraints)
+    {
+        // ③ 输入含工序行 ⇒ 不是"合法无 Routing"，维持未排（可能是 BuildRoutingGraphs 缺陷）
+        if (constraints.MaterialsWithRoutingInput.Contains(demand.MaterialId))
+        {
+            return false;
+        }
+
+        // ① 必须有权威 Stage 链
+        var chain = request.StageSequenceChains.FirstOrDefault(c => c.MaterialId == demand.MaterialId);
+        if (chain is null || chain.Stages.Count == 0)
+        {
+            return false;
+        }
+
+        // ④ 起点必须在链内（2026-11-24 实测修复）：
+        //   Phase1 `ResolveChainStagesInScope` 会按 `StartStageCode` 裁剪可达 Stage；若起点在链内**定位不到**，
+        //   可达集为空 ⇒ Phase5 一段也产不出 ⇒ 会变成"既不进未排、也没有 StageTimings"的**静默丢失**
+        //   （实测 FRL 8,218 条放行里有 280 条正是此形态：`StartStageCode='TJ_MACH'`，链只有 `TJ_OUTS`）。
+        if (!string.IsNullOrWhiteSpace(demand.StartStageCode)
+            && !chain.Stages.Any(s => string.Equals(s.StageCode, demand.StartStageCode, StringComparison.Ordinal)))
+        {
+            return false;
+        }
+
+        // 无工序行时无法把 `StartOperationCode` 映射到 Stage ⇒ 保守按未排（与 Phase1 BFS 起点同口径）
+        if (!string.IsNullOrWhiteSpace(demand.StartOperationCode))
+        {
+            return false;
+        }
+
+        // 按起点裁剪后的**在范围 Stage**（与 Phase1 同口径：`StageSeq >= 起点 Seq`）
+        var startSeq = 0;
+        if (!string.IsNullOrWhiteSpace(demand.StartStageCode))
+        {
+            startSeq = chain.Stages
+                .Where(s => string.Equals(s.StageCode, demand.StartStageCode, StringComparison.Ordinal))
+                .Select(s => s.StageSeq)
+                .DefaultIfEmpty(0)
+                .Min();
+        }
+
+        var inScope = chain.Stages.Where(s => s.StageSeq >= startSeq).ToList();
+        if (inScope.Count == 0)
+        {
+            return false;
+        }
+
+        // ② 链上每个（在范围内的）Stage 都要有合法小时 LT（缺一段即 STAGE_LEADTIME_MISSING，不得局部编时间），
+        //    并且**必须在合法 WORK 窗口内推得动**（0号位 §二 表：「缺 LT/Calendar 只让受影响 Demand 正常未排，
+        //    禁止假 Task/假时间」）。此处用与 Phase5 **同一函数** `TryAdvanceByWorkHours` 预演，
+        //    保证"放行"与"真的能产出 StageTiming 段"是同一条判据 —— 否则会出现"既未排、也无时间"的静默丢失。
+        var cu = request.PlanningStart;
+        var ltFacts = request.StageLeadTimes
+            .Where(f => f.MaterialId == demand.MaterialId)
+            .ToDictionary(f => f.StageCode, f => f, StringComparer.Ordinal);
+
+        foreach (var step in inScope)
+        {
+            if (!ltFacts.TryGetValue(step.StageCode, out var lt))
+            {
+                return false;
+            }
+
+            if (!StageTimingNodeBuilder.TryAdvanceByWorkHours(
+                    request, demand, step.StageCode, cu, lt.LeadTimeHours, out var cuEnd, out _, lt.IsLeadTimeOnly))
+            {
+                // WORK 窗口不足 / 无部门上下文 / 无日历 ⇒ 本需求仍按未排（不假设 7×24、不假造时间）
+                return false;
+            }
+
+            cu = cuEnd;
+        }
+
+        return true;
     }
 
     private void RecordPhase2Block(string? demandKey, string text)
@@ -1087,6 +1190,16 @@ internal class PhaseTwoInitialScheduler
             if (!constraints.TryGetRoutingGraphs(actualDemand.MaterialId, out var allPaths))
             {
                 // 无工艺路线 → 无法排程
+                // ── O-009（0号位 2026-11-23 §二A）：合法无 Routing **不得整条错停** ──
+                //   三条同时成立才走"只计时"：①输入有该物料的 Stage 链；②链上每个 Stage 都有合法小时 LT；
+                //   ③输入**不含**该物料的工序行（真·无 Routing；含行未建图属我方 BuildRoutingGraphs，仍按未排）。
+                //   此时 Phase5 `StageTimingNodeBuilder.Build` 会产出 StageTimingNode（`HasRoutingInScope=false`
+                //   不会抑制候选提前期），本需求**不计未排**；**不伪造 Task**，WORK 窗口不足时仍由既有 Issue 留痕。
+                if (IsRoutelessTimingOnly(actualDemand, request, constraints))
+                {
+                    continue;
+                }
+
                 result.UnscheduledDemandKeys.Add(actualDemand.LogicalDemandKey);
                 RecordPhase2Block(actualDemand.LogicalDemandKey,
                     $"Phase2 出口=P2_NO_ROUTING：物料 {actualDemand.MaterialId} 在本次输入里**一条 Routing 图都没有**"
@@ -7372,19 +7485,26 @@ internal class PhaseTwoInitialScheduler
                 ? demand.PlannedProcessQty - procAssigned
                 : decimal.Round(demand.PlannedProcessQty / count, 4, MidpointRounding.ToZero);
 
-            // ── 0号位 v1.7 N-11（2026-11-19）：第二类**投入侧按本批实际执行量分配** ──
+            // ── 0号位 v1.7 N-11（2026-11-19）＋ v1.1 §四 P0-01（2026-11-21）：**投入侧按本批实际执行量分配** ──
             //   「良率投入侧 `PlannedProcessQty` 按真实实际执行量及 Stage 规则计算，允许计算中的小数；
             //     MES 实际执行净量及每个新增批为正整数」「不得全字段 Round」。
-            //   第二类各批执行量不等（4+4+4+3）时，投入量若仍等分，3 件批会拿到与 4 件批相同的投料
-            //   ⇒ 按 `PlannedProcessQty × 本批执行量 ÷ Q_target` 分配；**总量仍守恒**（Σ = 需求 PlannedProcessQty）。
-            if (!demand.IsContinuation
-                && demand.NetOutputQty > 0m
-                && demand.NetOutputQty != decimal.Truncate(demand.NetOutputQty))
+            //   ⚠ 原实现只对**第二类（原生小数）**生效，**第一类（整数净量）仍均分** ⇒
+            //     13 拆 4+4+5 时三批各拿 1/3 投料，**5 件批与 4 件批的投料、工时完全相同** ⇒
+            //     5 件批资源分钟与实产量失配（0号位 v1.1 §四 P0-01 点名）。
+            //   ⇒ 两类统一：按 `PlannedProcessQty × 本批执行量 ÷ Σ本批执行量` 分配；总量仍守恒。
+            if (!demand.IsContinuation && demand.NetOutputQty > 0m)
             {
-                var target = decimal.Ceiling(demand.NetOutputQty);
-                batchProc = last
-                    ? demand.PlannedProcessQty - procAssigned
-                    : decimal.Round(demand.PlannedProcessQty * batchNet / target, 4, MidpointRounding.ToZero);
+                // 分母 = 本轮**整数执行总量**：第一类 = NetOutputQty（本身即整数，与 ΣbatchNet 相等）；
+                //   第二类 = ceil(NetOutputQty)（= Q_target，与上面 batchNet 的切分口径同源）。
+                var target = demand.NetOutputQty == decimal.Truncate(demand.NetOutputQty)
+                    ? decimal.Truncate(demand.NetOutputQty)
+                    : decimal.Ceiling(demand.NetOutputQty);
+                if (target > 0m)
+                {
+                    batchProc = last
+                        ? demand.PlannedProcessQty - procAssigned
+                        : decimal.Round(demand.PlannedProcessQty * batchNet / target, 4, MidpointRounding.ToZero);
+                }
             }
 
             // ── BATCH-03（0号位 e31a6fb §3）：**批数量严格 > 0**，不得产出 0 件批 / 负尾差批 ──

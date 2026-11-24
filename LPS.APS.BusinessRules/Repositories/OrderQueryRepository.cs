@@ -23,10 +23,37 @@ public class OrderQueryRepository : IOrderQueryRepository
     // ── 11-12（4号位《订单需求计划页改版》R2/R3/R4）：FROM/WHERE/risk 判定 **类级单源** ──
     // 列表、COUNT、summary、facets 四处必须逐字同一谓词文本（total/列表/KPI 分叉在源头堵死；
     // 同「FROM+WHERE 逐字一致」10-19 纪律的跨方法延伸）。
+    /// <summary>P03 H2（11-23 4号位件）：订单树上游闭包 CTE——边查询与关键词检索**同一文本单源**；
+    /// 种子=本订单 Task ∪ 份额行；前沿=COALESCE(Parent,Child)（11-17 两版弯路教训内嵌注释）。</summary>
+    private const string TreeClosureCte = @"
+;WITH seed AS (
+    SELECT t.Id AS TaskId FROM Task t WHERE t.PlanVersionId = @Pv AND t.OrderId = @Or
+    UNION
+    SELECT s.TaskId FROM AllocationTaskShare s WHERE s.PlanVersionId = @Pv AND s.RootOrderId = @Or
+),
+closure AS (
+    SELECT CAST(NULL AS bigint) AS ParentTaskId, sd.TaskId AS ChildTaskId, 0 AS Depth,
+           CONVERT(varchar(max), CONCAT(',', sd.TaskId, ',')) AS Path
+    FROM seed sd
+    UNION ALL
+    -- 前沿=本行距种子最远的端点：种子行（Parent 为 NULL）前沿在 Child；其后行前沿在 Parent。
+    -- （两版弯路 11-17 预跑抓出：①续走 Child＝原地只出 1 跳；②只认 Parent＝种子行断扩。COALESCE 才对。）
+    SELECT p.UpstreamTaskId, COALESCE(c.ParentTaskId, c.ChildTaskId), c.Depth + 1,
+           CONVERT(varchar(max), CONCAT(c.Path, p.UpstreamTaskId, ','))
+    FROM closure c
+    JOIN Pegging p ON p.PlanVersionId = @Pv
+       AND p.DownstreamTaskId = COALESCE(c.ParentTaskId, c.ChildTaskId)
+    WHERE c.Depth < 10
+      AND c.Path NOT LIKE CONCAT('%,', p.UpstreamTaskId, ',%')
+)
+";
+
     private const string FromJoin = @"
 FROM [Order] o
 LEFT JOIN Factory f ON f.Id = o.FactoryId
-LEFT JOIN ProductFamily pf ON pf.Id = o.ProductFamilyId";
+LEFT JOIN ProductFamily pf ON pf.Id = o.ProductFamilyId
+-- A6（11-21 4号位件）：标准 Material 分类直投（Id 唯一 1:1 无扇出）；KPI 已按同列分区（r14318）。
+LEFT JOIN Material m ON m.Id = o.MaterialId";
 
     private const string WherePart = @"
 WHERE o.PlanVersionId = @PlanVersionId
@@ -42,7 +69,10 @@ WHERE o.PlanVersionId = @PlanVersionId
     AND (@DueDateFrom IS NULL OR o.CustomerDueDate >= @DueDateFrom)
     AND (@DueDateTo IS NULL OR o.CustomerDueDate <= @DueDateTo)
     AND (@HasFactories = 0 OR f.Code IN @AllowedFactories)
-    AND (@HasDomains = 0 OR o.DomainKey IN @AllowedDomains)";
+    AND (@HasDomains = 0 OR o.DomainKey IN @AllowedDomains)
+    -- A5（11-21 4号位件）：统计卡回筛两参——与 KPI 分区行字面值同源；缺省=不过滤（全部消费方同文本）
+    AND (@OrderType IS NULL OR o.OrderType = @OrderType)
+    AND (@MaterialType IS NULL OR m.MaterialType = @MaterialType)";
 
     /// <summary>
     /// 计划派生交付判定（冻结 01 §64 / 07 §八.2）——与列表富化 C# 式逐语等价：
@@ -72,6 +102,8 @@ INSERT #tc SELECT OrderId, MAX(PlannedEndTime) FROM [Task] WHERE PlanVersionId =
         string? status = null,
         string? productionInstructionNo = null,
         string? productFamilyCode = null,
+        string? orderType = null,
+        string? materialType = null,
         DateTime? dueDateFrom = null,
         DateTime? dueDateTo = null,
         string? riskLevel = null,
@@ -130,7 +162,8 @@ SELECT
     o.DelayStatus,
     o.DemandMaturityStatus,
     o.MTS_InstructionNo,
-    o.BOMNO";
+    o.BOMNO,
+    m.MaterialType";   // A6：标准分类原值（缺主数据⇒null=未提供）
 
         // R1（11-12 4号位件）：sortBy 白名单——**缺省排序逐字保留全链清扫原式**；每个自定义排序尾挂 o.Id 保分页确定性。
         // dir 仅二值（service 已校验；仓储防御性二值化，杜绝注入）。非法 sortBy 抛 ArgumentException→400（不静默忽略，R2 教训）。
@@ -165,6 +198,8 @@ SELECT
         var parameters = new
         {
             PlanVersionId = planVersionId,
+            OrderType = orderType,
+            MaterialType = materialType,
             OrderNo = orderNo,
             MaterialCode = materialCode,
             CustomerName = customerName,
@@ -370,6 +405,8 @@ ORDER BY t.OperationSeq";
         string? status = null,
         string? productionInstructionNo = null,
         string? productFamilyCode = null,
+        string? orderType = null,
+        string? materialType = null,
         DateTime? dueDateFrom = null,
         DateTime? dueDateTo = null,
         string? riskLevel = null,
@@ -423,6 +460,8 @@ DROP TABLE #tc;";
         var parameters = new
         {
             PlanVersionId = planVersionId,
+            OrderType = orderType,
+            MaterialType = materialType,
             OrderNo = orderNo,
             MaterialCode = materialCode,
             CustomerName = customerName,
@@ -464,6 +503,8 @@ DROP TABLE #tc;";
         string? status = null,
         string? productionInstructionNo = null,
         string? productFamilyCode = null,
+        string? orderType = null,
+        string? materialType = null,
         DateTime? dueDateFrom = null,
         DateTime? dueDateTo = null,
         string? riskLevel = null,
@@ -501,6 +542,8 @@ DROP TABLE #tc;";
         var parameters = new
         {
             PlanVersionId = planVersionId,
+            OrderType = orderType,
+            MaterialType = materialType,
             OrderNo = orderNo,
             MaterialCode = materialCode,
             CustomerName = customerName,
@@ -567,6 +610,8 @@ DROP TABLE #tc;";
         string? status = null,
         string? productionInstructionNo = null,
         string? productFamilyCode = null,
+        string? orderType = null,
+        string? materialType = null,
         DateTime? dueDateFrom = null,
         DateTime? dueDateTo = null,
         string? riskLevel = null,
@@ -592,6 +637,8 @@ DROP TABLE #tc;";
         var parameters = new
         {
             PlanVersionId = planVersionId,
+            OrderType = orderType,
+            MaterialType = materialType,
             OrderNo = orderNo,
             MaterialCode = materialCode,
             CustomerName = customerName,
@@ -620,9 +667,17 @@ SELECT
     SUM(CASE WHEN " + RiskCaseExpr + @" = 'ON_TRACK' THEN 1 ELSE 0 END) AS OnTimeOrders,
     SUM(CASE WHEN " + RiskCaseExpr + @" = 'DELAYED' THEN 1 ELSE 0 END) AS LateOrders,
     SUM(CASE WHEN " + RiskCaseExpr + @" = 'UNSCHEDULED' THEN 1 ELSE 0 END) AS UndeterminedOrders"
+            // A7（11-21 4号位件）：三均值＝**候选口径**（起点=IssueDate；APS完成=同PV Task MAX(PlannedEnd)；
+            // 延期均值仅延期单；四列实库填充 100%）。同段 WHERE/筛选单源；行级 GROUPING 下**只取总计行**回填。
+            + @"
+    ,AVG(CAST(DATEDIFF(day, o.IssueDate, o.CustomerDueDate) AS decimal(18,2))) AS AvgCustomerExpectDays
+    ,AVG(CAST(DATEDIFF(day, o.IssueDate, tc.MaxEnd) AS decimal(18,2))) AS AvgApsLeadDays
+    ,AVG(CASE WHEN tc.MaxEnd IS NOT NULL AND CAST(tc.MaxEnd AS date) > o.CustomerDueDate
+              THEN CAST(DATEDIFF(day, o.CustomerDueDate, tc.MaxEnd) AS decimal(18,2)) END) AS AvgDelayDays"
             + FromJoin + "\nLEFT JOIN #tc tc ON tc.OrderId = o.Id"
             // 0号位 11-20 裁：FG/WIP=标准 Material 分类（MaterialType），四组 GROUPING SETS 逐行出全、不合并。
-            + "\nLEFT JOIN Material m ON m.Id = o.MaterialId"
+            // ⚠m 的 JOIN 已随 A6 并入类级 FromJoin 单源——此处**严禁再加**（11-23 重复别名' m' 500 回归：
+            // 手写等价 SQL 预跑测不出拼接文本错误，预跑必须跑"代码拼出的同一段文本"）。
             + WherePart + riskPred + @"
 GROUP BY GROUPING SETS ((o.OrderType), (m.MaterialType), (m.MaterialType, o.OrderType), ())
 ORDER BY IsGrandTotal DESC, IsMT DESC, m.MaterialType, o.OrderType
@@ -639,6 +694,9 @@ DROP TABLE #tc;";
                       + "计划完成=同PV Task MAX(PlannedEndTime) 读模型计算；分母=去重根订单含未判定",
             PlannedCompletionSource = "readmodel_task_max",
             FgWipDimensionAvailable = true,   // 0号位 11-20 裁：标准 MaterialType 为唯一判据（禁前缀/ERP属性/Routing 推断）
+            AvgCustomerExpectDays = raw.FirstOrDefault(x => x.IsGrandTotal == 1 && x.IsMT == 1)?.AvgCustomerExpectDays,
+            AvgApsLeadDays = raw.FirstOrDefault(x => x.IsGrandTotal == 1 && x.IsMT == 1)?.AvgApsLeadDays,
+            AvgDelayDays = raw.FirstOrDefault(x => x.IsGrandTotal == 1 && x.IsMT == 1)?.AvgDelayDays,
             TargetPercent = null,   // 待 3号位 合同核对（Q-c：我方不自选配置源）
             Rows = raw.Select(r => new DeliveryKpiRowDto
             {
@@ -665,6 +723,9 @@ DROP TABLE #tc;";
     {
         public int IsGrandTotal { get; set; }
         public int IsMT { get; set; }
+        public decimal? AvgCustomerExpectDays { get; set; }
+        public decimal? AvgApsLeadDays { get; set; }
+        public decimal? AvgDelayDays { get; set; }
         public string? OrderType { get; set; }
         public string? MaterialType { get; set; }
         public int TotalOrders { get; set; }
@@ -683,6 +744,7 @@ DROP TABLE #tc;";
     public async Task<OrderTreeResultDto> GetOrderTreeAsync(
         int planVersionId,
         long orderId,
+        string? keyword = null,
         IReadOnlySet<string>? allowedDomains = null,
         IReadOnlySet<string>? allowedFactories = null,
         int nodeLimit = 500,
@@ -719,27 +781,7 @@ DROP TABLE #tc;";
         var edgeRows = new List<TreeEdgeRow>();
         if (seedIds.Count > 0)
         {
-            edgeRows = (await _connectionManager.QueryAsync<TreeEdgeRow>(@"
-;WITH seed AS (
-    SELECT t.Id AS TaskId FROM Task t WHERE t.PlanVersionId = @Pv AND t.OrderId = @Or
-    UNION
-    SELECT s.TaskId FROM AllocationTaskShare s WHERE s.PlanVersionId = @Pv AND s.RootOrderId = @Or
-),
-closure AS (
-    SELECT CAST(NULL AS bigint) AS ParentTaskId, sd.TaskId AS ChildTaskId, 0 AS Depth,
-           CONVERT(varchar(max), CONCAT(',', sd.TaskId, ',')) AS Path
-    FROM seed sd
-    UNION ALL
-    -- 前沿=本行距种子最远的端点：种子行（Parent 为 NULL）前沿在 Child；其后行前沿在 Parent。
-    -- （两版弯路 11-17 预跑抓出：①续走 Child＝原地只出 1 跳；②只认 Parent＝种子行断扩。COALESCE 才对。）
-    SELECT p.UpstreamTaskId, COALESCE(c.ParentTaskId, c.ChildTaskId), c.Depth + 1,
-           CONVERT(varchar(max), CONCAT(c.Path, p.UpstreamTaskId, ','))
-    FROM closure c
-    JOIN Pegging p ON p.PlanVersionId = @Pv
-       AND p.DownstreamTaskId = COALESCE(c.ParentTaskId, c.ChildTaskId)
-    WHERE c.Depth < 10
-      AND c.Path NOT LIKE CONCAT('%,', p.UpstreamTaskId, ',%')
-)
+            edgeRows = (await _connectionManager.QueryAsync<TreeEdgeRow>(TreeClosureCte + @"
 SELECT TOP (@EdgeCap) c.ParentTaskId, c.ChildTaskId, c.Depth,
        p.Quantity, p.UOM AS Uom, p.PeggingType, p.LeadTimeDays, p.IsCrossDomain, p.AllocationReason
 FROM closure c
@@ -801,8 +843,48 @@ GROUP BY s.TaskId",
                 CommandType.Text, DatabaseId.APS, commandTimeout: 20)).ToList();
         var shareMap = shareRows.ToDictionary(r => r.TaskId);
 
+        // P03 H2（11-23 4号位件）：深层节点检索——闭包**全量**（不受 500/1500/500 截断，同一 CTE 单源）
+        // 上按 任务号/物料码/物料名/部门名/工单号/PI 六路 LIKE；hitCount=服务端全量命中数（Q05 纪律）。
+        List<LPS.APS.Core.Dto.OrderTreeHitDto> hits = new();
+        int hitCount = 0;
+        var kw = string.IsNullOrWhiteSpace(keyword) ? null : "%" + keyword.Trim() + "%";
+        if (kw is not null && seedIds.Count > 0)
+        {
+            hits = (await _connectionManager.QueryAsync<LPS.APS.Core.Dto.OrderTreeHitDto>(
+                TreeClosureCte + @"
+SELECT t.Id AS TaskId, t.TaskNo, m.MaterialCode, m.MaterialName,
+       pd.DeptName AS DepartmentName, t.MESWorkOrderNo AS WorkOrderNo, t.MTS_InstructionNo AS InstructionNo
+FROM (SELECT TaskId FROM seed
+      UNION SELECT ParentTaskId FROM closure WHERE ParentTaskId IS NOT NULL
+      UNION SELECT ChildTaskId FROM closure) n
+JOIN Task t ON t.Id = n.TaskId AND t.PlanVersionId = @Pv
+LEFT JOIN Material m ON m.Id = t.MaterialId
+LEFT JOIN ProductionDepartment pd ON pd.Id = t.ProductionDepartmentId
+WHERE m.MaterialCode LIKE @Kw OR m.MaterialName LIKE @Kw OR t.TaskNo LIKE @Kw
+   OR pd.DeptName LIKE @Kw OR t.MESWorkOrderNo LIKE @Kw OR t.MTS_InstructionNo LIKE @Kw
+ORDER BY t.Id
+OFFSET 0 ROWS FETCH NEXT 201 ROWS ONLY",
+                new { Pv = planVersionId, Or = orderId, Kw = kw },
+                CommandType.Text, DatabaseId.APS, commandTimeout: 30)).ToList();
+            hitCount = await _connectionManager.QueryFirstOrDefaultAsync<int>(
+                TreeClosureCte + @"
+SELECT COUNT(*)
+FROM (SELECT TaskId FROM seed
+      UNION SELECT ParentTaskId FROM closure WHERE ParentTaskId IS NOT NULL
+      UNION SELECT ChildTaskId FROM closure) n
+JOIN Task t ON t.Id = n.TaskId AND t.PlanVersionId = @Pv
+LEFT JOIN Material m ON m.Id = t.MaterialId
+LEFT JOIN ProductionDepartment pd ON pd.Id = t.ProductionDepartmentId
+WHERE m.MaterialCode LIKE @Kw OR m.MaterialName LIKE @Kw OR t.TaskNo LIKE @Kw
+   OR pd.DeptName LIKE @Kw OR t.MESWorkOrderNo LIKE @Kw OR t.MTS_InstructionNo LIKE @Kw",
+                new { Pv = planVersionId, Or = orderId, Kw = kw },
+                CommandType.Text, DatabaseId.APS, commandTimeout: 30);
+            if (hits.Count > 200) hits = hits.Take(200).ToList();
+        }
+
         var demandsRaw = (await _connectionManager.QueryAsync<OrderTreeDemandDto>(@"
 SELECT TOP (@DemandCap)
+    Id,   -- H3：PeggingSupplyAllocation.Id 稳定主键（与 P07 列表 id 同键）
     AllocationSequence, MaterialId, MaterialCode, DemandStageCode,
     DemandQty, AllocatedQty, DemandQty - AllocatedQty AS GapQty,
     SupplyType, SupplyDocumentNo, SupplyFactoryCode, SupplyMode, CommitmentStatus,
@@ -852,6 +934,8 @@ ORDER BY AllocationSequence",
                 Quantity = e.Quantity, Uom = e.Uom, PeggingType = e.PeggingType,
                 LeadTimeDays = e.LeadTimeDays, IsCrossDomain = e.IsCrossDomain, AllocationReason = e.AllocationReason
             }).ToList(),
+            KeywordHits = hits,
+            KeywordHitCount = kw is null ? null : hitCount,
             Demands = demandsTruncated ? demandsRaw.Take(demandLimit).ToList() : demandsRaw,
             NodesTruncated = nodesTruncated,
             EdgesTruncated = edgesTruncated,

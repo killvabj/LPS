@@ -236,25 +236,24 @@ public sealed class C0xDestructiveCounterexampleTests
         Assert.Contains("FRACTIONAL_EXECUTION_BATCH_QTY", err);
     }
 
-    // ── C07 反向变体：同一批声称走了**不存在的 Path**（本批实测：硬校验**放行**）──
+    // ── C07 反向变体：同一批声称走了**不存在的 Path** ⇒ 必须拒 ──
     //
-    // 2026-11-20 实测：`ValidateHardResultForTest` **不检查** Task 的 `(RouteCode, PathId)` 是否真在该物料的
-    // `RoutingGraphs` 里 ⇒ 身份不可证的 Path 会被放行。这是**新发现的口径缺口**，不在本轮擅自改判定
-    // （改它要 0号位 先定「Path 身份不存在时是拒整单、还是判技术失败」），故按现行为立例并 Skip，
-    // 与 `SH_LINKED` 待裁例同一处理方式。
-    [Fact(
-        DisplayName = "C07反例变体（待0号位裁）：同批引用不存在的Path 当前被放行",
-        Skip = "实测硬校验不检查 Path 身份存在性（放行）；待 0号位 裁决应拒还是应判技术失败后再改。")]
-    public void C07_InverseVariant_UnknownPathInBatch_CurrentBehavior_Accepted()
+    // 冻结依据（0号位《P0-04 MultiRouting Review》§3 第 2 条逐字）：
+    //   「先校验每个 Batch 对应的**完整合法真实 Path**、Stage批身份和份额」
+    // ⇒ 身份不可证的 Path 属「非完整合法真实 Path」，必须拒（`BATCH_ROUTE_UNKNOWN`）。
+    // 物料整体无路由图时不判（无 Routing 需求由未排出口承担），见实现注释。
+    [Fact(DisplayName = "C07反例变体：同批引用不存在的Path ⇒ 拒（BATCH_ROUTE_UNKNOWN）")]
+    public void C07_InverseVariant_UnknownPathInBatch_ShouldReject()
     {
         var tasks = new List<FinalTaskDraft>
         {
             T("T1", "D1", "OP10", 10m, pathId: 9, seb: "EB1"),   // Path 9 不在 RoutingGraphs 里
             T("T2", "D1", "OP20", 10m, pathId: 9, seb: "EB1"),
         };
-        var (valid, _) = Run(tasks, SinglePathTwoOp(), new[] { Demand("D1", 10m) });
+        var (valid, err) = Run(tasks, SinglePathTwoOp(), new[] { Demand("D1", 10m) });
 
-        Assert.True(valid, "现行为：路径身份不可证也放行（缺口，待裁）。");
+        Assert.False(valid, "路径身份不可证（Path 9 不存在）必须拒，不得放行。" + err);
+        Assert.Contains("BATCH_ROUTE_UNKNOWN", err);
     }
 
     // ── C01 反向：同批内两工序份额打架（26 vs 25）⇒ 批净产出自相矛盾，必须拒 ──

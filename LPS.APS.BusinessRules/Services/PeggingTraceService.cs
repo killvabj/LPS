@@ -21,13 +21,20 @@ public class PeggingTraceService
     /// <summary>
     /// 查询Pegging分配列表
     /// </summary>
-    public async Task<List<PeggingTraceDto>> QueryAsync(
+        private static IReadOnlyList<string>? SplitCsv(string? csv) =>
+        string.IsNullOrWhiteSpace(csv) ? null : csv.Split(',', StringSplitOptions.RemoveEmptyEntries)
+            .Select(x => x.Trim()).Where(x => x.Length > 0).ToList();
+
+public async Task<List<PeggingTraceDto>> QueryAsync(
         int planVersionId,
         string? materialCode = null,
         string? supplyType = null,
         string? commitmentStatus = null,
         string? orderNo = null,
         string? supplyDocumentNo = null,
+        string? demandFactoryCode = null,
+        string? supplyFactoryCode = null,
+        string? supplyDocumentType = null,
         long? rootOrderId = null,
         int skip = 0,
         int take = 100,
@@ -40,8 +47,13 @@ public class PeggingTraceService
         if (take > 500) take = 500;
 
         return await _repository.QueryAsync(
-            planVersionId, materialCode, supplyType, commitmentStatus,
-            orderNo, supplyDocumentNo, rootOrderId, skip, take, ct, allowedFactories);
+            planVersionId: planVersionId, materialCode: materialCode, supplyType: supplyType,
+            commitmentStatus: commitmentStatus, orderNo: orderNo, supplyDocumentNo: supplyDocumentNo,
+            rootOrderId: rootOrderId,
+            demandFactoryCodes: SplitCsv(demandFactoryCode),
+            supplyFactoryCodes: SplitCsv(supplyFactoryCode),
+            supplyDocumentTypes: SplitCsv(supplyDocumentType),
+            skip: skip, take: take, ct: ct, allowedFactories: allowedFactories);
     }
 
     /// <summary>筛选后总数（R2.1，11-14：与列表同参数集，含数据范围）。</summary>
@@ -52,6 +64,9 @@ public class PeggingTraceService
         string? commitmentStatus = null,
         string? orderNo = null,
         string? supplyDocumentNo = null,
+        string? demandFactoryCode = null,
+        string? supplyFactoryCode = null,
+        string? supplyDocumentType = null,
         long? rootOrderId = null,
         CancellationToken ct = default,
         IReadOnlySet<string>? allowedFactories = null)
@@ -59,8 +74,13 @@ public class PeggingTraceService
         if (planVersionId <= 0) throw new ArgumentException("planVersionId is required");
 
         return await _repository.CountAsync(
-            planVersionId, materialCode, supplyType, commitmentStatus,
-            orderNo, supplyDocumentNo, rootOrderId, ct, allowedFactories);
+            planVersionId: planVersionId, materialCode: materialCode, supplyType: supplyType,
+            commitmentStatus: commitmentStatus, orderNo: orderNo, supplyDocumentNo: supplyDocumentNo,
+            rootOrderId: rootOrderId,
+            demandFactoryCodes: SplitCsv(demandFactoryCode),
+            supplyFactoryCodes: SplitCsv(supplyFactoryCode),
+            supplyDocumentTypes: SplitCsv(supplyDocumentType),
+            ct: ct, allowedFactories: allowedFactories);
     }
 
     /// <summary>

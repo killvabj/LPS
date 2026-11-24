@@ -21,6 +21,7 @@ public class PermissionSeedService : IPermissionSeedService
         // Plan
         ("aps.plan.view", "查看计划", "Plan", "View", "查看授权业务范围内计划"),
         ("aps.plan.run", "发起排程", "Plan", "Execute", "按授权范围发起排程/运行"),
+        ("aps.admin.run", "运行治理管理员", "Plan", "Execute", "P10 运行治理/整 Domain 人工重排专属（0号位 2026-11-21 G-01），仅系统管理员；普通候选/局部重排仍走 aps.plan.run"),
         ("aps.plan.compare", "计划对比", "Plan", "View", "查看版本/Candidate对比"),
         ("aps.plan.export", "导出计划", "Plan", "Execute", "导出授权范围内计划"),
 

@@ -30,6 +30,10 @@ public sealed class OrderListItemDto
     /// <summary>JSON: materialId</summary>
     public int MaterialId { get; init; }
 
+    /// <summary>A6（11-21 4号位件）：标准 Material 分类原值（FINISHED_GOOD/SEMI_FINISHED/ASSY/RAW_MATERIAL/MFG）；
+    /// 禁由品番前缀推断（0号位 11-20 裁）；主数据缺行 ⇒ null=未提供。JSON: materialType</summary>
+    public string? MaterialType { get; init; }
+
     /// <summary>客户名称（v24 有值率 59.9%；缺失源于 ERP 源头未带）。JSON: customerName</summary>
     public string? CustomerName { get; init; }
 

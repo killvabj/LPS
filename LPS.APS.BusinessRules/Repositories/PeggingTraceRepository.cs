@@ -31,7 +31,13 @@ WHERE PlanVersionId = @PlanVersionId
          OR CommitmentStatus = @CommitmentStatus)
     AND (@OrderNo IS NULL OR RootOrderNo LIKE '%' + @OrderNo + '%' OR CurrentOrderNo LIKE '%' + @OrderNo + '%')
     AND (@RootOrderId IS NULL OR RootOrderId = @RootOrderId)
-    AND (@SupplyDocumentNo IS NULL OR SupplyDocumentNo LIKE '%' + @SupplyDocumentNo + '%')";
+    AND (@SupplyDocumentNo IS NULL OR SupplyDocumentNo LIKE '%' + @SupplyDocumentNo + '%')
+    -- P07 H1/H3（11-23 4号位件）：工厂双侧独立参数（语义不同不合并；合并判据待 0 裁）＋来源单据类型。
+    -- ⚠supplyDocumentType 列实库全 NULL（6,067,270/6,067,270）⇒ 谓词合法、现值域任何取值实测空；数据缺口归 0 分派 2号位。
+    -- Dapper 列表纪律：Has 标志＋IN，禁 `@X IS NULL OR IN @X`（SQL 4145 教训）。
+    AND (@HasDemandFactories = 0 OR DemandFactoryCode IN @DemandFactoryCodes)
+    AND (@HasSupplyFactories = 0 OR SupplyFactoryCode IN @SupplyFactoryCodes)
+    AND (@HasDocTypes = 0 OR SupplyDocumentType IN @SupplyDocumentTypes)";
 
     /// <summary>数据范围谓词（DemandFactoryCode，31-0 Q2 裁决；空集 fail-closed 由调用方前置处理）。</summary>
     private const string TraceScopePredicate = @"
@@ -79,6 +85,9 @@ SELECT
         string? orderNo = null,
         string? supplyDocumentNo = null,
         long? rootOrderId = null,
+        IReadOnlyList<string>? demandFactoryCodes = null,
+        IReadOnlyList<string>? supplyFactoryCodes = null,
+        IReadOnlyList<string>? supplyDocumentTypes = null,
         int skip = 0,
         int take = 100,
         CancellationToken ct = default,
@@ -88,6 +97,9 @@ SELECT
         if (allowedFactories is { Count: 0 })
             return new List<PeggingTraceDto>();
         var hasFactories = allowedFactories is { Count: > 0 };
+        var hasDemandFactories = demandFactoryCodes is { Count: > 0 };
+        var hasSupplyFactories = supplyFactoryCodes is { Count: > 0 };
+        var hasDocTypes = supplyDocumentTypes is { Count: > 0 };
 
         var sql = TraceSelectCols + @"
 FROM PeggingSupplyAllocation" + TraceWhereCore + TraceScopePredicate + @"
@@ -103,6 +115,12 @@ OFFSET @Skip ROWS FETCH NEXT @Take ROWS ONLY";
             OrderNo = orderNo,
             SupplyDocumentNo = supplyDocumentNo,
             RootOrderId = rootOrderId,
+            HasDemandFactories = hasDemandFactories,
+            DemandFactoryCodes = demandFactoryCodes,
+            HasSupplyFactories = hasSupplyFactories,
+            SupplyFactoryCodes = supplyFactoryCodes,
+            HasDocTypes = hasDocTypes,
+            SupplyDocumentTypes = supplyDocumentTypes,
             HasFactories = hasFactories,
             AllowedFactories = allowedFactories,
             Skip = skip,
@@ -128,12 +146,18 @@ OFFSET @Skip ROWS FETCH NEXT @Take ROWS ONLY";
         string? orderNo = null,
         string? supplyDocumentNo = null,
         long? rootOrderId = null,
+        IReadOnlyList<string>? demandFactoryCodes = null,
+        IReadOnlyList<string>? supplyFactoryCodes = null,
+        IReadOnlyList<string>? supplyDocumentTypes = null,
         CancellationToken ct = default,
         IReadOnlySet<string>? allowedFactories = null)
     {
         if (allowedFactories is { Count: 0 })
             return 0;
         var hasFactories = allowedFactories is { Count: > 0 };
+        var hasDemandFactories = demandFactoryCodes is { Count: > 0 };
+        var hasSupplyFactories = supplyFactoryCodes is { Count: > 0 };
+        var hasDocTypes = supplyDocumentTypes is { Count: > 0 };
 
         var sql = "SELECT COUNT(*) FROM PeggingSupplyAllocation" + TraceWhereCore + TraceScopePredicate;
 
@@ -146,6 +170,12 @@ OFFSET @Skip ROWS FETCH NEXT @Take ROWS ONLY";
             OrderNo = orderNo,
             SupplyDocumentNo = supplyDocumentNo,
             RootOrderId = rootOrderId,
+            HasDemandFactories = hasDemandFactories,
+            DemandFactoryCodes = demandFactoryCodes,
+            HasSupplyFactories = hasSupplyFactories,
+            SupplyFactoryCodes = supplyFactoryCodes,
+            HasDocTypes = hasDocTypes,
+            SupplyDocumentTypes = supplyDocumentTypes,
             HasFactories = hasFactories,
             AllowedFactories = allowedFactories
         };

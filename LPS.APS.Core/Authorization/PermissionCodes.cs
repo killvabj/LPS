@@ -14,6 +14,8 @@ public static class PermissionCodes
     public const string PlanView = "aps.plan.view";
     /// <summary>发起排程/运行（白天候选运行创建、FAILED 恢复）</summary>
     public const string PlanRun = "aps.plan.run";
+    /// <summary>运行治理管理员（0号位 2026-11-21 裁决《用户输出权限与运行治理统一收口》G-01：仅 P10 治理/整 Domain 人工重排，仅系统管理员；普通白天候选创建与局部重排仍走 aps.plan.run）</summary>
+    public const string RunAdmin = "aps.admin.run";
     /// <summary>计划对比</summary>
     public const string PlanCompare = "aps.plan.compare";
     /// <summary>导出计划</summary>
@@ -125,10 +127,10 @@ public static class PermissionCodes
     /// <summary>查看审计日志</summary>
     public const string AuditView = "aps.audit.view";
 
-    /// <summary>全部 V1 功能权限点（45 码：44 码基线 + DomainMaintain 域维护 1 码（2026-10-25，冻结《Domain 裁决 v1.0》§4.1 系统管理员维护））</summary>
+    /// <summary>全部 V1 功能权限点（46 码：44 码基线 + DomainMaintain 域维护 1 码（2026-10-25，冻结《Domain 裁决 v1.0》§4.1 系统管理员维护） + RunAdmin 运行治理 1 码（0号位 2026-11-21 裁决 G-01））</summary>
     public static readonly IReadOnlyList<string> All = new[]
     {
-        PlanView, PlanRun, PlanCompare, PlanExport,
+        PlanView, PlanRun, RunAdmin, PlanCompare, PlanExport,
         CtpView, PlanCtp, OrderInsertImpact, ReschedulePartial, RescheduleManual,
         CandidateView, CandidateConfirm, CandidateActivate,
         RuleView, RuleMaintain, RulePublish,

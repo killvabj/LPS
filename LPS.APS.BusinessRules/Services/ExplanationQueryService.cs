@@ -29,6 +29,7 @@ public class ExplanationQueryService
         string? reasonCode = null,
         string? severity = null,
         DateTime? occurredFrom = null, DateTime? occurredTo = null,
+        IReadOnlySet<string>? allowedDomains = null,
         int skip = 0,
         int take = 100,
         CancellationToken ct = default)
@@ -40,7 +41,7 @@ public class ExplanationQueryService
 
         return await _repository.QueryAsync(
             planVersionId, objectType, orderId, taskId,
-            reasonCode, severity, occurredFrom, occurredTo, skip, take, ct);
+            reasonCode, severity, occurredFrom, occurredTo, allowedDomains, skip, take, ct);
     }
 
     /// <summary>
@@ -48,11 +49,12 @@ public class ExplanationQueryService
     /// </summary>
     public async Task<ExplanationSummaryDto> GetSummaryAsync(
         int planVersionId,
+        IReadOnlySet<string>? allowedDomains = null,
         CancellationToken ct = default)
     {
         if (planVersionId <= 0) throw new ArgumentException("planVersionId is required");
 
-        return await _repository.GetSummaryAsync(planVersionId, ct);
+        return await _repository.GetSummaryAsync(planVersionId, allowedDomains, ct);
     }
 
     /// <summary>FULL-06 三族词表（大小写敏感，Ordinal；族外值 400 不静默过滤成空）。</summary>

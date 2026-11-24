@@ -57,6 +57,12 @@ WHERE d.SourcePlanVersionId = @Pv
   AND (@HasDeptFilter = 0 OR d.ProductionDepartmentCode IN @DepartmentCodes)
   AND (@HasScopeDepts = 0 OR d.ProductionDepartmentCode IN @ScopeDepartments)
   AND (@HasFactories = 0 OR f.Code IN @AllowedFactories)
+  -- P11 H3（11-23 4号位件）：设备筛选经同批 Task 行 EXISTS（TaskDispatch 无资源列）；
+  -- MES 执行状态筛选=批内任一工单命中（快照按源 Run；SrcRun=0 恒空=未提供，不猜别 Run）。
+  AND (@HasResources = 0 OR EXISTS (SELECT 1 FROM Task rt
+        WHERE rt.PlanVersionId = d.SourcePlanVersionId AND rt.TaskNo = d.TaskNo AND rt.ResourceId IN @ResourceIds))
+  AND (@HasWoStatus = 0 OR EXISTS (SELECT 1 FROM MESWorkOrderSnapshot w2
+        WHERE w2.ScheduleRunId = @SrcRun AND w2.MESWorkOrderNo = d.MESWorkOrderNo AND w2.WorkOrderStatus IN @WoStatuses))
 GROUP BY d.TaskNo, d.ProductionInstructionNo
 HAVING (@Status IS NULL OR SUM(CASE WHEN d.DispatchStatus = @Status THEN 1 ELSE 0 END) > 0)";
 
@@ -72,6 +78,8 @@ HAVING (@Status IS NULL OR SUM(CASE WHEN d.DispatchStatus = @Status THEN 1 ELSE 
         string? keyword = null,
         string? dispatchStatus = null,
         IReadOnlyList<string>? departmentCodes = null,
+        IReadOnlyList<int>? resourceIds = null,
+        IReadOnlyList<string>? workOrderStatuses = null,
         IReadOnlySet<string>? allowedDomains = null,
         IReadOnlySet<string>? allowedFactories = null,
         IReadOnlySet<string>? allowedDepartments = null,
@@ -79,7 +87,7 @@ HAVING (@Status IS NULL OR SUM(CASE WHEN d.DispatchStatus = @Status THEN 1 ELSE 
         int pageSize = 50,
         CancellationToken ct = default)
     {
-        if (stageCodes is { Count: 0 } || departmentCodes is { Count: 0 })
+        if (stageCodes is { Count: 0 } || departmentCodes is { Count: 0 } || resourceIds is { Count: 0 } || workOrderStatuses is { Count: 0 })
             return new MesStatusListResultDto { PlanVersionId = planVersionId, Page = Math.Max(1, pageIndex), PageSize = Math.Clamp(pageSize, 1, 200) };
 
         var header = await _connectionManager.QueryFirstOrDefaultAsync<MesPvHeader>(
@@ -114,6 +122,10 @@ HAVING (@Status IS NULL OR SUM(CASE WHEN d.DispatchStatus = @Status THEN 1 ELSE 
             Status = string.IsNullOrWhiteSpace(dispatchStatus) ? null : dispatchStatus.Trim(),
             HasDeptFilter = departmentCodes is { Count: > 0 },
             DepartmentCodes = departmentCodes,
+            HasResources = resourceIds is { Count: > 0 },
+            ResourceIds = resourceIds,
+            HasWoStatus = workOrderStatuses is { Count: > 0 },
+            WoStatuses = workOrderStatuses,
             HasScopeDepts = allowedDepartments is { Count: > 0 },
             ScopeDepartments = allowedDepartments is { Count: > 0 } ? allowedDepartments.ToList() : null,
             HasFactories = allowedFactories is { Count: > 0 },
@@ -181,6 +193,31 @@ DROP TABLE #b;",
             Page = page,
             PageSize = size
         };
+    }
+
+    /// <summary>P06 H3（11-23 4号位件）：单任务执行事实（工单状态 + 报工聚合）。
+    /// 键与 P11 批读面 OUTER APPLY 完全同构（SrcRun+WO / SrcRun+PI+Stage）；E2 五态如获 0 裁将在此单源派生。
+    /// srcRun 空/0 ⇒ 返回 null（未提供——快照按 Run 装载纪律，不猜别的 Run）。</summary>
+    public async Task<MesTaskExecFactsDto?> GetTaskExecFactsAsync(
+        long? srcRun, string? piNo, string? stageCode, string? workOrderNo, CancellationToken ct = default)
+    {
+        if (srcRun is null or <= 0) return null;
+        var sql = @"
+SELECT
+    (SELECT TOP 1 w0.WorkOrderStatus FROM MESWorkOrderSnapshot w0
+      WHERE w0.ScheduleRunId = @SrcRun AND w0.MESWorkOrderNo = @Wo) AS WorkOrderStatus,
+    CASE WHEN COUNT(*) > 0 THEN CAST(1 AS bit) ELSE CAST(0 AS bit) END AS Reported,
+    SUM(p.PlannedQty) AS PlannedQtyReported, SUM(p.GoodQty) AS GoodQty,
+    SUM(p.ScrapQty) AS ScrapQty, SUM(p.ReworkQty) AS ReworkQty,
+    SUM(p.RemainingQty) AS RemainingQty, MAX(p.LastReportTime) AS LastReportTime
+FROM OperationProgressSnapshot p
+WHERE p.ScheduleRunId = @SrcRun AND p.ProductionInstructionNo = @Pi AND p.StageCode = @Stage";
+        var row = await _connectionManager.QueryFirstOrDefaultAsync<MesTaskExecFactsDto>(
+            sql, new { SrcRun = srcRun, Wo = string.IsNullOrWhiteSpace(workOrderNo) ? null : workOrderNo.Trim(),
+                       Pi = string.IsNullOrWhiteSpace(piNo) ? null : piNo.Trim(),
+                       Stage = string.IsNullOrWhiteSpace(stageCode) ? null : stageCode.Trim() },
+            CommandType.Text, DatabaseId.APS, commandTimeout: 10);
+        return row;
     }
 
     public async Task<MesStatusBatchDetailDto> GetBatchDetailAsync(

@@ -42,7 +42,12 @@ WHERE 1=1
     AND (@HasWarehouses = 0 OR o.ReceivingWarehouse IN @Warehouses)
     AND (@EtaBefore IS NULL OR o.ManualEta <= @EtaBefore)
     AND (@EtaAfter IS NULL OR o.ManualEta >= @EtaAfter)
-    AND (@UpdatedAfter IS NULL OR o.UpdatedAt >= @UpdatedAfter)";
+    AND (@UpdatedAfter IS NULL OR o.UpdatedAt >= @UpdatedAfter)
+    -- R3（3号位 11-21 裁）：读侧工厂 Scope fail-closed——本表无厂列，经 PO 的供给事实推导
+    -- （PO 无事实记录 ⇒ 受限用户不可见；Global 用户不受限）。装载器 GetActiveOverrides **不加**（2号位消费面）。
+    AND (@HasFactories = 0 OR EXISTS (
+        SELECT 1 FROM SupplyFact_Pipeline s
+        WHERE s.SourceDocumentNo = o.PONo AND s.FactoryCode IN @AllowedFactories))";
 
     private const string SelectCols = @"
 SELECT
@@ -92,6 +97,7 @@ SELECT
         int pageIndex = 1,
         int pageSize = 20,
         bool withMatched = false,
+        IReadOnlySet<string>? allowedFactories = null,
         CancellationToken ct = default)
     {
         // Dapper 列表参数只能出现在 IN 内；@X IS NULL(标量) 会随 @X 一起扩成 (@p1,@p2) → "(@p1,@p2) IS NULL" 非法 SQL 4145。
@@ -145,6 +151,8 @@ SELECT
             EtaBefore = etaBefore,
             EtaAfter = etaAfter,
             UpdatedAfter = updatedAfter,
+            HasFactories = allowedFactories is { Count: > 0 },
+            AllowedFactories = allowedFactories,
             Skip = (pageIndex <= 1 ? 0 : (pageIndex - 1)) * pageSize,
             Take = pageSize
         };
@@ -184,6 +192,7 @@ SELECT
         DateTime? etaBefore = null,
         DateTime? etaAfter = null,
         DateTime? updatedAfter = null,
+        IReadOnlySet<string>? allowedFactories = null,
         CancellationToken ct = default)
     {
         if (materialIds is { Count: 0 } || materialCodes is { Count: 0 }
@@ -203,7 +212,9 @@ SELECT
             Warehouses = receivingWarehouses,
             EtaBefore = etaBefore,
             EtaAfter = etaAfter,
-            UpdatedAfter = updatedAfter
+            UpdatedAfter = updatedAfter,
+            HasFactories = allowedFactories is { Count: > 0 },
+            AllowedFactories = allowedFactories
         };
 
         // R6 同源化：两桶 CASE 引用类级常量（与列表 bucket 同一文本）；并回带实际日界（函 §2.3 采纳）。
@@ -229,17 +240,29 @@ SELECT
     /// </summary>
     public async Task<ProcurementManualEtaFacetsDto> GetFacetsAsync(
         string? search = null,
+        IReadOnlySet<string>? allowedFactories = null,
         CancellationToken ct = default)
     {
-        var parameters = new { Kw = string.IsNullOrWhiteSpace(search) ? null : "%" + search.Trim() + "%" };
+        var parameters = new
+        {
+            Kw = string.IsNullOrWhiteSpace(search) ? null : "%" + search.Trim() + "%",
+            HasFactories = allowedFactories is { Count: > 0 },
+            AllowedFactories = allowedFactories
+        };
 
         var ponos = (await _connectionManager.QueryAsync<string>(
             @"SELECT DISTINCT TOP (501) PONo FROM ProcurementManualEtaOverride
-              WHERE (@Kw IS NULL OR PONo LIKE @Kw) ORDER BY PONo",
+              WHERE (@Kw IS NULL OR PONo LIKE @Kw)
+              AND (@HasFactories = 0 OR EXISTS (SELECT 1 FROM SupplyFact_Pipeline s
+                    WHERE s.SourceDocumentNo = ProcurementManualEtaOverride.PONo AND s.FactoryCode IN @AllowedFactories))
+              ORDER BY PONo",
             parameters, CommandType.Text, DatabaseId.APS, commandTimeout: 10)).ToList();
         var mats = (await _connectionManager.QueryAsync<string>(
             @"SELECT DISTINCT TOP (501) MaterialCode FROM ProcurementManualEtaOverride
-              WHERE (@Kw IS NULL OR MaterialCode LIKE @Kw) ORDER BY MaterialCode",
+              WHERE (@Kw IS NULL OR MaterialCode LIKE @Kw)
+              AND (@HasFactories = 0 OR EXISTS (SELECT 1 FROM SupplyFact_Pipeline s
+                    WHERE s.SourceDocumentNo = ProcurementManualEtaOverride.PONo AND s.FactoryCode IN @AllowedFactories))
+              ORDER BY MaterialCode",
             parameters, CommandType.Text, DatabaseId.APS, commandTimeout: 10)).ToList();
 
         var truncated = ponos.Count > 500 || mats.Count > 500;
@@ -271,11 +294,31 @@ ORDER BY UpdatedAt DESC, PONo, [LineNo]";   // 同口径定序：非分页导出
         return results.ToList();
     }
 
+    /// <summary>G-04 裁一（3号位 11-23）：PO 工厂归属解析——**归属判据，不以"存在供给事实"为准**。
+    /// 层级：①ext_ERP_PurchaseInTransit_View（采购在途源，实查 20,405 PO 且 PO→工厂 1:1，多厂=0）；
+    /// ②SupplyFact_Pipeline 兜底（有事实但视图未覆盖的历史 PO，如 CC44390→CN）；③两者皆无 ⇒ null（调用方 403）。
+    /// </summary>
+    public async Task<string?> ResolvePoFactoryAsync(string poNo, CancellationToken ct = default)
+    {
+        var trimmed = poNo.Trim();
+        var viaView = await _connectionManager.QueryFirstOrDefaultAsync<string>(
+            @"SELECT TOP 1 FactoryCode FROM ext_ERP_PurchaseInTransit_View
+              WHERE SourceDocumentNo = @Po AND FactoryCode IS NOT NULL
+              ORDER BY SourceUpdatedAt DESC",
+            new { Po = trimmed }, CommandType.Text, DatabaseId.APS, commandTimeout: 10);
+        if (!string.IsNullOrWhiteSpace(viaView)) return viaView;
+        return await _connectionManager.QueryFirstOrDefaultAsync<string>(
+            @"SELECT TOP 1 FactoryCode FROM SupplyFact_Pipeline
+              WHERE SourceDocumentNo = @Po AND IsActive = 1 AND FactoryCode IS NOT NULL",
+            new { Po = trimmed }, CommandType.Text, DatabaseId.APS, commandTimeout: 10);
+    }
+
     public async Task<ProcurementManualEtaOverride?> GetByBusinessKeyAsync(
         string poNo,
         int lineNo,
         int materialId,
         string receivingWarehouse,
+        IReadOnlySet<string>? allowedFactories = null,
         CancellationToken ct = default)
     {
         var sql = @"
@@ -288,14 +331,19 @@ LEFT JOIN Material m ON m.Id = o.MaterialId
 WHERE o.PONo = @PONo
     AND o.[LineNo] = @LineNo
     AND o.MaterialId = @MaterialId
-    AND o.ReceivingWarehouse = @ReceivingWarehouse";
+    AND o.ReceivingWarehouse = @ReceivingWarehouse
+    AND (@HasFactories = 0 OR EXISTS (
+        SELECT 1 FROM SupplyFact_Pipeline s
+        WHERE s.SourceDocumentNo = o.PONo AND s.FactoryCode IN @AllowedFactories))";
 
         var parameters = new
         {
             PONo = poNo,
             LineNo = lineNo,
             MaterialId = materialId,
-            ReceivingWarehouse = receivingWarehouse
+            ReceivingWarehouse = receivingWarehouse,
+            HasFactories = allowedFactories is { Count: > 0 },
+            AllowedFactories = allowedFactories
         };
 
         var results = await _connectionManager.QueryAsync<ProcurementManualEtaOverride>(
@@ -549,9 +597,9 @@ WHEN NOT MATCHED THEN
             DatabaseId.APS,
             commandTimeout: 30);
 
-        // 查询保存后的完整实体返回
+        // 查询保存后的完整实体返回（写后回读不做 Scope 门：写入已按四元键与权限码判定，回读取其自身行）
         var saved = await GetByBusinessKeyAsync(
-            @override.PONo, @override.LineNo, @override.MaterialId, @override.ReceivingWarehouse, ct);
+            @override.PONo, @override.LineNo, @override.MaterialId, @override.ReceivingWarehouse, null, ct);
 
         return saved!;
     }

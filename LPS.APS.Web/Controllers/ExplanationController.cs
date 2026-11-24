@@ -1,5 +1,6 @@
 using Microsoft.AspNetCore.Authorization;
 using LPS.APS.Core.Authorization;
+using LPS.APS.Core.Interfaces;
 using LPS.APS.BusinessRules.Services;
 using LPS.APS.Core.Dto;
 using LPS.APS.Shared.Models;
@@ -24,16 +25,22 @@ namespace LPS.APS.Web.Controllers;
 [Route("api/explanation")]
 public class ExplanationController : ControllerBase
 {
+    private readonly IDataScopeService _dataScopeService;
     private readonly ExplanationQueryService _service;
     private readonly ILogger<ExplanationController> _logger;
 
     public ExplanationController(
         ExplanationQueryService service,
+        IDataScopeService dataScopeService,
         ILogger<ExplanationController> logger)
     {
+        _dataScopeService = dataScopeService;
         _service = service ?? throw new ArgumentNullException(nameof(service));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
     }
+
+    private int GetCurrentUserId()
+        => int.TryParse(User.FindFirst(System.Security.Claims.ClaimTypes.NameIdentifier)?.Value, out var id) ? id : 0;
 
     /// <summary>
     /// 查询Explanation列表
@@ -54,9 +61,12 @@ public class ExplanationController : ControllerBase
     {
         try
         {
+            var scope = await _dataScopeService.ResolveScopeAsync(GetCurrentUserId(), cancellationToken);
             var result = await _service.QueryAsync(
                 planVersionId, objectType, orderId, taskId,
-                reasonCode, severity, occurredFrom, occurredTo, skip, take, cancellationToken);
+                reasonCode, severity, occurredFrom, occurredTo,
+                scope.IsGlobal ? null : scope.GetValues(DataScopeTypes.Domain),
+                skip, take, cancellationToken);
 
             return ApiResponse<List<ExplanationDto>>.Success(result);
         }
@@ -81,7 +91,8 @@ public class ExplanationController : ControllerBase
     {
         try
         {
-            var result = await _service.GetSummaryAsync(planVersionId, cancellationToken);
+            var scope = await _dataScopeService.ResolveScopeAsync(GetCurrentUserId(), cancellationToken);
+            var result = await _service.GetSummaryAsync(planVersionId, scope.IsGlobal ? null : scope.GetValues(DataScopeTypes.Domain), cancellationToken);
             return ApiResponse<ExplanationSummaryDto>.Success(result);
         }
         catch (ArgumentException ex)

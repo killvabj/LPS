@@ -182,6 +182,8 @@ builder.Services.AddSwaggerGen(c =>
 builder.Services.AddHttpContextAccessor();
 
 // 健康检查（包含数据库健康检查在AddDatabaseHealthCheck中注册）
+builder.Services.AddTransient<LPS.APS.Web.Hosting.AppStartupVersionLogger>();
+
 builder.Services.AddHealthChecks()
     .AddCheck("self", () => Microsoft.Extensions.Diagnostics.HealthChecks.HealthCheckResult.Healthy("运行正常"));
 
@@ -388,6 +390,23 @@ using (var scope = app.Services.CreateScope())
 app.MapGet("/", () => Results.Redirect("/swagger")).AllowAnonymous();
 
 Log.Information("LPS.APS 应用程序启动完成");
+// 2026-11-23（A28 自定）：**启动版本留痕**——把「程序集版本＋启动时刻＋主机」写一行 `APS_ETL_Log`。
+//   动机：**Run 创建时间 ≠ 执行时间**（探针/手工入口可随时起跑）⇒ 「Run 建于何时」推不出「跑的哪一版」；
+//   程序集版本里嵌的又是 **git 哈希**、与 SVN 无逐提交映射，且无部署/启动版本日志
+//   ⇒ 历史 Run 只能标 `PROCESS_REV_UNVERIFIED`。此后每次启动留一行，同源核证即可自证。
+//   不阻塞启动：任何异常仅记日志，不让宿主起不来。
+try
+{
+    using var scope = app.Services.CreateScope();
+    var startupLogger = scope.ServiceProvider.GetService<LPS.APS.Web.Hosting.AppStartupVersionLogger>();
+    if (startupLogger is not null)
+        await startupLogger.WriteAsync(CancellationToken.None);
+}
+catch (Exception ex)
+{
+    Console.WriteLine($"[A28] 启动版本留痕失败（不影响启动）：{ex.Message}");
+}
+
 app.Run();
 
 }

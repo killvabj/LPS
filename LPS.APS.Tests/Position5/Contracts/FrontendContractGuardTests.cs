@@ -145,9 +145,57 @@ public class FrontendContractGuardTests
         {
             Assert.NotNull(Prop(r, key));
         }
+        // A7（11-21）：三均值键面（候选公式，0号位 确认前页面不显数字——键在即证明投影到位）。
+        foreach (var avgKey in new[] { "AvgCustomerExpectDays", "AvgApsLeadDays", "AvgDelayDays" })
+        {
+            Assert.NotNull(Prop(typeof(DeliveryKpiResultDto), avgKey));
+        }
         var t = typeof(DeliveryKpiResultDto);
         Assert.NotNull(Prop(t, "Caliber"));
         Assert.NotNull(Prop(t, "PlannedCompletionSource"));
         Assert.NotNull(Prop(t, "TargetPercent"));
+    }
+
+    [Fact]
+    public void ElevenBatch_P0230405060711_KeysPresent()
+    {
+        // 11-23 九函批（十件）承诺返回键——发函前置纪律（R3′ 同款，防映射层丢列）。
+        // P03 H2/H3：树检索命中与需求行稳定主键。
+        Assert.NotNull(Prop(typeof(LPS.APS.Core.Dto.OrderTreeDemandDto), "Id"));
+        Assert.NotNull(Prop(typeof(LPS.APS.Core.Dto.OrderTreeResultDto), "KeywordHits"));
+        Assert.NotNull(Prop(typeof(LPS.APS.Core.Dto.OrderTreeResultDto), "KeywordHitCount"));
+        foreach (var k in new[] { "taskId", "taskNo", "materialCode", "materialName", "departmentName", "workOrderNo", "instructionNo" })
+        {
+            Assert.NotNull(Prop(typeof(LPS.APS.Core.Dto.OrderTreeHitDto), char.ToUpper(k[0]) + k[1..]));
+        }
+        // P04 H3：资源行 kind 位＋任务行槽码。
+        Assert.NotNull(Prop(typeof(LPS.APS.Application.Services.Query.Dto.GanttResourceDto), "ResourceKind"));
+        Assert.NotNull(Prop(typeof(LPS.APS.Application.Services.Query.Dto.GanttTaskDto), "ManualSlotCode"));
+        // P06 H3/H4：详情执行事实与源 Run 身份。
+        var d = typeof(LPS.APS.Core.Dto.TaskDetailResultDto);
+        foreach (var k in new[] { "SourceRunId", "SourceRunType", "RunTriggeredBy",
+                                  "MesWorkOrderStatus", "MesReported", "MesPlannedQtyReported",
+                                  "MesGoodQty", "MesScrapQty", "MesReworkQty", "MesRemainingQty", "MesLastReportTime" })
+        {
+            Assert.NotNull(Prop(d, k));
+        }
+    }
+
+    [Fact]
+    public void A5A6_P02_KeysPresent()
+    {
+        // A5（11-23 承诺）：orderType/materialType 两筛参必须进四方法签名（Query/Summary/DeliveryKpi/Facets 同一类级 WHERE 消费方）。
+        // 测试工程不引用 Web ⇒ 钉仓储接口（契约源头；控制器透传同名参数已编译实证）。
+        var iface = typeof(LPS.APS.BusinessRules.Repositories.IOrderQueryRepository);
+        foreach (var m in new[] { "QueryOrdersAsync", "GetSummaryAsync", "GetDeliveryKpiAsync", "GetFacetsAsync" })
+        {
+            var mi = iface.GetMethod(m);
+            Assert.NotNull(mi);
+            var ps = mi!.GetParameters().Select(p => p.Name).ToList();
+            Assert.Contains("orderType", ps);
+            Assert.Contains("materialType", ps);
+        }
+        // A6（11-23 承诺）：列表行键 materialType（Dapper 静默丢列=本测试存在的唯一理由）。
+        Assert.NotNull(Prop(typeof(OrderListItemDto), "MaterialType"));
     }
 }

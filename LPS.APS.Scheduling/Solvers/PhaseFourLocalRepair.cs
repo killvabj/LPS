@@ -2568,6 +2568,25 @@ internal class PhaseFourLocalRepair
     }
 
     /// <summary>
+    /// 仅供 `LPS.APS.Tests`（`InternalsVisibleTo`）：暴露 <see cref="TrySplitOperation"/>，
+    /// 供 **P0-02**「5 拆 2 份 ⇒ 2+3，工时必须按各份自己的投入量算，不得均分」直接反证。
+    /// 生产路径不变。
+    /// </summary>
+    internal List<FinalTaskDraft> TrySplitOperationForTest(
+        LogicalProductionDemand demand,
+        OperationNode operation,
+        string batchDraftKey,
+        List<int> eligibleResources,
+        DateTime earliestStart,
+        ConstraintContext constraints,
+        Dictionary<int, List<TimeWindow>> resourceOccupancy,
+        DateTime planningEnd,
+        int splitAlternatives,
+        decimal minBatchQty)
+        => TrySplitOperation(demand, operation, batchDraftKey, eligibleResources, earliestStart,
+            constraints, resourceOccupancy, planningEnd, splitAlternatives, minBatchQty);
+
+    /// <summary>
     /// 第4轮Split修复：尝试将工序拆分成多个小批次
     /// 文档§十三 13.3第6项：有限Split，Guardrail参数Split候选≤3
     /// </summary>
@@ -2589,11 +2608,41 @@ internal class PhaseFourLocalRepair
         // 拆分下限（P1-02：读冻结 MinBatchQty，默认 0.1）
         var splitCandidates = Enumerable.Range(2, Math.Max(0, splitAlternatives - 1)).ToArray();
 
+        // ── 0号位 v1.1 §四 P0-02（2026-11-21）：**先算逐份净量与投入，再选槽** ──
+        //   旧实现先用均分 `qtyPerSplit = PlannedProcessQty / splitCount` 算工时，而净量却是
+        //   「整除+余数」的**不等整数批**（5 拆 2 份 = 2+3）⇒ 3 件批与 2 件批占**同样长度的窗口**
+        //   ⇒ 资源分钟与实产量失配。改为逐份先定 `net → 投入(按 net 比例) → 工时`，再逐份选槽。
+        var pieces = new List<(decimal Net, decimal Proc)>();
+        var totalNetForSplit = demand.NetOutputQty == decimal.Truncate(demand.NetOutputQty)
+            ? decimal.Truncate(demand.NetOutputQty)
+            : decimal.Ceiling(demand.NetOutputQty);
+
         foreach (var splitCount in splitCandidates)
         {
-            // 计算每份数量（PlannedProcessQty）
-            var qtyPerSplit = demand.PlannedProcessQty / splitCount;
-            if (qtyPerSplit < minBatchQty) continue; // 拆分后数量过小，跳过
+            pieces.Clear();
+            var piecesValid = true;
+            for (int pi = 0; pi < splitCount; pi++)
+            {
+                decimal pieceNet;
+                if (!demand.IsContinuation && demand.NetOutputQty > 0m)
+                {
+                    var baseNet = decimal.Floor(totalNetForSplit / splitCount);
+                    var netRemainder = totalNetForSplit - baseNet * splitCount;
+                    pieceNet = baseNet + ((decimal)pi < netRemainder ? 1m : 0m);
+                    if (pieceNet <= 0m) { piecesValid = false; break; }   // 份数多于可整数分配的数量
+                }
+                else
+                {
+                    pieceNet = demand.NetOutputQty / splitCount;
+                }
+
+                var pieceProc = demand.NetOutputQty > 0m && totalNetForSplit > 0m
+                    ? demand.PlannedProcessQty * pieceNet / totalNetForSplit
+                    : demand.PlannedProcessQty / splitCount;
+                if (pieceProc < minBatchQty) { piecesValid = false; break; }
+                pieces.Add((pieceNet, pieceProc));
+            }
+            if (!piecesValid) continue;
 
             var candidateTasks = new List<FinalTaskDraft>();
             var candidateStart = earliestStart;
@@ -2614,7 +2663,8 @@ internal class PhaseFourLocalRepair
                     {
                         continue; // CapacityFactor缺失/非法，跳过该资源
                     }
-                    var adjustedDuration = operation.StandardDuration * qtyPerSplit / capacityFactor.Value;
+                    // P0-02：用**本份自己的投入量**算工时（不是均分），保证 2 件批 / 3 件批窗口不等长。
+                    var adjustedDuration = operation.StandardDuration * pieces[i].Proc / capacityFactor.Value;
                     var processDuration = TimeSpan.FromMinutes((double)adjustedDuration);
 
                     // item1 接线（阶段二）：拆分件 Setup 走规则查找——首件前产品 = 资源时间线邻接；
@@ -2661,36 +2711,14 @@ internal class PhaseFourLocalRepair
                         // 创建Split Task：Quantity按比例拆分
                         // Task的PlannedStartTime是加工开始时间（Setup之后）
                         var taskStart = pieceSlot.Value.Start + TimeSpan.FromMinutes((double)setupMinutes);
-                        // 0号位 v1.2 §二.3/§二.4（2026-11-19）：新增可执行批净量必须整数。
-                        //   非续作 + 整数净量需求 ⇒ 「整除 + 余数逐份 +1」，与 Phase2 `BuildBatchFormation` 同口径；
-                        //   续作（A/B 冻结事实）或小数净量需求维持原按比例拆分。
-                        decimal splitQuantity;
-                        if (!demand.IsContinuation && demand.NetOutputQty > 0m)
-                        {
-                            // ── 0号位 v1.7（2026-11-19）：第二类原生小数同样按**整数目标**切分 ──
-                            //   逐字口径：「逐批净生产量 b_i 为正整数，且 Σb_i = Q_exec」「先圆整一次、再拆批」。
-                            //   整数需求：totalNet = Q；原生小数：totalNet = ceil(Q)（与 Phase2 同一 Q_target）。
-                            var totalNet = demand.NetOutputQty == decimal.Truncate(demand.NetOutputQty)
-                                ? decimal.Truncate(demand.NetOutputQty)
-                                : decimal.Ceiling(demand.NetOutputQty);
-                            var baseNet = decimal.Floor(totalNet / splitCount);
-                            var netRemainder = totalNet - baseNet * splitCount;
-                            splitQuantity = baseNet + ((decimal)i < netRemainder ? 1m : 0m);
-                            if (splitQuantity <= 0m)
-                            {
-                                // 份数多于可整数分配的数量 ⇒ 该 splitCount 方案不合法，换下一个候选
-                                allSplitsScheduled = false;
-                                break;
-                            }
-                        }
-                        else
-                        {
-                            splitQuantity = demand.NetOutputQty / splitCount;
-                        }
+                        // 净量与投入量已在循环外按「整除+余数 / 按 net 比例」算好（P0-02），此处直接取本份值，
+                        //   不再用均分 —— 否则工时（均分）与数量（不等整数批）互相矛盾。
+                        var splitQuantity = pieces[i].Net;
+                        var splitProcQty = pieces[i].Proc;
                         var splitSetupSource = convergedResolution.HasValue
                             ? SetupOptimizer.SetupOutcomeToSource(convergedResolution.Value.Outcome)
                             : null;
-                        splitTask = CreateSplitTask(demand, operation, resourceId, taskStart, pieceSlot.Value.End, adjustedDuration, qtyPerSplit, splitQuantity, setupMinutes, constraints, batchDraftKey, splitSetupSource);
+                        splitTask = CreateSplitTask(demand, operation, resourceId, taskStart, pieceSlot.Value.End, adjustedDuration, splitProcQty, splitQuantity, setupMinutes, constraints, batchDraftKey, splitSetupSource);
 
                         candidateTasks.Add(splitTask);
 

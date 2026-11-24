@@ -38,12 +38,21 @@ public sealed class MaterialRequirementLink
     public int ProducerMaterialId { get; init; }
 
     /// <summary>
-    /// 完整子需求数量（父对子的总需求 = BOM 展开后的子需求，非子件新增生产缺口量）。
+    /// **该生产方（<see cref="ProducerLogicalDemandKey"/>）的合法承接份额**。
+    ///
+    /// <para>⚠ 2026-11-23 修订（原注释写「完整子需求数量（父对子的总需求…非子件新增生产缺口量）」，**已过期**）：
+    /// 自 0号位 2026-11-20 §二.4 定「多来源按数量份额拆边」起，本字段即表达**份额**而非总需求 ——
+    /// 一条需求被多张 PI 承接时拆成多条边、各自带份额；单来源时同样只写该 PI 的承接份额
+    /// （子件总需求中由**库存等已承接**的部分不计入本字段）。
+    /// ⇒ 按旧注释读会把它当总需求，必错。</para>
     /// </summary>
     public decimal RequiredQty { get; init; }
 
     /// <summary>
-    /// 子件 NEW_REQUIREMENT 分配的 AllocationSequence（= 子 LogicalProductionDemand.AllocationSequence），1号位零推断。
+    /// **本边 `Producer` 的 `AllocationSequence`**（= `ProducerLogicalDemandKey` 那条 LPD 的序号），1号位零推断。
+    ///
+    /// <para>⚠ 2026-11-23 修订：多来源拆边时原实现**复制原 Link 的旧值** ⇒ 拆边后指向错的 Producer（字段失真）。
+    /// 现按每条边的 Producer 取各自序号；取不到才回退原值。</para>
     /// </summary>
     public long ProducerAllocationSequence { get; init; }
 

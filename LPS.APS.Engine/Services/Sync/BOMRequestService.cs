@@ -89,10 +89,22 @@ public class BOMRequestService : IBOMRequestService
                     oc.SourceSystem,
                     oc.SourceOrderId,
                     oc.MaterialCode,
-                    oc.FactoryCode,
+                    -- ★ 2026-11-21（A12，0号位 2026-11-20 指示）：`FactoryCode` 改取「完成工序厂」。
+                    --   完成工序码 `ProdFinshProcCode` 来自 ERP（`v_APS_SalesOrder` 已加列 → `ERP_Order_Staging`）。
+                    --   翻译口径**照目标厂既有规则**（`sp_ValidateAndPromoteOrders` 1f 同款）：
+                    --     字典命中 → 用翻译出的厂；**未命中 → 保留原码**（非阻断，由 Issue 暴露），绝不回落成别的厂。
+                    --   完成码缺失（ERP 没给）→ 回落订单厂 `oc.FactoryCode`（= 原先行为）。
+                    Isnull(pc3.FactoryCode,
+                          Isnull(NULLIF(Isnull(stg.ProdFinshProcCode, N''), N''), oc.FactoryCode)) AS FactoryCode,
+                    oc.FactoryCode AS OrderFactoryCode,
                     oc.OrderType,
                     oc.BOMNO AS RequestedBOMNO
                 FROM Order_Canonical oc
+                -- 完成工序码取自 Staging（一单一行＝该单最近一次同步结果）
+                LEFT JOIN ERP_Order_Staging stg ON stg.OrderNo = oc.OrderNo
+                -- 工序码字典：补齐 6 位后再查（与 sp_ValidateAndPromoteOrders 1f 完全同款）
+                LEFT JOIN ext_MES_ProcessCode_View pc3
+                       ON pc3.ProcessCode = RIGHT('000000' + Isnull(stg.ProdFinshProcCode, ''), 6)
                 WHERE oc.Status = N'OPEN'
                   AND (
                       -- 2026-11-05 修复：原写法 SALES_ORDER 用 `BETWEEN 今天 AND 今天+90`，多了下界

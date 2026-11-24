@@ -18,6 +18,9 @@ public interface IPeggingTraceRepository
         string? orderNo = null,
         string? supplyDocumentNo = null,
         long? rootOrderId = null,
+        IReadOnlyList<string>? demandFactoryCodes = null,
+        IReadOnlyList<string>? supplyFactoryCodes = null,
+        IReadOnlyList<string>? supplyDocumentTypes = null,
         int skip = 0,
         int take = 100,
         CancellationToken ct = default,
@@ -34,6 +37,9 @@ public interface IPeggingTraceRepository
         string? orderNo = null,
         string? supplyDocumentNo = null,
         long? rootOrderId = null,
+        IReadOnlyList<string>? demandFactoryCodes = null,
+        IReadOnlyList<string>? supplyFactoryCodes = null,
+        IReadOnlyList<string>? supplyDocumentTypes = null,
         CancellationToken ct = default,
         IReadOnlySet<string>? allowedFactories = null);
 

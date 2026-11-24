@@ -831,6 +831,7 @@ public class SchedulingOrchestrator : ISchedulingOrchestrator
             // 【P0「一个 Run 一个 PV」】入参 planVersionId 若**已经装过结果**，本方法不再往里写第二轮，
             //   改为新分配一个 PV（详见 EnsureFreshPlanVersionForRunAsync 的说明）。
             //   放在订单装载之前：新 PV 必须自己装一套订单，否则按 planVersionId 分区取需求会取到空集。
+            var sourcePlanVersionIdForLinkCopy = planVersionId;   // 换 PV 后用它补 BOM 链接（见下）
             planVersionId = await EnsureFreshPlanVersionForRunAsync(planVersionId, scheduleRunId, cancellationToken);
 
             // 【续跑刷新 StartedAt】本入口同样是执行起点：FAMILY_X 单域复跑等场景会让 Run 跨天，
@@ -854,6 +855,15 @@ public class SchedulingOrchestrator : ISchedulingOrchestrator
                 _logger.LogInformation(
                     "白天候选订单池准备：PlanVersionId={PlanVersionId}，本次装载 {Loaded} 条订单",
                     planVersionId, loadedOrders);
+
+                // ★ 2026-11-23（1号位 来件 §二）：**换 PV（PVR）后 BOM 链接必须补**
+                //   现象（PV999638 失败重跑→PVR 999643）：`[Order]` 装好 23,804 单，但
+                //   `OrderBomRequestLink` **0 行** ⇒ Pegging 读锚点时 `BomInputState.NoLinkedBatch`
+                //   ⇒ 整域 Fail-Closed。⇒ **任何失败域的重跑都会必然失败**。
+                //   补法：从**源 PV** 复制链接，但 **OrderId 必须映射到新 PV 的 `[Order].Id`**
+                //   （链接是 (PlanVersionId, OrderCanonicalId) 唯一、锚点按 OrderId 读 ⇒ 整行照抄会指向旧 PV 订单）。
+                if (planVersionId != sourcePlanVersionIdForLinkCopy)
+                    await CopyOrderBomRequestLinksAsync(sourcePlanVersionIdForLinkCopy, planVersionId, cancellationToken);
             }
             catch (Exception ex)
             {
@@ -1016,6 +1026,52 @@ public class SchedulingOrchestrator : ISchedulingOrchestrator
     /// ⚠ **不在这里做「同 PV 清理」**：本方法只负责换一个干净的靶子，不删任何历史行。
     /// </para>
     /// </remarks>
+    /// <summary>
+    /// **2026-11-23（1号位 来件 §二）**：换 PV（PVR）后，从**源 PV** 复制 `OrderBomRequestLink` 到新 PV。
+    ///
+    /// <para><b>为什么必须有这一步</b>：`EnsureFreshPlanVersionForRunAsync` 建新 PV 时只 INSERT `PlanVersion`
+    /// 一行，<b>不复制订单、也不复制 BOM 链接</b>；订单由随后的装载补上，但**链接没有任何代码补** ⇒
+    /// Pegging 锚点回填读到 `NoLinkedBatch` ⇒ 整域 Fail-Closed（实测 PV999638→PVR 999643：23,804 单 / 0 链接）。</para>
+    ///
+    /// <para><b>为什么不能整行照抄</b>：链接唯一键是 `(PlanVersionId, OrderCanonicalId)`，但 Pegging 的锚点
+    /// 按 **`OrderId`** 读（`FillDemandRequestAnchorsAsync`）⇒ 必须把 `OrderId` **重映射到新 PV 的 `[Order].Id`**
+    /// （同 `OrderCanonicalId`）。源 PV 有链接、新 PV 找不到对应订单的，**跳过不造**。</para>
+    ///
+    /// <para><b>幂等</b>：逐行 `NOT EXISTS (同 PV 同 OrderCanonicalId)` ⇒ 重复调用只补缺，不重复插。</para>
+    /// </summary>
+    private async Task<int> CopyOrderBomRequestLinksAsync(
+        int sourcePlanVersionId, int targetPlanVersionId, CancellationToken cancellationToken)
+    {
+        if (sourcePlanVersionId <= 0 || targetPlanVersionId <= 0 || sourcePlanVersionId == targetPlanVersionId)
+            return 0;
+
+        var copied = await _connectionManager.ExecuteAsync(
+            @"INSERT INTO OrderBomRequestLink
+                  (PlanVersionId, BatchNo, OrderId, OrderCanonicalId, OrderNo, SourceSystem, SourceOrderId,
+                   RequestDetailId, RequestedBOMNO, ResolvedBOMNO, RepWorksetId, LinkStatus, ErrorMessage, SyncedAt)
+              SELECT @TargetPv, l.BatchNo, o.Id, l.OrderCanonicalId, l.OrderNo, l.SourceSystem, l.SourceOrderId,
+                     l.RequestDetailId, l.RequestedBOMNO, l.ResolvedBOMNO, l.RepWorksetId, l.LinkStatus, l.ErrorMessage, l.SyncedAt
+              FROM OrderBomRequestLink l
+              INNER JOIN [Order] o
+                      ON o.PlanVersionId = @TargetPv
+                     AND o.OrderCanonicalId = l.OrderCanonicalId
+              WHERE l.PlanVersionId = @SourcePv
+                AND NOT EXISTS (
+                      SELECT 1 FROM OrderBomRequestLink x
+                      WHERE x.PlanVersionId = @TargetPv
+                        AND x.OrderCanonicalId = l.OrderCanonicalId);",
+            new { SourcePv = sourcePlanVersionId, TargetPv = targetPlanVersionId },
+            db: DatabaseId.APS,
+            commandTimeout: 300);
+
+        _logger.LogWarning(
+            "[P0][PVR] 换 PV 后补 BOM 链接：源 PlanVersionId={SourcePvId} → 新 PlanVersionId={TargetPvId}，复制 {Copied} 行"
+            + "（OrderId 已按 OrderCanonicalId 重映射到新 PV 订单；源有新无的跳过不造）",
+            sourcePlanVersionId, targetPlanVersionId, copied);
+
+        return copied;
+    }
+
     private async Task<int> EnsureFreshPlanVersionForRunAsync(
         int planVersionId,
         int scheduleRunId,

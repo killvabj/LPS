@@ -339,6 +339,7 @@ public class ERPOrderSyncService : IERPOrderSyncService
                 BOMNO,
                 FactoryCode,
                 SourceWarehouseProcessCode,
+                ProdFinshProcCode,
                 Quantity,
                 UOM,
                 DueDate,
@@ -440,6 +441,7 @@ public class ERPOrderSyncService : IERPOrderSyncService
         dataTable.Columns.Add("Model", typeof(string));
         dataTable.Columns.Add("FactoryCode", typeof(string));
         dataTable.Columns.Add("SourceWarehouseProcessCode", typeof(string));
+        dataTable.Columns.Add("ProdFinshProcCode", typeof(string));   // 2026-11-21 A12
         dataTable.Columns.Add("Quantity", typeof(decimal));
         dataTable.Columns.Add("UOM", typeof(string));
         dataTable.Columns.Add("DueDate", typeof(DateTime));
@@ -482,6 +484,7 @@ public class ERPOrderSyncService : IERPOrderSyncService
                 (object?)order.SourceModel ?? DBNull.Value,
                 order.FactoryCode,
                 order.SourceWarehouseProcessCode,
+                (object?)order.ProdFinshProcCode ?? DBNull.Value,
                 order.Quantity,
                 order.UOM,
                 order.DueDate,

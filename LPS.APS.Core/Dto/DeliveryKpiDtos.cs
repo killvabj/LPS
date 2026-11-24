@@ -23,6 +23,15 @@ public sealed class DeliveryKpiResultDto
     /// <summary>可配置目标准交率：待 3号位 合同核对结论（Q-c 禁我方自选配置源）——现为 null 占位。</summary>
     public decimal? TargetPercent { get; init; }
 
+    // ── A7（11-21 4号位件）：交期三均值＝**候选公式**（0号位 明文"未证实公式不得先填假值"，
+    // 本组值仅供已核实后展示；页面在 0号位 确认公式前不显数字）。
+    /// <summary>平均客户期望交期天数 = CustomerDueDate − IssueDate（自然日）；日期缺则不计入分母。</summary>
+    public decimal? AvgCustomerExpectDays { get; init; }
+    /// <summary>平均APS排产交期天数 = 同PV Task MAX(PlannedEndTime) − IssueDate（自然日）；无任务不计。</summary>
+    public decimal? AvgApsLeadDays { get; init; }
+    /// <summary>平均延期天数 = 仅**延期订单**（MaxEnd 日期&gt;交期）计平均（自然日）。</summary>
+    public decimal? AvgDelayDays { get; init; }
+
     public List<DeliveryKpiRowDto> Rows { get; init; } = new();
 }
 

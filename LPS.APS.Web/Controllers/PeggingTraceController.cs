@@ -57,6 +57,9 @@ public class PeggingTraceController : ControllerBase
         [FromQuery] string? commitmentStatus = null,
         [FromQuery] string? orderNo = null,
         [FromQuery] string? supplyDocumentNo = null,
+        [FromQuery] string? demandFactoryCode = null,     // P07 H1：逗号多值
+        [FromQuery] string? supplyFactoryCode = null,     // P07 H1：逗号多值
+        [FromQuery] string? supplyDocumentType = null,    // P07 H3：逗号多值（现库列全 NULL，见裁决函）
         [FromQuery] long? rootOrderId = null,
         [FromQuery] int skip = 0,
         [FromQuery] int take = 100,
@@ -71,9 +74,13 @@ public class PeggingTraceController : ControllerBase
             var allowedFactories = scope.GetValues(DataScopeTypes.Factory);
 
             var result = await _service.QueryAsync(
-                planVersionId, materialCode, supplyType, commitmentStatus,
-                orderNo, supplyDocumentNo, rootOrderId, skip, take, cancellationToken,
-                allowedFactories);
+                planVersionId: planVersionId, materialCode: materialCode, supplyType: supplyType,
+                commitmentStatus: commitmentStatus,
+                orderNo: orderNo, supplyDocumentNo: supplyDocumentNo, rootOrderId: rootOrderId,
+                demandFactoryCode: demandFactoryCode, supplyFactoryCode: supplyFactoryCode,
+                supplyDocumentType: supplyDocumentType,
+                skip: skip, take: take, ct: cancellationToken,
+                allowedFactories: allowedFactories);
 
             return ApiResponse<List<PeggingTraceDto>>.Success(result);
         }
@@ -100,6 +107,9 @@ public class PeggingTraceController : ControllerBase
         [FromQuery] string? commitmentStatus = null,
         [FromQuery] string? orderNo = null,
         [FromQuery] string? supplyDocumentNo = null,
+        [FromQuery] string? demandFactoryCode = null,     // P07 H1：逗号多值
+        [FromQuery] string? supplyFactoryCode = null,     // P07 H1：逗号多值
+        [FromQuery] string? supplyDocumentType = null,    // P07 H3：逗号多值（现库列全 NULL，见裁决函）
         [FromQuery] long? rootOrderId = null,
         CancellationToken cancellationToken = default)
     {
@@ -110,7 +120,10 @@ public class PeggingTraceController : ControllerBase
 
             var total = await _service.CountAsync(
                 planVersionId, materialCode, supplyType, commitmentStatus,
-                orderNo, supplyDocumentNo, rootOrderId, cancellationToken, allowedFactories);
+                orderNo: orderNo, supplyDocumentNo: supplyDocumentNo, rootOrderId: rootOrderId,
+                demandFactoryCode: demandFactoryCode, supplyFactoryCode: supplyFactoryCode,
+                supplyDocumentType: supplyDocumentType,
+                ct: cancellationToken, allowedFactories: allowedFactories);
 
             return ApiResponse<PeggingTraceCountDto>.Success(new PeggingTraceCountDto { Total = total });
         }

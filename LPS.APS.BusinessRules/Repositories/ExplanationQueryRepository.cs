@@ -17,6 +17,20 @@ public class ExplanationQueryRepository : IExplanationQueryRepository
         _connectionManager = connectionManager ?? throw new ArgumentNullException(nameof(connectionManager));
     }
 
+    /// <summary>R4（3号位 11-21 裁）：解释线 Scope——PV 域门，fail-closed。
+    /// 解释事实无 Domain 列，但其 PV 恒有 DomainKey（实库 27,636/27,636 可关联）；
+    /// 受限用户请求域外 PV ⇒ 空集（页面按"无权限/无数据"文案区分由 4号位 判）。
+    /// </summary>
+    private async Task<bool> PvDomainGateAsync(int planVersionId, IReadOnlySet<string>? allowedDomains, CancellationToken ct)
+    {
+        if (allowedDomains is null) return true;             // Global
+        if (allowedDomains.Count == 0) return false;          // 空授权=拒绝全部
+        var domainKey = await _connectionManager.QueryFirstOrDefaultAsync<string>(
+            "SELECT TOP 1 DomainKey FROM PlanVersion WHERE Id = @Pv",
+            new { Pv = planVersionId }, CommandType.Text, DatabaseId.APS, commandTimeout: 10);
+        return domainKey is not null && allowedDomains.Contains(domainKey);
+    }
+
     public async Task<List<ExplanationDto>> QueryAsync(
         int planVersionId,
         string? objectType = null,
@@ -25,10 +39,14 @@ public class ExplanationQueryRepository : IExplanationQueryRepository
         string? reasonCode = null,
         string? severity = null,
         DateTime? occurredFrom = null, DateTime? occurredTo = null,
+        IReadOnlySet<string>? allowedDomains = null,
         int skip = 0,
         int take = 100,
         CancellationToken ct = default)
     {
+        if (!await PvDomainGateAsync(planVersionId, allowedDomains, ct))
+            return new List<ExplanationDto>();
+
         var sql = @"
 SELECT
     f.Id,
@@ -86,8 +104,12 @@ OFFSET @Skip ROWS FETCH NEXT @Take ROWS ONLY";
 
     public async Task<ExplanationSummaryDto> GetSummaryAsync(
         int planVersionId,
+        IReadOnlySet<string>? allowedDomains = null,
         CancellationToken ct = default)
     {
+        if (!await PvDomainGateAsync(planVersionId, allowedDomains, ct))
+            return new ExplanationSummaryDto { PlanVersionId = planVersionId };
+
         // 查询汇总统计
         var summarySql = @"
 SELECT

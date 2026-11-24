@@ -115,3 +115,16 @@ public sealed class MesStatusOperationRowDto
     public decimal? RemainingQty { get; init; }
     public DateTime? LastReportTime { get; init; }
 }
+
+/// <summary>P06 单任务执行事实（P11 同键只读投影；E2 五态派生挂载位——0 裁前 Reported 三态：true 有报工/false 无行且快照 Run 有效/null 未提供）。</summary>
+public sealed class MesTaskExecFactsDto
+{
+    public string? WorkOrderStatus { get; set; }
+    public bool Reported { get; set; }
+    public decimal? PlannedQtyReported { get; set; }
+    public decimal? GoodQty { get; set; }
+    public decimal? ScrapQty { get; set; }
+    public decimal? ReworkQty { get; set; }
+    public decimal? RemainingQty { get; set; }
+    public DateTime? LastReportTime { get; set; }
+}

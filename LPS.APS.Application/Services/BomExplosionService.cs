@@ -131,6 +131,23 @@ public sealed class BomExplosionService : IBomExplosionService
         Discover(root.RootMaterialCode, root.RootMaterialId, parentCode: "", parentId: 0, qtyPerUnit: 0m,
                  parentFactoryId: root.FactoryId, requiredFactoryCode: null);
 
+        // ★ 2026-11-21（0号位 裁决）：**必须按订单号查该订单自己的 BOM**，「有下阶即内制」也只在**本订单内**成立，
+        //   不得跨所有 BOM 反查。⇒ 订单级 BOM 入口不可证（无 `OrderBomRequestLink` / 锚点 BOMNO 本批无行，
+        //   走的是「全部边并集」）时，并集里的子件可能来自**别的订单的 BOM** ⇒ **不得据此展开**。
+        //   处置：只保留根节点（订单自身需求是真实事实），**不产任何子件**，由调用方按缺事实记 Issue。
+        if (!bomSourceProven)
+        {
+            return new List<BomLevelNode>
+            {
+                new(MaterialId: root.RootMaterialId,
+                    MaterialCode: root.RootMaterialCode,
+                    FactoryId: root.FactoryId,
+                    Level: 0,
+                    IsPurchased: false,
+                    ParentEdges: Array.Empty<BomParentEdge>())
+            };
+        }
+
         // 阶段② 最深层（LLC）拓扑弛豫：level[child] = max(level[parent] + 1)。
         var levelByCode = new Dictionary<string, int>(StringComparer.Ordinal);
         foreach (var code in idByCode.Keys) levelByCode[code] = 0;

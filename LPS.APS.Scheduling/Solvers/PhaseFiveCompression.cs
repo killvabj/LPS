@@ -4171,6 +4171,26 @@ internal class PhaseFiveCompression
                 continue;
             }
 
+            // L2-a2（2026-11-21 C07 补口）：批声明的 (RouteCode, PathId) 必须是该物料**真实存在**的路径。
+            //   0号位《P0-04 MultiRouting Review》§3 第 2 条逐字：「先校验每个 Batch 对应的**完整合法真实 Path**、
+            //   Stage批身份和份额」⇒ 身份不可证的 Path **不得放行**（旧实现此处 skip ⇒ 同批引用不存在的 Path 被放过）。
+            //   物料整体无路由图（`Count == 0` / 无该物料条目）⇒ **不判**：无 Routing 需求由未排出口承担，不能在此误杀。
+            var batchRouteCode = routeCodes.First();
+            var batchPathIdRaw = pathIds.First();
+            if (!string.IsNullOrEmpty(batchRouteCode)
+                && batchPathIdRaw is long batchPathIdLong
+                && batchPathIdLong >= int.MinValue && batchPathIdLong <= int.MaxValue
+                && demandByKey.TryGetValue(key.Demand, out var pathDemand)
+                && constraints.RoutingGraphs.TryGetValue(pathDemand.MaterialId, out var graphsOfMaterial)
+                && graphsOfMaterial.Count > 0
+                && !graphsOfMaterial.ContainsKey(new RoutePathKey(batchRouteCode, (int)batchPathIdLong)))
+            {
+                firstError ??= $"BATCH_ROUTE_UNKNOWN: 需求 {key.Demand} Stage {key.Stage} 执行批 {key.Seb} "
+                    + $"引用**不存在**的 Path（RouteCode={batchRouteCode} PathId={batchPathIdRaw}）"
+                    + $"—— 该物料真实路径只有 [{string.Join(",", graphsOfMaterial.Keys)}]";
+                continue;
+            }
+
             // L3：按工序聚合本需求份额
             var byOp = new Dictionary<string, decimal>(StringComparer.Ordinal);
             foreach (var (t, qty) in members)

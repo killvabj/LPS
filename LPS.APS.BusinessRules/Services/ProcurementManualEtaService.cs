@@ -47,6 +47,7 @@ public class ProcurementManualEtaService
         int pageIndex = 1,
         int pageSize = 20,
         bool withMatched = false,
+        IReadOnlySet<string>? allowedFactories = null,
         CancellationToken ct = default)
     {
         if (!string.IsNullOrWhiteSpace(sortBy) && !SortByWhitelist.Contains(sortBy))
@@ -69,7 +70,7 @@ public class ProcurementManualEtaService
             materialIds, materialCodes, poNos, receivingWarehouses,
             etaBefore, etaAfter, updatedAfter,
             activeOnly, cancelledOnly, sortBy, sortDir, bucket,
-            pageIndex, pageSize, withMatched, ct);
+            pageIndex, pageSize, withMatched, allowedFactories, ct);
     }
 
     /// <summary>
@@ -83,19 +84,21 @@ public class ProcurementManualEtaService
         DateTime? etaBefore = null,
         DateTime? etaAfter = null,
         DateTime? updatedAfter = null,
+        IReadOnlySet<string>? allowedFactories = null,
         CancellationToken ct = default)
     {
         return await _repository.GetSummaryAsync(
             materialIds, materialCodes, poNos, receivingWarehouses,
-            etaBefore, etaAfter, updatedAfter, ct);
+            etaBefore, etaAfter, updatedAfter, allowedFactories, ct);
     }
 
     /// <summary>筛选候选（R4，11-12）：本表 distinct PONo/物料码，search 服务端过滤，每维顶 500。</summary>
     public async Task<ProcurementManualEtaFacetsDto> GetFacetsAsync(
         string? search = null,
+        IReadOnlySet<string>? allowedFactories = null,
         CancellationToken ct = default)
     {
-        return await _repository.GetFacetsAsync(search, ct);
+        return await _repository.GetFacetsAsync(search, allowedFactories, ct);
     }
 
     /// <summary>乙端点（11-14）：本页域内物料候选；poNo[/lineNo] 收窄到该采购订单行（不裁剪工厂范围、查无=空集）。</summary>
@@ -130,11 +133,16 @@ public class ProcurementManualEtaService
     /// <summary>
     /// 根据业务键查询单条记录
     /// </summary>
+    /// <summary>G-04 裁一透传：PO 工厂归属（null=不可解析，调用方据此 403）。</summary>
+    public async Task<string?> ResolvePoFactoryAsync(string poNo, CancellationToken ct = default)
+        => await _repository.ResolvePoFactoryAsync(poNo, ct);
+
     public async Task<ProcurementManualEtaOverride?> GetByBusinessKeyAsync(
         string poNo,
         int lineNo,
         int materialId,
         string receivingWarehouse,
+        IReadOnlySet<string>? allowedFactories = null,
         CancellationToken ct = default)
     {
         if (string.IsNullOrWhiteSpace(poNo))
@@ -146,7 +154,7 @@ public class ProcurementManualEtaService
         if (string.IsNullOrWhiteSpace(receivingWarehouse))
             throw new ArgumentException("ReceivingWarehouse cannot be empty", nameof(receivingWarehouse));
 
-        return await _repository.GetByBusinessKeyAsync(poNo, lineNo, materialId, receivingWarehouse, ct);
+        return await _repository.GetByBusinessKeyAsync(poNo, lineNo, materialId, receivingWarehouse, allowedFactories, ct);
     }
 
     /// <summary>

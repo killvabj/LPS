@@ -20,12 +20,16 @@ public interface IMesStatusRepository
         string? keyword = null,
         string? dispatchStatus = null,
         IReadOnlyList<string>? departmentCodes = null,
+        IReadOnlyList<int>? resourceIds = null,
+        IReadOnlyList<string>? workOrderStatuses = null,
         IReadOnlySet<string>? allowedDomains = null,
         IReadOnlySet<string>? allowedFactories = null,
         IReadOnlySet<string>? allowedDepartments = null,
         int pageIndex = 1,
         int pageSize = 50,
         CancellationToken ct = default);
+
+    Task<MesTaskExecFactsDto?> GetTaskExecFactsAsync(long? srcRun, string? piNo, string? stageCode, string? workOrderNo, CancellationToken ct = default);
 
     /// <summary>批详情（工序级下发/报工行）。taskNo 全局业务身份（跨版延续），必须带 planVersionId 限定版本。</summary>
     Task<MesStatusBatchDetailDto> GetBatchDetailAsync(

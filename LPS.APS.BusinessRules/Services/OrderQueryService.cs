@@ -53,6 +53,8 @@ public class OrderQueryService
         string? status = null,
         string? productionInstructionNo = null,
         string? productFamilyCode = null,
+        string? orderType = null,
+        string? materialType = null,
         DateTime? dueDateFrom = null,
         DateTime? dueDateTo = null,
         string? riskLevel = null,
@@ -72,11 +74,13 @@ public class OrderQueryService
         ValidateSortAndRisk(riskLevel, sortBy, sortDir);
 
         return await _repository.QueryOrdersAsync(
-            planVersionId, orderNo, materialCode, customerName,
-            factoryCode, domainKey, delayStatus, status,
-            productionInstructionNo, productFamilyCode, dueDateFrom, dueDateTo,
-            riskLevel, sortBy, sortDir,
-            skip, take, ct, allowedFactories, allowedDomains);
+            planVersionId: planVersionId, orderNo: orderNo, materialCode: materialCode, customerName: customerName,
+            factoryCode: factoryCode, domainKey: domainKey, delayStatus: delayStatus, status: status,
+            productionInstructionNo: productionInstructionNo, productFamilyCode: productFamilyCode,
+            orderType: orderType, materialType: materialType,
+            dueDateFrom: dueDateFrom, dueDateTo: dueDateTo,
+            riskLevel: riskLevel, sortBy: sortBy, sortDir: sortDir,
+            skip: skip, take: take, ct: ct, allowedFactories: allowedFactories, allowedDomains: allowedDomains);
     }
 
     /// <summary>
@@ -108,6 +112,8 @@ public class OrderQueryService
         string? status = null,
         string? productionInstructionNo = null,
         string? productFamilyCode = null,
+        string? orderType = null,
+        string? materialType = null,
         DateTime? dueDateFrom = null,
         DateTime? dueDateTo = null,
         string? riskLevel = null,
@@ -120,10 +126,12 @@ public class OrderQueryService
             throw new ArgumentException($"非法 riskLevel：{riskLevel}（允许：ON_TRACK/DELAYED/AT_RISK/UNSCHEDULED 或不传）");
 
         return await _repository.GetSummaryAsync(
-            planVersionId, orderNo, materialCode, customerName,
-            factoryCode, domainKey, delayStatus, status,
-            productionInstructionNo, productFamilyCode, dueDateFrom, dueDateTo,
-            riskLevel, allowedFactories, allowedDomains, ct);
+            planVersionId: planVersionId, orderNo: orderNo, materialCode: materialCode, customerName: customerName,
+            factoryCode: factoryCode, domainKey: domainKey, delayStatus: delayStatus, status: status,
+            productionInstructionNo: productionInstructionNo, productFamilyCode: productFamilyCode,
+            orderType: orderType, materialType: materialType,
+            dueDateFrom: dueDateFrom, dueDateTo: dueDateTo,
+            riskLevel: riskLevel, allowedFactories: allowedFactories, allowedDomains: allowedDomains, ct: ct);
     }
 
     /// <summary>
@@ -141,6 +149,8 @@ public class OrderQueryService
         string? status = null,
         string? productionInstructionNo = null,
         string? productFamilyCode = null,
+        string? orderType = null,
+        string? materialType = null,
         DateTime? dueDateFrom = null,
         DateTime? dueDateTo = null,
         string? riskLevel = null,
@@ -153,10 +163,12 @@ public class OrderQueryService
             throw new ArgumentException($"非法 riskLevel：{riskLevel}（允许：ON_TRACK/DELAYED/AT_RISK/UNSCHEDULED 或不传）");
 
         return await _repository.GetDeliveryKpiAsync(
-            planVersionId, orderNo, materialCode, customerName,
-            factoryCode, domainKey, delayStatus, status,
-            productionInstructionNo, productFamilyCode, dueDateFrom, dueDateTo,
-            riskLevel, allowedFactories, allowedDomains, ct);
+            planVersionId: planVersionId, orderNo: orderNo, materialCode: materialCode, customerName: customerName,
+            factoryCode: factoryCode, domainKey: domainKey, delayStatus: delayStatus, status: status,
+            productionInstructionNo: productionInstructionNo, productFamilyCode: productFamilyCode,
+            orderType: orderType, materialType: materialType,
+            dueDateFrom: dueDateFrom, dueDateTo: dueDateTo,
+            riskLevel: riskLevel, allowedFactories: allowedFactories, allowedDomains: allowedDomains, ct: ct);
     }
 
     /// <summary>
@@ -165,13 +177,14 @@ public class OrderQueryService
     public async Task<LPS.APS.Core.Dto.OrderTreeResultDto> GetOrderTreeAsync(
         int planVersionId,
         long orderId,
+        string? keyword = null,
         IReadOnlySet<string>? allowedDomains = null,
         IReadOnlySet<string>? allowedFactories = null,
         CancellationToken ct = default)
     {
         if (planVersionId <= 0) throw new ArgumentException("planVersionId 必填");
         if (orderId <= 0) throw new ArgumentException("orderId 必填（[Order].Id 根订单身份）");
-        return await _repository.GetOrderTreeAsync(planVersionId, orderId, allowedDomains, allowedFactories, ct: ct);
+        return await _repository.GetOrderTreeAsync(planVersionId: planVersionId, orderId: orderId, keyword: keyword, allowedDomains: allowedDomains, allowedFactories: allowedFactories, ct: ct);
     }
 
     /// <summary>
@@ -207,6 +220,8 @@ public class OrderQueryService
         string? status = null,
         string? productionInstructionNo = null,
         string? productFamilyCode = null,
+        string? orderType = null,
+        string? materialType = null,
         DateTime? dueDateFrom = null,
         DateTime? dueDateTo = null,
         string? riskLevel = null,
@@ -219,9 +234,11 @@ public class OrderQueryService
             throw new ArgumentException($"非法 riskLevel：{riskLevel}");
 
         return await _repository.GetFacetsAsync(
-            planVersionId, orderNo, materialCode, customerName,
-            factoryCode, domainKey, delayStatus, status,
-            productionInstructionNo, productFamilyCode, dueDateFrom, dueDateTo,
-            riskLevel, allowedFactories, allowedDomains, ct);
+            planVersionId: planVersionId, orderNo: orderNo, materialCode: materialCode, customerName: customerName,
+            factoryCode: factoryCode, domainKey: domainKey, delayStatus: delayStatus, status: status,
+            productionInstructionNo: productionInstructionNo, productFamilyCode: productFamilyCode,
+            orderType: orderType, materialType: materialType,
+            dueDateFrom: dueDateFrom, dueDateTo: dueDateTo,
+            riskLevel: riskLevel, allowedFactories: allowedFactories, allowedDomains: allowedDomains, ct: ct);
     }
 }

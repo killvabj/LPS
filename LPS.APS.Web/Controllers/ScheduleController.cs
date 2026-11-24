@@ -77,6 +77,8 @@ public class ScheduleController : ControllerBase
         [FromQuery] DateTime? from = null,
         [FromQuery] DateTime? to = null,
         [FromQuery] int[]? resourceIds = null,
+        [FromQuery] string? departmentIds = null,   // P04 H2：部门 Id 逗号多值（与 /tasks 同口径）
+        [FromQuery] string? orderNo = null,          // P04 H2：订单号模糊（EXISTS 谓词，不扇出）
         [FromQuery] int? limit = null,
         [FromQuery] int? afterResourceId = null,
         [FromQuery] DateTime? afterStartAt = null,
@@ -94,9 +96,16 @@ public class ScheduleController : ControllerBase
                 "resourceIds 不支持数组下标写法（resourceIds[]），请使用重复键：?resourceIds=1&resourceIds=2");
         }
 
+        var ganttDepts = string.IsNullOrWhiteSpace(departmentIds)
+            ? null
+            : departmentIds.Split(',', StringSplitOptions.RemoveEmptyEntries)
+                .Select(x => int.TryParse(x.Trim(), out var v) ? v : -1).ToList();
+
         var data = await _queryService.GetGanttAsync(
-            GetCurrentUserId(), planVersionId, from, to, resourceIds,
-            limit, afterResourceId, afterStartAt, afterTaskId, cancellationToken);
+            userId: GetCurrentUserId(), planVersionId: planVersionId, from: from, to: to,
+            resourceIds: resourceIds, departmentIds: ganttDepts, orderNo: orderNo,
+            limit: limit, afterResourceId: afterResourceId, afterStartAt: afterStartAt,
+            afterTaskId: afterTaskId, cancellationToken: cancellationToken);
         return ApiResponse<GanttDataDto>.Success(data);
     }
 
@@ -149,6 +158,7 @@ public class ScheduleController : ControllerBase
         [FromQuery] DateTime? to = null,
         [FromQuery] int[]? resourceIds = null,
         [FromQuery] string? stageCodes = null,
+        [FromQuery] string? operationCodes = null,   // P05 H1（11-23 4号位件）：工序码逗号多值，与 stageCodes 同形
         [FromQuery] string? departmentIds = null,
         [FromQuery] string? keyword = null,
         [FromQuery] string? status = null,
@@ -168,6 +178,9 @@ public class ScheduleController : ControllerBase
         var stages = string.IsNullOrWhiteSpace(stageCodes)
             ? null
             : stageCodes.Split(',', StringSplitOptions.RemoveEmptyEntries).Select(x => x.Trim()).Where(x => x.Length > 0).ToList();
+        var ops = string.IsNullOrWhiteSpace(operationCodes)
+            ? null
+            : operationCodes.Split(',', StringSplitOptions.RemoveEmptyEntries).Select(x => x.Trim()).Where(x => x.Length > 0).ToList();
         List<int>? depts = null;
         if (!string.IsNullOrWhiteSpace(departmentIds))
         {
@@ -176,8 +189,11 @@ public class ScheduleController : ControllerBase
         }
 
         var data = await _queryService.QueryTasksAsync(
-            GetCurrentUserId(), planVersionId, from, to, resourceIds, stages, depts,
-            keyword, status, hasWorkOrder, sortBy, sortDir, pageIndex, pageSize, cancellationToken);
+            userId: GetCurrentUserId(), planVersionId: planVersionId, from: from, to: to,
+            resourceIds: resourceIds, stageCodes: stages, operationCodes: ops, departmentIds: depts,
+            keyword: keyword, status: status, hasWorkOrder: hasWorkOrder,
+            sortBy: sortBy, sortDir: sortDir, pageIndex: pageIndex, pageSize: pageSize,
+            cancellationToken: cancellationToken);
         return ApiResponse<LPS.APS.Core.Dto.TaskListResultDto>.Success(data);
     }
 

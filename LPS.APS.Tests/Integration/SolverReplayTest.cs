@@ -323,6 +323,34 @@ public class SolverReplayTest
             _output.WriteLine($"[DUMP] 逐 Task 时间窗已写：{taskDumpPath}（{result.FinalTasks.Count} 行）");
         }
 
+        // ── 2026-11-23（O-009 同输入对拍）：`APS_REPLAY_COMPLETION_DUMP=<path>` 导出**逐需求完成事实** ──
+        //   用途：证明「合法无 Routing 放行后**确实**产出了 StageTiming 计时节点」，而不是
+        //   「既不进 UnscheduledTasks、也没有 StageTimings」的静默丢失。
+        //   判据（0号位 三态）：`terminalFinalDraftId == null && stageTimingCount > 0` ⇒ (ii) 合法时间约束。
+        //   纯导出，不改判定、不写库。
+        var compDumpPath = Environment.GetEnvironmentVariable("APS_REPLAY_COMPLETION_DUMP");
+        if (!string.IsNullOrWhiteSpace(compDumpPath))
+        {
+            using var cw = new System.IO.StreamWriter(compDumpPath!, false, System.Text.Encoding.UTF8);
+            cw.WriteLine("demand\tterminalFinalDraftId\tstageTimingCount\tsumLeadTimeHours\tstages\tcompletionTime\tavailableTime");
+            foreach (var f in result.DemandCompletions)
+            {
+                var segs = f.StageTimings ?? Array.Empty<StageTimingSegmentFact>();
+                var sumHours = segs.Sum(s => s.LeadTimeHours);
+                var stages = string.Join("|", segs.Select(s =>
+                    $"{s.StageCode}:{s.StartTime:yyyy-MM-dd HH:mm}:{s.EndTime:yyyy-MM-dd HH:mm}"));
+                cw.WriteLine(string.Join('\t',
+                    f.LogicalDemandKey ?? string.Empty,
+                    f.TerminalFinalDraftId ?? "null",
+                    segs.Count.ToString(),
+                    sumHours.ToString("G29"),
+                    stages,
+                    f.CompletionTime.ToString("yyyy-MM-dd HH:mm:ss"),
+                    f.AvailableTime.ToString("yyyy-MM-dd HH:mm:ss")));
+            }
+            _output.WriteLine($"[DUMP] 逐需求完成事实已写：{compDumpPath}（{result.DemandCompletions.Count} 行）");
+        }
+
         // ── 2026-11-21（EX-T01 / EX-T02 真实 PV 绑定）：`APS_REPLAY_FACTS_DUMP=<path>` 导出**解释事实** ──
         //   用途：把 Phase3 的 `ScheduleExplanationFact`（原因码/证据类别/ImpactHours/EvidenceJson）
         //   摊平成 TSV，供逐条核对「五类最终真紧约束」与「物料绑定证据（bindingState/materialReadyAt/slack）」。
@@ -692,6 +720,34 @@ public class SolverReplayTest
                 ("batch_adopt", SolverDiagnostics.Hotspot.BatchAdopt, 0),
                 ("merge_anchor_scan", SolverDiagnostics.Hotspot.MergeAnchorScan, c.MergeScanCalls),
                 ("detach_tail", SolverDiagnostics.Hotspot.DetachTail, 0),
+                // ── 2026-11-21（W5）：把 `batch_trial` 里 ~1,090s 的**未分项**拆开 ──
+                //   999507 实测 batch_trial 1,575.9s，而既有 dump 的 prep/clone/slot 合计只解释 ~480s。
+                //   这里补导出 RunBatchPlan / RunDemandSchedule / 落定段 的既有埋点（**不加新埋点、不改行为**）。
+                ("demand_schedule", SolverDiagnostics.Hotspot.DemandSchedule, 0),
+                ("schedule_demand_ops", SolverDiagnostics.Hotspot.ScheduleDemandOps, 0),
+                ("timeline_clone", SolverDiagnostics.Hotspot.TimelineClone, 0),
+                ("batch_group_index", SolverDiagnostics.Hotspot.BatchGroupIndex, 0),
+                ("try_merge_stage_batch", SolverDiagnostics.Hotspot.TryMergeStageBatch, 0),
+                ("merge_batch_detach", SolverDiagnostics.Hotspot.MergeBatchDetach, 0),
+                ("detach_locate", SolverDiagnostics.Hotspot.DetachLocate, 0),
+                ("detach_remove_at", SolverDiagnostics.Hotspot.DetachRemoveAt, 0),
+                ("prep_direction", SolverDiagnostics.Hotspot.PrepDirection, 0),
+                ("schedule_forward", SolverDiagnostics.Hotspot.ScheduleForward, 0),
+                ("schedule_backward", SolverDiagnostics.Hotspot.ScheduleBackward, 0),
+                ("landing_run", SolverDiagnostics.Hotspot.LandingRun, 0),
+                ("schedule_preamble", SolverDiagnostics.Hotspot.SchedulePreamble, 0),
+                ("occupancy_rollback", SolverDiagnostics.Hotspot.OccupancyRollback, 0),
+                ("outer_adopt", SolverDiagnostics.Hotspot.OuterAdopt, 0),
+                ("landing_share_refill", SolverDiagnostics.Hotspot.LandingShareRefill, 0),
+                ("landing_occ_refill", SolverDiagnostics.Hotspot.LandingOccRefill, 0),
+                ("landing_run_direct", SolverDiagnostics.Hotspot.LandingRunDirect, 0),
+                ("landing_pure_append", SolverDiagnostics.Hotspot.LandingPureAppendCheck, 0),
+                ("landing_index_rebuild", SolverDiagnostics.Hotspot.LandingIndexRebuild, 0),
+                ("landing_trace_refill", SolverDiagnostics.Hotspot.LandingTraceRefill, 0),
+                ("landing_route_refill", SolverDiagnostics.Hotspot.LandingRouteRefill, 0),
+                ("batch_group_trial_fresh", SolverDiagnostics.Hotspot.BatchGroupTrialFresh, 0),
+                ("batch_group_trial_overlay", SolverDiagnostics.Hotspot.BatchGroupTrialOverlay, 0),
+                ("batch_group_overlay_restore", SolverDiagnostics.Hotspot.BatchGroupOverlayRestore, 0),
             };
             foreach (var (name, slot, calls) in rows)
             {

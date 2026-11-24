@@ -99,7 +99,10 @@ public class GanttCursorDto
 
 public class GanttResourceDto
 {
+    /// <summary>P04 H3（11-23）：人工能力槽行用**负 Id**（=-ManualCapacitySlot.ManualSlotId）与设备正 Id 天然分隔，泳道键不撞；kind 位再兜底。JSON: resourceId</summary>
     public int ResourceId { get; set; }
+    /// <summary>JSON: resourceKind——EQUIPMENT 设备 / MANUAL_SLOT 人工能力槽。</summary>
+    public string? ResourceKind { get; set; }
     public string ResourceCode { get; set; } = string.Empty;
     public string ResourceName { get; set; } = string.Empty;
     public int? FactoryId { get; set; }
@@ -292,7 +295,9 @@ public class GanttTaskDto
 
     /// <summary>人工槽 Id（Task.ManualSlotId，人工作业行才有值=资源侧与设备互斥身份）。JSON: manualSlotId</summary>
     public int? ManualSlotId { get; set; }
-
+    /// <summary>P04 H3：槽编码（ManualCapacitySlot.SlotCode；同码可跨部门重复，行身份请用 resourceId=负槽Id）。JSON: manualSlotCode</summary>
+    public string? ManualSlotCode { get; set; }
+    
     /// <summary>生产指示号（Task.MTS_InstructionNo，A 桶关联 PI）。⚠ JSON 键=**`mtS_InstructionNo`**（同订单列表规律）。</summary>
     public string? MTS_InstructionNo { get; set; }
 

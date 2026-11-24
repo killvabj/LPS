@@ -1103,8 +1103,8 @@ public class GovernanceController : ControllerBase
     }
 
     /// <summary>FAILED 恢复（P0-08：为 FAILED ScheduleRun 新建一条 RUNNING 重跑，继承基线；旧记录不动）</summary>
-    /// <remarks>开发者：3号位</remarks>
-    [Authorize(Policy = PermissionCodes.PlanRun)]
+    /// <remarks>开发者：3号位。鉴权：0号位 2026-11-21 G-01 — FAILED FULL 恢复属治理/整 Domain 重跑，挂 aps.admin.run（仅系统管理员）；普通白天候选/局部重排仍走 aps.plan.run，不因本次改码受损。</remarks>
+    [Authorize(Policy = PermissionCodes.RunAdmin)]
     [HttpPost("run/{failedScheduleRunId}/recover")]
     public async Task<IActionResult> RecoverFailedRun(int failedScheduleRunId, CancellationToken ct)
     {

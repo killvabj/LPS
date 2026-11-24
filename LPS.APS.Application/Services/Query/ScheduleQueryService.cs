@@ -27,16 +27,20 @@ public class ScheduleQueryService : IScheduleQueryService
         DatabaseConnectionManager connectionManager,
         IDataScopeService dataScopeService,
         ILogger<ScheduleQueryService> logger,
-        Services.IResourceCalendarService resourceCalendarService)
+        Services.IResourceCalendarService resourceCalendarService,
+        LPS.APS.BusinessRules.Repositories.IMesStatusRepository mesStatusRepository)
     {
         _connectionManager = connectionManager ?? throw new ArgumentNullException(nameof(connectionManager));
         _dataScopeService = dataScopeService ?? throw new ArgumentNullException(nameof(dataScopeService));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         // P12① 分母专用：三级继承解析**唯一件**（A6 禁抄第二份解析——同甘特窗口件纪律）。
         _resourceCalendarService = resourceCalendarService ?? throw new ArgumentNullException(nameof(resourceCalendarService));
+        // P06 H3（11-21/23）：执行事实单源=P11 仓储（禁在详情另起一套快照谓词——E2 挂载点也在这件）。
+        _mesStatusRepository = mesStatusRepository ?? throw new ArgumentNullException(nameof(mesStatusRepository));
     }
 
     private readonly Services.IResourceCalendarService _resourceCalendarService;
+    private readonly LPS.APS.BusinessRules.Repositories.IMesStatusRepository _mesStatusRepository;
 
     /// <inheritdoc />
     public async Task<IReadOnlyList<PlanVersionSummaryDto>> GetVersionsAsync(
@@ -116,6 +120,13 @@ public class ScheduleQueryService : IScheduleQueryService
     /// 窗口/资源过滤谓词——**明细计数、明细体、buckets 三处共用的单源**（Q1 收敛教训：口径修复必须单源，不抄第三份副本）。
     /// NULL 计划时间恒保留；`from/to` 为 naive 比较（列无时区，Z 在绑参时已抹平——桶条同源定稿 2026-10-30）。
     /// </summary>
+    /// <summary>P04 H2（11-23 4号位件）：甘特用户侧筛选尾（部门多选＋订单号模糊）。
+    /// 三消费点（资源行/COUNT/任务体）同一文本——"totalTasks 随过滤变化"即由此结构保证。</summary>
+    private const string GanttUserFilterTail = @"
+                AND (@HasUserDepts = 0 OR t.ProductionDepartmentId IN @UserDeptIds)
+                AND (@GanttOrderNo IS NULL OR EXISTS (SELECT 1 FROM [Order] og
+                     WHERE og.Id = t.OrderId AND og.OrderNo LIKE '% ' + @GanttOrderNo + '%'))";
+
     private const string GanttWindowPredicate = @"
                 AND (@From IS NULL OR t.PlannedEndTime IS NULL OR t.PlannedEndTime >= @From)
                 AND (@To IS NULL OR t.PlannedStartTime IS NULL OR t.PlannedStartTime <= @To)
@@ -143,6 +154,7 @@ public class ScheduleQueryService : IScheduleQueryService
     /// <summary>P05 追加筛选片段（窗口/部门在 <see cref="GanttWindowPredicate"/>+DepartmentPredicate 里，不重复定义）。</summary>
     private const string TaskListFilterTail = @"
                 AND (@HasStages = 0 OR t.StageCode IN @StageCodes)
+                AND (@HasOperations = 0 OR t.OperationCode IN @OperationCodes)
                 AND (@HasDepts = 0 OR t.ProductionDepartmentId IN @DepartmentIds)
                 AND (@Status IS NULL OR t.Status = @Status)
                 AND (@Kw IS NULL OR m.MaterialCode LIKE @Kw OR m.MaterialName LIKE @Kw OR t.TaskNo LIKE @Kw)
@@ -183,6 +195,7 @@ public class ScheduleQueryService : IScheduleQueryService
         DateTime? to = null,
         IReadOnlyList<int>? resourceIds = null,
         IReadOnlyList<string>? stageCodes = null,
+        IReadOnlyList<string>? operationCodes = null,
         IReadOnlyList<int>? departmentIds = null,
         string? keyword = null,
         string? status = null,
@@ -203,7 +216,7 @@ public class ScheduleQueryService : IScheduleQueryService
             : sortDir.Trim().Equals("asc", StringComparison.OrdinalIgnoreCase) ? "ASC"
             : throw new ArgumentException($"非法 sortDir：{sortDir}（允许：asc/desc 或不传）");
         // 空集筛选=fail-closed（IN () 非法且空清单当"全放行"必错口径；同 manual-eta）
-        if (resourceIds is { Count: 0 } || stageCodes is { Count: 0 } || departmentIds is { Count: 0 })
+        if (resourceIds is { Count: 0 } || stageCodes is { Count: 0 } || operationCodes is { Count: 0 } || departmentIds is { Count: 0 })
             return new LPS.APS.Core.Dto.TaskListResultDto
             { Items = new(), Total = 0, Page = Math.Max(1, pageIndex), PageSize = Math.Clamp(pageSize, 1, 200) };
 
@@ -229,6 +242,8 @@ public class ScheduleQueryService : IScheduleQueryService
             ResourceIds = resourceIds,
             HasStages = stageCodes is { Count: > 0 },
             StageCodes = stageCodes,
+            HasOperations = operationCodes is { Count: > 0 },
+            OperationCodes = operationCodes,
             HasDepts = departmentIds is { Count: > 0 },
             DepartmentIds = departmentIds,
             Status = string.IsNullOrWhiteSpace(status) ? null : status.Trim(),
@@ -286,7 +301,8 @@ public class ScheduleQueryService : IScheduleQueryService
         var parameters = WithDepartmentScope(new { TaskId = taskId }, departmentCodes);
         var row = await _connectionManager.QueryFirstOrDefaultAsync<TaskDetailRow>(
             TaskListSelect + @",
-                    pv.VersionCode, pv.Status AS PlanVersionStatus, sr.DataCutoffTime
+                    pv.VersionCode, pv.Status AS PlanVersionStatus, sr.DataCutoffTime,
+                    sr.Id AS SourceRunId, sr.RunType AS SourceRunType, sr.TriggeredBy AS RunTriggeredBy
                 FROM [Task] t
                 LEFT JOIN Material m ON m.Id = t.MaterialId
                 LEFT JOIN Resource r ON r.Id = t.ResourceId
@@ -312,6 +328,13 @@ public class ScheduleQueryService : IScheduleQueryService
               ORDER BY s.AllocationSequence",
             new { TaskId = taskId, PvId = ident.PlanVersionId }, db: DatabaseId.APS)).ToList();
 
+        // 执行事实：需 源Run＋PI＋Stage 三者齐（缺一=未提供 null；不猜别的 Run——快照装载纪律同 P11）。
+        var execFacts = (row.SourceRunId is > 0 && !string.IsNullOrWhiteSpace(row.MtsInstructionNo)
+                         && !string.IsNullOrWhiteSpace(row.StageCode))
+            ? await _mesStatusRepository.GetTaskExecFactsAsync(
+                row.SourceRunId, row.MtsInstructionNo, row.StageCode, row.MesWorkOrderNo, cancellationToken)
+            : null;
+
         return new LPS.APS.Core.Dto.TaskDetailResultDto
         {
             Found = true,
@@ -321,7 +344,18 @@ public class ScheduleQueryService : IScheduleQueryService
             PlanVersionStatus = row.PlanVersionStatus,
             DataCutoffTime = row.DataCutoffTime,
             Shares = shares,
-            SharesProvided = true
+            SharesProvided = true,
+            // P06 H4：源 Run 身份（无源 Run=键省略 null）。
+            SourceRunId = row.SourceRunId,
+            SourceRunType = row.SourceRunType,
+            RunTriggeredBy = row.RunTriggeredBy,
+            // P06 H3：MES 执行事实（P11 同键单源）。
+            MesWorkOrderStatus = execFacts?.WorkOrderStatus,
+            MesReported = execFacts is null ? null : execFacts.Reported,
+            MesPlannedQtyReported = execFacts?.PlannedQtyReported,
+            MesGoodQty = execFacts?.GoodQty, MesScrapQty = execFacts?.ScrapQty,
+            MesReworkQty = execFacts?.ReworkQty, MesRemainingQty = execFacts?.RemainingQty,
+            MesLastReportTime = execFacts?.LastReportTime
         };
     }
 
@@ -331,6 +365,9 @@ public class ScheduleQueryService : IScheduleQueryService
         public string? VersionCode { get; set; }
         public string? PlanVersionStatus { get; set; }
         public DateTime? DataCutoffTime { get; set; }
+        public long? SourceRunId { get; set; }
+        public string? SourceRunType { get; set; }
+        public string? RunTriggeredBy { get; set; }
     }
 
     /// <summary>详情身份头投影（内部件）。</summary>
@@ -605,6 +642,8 @@ OPTION (MAXRECURSION 40)";
         DateTime? from = null,
         DateTime? to = null,
         IReadOnlyList<int>? resourceIds = null,
+        IReadOnlyList<int>? departmentIds = null,
+        string? orderNo = null,
         int? limit = null,
         int? afterResourceId = null,
         DateTime? afterStartAt = null,
@@ -622,6 +661,8 @@ OPTION (MAXRECURSION 40)";
         var allowed = await ResolveAllowedDomainKeysAsync(userId, cancellationToken);
         var departmentCodes = await ResolveAllowedDepartmentCodesAsync(userId, cancellationToken);
         var hasResources = resourceIds is { Count: > 0 };
+        var hasUserDepts = departmentIds is { Count: > 0 };
+        var ganttOrderNo = string.IsNullOrWhiteSpace(orderNo) ? null : orderNo.Trim();
         // 11-06 排序改时间序（B 案裁决）：游标=二元组(归一start, taskId)。
         // afterResourceId **保留入参但被忽略**——旧前端原样回传三参不报错（软兼容，不要求前后端同批上线）；
         // 有 afterTaskId 即视为翻页（afterStartAt 缺省按 1753 归一下界）。
@@ -671,7 +712,8 @@ OPTION (MAXRECURSION 40)";
                 @DomainKey AS DomainKey,
                 f.Name AS FactoryName,
                 pd.DeptName AS ProductionDepartmentName,
-                pd.StageCode AS Stage
+                pd.StageCode AS Stage,
+                N'EQUIPMENT' AS ResourceKind   -- P04 H3
               FROM Resource r
               INNER JOIN [Task] t ON t.ResourceId = r.Id
               LEFT JOIN Factory f ON f.Id = r.FactoryId
@@ -680,7 +722,7 @@ OPTION (MAXRECURSION 40)";
                 -- 与任务条同口径过滤：资源行只保留过滤后仍可见的任务所用资源
                 AND (@From IS NULL OR t.PlannedEndTime IS NULL OR t.PlannedEndTime >= @From)
                 AND (@To IS NULL OR t.PlannedStartTime IS NULL OR t.PlannedStartTime <= @To)
-                AND (@HasResources = 0 OR t.ResourceId IN @ResourceIds){DepartmentPredicate("t")}
+                AND (@HasResources = 0 OR t.ResourceId IN @ResourceIds){DepartmentPredicate("t")}{GanttUserFilterTail}
               -- 10-31 4号位 缺陷修复：资源行排序必须与任务游标同一把尺（资源 Id 升序）。
               -- 前端照抄 resources[] 顺序摆泳道、任务流按游标序 → 两序不一致时首屏泳道全空。
               -- INNER JOIN 保证本清单无 NULL ResourceId，故与游标键 ISNULL(t.ResourceId,-1) 完全等价；
@@ -693,7 +735,10 @@ OPTION (MAXRECURSION 40)";
                 From = from,
                 To = to,
                 HasResources = hasResources,
-                ResourceIds = resourceIds
+                ResourceIds = resourceIds,
+                HasUserDepts = hasUserDepts,
+                UserDeptIds = departmentIds,
+                GanttOrderNo = ganttOrderNo
             }, departmentCodes),
             db: DatabaseId.APS);
 
@@ -708,14 +753,17 @@ OPTION (MAXRECURSION 40)";
         var totalCount = await _connectionManager.QueryFirstOrDefaultAsync<int>(
             $@"SELECT COUNT(*)
                 FROM [Task] t
-                WHERE t.PlanVersionId = @Id{GanttWindowPredicate}{DepartmentPredicate("t")}",
+                WHERE t.PlanVersionId = @Id{GanttWindowPredicate}{DepartmentPredicate("t")}{GanttUserFilterTail}",
             WithDepartmentScope(new
             {
                 Id = planVersionId,
                 From = from,
                 To = to,
                 HasResources = hasResources,
-                ResourceIds = resourceIds
+                ResourceIds = resourceIds,
+                HasUserDepts = hasUserDepts,
+                UserDeptIds = departmentIds,
+                GanttOrderNo = ganttOrderNo
             }, departmentCodes),
             db: DatabaseId.APS);
 
@@ -745,6 +793,7 @@ OPTION (MAXRECURSION 40)";
                 t.RouteCode                   AS RouteCode,
                 t.PathId                      AS PathId,
                 t.ManualSlotId                AS ManualSlotId,
+                ms.SlotCode                   AS ManualSlotCode,
                 t.MTS_InstructionNo           AS MTS_InstructionNo,
                 t.StageExecutionBatchDraftKey AS StageExecutionBatchKey,
                 t.StageExecutionBatchQty      AS StageExecutionBatchQty,
@@ -788,7 +837,8 @@ OPTION (MAXRECURSION 40)";
               LEFT JOIN Material m ON m.Id = t.MaterialId
               LEFT JOIN ProductionDepartment pdn ON pdn.Id = t.ProductionDepartmentId
               LEFT JOIN PlanVersion pv ON pv.Id = @Id
-              WHERE t.PlanVersionId = @Id{GanttWindowPredicate}{DepartmentPredicate("t")}
+              LEFT JOIN ManualCapacitySlot ms ON ms.ManualSlotId = t.ManualSlotId
+              WHERE t.PlanVersionId = @Id{GanttWindowPredicate}{DepartmentPredicate("t")}{GanttUserFilterTail}
                 -- 11-06 B 案：全序键=（归一计划开始时刻, TaskId）——人工/设备按时间穿插，首屏即见双视图
                 -- （实测 44,702 无资源任务全部=人工槽、真未分配=0，「垫底/置顶 -1 桶」任一固定法都会把一边埋没）；
                 -- 未排(NULL 开始)归一 1753-01-01 排最前，同 buckets 未排桶行口径；游标谓词与排序键同式。
@@ -805,6 +855,9 @@ OPTION (MAXRECURSION 40)";
                 To = to,
                 HasResources = hasResources,
                 ResourceIds = resourceIds,
+                HasUserDepts = hasUserDepts,
+                UserDeptIds = departmentIds,
+                GanttOrderNo = ganttOrderNo,
                 Fetch = effectiveLimit + 1,          // 多取1行判溢出：hasMore 零额外查询、永不撒谎
                 HasCursor = hasCursor,
                 CurStartS = (afterStartAt ?? sqlDateFloor).ToString("yyyy-MM-dd HH:mm:ss.fffffff"),   // Dapper 将 DateTime 默认绑定为 SQL datetime（下限1753），MinValue 会 SqlTypeException 溢出
@@ -896,7 +949,47 @@ OPTION (MAXRECURSION 40)";
             }
         }
 
+        // P04 H3（11-23 4号位件）：人工能力槽成资源行——视图②「设备/人工能力槽」的人工侧落地。
+        // 键=负槽Id（与设备正 Id 空间天然分隔）；resourceKind=MANUAL_SLOT；Factory 列=null（槽挂部门，非设备域事实）。
+        // ⚠resourceIds（设备）筛选生效时槽行整侧退出（设备过滤器不应误显人工行）；窗口/部门/订单谓词与设备行同一文本。
+        IReadOnlyList<GanttResourceDto> slotRows = Array.Empty<GanttResourceDto>();
+        if (!hasResources)
+        {
+            slotRows = (await _connectionManager.QueryAsync<GanttResourceDto>(
+                $@"SELECT DISTINCT
+                    -ms.ManualSlotId AS ResourceId,
+                    ms.SlotCode AS ResourceCode,
+                    ms.SlotCode + N' | ' + ISNULL(pd.DeptName, N'')
+                        + CASE WHEN ms.OperationName IS NULL THEN N'' ELSE N' | ' + ms.OperationName END AS ResourceName,
+                    NULL AS FactoryId,
+                    ms.ProductionDepartmentId AS ProductionDepartmentId,
+                    @DomainKey AS DomainKey,
+                    NULL AS FactoryName,
+                    pd.DeptName AS ProductionDepartmentName,
+                    pd.StageCode AS Stage,
+                    N'MANUAL_SLOT' AS ResourceKind
+                  FROM ManualCapacitySlot ms
+                  INNER JOIN [Task] t ON t.ManualSlotId = ms.ManualSlotId
+                  LEFT JOIN ProductionDepartment pd ON pd.Id = ms.ProductionDepartmentId
+                  WHERE t.PlanVersionId = @Id
+                    AND (@From IS NULL OR t.PlannedEndTime IS NULL OR t.PlannedEndTime >= @From)
+                    AND (@To IS NULL OR t.PlannedStartTime IS NULL OR t.PlannedStartTime <= @To)" + DepartmentPredicate("t") + GanttUserFilterTail + @"
+                  ORDER BY ResourceId",
+                WithDepartmentScope(new
+                {
+                    Id = planVersionId,
+                    DomainKey = version.DomainKey,
+                    From = from,
+                    To = to,
+                    HasUserDepts = hasUserDepts,
+                    UserDeptIds = departmentIds,
+                    GanttOrderNo = ganttOrderNo
+                }, departmentCodes),
+                db: DatabaseId.APS)).ToList();
+        }
+
         var resourceList = resources.ToList();
+        resourceList = resourceList.Concat(slotRows).ToList();   // P04 H3：设备段（正Id升序）＋人工槽段（负Id升序）
 
         // B1(11-05)：资源不可用窗口——口径与总览 R6 完全同源（本级 ResourceCalendarSlot AvailableFlag=0，
             // 不含部门/工厂继承 OFF；10-16 已裁口径 b 未采用，两页保持一套，合并口径若需另提）。
