@@ -157,6 +157,17 @@ public class FrontendContractGuardTests
     }
 
     [Fact]
+    public void PL2_PL3_OR3_KeysPresent()
+    {
+        // 11-24 三裁（PL2甲/OR3丙）承诺键——发函前置（R3′ 同款）。
+        Assert.NotNull(Prop(typeof(LPS.APS.Core.Dto.ResourceLoadRowDto), "ExecutingDepartments"));
+        Assert.NotNull(Prop(typeof(LPS.APS.Core.Dto.ResourceLoadExecDeptDto), "ProductionDepartmentId"));
+        Assert.NotNull(Prop(typeof(LPS.APS.Core.Dto.ResourceLoadExecDeptDto), "DepartmentCode"));
+        Assert.NotNull(Prop(typeof(LPS.APS.Core.Dto.ResourceLoadExecDeptDto), "DepartmentName"));
+        Assert.NotNull(Prop(typeof(LPS.APS.Core.Dto.OrderListItemDto), "ExecDepartmentCodes"));
+    }
+
+    [Fact]
     public void ElevenBatch_P0230405060711_KeysPresent()
     {
         // 11-23 九函批（十件）承诺返回键——发函前置纪律（R3′ 同款，防映射层丢列）。

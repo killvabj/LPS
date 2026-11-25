@@ -1933,6 +1933,12 @@ public class SchedulingOrchestrator : ISchedulingOrchestrator
         // ⚠ 2026-10-13 改：**不再只取 `AvailableFlag=1`**。`AvailableFlag=0` 是「资源级显式 OFF（停机/维修）」，
         //   属 RC-006「资源自身明确 OFF 为硬排除」，必须交给解析器作**例外裁剪**，不能在这里静默丢掉。
         //   （实测全表 `AvailableFlag=0` 为 0 行 ⇒ 本改动当前不改变任何结果，只把语义摆正。）
+        // 2026-11-25（0号位 统一答复 §2 / 总表 v1.7 §十四.2，A 方案）：
+        //   把**已装载的工厂／部门两级原始事实行**留在 Run 级共享上下文里，
+        //   供各 Domain 直接复用，消除「每 Domain 重复读同一张表」。
+        //   只存原始行（现库 93 行），合成与裁剪仍由各 Domain 自己做；不改三级继承/资格/边界。
+        context.UpperLevelCalendarFacts = upperCalendarRows.ToList();
+
         var calendarRows = await _connectionManager.QueryAsync<ResourceCalendarSlotLoadDto>(
             @"SELECT ResourceId, StartTime, EndTime, AvailableFlag
                 FROM ResourceCalendarSlot",

@@ -40,7 +40,13 @@ public class OrderQueryController : ControllerBase
     }
 
     /// <summary>解析当前登录用户 Id（无效返回 0 → 范围解析为拒绝全部，安全默认）</summary>
-    private int GetCurrentUserId()
+        private static List<string>? ParseCsv(string? csv)
+        => string.IsNullOrWhiteSpace(csv)
+            ? null
+            : csv.Split(',', StringSplitOptions.RemoveEmptyEntries)
+                .Select(x => x.Trim()).Where(x => x.Length > 0).ToList();
+
+private int GetCurrentUserId()
         => int.TryParse(User.FindFirst(ClaimTypes.NameIdentifier)?.Value, out var id) ? id : 0;
 
     /// <summary>
@@ -60,6 +66,7 @@ public class OrderQueryController : ControllerBase
         [FromQuery] string? productFamilyCode = null,
         [FromQuery] string? orderType = null,        // A5：PRODUCTION_INSTRUCTION/SALES_ORDER（缺省不过滤）
         [FromQuery] string? materialType = null,     // A5：标准 MaterialType 原值（缺省不过滤）
+        [FromQuery] string? departmentCode = null,   // OR3 丙：执行部门 DeptCode 逗号多值（筛选，不收窄可见性）
         [FromQuery] DateTime? dueDateFrom = null,
         [FromQuery] DateTime? dueDateTo = null,
         [FromQuery] string? riskLevel = null,
@@ -99,7 +106,7 @@ public class OrderQueryController : ControllerBase
                 planVersionId: planVersionId, orderNo: orderNo, materialCode: materialCode, customerName: customerName,
                 factoryCode: factoryCode, domainKey: domainKey, delayStatus: delayStatus, status: status,
                 productionInstructionNo: productionInstructionNo, productFamilyCode: productFamilyCode,
-                orderType: orderType, materialType: materialType,
+                orderType: orderType, materialType: materialType, execDepartmentCodes: ParseCsv(departmentCode),
                 dueDateFrom: dueDateFrom, dueDateTo: dueDateTo,
                 riskLevel: riskLevel, sortBy: sortBy, sortDir: sortDir,
                 skip: skip, take: take, ct: cancellationToken,
@@ -211,9 +218,11 @@ public class OrderQueryController : ControllerBase
             if (planVersionId <= 0) throw new ArgumentException("planVersionId 必填");
             var scope = await _dataScopeService.ResolveScopeAsync(GetCurrentUserId(), cancellationToken);
             var result = await _service.GetOrderPoolAsync(
-                planVersionId, participation, keyword, orderType, pageIndex, pageSize,
-                scope.IsGlobal ? null : scope.GetValues(DataScopeTypes.Domain),
-                cancellationToken);
+                planVersionId: planVersionId, participation: participation, keyword: keyword,
+                orderType: orderType, pageIndex: pageIndex, pageSize: pageSize,
+                allowedDomains: scope.IsGlobal ? null : scope.GetValues(DataScopeTypes.Domain),
+                allowedFactories: scope.IsGlobal ? null : scope.GetValues(DataScopeTypes.Factory),
+                ct: cancellationToken);
             return ApiResponse<LPS.APS.Core.Dto.OrderPoolResultDto>.Success(result);
         }
         catch (ArgumentException ex)
@@ -245,6 +254,7 @@ public class OrderQueryController : ControllerBase
         [FromQuery] string? productFamilyCode = null,
         [FromQuery] string? orderType = null,        // A5：PRODUCTION_INSTRUCTION/SALES_ORDER（缺省不过滤）
         [FromQuery] string? materialType = null,     // A5：标准 MaterialType 原值（缺省不过滤）
+        [FromQuery] string? departmentCode = null,   // OR3 丙：执行部门 DeptCode 逗号多值（筛选，不收窄可见性）
         [FromQuery] DateTime? dueDateFrom = null,
         [FromQuery] DateTime? dueDateTo = null,
         [FromQuery] string? riskLevel = null,
@@ -267,7 +277,7 @@ public class OrderQueryController : ControllerBase
                 planVersionId: planVersionId, orderNo: orderNo, materialCode: materialCode, customerName: customerName,
                 factoryCode: factoryCode, domainKey: domainKey, delayStatus: delayStatus, status: status,
                 productionInstructionNo: productionInstructionNo, productFamilyCode: productFamilyCode,
-                orderType: orderType, materialType: materialType,
+                orderType: orderType, materialType: materialType, execDepartmentCodes: ParseCsv(departmentCode),
                 dueDateFrom: dueDateFrom, dueDateTo: dueDateTo,
                 riskLevel: riskLevel, allowedFactories: allowedFactories, allowedDomains: allowedDomains, ct: cancellationToken);
 
@@ -307,6 +317,7 @@ public class OrderQueryController : ControllerBase
         [FromQuery] string? productFamilyCode = null,
         [FromQuery] string? orderType = null,        // A5：PRODUCTION_INSTRUCTION/SALES_ORDER（缺省不过滤）
         [FromQuery] string? materialType = null,     // A5：标准 MaterialType 原值（缺省不过滤）
+        [FromQuery] string? departmentCode = null,   // OR3 丙：执行部门 DeptCode 逗号多值（筛选，不收窄可见性）
         [FromQuery] DateTime? dueDateFrom = null,
         [FromQuery] DateTime? dueDateTo = null,
         [FromQuery] string? riskLevel = null,
@@ -324,7 +335,7 @@ public class OrderQueryController : ControllerBase
                 planVersionId: planVersionId, orderNo: orderNo, materialCode: materialCode, customerName: customerName,
                 factoryCode: factoryCode, domainKey: domainKey, delayStatus: delayStatus, status: status,
                 productionInstructionNo: productionInstructionNo, productFamilyCode: productFamilyCode,
-                orderType: orderType, materialType: materialType,
+                orderType: orderType, materialType: materialType, execDepartmentCodes: ParseCsv(departmentCode),
                 dueDateFrom: dueDateFrom, dueDateTo: dueDateTo,
                 riskLevel: riskLevel, allowedFactories: scope.GetValues(DataScopeTypes.Factory),
                 allowedDomains: scope.GetValues(DataScopeTypes.Domain), ct: cancellationToken);
@@ -361,6 +372,7 @@ public class OrderQueryController : ControllerBase
         [FromQuery] string? productFamilyCode = null,
         [FromQuery] string? orderType = null,        // A5：PRODUCTION_INSTRUCTION/SALES_ORDER（缺省不过滤）
         [FromQuery] string? materialType = null,     // A5：标准 MaterialType 原值（缺省不过滤）
+        [FromQuery] string? departmentCode = null,   // OR3 丙：执行部门 DeptCode 逗号多值（筛选，不收窄可见性）
         [FromQuery] DateTime? dueDateFrom = null,
         [FromQuery] DateTime? dueDateTo = null,
         [FromQuery] string? riskLevel = null,
@@ -381,7 +393,7 @@ public class OrderQueryController : ControllerBase
                 planVersionId: planVersionId, orderNo: orderNo, materialCode: materialCode, customerName: customerName,
                 factoryCode: factoryCode, domainKey: domainKey, delayStatus: delayStatus, status: status,
                 productionInstructionNo: productionInstructionNo, productFamilyCode: productFamilyCode,
-                orderType: orderType, materialType: materialType,
+                orderType: orderType, materialType: materialType, execDepartmentCodes: ParseCsv(departmentCode),
                 dueDateFrom: dueDateFrom, dueDateTo: dueDateTo,
                 riskLevel: riskLevel, allowedFactories: allowedFactories, allowedDomains: allowedDomains, ct: cancellationToken);
 

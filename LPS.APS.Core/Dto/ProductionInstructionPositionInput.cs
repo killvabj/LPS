@@ -84,6 +84,17 @@ public sealed class ProductionInstructionPositionInput
 
     /// <summary>
     /// 强事实（Received等有明确单据支撑的事实）
+    ///
+    /// ⚠ **2026-11-24 判定 `UNAVAILABLE_BY_DATA`（数据不支持），禁止用作位置修正依据**：
+    ///   本项目无合法且不重复的喂给来源，装载层零引用（PeggingOrchestrator 构造本输入时从不赋值）。
+    ///   依据（详见 5号位 2026-11-24 回函《回StrongFacts通道判定》）：
+    ///   ① 唯一按单据收讫源 `ERP_Received_ByDocument_View` 底层是 ERP U13 生产入库（InstrID=PI、
+    ///      ProcessCode 980xxx→CN_FINAL 成品入库段），属「已入 M 库」量——按 F05 语义已在 ERP RemainingQty
+    ///      之外，绝不能再入本方法（其 DocumentType 为 ODS 视图硬编码常量，非单据真实类型）；
+    ///   ② MES Stage 报工已由 `StageProgress` 通道承载（且装载侧已按 §9.6 同减 PiReceivedQty）；
+    ///   ③ 线边仓/跨厂在途分别由 `XcFacts`/`TransitFacts` 承载；
+    ///   ④ 再喂收讫单据＝同一数量二次扣减（方法内「二次扣减风险」注释）。
+    ///   若未来出现「仍属 RemainingQty 边界内、且可定位 Stage 的收讫类事实」，须先经 0号位 裁决并重开本通道。
     /// </summary>
     public IReadOnlyList<ReceivedFact> StrongFacts { get; init; } = Array.Empty<ReceivedFact>();
 

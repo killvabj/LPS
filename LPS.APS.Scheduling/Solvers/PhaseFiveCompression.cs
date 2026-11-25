@@ -757,8 +757,17 @@ internal class PhaseFiveCompression
             var missing = 0;
             var conflict = 0;
             var unavailable = 0;
-            foreach (var reason in hardFailures.Values)
+            // ── 2026-11-24 D-04（0号位 §二「是否实证 B010 合法 PI Stage 上限及 Reason 关联」）──
+            //   原 `else` 兜底把「一切非 MISSING/UNAVAILABLE」都算作 `conflict`。实测（FRL v5 / CYL v1 账本）：
+            //     CYL 483 + FRL 59 = **542 条** `BATCH_POLICY_CONFLICT` 的明细文本全部以
+            //     `PI_LEGAL_QTY_CONTRACT_PENDING` 开头 —— 真实原因是 **PI 法定量 / Stage 合法自由量缺失**，
+            //     不是批次策略冲突；且按策略载体口径这些键全部是 `State=Valid`（载体根本没冲突）。
+            //   冻结 ReasonCode 值域不变（出口码仍是既有那 15 个），仅把**聚合计数**按明细文本分列，
+            //   使 0号位 能一眼看出「冲突」里有多少其实是 PI 契约待核。
+            var piContractPending = 0;
+            foreach (var kv in hardFailures)
             {
+                var reason = kv.Value;
                 if (string.Equals(reason, "BATCH_POLICY_MISSING", StringComparison.Ordinal))
                 {
                     missing++;
@@ -772,6 +781,13 @@ internal class PhaseFiveCompression
                 else
                 {
                     conflict++;
+                    // 542 条中哪些其实是 PI 契约待核 —— 只是**注释性拆分子集**，不改变 conflict 总数。
+                    var detailText = FindBatchPolicyDetail(scheduleResult, kv.Key);
+                    if (detailText is not null
+                        && detailText.Contains("PI_LEGAL_QTY_CONTRACT_PENDING", StringComparison.Ordinal))
+                    {
+                        piContractPending++;
+                    }
                 }
             }
 
@@ -798,6 +814,10 @@ internal class PhaseFiveCompression
 
             var text = $"[BatchPolicy] 硬失败需求 {hardFailures.Count} 条"
                      + $"（BATCH_POLICY_MISSING {missing} / BATCH_POLICY_CONFLICT {conflict}"
+                     + (piContractPending > 0
+                         ? $"〔其中 PI 契约待核 {piContractPending}：明细为 PI_LEGAL_QTY_CONTRACT_PENDING，"
+                           + "非批次策略冲突〕"
+                         : string.Empty)
                      + $" / BATCH_POLICY_STATE_UNAVAILABLE {unavailable}）";
             if (samples.Count > 0)
             {

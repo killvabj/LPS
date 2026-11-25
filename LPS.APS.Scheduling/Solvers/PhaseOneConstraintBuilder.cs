@@ -469,11 +469,12 @@ internal class PhaseOneConstraintBuilder
         //    P1-06修复：StartOperation/StartStage 之前的已完成 Stage 不再参与本次求解，
         //    即使其缺 Department Context 也不应误杀当前剩余 Routing。
         //    无 Start 信息的需求（新单从首工序起）仍校验全量 Stage。
-        var reachableStages = BuildReachableStages(request);
+        var reachableStages = BuildReachableStages(request, out var stageFactoryByDemandStage);
 
         // 供 Phase5 计算「无 Routing Stage」时间节点（0号位 2026-09-29 裁决 §十四第4项）。
         // 见 ConstraintContext.EffectiveStages 注释：语义不变，仅把原本的局部变量挂出来复用。
         context.EffectiveStages = reachableStages;
+        context.StageFactoryByDemandStage = stageFactoryByDemandStage;
 
         // R09-③（2026-10-29）：把「中间无 Routing Stage」的提前期前置算好，供 Phase2 当硬时间约束。
         //   必须在 EffectiveStages 赋值**之后**调用 —— 它读 context.EffectiveStages 判「本范围无 Routing」。
@@ -634,9 +635,12 @@ internal class PhaseOneConstraintBuilder
     ///
     /// 返回：MaterialId → 该物料在范围内的 StageCode 集合（①②并集，多个需求再取并集）。
     /// </summary>
-    private Dictionary<int, HashSet<string>> BuildReachableStages(DomainSolveRequest request)
+    private Dictionary<int, HashSet<string>> BuildReachableStages(
+        DomainSolveRequest request,
+        out Dictionary<string, Dictionary<string, string>> stageFactoryByDemandStage)
     {
         var result = new Dictionary<int, HashSet<string>>();
+        stageFactoryByDemandStage = new Dictionary<string, Dictionary<string, string>>(StringComparer.Ordinal);
 
         // 预处理：物料 → 工序行 与依赖行（V1 默认 DEFAULT 路径）
         var opsByMaterial = request.RoutingOperations
@@ -648,14 +652,33 @@ internal class PhaseOneConstraintBuilder
             .ToDictionary(g => g.Key, g => g.ToList());
 
         // N8-01（0号位 2026-10-15 第九轮 §3.2/§3.3）：BOM/Stage 权威链也是 Stage 范围的取源。
-        var chainByMaterial = BuildStageChainIndex(request);
+        // 2026-11-25（A31③）：改为**逐需求**取链（`DemandChainResolver` 单点），
+        //   替换原「按 MaterialId 建字典」——原口径为**并集**（多需求同物料会并入同一 HashSet），
+        //   同物料多链时会让走 EDGE 链的需求多看到 Stage（不报错、只是结果对不上）。
+        var chainIndex = DemandChainResolver.BuildIndex(request);
 
         foreach (var demand in request.LogicalProductionDemands)
         {
             opsByMaterial.TryGetValue(demand.MaterialId, out var ops);
 
             // ① N8-01：BOM/Stage 权威链里、按起点裁剪后仍在范围内的 Stage（含零 Routing 的 Stage）。
-            var chainStages = ResolveChainStagesInScope(request, demand, chainByMaterial);
+            var chainStages = ResolveChainStagesInScope(request, demand, chainIndex);
+
+            // 2026-11-25（0号位 Q1）：同时登记「该需求每个 Stage 的执行厂」，供交接等待与 Stage 级日历消费。
+            if (DemandChainResolver.TryResolve(chainIndex, demand, out var chainSteps, out _))
+            {
+                Dictionary<string, string>? factoryByStage = null;
+                foreach (var step in chainSteps)
+                {
+                    if (string.IsNullOrEmpty(step.StageFactoryCode)) continue;
+                    factoryByStage ??= new Dictionary<string, string>(StringComparer.Ordinal);
+                    factoryByStage[step.StageCode] = step.StageFactoryCode!;
+                }
+                if (factoryByStage is not null && !string.IsNullOrEmpty(demand.LogicalDemandKey))
+                {
+                    stageFactoryByDemandStage[demand.LogicalDemandKey] = factoryByStage;
+                }
+            }
 
             if (ops == null && chainStages.Count == 0)
             {
@@ -833,32 +856,6 @@ internal class PhaseOneConstraintBuilder
     }
 
     /// <summary>
-    /// N8-01：把 <see cref="DomainSolveRequest.StageSequenceChains"/> 收敛成「物料 → 去重后的 Stage 步」。
-    /// 同 StageCode 取最小 StageSeq（DTO 契约本就如此，此处再收敛一次是防御，与
-    /// <see cref="ValidateStageSequences"/> 同口径）。
-    /// </summary>
-    private static Dictionary<int, List<StageSequenceStep>> BuildStageChainIndex(DomainSolveRequest request)
-    {
-        var index = new Dictionary<int, List<StageSequenceStep>>();
-
-        foreach (var chain in request.StageSequenceChains)
-        {
-            if (chain?.Stages == null || chain.Stages.Count == 0)
-            {
-                continue;
-            }
-
-            index[chain.MaterialId] = chain.Stages
-                .Where(s => !string.IsNullOrWhiteSpace(s.StageCode))
-                .GroupBy(s => s.StageCode, StringComparer.Ordinal)
-                .Select(g => g.OrderBy(s => s.StageSeq).First())
-                .ToList();
-        }
-
-        return index;
-    }
-
-    /// <summary>
     /// **R09-③（2026-10-29 落码）**：把每个需求「**中间**无 Routing Stage」的提前期**前置算好**，
     /// 挂到 <see cref="ConstraintContext.RoutelessLeadStepsByDemand"/>，供 Phase2 当硬时间约束。
     ///
@@ -885,12 +882,16 @@ internal class PhaseOneConstraintBuilder
     /// </summary>
     private static void BuildRoutelessLeadSteps(DomainSolveRequest request, ConstraintContext context)
     {
-        if (request.LogicalProductionDemands.Count == 0 || request.StageSequenceChains.Count == 0)
+        // 2026-11-25（A31③）：原判据只看物料级兼容载体；新 DTO 下多链物料会**从该载体里消失**
+        //   （2号位 撤隔离后），若仍以它为空提前返回，会让这些需求**丢失无 Routing 阶段的提前期**。
+        //   ⇒ 只要还有逐需求绑定，就必须继续。
+        if (request.LogicalProductionDemands.Count == 0
+            || (request.StageSequenceChains.Count == 0 && request.DemandStageChainBindings.Count == 0))
         {
             return;
         }
 
-        var chainByMaterial = BuildStageChainIndex(request);
+        var chainIndex = DemandChainResolver.BuildIndex(request);
 
         var leadTimeByKey = new Dictionary<(int MaterialId, string StageCode), StageLeadTimeFact>();
         foreach (var fact in request.StageLeadTimes)
@@ -906,7 +907,7 @@ internal class PhaseOneConstraintBuilder
             }
 
             // 权威链（已按起点裁剪）：顺序就是工艺顺序，跨 Stage 段的「中间」由它定义。
-            var chainStages = ResolveChainStagesInScope(request, demand, chainByMaterial);
+            var chainStages = ResolveChainStagesInScope(request, demand, chainIndex);
             if (chainStages.Count == 0)
             {
                 continue;
@@ -980,9 +981,10 @@ internal class PhaseOneConstraintBuilder
     private static List<string> ResolveChainStagesInScope(
         DomainSolveRequest request,
         LogicalProductionDemand demand,
-        Dictionary<int, List<StageSequenceStep>> chainByMaterial)
+        DemandChainResolver.Index chainIndex)
     {
-        if (!chainByMaterial.TryGetValue(demand.MaterialId, out var steps) || steps.Count == 0)
+        // 2026-11-25（A31③）：逐需求取链（绑定优先、无绑定行才回落物料级兼容载体）。
+        if (!DemandChainResolver.TryResolve(chainIndex, demand, out var steps, out _) || steps.Count == 0)
         {
             return new List<string>();
         }
@@ -1016,7 +1018,7 @@ internal class PhaseOneConstraintBuilder
     private static int? ResolveStartStageSeq(
         DomainSolveRequest request,
         LogicalProductionDemand demand,
-        List<StageSequenceStep> chainSteps)
+        IReadOnlyList<StageSequenceStep> chainSteps)
     {
         var hasStartOperation = !string.IsNullOrWhiteSpace(demand.StartOperationCode);
         var hasStartStage = !string.IsNullOrWhiteSpace(demand.StartStageCode);
@@ -2005,6 +2007,15 @@ internal class ConstraintContext
             return true;
         }
 
+        // ── Q-3 红线（2026-11-24 修复）：需求**声明了固定路径**但图里不存在 ⇒ Fail Closed ──
+        //   旧实现无条件回落 `TryGetSingleRoutingGraph`：单路径物料会被「猜」到唯一那条 Path，
+        //   于是 Phase2 的 `P2_FIXED_PATH_MISSING` 被 Phase4 局部修复**绕过**（实测：需求声明 RT/99、
+        //   物料只有 RT/1 ⇒ Phase2 未排，但最终仍产出 RT/1 的 Task）。冻结 `07 :724`/Q-3 明令不得猜。
+        if (!string.IsNullOrEmpty(demandRouteCode) || demandPathId is not null)
+        {
+            return false;
+        }
+
         return TryGetSingleRoutingGraph(materialId, out graph);
     }
 
@@ -2042,6 +2053,12 @@ internal class ConstraintContext
         if (TryGetRoutingGraph(materialId, demandRouteCode, demandPathId, out graph))
         {
             return true;
+        }
+
+        // Q-3 红线（同上）：声明了固定路径但图缺失 ⇒ Fail Closed，不得猜唯一 Path
+        if (!string.IsNullOrEmpty(demandRouteCode) || demandPathId is not null)
+        {
+            return false;
         }
 
         if (TryGetSingleRoutingGraph(materialId, out graph))
@@ -2114,6 +2131,18 @@ internal class ConstraintContext
     ///   故取源虽含 BOM/Stage 链，但**必须按起点裁剪**（见 `ResolveChainStagesInScope`）。
     /// </summary>
     public Dictionary<int, HashSet<string>> EffectiveStages { get; set; } = new();
+
+    /// <summary>
+    /// **每需求、每 Stage 的实际执行厂**（0号位 2026-11-25 Q1：「当前正在排程的 Stage 决定工厂」）。
+    /// 来源 = 逐需求链定义里的 `StageSequenceStep.StageFactoryCode`（源自 `StageDict.FactoryCode`）。
+    ///
+    /// <para>【为什么需要】交接等待规则的工厂键、Stage 级 WORK 日历都应以**该 Stage 的执行厂**为准，
+    ///   而不是 `Demand.FactoryCode`（真跨厂 Stage 会取错规则/取错日历）。</para>
+    /// <para>【缺键语义】某需求某 Stage 不在表内 ⇒ 该 Stage 的执行厂**未知**。消费侧按既有口径
+    ///   **显式回落 `Demand.FactoryCode`**（保持改造前行为，不静默当已知）；新 DTO 到位后该键恒存在。</para>
+    /// </summary>
+    public Dictionary<string, Dictionary<string, string>> StageFactoryByDemandStage { get; set; }
+        = new(StringComparer.Ordinal);
 
     /// <summary>
     /// **R09-③ 载体｜原始求解入参的只读引用**（2026-10-29）。

@@ -42,7 +42,7 @@ public interface IResourceCalendarService
     /// </summary>
     Task<List<ResourceCalendarResolvePreviewDto>> ResolvePreviewAsync(
         IReadOnlyList<int> resourceIds, DateTime startDate, DateTime endDate,
-        int actorUserId, CancellationToken ct = default);
+        int actorUserId, IReadOnlySet<int>? additionalAllowedResourceIds = null, CancellationToken ct = default);
 
     /// <summary>
     /// 人工槽版三级合并解析预览（4号位 10-23 函 R1 选 (a)）：与设备侧同一 Resolver/上级装载器/
@@ -259,7 +259,7 @@ WHERE rc.Id = @Id",
     /// </summary>
     public async Task<List<ResourceCalendarResolvePreviewDto>> ResolvePreviewAsync(
         IReadOnlyList<int> resourceIds, DateTime startDate, DateTime endDate,
-        int actorUserId, CancellationToken ct = default)
+        int actorUserId, IReadOnlySet<int>? additionalAllowedResourceIds = null, CancellationToken ct = default)
     {
         if (resourceIds is null || resourceIds.Count == 0)
             throw new ArgumentException("resourceIds 不能为空");
@@ -279,10 +279,13 @@ WHERE r.Id IN @Ids",
 
         // S5-01 fail-closed：越界设备直接剔除（多目标读不泄露存在性）
         var scope = await _dataScopeService.ResolveScopeAsync(actorUserId, ct);
+        // P12 PL3 甲（3号位 11-24 裁）：additionalAllowedResourceIds＝本请求中"窗内存在本部门授权任务"的设备集合；
+        // 命中者对**部门维**放行（其日历窗口纳入分母），**工厂维仍须过**；仅 P12 传该参数，S5-01 其余语义零变动。
         var scoped = resources.Where(r =>
             scope.IsGlobal
             || (!string.IsNullOrWhiteSpace(r.FactoryCode) && scope.Allows(DataScopeTypes.Factory, r.FactoryCode)
-                && (string.IsNullOrWhiteSpace(r.DeptCode) || scope.Allows(DataScopeTypes.Department, r.DeptCode))))
+                && (string.IsNullOrWhiteSpace(r.DeptCode) || scope.Allows(DataScopeTypes.Department, r.DeptCode)
+                    || (additionalAllowedResourceIds?.Contains(r.Id) ?? false))))
             .ToList();
         if (scoped.Count == 0)
             return new List<ResourceCalendarResolvePreviewDto>();

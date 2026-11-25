@@ -115,7 +115,7 @@ public class ResourceCalendarController : ControllerBase
             if (ids.Count == 0)
                 return ApiResponse<List<ResourceCalendarResolvePreviewDto>>.Fail(400, "resourceIds 不能为空（逗号分隔）");
 
-            var rows = await _service.ResolvePreviewAsync(ids, startDate, endDate, GetCurrentUserId(), ct);
+            var rows = await _service.ResolvePreviewAsync(ids, startDate, endDate, GetCurrentUserId(), null, ct);   // 日历预览端点不挂 PL3 白名单（仅 P12 传）
             return ApiResponse<List<ResourceCalendarResolvePreviewDto>>.Success(rows);
         }
         catch (ArgumentException ex)

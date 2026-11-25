@@ -653,6 +653,11 @@ public class ProductionInstructionPositionCalculator : IProductionInstructionPos
     /// <summary>
     /// 应用强位置事实（MES Stage内部报工/进度证据）
     ///
+    /// ⚠ 2026-11-24：本通道经核实为 **`UNAVAILABLE_BY_DATA`（本项目无合法数据源）**，装载层零引用；
+    ///   保留本方法仅作防御性校验（若真被喂数，下方 SH/UNKNOWN 闸门与 RELATED Stage 定位仍按原语义拦截）。
+    ///   禁止以 ERP U13 生产入库/成品入库收讫事实喂本通道（属已出 RemainingQty 的最终收讫，会二次扣减）。
+    ///   判定依据见 `ProductionInstructionPositionInput.StrongFacts` 注释与 5号位 2026-11-24 回函。
+    ///
     /// 语义边界（F05）：
     /// - StrongFacts只能包含"仍属于ERP RemainingQty内部的位置事实"
     /// - MES Stage报工/工序进度 = 属于RemainingQty内部，可以定位Stage Position

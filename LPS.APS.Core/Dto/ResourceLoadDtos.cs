@@ -6,6 +6,16 @@ namespace LPS.APS.Core.Dto;
 /// **三率均为计划指标，非 MES 实际利用率**；跨午夜 Task 按日期切片（每片只算落在该业务日内的小时）。
 /// 三态显式：有值 / 明确零（有可用小时但当日无排产）/ <see cref="NotApplicableReason"/> 非空=不适用（禁 0 冒充）。
 /// </summary>
+
+/// <summary>P12 PL2 甲（3号位 11-24 裁）：行级执行部门元素（设备×日窗内任务执行部门去重）。
+/// 与"设备归属部门"（productionDepartmentId/code/name 三列）**两列并出**（PL1 裁：归属回答"归谁管"、执行回答"谁的活"）。JSON: executingDepartments[]</summary>
+public sealed class ResourceLoadExecDeptDto
+{
+    public int ProductionDepartmentId { get; init; }
+    public string? DepartmentCode { get; init; }
+    public string? DepartmentName { get; init; }
+}
+
 public sealed class ResourceLoadResultDto
 {
     public bool VersionExists { get; init; } = true;
@@ -42,6 +52,10 @@ public sealed class ResourceLoadRowDto
     public int? ProductionDepartmentId { get; init; }
     public string? DepartmentCode { get; init; }
     public string? DepartmentName { get; init; }
+
+    /// <summary>PL2 甲（3号位 11-24 裁）：该设备×该日窗内**任务执行部门**去重数组（多值；无任务日=空数组）。
+    /// 与上三列（设备归属部门）**并出**——归属回答"设备归谁管"，执行回答"这批活是谁的"——两个事实不可折叠。</summary>
+    public List<ResourceLoadExecDeptDto> ExecutingDepartments { get; init; } = new();
 
     /// <summary>业务日（date 级，naive 工厂墙钟）。</summary>
     public DateTime BusinessDate { get; init; }

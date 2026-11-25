@@ -7,7 +7,7 @@ namespace LPS.APS.BusinessRules.Services;
 /// 供应事实原始追溯业务服务（5号位提供给4号位）
 ///
 /// 用于页面查看Procurement/VMI/Received/Transit原始供应事实
-/// 来源：SupplyFact_Pipeline + ext_ERP_Received_ByDocument_View
+/// 来源：SupplyFact_Pipeline（2026-11-24 起 RECEIVED 腿停用：Owner 判定 ext_ERP_Received_ByDocument_View 暂不使用）
 /// </summary>
 public class SupplyFactTraceService
 {

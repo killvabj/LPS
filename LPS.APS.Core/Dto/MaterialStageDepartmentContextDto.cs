@@ -69,6 +69,76 @@ public sealed class StageSequenceStep
     ///   `MISSING_PRODUCTION_DEPARTMENT_CONTEXT` 并置 Unscheduled，不得由 1号位 自行猜部门。
     /// </summary>
     public int? ProductionDepartmentId { get; init; }
+
+    // ────────────────────────────────────────────────────────────────────────
+    // 2026-11-25 新增：**Stage 实际执行厂**（0号位 2026-11-24 裁决 v1.2 §四；
+    //   2026-11-25 总表 §一「每段Stage精确通过 StageDict.StageCode→FactoryCode→FactoryId
+    //   验证 ProductionDepartment.FactoryId，传实际Stage执行厂、部门、匹配状态」）。
+    //
+    // 【为什么必须查字典，不能按 StageCode 前缀推】
+    //   实测（2026-11-25）：`StageDict` 里 `CN6_ASSY` / `CN6_MACH` / `CN6_OUTS` 的厂是 **`CN6课`**，
+    //   而 `Factory` 主档**没有 `CN6` 这个 Code**（只有 CN=2 / BJ=3 / CN6课=4 / SH=5 / TJ=6）。
+    //   按前缀推会得到 `CN6` ⇒ 查不到厂。规模：`CN6_MACH` 在 BOM 12,349 行 / MSDC 182,268 行。
+    //   ⚠ 别和 `StageLeadTimeParam` 搞混——那张表的厂码口径**是**阶段码前缀（`CN6`），
+    //     两张表口径相反且各自都对，统一成一个则另一边立刻错。
+    //
+    // 【来源】`StageFactoryCode` = `ext_MES_StageDict.FactoryCode`（ODS 同义词，只读）；
+    //         `StageFactoryId`   = `Factory.Code` 等值匹配得到的 `Id`；
+    //         `DepartmentFactoryId` = `ProductionDepartment.FactoryId`，**仅用于校验**，不参与取厂。
+    //
+    // 【null 语义】查不到就是查不到，**不猜、不回落 `Demand.FactoryId`／`SH.SourceFactoryId`**。
+    //   具体成因见 <see cref="FactoryMatchStatus"/>，消费侧据此走局部异常分支。
+    // ────────────────────────────────────────────────────────────────────────
+
+    /// <summary>`StageDict.FactoryCode`（如 `CN6课`）。查不到阶段码时为 null。</summary>
+    public string? StageFactoryCode { get; init; }
+
+    /// <summary>`Factory.Code → Factory.Id` 解析结果。解析不出为 null。</summary>
+    public int? StageFactoryId { get; init; }
+
+    /// <summary>`ProductionDepartment.FactoryId`——用于与 <see cref="StageFactoryId"/> 校验，不参与取厂。</summary>
+    public int? DepartmentFactoryId { get; init; }
+
+    /// <summary>工厂匹配状态，取值见 <see cref="StageFactoryMatchStatus"/>。默认空串＝未投影。</summary>
+    public string FactoryMatchStatus { get; init; } = string.Empty;
+}
+
+/// <summary>
+/// <see cref="StageSequenceStep.FactoryMatchStatus"/> 的取值。
+///
+/// 【实测分布 2026-11-25】（`MaterialStageDeptContext` 1,066,449 行）
+///   · 可解析到 FactoryId 的：1,066,448 行；
+///   · **部门厂 ≠ Stage 厂：0 行** ⇒ 今日事实上全部是 <see cref="Match"/>；
+///   · 唯一 1 行不可解析的是 `SYN-STAGE-1`（不在 StageDict、BOM 里也没有，死数据）。
+///
+/// 【为什么还要保留其余状态】今天的「0」是数据现状，不是契约保证：一旦 3号位/5号位 改主数据，
+///   静默取一个厂会让排程结果无声偏移。用状态位把「没有合法映射」显性化，是裁决的原话要求。
+/// </summary>
+public static class StageFactoryMatchStatus
+{
+    /// <summary>
+    /// 未投影／无判定。两种情形共用：
+    ///   ① 老载体（本字段未填）；
+    ///   ② **链级定义**（<see cref="StageChainDefinition.Stages"/>）——链可被多个物料共用，
+    ///      部门是 (物料,阶段) 级事实、不属于链，故**只给厂、不判定部门**。
+    /// 消费侧应按「无部门判定」处理，**不得**当 MATCH，也**不得**当「该阶段无部门」。
+    /// </summary>
+    public const string NotProjected = "";
+
+    /// <summary>部门厂 = Stage 厂。今日 100% 属此类。</summary>
+    public const string Match = "MATCH";
+
+    /// <summary>部门厂 ≠ Stage 厂。**不静默二选一**，保留异常交下游判定。</summary>
+    public const string Mismatch = "MISMATCH";
+
+    /// <summary>`StageDict` 有该阶段码，但 `FactoryCode` 在 `Factory` 主档查不到（如误填 `CN6`）。</summary>
+    public const string StageFactoryUnresolved = "STAGE_FACTORY_UNRESOLVED";
+
+    /// <summary>阶段码不在 `StageDict`（今日 BOM 侧 0 例）。</summary>
+    public const string StageNotInDict = "STAGE_NOT_IN_DICT";
+
+    /// <summary>该步无部门（今日 301,107 行 BOM，全部是 FINAL/OUTS，属**常态**非缺陷）。</summary>
+    public const string DepartmentUnresolved = "DEPARTMENT_UNRESOLVED";
 }
 
 /// <summary>
@@ -165,4 +235,119 @@ public sealed class StageLeadTimeFact
     ///   本字段是 `LPS.APS.Core` 契约扩展，**默认 false 保持既有行为**，加字段本身不改变任何现有结果。
     /// </summary>
     public bool IsLeadTimeOnly { get; init; }
+}
+
+/// <summary>
+/// **去重后的合法 Stage 链目录**（0号位 2026-11-24 裁决 v1.2 §3；2026-11-25 总表 §一 P0 第一项）。
+///
+/// 【它解决什么】旧载体 <see cref="StageSequenceChain"/> 以 `MaterialId` 为键，一个物料只能装一条链，
+///   同物料多条合法链只能整料隔离（289 条 `STAGE_CHAIN_ROLE_CONFLICT` 的直接成因）。
+///   本类按**链**去重，一条链一个 <see cref="ChainRefId"/>，与物料解耦。
+///
+/// 【与旧载体并存】`DomainSolveRequest.StageSequenceChains` 保留，但降级为
+///   「某物料在整个 Run 内**只有唯一等价链**时才出」的兼容口径。
+/// </summary>
+public sealed class StageChainDefinition
+{
+    /// <summary>
+    /// 链的稳定标识 = `<c>{StageScopeType}:{ChainSignature}</c>`（如 `ROOT:10:CN_MACH|20:CN_SURF`）。
+    ///
+    /// 【为什么是确定性字符串而不是自增】同一链在任何 Run 里算出同一个值，便于跨 Run 对拍；
+    ///   自增 Id 跨 Run 无意义，对拍还得再引一个签名。
+    /// </summary>
+    public string ChainRefId { get; init; } = string.Empty;
+
+    /// <summary>`ROOT` / `EDGE`（`EffectiveStageChainResolver.ScopeRoot` / `ScopeEdge`）。</summary>
+    public string StageScopeType { get; init; } = string.Empty;
+
+    /// <summary>
+    /// 链签名 = `StageSeq:StageCode` 按升序 `|` 连接（`EffectiveStageChainResolver.BuildChainKey`）。
+    /// 与 `ChainRefId` 的后半段恒等，单列出来是为了让消费侧不必解析 `ChainRefId`。
+    /// </summary>
+    public string ChainSignature { get; init; } = string.Empty;
+
+    /// <summary>已按 `StageSeq` 升序排列的完整 Stage 链（含工厂/部门富化）。</summary>
+    public IReadOnlyList<StageSequenceStep> Stages { get; init; } = Array.Empty<StageSequenceStep>();
+}
+
+/// <summary>
+/// **逐需求的链绑定**（0号位 2026-11-24 裁决 v1.2 §3「一 Demand 一行」「不同父边来源必须有真实 BindingKey」）。
+///
+/// 【键】`LogicalDemandKey` ＋ `BindingKey`。同一需求有多条父边时用不同 `BindingKey` 区分，
+///   不得把多父边塞进 `StageSegmentsJson` 冒充身份。
+/// </summary>
+public sealed class DemandStageChainBinding
+{
+    public string LogicalDemandKey { get; init; } = string.Empty;
+
+    /// <summary>同一需求内区分不同父边/供给关联的键。当前一个需求一条，形如 `<c>{scope}|{BOMNO}|{RepWorksetId}</c>`。</summary>
+    public string BindingKey { get; init; } = string.Empty;
+
+    /// <summary>父需求键（EDGE 侧有意义）。当前载体未提供逐父边需求键 ⇒ 暂为 null。</summary>
+    public string? ParentDemandKey { get; init; }
+
+    /// <summary>绑定的链；<see cref="StageChainBindingStatus.NoChain"/> 的状态下为 null。</summary>
+    public string? ChainRefId { get; init; }
+
+    /// <summary>`ROOT` / `EDGE`。</summary>
+    public string StageScopeType { get; init; } = string.Empty;
+
+    /// <summary>本需求所属请求的 `ResolvedBOMNO`。</summary>
+    public string? ResolvedBOMNO { get; init; }
+
+    /// <summary>本需求所属 Workset（`OrderBomRequestLink.RepWorksetId`）。</summary>
+    public long? RepWorksetId { get; init; }
+
+    /// <summary>本次装载的 BOM 批次标识，便于与源数据对拍。</summary>
+    public string? BatchNo { get; init; }
+
+    /// <summary>解析状态，取值见 <see cref="StageChainBindingStatus"/>。</summary>
+    public string Status { get; init; } = StageChainBindingStatus.Resolved;
+
+    /// <summary>
+    /// **候选链签名**（1号位 2026-11-25 回执 §Q4 点名要的「歧义在哪几条链」）。
+    ///
+    /// 【内容】本需求在选择时**所有出现过的**候选链签名（`StageSeq:StageCode|…`），含最终选中的那条。
+    ///   来源＝`EffectiveStageChainResolver.Resolution` 的 `ChainKey` ＋ `RejectedChainKeys`，
+    ///   装载侧现成就有、不额外查库。
+    ///
+    /// 【为空的情形】无任何候选（`NO_CHAIN` / `NO_ANCHOR`）⇒ 空表；正常单链 ⇒ 只含 1 条。
+    /// 【口径】只报**签名**，不重复报各链的阶段明细 —— 明细在 `StageChainDefinitions` 里按 `ChainRefId` 取。
+    /// </summary>
+    public IReadOnlyList<string> CandidateChainSignatures { get; init; } = Array.Empty<string>();
+
+    /// <summary>候选链条数（`CandidateChainSignatures.Count` 的便捷投影，便于快速过滤 >1 的歧义需求）。</summary>
+    public int CandidateChainCount { get; init; }
+}
+
+/// <summary>
+/// <see cref="DemandStageChainBinding.Status"/> 取值。
+///
+/// 【前四个不是我方自造的词表】与 `EffectiveStageChainResolver.RequestIdentityState`
+///   一一对应（`Anchored`→<see cref="Resolved"/>、`ParentEdgeScoped`→<see cref="ParentEdgeScoped"/>、
+///   `UnverifiedRequestIdentity`→<see cref="UnverifiedIdentity"/>、`NoAnchor`→<see cref="NoAnchor"/>），
+///   只有 <see cref="Conflict"/> 是新增的。1号位 若希望直接用枚举原名，改这一个常量类即可。
+///
+/// 【消费侧要求】`NoChain` 的三种（<see cref="NoAnchor"/> / <see cref="Conflict"/> / 无绑定行）
+///   成因不同、未排原因也不同，**不得**合并成一类静默处理。
+/// </summary>
+public static class StageChainBindingStatus
+{
+    /// <summary>锚定到真实请求键，唯一合法链。</summary>
+    public const string Resolved = "RESOLVED";
+
+    /// <summary>EDGE 只能按父边收窄，**非请求级可信**（J16-01）。</summary>
+    public const string ParentEdgeScoped = "PARENT_EDGE_SCOPED";
+
+    /// <summary>有 BOMNO 但缺第二层锚点，请求实例身份未验证（J15-01 状态 b）。</summary>
+    public const string UnverifiedIdentity = "UNVERIFIED_IDENTITY";
+
+    /// <summary>三键全空 ⇒ 无权威请求身份（J15-01 状态 c）。</summary>
+    public const string NoAnchor = "NO_ANCHOR";
+
+    /// <summary>请求身份未经证明且候选链内容不一致（J16-01 准入），或物料级角色冲突。**仅隔离本需求，不影响邻单**。</summary>
+    public const string Conflict = "CONFLICT";
+
+    /// <summary>本需求本次没有可用链（本批无该物料 StagePath 行 / 首选 scope 无链）。</summary>
+    public const string NoChain = "NO_CHAIN";
 }

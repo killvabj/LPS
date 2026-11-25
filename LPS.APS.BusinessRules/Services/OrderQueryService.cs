@@ -55,6 +55,7 @@ public class OrderQueryService
         string? productFamilyCode = null,
         string? orderType = null,
         string? materialType = null,
+        IReadOnlyList<string>? execDepartmentCodes = null,
         DateTime? dueDateFrom = null,
         DateTime? dueDateTo = null,
         string? riskLevel = null,
@@ -77,7 +78,7 @@ public class OrderQueryService
             planVersionId: planVersionId, orderNo: orderNo, materialCode: materialCode, customerName: customerName,
             factoryCode: factoryCode, domainKey: domainKey, delayStatus: delayStatus, status: status,
             productionInstructionNo: productionInstructionNo, productFamilyCode: productFamilyCode,
-            orderType: orderType, materialType: materialType,
+            orderType: orderType, materialType: materialType, execDepartmentCodes: execDepartmentCodes,
             dueDateFrom: dueDateFrom, dueDateTo: dueDateTo,
             riskLevel: riskLevel, sortBy: sortBy, sortDir: sortDir,
             skip: skip, take: take, ct: ct, allowedFactories: allowedFactories, allowedDomains: allowedDomains);
@@ -114,6 +115,7 @@ public class OrderQueryService
         string? productFamilyCode = null,
         string? orderType = null,
         string? materialType = null,
+        IReadOnlyList<string>? execDepartmentCodes = null,
         DateTime? dueDateFrom = null,
         DateTime? dueDateTo = null,
         string? riskLevel = null,
@@ -129,7 +131,7 @@ public class OrderQueryService
             planVersionId: planVersionId, orderNo: orderNo, materialCode: materialCode, customerName: customerName,
             factoryCode: factoryCode, domainKey: domainKey, delayStatus: delayStatus, status: status,
             productionInstructionNo: productionInstructionNo, productFamilyCode: productFamilyCode,
-            orderType: orderType, materialType: materialType,
+            orderType: orderType, materialType: materialType, execDepartmentCodes: execDepartmentCodes,
             dueDateFrom: dueDateFrom, dueDateTo: dueDateTo,
             riskLevel: riskLevel, allowedFactories: allowedFactories, allowedDomains: allowedDomains, ct: ct);
     }
@@ -151,6 +153,7 @@ public class OrderQueryService
         string? productFamilyCode = null,
         string? orderType = null,
         string? materialType = null,
+        IReadOnlyList<string>? execDepartmentCodes = null,
         DateTime? dueDateFrom = null,
         DateTime? dueDateTo = null,
         string? riskLevel = null,
@@ -166,7 +169,7 @@ public class OrderQueryService
             planVersionId: planVersionId, orderNo: orderNo, materialCode: materialCode, customerName: customerName,
             factoryCode: factoryCode, domainKey: domainKey, delayStatus: delayStatus, status: status,
             productionInstructionNo: productionInstructionNo, productFamilyCode: productFamilyCode,
-            orderType: orderType, materialType: materialType,
+            orderType: orderType, materialType: materialType, execDepartmentCodes: execDepartmentCodes,
             dueDateFrom: dueDateFrom, dueDateTo: dueDateTo,
             riskLevel: riskLevel, allowedFactories: allowedFactories, allowedDomains: allowedDomains, ct: ct);
     }
@@ -198,11 +201,12 @@ public class OrderQueryService
         int pageIndex = 1,
         int pageSize = 50,
         IReadOnlySet<string>? allowedDomains = null,
+        IReadOnlySet<string>? allowedFactories = null,
         CancellationToken ct = default)
     {
         if (planVersionId <= 0) throw new ArgumentException("planVersionId 必填");
         return await _repository.GetOrderPoolAsync(planVersionId, participation, keyword, orderType,
-            pageIndex, pageSize, allowedDomains, ct);
+            pageIndex, pageSize, allowedDomains, allowedFactories, ct);
     }
 
     /// <summary>
@@ -222,6 +226,7 @@ public class OrderQueryService
         string? productFamilyCode = null,
         string? orderType = null,
         string? materialType = null,
+        IReadOnlyList<string>? execDepartmentCodes = null,
         DateTime? dueDateFrom = null,
         DateTime? dueDateTo = null,
         string? riskLevel = null,
@@ -237,7 +242,7 @@ public class OrderQueryService
             planVersionId: planVersionId, orderNo: orderNo, materialCode: materialCode, customerName: customerName,
             factoryCode: factoryCode, domainKey: domainKey, delayStatus: delayStatus, status: status,
             productionInstructionNo: productionInstructionNo, productFamilyCode: productFamilyCode,
-            orderType: orderType, materialType: materialType,
+            orderType: orderType, materialType: materialType, execDepartmentCodes: execDepartmentCodes,
             dueDateFrom: dueDateFrom, dueDateTo: dueDateTo,
             riskLevel: riskLevel, allowedFactories: allowedFactories, allowedDomains: allowedDomains, ct: ct);
     }

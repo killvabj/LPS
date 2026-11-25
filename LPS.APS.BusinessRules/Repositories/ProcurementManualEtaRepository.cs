@@ -408,9 +408,9 @@ WITH hit AS (
     SELECT MaterialId FROM SupplyFact_Pipeline
      WHERE SourceDocumentNo = @PoNo
        AND (@LineNo IS NULL OR TRY_CAST(SourceDocumentLineNo AS int) = @LineNo)
-    UNION
-    SELECT ISNULL(MasterID, 0) FROM ext_ERP_Received_ByDocument_View
-     WHERE DocumentNo = @PoNo
+    -- 2026-11-24 Owner 判定视图暂不使用：原 UNION 第三路（ext_ERP_Received_ByDocument_View，DocumentNo=@PoNo）
+    -- 已停用。该路 DocumentNo 实为生产指示号（InstrID）而非采购单号，语义本有歧义；
+    -- 恢复须换源（直读 ERP_U13_Received 真表）并经 0号位 裁决，禁止直接改回旧视图。
 )" + selectPart + @"
 INNER JOIN (SELECT DISTINCT MaterialId FROM hit WHERE MaterialId > 0) h ON h.MaterialId = m.Id
 WHERE (@Kw IS NULL OR m.MaterialCode LIKE @Kw OR m.MaterialName LIKE @Kw OR m.Spec LIKE @Kw)

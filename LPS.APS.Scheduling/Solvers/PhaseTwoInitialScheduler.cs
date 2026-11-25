@@ -210,6 +210,12 @@ internal class PhaseTwoInitialScheduler
     private readonly HashSet<string> _handoffWorkNoCalendarKeys = new(StringComparer.Ordinal);
 
     /// <summary>
+    /// 2026-11-25（0号位 v1.2 §3）：`STAGE_FACTORY_UNVERIFIED` 追溯去重（`需求键|ToStage`）。
+    /// 同一需求同一 Stage 只写一条，避免规则表多条时刷屏。
+    /// </summary>
+    private readonly HashSet<string> _handoffFactoryUnverifiedKeys = new(StringComparer.Ordinal);
+
+    /// <summary>
     /// **2026-10-25 未排原因自报**（响应 2号位《单域可复现样本》：1 条需求产出 0 Task 且槽位检索 **0 次**）。
     ///
     /// 【要解决的问题】Phase2 里能让一条需求「0 Task 且一次槽位检索都不做」的出口有**十几条**
@@ -249,33 +255,97 @@ internal class PhaseTwoInitialScheduler
     /// <para>三档：①有 routeless 提前期片且**全部命中 LT** ⇒ 只做 StageTiming；②有片但**缺 LT** ⇒ `STAGE_LEADTIME_MISSING`；
     /// ③连 Stage 链都没有 ⇒ StageTimingNode 也无从形成（缺 `StageSequenceChains`/StagePath）。</para>
     /// </summary>
-    private static string ClassifyNoRouting(LogicalProductionDemand demand, DomainSolveRequest request)
+    private static string ClassifyNoRouting(
+        LogicalProductionDemand demand,
+        DomainSolveRequest request,
+        ConstraintContext constraints,
+        DemandChainResolver.Index chainIndex)
     {
         // ⚠ 不能用 `RoutelessLeadStepsByDemand`：它只登记「**有 Routing 的物料**中间的无 Routing Stage」，
         //   对「整个物料一条 Routing 都没有」**不生成条目**（实测 134/134 全落空 ⇒ 误判成"无 Stage 链"）。
         //   ⇒ 直接读本次入参的两个原始载体：`StageSequenceChains`（链）与 `StageLeadTimes`（LT）。
-        var chain = request.StageSequenceChains.FirstOrDefault(c => c.MaterialId == demand.MaterialId);
-        var chainStages = chain?.Stages;
-        if (chainStages is null || chainStages.Count == 0)
+        // 2026-11-25（A31③）：逐需求取链（绑定优先、无绑定行才回落物料级兼容载体）。
+        //   同时把「载体未投影」与「2号位 判定本需求无链」分开报——两者未排成因不同（0号位 §3 S3）。
+        if (!DemandChainResolver.TryResolve(chainIndex, demand, out var chainStages, out var chainSource)
+            || chainStages.Count == 0)
         {
-            return "［分因：**无 Stage 链**（缺 `StageSequenceChains`/StagePath）⇒ StageTimingNode 也无从形成］";
+            return chainSource == DemandChainResolver.ChainSource.BindingNoChain
+                ? "［分因：**本需求本次无可用链**（绑定 `Status` 为 `NO_CHAIN`/`NO_ANCHOR`/`CONFLICT`）⇒ StageTimingNode 也无从形成］"
+                : "［分因：**无 Stage 链**（既无逐需求绑定，物料级 `StageSequenceChains` 也无此物料）⇒ StageTimingNode 也无从形成］";
         }
 
-        var ltStages = new HashSet<string>(
-            request.StageLeadTimes
-                .Where(f => f.MaterialId == demand.MaterialId)
-                .Select(f => f.StageCode),
-            StringComparer.Ordinal);
-        var missing = chainStages
-            .Select(s => s.StageCode)
-            .Where(s => !ltStages.Contains(s))
-            .Distinct()
-            .ToList();
+        // ── 2026-11-25 修正（0号位 §3 T4「根因须指向最早真实阻断」）──
+        //   原实现只要「链上都有 LT」就报「有合法 LT ⇒ 只形成 StageTimingNode」，
+        //   但本方法**只在未排分支被调用** ⇒ 文案读起来像"已放行"，与"未排"结果自相矛盾。
+        //   实测样本 `999634_72`（链 BJ_ASSY>BJ_FINAL，`BJ_FINAL` 有 LT 但无部门）即此形态：
+        //   文案写"有合法 LT"，真实阻断是**缺部门⇒无合法 WORK 窗**。
+        //   ⇒ 改为**与 `IsRoutelessTimingOnly` 完全同源**地逐门禁复核：
+        //     它为什么返回 false，这里就报哪一道，文案与结果不可能再打架。
 
-        return missing.Count > 0
-            ? $"［分因：无Routing Stage **缺合法小时 LT**（{string.Join("/", missing)}）"
-              + "⇒ 按冻结记 `STAGE_LEADTIME_MISSING`，本需求局部未排］"
-            : "［分因：无Routing Stage **有合法 LT** ⇒ 按冻结只形成 StageTimingNode、**不生成 Task**（O-009）］";
+        // ③ 输入含工序行（真·非无 Routing）
+        if (constraints.MaterialsWithRoutingInput.Contains(demand.MaterialId))
+        {
+            return "［分因：输入**含**本物料的工序行但未建出 Routing 图（我方 `BuildRoutingGraphs`）"
+                 + "⇒ 按未排，不以「无 Routing」放行］";
+        }
+
+        // ④ 起点必须在链内
+        if (!string.IsNullOrWhiteSpace(demand.StartStageCode)
+            && !chainStages.Any(s => string.Equals(s.StageCode, demand.StartStageCode, StringComparison.Ordinal)))
+        {
+            return $"［分因：`StartStageCode='{demand.StartStageCode}'` **不在本需求的 Stage 链内**"
+                 + $"（链={string.Join(">", chainStages.Select(s => s.StageCode))}）⇒ 起点非法，按未排］";
+        }
+
+        // 无工序行时无法把 StartOperationCode 映射到 Stage
+        if (!string.IsNullOrWhiteSpace(demand.StartOperationCode))
+        {
+            return $"［分因：`StartOperationCode='{demand.StartOperationCode}'` 无工序行可映射到 Stage"
+                 + "⇒ 无法确定起点，按未排（与 Phase1 BFS 起点同口径）］";
+        }
+
+        // ② 链上（在范围内的）每段：LT + 合法 WORK 窗口 —— 用与 `IsRoutelessTimingOnly` **同一函数**预演
+        var startSeq = 0;
+        if (!string.IsNullOrWhiteSpace(demand.StartStageCode))
+        {
+            startSeq = chainStages
+                .Where(s => string.Equals(s.StageCode, demand.StartStageCode, StringComparison.Ordinal))
+                .Select(s => s.StageSeq)
+                .DefaultIfEmpty(0)
+                .Min();
+        }
+        var inScope = chainStages.Where(s => s.StageSeq >= startSeq).ToList();
+        if (inScope.Count == 0)
+        {
+            return "［分因：按起点裁剪后**在范围内的 Stage 为空** ⇒ StageTimingNode 无从形成，按未排］";
+        }
+
+        var cu = request.PlanningStart;
+        var ltFacts = request.StageLeadTimes
+            .Where(f => f.MaterialId == demand.MaterialId)
+            .ToDictionary(f => f.StageCode, f => f, StringComparer.Ordinal);
+        foreach (var step in inScope)
+        {
+            if (!ltFacts.TryGetValue(step.StageCode, out var lt))
+            {
+                return $"［分因：无Routing Stage `{step.StageCode}` **缺合法小时 LT**"
+                     + "⇒ 按冻结记 `STAGE_LEADTIME_MISSING`，本需求局部未排］";
+            }
+
+            if (!StageTimingNodeBuilder.TryAdvanceByWorkHours(
+                    request, demand, step.StageCode, cu, lt.LeadTimeHours, out var cuEnd, out var workReason,
+                    lt.IsLeadTimeOnly))
+            {
+                return $"［分因：无Routing Stage `{step.StageCode}` **无合法 WORK 窗口**"
+                     + (string.IsNullOrWhiteSpace(workReason) ? string.Empty : $"（{workReason}）")
+                     + "⇒ 缺口日历/部门事实，本需求局部未排；不假造时间］";
+            }
+
+            cu = cuEnd;
+        }
+
+        // 走到这里说明各门禁都过 —— 理论不可达（调用点只在 `IsRoutelessTimingOnly` 返回 false 时进入）。
+        return "［分因：各门禁复核均通过但未被放行 ⇒ **判据不同源，需排查**（不应出现）］";
     }
 
     /// <summary>
@@ -295,7 +365,8 @@ internal class PhaseTwoInitialScheduler
     private static bool IsRoutelessTimingOnly(
         LogicalProductionDemand demand,
         DomainSolveRequest request,
-        ConstraintContext constraints)
+        ConstraintContext constraints,
+        DemandChainResolver.Index chainIndex)
     {
         // ③ 输入含工序行 ⇒ 不是"合法无 Routing"，维持未排（可能是 BuildRoutingGraphs 缺陷）
         if (constraints.MaterialsWithRoutingInput.Contains(demand.MaterialId))
@@ -303,9 +374,9 @@ internal class PhaseTwoInitialScheduler
             return false;
         }
 
-        // ① 必须有权威 Stage 链
-        var chain = request.StageSequenceChains.FirstOrDefault(c => c.MaterialId == demand.MaterialId);
-        if (chain is null || chain.Stages.Count == 0)
+        // ① 必须有权威 Stage 链（2026-11-25 A31③：逐需求取链，绑定优先）
+        if (!DemandChainResolver.TryResolve(chainIndex, demand, out var chainStages, out _)
+            || chainStages.Count == 0)
         {
             return false;
         }
@@ -315,7 +386,7 @@ internal class PhaseTwoInitialScheduler
         //   可达集为空 ⇒ Phase5 一段也产不出 ⇒ 会变成"既不进未排、也没有 StageTimings"的**静默丢失**
         //   （实测 FRL 8,218 条放行里有 280 条正是此形态：`StartStageCode='TJ_MACH'`，链只有 `TJ_OUTS`）。
         if (!string.IsNullOrWhiteSpace(demand.StartStageCode)
-            && !chain.Stages.Any(s => string.Equals(s.StageCode, demand.StartStageCode, StringComparison.Ordinal)))
+            && !chainStages.Any(s => string.Equals(s.StageCode, demand.StartStageCode, StringComparison.Ordinal)))
         {
             return false;
         }
@@ -330,14 +401,14 @@ internal class PhaseTwoInitialScheduler
         var startSeq = 0;
         if (!string.IsNullOrWhiteSpace(demand.StartStageCode))
         {
-            startSeq = chain.Stages
+            startSeq = chainStages
                 .Where(s => string.Equals(s.StageCode, demand.StartStageCode, StringComparison.Ordinal))
                 .Select(s => s.StageSeq)
                 .DefaultIfEmpty(0)
                 .Min();
         }
 
-        var inScope = chain.Stages.Where(s => s.StageSeq >= startSeq).ToList();
+        var inScope = chainStages.Where(s => s.StageSeq >= startSeq).ToList();
         if (inScope.Count == 0)
         {
             return false;
@@ -647,6 +718,9 @@ internal class PhaseTwoInitialScheduler
         // 按跨物料分层顺序排序（子层先、父层后，层内按 DemandSequence）；无跨物料关系时等价于旧平铺。
         var demandByKey = request.LogicalProductionDemands
             .ToDictionary(d => d.LogicalDemandKey);
+
+        // 2026-11-25（A31③）：逐需求取链索引，**每轮建一次**（5 处消费共用，避免 per-demand 重建）。
+        var chainIndex = DemandChainResolver.BuildIndex(request);
 
         List<LogicalProductionDemand> sortedDemands;
         if (constraints.CrossMaterialOrder.Count > 0)
@@ -985,19 +1059,36 @@ internal class PhaseTwoInitialScheduler
         //   在查清 `StageTimingNodeBuilder.Build` 到底改了什么之前，**保持关闭**（传 null = 旧行为）。
         // ⛔ 2026-11-04 关闭（甲案）：r18 实测本预计算把 MISSING_PRODUCTION_DEPARTMENT_CONTEXT
         //   从 2,178 炸到 35,818、FinalTask 归零。原因未查清前**不进主线**。
-        // ── 2026-11-21：改成**受控开关**（默认关闭、零行为变更），用于小域 A/B 复现 r18。
+        // ── 2026-11-21：改成**受控开关**（当时默认关闭、零行为变更），用于小域 A/B 复现 r18。
         //   复现方法：`APS_P2_STAGETIMING_FLOOR=1` 时启用；同一入参跑「关/开」两轮对比未排与 Task 数。
         //   `BuildLeadTimeOnlyCompletion` 已自带 TraceNotes 回滚（见其注释），因此 r18 的爆炸**不是**
         //   注记重复导致 —— 真因仍需以两轮实测定位，不以推测代替证据。
-        var leadTimeOnlyCompletion = Environment.GetEnvironmentVariable("APS_P2_STAGETIMING_FLOOR") == "1"
-            ? (IReadOnlyDictionary<string, DateTime>?)BuildLeadTimeOnlyCompletion(request, constraints)
-            : null;
+        //
+        // ── 2026-11-24 **默认启用**（CF-T 功能补全；0号位 §A.4「合法无 Routing 的 Stage 独立计时，
+        //    可传播其合法时间」）──
+        //   为什么现在必须开：O-009 把 7,932 条需求放行为「仅计时、不产 Task」后，其父件取
+        //     `demandCompletion` 永远无条目 ⇒ 实测 FRL **12,039 个父件**被判 `P2_CHILD_UNAVAILABLE`
+        //     且归因成「未轮到」。不开这一项，O-009 的放行等于把连坐从子件转嫁给父件。
+        //   红线仍守：本表只收「**无末端 Task 且有 StageTimings**」的合法时间约束；有 Routing 却未排下
+        //     的支路，其候选口径提前期已被 `StageTimingNodeBuilder` 抑制 ⇒ 不进本表（不会假齐料）。
+        //   ⚠ **未证事项（如实登记）**：2026-11-04 r18 打开时曾出现 `MISSING_PRODUCTION_DEPARTMENT_CONTEXT`
+        //     由 2,178 炸到 35,818、FinalTask 归零，真因至今未查清。本次按 0号位 功能优先要求先开，
+        //     **同输入对拍验证尚未执行**；一旦出现同类爆炸，用 `APS_P2_STAGETIMING_FLOOR=0` 即可回滚到旧行为。
+        var leadTimeOnlyCompletion = Environment.GetEnvironmentVariable("APS_P2_STAGETIMING_FLOOR") == "0"
+            ? null
+            : (IReadOnlyDictionary<string, DateTime>?)BuildLeadTimeOnlyCompletion(request, constraints);
 
-        // 原实现（待修复后恢复）：
-        // var leadTimeOnlyCompletion = BuildLeadTimeOnlyCompletion(request, constraints);
+        // ── 2026-11-24 CF-T（0号位 §一.4「`P2_CHILD_UNAVAILABLE` 必须溯到每条最早阻断，
+        //   **不能只出父件失败码**」）──
+        //   旧判定把「不在 `UnscheduledDemandKeys` 里」一律当成**未轮到**；O-009 放行的
+        //   「仅计时、不产 Task、也不登记未排」需求恰好同样不在该集合 ⇒ 实测 FRL 12,039 个父件
+        //   的「未轮到」样例子件 **100%** 是这类已放行需求（1,809/1,809），纯属**假分类**。
+        //   本集合只用于**归因文案**，不参与任何判定。
+        var processedDemandKeys = new HashSet<string>(StringComparer.Ordinal);
 
         foreach (var demand in sortedDemands)
         {
+            processedDemandKeys.Add(demand.LogicalDemandKey);
             SolverDiagnostics.SetPhase2DemandProgress(++phase2Processed);
             // 2026-11-09 Step 1（专家 Q3/Q4）：低频分桶画像。未设 `APS_P2_BUCKET_CSV` 时第一行即返回（零成本）。
             Phase2WindowProfiler.Tick(phase2Processed);
@@ -1195,7 +1286,7 @@ internal class PhaseTwoInitialScheduler
                 //   ③输入**不含**该物料的工序行（真·无 Routing；含行未建图属我方 BuildRoutingGraphs，仍按未排）。
                 //   此时 Phase5 `StageTimingNodeBuilder.Build` 会产出 StageTimingNode（`HasRoutingInScope=false`
                 //   不会抑制候选提前期），本需求**不计未排**；**不伪造 Task**，WORK 窗口不足时仍由既有 Issue 留痕。
-                if (IsRoutelessTimingOnly(actualDemand, request, constraints))
+                if (IsRoutelessTimingOnly(actualDemand, request, constraints, chainIndex))
                 {
                     continue;
                 }
@@ -1214,7 +1305,7 @@ internal class PhaseTwoInitialScheduler
                     //   冻结口径：无 Routing Stage 不生成 Task，只形成 StageTimingNode；
                     //   「缺合法小时 LT」⇒ `STAGE_LEADTIME_MISSING`，**受影响需求局部未排、其他需求继续**。
                     //   ⚠ 只改**诊断正文**，官方 `UnscheduledTasks.Reason` 仍是既有码（值域封闭，不自造新码）。
-                    + ClassifyNoRouting(actualDemand, request));
+                    + ClassifyNoRouting(actualDemand, request, constraints, chainIndex));
                 continue;
             }
 
@@ -1371,9 +1462,10 @@ internal class PhaseTwoInitialScheduler
                     unschedAbsorbed++;
                 }
 
-                int childFailed = 0, childNotYet = 0, childDangling = 0;
+                int childFailed = 0, childNotYet = 0, childDangling = 0, childReleased = 0;
                 var notYetSample = new List<string>(2);
                 var danglingSample = new List<string>(2);
+                var releasedSample = new List<string>(2);
                 // 2026-11-04（纯观测）：把「已失败」的子件**按它自己的出口成因分档** —— 此前只知数量、
                 //   不知成因，导致 5,514 片连坐里除缺部门外那三千多条查不出来源。
                 var failedByCause = new Dictionary<string, int>(StringComparer.Ordinal);
@@ -1405,8 +1497,18 @@ internal class PhaseTwoInitialScheduler
                     }
                     else if (demandByKey.ContainsKey(childKey))
                     {
-                        childNotYet++;
-                        if (notYetSample.Count < 2) notYetSample.Add(childKey);
+                        // 2026-11-24 CF-T：**已处理但既不产 Task、也不登记未排** ⇒ 是 O-009「仅计时放行」，
+                        //   不是「未轮到」。真·未轮到只可能是拓扑序失效（本处保持原样，便于发现回归）。
+                        if (processedDemandKeys.Contains(childKey))
+                        {
+                            childReleased++;
+                            if (releasedSample.Count < 2) releasedSample.Add(childKey);
+                        }
+                        else
+                        {
+                            childNotYet++;
+                            if (notYetSample.Count < 2) notYetSample.Add(childKey);
+                        }
                     }
                     else
                     {
@@ -1423,6 +1525,8 @@ internal class PhaseTwoInitialScheduler
                     + $"/{(constraints.CrossMaterialParentToChildren.TryGetValue(demand.LogicalDemandKey, out var allKids) ? allKids.Count : missingChildren.Count)}："
                     + $"已失败 {childFailed}｜未轮到 {childNotYet}"
                     + $"{(notYetSample.Count > 0 ? "（例 " + string.Join(",", notYetSample) + "）" : string.Empty)}"
+                    + $"｜已放行无Task {childReleased}"
+                    + $"{(releasedSample.Count > 0 ? "（例 " + string.Join(",", releasedSample) + "）" : string.Empty)}"
                     + $"｜悬空键 {childDangling}"
                     + $"{(danglingSample.Count > 0 ? "（例 " + string.Join(",", danglingSample) + "）" : string.Empty)}"
                     // 2026-11-04（纯观测）：已失败子件按**自身成因**再分档，供定位连坐链源头
@@ -2265,7 +2369,15 @@ internal class PhaseTwoInitialScheduler
                 if (fact.TerminalFinalDraftId is null
                     && fact.StageTimings is { Count: > 0 })
                 {
-                    map[fact.LogicalDemandKey] = fact.CompletionTime;
+                    // ── 2026-11-24（0号位《逐DemandStage链…》§二.3）──
+                    //   逐字：「下游如依赖该 Stage，最早开始时间不得早于上游**最后必要数量**的
+                    //   合法阶段完成时间/所需 LT」。
+                    //   `RequiredStageCode` = BOM 边的供给阈值 Stage（子件做到这个 Stage 即可被父件使用）；
+                    //   ⇒ 有阈值时必须取 **`RequiredStageCompletionTime`**（该阈值段的完成时点），
+                    //     而不是整链 `CompletionTime` —— 后者含阈值之后的工序，会把父件**不必要地推后**，
+                    //     违反「既不提前释放不合格供给、也不错误压到末端完工时点」（0号位 2026-10-23 §3 R09-T11）。
+                    //   无阈值（`RequiredStageCode` 空）⇒ 冻结口径是「全工艺完成才可供给」⇒ 用整链完成时间。
+                    map[fact.LogicalDemandKey] = fact.RequiredStageCompletionTime ?? fact.CompletionTime;
                     withTimings++;
                 }
                 else
@@ -5326,9 +5438,22 @@ internal class PhaseTwoInitialScheduler
             if (rule is null || rule.IsActive != true) continue;
             if (!string.Equals(rule.ToStageCode, toStageCode, StringComparison.Ordinal)) continue;
             if (string.Equals(rule.FromStageCode, toStageCode, StringComparison.Ordinal)) continue;
-            // 键域 = 需求自带厂代码（`LogicalProductionDemand.FactoryCode`，契约 §五 指定首键）；
-            //   **不得**用资源厂代码反推（同字段注释明令禁止）。
-            if (!string.Equals(rule.FactoryCode, demand.FactoryCode, StringComparison.Ordinal)) continue;
+            // 键域 = **当前正在排程的 Stage 的执行厂**（0号位 2026-11-25 Q1 逐字：
+            //   「以当前正在排程的 Stage 为准……不使用 Demand.FactoryCode、根订单厂或任意上下游 Stage 厂」）。
+            //   来源 = 逐需求链定义的 `StageFactoryCode`（`StageDict.FactoryCode` 权威映射）。
+            //   ⚠ 0号位 2026-11-25 v1.2 §3 逐字：「**不能缺值回 `Demand.FactoryCode`**。r14421 的
+            //     回退分支**必须撤除**；缺权威厂应暴露技术未证……不捏造可用时间或全域误阻。」
+            //     ⇒ 取不到权威厂 = **判定不了本条规则是否命中** ⇒ 该条等待**不应用**（既不加也不减）、
+            //       **不回退需求厂**，并就地登记「该需求该 Stage 的需用时间不可信」。
+            //   仍**不得**用资源厂代码反推（同字段注释明令禁止）。
+            var ruleFactoryKey = StageHandoffFactoryKey.Resolve(
+                constraints.StageFactoryByDemandStage, demand, rule.ToStageCode);
+            if (ruleFactoryKey is null)
+            {
+                RecordStageHandoffFactoryUnverified(demand, rule, constraints);
+                continue;
+            }
+            if (!string.Equals(rule.FactoryCode, ruleFactoryKey, StringComparison.Ordinal)) continue;
 
             // 本批内 FromStage 全部 Task 的最晚结束时间
             DateTime fromStageEnd = DateTime.MinValue;
@@ -5362,6 +5487,47 @@ internal class PhaseTwoInitialScheduler
         }
 
         return effective;
+    }
+
+    /// <summary>
+    /// 2026-11-25（0号位 v1.2 §3）｜**缺权威 Stage 执行厂 ⇒ 判定不了规则是否命中**，就地留痕。
+    ///
+    /// <para>逐字依据：「`StageCode→StageDict.FactoryCode` 权威取得……**不能缺值回 `Demand.FactoryCode`**。
+    ///   r14421 的回退分支**必须撤除**；缺权威厂应暴露技术未证并阻断受影响需用时间/份额，
+    ///   不捏造可用时间或全域误阻。」</para>
+    ///
+    /// <para>【本方法做什么/不做什么】</para>
+    /// <list type="bullet">
+    ///   <item>**不**改排程结果以外的任何判定：该条等待不应用（既不加也不减）；</item>
+    ///   <item>**不**回退需求厂、**不**用资源厂反推、**不**截 StageCode 前缀；</item>
+    ///   <item>把「该需求 × 该 Stage 的需用时间**不可信**」写进追溯（每条只写一次）；
+    ///     同一判据在 <see cref="StageTimingNodeBuilder"/> 侧驱动 `CompletionTimeCertain=false`。</item>
+    /// </list>
+    ///
+    /// <para>⚠ 为什么**不**直接判该需求未排：老载荷（`StageChainDefinitions` 为空）下全域都取不到厂，
+    ///   硬阻断会变成 0号位 明令禁止的「**全域误阻**」。本方法只收缩「可声称的时间」，不收缩「能否排」。</para>
+    /// </summary>
+    private void RecordStageHandoffFactoryUnverified(
+        LogicalProductionDemand demand,
+        StageHandoffWaitRule rule,
+        ConstraintContext constraints)
+    {
+        var key = $"{demand.LogicalDemandKey}|{rule.ToStageCode}";
+        if (!_handoffFactoryUnverifiedKeys.Add(key)) return;
+
+        constraints.TraceNotes.Add(new SolveTraceNote
+        {
+            Key = demand.LogicalDemandKey ?? string.Empty,
+            ReasonCode = "STAGE_FACTORY_UNVERIFIED",
+            Level = "Warning",
+            Message = $"Stage 交接等待规则 `{rule.FromStageCode}→{rule.ToStageCode}`（规则厂={rule.FactoryCode}，"
+                      + $"等待 {rule.WaitMinutes} 分钟）**无法判定是否命中本需求**："
+                      + $"该 Stage 的权威执行厂（`StageDict.StageCode→FactoryCode`）在本次载荷中取不到"
+                      + $"（`StageChainDefinitions[].Stages[].StageFactoryCode` 缺失/未投影）。"
+                      + "按 0号位 2026-11-25 Q1：**不回退 `Demand.FactoryCode`**、不猜厂；"
+                      + "该条等待**未应用**（不加也不减），本需求该 Stage 的需用时间**不可信**"
+                      + "（`CompletionTimeCertain=false`）。待 2号位 下发含执行厂的链定义后重算。"
+        });
     }
 
     /// <summary>
@@ -10418,6 +10584,26 @@ internal class PhaseTwoInitialScheduler
                     || !string.Equals(piCandidate.ProductionInstructionNo,
                                       demand.ProductionInstructionNo, StringComparison.Ordinal)) continue;
             }
+
+            // ── 2026-11-24 W5（有界改动，**判据集合与命中结果逐条不变**）──
+            //   旧实现：对**每个**同(物料,工厂)分组都 `new HashSet` + 逐 Task 插入 + `SetEquals`。
+            //   实测 `merge_anchor_scan` 256,356 ms／447,470 次（PV999507 剖析，占墙钟 8.9%）。
+            //   新增的只是**等价前置过滤**：`group.Count == operations.Count` 已成立，
+            //   若组内任一 Task 的 (StageCode, OperationCode) 不在候选工序集里，
+            //   则 `groupOps` 与 `opByKey.Keys` 的集合必然不等 ⇒ 旧实现也会 `continue`。
+            //   ⇒ 命中结果不可能改变；只是绝大多数不匹配的分组不再分配 `HashSet`。
+            //   ⚠ 保留原 `SetEquals`：它同时挡住「组内工序键重复」的畸形批
+            //      （此时子集成立但集合不等），删除它会**放宽**判据，故不删。
+            var maybeSubset = true;
+            foreach (var t in group)
+            {
+                if (!opByKey.ContainsKey(OperationNodeKey.Of(t.StageCode, t.OperationCode)))
+                {
+                    maybeSubset = false;
+                    break;
+                }
+            }
+            if (!maybeSubset) continue;
 
             var groupOps = new HashSet<OperationNodeKey>();
             foreach (var t in group)

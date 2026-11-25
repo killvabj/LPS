@@ -148,8 +148,8 @@ public class SolverReplayTest
                 .Take(5).Select(d => $"{d.LogicalDemandKey}(alloc={d.AllocationSequence},net={d.NetOutputQty:G29})"))}");
             _output.WriteLine($"[ANA] 切片 alloc 样例={string.Join(",", unknownAllocs.Take(5))}"
                 + $"；需求 alloc 样例={string.Join(",", demandAllocs.Take(5))}"
-                + $"；切片 alloc 范围={unknownAllocs.Min()}~{unknownAllocs.Max()}"
-                + $"；需求 alloc 范围={demandAllocs.Min()}~{demandAllocs.Max()}");
+                + $"；切片 alloc 范围={(unknownAllocs.Count > 0 ? $"{unknownAllocs.Min()}~{unknownAllocs.Max()}" : "(无)")}"
+                + $"；需求 alloc 范围={(demandAllocs.Count > 0 ? $"{demandAllocs.Min()}~{demandAllocs.Max()}" : "(无)")}");
 
             // 2026-11-20：D-04 分类只依赖 request DTO（与求解无关）⇒ 只读分析模式也顺手导出，
             //   不必为了分类再跑一次 40 分钟全量。
@@ -256,6 +256,27 @@ public class SolverReplayTest
         // 2026-11-19 诊断（乙：查整数门禁带来的 FinalTask 变化去向）：
         //   `APS_REPLAY_DUMP=<path>` ⇒ 逐需求导出 TSV，供两次重放（revert 前 / 打回 patch 后）按 LogicalDemandKey 对拍。
         var dumpPath = Environment.GetEnvironmentVariable("APS_REPLAY_DUMP");
+
+        // ── 2026-11-25（r14415 DTO）：链目录索引 + 每需求 Stage→执行厂映射 ──
+        //   提到方法级是因为 **T1（ledger）与 T2（task dump）两个导出块都要用**，块内定义会越界。
+        //   无 DTO 投影时（`StageChainDefinitions` 为空）构建为空表，不报错、不影响任何求解。
+        var defByRefId = request.StageChainDefinitions
+            .GroupBy(d => d.ChainRefId, StringComparer.Ordinal)
+            .ToDictionary(g => g.Key, g => g.First(), StringComparer.Ordinal);
+        // 每需求的 Stage → (Seq, StageFactoryCode/Id)，供 T2 逐 Task 回填「当前排程 Stage 的执行厂」（0号位 Q1 口径）。
+        var stageMetaByDemand = new Dictionary<string, Dictionary<string, (int Seq, string? Code, int? Id)>>(StringComparer.Ordinal);
+        foreach (var b in request.DemandStageChainBindings)
+        {
+            if (string.IsNullOrEmpty(b.ChainRefId) || !defByRefId.TryGetValue(b.ChainRefId, out var def)) continue;
+            var map = new Dictionary<string, (int Seq, string? Code, int? Id)>(StringComparer.Ordinal);
+            foreach (var s in def.Stages)
+            {
+                if (!string.IsNullOrEmpty(s.StageCode))
+                    map[s.StageCode] = (s.StageSeq, s.StageFactoryCode, s.StageFactoryId);
+            }
+            stageMetaByDemand[b.LogicalDemandKey] = map;
+        }
+
         if (!string.IsNullOrWhiteSpace(dumpPath))
         {
             var unschedByDemand = result.UnscheduledTasks
@@ -269,14 +290,85 @@ public class SolverReplayTest
                     g => (Cnt: g.Count(), Qty: g.Sum(t => t.Quantity)),
                     StringComparer.Ordinal);
 
+            // ── 2026-11-25（0号位 v1.1 §3 T1 DemandLedger）：逐需求导出扩到「身份＋数量账＋链绑定」 ──
+            //   0号位 要求 T1 为**全量逐 LPD 数量账**，含身份、原始数量账、生产数量账、结果与解释四组。
+            //   此前只有 8 列，不足以支撑。**纯导出，不改任何求解判定**；
+            //   新列全部追加在原 8 列之后，原列名与顺序不变（旧对拍脚本仍可用）。
+            var parentsByChild = request.MaterialRequirementLinks
+                .Where(l => !string.IsNullOrEmpty(l.ProducerLogicalDemandKey))
+                .GroupBy(l => l.ProducerLogicalDemandKey!, StringComparer.Ordinal)
+                .ToDictionary(g => g.Key,
+                    g => string.Join("|", g.Select(l => l.ConsumerLogicalDemandKey ?? string.Empty)),
+                    StringComparer.Ordinal);
+            var bindingByDemand = request.DemandStageChainBindings
+                .GroupBy(b => b.LogicalDemandKey, StringComparer.Ordinal)
+                .ToDictionary(g => g.Key, g => g.First(), StringComparer.Ordinal);
+            var completionByDemand = result.DemandCompletions
+                .GroupBy(c => c.LogicalDemandKey, StringComparer.Ordinal)
+                .ToDictionary(g => g.Key, g => g.First(), StringComparer.Ordinal);
+            var batchCountByDemand = result.FinalTasks
+                .Where(t => !string.IsNullOrEmpty(t.StageExecutionBatchDraftKey))
+                .GroupBy(t => t.SourceDraftId, StringComparer.Ordinal)
+                .ToDictionary(g => g.Key,
+                    g => g.Select(t => t.StageExecutionBatchDraftKey).Distinct(StringComparer.Ordinal).Count(),
+                    StringComparer.Ordinal);
+
             using var dumpWriter = new System.IO.StreamWriter(dumpPath!, false, System.Text.Encoding.UTF8);
-            dumpWriter.WriteLine("demand\tnet\tisCont\tuom\ttaskCnt\ttaskQty\tuQty\tuReason");
+            dumpWriter.WriteLine(
+                "demand\tnet\tisCont\tuom\ttaskCnt\ttaskQty\tuQty\tuReason"
+                // ↓ 2026-11-25 追加（T1 身份组 / 数量账组 / 结果组）
+                + "\tmaterialId\tfactoryId\tfactoryCode\tsourceDemandKey\torderId\tbomNo\trepWorksetId"
+                + "\trequiredStageCode\tstartStageCode\tplannedProcessQty\tnoSplitMerge\tproductionInstructionNo"
+                + "\tcompletionTime\tcompletionTimeCertain\thasTerminalTask\tstageTimingCount\tsumLeadTimeHours"
+                + "\tdistinctStageBatchCount"
+                + "\tchainRefId\tchainScopeType\tchainSignature\tbindingKey\tbindingStatus\tparentDemandKeys");
             foreach (var d in request.LogicalProductionDemands)
             {
                 taskByDemand.TryGetValue(d.LogicalDemandKey, out var ta);
                 unschedByDemand.TryGetValue(d.LogicalDemandKey, out var ua);
-                dumpWriter.WriteLine(
-                    $"{d.LogicalDemandKey}\t{d.NetOutputQty:G29}\t{d.IsContinuation}\t{d.UOM ?? ""}\t{ta.Cnt}\t{ta.Qty:G29}\t{ua.Qty:G29}\t{ua.Reason}");
+                completionByDemand.TryGetValue(d.LogicalDemandKey, out var cf);
+                bindingByDemand.TryGetValue(d.LogicalDemandKey, out var bd);
+                var refId = bd?.ChainRefId ?? string.Empty;
+                var sig = (!string.IsNullOrEmpty(refId) && defByRefId.TryGetValue(refId, out var df))
+                    ? df.ChainSignature : string.Empty;
+                parentsByChild.TryGetValue(d.LogicalDemandKey, out var parents);
+                batchCountByDemand.TryGetValue(d.LogicalDemandKey, out var batchCnt);
+                var sumLt = cf?.StageTimings is { Count: > 0 }
+                    ? cf.StageTimings.Sum(s => s.LeadTimeHours)
+                    : 0m;
+                dumpWriter.WriteLine(string.Join('\t',
+                    d.LogicalDemandKey,
+                    d.NetOutputQty.ToString("G29"),
+                    d.IsContinuation,
+                    d.UOM ?? string.Empty,
+                    ta.Cnt,
+                    ta.Qty.ToString("G29"),
+                    ua.Qty.ToString("G29"),
+                    Clean(ua.Reason),
+                    d.MaterialId,
+                    d.FactoryId,
+                    Clean(d.FactoryCode),
+                    Clean(d.DemandKey),
+                    d.OrderId?.ToString() ?? "null",
+                    Clean(d.BomNo),
+                    d.RepWorksetId?.ToString() ?? "null",
+                    Clean(d.RequiredStageCode),
+                    Clean(d.StartStageCode),
+                    d.PlannedProcessQty.ToString("G29"),
+                    d.NoSplitMerge,
+                    Clean(d.ProductionInstructionNo),
+                    cf is null ? "null" : cf.CompletionTime.ToString("yyyy-MM-dd HH:mm:ss"),
+                    cf?.CompletionTimeCertain?.ToString() ?? "null",
+                    cf?.TerminalFinalDraftId is null ? "0" : "1",
+                    cf?.StageTimings?.Count ?? 0,
+                    sumLt.ToString("G29"),
+                    batchCnt,
+                    refId,
+                    Clean(bd?.StageScopeType),
+                    Clean(sig),
+                    Clean(bd?.BindingKey),
+                    Clean(bd?.Status),
+                    Clean(parents)));
             }
             _output.WriteLine($"[DUMP] 逐需求去向已写：{dumpPath}（{request.LogicalProductionDemands.Count} 行）");
 
@@ -306,9 +398,24 @@ public class SolverReplayTest
             using var tw = new System.IO.StreamWriter(taskDumpPath!, false, System.Text.Encoding.UTF8);
             // 2026-11-21（EX-T05）：末列补 `isCritical` —— 2号位 r14344 已把字段加进 DTO，
             //   本列用于「真实 PV 上关键路径是否合理」的核对（false = 算过且不关键，非未算）。
-            tw.WriteLine("taskId\tresourceId\tstart\tend\tsetupMinutes\tdemandKey\tstage\top\tisCritical");
+            // ── 2026-11-25（0号位 v1.1 §3 T2 ExecutionEvidence）：逐 Task 追加数量/执行批/路径/Stage 厂 ──
+            //   原 9 列保留在前，新列追加在后。**纯导出，不改求解**。
+            //   `stageSeq`/`stageFactoryCode`/`stageFactoryId` 来自 r14415 的 `StageChainDefinitions`（0号位 Q1
+            //   「以当前正在排程的 Stage 为准」）——按 `<LogicalDemandKey, StageCode>` 回填；取不到 ⇒ `null`，不猜厂。
+            tw.WriteLine(
+                "taskId\tresourceId\tstart\tend\tsetupMinutes\tdemandKey\tstage\top\tisCritical"
+                + "\tmaterialId\tfactoryId\toperationSeq\trouteCode\tpathId"
+                + "\tquantity\tplannedProcessQty\tuom\tduration\teffectiveProcessMinutes\ttaskType"
+                + "\texecutionBatchDraftKey\tstageExecutionBatchDraftKey\tstageExecutionBatchQty"
+                + "\tresourceCode\tcontinuationKey"
+                + "\tstageSeq\tstageFactoryCode\tstageFactoryId");
             foreach (var t in result.FinalTasks)
             {
+                stageMetaByDemand.TryGetValue(t.SourceDraftId, out var stageMap);
+                (int Seq, string? Code, int? Id) meta = default;
+                var hasMeta = stageMap is not null
+                              && !string.IsNullOrEmpty(t.StageCode)
+                              && stageMap.TryGetValue(t.StageCode!, out meta);
                 tw.WriteLine(string.Join('\t',
                     t.FinalDraftId,
                     t.ResourceId?.ToString() ?? "null",
@@ -318,7 +425,26 @@ public class SolverReplayTest
                     t.SourceDraftId,
                     t.StageCode ?? string.Empty,
                     t.OperationCode ?? string.Empty,
-                    t.IsCriticalPath ? "1" : "0"));
+                    t.IsCriticalPath ? "1" : "0",
+                    t.MaterialId,
+                    t.FactoryId,
+                    t.OperationSeq,
+                    Clean(t.RouteCode),
+                    t.PathId?.ToString() ?? "null",
+                    t.Quantity.ToString("G29"),
+                    t.PlannedProcessQty.ToString("G29"),
+                    Clean(t.UOM),
+                    t.Duration?.ToString("G29") ?? "null",
+                    t.EffectiveProcessMinutes?.ToString("G29") ?? "null",
+                    Clean(t.TaskType),
+                    Clean(t.ExecutionBatchDraftKey),
+                    Clean(t.StageExecutionBatchDraftKey),
+                    t.StageExecutionBatchQty?.ToString("G29") ?? "null",
+                    Clean(t.ResourceCode),
+                    Clean(t.ContinuationKey),
+                    hasMeta ? meta.Seq.ToString() : "null",
+                    hasMeta ? Clean(meta.Code) : "null",
+                    hasMeta ? (meta.Id?.ToString() ?? "null") : "null"));
             }
             _output.WriteLine($"[DUMP] 逐 Task 时间窗已写：{taskDumpPath}（{result.FinalTasks.Count} 行）");
         }
@@ -767,5 +893,15 @@ public class SolverReplayTest
         {
             // 埋点失败绝不影响求解
         }
+    }
+
+    /// <summary>
+    /// 2026-11-25（T1 导出）：把可能含制表符/换行/空白的自由文本字段归一化。
+    /// 0号位 v1.1 §3 要求「未知用 NULL，不得以空白混同」——空/纯空白 ⇒ <c>null</c>，其余去控制字符。
+    /// </summary>
+    private static string Clean(string? s)
+    {
+        if (string.IsNullOrWhiteSpace(s)) return "null";
+        return s.Replace('\t', ' ').Replace('\r', ' ').Replace('\n', ' ');
     }
 }

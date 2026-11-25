@@ -70,7 +70,34 @@ public class StageHandoffWaitTests
             DomainKey = "DOMAIN",
             StrategySnapshot = new SolverStrategySnapshot { StageHandoffWaitRules = rules }
         };
+
+        // 2026-11-25（0号位 v1.2 §3 / Q1）：交接等待的厂键 = **该 Stage 的权威执行厂**
+        //   （`StageChainDefinitions[].Stages[].StageFactoryCode` 经 Phase1 汇入此处），
+        //   **不得**回退 `Demand.FactoryCode`。夹具按生产路径给出 S1/S2/S3/S9 的权威厂 = F1。
+        ctx.StageFactoryByDemandStage = new Dictionary<string, Dictionary<string, string>>(StringComparer.Ordinal)
+        {
+            ["D1"] = new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                ["S1"] = Factory, ["S2"] = Factory, ["S3"] = Factory, ["S9"] = Factory
+            }
+        };
         return ctx;
+    }
+
+    /// <summary>
+    /// 2026-11-25（0号位 v1.2 §3）：**取不到权威 Stage 执行厂 ⇒ 判定不了，不回退需求厂**。
+    /// 逐字：「不能缺值回 `Demand.FactoryCode`……回退分支必须撤除」。
+    /// </summary>
+    [Fact]
+    public void 缺权威Stage厂_不回退需求厂_等待不应用()
+    {
+        var ctx = Ctx(Rule("S1", "S2", 90));   // 规则厂 = 需求厂 F1（旧口径下会命中）
+        ctx.StageFactoryByDemandStage = new Dictionary<string, Dictionary<string, string>>();
+
+        var tasks = new List<FinalTaskDraft> { Task("S1", T0.AddHours(2)) };
+        var start = Apply(ctx, "S2", tasks);
+
+        Assert.Equal(T0, start);
     }
 
     private static DateTime Apply(

@@ -1562,14 +1562,63 @@ public class PeggingOrchestrator : IPeggingOrchestrator
         //   后段无 Routing 到 +90 就「无工时」，出口会在第 90 天附近集中出一批「排不下」，根因却是投影截断
         //   （1号位 2026-10-25 G-2 回执 §四）。
         //   ⚠ 只抬「日历/工时投影」的上界；载荷里的 `PlanningStart/PlanningEnd` 仍是 90 天求解窗口，两者不混。
+        // ── 2026-11-25 日历 scope 止血（0号位 总表 v1.5 §十三.1 点名的结构性风险）──────────
+        //   投影的厂级 scope 原为「部门所属工厂 ∪ 需求工厂」，**遗漏「合法 Stage 实际执行厂」**：
+        //   一条无 Routing、无部门上下文的阶段，其执行厂若既不是需求厂、又不带部门，
+        //   该厂的厂级窗口根本不进投影 ⇒ 1号位 按 (厂, null) 取不到 ⇒ 第三级继承落空。
+        //   ⇒ 先把 StageDict 字典加载上来（后面富化同一份，不重复查库），
+        //     把「本域**全部链**的各 Stage 执行厂」并进投影 scope。
+        //     ⚠ 只扩「日历投影范围」，不授予任何排程资格、不改三级继承与 OFF 硬约束。
+        var stageFactoryResolver = await LoadStageFactoryResolverAsync();
+        var stageFactoryIds = effectiveStages.ChainDefinitions
+            .SelectMany(d => d.Stages)
+            .Select(s => s.StageCode)
+            .Where(c => !string.IsNullOrWhiteSpace(c))
+            .Select(c => stageFactoryResolver.ByStage.TryGetValue(c, out var entry) ? entry.FactoryId : null)
+            .Where(id => id is > 0)
+            .Select(id => id!.Value)
+            .Distinct()
+            .ToList();
+        var calendarFactoryIds = demandFactoryIds
+            .Concat(stageFactoryIds)
+            .Where(f => f > 0)
+            .Distinct()
+            .ToList();
+
         var departmentWorkWindowProjection = await LoadDepartmentWorkWindowsAsync(
-            materialStageDeptContexts, demandFactoryIds,
-            planningStart, planningEnd.AddDays(SchedulingHorizonPolicy.SoftBoundaryCalendarBufferDays));
+            materialStageDeptContexts, calendarFactoryIds,
+            planningStart, planningEnd.AddDays(SchedulingHorizonPolicy.SoftBoundaryCalendarBufferDays),
+            request.SchedulingContext?.UpperLevelCalendarFacts);
         MarkBuild("16 部门WORK窗口投影");
 
         // Stage 顺序事实（与 `StageSequenceChains` 同一份 `OrderedChains`）——G-1 与它必须同源，
         //   否则「1号位 拿到的 StageCode 集合」与「我方算量的 StageCode」会分叉。
         var stageSequenceChains = BuildEffectiveStagePaths(effectiveStages.OrderedChains, materialStageDeptContexts);
+
+        // ── A31③ 配套：Stage **实际执行厂**富化（0号位 2026-11-24 裁决 v1.2 §四；
+        //   2026-11-25 总表 §一「传实际Stage执行厂、部门、匹配状态」）。
+        //   厂取自 `StageDict.FactoryCode` → `Factory.Id`，**不按 StageCode 前缀推**
+        //   （`CN6_*` 的厂是 `CN6课` 而 Factory 主档没有 `CN6`，前缀推必错）。
+        //   字典读取失败 ⇒ 全部步骤标「未投影」，保持既有字段语义，不阻断装载。
+        //   ⚠ 字典已在日历投影前加载（见上），此处**复用**，不重复查库。
+        var deptByMaterialStage = BuildDeptByMaterialStage(materialStageDeptContexts);
+        stageSequenceChains = stageSequenceChains
+            .Select(c => new StageSequenceChain
+            {
+                MaterialId = c.MaterialId,
+                Stages     = EnrichStageFactory(c.Stages, c.MaterialId, stageFactoryResolver, deptByMaterialStage)
+            })
+            .ToList();
+        var stageChainDefinitions = effectiveStages.ChainDefinitions
+            .Select(d => new StageChainDefinition
+            {
+                ChainRefId     = d.ChainRefId,
+                StageScopeType = d.StageScopeType,
+                ChainSignature = d.ChainSignature,
+                // 定义是「链」级、可被多个物料共用 ⇒ 只富化与物料无关的厂信息，部门留空
+                Stages         = EnrichStageFactory(d.Stages, null, stageFactoryResolver, deptByMaterialStage)
+            })
+            .ToList();
 
         // G-1：逐 Stage 计划加工量（1号位 2026-10-25 核证回执 §五 点名；成因见 DTO 注释）。
         //   只**增**表，不改 `PlannedProcessQty` / `NetOutputQty` / PI 供给 ⇒ 整表为空时零回归。
@@ -1627,6 +1676,10 @@ public class PeggingOrchestrator : IPeggingOrchestrator
             // —— 即 PM《…接口裁决回复》2026-09-28 §三 命名的 `EffectiveStagePath` 业务事实
             //（MaterialId + StageCode + StageSeq + ProductionDepartmentId 四条一组）。
             StageSequenceChains            = stageSequenceChains,
+            // A31③（0号位 2026-11-25「A31 列第一优先级」）：链目录 ＋ 逐需求绑定。
+            //   与 `StageSequenceChains` 并存：后者降级为「物料全 Run 唯一等价链」时的兼容口径。
+            StageChainDefinitions          = stageChainDefinitions,
+            DemandStageChainBindings       = effectiveStages.ChainBindings,
             // G-1：逐 Stage 计划加工量（键 = LogicalDemandKey × StageCode）。
             //   空表 = 「本轮未投影或本域无可投影需求」⇒ 1号位 沿用需求级 `PlannedProcessQty`，零行为变化。
             StageProcessQuantities         = stageProcessQuantities,
@@ -10117,6 +10170,78 @@ public class PeggingOrchestrator : IPeggingOrchestrator
                 "拒绝本轮（过期切片不得混入本 Run Position 事实包）。");
         }
 
+        // ── 闸门④（2026-11-24 定）：**同批互核**（硬闸）＋ **批次身份留痕**（不拦） ──
+        //
+        // 口径（用户 2026-11-24 原话）：「同一次 PV 用到的数据都是同批次获取快照，一天只同步一次没问题」。
+        //   ⇒ 要保证的是**同一 PV 的供给事实取自同一次采集**；不要求「快照早于 cutoff」。
+        //
+        // ① 硬闸：库存批与 XC 批采集时刻相差 > 2 小时 ⇒ 拒绝（真正的混批：只重跑了一个同步）。
+        //    正常早间窗口：库存 00:26、XC 00:28，只差约 2 分钟；探针用的也是「当下这一批」，
+        //    两批天然同源 ⇒ **不会误伤探针**。
+        // ② 留痕：把「本次所用的库存批 / XC 批 / cutoff / 二者关系」写一行 APS_ETL_Log
+        //    （Step='SnapshotBatchIdentity'），同一 (XC 批, cutoff) 只写一次。
+        //    ⇒ 任一 Run 事后都能反查「它用的到底是哪一批快照」，含「快照晚于 cutoff」这种形态。
+        var invSyncLog = (await _connectionManager.QueryAsync<PiXcSyncLogRow>(
+            @"SELECT TOP 1 BatchNo, Status, CreatedAt, Message
+              FROM APS_ETL_Log
+              WHERE Step = N'sp_SyncInventorySnapshot'
+              ORDER BY CreatedAt DESC",
+            db: DatabaseId.APS, commandTimeout: 60)).FirstOrDefault();
+
+        var sameCycleWindow = TimeSpan.FromHours(2);
+        if (invSyncLog != null
+            && (lastRun.CreatedAt - invSyncLog.CreatedAt).Duration() > sameCycleWindow)
+        {
+            throw new InvalidOperationException(
+                $"[Pegging][PI-XC] 两次快照不是同一批采集：库存 {invSyncLog.CreatedAt:yyyy-MM-dd HH:mm:ss}" +
+                $"（{invSyncLog.BatchNo}）／XC {lastRun.CreatedAt:yyyy-MM-dd HH:mm:ss}（{lastRun.BatchNo}），" +
+                $"相差超过 {sameCycleWindow.TotalHours} 小时 ⇒ 拒绝本轮。" +
+                "（同一个 PV 的供给事实必须取自同一次快照采集；请把两道同步一起重跑后再起跑。）");
+        }
+
+        // 批次身份留痕（幂等：同一 XC 批 ＋ 同一 cutoff 只写一行）
+        try
+        {
+            var relation = dataCutoffTime == default
+                ? "CUTOFF_UNSET"
+                : lastRun.CreatedAt > dataCutoffTime ? "SNAPSHOT_AFTER_CUTOFF" : "SNAPSHOT_BEFORE_CUTOFF";
+            var identityMsg =
+                $"cutoff={(dataCutoffTime == default ? "(unset)" : dataCutoffTime.ToString("yyyy-MM-dd HH:mm:ss"))}" +
+                $";invBatch={invSyncLog?.BatchNo ?? "(none)"}" +
+                $";invCaptured={(invSyncLog == null ? "(none)" : invSyncLog.CreatedAt.ToString("yyyy-MM-dd HH:mm:ss"))}" +
+                $";xcBatch={lastRun.BatchNo}" +
+                $";xcCaptured={lastRun.CreatedAt:yyyy-MM-dd HH:mm:ss}" +
+                $";relation={relation}";
+
+            await _connectionManager.ExecuteAsync(
+                @"INSERT INTO APS_ETL_Log (BatchNo, Step, Message, Status, CreatedAt)
+                  SELECT @B, N'SnapshotBatchIdentity', @M, N'INFO', GETDATE()
+                  WHERE NOT EXISTS (
+                      SELECT 1 FROM APS_ETL_Log
+                       WHERE Step = N'SnapshotBatchIdentity'
+                         AND BatchNo = @B
+                         AND Message LIKE @Tag)",
+                new
+                {
+                    B = lastRun.BatchNo ?? string.Empty,
+                    M = identityMsg,
+                    Tag = $"%cutoff={(dataCutoffTime == default ? "(unset)" : dataCutoffTime.ToString("yyyy-MM-dd HH:mm:ss"))}%"
+                },
+                db: DatabaseId.APS, commandTimeout: 60);
+
+            if (relation == "SNAPSHOT_AFTER_CUTOFF")
+            {
+                _logger.LogWarning(
+                    "[Pegging][PI-XC] 快照采集晚于本轮 cutoff（不拦，已留痕）：xc={Xc} cutoff={Cutoff} ⇒ 本 Run 的供给事实晚于其声明边界",
+                    lastRun.CreatedAt, dataCutoffTime);
+            }
+        }
+        catch (Exception ex)
+        {
+            // 留痕失败不影响排程（与保留期清理同口径：维护动作不得反推业务失败）
+            _logger.LogWarning(ex, "[Pegging][PI-XC] 快照批次身份留痕写入失败（不影响本轮）");
+        }
+
         // PI → 允许的**物料**集合。同一 PI 在 A/B 两源若给出多组物料，全部保留为合法校验集。
         //
         // 【2026-10-27 变更 · 0号位《R03-27-04》裁定 A】原实现是 (物料, 厂) **二元组**：
@@ -10796,6 +10921,56 @@ public class PeggingOrchestrator : IPeggingOrchestrator
         var picks = new List<DemandChainPick>();
         var issues = new List<EffectiveStageIssue>();
 
+        // ── A31③（0号位 2026-11-25「A31 列第一优先级」）：逐需求链绑定 ──────────────
+        //   与 `picks` 并行收集，**含无链需求**（Status 为 NO_CHAIN / NO_ANCHOR / CONFLICT）。
+        //   与 `picks` 的区别：`picks` 只收成功选中的链，且随后按物料压扁（多链⇒隔离）；
+        //   本列表**不压扁**——这正是换载体的目的，同一物料两个需求各绑各的链。
+        var bindings = new List<DemandStageChainBinding>();
+        var chainDefinitions = new Dictionary<string, StageChainDefinition>(StringComparer.Ordinal);
+
+        DemandStageChainBinding NewBinding(
+            LogicalProductionDemand d, string scope, string status, string? chainRefId,
+            IReadOnlyList<string>? candidates = null)
+            => new()
+            {
+                LogicalDemandKey = d.LogicalDemandKey,
+                BindingKey       = scope + "|" + (string.IsNullOrWhiteSpace(d.BomNo) ? "-" : d.BomNo!.Trim())
+                                 + "|" + (d.RepWorksetId?.ToString() ?? "-"),
+                ChainRefId       = chainRefId,
+                StageScopeType   = scope,
+                ResolvedBOMNO    = string.IsNullOrWhiteSpace(d.BomNo) ? null : d.BomNo!.Trim(),
+                RepWorksetId     = d.RepWorksetId,
+                BatchNo          = batchNo,
+                Status           = status,
+                // 1号位 2026-11-25 §Q4：歧义要能说清「歧义在哪几条链」。
+                // 来源是解析器现成的 ChainKey ＋ RejectedChainKeys，不额外查库。
+                CandidateChainSignatures = candidates ?? Array.Empty<string>(),
+                CandidateChainCount      = (candidates ?? Array.Empty<string>()).Count
+            };
+
+        // 候选签名：选中链排第一，其后是解析器报出的未选用链（去重、保序）
+        static IReadOnlyList<string> Candidates(string? chosen, IReadOnlyList<string>? rejected)
+        {
+            var list = new List<string>(1 + (rejected?.Count ?? 0));
+            if (!string.IsNullOrEmpty(chosen)) list.Add(chosen!);
+            if (rejected is not null)
+                foreach (var r in rejected)
+                    if (!string.IsNullOrEmpty(r) && !list.Contains(r, StringComparer.Ordinal))
+                        list.Add(r);
+            return list;
+        }
+
+        static string ScopeOf(LogicalProductionDemand d)
+            => d.IsRootDemand ? EffectiveStageChainResolver.ScopeRoot : EffectiveStageChainResolver.ScopeEdge;
+
+        static string StatusOf(EffectiveStageChainResolver.RequestIdentityState s) => s switch
+        {
+            EffectiveStageChainResolver.RequestIdentityState.Anchored                  => StageChainBindingStatus.Resolved,
+            EffectiveStageChainResolver.RequestIdentityState.ParentEdgeScoped          => StageChainBindingStatus.ParentEdgeScoped,
+            EffectiveStageChainResolver.RequestIdentityState.UnverifiedRequestIdentity => StageChainBindingStatus.UnverifiedIdentity,
+            _                                                                          => StageChainBindingStatus.NoAnchor
+        };
+
         var noRowDemands = 0;            // 本批 StagePath 无该物料的行（数据缺口/采购件 ⇒ 合法「不限定 Stage」）
         var missingScopeDemands = 0;     // 有行，但按选择键收窄后首选 scope 无行（J14-01：不回退）
         var noAnchorDemands = 0;         // 无请求锚点（`BomNo` 空）⇒ 无权威身份（J15-01 状态 c）
@@ -10848,6 +11023,7 @@ public class PeggingOrchestrator : IPeggingOrchestrator
                 noRowDemands++;
                 issues.Add(new EffectiveStageIssue(code, StageChainIssueNoRows,
                     $"本批 StagePath 无该物料行（BatchNo={batchNo}，DemandKey={demand.DemandKey}）"));
+                bindings.Add(NewBinding(demand, ScopeOf(demand), StageChainBindingStatus.NoChain, null));
                 continue;
             }
 
@@ -10860,6 +11036,9 @@ public class PeggingOrchestrator : IPeggingOrchestrator
             }
 
             var prefersEdge = !demand.IsRootDemand;
+            var scopeOfDemand = prefersEdge
+                ? EffectiveStageChainResolver.ScopeEdge
+                : EffectiveStageChainResolver.ScopeRoot;
             var pick = EffectiveStageChainResolver.Resolve(
                 rows,
                 prefersEdge,
@@ -10869,6 +11048,7 @@ public class PeggingOrchestrator : IPeggingOrchestrator
             if (pick is null)
             {
                 noRowDemands++;
+                bindings.Add(NewBinding(demand, scopeOfDemand, StageChainBindingStatus.NoChain, null));
                 continue;
             }
 
@@ -10900,6 +11080,8 @@ public class PeggingOrchestrator : IPeggingOrchestrator
                     $"⇒ 本需求**不出链**，交 StageLeadTime／未排真相；候选={string.Join(" ; ", pick.RejectedChainKeys)}" +
                     $"（BomNo={demand.BomNo ?? "(无锚点)"}，RepWorksetId={demand.RepWorksetId?.ToString() ?? "NULL"}，" +
                     $"角色={(prefersEdge ? "EDGE" : "ROOT")}，DemandKey={demand.DemandKey}，BatchNo={batchNo}）"));
+                bindings.Add(NewBinding(demand, scopeOfDemand, StageChainBindingStatus.Conflict, null,
+                    Candidates(null, pick.RejectedChainKeys)));
                 continue;
             }
 
@@ -10910,6 +11092,7 @@ public class PeggingOrchestrator : IPeggingOrchestrator
                 issues.Add(new EffectiveStageIssue(code, StageChainIssueNoRequestAnchor,
                     $"三键全空（BomNo/RepWorksetId/父边均空）⇒ 无权威请求身份，本需求不出链（DemandKey={demand.DemandKey}，" +
                     $"BatchNo={batchNo}）；Q/U 不受影响，按未排真相处理。"));
+                bindings.Add(NewBinding(demand, scopeOfDemand, StageChainBindingStatus.NoAnchor, null));
                 continue;
             }
 
@@ -10924,11 +11107,15 @@ public class PeggingOrchestrator : IPeggingOrchestrator
                     $"首选 scope={pick.ScopeType} 按选择键收窄后无行（BomNo={demand.BomNo ?? "(无锚点)"}，" +
                     $"RepWorksetId={demand.RepWorksetId?.ToString() ?? "NULL"}，父边={(parents is null ? "(无)" : string.Join(",", parents))}，" +
                     $"BatchNo={batchNo}）；另一 scope 链条数={pick.OtherScopeDistinctChainCount}，按 J14-01 不回退。DemandKey={demand.DemandKey}"));
+                bindings.Add(NewBinding(demand, scopeOfDemand, StageChainBindingStatus.NoChain, null));
                 continue;
             }
 
             if (pick.Stages.Count == 0)
+            {
+                bindings.Add(NewBinding(demand, scopeOfDemand, StageChainBindingStatus.NoChain, null));
                 continue;
+            }
 
             var chainKey = EffectiveStageChainResolver.BuildChainKey(pick.Stages);
 
@@ -10952,6 +11139,22 @@ public class PeggingOrchestrator : IPeggingOrchestrator
                 chainKey,
                 pick.Stages,
                 prefersEdge ? EffectiveStageChainResolver.ScopeEdge : EffectiveStageChainResolver.ScopeRoot));
+
+            // A31③：成功选中的需求 → 一条绑定 + 保证该链在目录里（按 ChainRefId 去重）
+            var successChainRefId = scopeOfDemand + ":" + chainKey;
+            bindings.Add(NewBinding(demand, scopeOfDemand, StatusOf(pick.IdentityState), successChainRefId,
+                Candidates(chainKey, pick.RejectedChainKeys)));
+            if (!chainDefinitions.ContainsKey(successChainRefId))
+            {
+                chainDefinitions[successChainRefId] = new StageChainDefinition
+                {
+                    ChainRefId     = successChainRefId,
+                    StageScopeType = scopeOfDemand,
+                    ChainSignature = chainKey,
+                    // 工厂/部门富化在装载末尾统一做（`EnrichStageFactory`），此处先放解析器产出的原始步
+                    Stages         = pick.Stages
+                };
+            }
         }
 
         // 6) 按**物料**汇总：去重后 0 条 ⇒ 无链；1 条 ⇒ 出链；>1 条 ⇒ **隔离**（不出链）+ 诊断
@@ -10961,20 +11164,36 @@ public class PeggingOrchestrator : IPeggingOrchestrator
         var chains = new List<StageSequenceChain>();
         var conflictExamples = new List<string>(5);
 
+        // ── 2026-11-25 撤隔离配套①：`ByMaterial` 覆盖**全部出链物料**，不只单链物料 ──────
+        //   为什么必须改：`ByMaterial` 是 Routing 三件套的**存在性过滤集合**。
+        //   合法多链物料若在此缺席，`LoadRoutingContextAsync` 会走「缺键放行」把该物料的
+        //   **全部工序**整片放进 Solver（J17-01 明确记过这个洞），等于用「不隔离」换「过度放行」。
+        //   ⇒ 多链物料取其**各绑定链 Stage 的并集**（不是任取一条），过滤语义与单链物料一致。
+        foreach (var byMaterial in picks.GroupBy(p => p.MaterialId))
+        {
+            result[byMaterial.Key] = new HashSet<string>(
+                byMaterial.SelectMany(p => p.Stages).Select(s => s.StageCode),
+                StringComparer.Ordinal);
+        }
+
+        // ── 兼容载体：只出「全 Run 唯一等价链」的物料 ──────────────────────────────
+        //   多链物料在这里**仍然不出**（`StageSequenceChain` 每物料仅容一条，1号位 已改为按
+        //   `DemandStageChainBindings` 取链）；此处不再驱动拒绝集，只作老载荷兼容口径。
         foreach (var pick in aggregate.Chains)
         {
-            result[pick.MaterialId] = new HashSet<string>(pick.Stages.Select(s => s.StageCode), StringComparer.Ordinal);
             chains.Add(new StageSequenceChain { MaterialId = pick.MaterialId, Stages = pick.Stages });
         }
 
         foreach (var conflict in aggregate.Conflicts)
         {
             var matCode = codeByMaterialId.TryGetValue(conflict.Key, out var c) ? c : conflict.Key.ToString();
+            // 2026-11-25 撤隔离：多链物料**不再被隔离**，各需求按 `DemandStageChainBindings` 各取各的链；
+            //   本条仅作诊断计数保留（1号位 已改为逐需求取链，`StageSequenceChains` 的 last-wins 不再适用）。
             issues.Add(new EffectiveStageIssue(matCode, StageChainIssueRoleConflict,
                 $"同一物料在本次运行内收敛出 {conflict.Value.Count} 条不同的 Stage 链：{string.Join(" ; ", conflict.Value)}" +
-                "（角色按需求结构判定）。`StageSequenceChain` 每物料仅容一条" +
-                "（1号位 `BuildStageChainIndex`／`StageTimingNodeBuilder` 按 `MaterialId` 建字典、last-wins 会静默覆盖）" +
-                "⇒ 该物料本轮**不出链**（隔离），交 `StageLeadTime`／未排真相。"));
+                "（角色按需求结构判定）。**已按逐需求绑定发出，不再整料隔离**：" +
+                "各需求按 `DemandStageChainBindings[LogicalDemandKey+BindingKey] → ChainRefId` 各取各的链；" +
+                "`StageSequenceChains` 仅保留「全 Run 唯一等价链」的物料，本物料不在其中，属预期。"));
             if (conflictExamples.Count < 5)
                 conflictExamples.Add($"{matCode}({conflict.Value.Count})");
         }
@@ -11041,8 +11260,13 @@ public class PeggingOrchestrator : IPeggingOrchestrator
         // J16-02：被隔离的物料必须与「无 Stage 事实」区分开，否则 Routing 缺键会把它整片放行。
         // J17-01：拒绝集 = 角色冲突 ∪ 请求身份歧义 ∪ 首选 scope 无链（「已有事实但不属于本需求」三类）；
         //   `NoRows`（本批根本没有该物料行，采购件类）与「无锚点」不进此集 —— 那是事实缺失，交未排真相/兼容口径。
+        // 2026-11-25 撤隔离（1号位 r14420 五处消费落地后）：**角色冲突不再进拒绝集**。
+        //   理由：`StageSequenceChain` 每物料一条的载体限制已由 `DemandStageChainBindings` 解除，
+        //   1号位 已改为逐需求取链 ⇒ 合法多链物料不再是「无链」，不应被剔除 Routing。
+        //   仍进拒绝集的只剩两类「已有事实但不属于本需求」：身份歧义、首选 scope 无链。
+        //   `aggregate.Conflicts` 保留为**诊断计数**（见上），不再驱动本集合。
         var rejectedMaterials = ComputeRejectedMaterials(
-            aggregate.Conflicts.Keys, ambiguousMaterials, missingScopeMaterials, result);
+            Array.Empty<int>(), ambiguousMaterials, missingScopeMaterials, result);
 
         // 2026-11-20（1号位 零 Routing 三问）：把**拒绝集的三类来源 + 样例物料**显性化。
         //   1号位 只能看到 Solver 出口 `P2_NO_ROUTING`，看不到「为何无 Routing 图」；
@@ -11074,7 +11298,33 @@ public class PeggingOrchestrator : IPeggingOrchestrator
             ByMaterial = result,
             OrderedChains = chains,
             Issues = issues,
-            RejectedMaterials = rejectedMaterials
+            RejectedMaterials = rejectedMaterials,
+            ChainDefinitions = chainDefinitions.Values
+                .OrderBy(d => d.ChainRefId, StringComparer.Ordinal)
+                .ToList(),
+            ChainBindings = bindings
+                .OrderBy(b => b.LogicalDemandKey, StringComparer.Ordinal)
+                .ThenBy(b => b.BindingKey, StringComparer.Ordinal)
+                .ToList(),
+            // 撤隔离配套②：逐需求链（供 G-1 逐 Stage 加工量按需求取链）。
+            //   不能只用物料级 `OrderedChains`：多链物料在其中缺席 ⇒ G-1 会回落需求级量，
+            //   等于把「整批量被每个 Stage 重复计入」这个缺陷重新引入。
+            // ⚠ 必须覆盖**全部有绑定的需求**（含 `NO_CHAIN`/`CONFLICT`），值为 null 表示「有绑定但无链」。
+            //   若只放有链的，消费侧就无法区分「根本没有绑定（老载荷，可回退物料级）」与
+            //   「有绑定但无链（新合同，**不得回退**）」—— 0号位 2026-11-25 裁决 §1 明令禁止后者回退。
+            StepsByDemandKey = bindings
+                .GroupBy(b => b.LogicalDemandKey, StringComparer.Ordinal)
+                .ToDictionary(
+                    g => g.Key,
+                    g =>
+                    {
+                        var first = g.First();
+                        return first.ChainRefId is not null
+                               && chainDefinitions.TryGetValue(first.ChainRefId, out var def)
+                            ? def.Stages
+                            : null;
+                    },
+                    StringComparer.Ordinal)
         };
     }
 
@@ -11177,6 +11427,21 @@ public class PeggingOrchestrator : IPeggingOrchestrator
 
         public IReadOnlyList<StageSequenceChain> OrderedChains { get; init; }
             = Array.Empty<StageSequenceChain>();
+
+        /// <summary>A31③：去重后的合法链目录（多链物料在此按链出现，不按物料压缩）。</summary>
+        public IReadOnlyList<StageChainDefinition> ChainDefinitions { get; init; }
+            = Array.Empty<StageChainDefinition>();
+
+        /// <summary>A31③：逐需求的链绑定（含无链需求，Status 区分成因）。</summary>
+        public IReadOnlyList<DemandStageChainBinding> ChainBindings { get; init; }
+            = Array.Empty<DemandStageChainBinding>();
+
+        /// <summary>
+        /// A31③ 撤隔离配套：**逐需求的链步骤**（`LogicalDemandKey → Stages`）。
+        /// 供 G-1 逐 Stage 加工量按需求取链；空 = 未投影（回落物料级 `OrderedChains`，行为同改造前）。
+        /// </summary>
+        public IReadOnlyDictionary<string, IReadOnlyList<StageSequenceStep>?> StepsByDemandKey { get; init; }
+            = new Dictionary<string, IReadOnlyList<StageSequenceStep>?>(StringComparer.Ordinal);
 
         /// <summary>
         /// 装载期诊断（J14-01/02/03/04）。**不是**冻结 `ScheduleReasonCodeDomain.Frozen15` 里的原因码，
@@ -12871,6 +13136,178 @@ public class PeggingOrchestrator : IPeggingOrchestrator
     }
 
     /// <summary>
+    /// **Stage 执行厂映射**（A31③ 配套；0号位 2026-11-24 裁决 v1.2 §四，2026-11-25 总表 §一）。
+    ///
+    /// 【口径】`StageDict.StageCode → FactoryCode → Factory.Id`。**禁止**按 StageCode 前缀推厂：
+    ///   实测（2026-11-25）`CN6_ASSY`／`CN6_MACH`／`CN6_OUTS` 的厂是 **`CN6课`**，而 `Factory` 主档
+    ///   **没有 `CN6` 这个 Code**（只有 CN=2／BJ=3／CN6课=4／SH=5／TJ=6）⇒ 前缀推必落空。
+    ///   规模：`CN6_MACH` 在 BOM 12,349 行、MSDC 182,268 行。
+    ///   ⚠ 与 `StageLeadTimeParam` 口径**相反**（那张表的厂码就是前缀 `CN6`），两者不可统一。
+    ///
+    /// 【失败降级】字典读不到 ⇒ 返回空映射，所有步骤标「未投影」（`FactoryMatchStatus` 为空串），
+    ///   既有字段语义不变、不阻断装载。与 `IsLeadTimeOnly` 的降级口径一致。
+    /// </summary>
+    private async Task<StageFactoryResolver> LoadStageFactoryResolverAsync()
+    {
+        var byStage = new Dictionary<string, StageDictEntry>(StringComparer.OrdinalIgnoreCase);
+        var deptFactory = new Dictionary<int, int?>();
+        try
+        {
+            var dict = await _connectionManager.QueryAsync<StageDictRow>(
+                @"SELECT StageCode, FactoryCode FROM ext_MES_StageDict WHERE IsActive = 1",
+                db: DatabaseId.APS);
+            var factories = await _connectionManager.QueryAsync<FactoryRow>(
+                @"SELECT Id, Code FROM Factory",
+                db: DatabaseId.APS);
+            var departments = await _connectionManager.QueryAsync<DeptFactoryRow>(
+                @"SELECT Id, FactoryId FROM ProductionDepartment",
+                db: DatabaseId.APS);
+
+            var codeToId = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+            foreach (var f in factories)
+            {
+                var c = f.Code?.Trim();
+                if (!string.IsNullOrEmpty(c)) codeToId.TryAdd(c, f.Id);
+            }
+
+            foreach (var r in dict)
+            {
+                var sc = r.StageCode?.Trim();
+                if (string.IsNullOrEmpty(sc)) continue;
+                var fc = r.FactoryCode?.Trim();
+                int? fid = fc is not null && codeToId.TryGetValue(fc, out var id) ? id : null;
+                byStage[sc] = new StageDictEntry(fc, fid);
+            }
+
+            foreach (var d in departments) deptFactory[d.Id] = d.FactoryId;
+        }
+        catch (Exception ex)
+        {
+            // 退化为「无厂信息」＝与改造前完全一致，不影响本次 Run。
+            _logger.LogWarning(ex,
+                "[Pegging] 读取 StageDict／Factory／ProductionDepartment 失败，本次不投影 Stage 执行厂（行为同改造前）：{Message}",
+                ex.Message);
+            byStage.Clear();
+            deptFactory.Clear();
+        }
+
+        return new StageFactoryResolver(byStage, deptFactory);
+    }
+
+    private static IReadOnlyDictionary<(int MaterialId, string StageCode), int> BuildDeptByMaterialStage(
+        IReadOnlyList<MaterialStageDepartmentContextDto> deptContexts)
+    {
+        var map = new Dictionary<(int, string), int>();
+        foreach (var c in deptContexts)
+        {
+            if (!string.IsNullOrWhiteSpace(c.StageCode))
+                map.TryAdd((c.MaterialId, c.StageCode), c.ProductionDepartmentId);
+        }
+        return map;
+    }
+
+    /// <summary>
+    /// 给每一步补「实际执行厂 ＋ 部门厂 ＋ 匹配状态」。
+    ///
+    /// <paramref name="materialId"/> 为 <c>null</c> 时不查部门（链目录是链级、可被多物料共用），
+    ///   只补与物料无关的厂信息。
+    ///
+    /// 状态判定顺序（先因后果，避免把"没字典"记成"部门没有"）：
+    ///   ① 阶段码不在字典 ⇒ <see cref="StageFactoryMatchStatus.StageNotInDict"/>
+    ///   ② 有字典但 `FactoryCode` 解析不出 `Factory.Id` ⇒ <see cref="StageFactoryMatchStatus.StageFactoryUnresolved"/>
+    ///   ③ 无部门（FINAL/OUTS 常态）⇒ <see cref="StageFactoryMatchStatus.DepartmentUnresolved"/>
+    ///   ④ 两边都有且不等 ⇒ <see cref="StageFactoryMatchStatus.Mismatch"/>
+    ///   ⑤ 相等 ⇒ <see cref="StageFactoryMatchStatus.Match"/>
+    /// </summary>
+    private static IReadOnlyList<StageSequenceStep> EnrichStageFactory(
+        IReadOnlyList<StageSequenceStep> steps,
+        int? materialId,
+        StageFactoryResolver resolver,
+        IReadOnlyDictionary<(int MaterialId, string StageCode), int> deptByMaterialStage)
+    {
+        if (steps.Count == 0) return steps;
+
+        // 字典没读到 ⇒ 原样返回（不添任何字段），保持既有语义
+        if (resolver.ByStage.Count == 0) return steps;
+
+        var enriched = new List<StageSequenceStep>(steps.Count);
+        foreach (var s in steps)
+        {
+            // ⚠ 链级定义（`materialId == null`）**不查部门**：一条链可被多个物料共用，
+            //   部门是 (物料,阶段) 级事实、不属于链。此时**不得**把「没查部门」写成
+            //   `DEPARTMENT_UNRESOLVED` —— 那是假信号，会让消费侧以为该生产阶段本身缺部门。
+            //   实测 2026-11-25：改前 23 个 `DEPARTMENT_UNRESOLVED` 里绝大多数是
+            //   BJ_CAST/BJ_SURF/BJ_MACH/CN_MACH/CN_SURF/CN6_MACH/BJ_ASSY/CN_ASSY/TJ_ASSY 等**真实生产阶段**。
+            var isChainLevel = materialId is null;
+
+            int? deptId = isChainLevel ? null : s.ProductionDepartmentId;
+            if (!isChainLevel && materialId is int mid
+                && deptByMaterialStage.TryGetValue((mid, s.StageCode), out var d))
+                deptId = d;
+
+            int? deptFactoryId = deptId is int did && resolver.DeptFactory.TryGetValue(did, out var df)
+                ? df
+                : null;
+
+            string? factoryCode = null;
+            int? factoryId = null;
+            string status;
+
+            if (!resolver.ByStage.TryGetValue(s.StageCode, out var entry))
+            {
+                status = StageFactoryMatchStatus.StageNotInDict;
+            }
+            else
+            {
+                factoryCode = entry.FactoryCode;
+                factoryId = entry.FactoryId;
+                if (factoryId is null) status = StageFactoryMatchStatus.StageFactoryUnresolved;
+                else if (isChainLevel) status = StageFactoryMatchStatus.NotProjected;  // 链级：只给厂，不给部门判定
+                else if (deptId is null || deptFactoryId is null) status = StageFactoryMatchStatus.DepartmentUnresolved;
+                else status = deptFactoryId.Value == factoryId.Value
+                    ? StageFactoryMatchStatus.Match
+                    : StageFactoryMatchStatus.Mismatch;
+            }
+
+            enriched.Add(new StageSequenceStep
+            {
+                StageCode              = s.StageCode,
+                StageSeq               = s.StageSeq,
+                ProductionDepartmentId = deptId,
+                StageFactoryCode       = factoryCode,
+                StageFactoryId         = factoryId,
+                DepartmentFactoryId    = deptFactoryId,
+                FactoryMatchStatus     = status
+            });
+        }
+        return enriched;
+    }
+
+    private sealed record StageDictEntry(string? FactoryCode, int? FactoryId);
+
+    private sealed record StageFactoryResolver(
+        IReadOnlyDictionary<string, StageDictEntry> ByStage,
+        IReadOnlyDictionary<int, int?> DeptFactory);
+
+    internal sealed class StageDictRow
+    {
+        public string? StageCode { get; set; }
+        public string? FactoryCode { get; set; }
+    }
+
+    internal sealed class FactoryRow
+    {
+        public int Id { get; set; }
+        public string? Code { get; set; }
+    }
+
+    internal sealed class DeptFactoryRow
+    {
+        public int Id { get; set; }
+        public int? FactoryId { get; set; }
+    }
+
+    /// <summary>
     /// 组装 PM《Stage、生产部门、Routing、Dependency、StageLeadTimeParam 接口裁决回复》(2026-09-28) §三
     /// 定义的 **`EffectiveStagePath`**：2号位 提供给 1号位 的**业务事实** =
     /// `MaterialId + StageCode + StageSeq + ProductionDepartmentId`（四条一组，不是只有码与序号）。
@@ -13747,7 +14184,8 @@ public class PeggingOrchestrator : IPeggingOrchestrator
         IReadOnlyList<MaterialStageDepartmentContextDto> departmentContexts,
         IReadOnlyCollection<int> usedFactoryIds,
         DateTime planningStart,
-        DateTime planningEnd)
+        DateTime planningEnd,
+        IReadOnlyList<ProductionWorkCalendarSlot>? runLevelCalendarFacts = null)
     {
         // 两个来源都空 = 本域既没有部门归属、也没有需求工厂 ⇒ 空表属正常，不是缺陷。
         if (departmentContexts.Count == 0 && usedFactoryIds.Count == 0)
@@ -13764,13 +14202,19 @@ public class PeggingOrchestrator : IPeggingOrchestrator
 
         // 全表装载（实测 2026-10-25 = 69 行，`IsActive=1`；与 `SchedulingOrchestrator` 同一 SQL 同口径）。
         // 有效期（EffectiveFrom/To）不在这里过滤，由解析器按日判定 —— 否则「今天之后生效」的行会被整条丢掉。
-        var rows = (await _connectionManager.QueryAsync<ProductionWorkCalendarSlot>(
-            @"SELECT Id, ScopeType, FactoryId, ProductionDepartmentId, WorkDate, WeekdayIso,
-                     StartAt, EndAt, WorkState, AllowLowerOverride, IsAuthorizedOverride,
-                     SourceSystem, SourceReference, EffectiveFrom, EffectiveTo, IsActive
-                FROM ProductionWorkCalendarSlot
-               WHERE IsActive = 1",
-            db: DatabaseId.APS)).ToList();
+        // 2026-11-25（0号位 统一答复 §2，A 方案）：
+        //   Run 级若已把上两级原始事实行留在共享上下文（`SchedulingContext.UpperLevelCalendarFacts`），
+        //   **直接复用、不再查库**；为空（老调用方／单测／探针手工构造上下文）⇒ 回落本域自行查库，
+        //   与改造前逐字一致。只省一次重复读，不改变任何合成或裁剪语义。
+        var rows = runLevelCalendarFacts is { Count: > 0 }
+            ? runLevelCalendarFacts.Where(r => r.IsActive).ToList()
+            : (await _connectionManager.QueryAsync<ProductionWorkCalendarSlot>(
+                @"SELECT Id, ScopeType, FactoryId, ProductionDepartmentId, WorkDate, WeekdayIso,
+                         StartAt, EndAt, WorkState, AllowLowerOverride, IsAuthorizedOverride,
+                         SourceSystem, SourceReference, EffectiveFrom, EffectiveTo, IsActive
+                    FROM ProductionWorkCalendarSlot
+                   WHERE IsActive = 1",
+                db: DatabaseId.APS)).ToList();
 
         // 部门 → 工厂：部门级日历行本身也带 FactoryId，但主档才是权威归属
         //   （与 `SchedulingOrchestrator` 装载人工能力槽时的 `SELECT Id, FactoryId FROM ProductionDepartment` 同源）。
@@ -13866,9 +14310,13 @@ public class PeggingOrchestrator : IPeggingOrchestrator
         IReadOnlyList<LogicalProductionDemand> demands,
         IReadOnlyList<StageSequenceChain> chains,
         FrozenStrategySnapshot frozenSnapshot,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        IReadOnlyDictionary<string, IReadOnlyList<StageSequenceStep>?>? stepsByDemandKey = null)
     {
-        if (demands.Count == 0 || chains.Count == 0)
+        // 2026-11-25 撤隔离配套②：多链物料不在 `chains`（每物料仅容一条）里，
+        //   但其需求在 `stepsByDemandKey` 里有自己的链 ⇒ 不能因 `chains.Count == 0` 就整表跳过。
+        if (demands.Count == 0
+            || (chains.Count == 0 && (stepsByDemandKey is null || stepsByDemandKey.Count == 0)))
         {
             _logger.LogInformation(
                 "[Pegging] G-1 逐 Stage 加工量跳过：需求 {Demands} 条、Stage 链 {Chains} 条（StageProcessQuantities 传空表 ⇒ 1号位 沿用需求级 PlannedProcessQty）",
@@ -13901,7 +14349,8 @@ public class PeggingOrchestrator : IPeggingOrchestrator
             (materialId, stageCode) =>
                 codeByMaterialId.TryGetValue(materialId, out var code)
                     ? PlanningYieldResolver.ResolveWithSource(yieldRules, code, stageCode)
-                    : new YieldResolution(PlanningYieldResolver.NoLoss, YieldMatchLevel.NO_CONFIG));
+                    : new YieldResolution(PlanningYieldResolver.NoLoss, YieldMatchLevel.NO_CONFIG),
+            stepsByDemandKey: stepsByDemandKey);
 
         _logger.LogInformation(
             "[Pegging] G-1 逐 Stage 加工量投影：出 {Rows} 行（真实应有 {TotalRows} 行 / 安全上限 {Max}）；" +
@@ -14874,6 +15323,13 @@ public class PeggingOrchestrator : IPeggingOrchestrator
                 $"早于本轮截止时点 {cutoff:yyyy-MM-dd HH:mm:ss} 的 24 小时前 ⇒ 拒绝本轮。" +
                 "（库存同步漏跑或失败时表内保留的是上一批；缺源不得当零，也不得用旧库存冒充当期事实。）");
         }
+
+        // ── 快照晚于 cutoff：**不拒跑**，由 XC 闸门统一留痕（2026-11-24 定）──
+        // 口径（用户 2026-11-24）：要保证的是「同一 PV 的供给事实取自同一次采集」，不是「快照必须早于 cutoff」。
+        //   快照比 cutoff 新对排产无害（数据更准），有害的是「不知道它是新的」⇒ 只留痕、不拦截。
+        //   拦截留给真正的混批（见 `LoadPiXcFactsAsync` 的同批互核）。
+        // 为什么不在这里拒：探针/复跑会显式复用旧 PV 的 cutoff（如 `PV190SolverOnlyPerfTest:95`），
+        //   拒它会误伤诊断入口，而其诊断价值恰恰在于「用当下数据算一遍」。
 
         _logger.LogInformation(
             "[Pegging][Inventory] 库存快照闸门通过：采集 {CapturedAt:yyyy-MM-dd HH:mm:ss}，截止 {Cutoff:yyyy-MM-dd HH:mm:ss}",

@@ -4,7 +4,7 @@ namespace LPS.APS.Core.Dto;
 /// 供应事实原始追溯DTO（5号位提供给4号位）
 ///
 /// 用于页面查看Procurement/VMI/Received/Transit原始供应事实
-/// 来源：SupplyFact_Pipeline（采购/Transit）+ ext_ERP_Received_ByDocument_View（Received）
+/// 来源：SupplyFact_Pipeline（采购/Transit）；RECEIVED 腿自 2026-11-24 停用（Owner 判定 ext_ERP_Received_ByDocument_View 暂不使用），SourceType='RECEIVED' 暂不再出现
 /// </summary>
 public sealed class SupplyFactTraceDto
 {

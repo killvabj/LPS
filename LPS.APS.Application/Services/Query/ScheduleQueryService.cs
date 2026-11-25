@@ -434,7 +434,27 @@ public class ScheduleQueryService : IScheduleQueryService
         var baseParams = WithDepartmentScope(new { Id = planVersionId, From = from, To = to }, departmentCodes);
         var universe = resourceIds?.ToList();
         var truncated = false;
-        if (universe is null)
+        if (universe is not null)
+        {
+            // PL4（11-24 4号位件）：显式清单**同样过授权**——只保留"窗内存在本部门授权 Task"的设备。
+            // 语义与发现路径同一谓词（DepartmentPredicate(t) 按任务执行部门）；非授权设备整行不出
+            // （此前直调可拿设备编码/名称＝存在性小泄漏，UI 不可达但端点应收口；Global 不收窄）。
+            if (departmentCodes is { Count: > 0 })
+            {
+                var authorized = (await _connectionManager.QueryAsync<int>(
+                    @"SELECT DISTINCT t.ResourceId
+                      FROM [Task] t
+                      WHERE t.PlanVersionId = @Id
+                        AND t.ResourceId IN @Requested
+                        AND t.PlannedStartTime IS NOT NULL AND t.PlannedEndTime IS NOT NULL
+                        AND t.PlannedEndTime >= @From AND t.PlannedStartTime <= @To"
+                    + DepartmentPredicate("t"),
+                    WithDepartmentScope(new { Id = planVersionId, From = from, To = to, Requested = universe }, departmentCodes),
+                    db: DatabaseId.APS)).ToHashSet();
+                universe = universe.Where(authorized.Contains).ToList();
+            }
+        }
+        else
         {
             var discovered = (await _connectionManager.QueryAsync<int>(
                 @"SELECT DISTINCT TOP (201) t.ResourceId
@@ -463,7 +483,7 @@ public class ScheduleQueryService : IScheduleQueryService
     SELECT DATEADD(day, 1, d) FROM days WHERE d < @ToDay
 ),
 tk AS (
-    SELECT t.Id, t.ResourceId, t.PlannedStartTime, t.PlannedEndTime
+    SELECT t.Id, t.ResourceId, t.PlannedStartTime, t.PlannedEndTime, t.ProductionDepartmentId
     FROM [Task] t
     WHERE t.PlanVersionId = @Id
       AND t.ResourceId IN @Universe
@@ -471,8 +491,12 @@ tk AS (
       AND t.PlannedEndTime > t.PlannedStartTime
       AND t.PlannedEndTime >= @From AND t.PlannedStartTime <= @To" + DepartmentPredicate("t") + @"
 )
+-- PL2 甲（11-24 3号位 裁）：切片按 资源×日×执行部门 拆（行装配侧合并工时/任务数并出执行部门数组；
+-- 一任务恰属一部门 ⇒ COUNT(DISTINCT) 跨部门相加不重不漏）。
 SELECT tk.ResourceId,
        CAST(days.d AS datetime2) AS BusinessDate,
+       tk.ProductionDepartmentId AS ExecDeptId,
+       pd2.DeptCode AS ExecDeptCode, pd2.DeptName AS ExecDeptName,
        CAST(SUM(CAST(DATEDIFF(second,
              CASE WHEN tk.PlannedStartTime > CAST(days.d AS datetime2) THEN tk.PlannedStartTime ELSE CAST(days.d AS datetime2) END,
              CASE WHEN tk.PlannedEndTime < DATEADD(day, 1, CAST(days.d AS datetime2)) THEN tk.PlannedEndTime
@@ -482,8 +506,9 @@ FROM tk
 JOIN days
   ON tk.PlannedStartTime < DATEADD(day, 1, CAST(days.d AS datetime2))
  AND tk.PlannedEndTime >= CAST(days.d AS datetime2)
-GROUP BY tk.ResourceId, days.d
-ORDER BY tk.ResourceId, days.d
+LEFT JOIN ProductionDepartment pd2 ON pd2.Id = tk.ProductionDepartmentId
+GROUP BY tk.ResourceId, days.d, tk.ProductionDepartmentId, pd2.DeptCode, pd2.DeptName
+ORDER BY tk.ResourceId, days.d, tk.ProductionDepartmentId
 OPTION (MAXRECURSION 40)";
 
         var slices = (await _connectionManager.QueryAsync<ResourceLoadSliceRow>(
@@ -501,7 +526,9 @@ OPTION (MAXRECURSION 40)";
         try
         {
             resolved = await _resourceCalendarService.ResolvePreviewAsync(
-                universe, fromDay, toDay, userId, cancellationToken);
+                universe, fromDay, toDay, userId,
+                additionalAllowedResourceIds: universe.ToHashSet(),   // PL3 甲：本部门任务设备→日历分母放行（工厂维仍过）
+                cancellationToken);
         }
         catch (Exception ex)
         {
@@ -538,7 +565,9 @@ OPTION (MAXRECURSION 40)";
         static int Rank(string? s) => s switch { "Resource" => 3, "Department" => 2, "Factory" => 1, _ => 0 };
 
         // ── 组装：设备×日全矩阵（无排产无日历的日子=Calendar 未解析⇒①不适用；②恒 0） ──
-        var sliceMap = slices.ToDictionary(s => (s.ResourceId, DateOnly.FromDateTime(s.BusinessDate)));
+        // PL2 甲：同键多部门切片先分组（逐行合并工时/任务数＋执行部门数组）
+        var sliceMap = slices.GroupBy(s => (s.ResourceId, DateOnly.FromDateTime(s.BusinessDate)))
+            .ToDictionary(g => g.Key, g => g.ToList());
         var resMeta = (await _connectionManager.QueryAsync<ResourceLoadResMeta>(
             @"SELECT r.Id AS ResourceId, r.ResourceCode, r.ResourceName,
                      r.ProductionDepartmentId, pd.DeptCode AS DepartmentCode, pd.DeptName AS DepartmentName
@@ -555,9 +584,20 @@ OPTION (MAXRECURSION 40)";
             var dayKey = DateOnly.FromDateTime(day);
             foreach (var rid in universe)
             {
-                var hasSlice = sliceMap.TryGetValue((rid, dayKey), out var sc);
+                var hasSlice = sliceMap.TryGetValue((rid, dayKey), out var scList);
                 var hasCal = calByResourceDay.TryGetValue((rid, dayKey), out var cal);
-                var sched = hasSlice ? sc!.ScheduledHours : 0m;
+                var sched = hasSlice ? scList!.Sum(x => x.ScheduledHours) : 0m;
+                var execDepts = hasSlice
+                    ? scList!.Where(x => x.ExecDeptId > 0)
+                        .GroupBy(x => (x.ExecDeptId, x.ExecDeptCode, x.ExecDeptName))
+                        .OrderByDescending(g => g.Sum(y => y.TaskCount))
+                        .Select(g => new LPS.APS.Core.Dto.ResourceLoadExecDeptDto
+                        {
+                            ProductionDepartmentId = g.Key.ExecDeptId,
+                            DepartmentCode = g.Key.ExecDeptCode,
+                            DepartmentName = g.Key.ExecDeptName
+                        }).ToList()
+                    : new List<LPS.APS.Core.Dto.ResourceLoadExecDeptDto>();
                 resMeta.TryGetValue(rid, out var meta);
 
                 decimal? rate1 = null;
@@ -581,7 +621,8 @@ OPTION (MAXRECURSION 40)";
                     DepartmentName = meta?.DepartmentName,
                     BusinessDate = day,
                     ScheduledHours = sched,
-                    TaskCount = hasSlice ? sc!.TaskCount : 0,
+                    TaskCount = hasSlice ? scList!.Sum(x => x.TaskCount) : 0,
+                    ExecutingDepartments = execDepts,
                     SetupHours = null,                                   // Q-b：Solver 落库产物缺，不代算
                     CalendarLoadRatePct = rate1,
                     Fixed16LoadRatePct = Math.Round(sched / 16m * 100m, 1),
@@ -621,6 +662,9 @@ OPTION (MAXRECURSION 40)";
     {
         public int ResourceId { get; init; }
         public DateTime BusinessDate { get; init; }
+        public int ExecDeptId { get; init; }
+        public string? ExecDeptCode { get; init; }
+        public string? ExecDeptName { get; init; }
         public decimal ScheduledHours { get; init; }
         public int TaskCount { get; init; }
     }

@@ -141,7 +141,8 @@ public static class DemandStageProcessQuantityProjector
         IReadOnlyList<LogicalProductionDemand>? demands,
         IReadOnlyList<StageSequenceChain>? chains,
         Func<int, string, YieldResolution>? yieldPercent,
-        int maxRowCount = MaxRowCount)
+        int maxRowCount = MaxRowCount,
+        IReadOnlyDictionary<string, IReadOnlyList<StageSequenceStep>?>? stepsByDemandKey = null)
     {
         var chainByMaterial = BuildChainIndex(chains, out var duplicateChainMaterials);
         var rows = new List<DemandStageProcessQuantity>();
@@ -163,7 +164,29 @@ public static class DemandStageProcessQuantityProjector
         foreach (var demand in demands ?? Array.Empty<LogicalProductionDemand>())
         {
             // 撞上限后**不 break**：继续空转——量照算、行不加、计数不停，为的是把 `TotalRowCount` 数成真实值。
-            if (!chainByMaterial.TryGetValue(demand.MaterialId, out var chain) || chain.Count == 0)
+            // 2026-11-25 撤隔离：**先按需求键取链**（合法多链物料在 `chains` 里缺席、但其需求有自己的链）。
+            //   回退口径按 0号位 2026-11-25 裁决 §1 收紧：
+            //     · **有绑定行** ⇒ 只认绑定；绑定无链（`NO_CHAIN`/`CONFLICT`/身份歧义）⇒ 该需求无链，
+            //       **不回退物料级**（新合同禁止借用其他需求的 Stage 链）；
+            //     · **无绑定行**（老载荷/未投影新 DTO）⇒ 才回落物料级唯一等价链（合法旧版兼容）。
+            IReadOnlyList<StageSequenceStep>? chain = null;
+            if (stepsByDemandKey is not null
+                && !string.IsNullOrEmpty(demand.LogicalDemandKey)
+                && stepsByDemandKey.TryGetValue(demand.LogicalDemandKey, out var demandChain))
+            {
+                // 有绑定行：**只认这条绑定**。`null`/空 ⇒ 该需求本就没有合法链
+                //   （`NO_CHAIN` / `CONFLICT` / 身份歧义）——按 0号位 2026-11-25 裁决 §1，
+                //   **不得回退**物料级链，也不得借用其他需求的 Stage 链。
+
+                chain = demandChain;
+            }
+            else if (chainByMaterial.TryGetValue(demand.MaterialId, out var materialChain) && materialChain.Count > 0)
+            {
+                // 无绑定行（老载荷 / 未投影新 DTO）= 合法旧版兼容：此时物料级只有唯一等价链。
+                chain = materialChain;
+            }
+
+            if (chain is null || chain.Count == 0)
             {
                 withoutChain++;
                 continue;

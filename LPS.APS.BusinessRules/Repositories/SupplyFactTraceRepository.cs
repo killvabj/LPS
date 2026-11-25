@@ -88,6 +88,11 @@ OFFSET @Skip ROWS FETCH NEXT @Take ROWS ONLY";
         return results.ToList();
     }
 
+    /// <summary>
+    /// 【2026-11-24 起无调用方 · Owner 判定视图暂不使用】原读 ext_ERP_Received_ByDocument_View；
+    /// 保留本方法仅作将来换源（直读 ERP_U13_Received 真表）的恢复骨架——恢复须经 0号位 裁决，
+    /// 禁止在 QueryAllAsync 中直接改回读旧视图（其 DocumentType 为硬编码常量、底层为 U13 生产入库）。
+    /// </summary>
     public async Task<List<SupplyFactTraceDto>> QueryReceivedAsync(
         string? materialCode = null,
         int? materialId = null,
@@ -185,26 +190,11 @@ OFFSET @Skip ROWS FETCH NEXT @Take ROWS ONLY";
             allFacts.AddRange(pipelineFacts);
         }
 
-        // Received事实
-        if (string.IsNullOrEmpty(sourceType) || sourceType == "RECEIVED")
-        {
-            // 将supplyType映射到documentType
-            string? documentType = null;
-            if (!string.IsNullOrEmpty(supplyType))
-            {
-                documentType = supplyType switch
-                {
-                    "SHIPPING_INSTRUCTION" => "SHIPPING_INSTRUCTION",
-                    "PRODUCTION_INSTRUCTION" => "PRODUCTION_INSTRUCTION",
-                    _ => null
-                };
-            }
-
-            var receivedFacts = await QueryReceivedAsync(
-                materialCode, materialId, factoryCode, documentType, sourceDocumentNo,
-                activeOnly, take: take, ct: ct, allowedFactories: allowedFactories);
-            allFacts.AddRange(receivedFacts);
-        }
+        // ── RECEIVED 腿：2026-11-24 Owner 判定「视图 ERP_Received_ByDocument_View 暂不使用」，本端点不再返回该类行。
+        //    原实现调用 QueryReceivedAsync 直读 ext_ERP_Received_ByDocument_View（其 DocumentType 为硬编码常量，
+        //    底层是 ERP U13 生产入库），现整腿停用；QueryReceivedAsync 保留为将来换源（直读 ERP_U13_Received 真表）
+        //    的恢复入口，恢复须经 0号位 裁决，禁止直接改回读旧视图。
+        //    ⇒ sourceType='RECEIVED' 现在返回空集（如实空，不造行）；sourceType 空=仅供给流水线腿。
 
         return allFacts
             .OrderByDescending(f => f.SyncedAt ?? f.LastReceivedAt ?? f.SourceUpdatedAt)

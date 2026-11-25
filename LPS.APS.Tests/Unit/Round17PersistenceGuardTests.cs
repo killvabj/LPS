@@ -195,12 +195,22 @@ public class Round17PersistenceGuardTests
             .Should().BeEmpty();
     }
 
+    /// <summary>
+    /// 2026-11-25 撤隔离后：**角色冲突不再进拒绝集**（调用点传空），仍进拒绝集的只有身份歧义与首选 scope 无链。
+    /// 本用例钉死「函数在收到冲突键时仍会拒绝」的能力保留（供将来按需启用），
+    /// 但**生产路径已不再传冲突键** —— 见 `PeggingOrchestrator` 中 `ComputeRejectedMaterials` 调用点。
+    /// </summary>
     [Fact]
-    public void 角色冲突与身份歧义无条件拒绝_即便该物料有链()
+    public void 函数能力保留_传入冲突键时仍拒绝_但生产路径已不传()
     {
         PeggingOrchestrator.ComputeRejectedMaterials(
                 new[] { 100 }, new[] { 200 }, Array.Empty<int>(), Chains((100, "S10"), (200, "S20")))
             .Should().BeEquivalentTo(new[] { 100, 200 });
+
+        // 生产路径实际入参：冲突键为空 ⇒ 冲突物料不在拒绝集
+        PeggingOrchestrator.ComputeRejectedMaterials(
+                Array.Empty<int>(), new[] { 200 }, Array.Empty<int>(), Chains((100, "S10")))
+            .Should().Equal(200);
     }
 
     [Fact]

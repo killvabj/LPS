@@ -1,3 +1,4 @@
+using LPS.APS.Core.Entities.APS;
 using LPS.APS.Shared.Models;
 
 namespace LPS.APS.Core.Models.Scheduling;
@@ -82,6 +83,22 @@ public class SchedulingContext
     /// 【2号位填充】阶段1 从上游域已落盘的排程结果读取（跨域协同场景），单域场景为空
     /// </summary>
     public Dictionary<string, DateTime> VirtualInventory { get; set; } = new();
+
+    /// <summary>
+    /// **Run 级上两级日历事实（工厂／生产部门）**——`ProductionWorkCalendarSlot` 原始有效行。
+    ///
+    /// <para>【为什么放在这里】0号位 2026-11-25 统一答复 §2：Run 启动时已统一装载三级日历，
+    /// 但没有在共享上下文里保留工厂／部门两级，导致 Pegging 侧按 Domain 重复读库。
+    /// 本属性把**已装载的原始行**留在 Run 上下文里，各 Domain 直接复用，不再重复查库。</para>
+    ///
+    /// <para>【边界】只放**原始事实行**（现库 93 行），不是合成后的窗口、不是快照表：
+    /// 各 Domain 仍按自身合法 Stage／部门／资源范围投影成 `DepartmentWorkWindows`；
+    /// 三级继承、OFF 硬约束、资源资格与 Domain 计算边界**一律不变**。</para>
+    ///
+    /// <para>【空值语义】空 = 未装载（老调用方／单测／探针手工构造上下文）⇒ 消费方**回落自行查库**，
+    /// 与改造前逐字一致，零回归。</para>
+    /// </summary>
+    public List<ProductionWorkCalendarSlot> UpperLevelCalendarFacts { get; set; } = new();
 
     /// <summary>
     /// 现货库存（L5 内存消费层，阶段1.5 从 InventoryBalance 装载）

@@ -23,6 +23,7 @@ public interface IOrderQueryRepository
         string? productFamilyCode = null,
         string? orderType = null,
         string? materialType = null,
+        IReadOnlyList<string>? execDepartmentCodes = null,
         DateTime? dueDateFrom = null,
         DateTime? dueDateTo = null,
         string? riskLevel = null,
@@ -58,6 +59,7 @@ public interface IOrderQueryRepository
         string? productFamilyCode = null,
         string? orderType = null,
         string? materialType = null,
+        IReadOnlyList<string>? execDepartmentCodes = null,
         DateTime? dueDateFrom = null,
         DateTime? dueDateTo = null,
         string? riskLevel = null,
@@ -83,6 +85,7 @@ public interface IOrderQueryRepository
         string? productFamilyCode = null,
         string? orderType = null,
         string? materialType = null,
+        IReadOnlyList<string>? execDepartmentCodes = null,
         DateTime? dueDateFrom = null,
         DateTime? dueDateTo = null,
         string? riskLevel = null,
@@ -120,6 +123,7 @@ public interface IOrderQueryRepository
         int pageIndex = 1,
         int pageSize = 50,
         IReadOnlySet<string>? allowedDomains = null,
+        IReadOnlySet<string>? allowedFactories = null,
         CancellationToken ct = default);
 
     /// <summary>
@@ -138,6 +142,7 @@ public interface IOrderQueryRepository
         string? productFamilyCode = null,
         string? orderType = null,
         string? materialType = null,
+        IReadOnlyList<string>? execDepartmentCodes = null,
         DateTime? dueDateFrom = null,
         DateTime? dueDateTo = null,
         string? riskLevel = null,

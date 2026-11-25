@@ -34,6 +34,11 @@ public sealed class OrderListItemDto
     /// 禁由品番前缀推断（0号位 11-20 裁）；主数据缺行 ⇒ null=未提供。JSON: materialType</summary>
     public string? MaterialType { get; init; }
 
+    /// <summary>OR3 丙（11-24 3号位 裁）：该订单窗内各工序执行部门 DeptCode 去重集合（多值、序稳定；无 Task=空）。
+    /// 排产事实侧（Task.ProductionDepartmentId→DeptCode）；**可见性不收窄（丙）**，本列仅告知。
+    /// 可变属性=两段式富化写入（同 plannedCompletionTime 族）。JSON: execDepartmentCodes</summary>
+    public List<string> ExecDepartmentCodes { get; set; } = new();
+
     /// <summary>客户名称（v24 有值率 59.9%；缺失源于 ERP 源头未带）。JSON: customerName</summary>
     public string? CustomerName { get; init; }
 

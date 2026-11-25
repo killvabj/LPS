@@ -72,7 +72,11 @@ WHERE o.PlanVersionId = @PlanVersionId
     AND (@HasDomains = 0 OR o.DomainKey IN @AllowedDomains)
     -- A5（11-21 4号位件）：统计卡回筛两参——与 KPI 分区行字面值同源；缺省=不过滤（全部消费方同文本）
     AND (@OrderType IS NULL OR o.OrderType = @OrderType)
-    AND (@MaterialType IS NULL OR m.MaterialType = @MaterialType)";
+    AND (@MaterialType IS NULL OR m.MaterialType = @MaterialType)
+    -- OR3 丙（11-24 3号位 裁）：按执行部门筛选（EXISTS 不扇出；可见性不收窄，仅查询条件）
+    AND (@HasExecDepts = 0 OR EXISTS (SELECT 1 FROM [Task] _t
+        JOIN ProductionDepartment _pd ON _pd.Id = _t.ProductionDepartmentId
+        WHERE _t.PlanVersionId = o.PlanVersionId AND _t.OrderId = o.Id AND _pd.DeptCode IN @ExecDeptCodes))";
 
     /// <summary>
     /// 计划派生交付判定（冻结 01 §64 / 07 §八.2）——与列表富化 C# 式逐语等价：
@@ -104,6 +108,7 @@ INSERT #tc SELECT OrderId, MAX(PlannedEndTime) FROM [Task] WHERE PlanVersionId =
         string? productFamilyCode = null,
         string? orderType = null,
         string? materialType = null,
+        IReadOnlyList<string>? execDepartmentCodes = null,
         DateTime? dueDateFrom = null,
         DateTime? dueDateTo = null,
         string? riskLevel = null,
@@ -200,6 +205,8 @@ SELECT
             PlanVersionId = planVersionId,
             OrderType = orderType,
             MaterialType = materialType,
+            HasExecDepts = execDepartmentCodes is { Count: > 0 },
+            ExecDeptCodes = execDepartmentCodes,
             OrderNo = orderNo,
             MaterialCode = materialCode,
             CustomerName = customerName,
@@ -261,6 +268,21 @@ SELECT
             var plannedById = plannedRows.ToDictionary(r => r.OrderId, r => r.PlannedCompletion);
             var reasonById = reasonRows.ToDictionary(r => r.OrderId, r => r.ReasonCode);
 
+            // OR3 丙：行级执行部门集合富化——两段式（当前页订单 Id 批次查，禁逐行子查询）。
+            var deptRows = await _connectionManager.QueryAsync<OrderExecDeptRow>(
+                @"SELECT t.OrderId, pd.DeptCode
+                    FROM [Task] t
+                    JOIN ProductionDepartment pd ON pd.Id = t.ProductionDepartmentId
+                    WHERE t.PlanVersionId = @PlanVersionId
+                      AND t.OrderId IN (SELECT CAST(value AS bigint) FROM STRING_SPLIT(@Ids, ','))
+                      AND pd.DeptCode IS NOT NULL
+                    GROUP BY t.OrderId, pd.DeptCode
+                    OPTION (RECOMPILE)",
+                new { PlanVersionId = planVersionId, Ids = ids },
+                CommandType.Text, DatabaseId.APS, commandTimeout: 30);
+            var deptById = deptRows.GroupBy(r => r.OrderId)
+                .ToDictionary(g => g.Key, g => g.Select(x => x.DeptCode!).OrderBy(x => x, StringComparer.Ordinal).ToList());
+
             foreach (var item in items)
             {
                 plannedById.TryGetValue(item.Id, out var completion);
@@ -269,6 +291,8 @@ SELECT
                 item.DelayHours = CalcDelayHours(completion, item.CustomerDueDate);
                 // 冻结 01 §64 计划派生延期判定（riskLevel，11-02 口径函 Q1）：无 Task 或无交期 ⇒ 缺键=不可判定（≠未延迟）；
                 // 日期口径与 delayHours 同判据家族（Q1/DelayedOnDate 族）。AT_RISK 无源不出（OrderScheduleSummary 空表）。
+                // OR3：执行部门集合（无 Task=空列表——事实为空，不是未提供）。
+                item.ExecDepartmentCodes = deptById.TryGetValue(item.Id, out var deptCodes) ? deptCodes : new List<string>();
                 item.RiskLevel = completion is null || item.CustomerDueDate == default
                     ? null
                     : completion.Value.Date > item.CustomerDueDate.Date ? "DELAYED" : "ON_TRACK";
@@ -407,6 +431,7 @@ ORDER BY t.OperationSeq";
         string? productFamilyCode = null,
         string? orderType = null,
         string? materialType = null,
+        IReadOnlyList<string>? execDepartmentCodes = null,
         DateTime? dueDateFrom = null,
         DateTime? dueDateTo = null,
         string? riskLevel = null,
@@ -462,6 +487,8 @@ DROP TABLE #tc;";
             PlanVersionId = planVersionId,
             OrderType = orderType,
             MaterialType = materialType,
+            HasExecDepts = execDepartmentCodes is { Count: > 0 },
+            ExecDeptCodes = execDepartmentCodes,
             OrderNo = orderNo,
             MaterialCode = materialCode,
             CustomerName = customerName,
@@ -505,6 +532,7 @@ DROP TABLE #tc;";
         string? productFamilyCode = null,
         string? orderType = null,
         string? materialType = null,
+        IReadOnlyList<string>? execDepartmentCodes = null,
         DateTime? dueDateFrom = null,
         DateTime? dueDateTo = null,
         string? riskLevel = null,
@@ -544,6 +572,8 @@ DROP TABLE #tc;";
             PlanVersionId = planVersionId,
             OrderType = orderType,
             MaterialType = materialType,
+            HasExecDepts = execDepartmentCodes is { Count: > 0 },
+            ExecDeptCodes = execDepartmentCodes,
             OrderNo = orderNo,
             MaterialCode = materialCode,
             CustomerName = customerName,
@@ -612,6 +642,7 @@ DROP TABLE #tc;";
         string? productFamilyCode = null,
         string? orderType = null,
         string? materialType = null,
+        IReadOnlyList<string>? execDepartmentCodes = null,
         DateTime? dueDateFrom = null,
         DateTime? dueDateTo = null,
         string? riskLevel = null,
@@ -639,6 +670,8 @@ DROP TABLE #tc;";
             PlanVersionId = planVersionId,
             OrderType = orderType,
             MaterialType = materialType,
+            HasExecDepts = execDepartmentCodes is { Count: > 0 },
+            ExecDeptCodes = execDepartmentCodes,
             OrderNo = orderNo,
             MaterialCode = materialCode,
             CustomerName = customerName,
@@ -959,6 +992,7 @@ ORDER BY AllocationSequence",
         int pageIndex = 1,
         int pageSize = 50,
         IReadOnlySet<string>? allowedDomains = null,
+        IReadOnlySet<string>? allowedFactories = null,
         CancellationToken ct = default)
     {
         var part = string.IsNullOrWhiteSpace(participation) ? "all" : participation.Trim().ToLowerInvariant();
@@ -971,7 +1005,8 @@ ORDER BY AllocationSequence",
             new { Pv = planVersionId }, CommandType.Text, DatabaseId.APS, commandTimeout: 10);
         if (header is null || header.Id == 0)
             return new OrderPoolResultDto { PlanVersionId = planVersionId, VersionExists = false };
-        if (allowedDomains is { Count: 0 } || (allowedDomains is not null && !allowedDomains.Contains(header.DomainKey)))
+        if (allowedDomains is { Count: 0 } || (allowedDomains is not null && !allowedDomains.Contains(header.DomainKey))
+            || allowedFactories is { Count: 0 })
             return new OrderPoolResultDto { PlanVersionId = planVersionId, ScopeDenied = true };
         if (!string.Equals(header.PlanVersionStatus, "ACTIVE", StringComparison.OrdinalIgnoreCase))
             return new OrderPoolResultDto
@@ -1000,6 +1035,8 @@ ORDER BY AllocationSequence",
             Fam = dom?.ProductFamilyId ?? 0,
             DomFactory = string.Equals(dom.ScopeType, "FACTORY_FAMILY", StringComparison.OrdinalIgnoreCase) ? dom.FactoryCode : null,
             P = part,
+            HasScopeFactories = allowedFactories is { Count: > 0 },
+            ScopeFactories = allowedFactories is { Count: > 0 } ? allowedFactories.ToList() : null,
             Kw = string.IsNullOrWhiteSpace(keyword) ? null : "%" + keyword.Trim() + "%",
             Ot = string.IsNullOrWhiteSpace(orderType) ? null : orderType.Trim(),
             Skip = (page - 1) * size,
@@ -1018,7 +1055,9 @@ sched AS (
            o.UpdatedAt AS ScheduledTime
     FROM [Order] o
     LEFT JOIN Material m ON m.Id = o.MaterialId
+    -- OR 批（11-24 3号位 裁丙随批）：选单池**补 Factory 维**（此前仅 Domain——比列表更宽，我方缺口登记收口）；空集在调用方 fail-closed。
     WHERE o.PlanVersionId = @Pv AND (@P = 'all' OR @P = 'scheduled')
+      AND (@HasScopeFactories = 0 OR EXISTS (SELECT 1 FROM Factory sf WHERE sf.Id = o.FactoryId AND sf.Code IN @ScopeFactories))
 ),
 fresh AS (
     SELECT c.OrderNo, CAST(NULL AS bigint) AS OrderId, c.Id AS OrderCanonicalId,
@@ -1031,6 +1070,7 @@ fresh AS (
     JOIN Material m ON m.MaterialCode = c.MaterialCode
     WHERE m.ProductFamilyId = @Fam
       AND (@DomFactory IS NULL OR c.FactoryCode = @DomFactory)
+      AND (@HasScopeFactories = 0 OR c.FactoryCode IN @ScopeFactories)
       AND NOT EXISTS (SELECT 1 FROM [Order] o WHERE o.PlanVersionId = @Pv AND o.OrderNo = c.OrderNo)
       AND (@P = 'all' OR @P = 'fresh')
 ),
@@ -1165,6 +1205,12 @@ OFFSET @Skip ROWS FETCH NEXT @Take ROWS ONLY",
     }
 
     /// <summary>两段式富化行：订单主要原因码（15 码白名单内 ImpactHours 最大者）</summary>
+    private sealed class OrderExecDeptRow
+    {
+        public long OrderId { get; set; }
+        public string? DeptCode { get; set; }
+    }
+
     private sealed class OrderReasonRow
     {
         public long OrderId { get; set; }

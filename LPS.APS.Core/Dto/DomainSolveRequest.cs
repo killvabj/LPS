@@ -172,6 +172,38 @@ public sealed class DomainSolveRequest
     public IReadOnlyList<StageSequenceChain> StageSequenceChains { get; init; }
         = Array.Empty<StageSequenceChain>();
 
+    /// <summary>
+    /// **去重后的合法 Stage 链目录**（A31③，0号位 2026-11-24 裁决 v1.2 §3；2026-11-25 总表 §一 P0 第一项）。
+    ///
+    /// 【与 <see cref="StageSequenceChains"/> 的关系】
+    ///   多链物料在本字段**每条链一条记录**，各自带 `ChainRefId`；
+    ///   <see cref="StageSequenceChains"/> 降级为兼容口径 —— **仅当某物料在整个 Run 内只有唯一等价链时**才照旧出现，
+    ///   有多个合法链的物料在那边**不再出现**，改由 <see cref="DemandStageChainBindings"/> 按需求取。
+    ///
+    /// 【为什么必须换载体】旧载体以 `MaterialId` 为键、一物料只能一条链；1号位 三处消费点取值口径还不一致：
+    ///   `PhaseOneConstraintBuilder.BuildStageChainIndex`（`:851`）与 `StageTimingNodeBuilder`（`:265`）是 **last-wins**，
+    ///   `PhaseTwoInitialScheduler`（`:257`）是 **first-wins**。真发两条链 ⇒ 同一 Run 内两处会走**不同**路径且不报错。
+    ///   实测（2026-11-25）因此被隔离的物料 = 289 条。
+    ///
+    /// 【空表语义】空 = 本域未投影（老调用方/单测）⇒ 消费侧按既有 `StageSequenceChains` 行为处理，零回归。
+    /// </summary>
+    public IReadOnlyList<StageChainDefinition> StageChainDefinitions { get; init; }
+        = Array.Empty<StageChainDefinition>();
+
+    /// <summary>
+    /// **逐需求的链绑定**（A31③）：每个 `LogicalDemandKey` 指到自己的 `ChainRefId`。
+    ///
+    /// 【键】`LogicalDemandKey` ＋ `BindingKey`。同一需求多条父边时用不同 `BindingKey` 区分 ——
+    ///   不得把多父边塞进 JSON 冒充身份（v1.2 §3）。
+    ///
+    /// 【无链需求也要出行】`Status` 为 `NO_ANCHOR` / `CONFLICT` / `NO_CHAIN` 时 `ChainRefId` 为 null。
+    ///   出行的意义是让消费侧能区分「根本没有链」与「有链但歧义」——两者的未排原因不同。
+    ///
+    /// 【空表语义】空 = 本域未投影 ⇒ 消费侧保持既有行为，零回归。
+    /// </summary>
+    public IReadOnlyList<DemandStageChainBinding> DemandStageChainBindings { get; init; }
+        = Array.Empty<DemandStageChainBinding>();
+
     public IReadOnlyList<MaterialAvailabilitySlice> MaterialConstraints { get; init; }
         = Array.Empty<MaterialAvailabilitySlice>();
 
