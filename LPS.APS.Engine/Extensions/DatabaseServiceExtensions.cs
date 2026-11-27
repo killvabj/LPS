@@ -60,9 +60,11 @@ public static class DatabaseServiceExtensions
                 .AddClasses(classes => classes
                     .InNamespaces(
                         "LPS.APS.Engine.Services.Sync",
-                        "LPS.APS.Engine.Services.Auth",
-                        // 保留期清理（D1~D4）：IRetentionMaintenanceService → RetentionMaintenanceService
-                        "LPS.APS.Engine.Services.Maintenance")
+                        "LPS.APS.Engine.Services.Auth"
+                        // 2026-11-26 停用：保留期改由 SQL 侧 `sp_PvRetentionCycle` ＋ Agent 作业承担，
+                        //   C# `RetentionMaintenanceService` 整条链路不再注册（该类已无任何调用方）。
+                        // "LPS.APS.Engine.Services.Maintenance"
+                        )
                     .Where(t => ServiceScanFilters.IsServiceCandidate(t)))
                 .AsImplementedInterfaces()
                 .WithScopedLifetime()

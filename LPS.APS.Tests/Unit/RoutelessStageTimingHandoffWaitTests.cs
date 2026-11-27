@@ -102,6 +102,141 @@ public class RoutelessStageTimingHandoffWaitTests
         Assert.Equal(Day.AddHours(10), f.CompletionTime);
     }
 
+    // ────────────────────────────────────────────────────────────────────
+    // 2026-11-25（0号位 v1.3 §4.3 / v1.5 ①）：Task→Timing 的 **WORK 基准**变体
+    //   原夹具窗口是「Day → +100 年」全开 ⇒ WORK 与 ELAPSED 结果相同，**测不出**区别。
+    //   本组改用「每天 08:00–16:00」的真实 OFF 窗口，三组结果两两不同：
+    //     无规则 ⇒ 09-02 10:00；ELAPSED 300 ⇒ 09-02 11:00；WORK 300 ⇒ 09-02 15:00。
+    // ────────────────────────────────────────────────────────────────────
+
+    [Fact]
+    public async Task WORK基准_交接等待按合法窗口推进_不得按自然分钟直加()
+    {
+        var baseline = await _solver.SolveAsync(BuildWithOffWindows(rule: null));
+        var elapsed = await _solver.SolveAsync(BuildWithOffWindows(new StageHandoffWaitRule
+        {
+            FactoryCode = "F1", FromStageCode = "CS1", ToStageCode = "CS2",
+            WaitMinutes = 300, TimeBasis = StageHandoffTimeBasis.ELAPSED, IsActive = true
+        }));
+        var work = await _solver.SolveAsync(BuildWithOffWindows(new StageHandoffWaitRule
+        {
+            FactoryCode = "F1", FromStageCode = "CS1", ToStageCode = "CS2",
+            WaitMinutes = 300, TimeBasis = StageHandoffTimeBasis.WORK, IsActive = true
+        }));
+
+        // 无规则：CS1 08:00→15:00（7h），CS2 15:00→16:00 + 次日 08:00→10:00（3h）
+        Assert.Equal(Day.AddDays(1).AddHours(10), Assert.Single(baseline.DemandCompletions).CompletionTime);
+
+        // ELAPSED 300：15:00 + 5h 自然 = 20:00（越窗）；CS2 3h 落次日 08:00→11:00
+        Assert.Equal(Day.AddDays(1).AddHours(11), Assert.Single(elapsed.DemandCompletions).CompletionTime);
+
+        // WORK 300：15:00 起只有 1 有效小时到 16:00，余 4h 落次日 08:00→12:00；
+        //   再 CS2 3h ⇒ 12:00→15:00。（把它当自然分钟会得到 11:00，即上一行，必须不同）
+        Assert.Equal(Day.AddDays(1).AddHours(15), Assert.Single(work.DemandCompletions).CompletionTime);
+    }
+
+    [Fact]
+    public async Task 无链定义时_按需求厂取窗_不得判STAGE_FACTORY_UNKNOWN()
+    {
+        // 2026-11-25（§4.2 两档口径的**下档**）：该需求没有任何链 ⇒ 不存在「Stage 执行厂」事实，
+        //   需求厂是唯一可用事实（不是回落）。⇒ 正常推进，且**不得**出现 STAGE_FACTORY_UNKNOWN。
+        var result = await _solver.SolveAsync(BuildWithOffWindows(rule: null, withChain: false));
+
+        Assert.Equal(Day.AddDays(1).AddHours(10), Assert.Single(result.DemandCompletions).CompletionTime);
+        Assert.DoesNotContain(
+            result.SolveTraceNotes,
+            n => n.Message is not null && n.Message.Contains("STAGE_FACTORY_UNKNOWN", StringComparison.Ordinal));
+    }
+
+    /// <summary>
+    /// 每天 `08:00–16:00` 两日窗口版本。默认带链且链里写明 `StageFactoryId = 1`（走上档）；
+    /// <paramref name="withChain"/> = false 时链/绑定全不给（走「无链」下档）。
+    /// </summary>
+    private static DomainSolveRequest BuildWithOffWindows(StageHandoffWaitRule? rule, bool withChain = true)
+    {
+        var request = Build(rule);
+
+        var windows = new List<DepartmentWorkWindow>
+        {
+            new() { FactoryId = 1, DepartmentId = Dept, Start = Day.AddHours(8), End = Day.AddHours(16) },
+            new() { FactoryId = 1, DepartmentId = Dept, Start = Day.AddDays(1).AddHours(8), End = Day.AddDays(1).AddHours(16) }
+        };
+
+        if (!withChain)
+        {
+            // 「无链」= 只有旧物料的 `StageSequenceChains`（链步不带执行厂），没有新契约链定义/绑定。
+            //   ⚠ 完全不给链则 R09-② 判「结构上无法定位」⇒ 不推进，那是另一条测试口径。
+            return new DomainSolveRequest
+            {
+                PlanVersionId = request.PlanVersionId,
+                DomainKey = request.DomainKey,
+                PlanningStart = request.PlanningStart,
+                PlanningEnd = request.PlanningEnd,
+                LogicalProductionDemands = request.LogicalProductionDemands,
+                RoutingOperations = request.RoutingOperations,
+                RoutingDependencies = request.RoutingDependencies,
+                OperationResourceEligibility = request.OperationResourceEligibility,
+                MaterialStageDepartmentContexts = request.MaterialStageDepartmentContexts,
+                DepartmentWorkWindows = windows,
+                StageLeadTimes = request.StageLeadTimes,
+                StageSequenceChains = new List<StageSequenceChain>
+                {
+                    new()
+                    {
+                        MaterialId = M,
+                        Stages = new List<StageSequenceStep>
+                        {
+                            new() { StageCode = "CS1", StageSeq = 1 },
+                            new() { StageCode = "CS2", StageSeq = 2 }
+                        }
+                    }
+                },
+                StageChainDefinitions = new List<StageChainDefinition>(),
+                DemandStageChainBindings = new List<DemandStageChainBinding>(),
+                ExecutionConstraints = request.ExecutionConstraints,
+                Resources = request.Resources,
+                CalendarSlots = request.CalendarSlots,
+                StrategySnapshot = request.StrategySnapshot
+            };
+        }
+
+        // 上档：链步带上厂 Id（`StageFactoryId`），窗口按该厂取。
+        var withIds = new List<StageChainDefinition>
+        {
+            new()
+            {
+                ChainRefId = "ROOT:1:CS1|2:CS2", StageScopeType = "ROOT", ChainSignature = "1:CS1|2:CS2",
+                Stages = new List<StageSequenceStep>
+                {
+                    new() { StageCode = "CS1", StageSeq = 1, ProductionDepartmentId = Dept, StageFactoryCode = "F1", StageFactoryId = 1 },
+                    new() { StageCode = "CS2", StageSeq = 2, ProductionDepartmentId = Dept, StageFactoryCode = "F1", StageFactoryId = 1 }
+                }
+            }
+        };
+
+        return new DomainSolveRequest
+        {
+            PlanVersionId = request.PlanVersionId,
+            DomainKey = request.DomainKey,
+            PlanningStart = request.PlanningStart,
+            PlanningEnd = request.PlanningEnd,
+            LogicalProductionDemands = request.LogicalProductionDemands,
+            RoutingOperations = request.RoutingOperations,
+            RoutingDependencies = request.RoutingDependencies,
+            OperationResourceEligibility = request.OperationResourceEligibility,
+            MaterialStageDepartmentContexts = request.MaterialStageDepartmentContexts,
+            DepartmentWorkWindows = windows,
+            StageLeadTimes = request.StageLeadTimes,
+            StageSequenceChains = request.StageSequenceChains,
+            StageChainDefinitions = withIds,
+            DemandStageChainBindings = request.DemandStageChainBindings,
+            ExecutionConstraints = request.ExecutionConstraints,
+            Resources = request.Resources,
+            CalendarSlots = request.CalendarSlots,
+            StrategySnapshot = request.StrategySnapshot
+        };
+    }
+
     private static DomainSolveRequest Build(StageHandoffWaitRule? rule)
         => new()
         {

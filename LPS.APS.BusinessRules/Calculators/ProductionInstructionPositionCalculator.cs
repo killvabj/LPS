@@ -1292,6 +1292,18 @@ public class ProductionInstructionPositionCalculator : IProductionInstructionPos
     {
         var contexts = new List<NextOperationContextDto>();
 
+        // ── 2026-11-26 D05-C13 P1 修正：区分「累计切片 vs 未完工切片」──
+        // 累计切片（SourceKey==null，StageProgress 累计差分量）＝本 Stage 已完工、未收讫/待下游的量；
+        //   其"下一工序"不是本 Stage 拓扑前沿（它已通过本 Stage 全部工序），若走前沿差分会被误排回已过工序。
+        //   整段按 Stage 级给出 StartOperationCode=null（Stage 已完成，仅剩收讫/下游衔接；39-0 §四.3、06/07「必要时才填」）。
+        // 未完工切片（SourceKey=FIRST_STAGE_RESIDUAL / FIRST_STAGE_FALLBACK）才走下面的前沿＋下游残差差分。
+        // 判别可靠：2号位 §9.6 装配的两处 `StageProgressFact.SnapshotId` 均恒为 null ⇒ 累计切片 SourceKey 恒 null。
+        if (string.IsNullOrEmpty(position.SourceKey))
+        {
+            contexts.Add(CreateNextOperationContext(input, position, stageCode, null, false));
+            return contexts;
+        }
+
         // 39-0 裁决 §四/§八：退出 OrderBy(OperationSequence)，改用三档降级判定
         var operations = input.OperationProgress
             .Where(op => op.StageCode == stageCode)
@@ -1308,24 +1320,84 @@ public class ProductionInstructionPositionCalculator : IProductionInstructionPos
         // 优先：DAG 拓扑前沿（Routing 数据可用时，39-0 §二/§五）
         if (input.RoutingDependencies.Count > 0)
         {
-            var (dagStartOp, dagFrontierCount, dagAmbiguous) = FindTopologicalFrontier(
+            var frontier = FindTopologicalFrontierList(
                 input.RoutingOperations, input.RoutingDependencies, operations, stageCode);
 
-            if (dagStartOp != null)
+            if (frontier.Count == 1)
             {
-                // DAG 唯一前沿
-                contexts.Add(CreateNextOperationContext(
-                    input, position, stageCode, dagStartOp, false, position.Quantity));
+                // ── 2026-11-26 D05-C13 修正（冻结 Pegging §2「对该剩余数量给出下一工序」）──
+                // 前沿分量 = 该工序自身剩余（不是整段 Position 量）；
+                // 未被前沿剩余覆盖的残差 = 已过前沿、下一道未报工的下游份额 ⇒ 按路由后继（唯一才给，不猜）
+                // 单独成片；无唯一后继 ⇒ StartOperationCode=NULL + NEXT_OPERATION_AMBIGUOUS（39-0 §四.2/§五）。
+                var f = frontier[0];
+                var progressOp = operations.FirstOrDefault(op =>
+                    string.Equals(op.OperationName, f.OpName, StringComparison.Ordinal));
+                var frontierQty = Math.Min(progressOp?.RemainingQty ?? position.Quantity, position.Quantity);
+                if (frontierQty < 0m) frontierQty = 0m;
+
+                if (frontierQty > 0.0001m)
+                {
+                    contexts.Add(CreateNextOperationContext(
+                        input, position, stageCode, f.OpName, false, frontierQty));
+                }
+
+                var residual = position.Quantity - frontierQty;
+                if (residual > 0.0001m)
+                {
+                    var (nextCode, nextName, succAmbiguous) =
+                        ResolveImmediateSuccessorFromRouting(input, stageCode, f.OpCode, operations);
+                    if (!succAmbiguous && nextName != null)
+                    {
+                        contexts.Add(CreateNextOperationContext(
+                            input, position, stageCode, nextName, false, residual));
+                    }
+                    else if (succAmbiguous)
+                    {
+                        // 多后继（并行分叉）→ AMBIGUOUS（39-0 §五：不得重新线性化）
+                        issues.Add(new PositionIssue
+                        {
+                            IssueType = "NEXT_OPERATION_AMBIGUOUS",
+                            Level = PositionIssueLevel.WARN,
+                            Description = $"Stage {stageCode}: 前沿 {f.OpName} 的下游残差{residual}后继多分支，无法唯一定位",
+                            ProductionInstructionNo = input.ProductionInstructionNo,
+                            StageCode = stageCode,
+                            AffectedQuantity = residual
+                        });
+                        contexts.Add(CreateNextOperationContext(
+                            input, position, stageCode, null, false, residual,
+                            "NEXT_OPERATION_AMBIGUOUS",
+                            $"Stage {stageCode}: 前沿 {f.OpName} 下游残差后继多分支"));
+                    }
+                    else
+                    {
+                        // 无直接后继（前沿是末工序，残差属"过末道未收讫"，本 Stage 已无下一工序可指）
+                        // 2026-11-26 P2：与「多后继」区分，独立记 NEXT_OPERATION_NO_SUCCESSOR
+                        issues.Add(new PositionIssue
+                        {
+                            IssueType = "NEXT_OPERATION_NO_SUCCESSOR",
+                            Level = PositionIssueLevel.WARN,
+                            Description = $"Stage {stageCode}: 前沿 {f.OpName} 的下游残差{residual}无直接路由后继（末工序），Stage 内无下一工序",
+                            ProductionInstructionNo = input.ProductionInstructionNo,
+                            StageCode = stageCode,
+                            AffectedQuantity = residual
+                        });
+                        contexts.Add(CreateNextOperationContext(
+                            input, position, stageCode, null, false, residual,
+                            "NEXT_OPERATION_NO_SUCCESSOR",
+                            $"Stage {stageCode}: 前沿 {f.OpName} 下游残差无后继"));
+                    }
+                }
                 return contexts;
             }
-            else if (dagAmbiguous)
+
+            if (frontier.Count > 1)
             {
-                // DAG 多前沿（并行分支）→ AMBIGUOUS
+                // DAG 多前沿（并行分支）→ AMBIGUOUS（39-0 §五：不得重新线性化）
                 issues.Add(new PositionIssue
                 {
                     IssueType = "NEXT_OPERATION_AMBIGUOUS",
                     Level = PositionIssueLevel.WARN,
-                    Description = $"Stage {stageCode}: DAG拓扑前沿{dagFrontierCount}个并行分支, 无法唯一定位",
+                    Description = $"Stage {stageCode}: DAG拓扑前沿{frontier.Count}个并行分支, 无法唯一定位",
                     ProductionInstructionNo = input.ProductionInstructionNo,
                     StageCode = stageCode,
                     AffectedQuantity = position.Quantity
@@ -1333,10 +1405,53 @@ public class ProductionInstructionPositionCalculator : IProductionInstructionPos
                 contexts.Add(CreateNextOperationContext(
                     input, position, stageCode, null, false, position.Quantity,
                     "NEXT_OPERATION_AMBIGUOUS",
-                    $"Stage {stageCode}: DAG {dagFrontierCount}个并行分支"));
+                    $"Stage {stageCode}: DAG {frontier.Count}个并行分支"));
                 return contexts;
             }
-            // else: DAG 无结果 → 降级到中间态
+
+            // 前沿为空 ⇒ 形态②：后道工序在 MES 无行时从 Routing 推「前驱全完工、自身未完工/无行」的工序
+            // （与既存执行上下文同口径；2026-11-26 修正：此前形态② 只装在既存执行上下文，NextContext 直接给 null）
+            var (form2Code, form2Name, form2Ambiguous) = ResolveNextOperationFromRouting(input, stageCode, operations);
+            if (form2Ambiguous)
+            {
+                issues.Add(new PositionIssue
+                {
+                    IssueType = "NEXT_OPERATION_AMBIGUOUS",
+                    Level = PositionIssueLevel.WARN,
+                    Description = $"Stage {stageCode}: 路由后继多个并行分支，无法唯一定位执行起点",
+                    ProductionInstructionNo = input.ProductionInstructionNo,
+                    StageCode = stageCode,
+                    AffectedQuantity = position.Quantity
+                });
+                contexts.Add(CreateNextOperationContext(
+                    input, position, stageCode, null, false, position.Quantity,
+                    "NEXT_OPERATION_AMBIGUOUS",
+                    $"Stage {stageCode}: 路由后继多分支"));
+            }
+            else if (form2Name == null)
+            {
+                // 前沿为空且路由无「前驱全完工、自身未完工/无行」的后道 ⇒ 末道真空（本 Stage 已无下一工序）
+                // 2026-11-26 P3：数量保留、起点 null，但不再静默——补 WARN（NEXT_OPERATION_NO_SUCCESSOR）
+                issues.Add(new PositionIssue
+                {
+                    IssueType = "NEXT_OPERATION_NO_SUCCESSOR",
+                    Level = PositionIssueLevel.WARN,
+                    Description = $"Stage {stageCode}: 前沿为空且路由无后继工序（末道真空），位置量{position.Quantity}按 Stage 级保留、起点为 null",
+                    ProductionInstructionNo = input.ProductionInstructionNo,
+                    StageCode = stageCode,
+                    AffectedQuantity = position.Quantity
+                });
+                contexts.Add(CreateNextOperationContext(
+                    input, position, stageCode, null, false, position.Quantity,
+                    "NEXT_OPERATION_NO_SUCCESSOR",
+                    $"Stage {stageCode}: 末道真空，无后继工序"));
+            }
+            else
+            {
+                contexts.Add(CreateNextOperationContext(
+                    input, position, stageCode, form2Name, false, position.Quantity));
+            }
+            return contexts;
         }
 
         // 备用：中间态三档降级（无 Routing 数据或 DAG 无结果时）
@@ -1610,6 +1725,55 @@ public class ProductionInstructionPositionCalculator : IProductionInstructionPos
         return (null, null, false); // 零候选：末工序真空
     }
 
+    /// <summary>
+    /// 解析指定工序的**直接路由后继**（同 Stage 内，唯一才返回；不猜）。
+    ///
+    /// 用途（2026-11-26 D05-C13 修正）：前沿工序之后的残差份额（已过前沿、尚未到达的下游份额）
+    /// 应归「下一道未完工工序」；仅当直接后继唯一且未完工时给出，多后继/无后继 ⇒ (null, null, ambiguous/真空)。
+    /// 与 <see cref="ResolveNextOperationFromRouting"/>（按完成集推首个可开工节点）不同：
+    /// 本方法只认 **fromOpCode 的直接出边**，避免跨工序跳跃改变归属。
+    /// </summary>
+    private static (string? OpCode, string? OpName, bool Ambiguous) ResolveImmediateSuccessorFromRouting(
+        ProductionInstructionPositionInput input,
+        string stageCode,
+        string fromOpCode,
+        IReadOnlyList<OperationProgressFact> stageRows)
+    {
+        var stageOps = input.RoutingOperations.Where(op => op.StageCode == stageCode).ToList();
+        if (stageOps.Count == 0 || string.IsNullOrEmpty(fromOpCode))
+            return (null, null, false);
+
+        var opCodes = new HashSet<string>(stageOps.Select(op => op.OperationCode), StringComparer.Ordinal);
+
+        // 已完工集（MES 行 RemainingQty<=0，按 OperationName 匹配）
+        var completed = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var row in stageRows)
+        {
+            var matched = stageOps.FirstOrDefault(r =>
+                string.Equals(r.OperationName, row.OperationName, StringComparison.Ordinal));
+            if (matched != null && row.RemainingQty <= 0)
+                completed.Add(matched.OperationCode);
+        }
+
+        var successors = input.RoutingDependencies
+            .Where(d => string.Equals(d.FromOperationCode, fromOpCode, StringComparison.Ordinal)
+                        && opCodes.Contains(d.ToOperationCode)
+                        && !string.Equals(d.ToOperationCode, fromOpCode, StringComparison.Ordinal)
+                        && !completed.Contains(d.ToOperationCode))
+            .Select(d => d.ToOperationCode)
+            .Distinct(StringComparer.Ordinal)
+            .ToList();
+
+        if (successors.Count == 1)
+        {
+            var op = stageOps.First(o => string.Equals(o.OperationCode, successors[0], StringComparison.Ordinal));
+            return (op.OperationCode, op.OperationName, false);
+        }
+        if (successors.Count > 1)
+            return (null, null, true); // 多后继：不猜
+        return (null, null, false);     // 无后继（末工序/边缺失）
+    }
+
     // ========================================================================
     // 第九步：标准化既存MES执行上下文（v1.4 §8.5 跨版本连续性）
     // ========================================================================
@@ -1718,6 +1882,42 @@ public class ProductionInstructionPositionCalculator : IProductionInstructionPos
                                 SliceQty = progressOp.RemainingQty,
                                 LastReportResourceCode = progressOp.LastReportResourceCode
                             });
+                        }
+
+                        // ── 2026-11-26 D05-C13 修正：下游残差片 ──
+                        // 单前沿时，WA 分配的份额可能大于前沿工序自身剩余（差额＝已过前沿、下一道未完成的份额）。
+                        // 该差额按「直接路由后继（唯一才给）」补一片连续份额，避免被 2号位 当 FREE 并沿用前沿起点而重排前沿工序。
+                        if (frontier.Count == 1)
+                        {
+                            var stageFactR = input.StageProgress
+                                .Where(sp => sp.StageCode == startStageCode)
+                                .FirstOrDefault();
+                            var stageSliceQtyR = AllocateStageRemaining(
+                                stageFactR, wo, totalPlannedQty, inProgressWorkOrders.Count, erpFallbackTotal);
+                            var allocated = slices.Sum(s => s.SliceQty);
+                            var residualR = stageSliceQtyR - allocated;
+                            if (residualR > 0.0001m)
+                            {
+                                var (cR, nR, ambR) =
+                                    ResolveImmediateSuccessorFromRouting(input, startStageCode, frontier[0].OpCode, operations);
+                                slices.Add(new ExistingExecutionSliceDto
+                                {
+                                    StartStageCode = startStageCode,
+                                    StartOperationCode = ambR ? null : cR,
+                                    StartOperationName = ambR ? null : nR,
+                                    SliceQty = residualR,
+                                    LastReportResourceCode = null,
+                                    // 2026-11-26 P2：多后继=AMBIGUOUS；无直接后继（末工序）=NO_SUCCESSOR，两语义分列
+                                    IssueCode = ambR ? "NEXT_OPERATION_AMBIGUOUS" : (nR == null ? "NEXT_OPERATION_NO_SUCCESSOR" : null)
+                                });
+                                if (ambR || nR == null)
+                                {
+                                    hasIssue = true;
+                                    issueDesc = ambR
+                                        ? $"Stage {startStageCode}: 前沿 {frontier[0].OpName} 下游残差{residualR}后继多分支，无法唯一定位"
+                                        : $"Stage {startStageCode}: 前沿 {frontier[0].OpName} 下游残差{residualR}无直接路由后继（末工序）";
+                                }
+                            }
                         }
                     }
                     else

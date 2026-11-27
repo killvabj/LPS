@@ -519,7 +519,7 @@ public class StageTimingNodeBuilderTests
 
         var pathUndetermined = new List<string>();
         var completionTimeUnavailable = new List<string>();
-        var result = StageTimingNodeBuilder.BuildCore(
+        var result = BuildCoreWithFactory(
             request, Stages(1001), Terminals(), pathUndetermined, completionTimeUnavailable);
 
         var fact = Assert.Single(result);
@@ -558,7 +558,7 @@ public class StageTimingNodeBuilderTests
 
         var pathUndetermined = new List<string>();
         var completionTimeUnavailable = new List<string>();
-        var result = StageTimingNodeBuilder.BuildCore(
+        var result = BuildCoreWithFactory(
             request, Stages(1001, "CN_PRE", "CN_MACH", "CN_FINAL"), Terminals(),
             pathUndetermined, completionTimeUnavailable);
 
@@ -598,7 +598,7 @@ public class StageTimingNodeBuilderTests
 
         var pathUndetermined = new List<string>();
         var completionTimeUnavailable = new List<string>();
-        var result = StageTimingNodeBuilder.BuildCore(
+        var result = BuildCoreWithFactory(
             request, Stages(1001, "CN_PRE", "CN_FINAL"), Terminals(),
             pathUndetermined, completionTimeUnavailable);
 
@@ -627,7 +627,7 @@ public class StageTimingNodeBuilderTests
 
         var pathUndetermined = new List<string>();
         var completionTimeUnavailable = new List<string>();
-        var result = StageTimingNodeBuilder.BuildCore(
+        var result = BuildCoreWithFactory(
             request, Stages(1001, "CN_MACH", "CN_FINAL"),
             Terminals(Task("F2", "D1", 1001, "CN_MACH", "M01", TerminalEnd)),
             pathUndetermined, completionTimeUnavailable);
@@ -655,11 +655,65 @@ public class StageTimingNodeBuilderTests
 
     // ─────────────────────────── 夹具 ───────────────────────────
 
+    /// <summary>
+    /// 2026-11-25（0号位 v1.5）：WORK 取窗必须用该 Stage 的权威执行厂，缺则该时间不可证。
+    /// 本文件多处**直接**调 `BuildCore`，故统一在测试侧声明「Stage 执行厂 = 需求厂」这一事实
+    /// （而不是让生产代码回落推断）。
+    /// </summary>
+    private static Dictionary<string, Dictionary<string, int>> FactoryIds(
+        DomainSolveRequest request, IReadOnlyDictionary<int, HashSet<string>> stages)
+        => request.LogicalProductionDemands
+            .Where(d => !string.IsNullOrEmpty(d.LogicalDemandKey)
+                        && stages.TryGetValue(d.MaterialId, out _))
+            .ToDictionary(
+                d => d.LogicalDemandKey,
+                d => stages[d.MaterialId].ToDictionary(s => s, _ => d.FactoryId, StringComparer.Ordinal),
+                StringComparer.Ordinal);
+
+    /// <summary>同 <see cref="StageTimingNodeBuilder.BuildCore"/>，但自动带上夹具声明的 Stage 执行厂。</summary>
+    private static List<DemandCompletionFact> BuildCoreWithFactory(
+        DomainSolveRequest request,
+        IReadOnlyDictionary<int, HashSet<string>> stages,
+        IReadOnlyDictionary<string, FinalTaskDraft> terminals,
+        ICollection<string>? pathUndetermined = null,
+        ICollection<string>? completionTimeUnavailable = null)
+        => StageTimingNodeBuilder.BuildCore(
+            request, stages, terminals, pathUndetermined, completionTimeUnavailable,
+            stageFactoryIdByDemandStage: FactoryIds(request, stages));
+
+    /// <summary>带「全部 Task」的重载（R09-T11）：同样自动补 Stage 执行厂。</summary>
+    private static List<DemandCompletionFact> BuildCoreWithFactory(
+        DomainSolveRequest request,
+        IReadOnlyDictionary<int, HashSet<string>> stages,
+        IReadOnlyDictionary<string, FinalTaskDraft> terminals,
+        ICollection<string>? pathUndetermined,
+        ICollection<string>? completionTimeUnavailable,
+        ICollection<(string DemandKey, string StageCode)>? missingLeadTimeStages,
+        ICollection<(string DemandKey, string StageCode, string Reason)>? workWindowUnavailableStages,
+        IReadOnlyDictionary<string, List<FinalTaskDraft>> tasksByDemandKey)
+        => StageTimingNodeBuilder.BuildCore(
+            request, stages, terminals, pathUndetermined, completionTimeUnavailable,
+            missingLeadTimeStages, workWindowUnavailableStages, tasksByDemandKey,
+            stageFactoryIdByDemandStage: FactoryIds(request, stages));
+
+    /// <summary>带缺参收集器的重载。</summary>
+    private static List<DemandCompletionFact> BuildCoreWithFactory(
+        DomainSolveRequest request,
+        IReadOnlyDictionary<int, HashSet<string>> stages,
+        IReadOnlyDictionary<string, FinalTaskDraft> terminals,
+        ICollection<string>? pathUndetermined,
+        ICollection<string>? completionTimeUnavailable,
+        ICollection<(string DemandKey, string StageCode)> missingLeadTimeStages)
+        => StageTimingNodeBuilder.BuildCore(
+            request, stages, terminals, pathUndetermined, completionTimeUnavailable,
+            missingLeadTimeStages,
+            stageFactoryIdByDemandStage: FactoryIds(request, stages));
+
     private static List<DemandCompletionFact> Run(
         DomainSolveRequest request,
         IReadOnlyDictionary<int, HashSet<string>> stages,
         IReadOnlyDictionary<string, FinalTaskDraft> terminals)
-        => StageTimingNodeBuilder.BuildCore(request, stages, terminals);
+        => BuildCoreWithFactory(request, stages, terminals);
 
     /// <summary>
     /// R09-T11 用重载：额外带「该需求**全部**真实 Task」（`Build` 在生产里本就持有）。
@@ -670,7 +724,7 @@ public class StageTimingNodeBuilderTests
         IReadOnlyDictionary<int, HashSet<string>> stages,
         IReadOnlyDictionary<string, FinalTaskDraft> terminals,
         IReadOnlyDictionary<string, List<FinalTaskDraft>> tasksByDemandKey)
-        => StageTimingNodeBuilder.BuildCore(
+        => BuildCoreWithFactory(
             request, stages, terminals, null, null, null, null, tasksByDemandKey);
 
     /// <summary>
@@ -682,7 +736,7 @@ public class StageTimingNodeBuilderTests
         IReadOnlyDictionary<int, HashSet<string>> stages,
         IReadOnlyDictionary<string, FinalTaskDraft> terminals,
         ICollection<(string DemandKey, string StageCode)> missingLeadTimeStages)
-        => StageTimingNodeBuilder.BuildCore(request, stages, terminals, null, null, missingLeadTimeStages);
+        => BuildCoreWithFactory(request, stages, terminals, null, null, missingLeadTimeStages);
 
     /// <summary>本族夹具统一使用的测试部门 / 工厂（连续窗口，见 <see cref="Req"/>）。</summary>
     private const int FixtureDepartmentId = 9001;

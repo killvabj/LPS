@@ -62,7 +62,25 @@ internal static class DemandChainResolver
         /// <para>与 <see cref="LegacyMaterial"/> 的区别即「载体未投影（合法兼容）」与
         ///   「新契约已生效但本需求漏绑定（契约缺口）」——后者必须暴露，不能被旧载体掩盖。</para>
         /// </summary>
-        BindingAbsent = 6
+        BindingAbsent = 6,
+
+        /// <summary>
+        /// 同一需求多条绑定、`ChainRefId` 相同但 **`Status` 不一致**（如一条 RESOLVED、一条 NO_CHAIN）
+        /// ⇒ 冲突，无链，**不取首条**（0号位 2026-11-25 v1.3 §4.5）。
+        /// </summary>
+        BindingStatusConflict = 7,
+
+        /// <summary>
+        /// 绑定的 `StageScopeType` 与链定义的角色**不一致**（ROOT 绑到 EDGE 链或反之）
+        /// ⇒ 无链，**不借另一角色的链**（0号位 2026-11-25 v1.3 §4.5「错误角色不得借链」）。
+        /// </summary>
+        BindingRoleMismatch = 8,
+
+        /// <summary>
+        /// 同一 `ChainRefId` 出现多次且**内容不等价**（签名或逐段不同）⇒ 契约冲突，无链、不任取其一
+        /// （0号位 2026-11-25 v1.3 §4.5）。等价重复则去重放行，不算冲突。
+        /// </summary>
+        DefinitionConflict = 9
     }
 
     /// <summary>预建索引：每轮求解建一次，5 处共用。</summary>
@@ -72,13 +90,21 @@ internal static class DemandChainResolver
             Dictionary<string, IReadOnlyList<DemandStageChainBinding>> bindingByDemand,
             Dictionary<string, StageChainDefinition> defByRefId,
             Dictionary<int, IReadOnlyList<StageSequenceStep>> legacyByMaterial,
-            bool hasNewContract)
+            bool hasNewContract,
+            HashSet<string> conflictingRefIds)
         {
             BindingByDemand = bindingByDemand;
             DefByRefId = defByRefId;
             LegacyByMaterial = legacyByMaterial;
             HasNewContract = hasNewContract;
+            ConflictingRefIds = conflictingRefIds;
         }
+
+        /// <summary>
+        /// 同一 `ChainRefId` 出现多次且内容**不等价**的定义（0号位 v1.3 §4.5）。
+        /// 命中 ⇒ 该 RefId 一律无链，**不任取其一**。
+        /// </summary>
+        internal HashSet<string> ConflictingRefIds { get; }
 
         internal Dictionary<string, IReadOnlyList<DemandStageChainBinding>> BindingByDemand { get; }
         internal Dictionary<string, StageChainDefinition> DefByRefId { get; }
@@ -110,12 +136,28 @@ internal static class DemandChainResolver
         }
 
         var defByRefId = new Dictionary<string, StageChainDefinition>(StringComparer.Ordinal);
+        // ── 0号位 v1.3 §4.5：**重复定义**不得 last-wins ──
+        //   「仅经证实**等价**且契约允许才可追溯去重，否则按现行门禁阻断受影响对象」。
+        //   ⇒ 同 ChainRefId 多次出现时：
+        //     · 内容**等价**（签名与逐段 StageCode/StageSeq 全同）⇒ 去重，取任一（确定性：取第一条）；
+        //     · 内容**不等价** ⇒ 记入冲突集，消费侧对该 RefId 一律无链（不任取）。
+        var conflictingRefIds = new HashSet<string>(StringComparer.Ordinal);
         if (request.StageChainDefinitions is { Count: > 0 } defs)
         {
             foreach (var d in defs)
             {
                 if (d is null || string.IsNullOrEmpty(d.ChainRefId)) continue;
-                defByRefId[d.ChainRefId] = d;
+
+                if (!defByRefId.TryGetValue(d.ChainRefId, out var existing))
+                {
+                    defByRefId[d.ChainRefId] = d;
+                    continue;
+                }
+
+                if (!AreEquivalentDefinitions(existing, d))
+                {
+                    conflictingRefIds.Add(d.ChainRefId);
+                }
             }
         }
 
@@ -129,8 +171,13 @@ internal static class DemandChainResolver
             }
         }
 
-        var hasNewContract = bindingByDemand.Count > 0 || defByRefId.Count > 0;
-        return new Index(bindingByDemand, defByRefId, legacyByMaterial, hasNewContract);
+        // ── 0号位 v1.3 §4.5：**新合同不可因漏装退旧** ──
+        //   ⚠ 判据必须是**原始集合是否非空**，不能是「索引成功数」：若上游发了新契约但内容全无效
+        //     （缺 ChainRefId / 绑定缺 LogicalDemandKey），索引后两表皆空 ⇒ 旧判据会判「老载荷」
+        //     ⇒ 静默退回 `StageSequenceChains`，正是被禁止的「新合同缺失时退旧」。
+        var hasNewContract = (request.DemandStageChainBindings?.Count ?? 0) > 0
+                             || (request.StageChainDefinitions?.Count ?? 0) > 0;
+        return new Index(bindingByDemand, defByRefId, legacyByMaterial, hasNewContract, conflictingRefIds);
     }
 
     /// <summary>
@@ -162,6 +209,19 @@ internal static class DemandChainResolver
                 return false;
             }
 
+            // ── 0号位 2026-11-25 v1.3 §4.5：「多绑定仅比 Ref 再首条 Status」是缺口 ──
+            //   同 Ref 但**状态不一致**（如一条 RESOLVED、一条 NO_CHAIN/CONFLICT）⇒ 不能取首条了事，
+            //   必须按**冲突**处理：无链，不任取（fail closed）。
+            var status0 = rows[0].Status ?? string.Empty;
+            foreach (var b in rows)
+            {
+                if (!string.Equals(status0, b.Status ?? string.Empty, StringComparison.Ordinal))
+                {
+                    source = ChainSource.BindingStatusConflict;
+                    return false;
+                }
+            }
+
             var first = rows[0];
             if (!IsUsableStatus(first.Status))
             {
@@ -169,10 +229,28 @@ internal static class DemandChainResolver
                 return false;
             }
 
+            // 0号位 v1.3 §4.5：同一 ChainRefId 有**不等价**重复定义 ⇒ 冲突，无链（不任取其一）。
+            if (!string.IsNullOrEmpty(refId) && index.ConflictingRefIds.Contains(refId!))
+            {
+                source = ChainSource.DefinitionConflict;
+                return false;
+            }
+
             if (string.IsNullOrEmpty(refId) || !index.DefByRefId.TryGetValue(refId!, out var def)
                 || def.Stages is null || def.Stages.Count == 0)
             {
                 source = ChainSource.BindingDangling;
+                return false;
+            }
+
+            // ── 0号位 2026-11-25 v1.3 §4.5：「错误 ROOT/EDGE 不得借链」──
+            //   绑定的角色与链定义的角色都非空且**不一致** ⇒ 该绑定指向的链不是本需求该用的链，
+            //   直接按无链处理，**不得**拿另一角色的链顶替（也不回落旧载体）。
+            if (!string.IsNullOrEmpty(def.StageScopeType)
+                && !string.IsNullOrEmpty(first.StageScopeType)
+                && !string.Equals(def.StageScopeType, first.StageScopeType, StringComparison.Ordinal))
+            {
+                source = ChainSource.BindingRoleMismatch;
                 return false;
             }
 
@@ -206,6 +284,34 @@ internal static class DemandChainResolver
     /// 可用状态 = 链内容已确定（可信度不同，但都指向唯一一条链）。
     /// <c>NO_CHAIN</c> / <c>NO_ANCHOR</c> / <c>CONFLICT</c> **一律不可用**，且不得回落旧载体。
     /// </summary>
+    /// <summary>
+    /// 两条同 `ChainRefId` 的定义是否**等价**：签名相同（若双方都给了）且逐段
+    /// `StageCode + StageSeq` 序列完全相同。等价 ⇒ 可追溯去重；不等价 ⇒ 冲突。
+    /// </summary>
+    private static bool AreEquivalentDefinitions(StageChainDefinition a, StageChainDefinition b)
+    {
+        if (!string.IsNullOrEmpty(a.ChainSignature) && !string.IsNullOrEmpty(b.ChainSignature)
+            && !string.Equals(a.ChainSignature, b.ChainSignature, StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        var sa = a.Stages ?? Array.Empty<StageSequenceStep>();
+        var sb = b.Stages ?? Array.Empty<StageSequenceStep>();
+        if (sa.Count != sb.Count) return false;
+
+        for (var i = 0; i < sa.Count; i++)
+        {
+            if (!string.Equals(sa[i].StageCode, sb[i].StageCode, StringComparison.Ordinal)
+                || sa[i].StageSeq != sb[i].StageSeq)
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
     private static bool IsUsableStatus(string? status)
     {
         if (string.IsNullOrEmpty(status)) return false;

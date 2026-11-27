@@ -21,3 +21,6 @@ D:\WorkSpace_LocalLib\Windsurf WorkSpace\LPS_SVN\LPS.APS.Application\obj\Debug\n
 D:\WorkSpace_LocalLib\Windsurf WorkSpace\LPS_SVN\LPS.APS.Application\obj\Debug\net8.0\refint\LPS.APS.Application.dll
 D:\WorkSpace_LocalLib\Windsurf WorkSpace\LPS_SVN\LPS.APS.Application\obj\Debug\net8.0\LPS.APS.Application.pdb
 D:\WorkSpace_LocalLib\Windsurf WorkSpace\LPS_SVN\LPS.APS.Application\obj\Debug\net8.0\ref\LPS.APS.Application.dll
+D:\tmp\binx2\Debug\net8.0\LPS.APS.Application.deps.json
+D:\tmp\binx2\Debug\net8.0\LPS.APS.Application.dll
+D:\tmp\binx2\Debug\net8.0\LPS.APS.Application.pdb

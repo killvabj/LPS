@@ -458,11 +458,12 @@ public class NextOperationContextTests
         Assert.True(result.IsSuccess);
 
         // DAG 唯一前沿 = 挤丝（NC 完成，挤丝已开工，研磨未开工）
-        Assert.Equal(1, result.NextOperationContexts.Count);
-        var slice = result.NextOperationContexts.First();
-        Assert.Equal("挤丝", slice.StartOperationCode);
-        Assert.Equal(1000m, slice.SliceQty);
-        Assert.Null(slice.IssueCode);
+        // 2026-11-26 D05-C13 语义：前沿分量=挤丝自身剩余 800；已过挤丝、未到研磨的 200 归唯一后继「研磨」
+        // （旧断言"1000 全给挤丝"编码的正是打包缺陷，已按冻结 Pegging §2/§3 更新）
+        Assert.Equal(2, result.NextOperationContexts.Count);
+        Assert.Contains(result.NextOperationContexts, c => c.StartOperationCode == "挤丝" && c.SliceQty == 800m && c.IssueCode == null);
+        Assert.Contains(result.NextOperationContexts, c => c.StartOperationCode == "研磨" && c.SliceQty == 200m && c.IssueCode == null);
+        Assert.DoesNotContain(result.NextOperationContexts, c => c.StartOperationCode == "挤丝" && c.SliceQty == 1000m);
     }
 
     /// <summary>
@@ -615,11 +616,14 @@ public class NextOperationContextTests
 
         Assert.True(result.IsSuccess);
 
-        // 并行结构但只有 B 开工 → 唯一前沿 = 挤丝
-        Assert.Equal(1, result.NextOperationContexts.Count);
-        var slice = result.NextOperationContexts.First();
-        Assert.Equal("挤丝", slice.StartOperationCode);
-        Assert.Equal(1000m, slice.SliceQty);
-        Assert.Null(slice.IssueCode);
+        // 并行结构但只有 B 开工 → 唯一前沿 = 挤丝（800）；差距 200 无「直接后继」（B 是叶子，C 是兄弟分支不是 B 的后继）
+        // ⇒ 2026-11-26 P2：无直接后继（末工序）判 NEXT_OPERATION_NO_SUCCESSOR，与「多后继 AMBIGUOUS」分列；残差不猜、起点 null
+        Assert.Equal(2, result.NextOperationContexts.Count);
+        Assert.Contains(result.NextOperationContexts, c => c.StartOperationCode == "挤丝" && c.SliceQty == 800m && c.IssueCode == null);
+        var residual = result.NextOperationContexts.Single(c => c.StartOperationCode == null);
+        Assert.Equal(200m, residual.SliceQty);
+        Assert.Equal("NEXT_OPERATION_NO_SUCCESSOR", residual.IssueCode);
+        Assert.Contains(result.Issues, i => i.IssueType == "NEXT_OPERATION_NO_SUCCESSOR");
+        Assert.DoesNotContain(result.Issues, i => i.IssueType == "NEXT_OPERATION_AMBIGUOUS");
     }
 }

@@ -222,6 +222,31 @@ public class StrictRoutelessStagesAndErrorMessageTests
                     },
                 },
             },
+            // 2026-11-25（0号位 v1.5）：WORK 取窗必须用该 Stage 的权威执行厂；缺则该时间不可证。
+            //   本夹具据此声明「Stage 执行厂 = 需求厂(0)」（窗口 FactoryId 也是 0）。
+            StageChainDefinitions = new[]
+            {
+                new StageChainDefinition
+                {
+                    ChainRefId = "ROOT:1:S1|2:S2|3:S3", StageScopeType = "ROOT",
+                    ChainSignature = "1:S1|2:S2|3:S3",
+                    Stages = new List<StageSequenceStep>
+                    {
+                        new() { StageCode = "S1", StageSeq = 1, ProductionDepartmentId = FixtureDepartmentId, StageFactoryCode = "F0", StageFactoryId = 0 },
+                        new() { StageCode = "S2", StageSeq = 2, ProductionDepartmentId = FixtureDepartmentId, StageFactoryCode = "F0", StageFactoryId = 0 },
+                        new() { StageCode = "S3", StageSeq = 3, ProductionDepartmentId = FixtureDepartmentId, StageFactoryCode = "F0", StageFactoryId = 0 },
+                    },
+                },
+            },
+            DemandStageChainBindings = new[]
+            {
+                new DemandStageChainBinding
+                {
+                    LogicalDemandKey = "D1", BindingKey = "ROOT|BOM|WS",
+                    ChainRefId = "ROOT:1:S1|2:S2|3:S3", StageScopeType = "ROOT",
+                    Status = StageChainBindingStatus.Resolved,
+                },
+            },
             RoutingOperations = new[]
             {
                 Op("R1", 1, "S1"),
@@ -296,6 +321,31 @@ public class StrictRoutelessStagesAndErrorMessageTests
                         new() { StageCode = "S2", StageSeq = 2 },
                         new() { StageCode = "S3", StageSeq = 3 },
                     },
+                },
+            },
+            // 2026-11-25（0号位 v1.5）：WORK 取窗必须用该 Stage 的权威执行厂；缺则该时间不可证。
+            //   本夹具据此声明「Stage 执行厂 = 需求厂(0)」（窗口 FactoryId 也是 0）。
+            StageChainDefinitions = new[]
+            {
+                new StageChainDefinition
+                {
+                    ChainRefId = "ROOT:1:S1|2:S2|3:S3", StageScopeType = "ROOT",
+                    ChainSignature = "1:S1|2:S2|3:S3",
+                    Stages = new List<StageSequenceStep>
+                    {
+                        new() { StageCode = "S1", StageSeq = 1, ProductionDepartmentId = FixtureDepartmentId, StageFactoryCode = "F0", StageFactoryId = 0 },
+                        new() { StageCode = "S2", StageSeq = 2, ProductionDepartmentId = FixtureDepartmentId, StageFactoryCode = "F0", StageFactoryId = 0 },
+                        new() { StageCode = "S3", StageSeq = 3, ProductionDepartmentId = FixtureDepartmentId, StageFactoryCode = "F0", StageFactoryId = 0 },
+                    },
+                },
+            },
+            DemandStageChainBindings = new[]
+            {
+                new DemandStageChainBinding
+                {
+                    LogicalDemandKey = "D1", BindingKey = "ROOT|BOM|WS",
+                    ChainRefId = "ROOT:1:S1|2:S2|3:S3", StageScopeType = "ROOT",
+                    Status = StageChainBindingStatus.Resolved,
                 },
             },
             RoutingOperations = ops,
@@ -586,6 +636,35 @@ public class StrictRoutelessStagesAndErrorMessageTests
     }
 
     /// <summary>
+    /// **0号位 v1.5 请裁1 → A 方向**：PI 契约缺口必须**从 Batch 冲突里单列**，
+    /// 「汇总必须单列、不能计为实际 Batch 策略冲突」，而逐需求出口码保持兼容（冻结 15 码不变）。
+    /// </summary>
+    [Fact]
+    public void PI契约缺口不计入Batch冲突_单列统计()
+    {
+        var hardFailures = new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            ["D-1"] = "BATCH_POLICY_CONFLICT",
+            ["D-2"] = "BATCH_POLICY_CONFLICT",
+            ["D-3"] = "BATCH_POLICY_CONFLICT"
+        };
+        var conflicts = new List<string>
+        {
+            "[D-1] PI_LEGAL_QTY_CONTRACT_PENDING：缺 Stage 合法自由量上下文",
+            "[D-2] PI_LEGAL_QTY_CONTRACT_PENDING：缺 Stage 合法自由量上下文",
+            "[D-3] Min/Max 无合法切分"   // 真正的批策略冲突
+        };
+
+        var text = PhaseFiveCompression.ComposeErrorMessage(
+            null, null, ResultWith(hardFailures: hardFailures, conflicts: conflicts));
+
+        Assert.NotNull(text);
+        // 真冲突只剩 1 条；2 条 PI 契约缺口单列
+        Assert.Contains("BATCH_POLICY_CONFLICT 1", text);
+        Assert.Contains("PI 契约待核 2", text);
+    }
+
+    /// <summary>
     /// **有界性反证**（2号位 实测 21,772/21,787 会被拦下 ⇒ 无界拼接会写出兆字节字符串）：
     /// 2,000 条硬失败 ⇒ 输出仍**远小于**明细总量，且**示例最多 3 条**、每条截断。
     /// </summary>
@@ -599,7 +678,9 @@ public class StrictRoutelessStagesAndErrorMessageTests
         {
             var key = $"D-{i:D5}";
             hardFailures[key] = "BATCH_POLICY_CONFLICT";
-            conflicts.Add($"[{key}] PI_LEGAL_QTY_CONTRACT_PENDING：" + new string('X', 400));
+            // 2026-11-25（0号位 v1.5 请裁1 → A）：PI 契约缺口已从 Batch 冲突**单列**，
+            //   本用例测的是「有界性」，故改用**真正的批策略冲突**原因作为明细。
+            conflicts.Add($"[{key}] Min/Max 无合法切分：" + new string('X', 400));
         }
 
         var result = ResultWith(hardFailures: hardFailures, conflicts: conflicts);

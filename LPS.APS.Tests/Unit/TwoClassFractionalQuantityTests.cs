@@ -687,6 +687,27 @@ public class TwoClassFractionalQuantityTests
     }
 
     // ═══════════════════════════════════════════════════════════════════
+    // M11（0号位 v1.5 主账：「5→2+3」）—— 与 51→26+25 同一类，但**总量不能被 2 整除**
+    //   5 / 2 = 2.5：若按均分再逐批取整，会得到 2.5+2.5 或 2+2（丢 1 件）；
+    //   冻结口径是**整数批 + 总量守恒** ⇒ 必须 2+3。
+    // ═══════════════════════════════════════════════════════════════════
+
+    [Fact(DisplayName = "M11 5 拆两批：必须 3+2，不得 2.5+2.5，也不得 2+2")]
+    public void M11_五拆两批_必须3加2_不得2点5加2点5也不得2加2()
+    {
+        var formation = PhaseTwoInitialScheduler.FormExecutionBatches(Demand(5m), Policy(max: 3m));
+
+        Assert.True(formation.IsLegal, formation.ConflictReason);
+        var nets = formation.Batches.Select(b => b.NetOutputQty).OrderBy(x => x).ToArray();
+
+        Assert.Equal(new[] { 2m, 3m }, nets);
+        Assert.Equal(5m, nets.Sum());                       // 守恒：不得丢 1 件
+        Assert.Equal(2, nets.Length);                        // 两批，不是三批
+        Assert.All(formation.Batches, b => Assert.Equal(decimal.Truncate(b.NetOutputQty), b.NetOutputQty));
+        Assert.DoesNotContain(formation.Batches, b => b.NetOutputQty == 2.5m);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
     // N-08（2026-11-20 补）：**不同根订单合批后，各自份额分别守恒**
     //   0号位 v1.8 §二 要求「至少 N01～N12 回归」；N-08 此前只由 check#1 间接覆盖、
     //   未单独立例。本组用硬校验正反两例直接锁「A 的份额不得挪到 B」。

@@ -60,6 +60,22 @@ public class SolverReplayTest
             $"未指定已存在的入参 JSON（{ReplayPathEnvVar}='{jsonPath ?? "(null)"}'）。"
             + " 先用 APS_CAPTURE_SOLVE_REQUEST=1 跑一次全流程把它捕获下来，再用本入口重放。");
 
+        // ── 2026-11-27（0号位 执行函 v1.7 §A-114/§A-115）：**整域离线重放默认禁止** ──
+        //   逐字：「任何整域离线重放、FULL、长耗时性能或等效大切片运行都不得自行开始。只有1先提交下表、
+        //   由0号位与其专属审核对话共同核对必要性/范围/证据目标并得到0明确授权后，才可执行」；
+        //   「整改脚本默认禁止长跑入口，只有明确0授权才解锁」；「**1号主开发授权不能替代0号位授权**」。
+        //   本入口是全域重放的唯一代码入口（读本地 JSON + 内存求解，不连库），⇒ 闸门放在这里：
+        //   未提供 0号位 明确授权凭据时一律 Skip，**不接受**「1号位自授权」绕过。
+        //   授权凭据格式（逐字粘贴 0号位 授权件里的编号或原文关键行）：
+        //     APS_REPLAY_AUTH="0HAOWEI-APPROVED:<0号位授权编号/原文关键行>"
+        var replayAuth = Environment.GetEnvironmentVariable("APS_REPLAY_AUTH");
+        Skip.If(string.IsNullOrWhiteSpace(replayAuth)
+                || !replayAuth.StartsWith("0HAOWEI-APPROVED:", StringComparison.Ordinal),
+            "整域离线重放默认禁止：未提供 0号位 明确授权凭据。"
+            + " 需要 APS_REPLAY_AUTH=\"0HAOWEI-APPROVED:<0号位授权编号或原文关键行>\"。"
+            + " 依据 0号位 执行函 v1.7 §A：1号主开发授权不能替代0号位授权。"
+            + " 快单测 / 可控小夹具 / 存量文件静态分析不受本闸门限制。");
+
         var swLoad = Stopwatch.StartNew();
         var request = Load(jsonPath!);
         swLoad.Stop();

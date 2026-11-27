@@ -1,3 +1,10 @@
+// ═══════════════════════════════════════════════════════════════════════════════════
+// ⛔ 2026-11-26 整文件停用（用户定）：C# `RetentionMaintenanceService` 已下线，
+//    保留期统一由 SQL 侧 `sp_PvRetentionCycle` ＋ Agent 作业 `APS_PV_RETENTION_CYCLE` 承担。
+//    用 `#if false` 关掉而**不删文件**，是为保留 D4 三条红线的断言备查（恢复时可直接用）。
+//    口径已定盘（用户 2026-11-26）：保留期只用 SQL 口径，本类作废，不复活、不恢复。
+// ═══════════════════════════════════════════════════════════════════════════════════
+#if false
 using FluentAssertions;
 using LPS.APS.Core.Dto;
 using LPS.APS.Engine.Configuration;
@@ -170,3 +177,4 @@ public class RetentionMaintenanceServiceTests
         (item.OverWindowRows - item.ProtectedRows).Should().Be(item.DeletableRows);
     }
 }
+#endif

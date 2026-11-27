@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Diagnostics.CodeAnalysis;
 using LPS.APS.Core.Dto;
 using LPS.APS.Core.Entities.APS;
@@ -88,10 +89,18 @@ internal class PhaseOneConstraintBuilder
         // ═══════════════════════════════════════════════
         BuildResourceCalendars(request, context);
 
+        // 3.1（2026-11-26，0号位 v1.8 §1）：登记**本次载荷已下发的资源定义集**。
+        //   找槽时「占用表未命中」的处置要靠它区分「合法空集」与「资源未知/占用未装载」——
+        //   见 `ConstraintContext.DefinedResourceIds` 注释。
+        BuildDefinedResourceIds(request, context);
+
         // ═══════════════════════════════════════════════
         // 4. 解析物料多段可用性（AllocationSequence → Quantity-Time 分段）
         // ═══════════════════════════════════════════════
         BuildMaterialAvailability(request, context);
+
+        // 2026-11-26（0号位 v1.7 §2）：部门 → 唯一所属厂（供 Stage 取窗解析执行厂，替代「回落需求厂」）
+        BuildDepartmentFactoryMap(request, context);
 
         // ═══════════════════════════════════════════════
         // 5. 解析锁定任务约束（DraftId → 锁定信息）
@@ -469,12 +478,14 @@ internal class PhaseOneConstraintBuilder
         //    P1-06修复：StartOperation/StartStage 之前的已完成 Stage 不再参与本次求解，
         //    即使其缺 Department Context 也不应误杀当前剩余 Routing。
         //    无 Start 信息的需求（新单从首工序起）仍校验全量 Stage。
-        var reachableStages = BuildReachableStages(request, out var stageFactoryByDemandStage);
+        var reachableStages = BuildReachableStages(
+            request, out var stageFactoryByDemandStage, out var stageFactoryIdByDemandStage);
 
         // 供 Phase5 计算「无 Routing Stage」时间节点（0号位 2026-09-29 裁决 §十四第4项）。
         // 见 ConstraintContext.EffectiveStages 注释：语义不变，仅把原本的局部变量挂出来复用。
         context.EffectiveStages = reachableStages;
         context.StageFactoryByDemandStage = stageFactoryByDemandStage;
+        context.StageFactoryIdByDemandStage = stageFactoryIdByDemandStage;
 
         // R09-③（2026-10-29）：把「中间无 Routing Stage」的提前期前置算好，供 Phase2 当硬时间约束。
         //   必须在 EffectiveStages 赋值**之后**调用 —— 它读 context.EffectiveStages 判「本范围无 Routing」。
@@ -637,10 +648,12 @@ internal class PhaseOneConstraintBuilder
     /// </summary>
     private Dictionary<int, HashSet<string>> BuildReachableStages(
         DomainSolveRequest request,
-        out Dictionary<string, Dictionary<string, string>> stageFactoryByDemandStage)
+        out Dictionary<string, Dictionary<string, string>> stageFactoryByDemandStage,
+        out Dictionary<string, Dictionary<string, int>> stageFactoryIdByDemandStage)
     {
         var result = new Dictionary<int, HashSet<string>>();
         stageFactoryByDemandStage = new Dictionary<string, Dictionary<string, string>>(StringComparer.Ordinal);
+        stageFactoryIdByDemandStage = new Dictionary<string, Dictionary<string, int>>(StringComparer.Ordinal);
 
         // 预处理：物料 → 工序行 与依赖行（V1 默认 DEFAULT 路径）
         var opsByMaterial = request.RoutingOperations
@@ -668,15 +681,30 @@ internal class PhaseOneConstraintBuilder
             if (DemandChainResolver.TryResolve(chainIndex, demand, out var chainSteps, out _))
             {
                 Dictionary<string, string>? factoryByStage = null;
+                Dictionary<string, int>? factoryIdByStage = null;
                 foreach (var step in chainSteps)
                 {
-                    if (string.IsNullOrEmpty(step.StageFactoryCode)) continue;
-                    factoryByStage ??= new Dictionary<string, string>(StringComparer.Ordinal);
-                    factoryByStage[step.StageCode] = step.StageFactoryCode!;
+                    if (!string.IsNullOrEmpty(step.StageFactoryCode))
+                    {
+                        factoryByStage ??= new Dictionary<string, string>(StringComparer.Ordinal);
+                        factoryByStage[step.StageCode] = step.StageFactoryCode!;
+                    }
+
+                    // 2026-11-25（0号位 v1.3 §4.2）：同时带出**厂 Id**，供 WORK 日历取窗用
+                    //   （`DepartmentWorkWindows` 以 `FactoryId` 为键，代码串无法直接取）。
+                    if (step.StageFactoryId is int fid)
+                    {
+                        factoryIdByStage ??= new Dictionary<string, int>(StringComparer.Ordinal);
+                        factoryIdByStage[step.StageCode] = fid;
+                    }
                 }
                 if (factoryByStage is not null && !string.IsNullOrEmpty(demand.LogicalDemandKey))
                 {
                     stageFactoryByDemandStage[demand.LogicalDemandKey] = factoryByStage;
+                }
+                if (factoryIdByStage is not null && !string.IsNullOrEmpty(demand.LogicalDemandKey))
+                {
+                    stageFactoryIdByDemandStage[demand.LogicalDemandKey] = factoryIdByStage;
                 }
             }
 
@@ -1330,6 +1358,9 @@ internal class PhaseOneConstraintBuilder
 
             // P1-12：记录 父→子 边界的滞后时间（分钟），供 GetDynamicMaterialFloor 累加。
             context.CrossMaterialLagMinutes[(parent, child)] = link.LagMinutes;
+        // 2026-11-26（0号位 v1.8 §2.1）：逐边需求量 —— 父件要「当前真实可用份额满足本父件必要承接量」
+        //   才允许排；不足则保留真实未满足量（不假齐套）。载体是本类内部字典，**不改共享 Core/DTO**。
+        context.CrossMaterialRequiredQty[(parent, child)] = link.RequiredQty;
 
             // 父的入度 = 它依赖的子件数
             inDegree[parent]++;
@@ -1439,6 +1470,19 @@ internal class PhaseOneConstraintBuilder
 
         context.OperationResourceEligibility = eligibilityGroups;
 
+        // ── 2026-11-27（0号位 v1.7 §B-2）：Priority **值**单独留一份 ──
+        //   上面那份列表已把 Priority 排序后丢弃值 ⇒ 下游无法分辨「同优先层」与「跨层」。本表只补值：
+        //   **不改列表成员、不改列表顺序**（`OrderBy` 稳定排序后 first-fit 的实际取用仍是同一台）。
+        //   同一 ResourceId 重复出现（同键同资源多行）取**首行**的 Priority —— 与 `OrderBy` 稳定排序后
+        //   该资源首次出现的位置同源，避免出现「排序用首行值、判层用另一行值」的口径分裂。
+        context.OperationResourcePriorities = eligibilities
+            .GroupBy(e => new EligibilityLookupKey(e.MaterialId, e.ProductionDepartmentId, e.RouteCode, e.PathId, e.OperationCode))
+            .ToDictionary(
+                g => g.Key,
+                g => g.GroupBy(e => e.ResourceId)
+                      .ToDictionary(gg => gg.Key, gg => gg.First().Priority)
+            );
+
         // P0-04修复：同时构建 ResourceCapacityFactors 映射
         // 第4轮C1修复：索引加入MaterialId；本次再补部门（同上）
         // (EligibilityLookupKey, ResourceId) → CapacityFactor
@@ -1519,6 +1563,76 @@ internal class PhaseOneConstraintBuilder
 
         context.ResourceCalendars = calendarsByResource;
     }
+
+    /// <summary>
+    /// 2026-11-26（0号位 v1.8 §1）：把本次载荷 `Resources` 的**资源 Id**登记进
+    /// <see cref="ConstraintContext.DefinedResourceIds"/>，供找槽环节判定
+    /// 「占用表未命中」到底是**合法空集**还是**资源未知/占用未装载**。
+    ///
+    /// <para>**为什么不校验内容**：本方法只回答「这个 Id 有没有被下发过定义」这一个问题。
+    /// 资源状态（`Status='AVAILABLE'` 之类）**不归求解器判**（既有冻结口径：装载侧负责），
+    /// 日历是否覆盖由 <see cref="BuildResourceCalendars"/> 后置的日历闸判定。三者互不顶替。</para>
+    ///
+    /// <para>**开关是「载荷有没有下发 `Resources`」，不是「集合非空」**（r14490，0号位 v1.13 复核）：
+    ///   `Resources == null` ⇒ <see cref="ConstraintContext.ResourcesPayloadPresent"/> = `false` ⇒ 护栏不启用（旧夹具/老载荷）；
+    ///   `Resources == []`  ⇒ `true` ⇒ 护栏**启用**（显式下发空集合 = 漏装，必须逐个拒绝而不是静默放行）。
+    ///   详见该属性注释的四种情形表。</para>
+    /// </summary>
+    private static void BuildDefinedResourceIds(DomainSolveRequest request, ConstraintContext context)
+    {
+        var set = new HashSet<int>();
+        if (request.Resources is { } resources)
+        {
+            foreach (var r in resources)
+            {
+                if (r is not null) set.Add(r.ResourceId);
+            }
+        }
+
+        context.DefinedResourceIds = set;
+        context.ResourcesPayloadPresent = request.Resources is not null;
+
+        // ── 漏装显式留痕（第三种情形）：`Resources == []` 但资格表指向了资源 ──
+        //   0号位 v1.13 复核：这种形态下护栏会把每个（工序×资源）按「资源未知」拒绝 ⇒ 需求全未排。
+        //   那是**如实**结论（没有资源定义就没有日历/没有占用装载的事实），但**绝不能不吭声**：
+        //   现场看到的会是「全未排」，必须能一眼在追溯里读到真正原因。
+        if (request.Resources is { Count: 0 }
+            && request.OperationResourceEligibility is { Count: > 0 } eligibility)
+        {
+            var referenced = eligibility
+                .Where(e => e is not null)
+                .Select(e => e.ResourceId)
+                .Distinct()
+                .Count();
+
+            context.TraceNotes.Add(new SolveTraceNote
+            {
+                Key = string.IsNullOrEmpty(request.DomainKey) ? "(domain)" : request.DomainKey,
+                ReasonCode = "RESOURCES_PAYLOAD_EMPTY_BUT_ELIGIBILITY_PRESENT",
+                Level = "Warning",
+                Message = $"本次载荷 `Resources` 是**显式空列表**（不是缺字段），但 `OperationResourceEligibility` 指向了 "
+                          + $"{referenced} 个资源 ⇒ **资源定义漏装**。找槽护栏（`DefinedResourceIds`）已启用，"
+                          + "这些（工序×资源）会逐个按「资源未知」拒绝（局部未排 + 计数 `UnknownResourceRefusals`），"
+                          + "**不会**按空占用表放行。日历/占用装载同样取不到 ⇒ 本域排程结果不可用。"
+                          + "请 2号位 补下发 `Resources`（含 `ResourceId`/`ResourceCode`/`FactoryCode`/`Capacity`）。"
+            });
+        }
+    }
+
+    /// <summary>
+    /// 2026-11-26（0号位 v1.7 §2 / §4 P0-1）：**部门 → 唯一所属厂**映射，供 Stage 取窗解析执行厂。
+    ///
+    /// <para>来源 = `DepartmentWorkWindows` 里**部门级行**（`DepartmentId != null`）的 `FactoryId`。
+    /// 只收**唯一**归属的部门；同一部门出现在多个厂 ⇒ 不入表（歧义不猜，取窗时按未知处理）。</para>
+    ///
+    /// <para>实测（PV999634 FRL 68 个部门 / PV999633 CYL 52 个部门）：**跨厂部门 = 0**，
+    /// 故该映射在真实输入上无歧义。⚠ 它不是 `StageDict` 的替代品：`StageDict` 才是权威；
+    /// 本表只用于「链没给厂、但部门已知」时**从数据里可证**地定位执行厂，
+    /// 不猜厂、不造厂、不回落需求厂。</para>
+    /// </summary>
+    private void BuildDepartmentFactoryMap(DomainSolveRequest request, ConstraintContext context)
+        => context.DepartmentFactoryMap =
+            StageTimingNodeBuilder.BuildDepartmentFactoryMap(request.DepartmentWorkWindows);
 
     /// <summary>
     /// 构建物料多段可用性
@@ -1722,6 +1836,45 @@ internal class PhaseOneConstraintBuilder
 /// </summary>
 internal class ConstraintContext
 {
+    /// <summary>
+    /// **本次载荷 `Resources`（`ResourceDefinition`）里已定义的资源 Id 集合**（2026-11-26，0号位 v1.8 §1）。
+    ///
+    /// <para><b>为什么要有它</b>：0号位 v1.8 §1 逐字 ——「仅确证合法资源且占用状态已完整装载的空集合可视空；
+    /// **资源未知 / 引用坏 / 占用未装载不能以空字典放行**」。找槽时占用表未命中，**不能**一律当成
+    /// 「该资源尚无占用」（= 可用），必须区分三种情形：</para>
+    /// <list type="number">
+    ///   <item>资源在 `Resources` 里、占用表有键、表为空 ⇒ **合法空集**，可放行（唯一允许的空字典）；</item>
+    ///   <item>资源**不在** `Resources` 里 ⇒ 引用坏 / 资源未知 ⇒ **拒绝**（局部未排 + 留痕）；</item>
+    ///   <item>资源在 `Resources` 里但**占用表无键** ⇒ 占用未装载 ⇒ **拒绝**（Phase2 预置按 `Resources` 逐资源建键，
+    ///         「已定义必有键」，缺键本身就是装载异常信号）。</item>
+    /// </list>
+    ///
+    /// <para><b>⚠ r14490（2026-11-26，0号位 v1.13 复核）：不再用 `Count &gt; 0` 当开关</b>。
+    ///   旧写法「集合非空才启用」把**显式下发的空 `Resources`（= 漏装）** 与 **压根没下发 `Resources`
+    ///   （= 旧夹具/老载荷）** 混成一件事，两者都静默 fail-open ⇒ 0号位 点名「空 Resources 整体退回旧行为」。
+    ///   现改用 <see cref="ResourcesPayloadPresent"/> 作为**唯一**开关，四种情形逐个区分：</para>
+    /// <list type="table">
+    ///   <item><term>`Resources == null`（载荷里没有这个字段）</term>
+    ///         <description>**在当前求解路径上不可达**：`BuildResourceCodes`（`:1495`）先对 `request.Resources`
+    ///         做 `GroupBy`，null 直接抛 `ArgumentNullException`。保留该分支只为**直接构造
+    ///         `ConstraintContext`** 的测试路径；它**不能**再被当成「空列表」的 fail-open 理由。</description></item>
+    ///   <item><term>`Resources == []` 且 `OperationResourceEligibility` 为空</term>
+    ///         <description>**合法空**（本域没有任何资源需求）⇒ 护栏启用但不产生任何拒绝（没有资源可查）。</description></item>
+    ///   <item><term>`Resources == []` 且 `OperationResourceEligibility` 非空</term>
+    ///         <description>**漏装**（资格指向的资源没有定义）⇒ 护栏启用 ⇒ 逐个按「资源未知」拒绝，并留一条
+    ///         `RESOURCES_PAYLOAD_EMPTY_BUT_ELIGIBILITY_PRESENT` 注记（**绝不静默**）。</description></item>
+    ///   <item><term>`Resources` 非空</term>
+    ///         <description>正常：集合内 + 占用表有键 + 空表 = 合法空集；不在集合里 = 引用坏；在集合里但占用表无键 = 占用未装载。</description></item>
+    /// </list>
+    /// </summary>
+    public HashSet<int> DefinedResourceIds { get; set; } = new();
+
+    /// <summary>
+    /// **本次载荷是否真的下发了 `Resources` 字段**（2026-11-26，0号位 v1.13 复核）。
+    /// `true` = 字段存在（哪怕是个空列表）；`false` = `Resources == null`（旧夹具/老载荷）。
+    /// <para>这是 <see cref="DefinedResourceIds"/> 护栏的**唯一**开关 —— 见该属性注释的四种情形。</para>
+    /// </summary>
+    public bool ResourcesPayloadPresent { get; set; }
     /// <summary>
     /// **PV195 跨日历窗找槽的启用开关（2026-10-29）**。默认 <c>false</c>。
     ///
@@ -2145,6 +2298,18 @@ internal class ConstraintContext
         = new(StringComparer.Ordinal);
 
     /// <summary>
+    /// **每需求、每 Stage 的实际执行厂 Id**（0号位 2026-11-25 v1.3 §4.2）。
+    ///
+    /// <para>【为什么与上表并存】`DepartmentWorkWindows` 的键是 **`FactoryId`（int）**，
+    ///   而 <see cref="StageFactoryByDemandStage"/> 只有厂的**代码**（string）⇒ 取窗时无法直接用。
+    ///   本表由 `StageSequenceStep.StageFactoryId`（`Factory.Code` 等值匹配得到的 Id）填充。</para>
+    /// <para>【缺键语义】某需求某 Stage 不在表内 ⇒ 该 Stage 的执行厂 Id **未知**，
+    ///   取窗按既有口径沿用 `Demand.FactoryId`（保持改造前行为），**不猜测**成别的厂。</para>
+    /// </summary>
+    public Dictionary<string, Dictionary<string, int>> StageFactoryIdByDemandStage { get; set; }
+        = new(StringComparer.Ordinal);
+
+    /// <summary>
     /// **R09-③ 载体｜原始求解入参的只读引用**（2026-10-29）。
     ///
     /// 【为什么挂在这里】Phase2 的 `ScheduleForward` / `ScheduleBackward` 形参里**没有** request，
@@ -2221,6 +2386,21 @@ internal class ConstraintContext
     /// 残留：契约 <c>OperationResourceEligibility</c> 无 StageCode 字段，无法再细到 Stage（见 <see cref="EligibilityLookupKey"/> 注释）。
     /// </summary>
     public Dictionary<EligibilityLookupKey, List<int>> OperationResourceEligibility { get; set; } = new();
+
+    /// <summary>
+    /// 2026-11-27（0号位 v1.7 §B-2「1有责任修正不合理 first-fit」）：
+    /// **工序资源资格的 Priority 值**，<see cref="EligibilityLookupKey"/> → (ResourceId → Priority)。
+    ///
+    /// 为什么需要单独存：<see cref="OperationResourceEligibility"/> 只保留「按 Priority 升序排好的
+    /// ResourceId 列表」，**排序完成后 Priority 值本身被丢弃** ⇒ 下游无法判断两台资源是否「同优先层」，
+    /// 只能按列表行序 first-fit。这正是「同优先、同资格、同硬约束时因输入行序接受远期方案」的载体。
+    /// 本表只补**值**，不改变资格集的成员与顺序；`Priority` 语义与契约 `OperationResourceEligibility.Priority`
+    /// 逐字一致（**数值越小优先级越高**，与 `OrderBy(e => e.Priority)` 同口径）。
+    /// 同一键下同 ResourceId 重复出现时取**首个**（与 `OrderBy` 稳定排序后 first-fit 的实际取用一致）。
+    /// 与 <see cref="OperationResourceEligibility"/> 一并由 `BuildOperationResourceEligibility` 构建；
+    /// 克隆走 `MemberwiseClone` 引用共享，下游**只读**。
+    /// </summary>
+    public Dictionary<EligibilityLookupKey, Dictionary<int, int>> OperationResourcePriorities { get; set; } = new();
 
     /// <summary>
     /// 2026-11-02（**纯观测**）：本次求解输入里**出现过工序行**的 `MaterialId` 集合。
@@ -2372,6 +2552,25 @@ internal class ConstraintContext
     public List<SolveTraceNote> TraceNotes { get; set; } = new();
 
     /// <summary>
+    /// **Phase2 逐需求自报出口正文**（键 = `LogicalDemandKey`，值 = 人可读正文）。
+    ///
+    /// <para><b>为什么放进上下文（2026-11-26 迁移）</b>：本表原先是 `PhaseTwoInitialScheduler` 的
+    ///   **实例字段**，只按 `demandKey` 键、**不分候选方案**。而批方案候选试排**每一轮都往里写**，
+    ///   后写覆盖先写 ⇒ 最终报文会把「**选中方案**的批数」和「**另一个候选方案**的工时」拼在一起。
+    ///   实测（`999634_191332`）：外层写「批方案共 2 个」（2 批 ⇒ 批001 = 1400 件），
+    ///   内层却写「本工序最长需 3662.68 分钟」——那是 **3 批候选**（批001 = 934 件）的 M102 工时
+    ///   （`235.29 秒/件 × 934 ÷ 60 = 3662.68`；与 2 批的 5490.10 差 1.5 倍）。
+    ///   0号位 据此要求「查实际资源系数/投入/公式，不能猜」——查实后既不是系数也不是良率，
+    ///   **是诊断串了方案**。</para>
+    ///
+    /// <para><b>迁移后</b>：随 <see cref="TraceNotes"/> 走同一条路——候选试排各自一份副本
+    ///   （见 <see cref="ShallowCloneForTrial"/>），父对象全程不被候选触碰，只补回胜者的那一份。</para>
+    ///
+    /// <para>⚠ 纯诊断：不参与任何判定，不进冻结 15 码。</para>
+    /// </summary>
+    public ConcurrentDictionary<string, string> Phase2BlockedDetails { get; set; } = new(StringComparer.Ordinal);
+
+    /// <summary>
     /// 2026-10-27 四十三刀：**候选试排用的浅拷贝上下文**（候选并行的前置条件）。
     ///
     /// 【为什么需要】候选试排会往上下文里写两个成员：`ProductTimeline`（逐候选 `realTimeline.Clone()` 后
@@ -2395,6 +2594,9 @@ internal class ConstraintContext
         var clone = (ConstraintContext)MemberwiseClone();
         clone.ProductTimeline = new ResourceProductTimeline();
         clone.TraceNotes = new List<SolveTraceNote>();
+        // 2026-11-26：Phase2 自报出口正文同样「每候选一份」——否则后写候选的批数/工时
+        //   会覆盖选中方案的，最终报文出现「2 批的批数 + 3 批的工时」（999634_191332 实测 1.5 倍差）。
+        clone.Phase2BlockedDetails = new ConcurrentDictionary<string, string>(StringComparer.Ordinal);
         // 0号位 v1.7：原始净量登记是「候选试排可写」状态 ⇒ 各候选一份副本（并行候选不得互相污染）。
         clone.RawBatchNetByExecutionBatchKey = new Dictionary<string, decimal>(RawBatchNetByExecutionBatchKey, StringComparer.Ordinal);
         // 2026-11-20：失败批候选路径表在候选试排里也会被写（同一批可能多次试排）⇒ 各候选各一份，不互相污染。
@@ -2444,6 +2646,13 @@ internal class ConstraintContext
     /// 资源日历：ResourceId → 可用时间窗列表（已排序）
     /// </summary>
     public Dictionary<int, List<TimeWindow>> ResourceCalendars { get; set; } = new();
+
+    /// <summary>
+    /// 2026-11-26（0号位 v1.7 §2 / §4 P0-1）：**部门 → 唯一所属厂**。
+    /// 由 `DepartmentWorkWindows` 的部门级行派生，只收唯一归属；跨厂部门不入表。
+    /// ⚠ 不是 `StageDict` 的替代：链给了厂就先用链的；本表只补「链没给厂、部门已知」这一档。
+    /// </summary>
+    public Dictionary<int, int> DepartmentFactoryMap { get; set; } = new();
 
     /// <summary>
     /// 物料多段可用性：AllocationSequence → Quantity-Time 分段列表（已按时间排序）
@@ -2552,6 +2761,14 @@ internal class ConstraintContext
     /// 供 Phase2/Phase4 的 GetDynamicMaterialFloor 在子件完成时间上累加滞后。
     /// </summary>
     public Dictionary<(string, string), decimal> CrossMaterialLagMinutes { get; set; } = new();
+
+    /// <summary>
+    /// 2026-11-26（0号位 v1.8 §2.1）：逐边**需求量**（`MaterialRequirementLink.RequiredQty`）。
+    /// 键域与 <see cref="CrossMaterialLagMinutes"/> 相同：<c>(父 DemandKey, 子 DemandKey)</c>。
+    /// 用途：父件评估子件时，除「时间可得」外还必须「**该子件已合法落定的份额 ≥ 本边需求量**」，
+    /// 不足则父件保留真实未满足量，**不得用全部 Q 假齐套**。
+    /// </summary>
+    public Dictionary<(string, string), decimal> CrossMaterialRequiredQty { get; set; } = new();
 
     /// <summary>
     /// 跨物料 BOM 依赖存在环。

@@ -463,6 +463,120 @@ public class DemandStageProcessQuantityProjectorTests
         r.YieldFallbackSamples.Should().OnlyContain(s => s.LogicalDemandKey == "D0",
             "未入载荷的行不得留样例，否则样例会指认一条根本没有交付的 Stage 量");
     }
+
+    // ── ⑤b A31 五类门禁：单需求漏绑定 / 真实冲突 / 合法多链 ─────────────────
+    //
+    // 0号位 v1.18 §二十三.2 点名五类最小正反例：
+    //   ①全目录装载失败为空 ②单需求漏绑定 ③真实冲突 ④合法旧版唯一链 ⑤合法多链。
+    //   ①④ 见上方两条；②③⑤ 在此。
+
+    [Fact]
+    public void 单需求漏绑定_该需求不出行_同批其他需求照常()
+    {
+        // 请求带合同、K2 有绑定，K1 没有 ⇒ 只有 K1 不得回落物料级。
+        var chains = new[] { Chain(("CN_ASSY", 10), ("CN_FINAL", 20)) };
+        var demands = new[] { Demand("K1", 100m), Demand("K2", 50m) };
+        var steps = new Dictionary<string, IReadOnlyList<StageSequenceStep>?>(StringComparer.Ordinal)
+        {
+            ["K2"] = new[] { new StageSequenceStep { StageCode = "CN_ASSY", StageSeq = 10 } }
+        };
+
+        var r = DemandStageProcessQuantityProjector.Project(
+            demands, chains, yieldPercent: null, stepsByDemandKey: steps, hasChainBindingContract: true);
+
+        r.Rows.Select(x => x.LogicalDemandKey).Distinct()
+            .Should().BeEquivalentTo(new[] { "K2" }, "漏绑定的 K1 不得借 K2 或物料级链算量");
+        r.DemandsWithoutChain.Should().Be(1);
+        r.DemandsWithChain.Should().Be(1);
+    }
+
+    [Fact]
+    public void 真实冲突_绑定存在但无链_该需求不出行()
+    {
+        // CONFLICT / NO_CHAIN 在 stepsByDemandKey 里是"有绑定、值为 null" ⇒ 不得回退。
+        var chains = new[] { Chain(("CN_ASSY", 10), ("CN_FINAL", 20)) };
+        var demands = new[] { Demand("K1", 100m) };
+        var steps = new Dictionary<string, IReadOnlyList<StageSequenceStep>?>(StringComparer.Ordinal)
+        {
+            ["K1"] = null
+        };
+
+        var r = DemandStageProcessQuantityProjector.Project(
+            demands, chains, yieldPercent: null, stepsByDemandKey: steps, hasChainBindingContract: true);
+
+        r.Rows.Should().BeEmpty("真实冲突/无链的需求必须 Fail-Closed，不能借物料级链顶替");
+        r.DemandsWithoutChain.Should().Be(1);
+    }
+
+    [Fact]
+    public void 合法多链_同物料两需求各走各的链()
+    {
+        // 同一物料两条合法链；物料级载体里只有其中一条 ⇒ 必须按需求取，不能都用物料级那条。
+        var chains = new[] { Chain(("BJ_CAST", 10), ("BJ_MACH", 20)) };   // 旧载体只有 A 链
+        var demands = new[] { Demand("A", 100m), Demand("B", 200m) };
+        var steps = new Dictionary<string, IReadOnlyList<StageSequenceStep>?>(StringComparer.Ordinal)
+        {
+            ["A"] = new[]
+            {
+                new StageSequenceStep { StageCode = "BJ_CAST", StageSeq = 10 },
+                new StageSequenceStep { StageCode = "BJ_MACH", StageSeq = 20 }
+            },
+            ["B"] = new[]
+            {
+                new StageSequenceStep { StageCode = "BJ_MACH", StageSeq = 20 },
+                new StageSequenceStep { StageCode = "BJ_SURF", StageSeq = 30 }
+            }
+        };
+
+        var r = DemandStageProcessQuantityProjector.Project(
+            demands, chains, yieldPercent: null, stepsByDemandKey: steps, hasChainBindingContract: true);
+
+        var aStages = r.Rows.Where(x => x.LogicalDemandKey == "A").Select(x => x.StageCode).OrderBy(x => x).ToList();
+        var bStages = r.Rows.Where(x => x.LogicalDemandKey == "B").Select(x => x.StageCode).OrderBy(x => x).ToList();
+
+        aStages.Should().BeEquivalentTo(new[] { "BJ_CAST", "BJ_MACH" });
+        bStages.Should().BeEquivalentTo(new[] { "BJ_MACH", "BJ_SURF" },
+            "B 需求必须走自己的链，不能因为物料级载体只有 A 链就套用 A");
+        r.DemandsWithChain.Should().Be(2);
+    }
+
+    // ── ⑥ 绑定合同：装载失败变空**不得**被判成旧版（0号位 总表 v1.12 §十八 第二行末句）──
+    //
+    // 原缺陷：调用方以「产出绑定条数 > 0」推断"本请求带新合同"。一旦新目录/绑定因装载失败变空，
+    //   整请求被误判为「旧版载荷」，G-1 回落物料级并集 ⇒ 借他单链算量（0号位 明令禁止）。
+    // 现口径：合同在不在是**请求级事实**；绑定空 ≠ 旧版。以下两条把两侧都钉住。
+
+    [Fact]
+    public void 带绑定合同但绑定为空_不得回落物料级链()
+    {
+        // 物料级有一条唯一等价链（旧版兼容路径「看得到」它），但请求带新合同且绑定为空。
+        var chains = new[] { Chain(("CN_ASSY", 10), ("CN_FINAL", 20)) };
+        var demands = new[] { Demand("D1", 100m) };
+
+        var r = DemandStageProcessQuantityProjector.Project(
+            demands, chains, yieldPercent: null,
+            stepsByDemandKey: new Dictionary<string, IReadOnlyList<StageSequenceStep>?>(StringComparer.Ordinal),
+            hasChainBindingContract: true);
+
+        r.Rows.Should().BeEmpty("带合同却无绑定行 ⇒ 该需求无链，不得借物料级并集算量");
+        r.DemandsWithoutChain.Should().Be(1);
+    }
+
+    [Fact]
+    public void 明显旧版载荷_无合同无绑定_才回落物料级唯一链()
+    {
+        // 真旧版：整个请求不带合同（离线重放调 Project 的默认参数）⇒ 唯一等价链合法兼容。
+        var chains = new[] { Chain(("CN_ASSY", 10), ("CN_FINAL", 20)) };
+        var demands = new[] { Demand("D1", 100m) };
+
+        var r = DemandStageProcessQuantityProjector.Project(
+            demands, chains, yieldPercent: null,
+            stepsByDemandKey: null,
+            hasChainBindingContract: false);
+
+        r.Rows.Should().NotBeEmpty("真旧版载荷无合同 ⇒ 物料级唯一等价链合法兼容（既有行为不变）");
+        r.DemandsWithChain.Should().Be(1);
+    }
 }
 
 /// <summary>
@@ -553,7 +667,6 @@ public class PlanningYieldResolverTests
             "「配了但不能用」与「没配」是两回事，前者要回查发布侧");
     }
 
-    [Fact]
     public void 来源_越界规则不得掩盖同键合法规则()
     {
         var yields = new[] { Rule("M1", "CN_SURF", 120m), Rule("M1", "CN_SURF", 88m) };

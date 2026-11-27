@@ -58,6 +58,12 @@ public sealed class NextOperationContextDto
 
     /// <summary>
     /// 从哪个小工序继续（需要精确到小工序时填写，否则为null）
+    ///
+    /// ⚠️ 2026-11-26 P4 注记：字段名虽为 Code，其值当前实为 **MES 工序名（OperationName）**，
+    ///    非 APS `RoutingOperation.OperationCode`——计算器各调用点传入的是
+    ///    `OperationProgressFact.OperationName` / DAG 前沿的 `OpName`。
+    ///    与 `ExistingExecutionSliceDto.StartOperationCode`（真正 OperationCode、另有独立 StartOperationName）
+    ///    **同名不同义**，消费方勿混；正名（改名或补 OperationName 字段）属契约变更，须联签，本轮不动。
     /// </summary>
     public string? StartOperationCode { get; init; }
 

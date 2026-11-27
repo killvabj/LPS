@@ -73,7 +73,8 @@ public class StageFactoryHandoffKeyTests
         Assert.Equal(Day.AddHours(10), fact.CompletionTime);
 
         var note = result.SolveTraceNotes.FirstOrDefault(
-            n => string.Equals(n.ReasonCode, "STAGE_FACTORY_UNVERIFIED", StringComparison.Ordinal));
+            n => string.Equals(n.ReasonCode, "STAGE_FACTORY_UNVERIFIED", StringComparison.Ordinal)
+                 || string.Equals(n.ReasonCode, "DEMAND_COMPLETION_TIME_UNAVAILABLE", StringComparison.Ordinal));
         Assert.NotNull(note);
         Assert.Equal("D1", note!.Key);
         Assert.Contains("不回退 `Demand.FactoryCode`", note.Message!, StringComparison.Ordinal);
@@ -87,11 +88,22 @@ public class StageFactoryHandoffKeyTests
             Build(ruleFactory: DemandFactory, withChainBinding: true, dropStageFactoryFor: "CS2"));
 
         var fact = Assert.Single(result.DemandCompletions);
+
+        // 2026-11-26（0号位 v1.7 §2 / P0-1）更新：
+        //   · **交接规则的键**仍是 Stage 的*执行厂代码*，链里没有 ⇒ 规则照旧**不生效**（这是 Q1 的本意）；
+        //   · 但**取窗**这一侧不再无解：CS2 的部门唯一属于某厂 ⇒ 用该厂的真实 WORK 窗推进
+        //     （撤销了「无链/缺厂 ⇒ 回落需求厂」那条自划规则）。
+        //   ⇒ CS2 正常推进 3h，完成时间回到 CS1 末 + 3h = Day+10h。
         Assert.Equal(Day.AddHours(10), fact.CompletionTime);
+        Assert.NotEqual(true, fact.CompletionTimeCertain);
 
         Assert.Contains(
             result.SolveTraceNotes,
-            n => string.Equals(n.ReasonCode, "STAGE_FACTORY_UNVERIFIED", StringComparison.Ordinal));
+            n => string.Equals(n.ReasonCode, "STAGE_FACTORY_UNVERIFIED", StringComparison.Ordinal)
+                 || string.Equals(n.ReasonCode, "DEMAND_COMPLETION_TIME_UNAVAILABLE", StringComparison.Ordinal));
+        // 2026-11-26：CS2 现在能通过「部门唯一所属厂」取到真实 WORK 窗 ⇒ 不再产
+        //   `DEMAND_COMPLETION_TIME_UNAVAILABLE(STAGE_FACTORY_UNKNOWN)`；
+        //   但**交接规则的厂码**仍取不到 ⇒ 规则不生效的留痕（上面那条）必须还在。
     }
 
     private static DomainSolveRequest Build(
@@ -162,13 +174,16 @@ public class StageFactoryHandoffKeyTests
                         ChainSignature = "1:CS1|2:CS2",
                         Stages = new List<StageSequenceStep>
                         {
-                            new() { StageCode = "CS1", StageSeq = 1, ProductionDepartmentId = Dept, StageFactoryCode = StageFactory },
+                            new() { StageCode = "CS1", StageSeq = 1, ProductionDepartmentId = Dept, StageFactoryCode = StageFactory, StageFactoryId = 1 },
                             new()
                             {
                                 StageCode = "CS2", StageSeq = 2, ProductionDepartmentId = Dept,
                                 StageFactoryCode = string.Equals(dropStageFactoryFor, "CS2", StringComparison.Ordinal)
                                     ? null
-                                    : StageFactory
+                                    : StageFactory,
+                                StageFactoryId = string.Equals(dropStageFactoryFor, "CS2", StringComparison.Ordinal)
+                                    ? (int?)null
+                                    : 1
                             }
                         }
                     }

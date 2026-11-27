@@ -275,6 +275,19 @@ public static class EffectiveStageChainResolver
                 bomNoFilterApplied, worksetIdFilterApplied, identityState, IdentityAmbiguous: true);
         }
 
+        // ④' **身份未验证不得因「候选唯一」放行**（0号位 2026-11-26 v1.20 口径：
+        //   「链内容唯一**不能代替**业务身份证明」；14:33 件 §5 同旨）。
+        //   原实现只在「候选 >1」时拦截；候选恰好 1 条时仍放行 ⇒ 等于用「只有一条」冒充「就是你的」。
+        //   ⚠ **只拦 `UnverifiedRequestIdentity`**：`ParentEdgeScoped`（EDGE 按本请求真实父边集收窄）
+        //     是**已证**的边维度身份，不能一并拦——拦了会把所有子件需求全变成未排。
+        //   `NoAnchor` 已在上面 ② 走无链。
+        if (identityState == RequestIdentityState.UnverifiedRequestIdentity)
+        {
+            return new Resolution(preferredScope, false, Array.Empty<StageSequenceStep>(),
+                picked.Select(c => c.ChainKey).ToList(), otherLongest, otherCount,
+                bomNoFilterApplied, worksetIdFilterApplied, identityState, IdentityAmbiguous: true);
+        }
+
         // ⑤ 同 scope 内去重后「取最长」；条数相同时按链签名 ordinal 降序取定（**确定性**，不随机、不按行序）
         //   —— 到达此处时要么身份是 Anchored（真实请求键已等值收窄），要么候选唯一。
         var chosen = picked[0];

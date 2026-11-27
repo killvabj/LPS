@@ -15,3 +15,6 @@ D:\WorkSpace_LocalLib\Windsurf WorkSpace\LPS_SVN\LPS.APS.Scheduling\obj\Debug\ne
 D:\WorkSpace_LocalLib\Windsurf WorkSpace\LPS_SVN\LPS.APS.Scheduling\obj\Debug\net8.0\refint\LPS.APS.Scheduling.dll
 D:\WorkSpace_LocalLib\Windsurf WorkSpace\LPS_SVN\LPS.APS.Scheduling\obj\Debug\net8.0\LPS.APS.Scheduling.pdb
 D:\WorkSpace_LocalLib\Windsurf WorkSpace\LPS_SVN\LPS.APS.Scheduling\obj\Debug\net8.0\ref\LPS.APS.Scheduling.dll
+D:\tmp\binx2\Debug\net8.0\LPS.APS.Scheduling.deps.json
+D:\tmp\binx2\Debug\net8.0\LPS.APS.Scheduling.dll
+D:\tmp\binx2\Debug\net8.0\LPS.APS.Scheduling.pdb

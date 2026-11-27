@@ -274,6 +274,16 @@ public class RoutelessLeadTimeWorkWindowTests
         DepartmentWorkWindows = new List<DepartmentWorkWindow>(windows),
     };
 
+    /// <summary>
+    /// 2026-11-25（0号位 v1.5）：WORK 日历取窗**必须**用该 Stage 的权威执行厂，缺则该时间不可证。
+    /// 本夹具声明「Stage 执行厂 = 需求厂」这一事实（而不是让生产代码回落）。
+    /// </summary>
+    private static Dictionary<string, Dictionary<string, int>> FactoryMap()
+        => new(StringComparer.Ordinal)
+        {
+            ["D1"] = new Dictionary<string, int>(StringComparer.Ordinal) { [Stage] = FactoryId }
+        };
+
     private static LogicalProductionDemand Demand() => new()
     {
         LogicalDemandKey = "D1",
@@ -288,7 +298,8 @@ public class RoutelessLeadTimeWorkWindowTests
         bool stageHasDept = true)
     {
         var ok = StageTimingNodeBuilder.TryAdvanceByWorkHours(
-            Request(windows, stageHasDept), Demand(), Stage, cursor, hours, out var end, out var reason);
+            Request(windows, stageHasDept), Demand(), Stage, cursor, hours, out var end, out var reason,
+            isLeadTimeOnly: false, stageFactoryIdByDemandStage: FactoryMap());
         return (ok, end, reason);
     }
 
@@ -299,7 +310,8 @@ public class RoutelessLeadTimeWorkWindowTests
         bool stageHasDept = true)
     {
         var ok = StageTimingNodeBuilder.TryRetreatByWorkHours(
-            Request(windows, stageHasDept), Demand(), Stage, cursor, hours, out var start, out var reason);
+            Request(windows, stageHasDept), Demand(), Stage, cursor, hours, out var start, out var reason,
+            isLeadTimeOnly: false, stageFactoryIdByDemandStage: FactoryMap());
         return (ok, start, reason);
     }
 }

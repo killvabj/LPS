@@ -50,7 +50,8 @@ internal static class RoutelessLeadTimePolicy
             }
 
             if (StageTimingNodeBuilder.TryAdvanceByWorkHours(
-                    request, demand, leg.StageCode, cursor, leg.Hours, out var end, out _))
+                    request, demand, leg.StageCode, cursor, leg.Hours, out var end, out _,
+                    stageFactoryIdByDemandStage: constraints.StageFactoryIdByDemandStage))
             {
                 cursor = end;
             }
@@ -87,7 +88,8 @@ internal static class RoutelessLeadTimePolicy
             }
 
             if (StageTimingNodeBuilder.TryRetreatByWorkHours(
-                    request, demand, leg.StageCode, cursor, leg.Hours, out var start, out _))
+                    request, demand, leg.StageCode, cursor, leg.Hours, out var start, out _,
+                    stageFactoryIdByDemandStage: constraints.StageFactoryIdByDemandStage))
             {
                 cursor = start;
             }

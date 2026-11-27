@@ -627,6 +627,25 @@ internal class PhaseFiveCompression
                 .Select(t => criticalTaskIds.Contains(t.FinalDraftId) ? WithCriticalPath(t, isCritical: true) : t)
                 .ToList();
 
+        // ── 2026-11-26（0号位《未排案例第二批》§9）：**归因闭合审计** ──
+        //   0号位 逐字要求「需打印它实际走的分支标记」。实测 FRL **246 条**需求在账上
+        //   「无 Task / 无 Timing / 无未排码」⇒ 既不算「排上」也不算「未排」，人工 PMC 无法追溯。
+        //   本审计在结果装配**之前**扫一遍：凡「声明量 > 0 且 `FinalTasks` 里没有它的任何 Task
+        //   且 `UnscheduledTasks` 里也没有它」的需求，一律留一条**决策说明层**注记，
+        //   并附带「它到底走到了哪一步」的既有事实（批键是否形成 / 是否选过路 / 是否还有存活份额）。
+        //   ⚠ **只留痕**：不改判定、不改任何数量、**不新增正式 ReasonCode**（冻结 15 码不动）。
+        //   ⚠ r14490（2026-11-26，0号位 v1.13 复核两处改正）：
+        //     ① **排除合法 `StageTiming` 载体** —— 末端/整条无 Routing Stage 的需求结构上就没有 Task，
+        //        其时间由 `DemandCompletions[].StageTimings` 承载 ⇒ 不是「三无」。为此把
+        //        `TimedStageTimingBuild` 提到审计**之前**求值，并把 `demandCompletions` 传进审计。
+        //     ② **不再用 `AllocationSequence` 级份额求和断言「已合批落定」** —— 一个 seq 可含**多个需求**、
+        //        且 `AllocationTaskShare` 跨 OP/Stage/切片，按 seq 求和后与**单个需求**净量比大小没有意义。
+        //        改用 `landedQtyByDemand`（`BuildTerminalContributions` 的**需求级**落定量，唯一运行期真相）。
+        var demandCompletionsForAudit = TimedStageTimingBuild(request, constraints, allScheduledTasks);
+        AuditUnaccountedDemands(
+            request, allScheduledTasks, unscheduledTasks, constraints,
+            landedQtyByDemand, demandCompletionsForAudit);
+
         var finalResult = new DomainSolveResult
         {
             Success = !technicalFailure,
@@ -642,7 +661,10 @@ internal class PhaseFiveCompression
             // ④⑤⑨（0号位 2026-09-29 裁决 §十四第 4/5/9 项）：末端/整条无 Routing Stage 的纯内存时间节点。
             // 载体在 Core（2号位 落），值由 1号位 填 —— 见 StageTimingNodeBuilder 类注释。
             // ⚠ 这些节点**不进 FinalTasks**：结构上就没有 Task 载体，不生成 TaskNo/MES工单。
-            DemandCompletions = TimedStageTimingBuild(request, constraints, allScheduledTasks),
+            // r14490：复用审计前**已求值一次**的同一份结果（见上方 `demandCompletionsForAudit`）。
+            //   ⚠ 行为差异仅一条：`StageTimingNodeBuilder.Build` 追加的追溯注记现在**先于**审计注记落位。
+            //     集合内容、`CompletionTime` 取值、`CompletionTimeCertain` 三态均不变。
+            DemandCompletions = demandCompletionsForAudit,
             Summary = new SolveSummary
             {
                 TotalDrafts = allScheduledTasks.Count + unscheduledTasks.Count,
@@ -695,6 +717,123 @@ internal class PhaseFiveCompression
     ///     <see cref="InitialScheduleResult.BatchPolicyMissingDemandKeys"/> /
     ///     <see cref="InitialScheduleResult.BatchPolicyUnavailableDemandKeys"/>（元素前缀 = `[{LogicalDemandKey}] `）。
     /// </summary>
+    /// <summary>
+    /// 2026-11-26｜**归因闭合审计**（纯观测，不参与任何判定、不改任何数量）。
+    ///
+    /// <para><b>要解决的问题</b>（0号位《未排案例第二批》§9）：实测 FRL **246 条**需求在账上
+    /// 「无 Task / 无 StageTimings / 无未排原因码」—— 既不算「排上」也不算「未排」，
+    /// 结果里没有任何可追溯出口，人工 PMC 无法知道它为什么没做。
+    /// 代表例 `999634_19165`（物料 365836，净量 1）：同物料同净量的兄弟需求 19141 / 46034 都排上了，
+    /// 只有它三无。**隔离切片能排上**（3 Task），只有在 1,424 条同部门需求竞争时才变三无
+    /// ⇒ 是全域竞争下某处把它「拿走了」却没留下任何痕迹。</para>
+    ///
+    /// <para><b>本方法做什么</b>：在结果装配前扫一遍需求，凡「声明量 &gt; 0 且
+    /// `FinalTasks` 里没有它的 Task 且 `UnscheduledTasks` 里也没有它」的，留一条
+    /// **决策说明层**注记（`P5_DEMAND_UNACCOUNTED`，**不是**正式 ReasonCode —— 冻结 15 码不动），
+    /// 并把「它走到了哪一步」的既有事实一并带出，让下一次运行能直接定位分支。</para>
+    ///
+    /// <para><b>为什么是注记而不是改判定</b>：判「它算不算未排」会改变全域未排量，
+    /// 属业务口径（0号位 裁）；本方法只负责让它**可被看见、可被计数**，绝不代裁。</para>
+    /// </summary>
+    private static void AuditUnaccountedDemands(
+        DomainSolveRequest request,
+        IReadOnlyList<FinalTaskDraft> tasks,
+        IReadOnlyList<UnscheduledTaskResult> unscheduled,
+        ConstraintContext constraints,
+        IReadOnlyDictionary<string, decimal> landedQtyByDemand,
+        IReadOnlyList<DemandCompletionFact> demandCompletions)
+    {
+        if (request.LogicalProductionDemands is not { Count: > 0 } demands) return;
+
+        var scheduledKeys = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var t in tasks)
+        {
+            if (!string.IsNullOrEmpty(t.SourceDraftId)) scheduledKeys.Add(t.SourceDraftId);
+        }
+
+        var unscheduledKeys = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var u in unscheduled)
+        {
+            if (!string.IsNullOrEmpty(u.DraftId)) unscheduledKeys.Add(u.DraftId);
+        }
+
+        // ── 合法 `StageTiming` 载体（r14490，0号位 v1.13 复核第一项）──
+        //   末端 Stage / 整条无 Routing Stage 的需求**结构上就没有 Task**（0号位 §9.2：禁止把无 Routing
+        //   Stage 伪装成真实 Task）⇒ 它的完成时间由 `DemandCompletions[].StageTimings`（`NodeType=STAGE_TIMING`）
+        //   承载。这种需求「无 Task」是**合法**的，不是「三无」，本审计必须排除，否则会把正常结构报成缺口。
+        var timingKeys = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var c in demandCompletions)
+        {
+            if (!string.IsNullOrEmpty(c.LogicalDemandKey) && c.StageTimings is { Count: > 0 })
+            {
+                timingKeys.Add(c.LogicalDemandKey);
+            }
+        }
+
+        var emitted = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var d in demands)
+        {
+            var key = d.LogicalDemandKey;
+            if (string.IsNullOrEmpty(key)) continue;
+            if (d.NetOutputQty <= 0m) continue;
+            if (scheduledKeys.Contains(key)) continue;
+            if (unscheduledKeys.Contains(key)) continue;
+            if (timingKeys.Contains(key)) continue;   // 合法 StageTiming 载体 ⇒ 已记账
+
+            SolverDiagnostics.CountPhase5UnaccountedDemand();
+            if (!emitted.Add(key)) continue;
+
+            var hasBatch = constraints.ExecutionBatchDraftKeys.TryGetValue(key, out var batchKeys)
+                           && batchKeys is { Count: > 0 };
+            var hasChosenRoute = constraints.ChosenRoutePaths.ContainsKey(key);
+
+            // ── 需求级落定量（r14490，0号位 v1.13 复核第二项）──
+            //   旧写法按 `AllocationSequence` 把**所有** `AllocationTaskShare.ComponentQty` 相加再与**单个需求**
+            //   净量比大小。三处不成立：① 一个 `AllocationSequence` 可含**多个需求**（分母错）；
+            //   ② 份额行是**末端 Task × Allocation** 粒度、可跨 OP/Stage/切片（分子重复计）；
+            //   ③ 合批时同一份产出会被多个需求各记一次（分子再放大）。
+            //   ⇒ 改取 `landedQtyByDemand` = `BuildTerminalContributions` 按 `DemandKey` 归集的落定量 ——
+            //     那是「某需求在这批末端 Task 里究竟占多少」的唯一运行期真相，与份额分摊互不顶替。
+            var landedQty = landedQtyByDemand.TryGetValue(key, out var lq) ? lq : 0m;
+            var qtyText = d.NetOutputQty.ToString("G29", System.Globalization.CultureInfo.InvariantCulture);
+            var landedText = landedQty.ToString("G29", System.Globalization.CultureInfo.InvariantCulture);
+
+            // 三种结论（**同一现象、三种性质，不得混为一谈**）：
+            //   · 落定量 ≥ 净量 ⇒ 它**已通过合批落定**（份额记在别人的末端 Task 上）⇒ 缺口在**账载体**；
+            //   · 0 < 落定量 < 净量 ⇒ **部分落定**：一部分进了别人的 Task，剩余量既没排出也没登记未排；
+            //   · 落定量 = 0 ⇒ **真归因缺口**，需逐分支查。
+            var conclusion =
+                landedQty >= d.NetOutputQty
+                    ? "**账载体缺口（已合批落定）**：本需求在最终结果里没有自己的 Task，也未登记未排原因；"
+                      + $"但末端 Task 构成里本需求**已落定 {landedText}** ≥ 净量 {qtyText}"
+                      + " ⇒ **业务上已通过合批（份额并入其它需求的 Task）落定**，不是未排。"
+                      + "缺口在于结果里**没有承载「本需求已排」这个事实的载体**"
+                      + "（`FinalTasks` 按 `SourceDraftId` 归属，合批份额不产生自己的 Task）"
+                      + "⇒ 下游按 taskCnt 统计会把「已排」读成「三无」。"
+                    : landedQty > 0m
+                        ? "**部分落定 + 归因缺口**：本需求在最终结果里没有自己的 Task、也未登记未排原因；"
+                          + $"末端 Task 构成里本需求已落定 {landedText} < 净量 {qtyText}"
+                          + $" ⇒ **剩余 {d.NetOutputQty - landedQty} 既没排出也没登记未排原因**，需逐分支查。"
+                        : "**真归因缺口**：本需求在最终结果里既无任何 Task、也无 `StageTiming` 载体，"
+                          + $"也未登记任何未排原因（需求级落定量 = {landedText}）"
+                          + " ⇒ 账上既不算「已排」也不算「未排」。";
+
+            constraints.TraceNotes.Add(new SolveTraceNote
+            {
+                Key = key,
+                ReasonCode = "P5_DEMAND_UNACCOUNTED",
+                Level = "Warning",
+                Message = conclusion
+                          + $"净量={qtyText}；需求级落定量={landedText}；物料={d.MaterialId}；"
+                          + $"AllocationSequence={d.AllocationSequence}；StartStageCode={d.StartStageCode ?? "(null)"}；"
+                          + $"执行批键形成={(hasBatch ? string.Join("/", batchKeys!) : "无")}；"
+                          + $"选路登记={(hasChosenRoute ? "有" : "无")}。"
+                          + "本码只作决策说明层留痕，**不是**正式 ReasonCode（冻结 15 码未扩展）；"
+                          + "是否应计未排属业务口径，待 0号位 裁。"
+            });
+        }
+    }
+
     /// <summary>
     /// 2026-11-02｜**确定性指纹**（纯观测，不参与任何判定）。
     ///
@@ -780,13 +919,20 @@ internal class PhaseFiveCompression
                 }
                 else
                 {
-                    conflict++;
-                    // 542 条中哪些其实是 PI 契约待核 —— 只是**注释性拆分子集**，不改变 conflict 总数。
+                    // ── 2026-11-25（0号位 v1.5 请裁1 → A 方向）：PI 契约缺口**单列**，不计为 Batch 冲突 ──
+                    //   逐字：「汇总必须单列、**不能计为实际 Batch 策略冲突**；用户业务解释不得冒称
+                    //   Batch 配置冲突」「保留当前技术出口码兼容，不改冻结 15 码」。
+                    //   ⇒ 逐需求出口码仍走 `BATCH_POLICY_CONFLICT`（值域不变、上层兼容），
+                    //     但**本聚合计数**把它从 `conflict` 移出，单列到 `piContractPending`。
                     var detailText = FindBatchPolicyDetail(scheduleResult, kv.Key);
                     if (detailText is not null
                         && detailText.Contains("PI_LEGAL_QTY_CONTRACT_PENDING", StringComparison.Ordinal))
                     {
                         piContractPending++;
+                    }
+                    else
+                    {
+                        conflict++;
                     }
                 }
             }

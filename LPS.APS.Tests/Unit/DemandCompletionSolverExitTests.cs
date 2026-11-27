@@ -720,6 +720,31 @@ public class DemandCompletionSolverExitTests
                         .ToList()
                 }
             },
+            // 2026-11-25（0号位 v1.5）：WORK 取窗必须用该 Stage 的**权威执行厂**；缺则该时间不可证。
+            //   本夹具据此声明「Stage 执行厂 = 需求厂(1)」这一事实，而不是让生产代码回落推断。
+            StageChainDefinitions = new List<StageChainDefinition>
+            {
+                new()
+                {
+                    ChainRefId = "ROOT:" + string.Join("|", chain.Select(s => $"{s.Seq}:{s.Stage}")),
+                    StageScopeType = "ROOT",
+                    ChainSignature = string.Join("|", chain.Select(s => $"{s.Seq}:{s.Stage}")),
+                    Stages = chain.Select(s => new StageSequenceStep
+                    {
+                        StageCode = s.Stage, StageSeq = s.Seq,
+                        ProductionDepartmentId = Dept, StageFactoryCode = "F1", StageFactoryId = 1
+                    }).ToList()
+                }
+            },
+            DemandStageChainBindings = new List<DemandStageChainBinding>
+            {
+                new()
+                {
+                    LogicalDemandKey = "D1", BindingKey = "ROOT|BOM|WS",
+                    ChainRefId = "ROOT:" + string.Join("|", chain.Select(s => $"{s.Seq}:{s.Stage}")),
+                    StageScopeType = "ROOT", Status = StageChainBindingStatus.Resolved
+                }
+            },
             ExecutionConstraints = Array.Empty<ExecutionConstraint>(),
             Resources = eligibility
                 .Select(e => e.ResourceId).Distinct()

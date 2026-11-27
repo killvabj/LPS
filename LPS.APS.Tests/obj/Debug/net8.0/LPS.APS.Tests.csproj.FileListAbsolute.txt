@@ -267,3 +267,16 @@ D:\WorkSpace_LocalLib\Windsurf WorkSpace\LPS_SVN\LPS.APS.Tests\bin\Debug\net8.0\
 D:\WorkSpace_LocalLib\Windsurf WorkSpace\LPS_SVN\LPS.APS.Tests\bin\Debug\net8.0\Validation.dll
 D:\WorkSpace_LocalLib\Windsurf WorkSpace\LPS_SVN\LPS.APS.Tests\bin\Debug\net8.0\Xunit.SkippableFact.dll
 D:\WorkSpace_LocalLib\Windsurf WorkSpace\LPS_SVN\LPS.APS.Tests\bin\Debug\net8.0\LPS.APS.Tests.runtimeconfig.dev.json
+D:\tmp\binx2\Debug\net8.0\CoverletSourceRootsMapping_LPS.APS.Tests
+D:\tmp\binx2\Debug\net8.0\testhost.dll
+D:\tmp\binx2\Debug\net8.0\testhost.exe
+D:\tmp\binx2\Debug\net8.0\appsettings.Test.json
+D:\tmp\binx2\Debug\net8.0\appsettings.Test.Local.json
+D:\tmp\binx2\Debug\net8.0\xunit.runner.visualstudio.dotnetcore.testadapter.dll
+D:\tmp\binx2\Debug\net8.0\xunit.runner.reporters.netcoreapp10.dll
+D:\tmp\binx2\Debug\net8.0\xunit.runner.utility.netcoreapp10.dll
+D:\tmp\binx2\Debug\net8.0\LPS.APS.Tests.deps.json
+D:\tmp\binx2\Debug\net8.0\LPS.APS.Tests.runtimeconfig.json
+D:\tmp\binx2\Debug\net8.0\LPS.APS.Tests.runtimeconfig.dev.json
+D:\tmp\binx2\Debug\net8.0\LPS.APS.Tests.dll
+D:\tmp\binx2\Debug\net8.0\LPS.APS.Tests.pdb

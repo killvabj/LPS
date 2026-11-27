@@ -85,6 +85,56 @@ public class StageHandoffWaitTests
     }
 
     /// <summary>
+    /// **AE-006 / 0号位 v1.3 §4.3｜Task→Task 组合**：`WORK` 基准必须按合法窗口折算，
+    /// 基准 = 本批 FromStage 全部 Task 的最晚结束（与 ELAPSED 同基准，只有折算方式不同）。
+    ///
+    /// <para>窗口 09-01 08:00–12:00；S1 最晚结束 10:00；等待 180 工作分钟 ⇒ 11:00。</para>
+    /// <para>修复前该分支直接 `continue` ⇒ 起点停在 10:00（等待被整体作废）。</para>
+    /// </summary>
+    [Fact]
+    public void WORK基准_Task到Task_按合法窗口折算_不加自然分钟()
+    {
+        var ctx = Ctx(Rule("S1", "S2", 180, StageHandoffTimeBasis.WORK));
+        ctx.Request = new DomainSolveRequest
+        {
+            PlanVersionId = 1,
+            DomainKey = "DOMAIN",
+            MaterialStageDepartmentContexts = new[]
+            {
+                new MaterialStageDepartmentContextDto
+                {
+                    MaterialId = 1, StageCode = "S2", ProductionDepartmentId = 900
+                }
+            },
+            // 两段窗，中间 12:00–13:00 是 OFF（午休）⇒ WORK 与自然分钟**不同值**，才有判别力。
+            DepartmentWorkWindows = new[]
+            {
+                new DepartmentWorkWindow
+                {
+                    FactoryId = 1, DepartmentId = 900,
+                    Start = T0.Date.AddHours(8), End = T0.Date.AddHours(12)
+                },
+                new DepartmentWorkWindow
+                {
+                    FactoryId = 1, DepartmentId = 900,
+                    Start = T0.Date.AddHours(13), End = T0.Date.AddHours(17)
+                }
+            },
+            StrategySnapshot = new SolverStrategySnapshot
+            {
+                StageHandoffWaitRules = new[] { Rule("S1", "S2", 180, StageHandoffTimeBasis.WORK) }
+            }
+        };
+
+        var tasks = new List<FinalTaskDraft> { Task("S1", T0.Date.AddHours(10)) };
+        var start = Apply(ctx, "S2", tasks);
+
+        // 10:00 起 180 工作分钟：10:00–12:00 取 2h，跳过 12:00–13:00 午休，13:00–14:00 取 1h ⇒ **14:00**。
+        //   若把 WORK 当自然分钟直加 ⇒ 13:00（落在午休内），错的。
+        Assert.Equal(T0.Date.AddHours(14), start);
+    }
+
+    /// <summary>
     /// 2026-11-25（0号位 v1.2 §3）：**取不到权威 Stage 执行厂 ⇒ 判定不了，不回退需求厂**。
     /// 逐字：「不能缺值回 `Demand.FactoryCode`……回退分支必须撤除」。
     /// </summary>

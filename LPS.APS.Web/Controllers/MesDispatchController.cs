@@ -46,7 +46,9 @@ public class MesDispatchController : ControllerBase
     /// **无 dispatchUpdatedAt 面**——全表 NULL=消费环留痕缺口（Q-d 在案），不得据缺痕断言链未开。
     /// 分类位 `mesRequirementCategory` 恒 null（Q-a 未裁，禁由工单号空值反推"无需MES"）。
     /// </summary>
-    [Authorize(Policy = PermissionCodes.PlanView)]
+    // R1（3号位 11-21 裁甲；4号位 11-25 绑码完成）：P11 读面自 r14415 起挂 `aps.mes.view`
+    // （原 aps.plan.view 系 B6 建面时的保守位；绑码未就绪前不得先改——防五角色断读，红线见 4号位 11-25 函 §四）。
+    [Authorize(Policy = PermissionCodes.MesView)]
     [HttpGet("status")]
     public async Task<ApiResponse<LPS.APS.Core.Dto.MesStatusListResultDto>> GetStatus(
         [FromQuery] int planVersionId,
@@ -104,7 +106,7 @@ public class MesDispatchController : ControllerBase
     /// 工序级下发行（FailureCode/Reason 原值）＋同 (Run,PI,Stage,OperationName) 报工列（缺行=null=未判定）。
     /// 批不存在/越权=200+`found=false`（不 404，同全链形状 B 纪律）。
     /// </summary>
-    [Authorize(Policy = PermissionCodes.PlanView)]
+    [Authorize(Policy = PermissionCodes.MesView)]   // R1 同批（列表与批详情同码）
     [HttpGet("status/batch")]
     public async Task<ApiResponse<LPS.APS.Core.Dto.MesStatusBatchDetailDto>> GetStatusBatch(
         [FromQuery] int planVersionId,

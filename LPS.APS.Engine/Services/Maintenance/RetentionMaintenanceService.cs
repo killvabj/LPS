@@ -8,6 +8,22 @@ namespace LPS.APS.Engine.Services.Maintenance;
 
 /// <summary>
 /// 写入表保留期清理（2号位）。规则 = 0号位 2026-11-02 v2.0 §2.1 的 D1~D4，**不自拟天数**。
+///
+/// <para><b>⛔ 2026-11-26 停用（用户定）：本类不再注册 DI、无任何调用方，保留仅为备查。</b></para>
+/// <para>
+/// 停用原因：保留期统一由 **SQL 侧** <c>sp_PvRetentionCycle</c> ＋ Agent 作业 <c>APS_PV_RETENTION_CYCLE</c>
+/// （每日 03:30）承担，与本类功能重复；且 <c>Retention:Enabled</c> 生产恒为 <c>false</c>
+/// ⇒ 本链路历来只出 dry-run 测算、一行未删，属**从未生效的死路径**。
+/// </para>
+/// <para>
+/// <b>口径已定盘（用户 2026-11-26）：保留期只用 SQL 口径，本类作废，不再纳入任何恢复射程。</b>
+/// 保留的只是代码文本，供解释历史改动；**不得**重新注册 DI、不得恢复调用。
+/// 如将来 SQL 侧确有覆盖不到的表，按**新需求立项**另议，不复活本类。
+/// </para>
+/// <para>
+/// 附记（仅作历史，不构成待办）：本类内 2026-11-24 的 D5 规则改动本身未完成
+/// （规则数 6→7，<c>RetentionMaintenanceServiceTests</c> 仍断言 6 条）——随本类作废一并封存。
+/// </para>
 /// </summary>
 /// <remarks>
 /// <para><b>硬约束（逐条都可对照原文）</b></para>
@@ -38,11 +54,24 @@ public sealed class RetentionMaintenanceService : IRetentionMaintenanceService
     private const long MaxRowsPerRule = 500_000;
 
     /// <summary>D2 的同款安全垫：每 Domain 保留最近几个成功 Run。</summary>
-    private const int KeepSuccessfulRunsPerDomain = 2;
+    private const int KeepSuccessfulRunsPerDomain = 3;   // 2026-11-24 用户定：实际表每域留 3 套
 
     /// <summary>
     /// 保护集 CTE。所有测算/删除语句共用同一份，避免「测算用一套、删除用另一套」。
     /// </summary>
+    /// <summary>
+    /// 受保护 **Run** 集合（2026-11-24 新增）：由受保护 PV 反推其 Run。
+    /// `OperationProgressSnapshot` 只有 `ScheduleRunId`、没有 `PlanVersionId`，故单独用它判保留。
+    /// </summary>
+    private const string ProtectRunCte = ProtectCte + @",
+ProtectedRun AS (
+    SELECT DISTINCT pv.SourceScheduleRunId AS RunId
+      FROM PlanVersion pv
+      JOIN Protected p ON p.PlanVersionId = pv.Id
+     WHERE pv.SourceScheduleRunId IS NOT NULL
+)
+";
+
     private const string ProtectCte = @"
 ;WITH RunRanked AS (
     SELECT pv.Id AS PlanVersionId,
@@ -86,10 +115,8 @@ Protected AS (
             now: now,
             countSql: ProtectCte + @"
 SELECT COUNT_BIG(*)                                            AS TotalRows,
-       COUNT_BIG(CASE WHEN t.CreatedAt < @Cut THEN 1 END)      AS OverWindowRows,
-       COUNT_BIG(CASE WHEN t.CreatedAt < @Cut
-                       AND EXISTS (SELECT 1 FROM Protected p WHERE p.PlanVersionId = t.PlanVersionId)
-                      THEN 1 END)                              AS ProtectedRows
+       COUNT_BIG(CASE WHEN NOT EXISTS (SELECT 1 FROM Protected p WHERE p.PlanVersionId = t.PlanVersionId) THEN 1 END) AS OverWindowRows,
+       COUNT_BIG(CASE WHEN     EXISTS (SELECT 1 FROM Protected p WHERE p.PlanVersionId = t.PlanVersionId) THEN 1 END) AS ProtectedRows
   FROM ExplainTrace t",
             note: null,
             cancellationToken: cancellationToken));
@@ -104,11 +131,8 @@ SELECT COUNT_BIG(*)                                            AS TotalRows,
             now: now,
             countSql: ProtectCte + @"
 SELECT COUNT_BIG(*)                                            AS TotalRows,
-       COUNT_BIG(CASE WHEN t.CreatedAt < @Cut THEN 1 END)      AS OverWindowRows,
-       COUNT_BIG(CASE WHEN t.CreatedAt < @Cut
-                       AND (t.ScheduleRunId IS NULL
-                            OR EXISTS (SELECT 1 FROM Protected p WHERE p.PlanVersionId = t.PlanVersionId))
-                      THEN 1 END)                              AS ProtectedRows
+       COUNT_BIG(CASE WHEN NOT EXISTS (SELECT 1 FROM Protected p WHERE p.PlanVersionId = t.PlanVersionId) AND t.ScheduleRunId IS NOT NULL THEN 1 END) AS OverWindowRows,
+       COUNT_BIG(CASE WHEN EXISTS (SELECT 1 FROM Protected p WHERE p.PlanVersionId = t.PlanVersionId) OR t.ScheduleRunId IS NULL THEN 1 END) AS ProtectedRows
   FROM ScheduleExplanationFact t",
             note: "ScheduleRunId IS NULL 的来源不明记录一律不删",
             cancellationToken: cancellationToken));
@@ -121,10 +145,8 @@ SELECT COUNT_BIG(*)                                            AS TotalRows,
             now: now,
             countSql: ProtectCte + @"
 SELECT COUNT_BIG(*)                                            AS TotalRows,
-       COUNT_BIG(CASE WHEN t.CreatedAt < @Cut THEN 1 END)      AS OverWindowRows,
-       COUNT_BIG(CASE WHEN t.CreatedAt < @Cut
-                       AND EXISTS (SELECT 1 FROM Protected p WHERE p.PlanVersionId = t.PlanVersionId)
-                      THEN 1 END)                              AS ProtectedRows
+       COUNT_BIG(CASE WHEN NOT EXISTS (SELECT 1 FROM Protected p WHERE p.PlanVersionId = t.PlanVersionId) THEN 1 END) AS OverWindowRows,
+       COUNT_BIG(CASE WHEN     EXISTS (SELECT 1 FROM Protected p WHERE p.PlanVersionId = t.PlanVersionId) THEN 1 END) AS ProtectedRows
   FROM ProductionInstructionPositionSnapshot t",
             note: "每 Domain 最近 2 个成功 Run 取更严保护",
             cancellationToken: cancellationToken));
@@ -183,6 +205,24 @@ SELECT COUNT_BIG(*) AS TotalRows,
             note: "Status = STARTED（未结案）永不删",
             cancellationToken: cancellationToken));
 
+        // ── D5 OperationProgressSnapshot（2026-11-24 新增，2号位）──────────────
+        // 动机：该表 632 万行、每轮 +90 万，此前**无任何规则**；它按 Run 存（无 PlanVersionId）。
+        // 口径：与其余表一致 —— **每域保留最近 3 个 Run**（受保护 Run 集合由 PV 反推）。
+        items.Add(await BuildItemAsync(
+            rule: "D5 OperationProgressSnapshot",
+            table: "OperationProgressSnapshot",
+            windowDays: 0,
+            now: now,
+            countSql: ProtectRunCte + @"
+SELECT COUNT_BIG(*) AS TotalRows,
+       COUNT_BIG(CASE WHEN t.ScheduleRunId IS NOT NULL
+                       AND t.ScheduleRunId NOT IN (SELECT RunId FROM ProtectedRun) THEN 1 END) AS OverWindowRows,
+       COUNT_BIG(CASE WHEN t.ScheduleRunId IS NULL
+                        OR t.ScheduleRunId IN (SELECT RunId FROM ProtectedRun) THEN 1 END)       AS ProtectedRows
+  FROM OperationProgressSnapshot t",
+            note: "按 Run 保留最近 3 个；ScheduleRunId 为空不删",
+            cancellationToken: cancellationToken));
+
         return items;
     }
 
@@ -211,6 +251,7 @@ SELECT COUNT_BIG(*) AS TotalRows,
             deleted += await DeleteStagingFailedAsync(cancellationToken);
             deleted += await DeleteEtlLogAsync(cancellationToken);
             deleted += await DeleteComputeStageProgressAsync(cancellationToken);
+            deleted += await DeleteOperationProgressSnapshotAsync(cancellationToken);
 
             result.DeletedRows = deleted;
             _logger.LogInformation("保留期清理完成：实际删除 {DeletedRows} 行。", deleted);
@@ -236,8 +277,7 @@ SELECT COUNT_BIG(*) AS TotalRows,
         deleteSql: ProtectCte + @"
 DELETE TOP (@Batch) t
   FROM ExplainTrace t
- WHERE t.CreatedAt < @Cut
-   AND NOT EXISTS (SELECT 1 FROM Protected p WHERE p.PlanVersionId = t.PlanVersionId)",
+ WHERE NOT EXISTS (SELECT 1 FROM Protected p WHERE p.PlanVersionId = t.PlanVersionId)",
         ct: ct);
 
     private Task<long> DeleteSefAsync(CancellationToken ct) => DeleteInBatchesAsync(
@@ -259,8 +299,7 @@ DELETE TOP (@Batch) t
         deleteSql: ProtectCte + @"
 DELETE TOP (@Batch) t
   FROM ProductionInstructionPositionSnapshot t
- WHERE t.CreatedAt < @Cut
-   AND NOT EXISTS (SELECT 1 FROM Protected p WHERE p.PlanVersionId = t.PlanVersionId)",
+ WHERE NOT EXISTS (SELECT 1 FROM Protected p WHERE p.PlanVersionId = t.PlanVersionId)",
         ct: ct);
 
     private Task<long> DeleteStagingFailedAsync(CancellationToken ct) => DeleteInBatchesAsync(
@@ -284,6 +323,17 @@ DELETE TOP (@Batch)
   FROM APS_ETL_Log
  WHERE (Status IN ('INFO', 'SUCCESS', 'SKIPPED', 'PARTIAL') AND CreatedAt < @Cut)
     OR (Status IN ('WARNING', 'WARN', 'ERROR', 'FAILED')      AND CreatedAt < DATEADD(DAY, -90, @Now))",
+        ct: ct);
+
+    private Task<long> DeleteOperationProgressSnapshotAsync(CancellationToken ct) => DeleteInBatchesAsync(
+        ruleName: "D5 OperationProgressSnapshot",
+        windowDays: 0,
+        now: DateTime.Now,
+        deleteSql: ProtectRunCte + @"
+DELETE TOP (@Batch) t
+  FROM OperationProgressSnapshot t
+ WHERE t.ScheduleRunId IS NOT NULL
+   AND t.ScheduleRunId NOT IN (SELECT RunId FROM ProtectedRun)",
         ct: ct);
 
     private Task<long> DeleteComputeStageProgressAsync(CancellationToken ct) => DeleteInBatchesAsync(

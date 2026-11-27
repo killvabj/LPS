@@ -84,14 +84,14 @@ public class SchedulingOrchestrator : ISchedulingOrchestrator
     private readonly ITimedSupplyFactLoader _timedSupplyFactLoader;
     private readonly IProcurementManualEtaRepository _procurementManualEtaRepo;
     private readonly IFrozenStrategySnapshotProvider _frozenStrategySnapshotProvider;
-    // D1~D4 保留期清理：夜间 FULL 成功后独立小批维护。**不参与任何事务、失败不反推排程失败、不新增 Cron**。
-    private readonly IRetentionMaintenanceService _retentionMaintenance;
-    /// <summary>
-    /// 保留期清理开关，配置键 <c>Retention:Enabled</c>，**默认 false**。
-    /// false ⇒ 每轮只在日志里出 dry-run 测算数，一行不删；true ⇒ 才真删。
-    /// D4「受控的小批维护」的「受控」= 这一行配置，改它需人工授权，不随部署自动开。
-    /// </summary>
-    private readonly bool _retentionDeleteEnabled;
+    // ── 保留期清理：**2026-11-26 停用**（C# `RetentionMaintenanceService` 整条链路下线）──
+    //   原因：用户 2026-11-26 定 —— 保留期统一由 **SQL 侧** `sp_PvRetentionCycle` ＋ Agent 作业
+    //   `APS_PV_RETENTION_CYCLE`（每日 03:30）承担，功能重复；且本链路 `Retention:Enabled` 生产恒为
+    //   false ⇒ 历来只出 dry-run、一行未删，属**从未生效的死路径**。
+    //   保留注释形态备查，不再注入、不再调用（DI 注册亦已注释，见 `DatabaseServiceExtensions`）。
+    // private readonly IRetentionMaintenanceService _retentionMaintenance;
+    /// <summary>保留期清理开关（已停用，见上）。</summary>
+    // private readonly bool _retentionDeleteEnabled;
     private readonly ILogger<SchedulingOrchestrator> _logger;
 
     public SchedulingOrchestrator(
@@ -105,7 +105,7 @@ public class SchedulingOrchestrator : ISchedulingOrchestrator
         ITimedSupplyFactLoader timedSupplyFactLoader,
         IProcurementManualEtaRepository procurementManualEtaRepo,
         IFrozenStrategySnapshotProvider frozenStrategySnapshotProvider,
-        IRetentionMaintenanceService retentionMaintenance,
+        // IRetentionMaintenanceService retentionMaintenance,   // 2026-11-26 停用：保留期改由 sp_PvRetentionCycle 承担
         IConfiguration configuration,
         ILogger<SchedulingOrchestrator> logger)
     {
@@ -119,8 +119,8 @@ public class SchedulingOrchestrator : ISchedulingOrchestrator
         _timedSupplyFactLoader = timedSupplyFactLoader ?? throw new ArgumentNullException(nameof(timedSupplyFactLoader));
         _procurementManualEtaRepo = procurementManualEtaRepo ?? throw new ArgumentNullException(nameof(procurementManualEtaRepo));
         _frozenStrategySnapshotProvider = frozenStrategySnapshotProvider ?? throw new ArgumentNullException(nameof(frozenStrategySnapshotProvider));
-        _retentionMaintenance = retentionMaintenance ?? throw new ArgumentNullException(nameof(retentionMaintenance));
-        _retentionDeleteEnabled = configuration?.GetValue<bool>("Retention:Enabled", false) ?? false;
+        // _retentionMaintenance = retentionMaintenance ?? throw new ArgumentNullException(nameof(retentionMaintenance));
+        // _retentionDeleteEnabled = configuration?.GetValue<bool>("Retention:Enabled", false) ?? false;
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
     }
 
@@ -172,48 +172,54 @@ public class SchedulingOrchestrator : ISchedulingOrchestrator
         //   ③ 清理失败不反推正式排程失败 —— RunAsync 内部吞异常，本处返回的仍是 runResult；
         //   ④ 受控 —— Retention:Enabled 默认 false，不改配置就只出 dry-run 测算数。
         // ⚠ PARTIAL_SUCCESS / FAILED 一律不清理：失败诊断必须留（D1 保护集第②条）。
-        if (runResult.IsSuccess)
-            await RunRetentionMaintenanceAsync(cancellationToken);
+        //
+        // 2026-11-26 停用：保留期统一由 SQL 侧 `sp_PvRetentionCycle` ＋ Agent 作业承担，此处不再调用。
+        // if (runResult.IsSuccess)
+        //     await RunRetentionMaintenanceAsync(cancellationToken);
 
         return runResult;
     }
 
-    /// <summary>
-    /// 保留期清理（D1~D4）。**任何情况下都不抛出**，只写日志——
-    /// 清理是维护动作，不得影响排程结果（D4 原文「清理失败不反推正式排程失败」）。
-    /// </summary>
-    private async Task RunRetentionMaintenanceAsync(CancellationToken cancellationToken)
-    {
-        try
-        {
-            var result = await _retentionMaintenance.RunAsync(dryRun: !_retentionDeleteEnabled, cancellationToken);
-
-            if (result.Error != null)
-            {
-                _logger.LogWarning("保留期清理未完成（不影响排程）：{Error}", result.Error);
-                return;
-            }
-
-            foreach (var item in result.Items)
-            {
-                _logger.LogInformation(
-                    "保留期清理【{Rule}】{Table}：总 {Total} / 超窗 {Over} / 受保护 {Protected} / 可删 {Deletable}（{Mode}）",
-                    item.Rule, item.Table, item.TotalRows, item.OverWindowRows,
-                    item.ProtectedRows, item.DeletableRows,
-                    result.DryRun ? "dry-run 未删" : "已删除");
-            }
-
-            _logger.LogInformation(
-                "保留期清理结束：模式={Mode}, 实际删除={Deleted} 行（测算可删 {Planned} 行）。",
-                result.DryRun ? "dry-run" : "执行", result.DeletedRows, result.TotalDeletable);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "保留期清理异常（不影响排程结果）。");
-        }
-    }
-
-    /// <inheritdoc />
+    // ═══ 2026-11-26 停用：保留期改由 SQL 侧 `sp_PvRetentionCycle` ＋ Agent 作业承担 ═══
+    //   本方法原为夜间 FULL 成功后挂载的 C# 清理链路（D1~D4）。
+    //   `Retention:Enabled` 生产恒 false ⇒ 历来只出 dry-run、一行未删，属从未生效的死路径。
+    //   整段保留注释形态备查，不再调用。
+    // /// <summary>
+    // /// 保留期清理（D1~D4）。**任何情况下都不抛出**，只写日志——
+    // /// 清理是维护动作，不得影响排程结果（D4 原文「清理失败不反推正式排程失败」）。
+    // /// </summary>
+    // private async Task RunRetentionMaintenanceAsync(CancellationToken cancellationToken)
+    // {
+    //     try
+    //     {
+    //         var result = await _retentionMaintenance.RunAsync(dryRun: !_retentionDeleteEnabled, cancellationToken);
+    //
+    //         if (result.Error != null)
+    //         {
+    //             _logger.LogWarning("保留期清理未完成（不影响排程）：{Error}", result.Error);
+    //             return;
+    //         }
+    //
+    //         foreach (var item in result.Items)
+    //         {
+    //             _logger.LogInformation(
+    //                 "保留期清理【{Rule}】{Table}：总 {Total} / 超窗 {Over} / 受保护 {Protected} / 可删 {Deletable}（{Mode}）",
+    //                 item.Rule, item.Table, item.TotalRows, item.OverWindowRows,
+    //                 item.ProtectedRows, item.DeletableRows,
+    //                 result.DryRun ? "dry-run 未删" : "已删除");
+    //         }
+    //
+    //         _logger.LogInformation(
+    //             "保留期清理结束：模式={Mode}, 实际删除={Deleted} 行（测算可删 {Planned} 行）。",
+    //             result.DryRun ? "dry-run" : "执行", result.DeletedRows, result.TotalDeletable);
+    //     }
+    //     catch (Exception ex)
+    //     {
+    //         _logger.LogError(ex, "保留期清理异常（不影响排程结果）。");
+    //     }
+    // }
+    //
+    //    /// <inheritdoc />
     public async Task<SchedulingRunResult> ExecuteRunAsync(int scheduleRunId, CancellationToken cancellationToken = default)
     {
         // 【2026-09-29 P1-03】本方法体原属 RunSchedulingAutoAsync，抽出后由两个调用方共用：
@@ -1938,6 +1944,7 @@ public class SchedulingOrchestrator : ISchedulingOrchestrator
         //   供各 Domain 直接复用，消除「每 Domain 重复读同一张表」。
         //   只存原始行（现库 93 行），合成与裁剪仍由各 Domain 自己做；不改三级继承/资格/边界。
         context.UpperLevelCalendarFacts = upperCalendarRows.ToList();
+        context.UpperLevelCalendarFactsLoaded = true;   // 装载成功（即使为空也置 true，见属性注释）
 
         var calendarRows = await _connectionManager.QueryAsync<ResourceCalendarSlotLoadDto>(
             @"SELECT ResourceId, StartTime, EndTime, AvailableFlag

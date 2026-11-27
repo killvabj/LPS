@@ -31,17 +31,24 @@ public class DemandChainResolverTests
         => new() { LogicalDemandKey = key, MaterialId = material };
 
     private static DemandStageChainBinding Binding(
-        string key, string chainRefId, string status = StageChainBindingStatus.Resolved, string bindingKey = "B1")
+        string key, string chainRefId, string status = StageChainBindingStatus.Resolved,
+        string bindingKey = "B1", string scopeType = "")
         => new()
         {
             LogicalDemandKey = key,
             BindingKey = bindingKey,
             ChainRefId = chainRefId,
-            Status = status
+            Status = status,
+            StageScopeType = scopeType
         };
 
-    private static StageChainDefinition Def(string chainRefId, IReadOnlyList<StageSequenceStep> stages)
-        => new() { ChainRefId = chainRefId, ChainSignature = chainRefId, Stages = stages };
+    private static StageChainDefinition Def(
+        string chainRefId, IReadOnlyList<StageSequenceStep> stages, string scopeType = "")
+        => new()
+        {
+            ChainRefId = chainRefId, ChainSignature = chainRefId, Stages = stages,
+            StageScopeType = scopeType
+        };
 
     private static DemandChainResolver.Index Index(
         IEnumerable<StageSequenceChain>? legacy = null,
@@ -122,6 +129,113 @@ public class DemandChainResolverTests
         Assert.True(ok);
         Assert.Equal(DemandChainResolver.ChainSource.LegacyMaterial, src);
         Assert.Equal(new[] { "TA", "TB" }, stages.Select(s => s.StageCode));
+    }
+
+    [Fact]
+    public void 同Ref多绑定但Status不一致_判冲突无链_不取首条()
+    {
+        // 0号位 v1.3 §4.5：「多绑定仅比 Ref 再首条 Status」是缺口。
+        //   同一条链，一条说 RESOLVED、一条说 NO_CHAIN ⇒ 状态自相矛盾，不得取首条了事。
+        var idx = Index(
+            defs: new[] { Def("A", Steps((10, "A1"))) },
+            binds: new[]
+            {
+                Binding("D1", "A", status: StageChainBindingStatus.Resolved, bindingKey: "K1"),
+                Binding("D1", "A", status: StageChainBindingStatus.NoChain, bindingKey: "K2")
+            });
+
+        var ok = DemandChainResolver.TryResolve(idx, Demand("D1", MatA), out var stages, out var src);
+
+        Assert.False(ok);
+        Assert.Equal(DemandChainResolver.ChainSource.BindingStatusConflict, src);
+        Assert.Empty(stages);
+    }
+
+    [Fact]
+    public void 绑定角色与链定义角色不一致_判角色不匹配_不借另一角色的链()
+    {
+        // 0号位 v1.3 §4.5「错误角色不得借链」：ROOT 绑定指向 EDGE 链 ⇒ 无链。
+        var idx = Index(
+            defs: new[] { Def("A", Steps((10, "A1")), scopeType: "EDGE") },
+            binds: new[] { Binding("D1", "A", scopeType: "ROOT") });
+
+        var ok = DemandChainResolver.TryResolve(idx, Demand("D1", MatA), out var stages, out var src);
+
+        Assert.False(ok);
+        Assert.Equal(DemandChainResolver.ChainSource.BindingRoleMismatch, src);
+        Assert.Empty(stages);
+    }
+
+    [Fact]
+    public void 同ChainRefId重复定义但内容等价_去重放行不判冲突()
+    {
+        // §4.5：「仅经证实**等价**且契约允许才可追溯去重」
+        var idx = Index(
+            defs: new[]
+            {
+                Def("A", Steps((10, "A1"), (20, "A2"))),
+                Def("A", Steps((10, "A1"), (20, "A2")))
+            },
+            binds: new[] { Binding("D1", "A") });
+
+        var ok = DemandChainResolver.TryResolve(idx, Demand("D1", MatA), out var stages, out var src);
+
+        Assert.True(ok);
+        Assert.Equal(DemandChainResolver.ChainSource.Binding, src);
+        Assert.Equal(new[] { "A1", "A2" }, stages.Select(s => s.StageCode));
+    }
+
+    [Fact]
+    public void 同ChainRefId重复定义且内容不等价_判定义冲突_不任取其一()
+    {
+        var idx = Index(
+            defs: new[]
+            {
+                Def("A", Steps((10, "A1"), (20, "A2"))),
+                Def("A", Steps((10, "A1"), (20, "A9")))   // 同 Ref、不同内容
+            },
+            binds: new[] { Binding("D1", "A") });
+
+        var ok = DemandChainResolver.TryResolve(idx, Demand("D1", MatA), out _, out var src);
+
+        Assert.False(ok);
+        Assert.Equal(DemandChainResolver.ChainSource.DefinitionConflict, src);
+    }
+
+    [Fact]
+    public void 新契约在场但内容全无效_判BindingAbsent_不因漏装退回旧载体()
+    {
+        // §4.5：「新合同**不可因漏装退旧**」——
+        //   上游发了 StageChainDefinitions 但每条都缺 ChainRefId ⇒ 索引后为空，
+        //   若判据用「索引成功数」就会误判成老载荷并静默回落到物料级旧链。此处必须判为新契约在场。
+        var idx = Index(
+            legacy: new[] { new StageSequenceChain { MaterialId = MatA, Stages = Steps((10, "LEGACY")) } },
+            defs: new[] { Def(string.Empty, Steps((10, "X1"))) });
+
+        var ok = DemandChainResolver.TryResolve(idx, Demand("D1", MatA), out var stages, out var src);
+
+        Assert.False(ok);
+        Assert.Equal(DemandChainResolver.ChainSource.BindingAbsent, src);
+        Assert.Empty(stages);
+    }
+
+    [Fact]
+    public void 多父边同为PARENT_EDGE_SCOPED且同链_不得判歧义()
+    {
+        // §4.5：合法多父边不得误阻——同 Ref、不同 BindingKey、状态 PARENT_EDGE_SCOPED ⇒ 应放行。
+        var idx = Index(
+            defs: new[] { Def("A", Steps((10, "A1"))) },
+            binds: new[]
+            {
+                Binding("D1", "A", status: StageChainBindingStatus.ParentEdgeScoped, bindingKey: "K1"),
+                Binding("D1", "A", status: StageChainBindingStatus.ParentEdgeScoped, bindingKey: "K2")
+            });
+
+        var ok = DemandChainResolver.TryResolve(idx, Demand("D1", MatA), out var stages, out var src);
+
+        Assert.True(ok);
+        Assert.Equal(DemandChainResolver.ChainSource.Binding, src);
+        Assert.Single(stages);
     }
 
     [Fact]
@@ -213,5 +327,93 @@ public class DemandChainResolverTests
         Assert.False(ok);
         Assert.Empty(stages);
         Assert.Equal(DemandChainResolver.ChainSource.None, src);
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // 2026-11-25（0号位 v1.3 §4.5 剩余组合）：错误 ROOT/EDGE、悬空+多父边、部分合法/部分非法
+    // ────────────────────────────────────────────────────────────────────
+
+    [Fact]
+    public void EDGE绑定指向ROOT链_同样判角色不匹配_不借链()
+    {
+        // 上一条只测了 ROOT 绑 EDGE 链；此处是**镜像方向**，两条都必须 fail closed。
+        var idx = Index(
+            defs: new[] { Def("A", Steps((10, "A1")), scopeType: "ROOT") },
+            binds: new[] { Binding("D1", "A", scopeType: "EDGE") });
+
+        var ok = DemandChainResolver.TryResolve(idx, Demand("D1", MatA), out var stages, out var src);
+
+        Assert.False(ok);
+        Assert.Equal(DemandChainResolver.ChainSource.BindingRoleMismatch, src);
+        Assert.Empty(stages);
+    }
+
+    [Fact]
+    public void 悬空Ref被同一需求多条父边绑定_仍判悬空而非歧义()
+    {
+        // 组合：多父边（三条绑定）**且**都指向同一个不存在的 ChainRefId。
+        //   判据：Ref 一致 ⇒ 不是歧义；找不到定义 ⇒ 悬空。两个结论不能互相掩盖。
+        var idx = Index(
+            defs: new[] { Def("EXISTS", Steps((10, "X"))) },
+            binds: new[]
+            {
+                Binding("D1", "MISSING", bindingKey: "P1|EDGE"),
+                Binding("D1", "MISSING", bindingKey: "P2|EDGE"),
+                Binding("D1", "MISSING", bindingKey: "P3|EDGE")
+            });
+
+        var ok = DemandChainResolver.TryResolve(idx, Demand("D1", MatA), out var stages, out var src);
+
+        Assert.False(ok);
+        Assert.Equal(DemandChainResolver.ChainSource.BindingDangling, src);
+        Assert.Empty(stages);
+    }
+
+    [Fact]
+    public void 多父边同Ref但定义重复且不等价_判定义冲突而非歧义()
+    {
+        // 组合：Ref 一致（非歧义）＋ 定义重复不等价 ⇒ 定义冲突；不得因「多绑定」误判成歧义。
+        var idx = Index(
+            defs: new[]
+            {
+                Def("A", Steps((10, "A1"), (20, "A2"))),
+                Def("A", Steps((10, "A1"), (20, "A9")))
+            },
+            binds: new[]
+            {
+                Binding("D1", "A", bindingKey: "P1|EDGE"),
+                Binding("D1", "A", bindingKey: "P2|EDGE")
+            });
+
+        var ok = DemandChainResolver.TryResolve(idx, Demand("D1", MatA), out _, out var src);
+
+        Assert.False(ok);
+        Assert.Equal(DemandChainResolver.ChainSource.DefinitionConflict, src);
+    }
+
+    [Fact]
+    public void 部分需求合法部分悬空_同请求内互不污染()
+    {
+        // 边界：同一份索引里 D1 绑到存在的链、D2 绑到不存在的链。
+        //   D1 必须照常取到链（不能因同批有坏绑定而整体降级），D2 必须悬空且**不回落旧载体**。
+        var idx = Index(
+            legacy: new[] { new StageSequenceChain { MaterialId = MatA, Stages = Steps((10, "LEGACY")) } },
+            defs: new[] { Def("OK", Steps((10, "S1"), (20, "S2"))) },
+            binds: new[]
+            {
+                Binding("D1", "OK"),
+                Binding("D2", "MISSING")
+            });
+
+        var ok1 = DemandChainResolver.TryResolve(idx, Demand("D1", MatA), out var s1, out var src1);
+        var ok2 = DemandChainResolver.TryResolve(idx, Demand("D2", MatA), out var s2, out var src2);
+
+        Assert.True(ok1);
+        Assert.Equal(DemandChainResolver.ChainSource.Binding, src1);
+        Assert.Equal(new[] { "S1", "S2" }, s1.Select(s => s.StageCode));
+
+        Assert.False(ok2);
+        Assert.Equal(DemandChainResolver.ChainSource.BindingDangling, src2);
+        Assert.Empty(s2);   // 不回落同物料的 LEGACY
     }
 }

@@ -155,7 +155,7 @@ internal class PhaseTwoInitialScheduler
     ///   · `constraints` 的候选内可写成员**只有两个**：`ProductTimeline`（逐候选 `realTimeline.Clone()`）
     ///     与 `TraceNotes`（追加）⇒ 由 `ShallowCloneForTrial()` 逐候选各给一份，父对象全程不被候选触碰。
     ///   · `batchGroupsIndex` 在候选循环**外**建好、循环内**只读**（`FindMergeableStageBatches` 对它无写入）。
-    ///   · 两个热路径缓存（`_calendarAscendingCache` / `_phase2BlockedDetails`）已换 `ConcurrentDictionary`；
+    ///   · 两个热路径缓存（`_calendarAscendingCache` / `ConstraintContext.Phase2BlockedDetails`）已换 `ConcurrentDictionary`；
     ///     `SolverDiagnostics` 的 44 个计数器与 68 个热点槽已换 `Interlocked`。
     ///
     /// 【为什么必须关掉内层并行】`MergeFindTasks` 自带 16 路分段扫。若候选并行时仍 16 路，
@@ -223,29 +223,28 @@ internal class PhaseTwoInitialScheduler
     ///   出口只能落到 Phase5 的泛化 `Phase 2 初始排程失败，Phase 4 修复未成功`，
     ///   「0 次」到底是「物料不足」「无合格资源」还是「压根没有工序」**分不出来**，而这三者指向完全相反的方向。
     ///
-    /// 【本表的语义】需求键 → **最后一次尝试**的自报出口正文（后写覆盖）。
-    ///   · 同一需求在一次 `Schedule` 里会被多次尝试（Routing 候选 / 批方案候选 / 倒排失败转正排）
-    ///     ⇒ **只保留最后一次**：不承诺「首次失败原因」，只回答「它最后是怎么退出来的」。
+    /// 【本表的位置】2026-11-26 起**迁到 `ConstraintContext.Phase2BlockedDetails`**（候选试排各自一份）。
+    ///   原先是本调度器的实例字段、只按需求键、**不分候选方案**；当时的注释以为
+    ///   「同一需求各候选失败原因本就同源」——**实测证伪**：
+    ///   `999634_191332` 的 2 批方案（批001 = 1400 件）与 3 批方案（批001 = 934 件）的 M102 工时
+    ///   差 1.5 倍（5490.10 vs 3662.68 分钟），后写候选把内层明细覆盖成了**另一方案**的数，
+    ///   最终报文出现「2 批的批数 + 3 批的工时」。0号位 据此要求核查「系数/投入/公式」，
+    ///   查实结论是**诊断串方案**，不是排程算错。
+    ///
+    /// 【现在的语义】需求键 → **胜出候选**的自报出口正文；候选试排各写自己那份，只补回胜者。
     ///   · **纯诊断**：只用于 Phase5 出口的 `SolveTraceNote.Message`（人可读正文），
     ///     **不改任何 `Reason`、不改任何归属、不改 Success、不改任务集合**。
     /// </summary>
-    /// <remarks>
-    /// 2026-10-27 四十三刀：`Dictionary` ⇒ `ConcurrentDictionary`。本表在 `ScheduleForward` / `ScheduleDemandOperations`
-    /// 里**边试排边写**，候选并行后属多线程写 ⇒ 必须并发安全。
-    /// 唯一的语义差异：并行时候选之间的「后写覆盖」次序不再确定 —— 本表**纯诊断**（`result.Phase2BlockedDetails`），
-    /// 同一需求各候选失败原因本就同源，故不影响任何判定与归属。
-    /// </remarks>
-    private readonly ConcurrentDictionary<string, string> _phase2BlockedDetails = new(StringComparer.Ordinal);
 
     /// <summary>
     /// **候选 Path 因 Routing 环被剔除时的去重键**（2026-11-02）。
     ///   键 = `需求键|RouteCode|PathId`；同一 (需求, 路径) 只写一条 `SolveTraceNote`，避免多轮尝试重复堆行。
-    ///   并发安全口径与 <see cref="_phase2BlockedDetails"/> 一致（候选并行下写入方可能在不同线程）。
+    ///   并发安全口径与 <see cref="ConstraintContext.Phase2BlockedDetails"/> 一致（候选并行下写入方可能在不同线程）。
     /// </summary>
     private readonly ConcurrentDictionary<string, byte> _routingCycleTraceKeys = new(StringComparer.Ordinal);
 
     /// <summary>
-    /// 登记一条需求在 Phase2 的自报出口正文（**纯诊断**，见 <see cref="_phase2BlockedDetails"/>）。
+    /// 登记一条需求在 Phase2 的自报出口正文（**纯诊断**，见 <see cref="ConstraintContext.Phase2BlockedDetails"/>）。
     ///   后写覆盖 —— 同一需求多次尝试只保留最后一次。
     /// </summary>
     /// <summary>
@@ -321,6 +320,7 @@ internal class PhaseTwoInitialScheduler
         }
 
         var cu = request.PlanningStart;
+        int? lastFactory = null;   // 2026-11-27：LT-only 段继承上一段已认证厂（见 TryAdvanceByWorkHours）
         var ltFacts = request.StageLeadTimes
             .Where(f => f.MaterialId == demand.MaterialId)
             .ToDictionary(f => f.StageCode, f => f, StringComparer.Ordinal);
@@ -332,9 +332,9 @@ internal class PhaseTwoInitialScheduler
                      + "⇒ 按冻结记 `STAGE_LEADTIME_MISSING`，本需求局部未排］";
             }
 
-            if (!StageTimingNodeBuilder.TryAdvanceByWorkHours(
+            if (!StageTimingNodeBuilder.TryAdvanceByWorkHoursWithFactory(
                     request, demand, step.StageCode, cu, lt.LeadTimeHours, out var cuEnd, out var workReason,
-                    lt.IsLeadTimeOnly))
+                    out var usedFactory, lt.IsLeadTimeOnly, inheritedFactoryId: lastFactory))
             {
                 return $"［分因：无Routing Stage `{step.StageCode}` **无合法 WORK 窗口**"
                      + (string.IsNullOrWhiteSpace(workReason) ? string.Empty : $"（{workReason}）")
@@ -342,6 +342,7 @@ internal class PhaseTwoInitialScheduler
             }
 
             cu = cuEnd;
+            lastFactory = usedFactory;
         }
 
         // 走到这里说明各门禁都过 —— 理论不可达（调用点只在 `IsRoutelessTimingOnly` 返回 false 时进入）。
@@ -419,6 +420,7 @@ internal class PhaseTwoInitialScheduler
         //    禁止假 Task/假时间」）。此处用与 Phase5 **同一函数** `TryAdvanceByWorkHours` 预演，
         //    保证"放行"与"真的能产出 StageTiming 段"是同一条判据 —— 否则会出现"既未排、也无时间"的静默丢失。
         var cu = request.PlanningStart;
+        int? lastFactory = null;   // 2026-11-27：LT-only 段继承上一段已认证厂（见 TryAdvanceByWorkHours）
         var ltFacts = request.StageLeadTimes
             .Where(f => f.MaterialId == demand.MaterialId)
             .ToDictionary(f => f.StageCode, f => f, StringComparer.Ordinal);
@@ -430,23 +432,29 @@ internal class PhaseTwoInitialScheduler
                 return false;
             }
 
-            if (!StageTimingNodeBuilder.TryAdvanceByWorkHours(
-                    request, demand, step.StageCode, cu, lt.LeadTimeHours, out var cuEnd, out _, lt.IsLeadTimeOnly))
+            if (!StageTimingNodeBuilder.TryAdvanceByWorkHoursWithFactory(
+                    request, demand, step.StageCode, cu, lt.LeadTimeHours, out var cuEnd, out _,
+                    out var usedFactory, lt.IsLeadTimeOnly, inheritedFactoryId: lastFactory))
             {
                 // WORK 窗口不足 / 无部门上下文 / 无日历 ⇒ 本需求仍按未排（不假设 7×24、不假造时间）
                 return false;
             }
 
             cu = cuEnd;
+            lastFactory = usedFactory;
         }
 
         return true;
     }
 
-    private void RecordPhase2Block(string? demandKey, string text)
+    private static void RecordPhase2Block(ConstraintContext constraints, string? demandKey, string text)
     {
         if (string.IsNullOrEmpty(demandKey)) return;
-        _phase2BlockedDetails[demandKey!] = text;
+        // 2026-11-26：改写到**上下文里**的那一份（候选试排各一份）。
+        //   原实现写「调度器实例字段」、只按 demandKey 键、**不分候选方案** ⇒ 后写候选覆盖先写候选，
+        //   最终报文会把「选中方案的批数」和「另一候选方案的工时」拼一起
+        //   （999634_191332 实测：2 批的批数 + 3 批候选的 3662.68 分钟，与 2 批的 5490.10 差 1.5 倍）。
+        constraints.Phase2BlockedDetails[demandKey!] = text;
     }
 
     /// <summary>
@@ -637,8 +645,8 @@ internal class PhaseTwoInitialScheduler
         var result = new InitialScheduleResult();
 
         // 2026-10-25：未排原因自报的**本轮快照起点** —— Phase4 Fallback 会重跑本方法，
-        //   上一轮的登记不得漏进这一轮（见 `_phase2BlockedDetails`）。
-        _phase2BlockedDetails.Clear();
+        //   上一轮的登记不得漏进这一轮（见 `ConstraintContext.Phase2BlockedDetails`）。
+        constraints.Phase2BlockedDetails.Clear();
 
         // 2026-10-19 四次定位：Phase2「循环外准备段」计时（槽 `SchedulePreamble`）。
         //   `BatchPlanTrial` 之外那 31%（16k 档 74,612 ms）必须拆开 —— 本槽量循环外，`LandingRun` 量循环内最大嫌疑。
@@ -709,7 +717,7 @@ internal class PhaseTwoInitialScheduler
             foreach (var cycleKey in constraints.CrossMaterialCycleKeys)
             {
                 result.UnscheduledDemandKeys.Add(cycleKey);
-                RecordPhase2Block(cycleKey,
+                RecordPhase2Block(constraints, cycleKey,
                     "Phase2 出口=P2_CROSS_MATERIAL_CYCLE：该需求处在跨物料依赖环上（子件→父件成环），"
                     + "本需求不排；环外需求照常排程。属技术性原因，非业务短缺，不写入 15 码业务原因。");
             }
@@ -1019,6 +1027,11 @@ internal class PhaseTwoInitialScheduler
 
         // 跨物料时序（块3/块4）：记录每个已排需求的最晚完成时间，供父件取子件完成时间作为动态物料下界。
         var demandCompletion = new Dictionary<string, DateTime>();
+        // 2026-11-26（0号位 v1.8 §2.1）：该需求**已合法落定的净产出总量**（供父件做数量门禁）。
+        //   · 全部批落定 ⇒ 需求自身 `NetOutputQty`；
+        //   · 部分落定（有 Task 但后续批失败）⇒ **已落定批的 NetOutputQty 之和**（不是全部 Q）。
+        //   父件只有在「时间可得 且 该子件落定量 ≥ 本边需求量」时才允许排；否则保留真实未满足量。
+        var demandLandedNet = new Dictionary<string, decimal>(StringComparer.Ordinal);
 
         // 2026-10-19 四次定位：准备段到此收口（槽 `SchedulePreamble`）。
         SolverDiagnostics.HotspotEnd(swPreamble, SolverDiagnostics.Hotspot.SchedulePreamble);
@@ -1261,7 +1274,7 @@ internal class PhaseTwoInitialScheduler
                     // 与 Phase2 其它 Fail Closed 点同口径（:129/:203/:314/:325/:364…）：**只记 UnscheduledDemandKeys、
                     // 不产 Task、不写 TraceNotes**（TraceNotes 会经 SolveTraceNote 落库给 2号位，不得自造码）。
                     result.UnscheduledDemandKeys.Add(actualDemand.LogicalDemandKey);
-                    RecordPhase2Block(actualDemand.LogicalDemandKey,
+                    RecordPhase2Block(constraints, actualDemand.LogicalDemandKey,
                         $"Phase2 出口=P2_CONTINUATION_INPUT_INCOMPLETE：`IsContinuation=true` 但缺 "
                         + $"{string.Join("/", missing)}（A/B 连续份额输入完整性 Fail Closed）"
                         + " ⇒ 不产计划，未进入任何资源/槽位检索。");
@@ -1292,7 +1305,7 @@ internal class PhaseTwoInitialScheduler
                 }
 
                 result.UnscheduledDemandKeys.Add(actualDemand.LogicalDemandKey);
-                RecordPhase2Block(actualDemand.LogicalDemandKey,
+                RecordPhase2Block(constraints, actualDemand.LogicalDemandKey,
                     $"Phase2 出口=P2_NO_ROUTING：物料 {actualDemand.MaterialId} 在本次输入里**一条 Routing 图都没有**"
                     + "（`ConstraintContext.TryGetRoutingGraphs` 未命中）⇒ 不产计划，未进入任何资源/槽位检索。"
                     // 2026-11-02（纯观测）：分清「输入里没有」与「有行但图没建出来」——前者归上游装载，
@@ -1317,7 +1330,7 @@ internal class PhaseTwoInitialScheduler
                 {
                     // Fail Closed：需求声明了固定路径但图缺失 ⇒ 不排（不猜、不跨 Path 找替代节点）
                     result.UnscheduledDemandKeys.Add(actualDemand.LogicalDemandKey);
-                    RecordPhase2Block(actualDemand.LogicalDemandKey,
+                    RecordPhase2Block(constraints, actualDemand.LogicalDemandKey,
                         $"Phase2 出口=P2_FIXED_PATH_MISSING：需求声明了固定路径 "
                         + $"RouteCode='{actualDemand.RouteCode}' PathId={actualDemand.PathId?.ToString() ?? "null"}，"
                         + $"但物料 {actualDemand.MaterialId} 的图里**没有这条路径**（不猜、不跨 Path 找替代节点）"
@@ -1332,7 +1345,7 @@ internal class PhaseTwoInitialScheduler
                 if (fixedGraph.IsOperationPlanningModeInvalid)
                 {
                     result.UnscheduledDemandKeys.Add(actualDemand.LogicalDemandKey);
-                    RecordPhase2Block(actualDemand.LogicalDemandKey,
+                    RecordPhase2Block(constraints, actualDemand.LogicalDemandKey,
                         $"Phase2 出口=P2_FIXED_PATH_MODE_INVALID：需求固定的路径 "
                         + $"RouteCode='{actualDemand.RouteCode}' PathId={actualDemand.PathId?.ToString() ?? "null"} "
                         + "因 `OperationPlanningMode` 越域被整条排除（详见 Phase1 的 Error 级输入契约 Issue）"
@@ -1393,13 +1406,13 @@ internal class PhaseTwoInitialScheduler
                     //     `plannedCandidates.All(p => p.Ops.Count == 0)` 走**既有未排语义**）。
                     result.TechnicalFailure = true;
                     result.TechnicalFailureReason ??= $"Routing图非法或存在环：MaterialId={actualDemand.MaterialId}, Route={pathKey}";
-                    RecordPhase2Block(actualDemand.LogicalDemandKey,
+                    RecordPhase2Block(constraints, actualDemand.LogicalDemandKey,
                         $"Phase2 出口=P2_ROUTING_CYCLE：MaterialId={actualDemand.MaterialId} RouteCode='{pathKey.RouteCode}' "
                         + $"PathId={pathKey.PathId} 的 Routing 图存在环（拓扑序未覆盖全部工序）⇒ **该候选 Path** 不产计划；"
                         + "其余候选 Path 与其余需求照常求解（2026-10-27：改前此处 `return` 会中止整个 Phase2）。");
 
-                    // ── 2026-11-02：被剔掉的候选 Path **必须逐需求留痕**（不能只进 `_phase2BlockedDetails`）──
-                    //   【缺口】`RecordPhase2Block` 只写 `_phase2BlockedDetails`，而那份登记**只有 Phase5 对
+                    // ── 2026-11-02：被剔掉的候选 Path **必须逐需求留痕**（不能只进 `ConstraintContext.Phase2BlockedDetails`）──
+                    //   【缺口】`RecordPhase2Block` 只写 `ConstraintContext.Phase2BlockedDetails`，而那份登记**只有 Phase5 对
                     //     「未排需求」才读**（`PhaseFiveCompression.cs:315`）⇒ 一条需求若靠**另一条合法候选 Path
                     //     排上了**，它这条被剔的 Path 在出口上**一个字都没有**：既不产 `SolveTraceNote`，
                     //     也不产 `ExplanationFact`。N24「失败粒度」里「需求级不可规划却看不出是哪条路径」即由此而来。
@@ -1437,7 +1450,7 @@ internal class PhaseTwoInitialScheduler
             {
                 // S26：全部候选的 StartStage/StartOperation 均非法 ⇒ 业务 Unscheduled（非技术失败，不静默回退）
                 result.UnscheduledDemandKeys.Add(actualDemand.LogicalDemandKey);
-                RecordPhase2Block(actualDemand.LogicalDemandKey,
+                RecordPhase2Block(constraints, actualDemand.LogicalDemandKey,
                     $"Phase2 出口=P2_NO_OPERATIONS：物料 {actualDemand.MaterialId} 的 "
                     + $"{plannedCandidates.Count} 条候选路径**全部**裁出空工序列表"
                     + $"（StartStageCode='{actualDemand.StartStageCode}' "
@@ -1449,9 +1462,11 @@ internal class PhaseTwoInitialScheduler
             // 块3/块4（任务喂任务，方案A）：子件完成时间 → 父件动态物料下界。
             // 拓扑序保证排父件时子件已排过；子件未成功排程则父件缺料 → Unscheduled。
             var missingChildren = new List<string>();
+            var missingByQuantity = new List<string>();
             var dynamicMaterialFloor = GetDynamicMaterialFloor(
                 demand.LogicalDemandKey, constraints, demandCompletion, out bool childUnavailable, missingChildren,
-                leadTimeOnlyCompletion);
+                leadTimeOnlyCompletion, demandLandedNet: demandLandedNet, missingByQuantity: missingByQuantity,
+                parentNetOutputQty: demand.NetOutputQty);
 
             if (childUnavailable)
             {
@@ -1469,6 +1484,12 @@ internal class PhaseTwoInitialScheduler
                 // 2026-11-04（纯观测）：把「已失败」的子件**按它自己的出口成因分档** —— 此前只知数量、
                 //   不知成因，导致 5,514 片连坐里除缺部门外那三千多条查不出来源。
                 var failedByCause = new Dictionary<string, int>(StringComparer.Ordinal);
+                // ── 2026-11-25（0号位 v1.3 §2.2 级联追源所需）：**逐子件明细** ──
+                //   原先只给各类计数 + 2 个样本 ⇒ 无法从结果侧还原「父件到底在等哪个子件、为什么」，
+                //   级联只能靠 `ledger.parentDemandKeys` 反推，而该载体与 Phase2 实际使用的父子关系**不一致**
+                //   （实测 `999634_162080`：Phase2 说 2 个子件、links 有 31 条、parentDemandKeys 亦不符）。
+                //   ⇒ 此处把**每个缺失子件的键与其归类**逐条写进报文，使追源可直接从结果完成。
+                var childCauseList = new List<string>(Math.Min(missingChildren.Count, 24));
                 foreach (var childKey in missingChildren)
                 {
                     if (unschedSoFar.Contains(childKey))
@@ -1477,7 +1498,7 @@ internal class PhaseTwoInitialScheduler
 
                         // ⚠ 顺序必须与 Phase5 的**判定优先级**一致：缺部门 > StageSeq > 日历 > Phase2 出口码。
                         //   原因：缺部门的需求被 Phase1 剔除全部工序行 ⇒ Phase2 看到「零工序」⇒
-                        //   其 `_phase2BlockedDetails` 留下的是 `P2_NO_ROUTING`；若先读它，
+                        //   其 `ConstraintContext.Phase2BlockedDetails` 留下的是 `P2_NO_ROUTING`；若先读它，
                         //   缺部门会被误记成无工艺（2026-11-04 第十七轮首版即犯此错）。
                         var cause = "(其它)";
                         var childDemand = demandByKey.GetValueOrDefault(childKey!);
@@ -1486,7 +1507,7 @@ internal class PhaseTwoInitialScheduler
                         {
                             cause = "缺部门";
                         }
-                        else if (_phase2BlockedDetails.TryGetValue(childKey!, out var childDetail)
+                        else if (constraints.Phase2BlockedDetails.TryGetValue(childKey!, out var childDetail)
                                  && !string.IsNullOrEmpty(childDetail))
                         {
                             var m = System.Text.RegularExpressions.Regex.Match(childDetail, @"P2_[A-Z_]+");
@@ -1494,6 +1515,10 @@ internal class PhaseTwoInitialScheduler
                         }
 
                         failedByCause[cause] = failedByCause.GetValueOrDefault(cause) + 1;
+                        if (childCauseList.Count < 24)
+                        {
+                            childCauseList.Add($"{childKey}=已失败/{cause}/完成表={(demandCompletion.ContainsKey(childKey) ? "有" : "无")}");
+                        }
                     }
                     else if (demandByKey.ContainsKey(childKey))
                     {
@@ -1503,25 +1528,28 @@ internal class PhaseTwoInitialScheduler
                         {
                             childReleased++;
                             if (releasedSample.Count < 2) releasedSample.Add(childKey);
+                            if (childCauseList.Count < 24) childCauseList.Add($"{childKey}=已放行无Task/完成表={(demandCompletion.ContainsKey(childKey) ? "有" : "无")}");
                         }
                         else
                         {
                             childNotYet++;
                             if (notYetSample.Count < 2) notYetSample.Add(childKey);
+                            if (childCauseList.Count < 24) childCauseList.Add($"{childKey}=未轮到/完成表={(demandCompletion.ContainsKey(childKey) ? "有" : "无")}");
                         }
                     }
                     else
                     {
                         childDangling++;
                         if (danglingSample.Count < 2) danglingSample.Add(childKey);
+                        if (childCauseList.Count < 24) childCauseList.Add($"{childKey}=悬空键");
                     }
                 }
 
                 result.UnscheduledDemandKeys.Add(demand.LogicalDemandKey);
-                RecordPhase2Block(demand.LogicalDemandKey,
+                RecordPhase2Block(constraints, demand.LogicalDemandKey,
                     $"Phase2 出口=P2_CHILD_UNAVAILABLE：跨物料子件未排成功 ⇒ 父件拿不到动态物料下界"
                     + $"（物料 {demand.MaterialId}）⇒ 不产计划，未进入任何资源/槽位检索。"
-                    + $"［缺子件 {missingChildren.Count}"
+                    + $"［评估序 {(processedDemandKeys.Count)}；缺子件 {missingChildren.Count}"
                     + $"/{(constraints.CrossMaterialParentToChildren.TryGetValue(demand.LogicalDemandKey, out var allKids) ? allKids.Count : missingChildren.Count)}："
                     + $"已失败 {childFailed}｜未轮到 {childNotYet}"
                     + $"{(notYetSample.Count > 0 ? "（例 " + string.Join(",", notYetSample) + "）" : string.Empty)}"
@@ -1529,11 +1557,21 @@ internal class PhaseTwoInitialScheduler
                     + $"{(releasedSample.Count > 0 ? "（例 " + string.Join(",", releasedSample) + "）" : string.Empty)}"
                     + $"｜悬空键 {childDangling}"
                     + $"{(danglingSample.Count > 0 ? "（例 " + string.Join(",", danglingSample) + "）" : string.Empty)}"
+                    + (missingByQuantity.Count > 0
+                        ? $"｜**量不足 {missingByQuantity.Count}**（例 " + string.Join(",", missingByQuantity.Take(3)) + "）"
+                        : string.Empty)
                     // 2026-11-04（纯观测）：已失败子件按**自身成因**再分档，供定位连坐链源头
                     + (failedByCause.Count > 0
                         ? "｜已失败成因：" + string.Join("、", failedByCause
                             .OrderByDescending(kv => kv.Value)
                             .Select(kv => $"{kv.Key}={kv.Value}"))
+                        : string.Empty)
+                    // 逐子件明细（v1.3 §2.2 级联追源）：`子件键=归类` 逗号分隔；超 24 条截断并标注总数
+                    + (childCauseList.Count > 0
+                        ? "｜逐子件：" + string.Join(",", childCauseList)
+                          + (missingChildren.Count > childCauseList.Count
+                              ? $",…(共 {missingChildren.Count} 个缺失子件，已列前 {childCauseList.Count})"
+                              : string.Empty)
                         : string.Empty)
                     + "］");
                 continue;
@@ -1735,6 +1773,16 @@ internal class PhaseTwoInitialScheduler
                         + $"（= min(PI Original / PI Remaining / Stage 合法自由 − 同PI同Stage已占)，"
                         + $"PI={actualDemand.ProductionInstructionNo} × 物料 {actualDemand.MaterialId}"
                         + $" × Stage {actualDemand.StartStageCode}）"
+                        // 2026-11-26（M04 证据未足）：把三项**逐项**写出来并点名最紧项 ——
+                        //   旧报文只给 min 结果，无法区分「PI 真没量」与「Stage 自由量被他处占用」。
+                        + (DescribePiLegalCapComponents(
+                               actualDemand.ProductionInstructionNo,
+                               actualDemand.MaterialId,
+                               actualDemand.FactoryId,
+                               request.PiRemainingFacts,
+                               piStageContextForCap) is string capParts
+                            ? "；" + capParts
+                            : "；三项分解取不到（PI 权威行 0 行或多行 / 无 Stage 上下文）")
                         + $" ⇒ 按合法整数可排量 {piCap.Value} 排产，原始需求剩余 {unscheduledRaw} 记**正常业务未排**"
                         + "（非技术 ERROR、不伪造虚拟 Task、不得突破法定上限）";
 
@@ -1780,7 +1828,13 @@ internal class PhaseTwoInitialScheduler
                 //   ⇒ 原因文本自带 `B010_PI_QUANTITY_CONTRACT_PENDING`（与笼统「无策略」可区分）。
                 //   出口码仍为 `BATCH_POLICY_MISSING`：ReasonCode 值域是**冻结封闭集**（`PhaseThreeDiagnostics`
                 //   权威 15 码），1号位 **不新增码**；契约待核信息走原因文本 / 报告，不改冻结值域。
-                if (formation.IsMissingPolicy)
+                if (formation.IsPiContractPending)
+                {
+                    // 2026-11-27（0号位 §二·02）：PI 合法量未知 ⇒ **单列**，不得计入「策略缺配」。
+                    result.BatchPolicyPiContractPendingDemandKeys.Add(
+                        $"[{demand.LogicalDemandKey}] {formation.ConflictReason}");
+                }
+                else if (formation.IsMissingPolicy)
                 {
                     result.BatchPolicyMissingDemandKeys.Add($"[{demand.LogicalDemandKey}] {formation.ConflictReason}");
                 }
@@ -2047,6 +2101,16 @@ internal class PhaseTwoInitialScheduler
                 constraints.TraceNotes.AddRange(pickedBatchPlan.Notes);
                 SolverDiagnostics.HotspotEnd(swTraceRefill, SolverDiagnostics.Hotspot.LandingTraceRefill);
 
+                // ── 2026-11-26：**胜者的 Phase2 自报出口正文**补回父上下文 ──
+                //   候选试排各自写自己那份 `ConstraintContext.Phase2BlockedDetails`（克隆出来的），
+                //   父上下文全程不被候选触碰 ⇒ 不补回的话**诊断会整体消失**（比串方案更糟）。
+                //   只回填**本需求这一条**（而不是整表遍历）：该表按需求键隔离，
+                //   本需求只会有自己那一条，避免每需求一次 O(全局大小) 的整表拷贝。
+                if (pickedBatchPlan.BlockedDetail is string winnerDetail)
+                {
+                    constraints.Phase2BlockedDetails[demand.LogicalDemandKey] = winnerDetail;
+                }
+
                 // 选路登记：试跑写进的是**一次性副本**（不污染真表）⇒ 胜者那份补回真表。
                 //   副本在候选试跑前是真实表的逐字拷贝、循环内真实表不被改写 ⇒ 整表回填 = 回填增量。
                 // B-01：这两张选路登记表若为跨需求全量，则每需求一次遍历 = O(全局大小)
@@ -2114,8 +2178,8 @@ internal class PhaseTwoInitialScheduler
                 //   本需求在批试排期间可能已由 ScheduleBackward/ScheduleForward 登记过具体出口
                 //   （物料不足 / 无合格资源 / 无可用时间槽 / 空工序），此处把它接在本条之后；
                 //   没有则说明批在进工序循环之前就被否（路径/批策略层）。
-                _phase2BlockedDetails.TryGetValue(demand.LogicalDemandKey, out var batchInnerBlock);
-                RecordPhase2Block(demand.LogicalDemandKey,
+                constraints.Phase2BlockedDetails.TryGetValue(demand.LogicalDemandKey, out var batchInnerBlock);
+                RecordPhase2Block(constraints, demand.LogicalDemandKey,
                     $"Phase2 出口=P2_BATCH_NOT_LANDED：批方案共 {batches.Count} 个，"
                     + $"第 {(outcome.FailedBatchIndex + 1)} 个执行批未落定（其后各批按 §六 不再尝试）"
                     + (string.IsNullOrEmpty(batchInnerBlock) ? "；批内工序级出口=未登记（批在进入工序循环之前被否）" : "；批内工序级出口=" + batchInnerBlock));
@@ -2163,6 +2227,35 @@ internal class PhaseTwoInitialScheduler
                 {
                     piStageLedger.RollbackTo(ledgerMark);
                 }
+                else
+                {
+                    // ── 2026-11-26（0号位 v1.8 §2.1 本地化）：**部分落定也必须按真实状态登记** ──
+                    //   已落定的前序批产出了**真实 Task** ⇒ 它们的完工时间就是这批份额最早可用时刻，
+                    //   不登记会让父件读到「完成表=无」⇒ 误判缺料 ⇒ 父件永久未排且无人重评。
+                    //   ⚠ 只登记**真实落定**部分：落定量 = 已落定批的 `NetOutputQty` 之和，
+                    //      **不拿需求全部 Q 冒充**（防「假齐套」）；父件侧再用数量门禁判是否够。
+                    var partialEnd = demandTasksAll.Max(t => t.PlannedEndTime);
+                    if (!demandCompletion.TryGetValue(demand.LogicalDemandKey, out var existed)
+                        || partialEnd > existed)
+                    {
+                        demandCompletion[demand.LogicalDemandKey] = partialEnd;
+                    }
+
+                    decimal landed = 0m;
+                    for (int i = 0; i < outcome.FailedBatchIndex && i < batches.Count; i++)
+                    {
+                        landed += batches[i].NetOutputQty;
+                    }
+
+                    demandLandedNet[demand.LogicalDemandKey] = landed;
+
+                    ApplyMergedTargets(constraints, demandCompletion, outcome.MergedTargets);
+                    RegisterDemandEarliestStart(
+                        constraints, demand.LogicalDemandKey, demandTasksAll.Min(t => t.PlannedStartTime));
+                    TraceCrossMaterialFloor(
+                        "P2_PARTIAL", demand.LogicalDemandKey, partialEnd,
+                        $"tasks={demandTasksAll.Count};batchFailed=1;landedNet={landed}");
+                }
 
                 continue;
             }
@@ -2181,6 +2274,36 @@ internal class PhaseTwoInitialScheduler
                     demandCompletion[demand.LogicalDemandKey] = ownEnd;
                     TraceCrossMaterialFloor("P2_DONE", demand.LogicalDemandKey, ownEnd, "tasks=0;merged=1");
                 }
+                else
+                {
+                    // ── 2026-11-26（0号位《未排案例第二批》§9「无 Task / 无 Timing / 无未排」）──
+                    //   走到这里 ⇒ 本需求**既没产出 Task、也没有 Merge 落定**（`MergedTargets` 为空）
+                    //   ⇒ 它在账上既不算「排上」也不算「未排」，只留一条
+                    //   `DEMAND_COMPLETION_TIME_UNAVAILABLE` 的泛化注记，**无法归因**。
+                    //   实测 FRL **246 条**正是此形态（例：`999634_19165`，物料 365836，净量 1，
+                    //     `taskCnt=0 / uQty=0 / stageTimingCount=0 / 无未排码`，而同物料同净量的
+                    //     兄弟需求 19141 / 46034 都排上了）。
+                    //
+                    //   处置（0号位 §4.2「打印它实际走的分支标记」）：
+                    //     ① 决策说明层留痕（**不是**新 ReasonCode —— 冻结 15 码不动，本码只进 trace）；
+                    //     ② 计数留痕（`P2_ZERO_TASK_NO_REASON`）。
+                    //   ⚠ **不改判定语义**：本条仍按现状 `continue`、**不**加入 `UnscheduledDemandKeys`
+                    //     —— 因为「批全部 Merge 但目标表为空」在语义上等价于「批形成成功、落定目标丢失」，
+                    //     是否算未排需 0号位 裁；此处先让它**可被看见、可被计数**，不擅自改账。
+                    SolverDiagnostics.CountPhase2ZeroTaskNoReason();
+                    constraints.TraceNotes.Add(new SolveTraceNote
+                    {
+                        Key = demand.LogicalDemandKey ?? string.Empty,
+                        ReasonCode = "P2_ZERO_TASK_NO_REASON",
+                        Level = "Warning",
+                        Message = "Phase2 出口=零 Task 且无未排登记（**归因缺口**）：本需求所有执行批"
+                                  + $"（batches={batches.Count}）均未产出新 Task，且 `MergedTargets` 为空"
+                                  + "（没有并入任何既有 Task）⇒ 在账上既不算「已排」也不算「未排」。"
+                                  + $"批键={string.Join("/", batches.Select(b => b.BatchDraftKey))}；"
+                                  + $"净量={demand.NetOutputQty}；StartStageCode={demand.StartStageCode ?? "(null)"}。"
+                                  + "本码只作决策说明层留痕，**不是**正式 ReasonCode（冻结 15 码未扩展）。"
+                    });
+                }
                 continue;
             }
 
@@ -2191,6 +2314,7 @@ internal class PhaseTwoInitialScheduler
             // 块3/块4：登记本需求完成时间（所有批所有工序 Task 的最晚 End），供父件取动态物料下界。
             var demandCompletionTime = demandTasksAll.Max(t => t.PlannedEndTime);
             demandCompletion[demand.LogicalDemandKey] = demandCompletionTime;
+            demandLandedNet[demand.LogicalDemandKey] = demand.NetOutputQty;
 
             // 2026-10-28：登记「已排起点」—— 合批守卫据此判断父件是否**已经被排过**及其起点。
             RegisterDemandEarliestStart(
@@ -2212,11 +2336,13 @@ internal class PhaseTwoInitialScheduler
 
         // P0-04修复：把 Merge M:N 份额追溯返回给 Phase5，避免合批份额血缘丢失
         result.AllocationTaskShare = allocationTaskShare;
+        // 2026-11-26（0号位 v1.8 §2.1）：把落定量交给 Phase4，供父件重评用同一数量门禁。
+        result.DemandLandedNet = new Dictionary<string, decimal>(demandLandedNet, StringComparer.Ordinal);
 
         // 2026-10-25 未排原因自报：把本次 Run 登记的逐需求出口正文交给 Phase5（**只用于 TraceNote 正文**）。
         //   纯诊断 —— Phase5 用它填 `SolveTraceNote.Message`，不改任何 `Reason`、不改归属。
         //   取**副本**：字段会被 Phase4 Fallback 重跑复用，交出去的必须是本次 Run 的快照。
-        result.Phase2BlockedDetails = new Dictionary<string, string>(_phase2BlockedDetails, StringComparer.Ordinal);
+        result.Phase2BlockedDetails = new Dictionary<string, string>(constraints.Phase2BlockedDetails, StringComparer.Ordinal);
 
         return result;
     }
@@ -2359,6 +2485,8 @@ internal class PhaseTwoInitialScheduler
         //   正式的那份由 Phase5 再产一次 ⇒ 必须**回滚**，否则同一 Stage 会出两条相同 Issue
         //   （实测：不回滚直接打红 5 条既有单测）。与 Phase2 试排的 watermark 口径一致。
         var traceWatermark = constraints.TraceNotes.Count;
+        // §4.4：有阈值但阈值段完成时间未知的需求（不入 map，父件 fail-closed；下面统一留痕）。
+        var thresholdCompletionUnknown = new List<(string DemandKey, string RequiredStageCode)>();
         int withTimings = 0, emptyTimings = 0, factCount = 0;
         try
         {
@@ -2377,8 +2505,31 @@ internal class PhaseTwoInitialScheduler
                     //     而不是整链 `CompletionTime` —— 后者含阈值之后的工序，会把父件**不必要地推后**，
                     //     违反「既不提前释放不合格供给、也不错误压到末端完工时点」（0号位 2026-10-23 §3 R09-T11）。
                     //   无阈值（`RequiredStageCode` 空）⇒ 冻结口径是「全工艺完成才可供给」⇒ 用整链完成时间。
-                    map[fact.LogicalDemandKey] = fact.RequiredStageCompletionTime ?? fact.CompletionTime;
-                    withTimings++;
+                    // ── 2026-11-25（0号位 v1.3 §4.4）：**缺阈值不得假回落** ──
+                    //   逐字：「要求逐边阈值、真实最后必要数量、实际可信时间、合法绑定和供给类型，
+                    //   **缺阈值不能假回落**；如果阈值合法且后段无关不应过阻」。
+                    //   ⇒ 分三种情形，**不再一律 `?? CompletionTime`**：
+                    //     ① 无阈值（`RequiredStageCode` 空）⇒ 冻结口径「全工艺完成才可供给」⇒ 整链完成时间（合法）；
+                    //     ② 有阈值且阈值段完成时间**已知** ⇒ 用该时间（不把后段无关工序算进来）；
+                    //     ③ 有阈值但阈值段完成时间**未知**（如缺 LT/缺窗/链上无该 Stage）⇒
+                    //        **不入 map**：父件走既有 `childUnavailable` fail-closed，并留痕；
+                    //        不得拿整链完成时间顶替（那会把父件过度推后，且掩盖真实缺口）。
+                    var hasThreshold = !string.IsNullOrWhiteSpace(fact.RequiredStageCode);
+                    if (!hasThreshold)
+                    {
+                        map[fact.LogicalDemandKey] = fact.CompletionTime;
+                        withTimings++;
+                    }
+                    else if (fact.RequiredStageCompletionTime is DateTime thresholdEnd)
+                    {
+                        map[fact.LogicalDemandKey] = thresholdEnd;
+                        withTimings++;
+                    }
+                    else
+                    {
+                        thresholdCompletionUnknown?.Add(
+                            (fact.LogicalDemandKey, fact.RequiredStageCode!));
+                    }
                 }
                 else
                 {
@@ -2393,6 +2544,23 @@ internal class PhaseTwoInitialScheduler
                 constraints.TraceNotes.RemoveRange(
                     traceWatermark, constraints.TraceNotes.Count - traceWatermark);
             }
+        }
+
+        // ── 2026-11-25（0号位 v1.3 §4.4）：有阈值但阈值段完成时间未知 ⇒ **显式留痕**（不静默） ──
+        //   这些需求**没有**进入下界 map ⇒ 父件按既有 `childUnavailable` fail-closed，
+        //   不会因为「拿整链完成时间顶替」而被过度推后，也不会被当成已齐料。
+        foreach (var (demandKey, requiredStage) in thresholdCompletionUnknown)
+        {
+            constraints.TraceNotes.Add(new SolveTraceNote
+            {
+                Key = demandKey,
+                ReasonCode = "STAGE_THRESHOLD_COMPLETION_UNKNOWN",
+                Level = "Warning",
+                Message = $"该需求有供给阈值 Stage `{requiredStage}`（`RequiredStageCode`），"
+                          + "但其阈值段完成时间取不到（缺 LT / 缺合法 WORK 窗 / 链上无该 Stage）"
+                          + "⇒ **不把它当作可用下界**：父件按缺料 fail-closed，"
+                          + "**不拿整链完成时间顶替**（不假回落）。待事实补齐后重算。",
+            });
         }
 
         // 2026-11-04（纯观测）：分因计数 —— 回答「无工艺子件为什么没算出 StageTiming」。
@@ -2426,7 +2594,10 @@ internal class PhaseTwoInitialScheduler
         Dictionary<string, DateTime> demandCompletion,
         out bool childUnavailable,
         List<string>? missingChildren = null,
-        IReadOnlyDictionary<string, DateTime>? leadTimeOnlyCompletion = null)
+        IReadOnlyDictionary<string, DateTime>? leadTimeOnlyCompletion = null,
+        IReadOnlyDictionary<string, decimal>? demandLandedNet = null,
+        List<string>? missingByQuantity = null,
+        decimal parentNetOutputQty = 0m)
     {
         childUnavailable = false;
 
@@ -3638,6 +3809,14 @@ internal class PhaseTwoInitialScheduler
         /// <summary>本次试跑产生的 trace 增量（按水位切片；采纳时补回真表）。</summary>
         public List<SolveTraceNote> Notes = null!;
 
+        /// <summary>
+        /// 本次试跑对该需求写的 **Phase2 自报出口正文**（`ConstraintContext.Phase2BlockedDetails` 里本需求那条）。
+        ///   2026-11-26：候选试排各写自己那份克隆上下文 ⇒ 采纳时必须把**胜者这条**补回父上下文，
+        ///   否则 `P2_BATCH_NOT_LANDED` 的内层明细会**整体消失**。
+        ///   ⚠ 只回填本需求一条，不做整表拷贝（该表按需求键隔离，本需求只会有一条）。
+        /// </summary>
+        public string? BlockedDetail;
+
         /// <summary>试跑写进的一次性选路副本（采纳时回填真表）。</summary>
         public Dictionary<string, RoutePathKey> ChosenBatchRoutePaths = null!;
 
@@ -3831,6 +4010,10 @@ internal class PhaseTwoInitialScheduler
                 Notes = ctx.TraceNotes.Count > notesBefore
                     ? ctx.TraceNotes.GetRange(notesBefore, ctx.TraceNotes.Count - notesBefore)
                     : new List<SolveTraceNote>(),
+                // 2026-11-26：本候选**自己那份**自报出口正文（只取本需求这一条）。
+                BlockedDetail = ctx.Phase2BlockedDetails.TryGetValue(actualDemand.LogicalDemandKey, out var bd)
+                    ? bd
+                    : null,
                 ChosenBatchRoutePaths = trialChosenBatch,
                 ChosenRoutePaths = trialChosen
             };
@@ -4455,7 +4638,14 @@ internal class PhaseTwoInitialScheduler
         SolverDiagnostics.HotspotEnd(swOccCopy, SolverDiagnostics.Hotspot.OccCopy);
 
         long swOccPos = SolverDiagnostics.HotspotStart();
-        var list = occupancy[resourceId];
+        // 2026-11-26（0号位 v1.7 §4 P0-3）：该资源**未被预置**进占用表时（有资格+有日历、
+        //   但不在 `Resources` 里）懒建一条空表 —— 否则 `occupancy[resourceId]` 抛
+        //   `KeyNotFoundException` 打挂整轮。空表语义 = 尚无已占窗，不改变任何判定。
+        if (!occupancy.TryGetValue(resourceId, out var list))
+        {
+            list = new List<TimeWindow>();
+            occupancy[resourceId] = list;
+        }
         int lo = 0, hi = list.Count;
         while (lo < hi)
         {
@@ -4896,7 +5086,7 @@ internal class PhaseTwoInitialScheduler
         {
             // 2026-10-25 未排原因自报（2号位 §7.1）：与「无合格资源」「无可用时间槽」分开登记 ——
             //   三者指向完全相反的方向（采购/工艺主数据/产能日历），混成一个泛化出口就无法定位。
-            RecordPhase2Block(demand.LogicalDemandKey,
+            RecordPhase2Block(constraints, demand.LogicalDemandKey,
                 $"P2_NO_MATERIAL(倒排)：需求 {demand.NetOutputQty} × 物料 {demand.MaterialId} "
                 + "总量不足（`GetMaterialEarliestTime` 判 `isMaterialSufficient=false`）"
                 + "⇒ 工序循环一次没进，槽位检索 0 次。");
@@ -4906,7 +5096,7 @@ internal class PhaseTwoInitialScheduler
         // 2026-10-25 未排原因自报：物料够但**工序列表为空** —— 旧实现会静默返回空列表（无一字留痕）。
         if (operations.Count == 0)
         {
-            RecordPhase2Block(demand.LogicalDemandKey,
+            RecordPhase2Block(constraints, demand.LogicalDemandKey,
                 "P2_NO_OPERATIONS(倒排)：物料足够，但裁出的工序列表为空 ⇒ 循环一次没进，槽位检索 0 次"
                 + "（Routing 拓扑裁剪结果为空：检查 StartStageCode/StartOperationCode 与 Routing 是否对得上）。");
             return new List<FinalTaskDraft>();
@@ -4951,7 +5141,7 @@ internal class PhaseTwoInitialScheduler
                 operation.StageCode);   // P1-02：软偏好仅作用于当前承接工序（身份 = StageCode + OperationCode）
             if (eligibleResources.Count == 0)
             {
-                RecordPhase2Block(demand.LogicalDemandKey,
+                RecordPhase2Block(constraints, demand.LogicalDemandKey,
                     "P2_NO_ELIGIBLE_RESOURCE(倒排)："
                     + $"Stage='{operation.StageCode}' Op='{operation.OperationCode}' "
                     + $"Dept={operation.ProductionDepartmentId} Route='{operation.RouteCode}' PathId={operation.PathId} "
@@ -5084,8 +5274,8 @@ internal class PhaseTwoInitialScheduler
 
             if (scheduledTask == null)
             {
-                RecordPhase2Block(demand.LogicalDemandKey,
-                    "P2_NO_SLOT(倒排)："
+                RecordPhase2Block(constraints, demand.LogicalDemandKey,
+                    "Phase2 出口=P2_NO_SLOT(倒排)："
                     + $"Stage='{operation.StageCode}' Op='{operation.OperationCode}' "
                     + $"合格资源 {eligibleResources.Count} 个**全部**排不进"
                     + $"；成因={DescribeNoSlotCause(eligibleResources, demand, operation, constraints, capacityFactorMissingResources)}"
@@ -5139,7 +5329,7 @@ internal class PhaseTwoInitialScheduler
         if (!isMaterialSufficient)
         {
             // 2026-10-25 未排原因自报（2号位 §7.1）：与「无合格资源」「无可用时间槽」分开登记。
-            RecordPhase2Block(demand.LogicalDemandKey,
+            RecordPhase2Block(constraints, demand.LogicalDemandKey,
                 $"P2_NO_MATERIAL(正排)：需求 {demand.NetOutputQty} × 物料 {demand.MaterialId} "
                 + "总量不足（`GetMaterialEarliestTime` 判 `isMaterialSufficient=false`）"
                 + "⇒ 工序循环一次没进，槽位检索 0 次。");
@@ -5149,7 +5339,7 @@ internal class PhaseTwoInitialScheduler
         // 2026-10-25 未排原因自报：物料够但**工序列表为空** —— 旧实现会静默返回空列表（无一字留痕）。
         if (operations.Count == 0)
         {
-            RecordPhase2Block(demand.LogicalDemandKey,
+            RecordPhase2Block(constraints, demand.LogicalDemandKey,
                 "P2_NO_OPERATIONS(正排)：物料足够，但裁出的工序列表为空 ⇒ 循环一次没进，槽位检索 0 次"
                 + "（Routing 拓扑裁剪结果为空：检查 StartStageCode/StartOperationCode 与 Routing 是否对得上）。");
             return new List<FinalTaskDraft>();
@@ -5251,7 +5441,7 @@ internal class PhaseTwoInitialScheduler
                       + $"Path={string.Join("/", existedKeys.Select(k => k.PathId).Distinct().Take(4))} "
                       + $"工序={string.Join("/", existedKeys.Select(k => k.OperationCode).Distinct().Take(6))}";
 
-                RecordPhase2Block(demand.LogicalDemandKey,
+                RecordPhase2Block(constraints, demand.LogicalDemandKey,
                     "P2_NO_ELIGIBLE_RESOURCE(正排)："
                     + $"Stage='{operation.StageCode}' Op='{operation.OperationCode}' "
                     + $"Dept={operation.ProductionDepartmentId} Route='{operation.RouteCode}' PathId={operation.PathId} "
@@ -5268,8 +5458,111 @@ internal class PhaseTwoInitialScheduler
 
             // 尝试在合格资源上找时间槽
             FinalTaskDraft? scheduledTask = null;
+
+            // ── 2026-11-27（0号位 执行函 v1.7 §B-2「1有责任修正不合理 first-fit」）──
+            //   **缺陷**：旧实现按候选顺序 first-fit —— **一找到可容纳的资源就 break**。于是「同优先、同资格、
+            //   同硬约束」的等价资源里，谁先出现在资格表行序里谁就把活全吃掉；后面的同层资源即使同样可用、
+            //   甚至更早完成，也永远轮不到。实测：物料 62137 的 `TJ_ASSY/M101` 有 15 台等价设备
+            //   （Priority 全 100、CapacityFactor 全 1.0、日历全 267 窗），其中 **8 台全年零 Task**，
+            //   `ASSY_SLOT_01` 一台吃 1,741 个 Task。
+            //   **修法（只改选择口径，不增删候选、不碰任何硬约束）**：
+            //     · 同 Priority 层内 —— 取 `occSlot.End` **最早**的候选（同刻取原顺序靠前者）；
+            //     · 跨层 —— **严格尊重层序**：比已选中层更差的层直接跳过（连槽都不找，保持原早退成本）；
+            //       更好层若因瓶颈/偏好重排而出现在后面，仍会被搜到并替换掉较差的已选层；
+            //     · **显式排序的资源不参与时点比较**（需求级 Preferred/Fallback、ForceAnchor 锚点、
+            //       有静态负荷的 PreferAnchor 锚点）—— 它们是业务指定的首选，保持「首个可容纳即胜出」，
+            //       与改造前**逐字一致**；
+            //     · 比较**无副作用**：`FindSlotWithDynamicSetup` / `FindForwardSlot` 只读日历与占用，
+            //       此处**不**调 `CreateTask`、不写占用、不写时间线；**只对胜出方案**提交一次。
+            var eligibilityKey = new EligibilityLookupKey(
+                demand.MaterialId, operation.ProductionDepartmentId, operation.RouteCode,
+                operation.PathId, operation.OperationCode);
+            constraints.OperationResourcePriorities.TryGetValue(eligibilityKey, out var resourcePriorities);
+            // ⚠ 没有 Priority 事实（上下文不是 Phase1 建的 / 键对不上）时**不得**退化成
+            //   "全局最早完成"——0号位 v1.7 §B-2 明文禁止该口径。此时回落到改造前的 first-fit（见 takeImmediately）。
+            var tieringAvailable = resourcePriorities is { Count: > 0 };
+            int TierOf(int id)
+                => resourcePriorities is not null && resourcePriorities.TryGetValue(id, out var p)
+                    ? p
+                    : int.MaxValue;   // 无 Priority 事实 ⇒ 全部并列成同一层（不与有值的层抢优先）
+
+            // 理论下界（用于早退）：任何方案的完成时刻都不可能早于 `最早开始 + 最短加工时长`（Setup ≥ 0）。
+            //   达到该下界即可立即收束 —— 「同层比较」不必把 15 台等价设备全部找一遍。
+            //   这是**合法性下界**，不是优化预算截断：没达到下界时仍然全层比较，不会丢更早方案。
+            TimeSpan minProcessDuration = TimeSpan.MaxValue;
+            foreach (var ridLb in eligibleResources)
+            {
+                var cfLb = GetCapacityFactor(demand.MaterialId, operation, ridLb, constraints);
+                if (cfLb is not > 0) continue;
+                var dLb = TimeSpan.FromMinutes((double)(operation.StandardDuration * demand.PlannedProcessQty / cfLb.Value));
+                if (dLb < minProcessDuration) minProcessDuration = dLb;
+            }
+
+            HashSet<int>? explicitlyRanked = null;
+            void MarkExplicit(int? id)
+            {
+                if (id is int v && eligibleResources.Contains(v))
+                {
+                    (explicitlyRanked ??= new HashSet<int>()).Add(v);
+                }
+            }
+            // 需求级显式偏好：与 `OrderResourcesByPreference` 同口径（含 Continuation 的身份收窄）。
+            var preferenceApplies = !demand.IsContinuation
+                || (string.Equals(operation.OperationCode, demand.StartOperationCode, StringComparison.Ordinal)
+                    && (string.IsNullOrEmpty(demand.StartStageCode)
+                        || string.Equals(operation.StageCode, demand.StartStageCode, StringComparison.Ordinal)));
+            if (preferenceApplies)
+            {
+                int? preferred = null;
+                if (!string.IsNullOrEmpty(demand.PreferredResourceCode)
+                    && constraints.ResourceIdsByCode.TryGetValue(demand.PreferredResourceCode!, out var byCode))
+                {
+                    preferred = byCode;
+                }
+                preferred ??= demand.PreferredResourceId;
+                MarkExplicit(preferred);
+                MarkExplicit(demand.FallbackResourceId);
+            }
+            // R06 锚点：仅 ForceAnchor / 有负荷的 PreferAnchor 是「无条件排最前」⇒ 不参与时点比较；
+            //   NotAnchor（排最后 = 不主动挤占）与 Auto 不在此列，仍按同层最早完成竞争。
+            if (constraints.BottleneckAnchorResourceId is int anchorId
+                && (constraints.BottleneckMode == DynamicBottleneckMode.ForceAnchor
+                    || (constraints.BottleneckMode == DynamicBottleneckMode.PreferAnchor
+                        && constraints.ResourcesWithStaticLoad.Contains(anchorId))))
+            {
+                MarkExplicit(anchorId);
+            }
+
+            int? bestTier = null;
+            int bestResourceId = 0;
+            TimeWindow bestOccSlot = default;
+            decimal bestSetupMinutes = 0;
+            decimal bestAdjustedDuration = 0;
+            TimeSpan bestProcessDuration = default;
+            SetupOptimizer.SetupResolution bestSetupResolution = default;
+            var hasBest = false;
+
+            // NotAnchor 的锚点「排最后」= **不主动挤占** ⇒ 它连「同层最早完成」也不参与竞争，
+            //   只在其它资源**全部**排不进时兜底（与 `ApplyBottleneckOrdering` 把锚点移到末位同向；
+            //   回归锁：`R06BottleneckModeSelectionTests.夹具A_NotAnchor_锚点排最后_改选R2`）。
+            var deferredFound = false;
+            int deferredResourceId = 0;
+            TimeWindow deferredOccSlot = default;
+            decimal deferredSetupMinutes = 0;
+            decimal deferredAdjustedDuration = 0;
+            TimeSpan deferredProcessDuration = default;
+            SetupOptimizer.SetupResolution deferredSetupResolution = default;
+
             foreach (var resourceId in eligibleResources)
             {
+                var tier = TierOf(resourceId);
+
+                // 跨层早退：更差的层永远赢不了已选中的层 ⇒ 不找槽（无副作用、不增加计时）。
+                if (hasBest && tier > bestTier!.Value)
+                {
+                    continue;
+                }
+
                 // P0-04修复：Duration = StandardDuration × PlannedProcessQty ÷ CapacityFactor
                 // 第4轮Setup修复：加上SetupTime占用资源时间轴
                 // 第5轮修复：CapacityFactor缺失或非法时不能继续
@@ -5303,10 +5596,84 @@ internal class PhaseTwoInitialScheduler
                     (f, total) => FindForwardSlot(f, total, resourceId, constraints, resourceOccupancy, planningEnd));
                 SolverDiagnostics.HotspotEnd(swFwdSetup, SolverDiagnostics.Hotspot.ScheduleFwdSetup);
 
-                if (found.HasValue)
+                if (!found.HasValue)
+                {
+                    continue;
+                }
+
+                var (occSlotCandidate, setupMinutesCandidate, setupResolutionCandidate) = found.Value;
+
+                // NotAnchor 的锚点：不参与同层时点竞争，只留作兜底（见上方 deferred 声明）。
+                if (constraints.BottleneckMode == DynamicBottleneckMode.NotAnchor
+                    && constraints.BottleneckAnchorResourceId == resourceId)
+                {
+                    if (!deferredFound)
+                    {
+                        deferredResourceId = resourceId;
+                        deferredOccSlot = occSlotCandidate;
+                        deferredSetupMinutes = setupMinutesCandidate;
+                        deferredSetupResolution = setupResolutionCandidate;
+                        deferredAdjustedDuration = adjustedDuration;
+                        deferredProcessDuration = processDuration;
+                        deferredFound = true;
+                    }
+                    continue;
+                }
+
+                // 显式排序（需求级 Preferred/Fallback、无条件锚点）：命中即胜出，与改造前逐字一致。
+                // 另：没有 Priority 事实时整条工序回落到 first-fit（见 tieringAvailable 注释）。
+                var takeImmediately = !tieringAvailable
+                    || (explicitlyRanked is not null && explicitlyRanked.Contains(resourceId));
+
+                // 同层比较：更早的层优先；同层取完成更早者；同刻保留先出现的候选（稳定）。
+                if (!takeImmediately
+                    && hasBest
+                    && (tier > bestTier!.Value
+                        || (tier == bestTier.Value && occSlotCandidate.End >= bestOccSlot.End)))
+                {
+                    continue;
+                }
+
+                bestTier = tier;
+                bestResourceId = resourceId;
+                bestOccSlot = occSlotCandidate;
+                bestSetupMinutes = setupMinutesCandidate;
+                bestSetupResolution = setupResolutionCandidate;
+                bestAdjustedDuration = adjustedDuration;
+                bestProcessDuration = processDuration;
+                hasBest = true;
+
+                // 已到下界 ⇒ 不可能再有更早完成（Setup ≥ 0、工时 ≥ 最短），直接收束。
+                if (takeImmediately || occSlotCandidate.End <= earliestStart + minProcessDuration)
+                {
+                    break;
+                }
+            }
+
+            // NotAnchor 兜底：其它资源全部排不进时，才允许锚点落地。
+            if (!hasBest && deferredFound)
+            {
+                bestTier = TierOf(deferredResourceId);
+                bestResourceId = deferredResourceId;
+                bestOccSlot = deferredOccSlot;
+                bestSetupMinutes = deferredSetupMinutes;
+                bestSetupResolution = deferredSetupResolution;
+                bestAdjustedDuration = deferredAdjustedDuration;
+                bestProcessDuration = deferredProcessDuration;
+                hasBest = true;
+            }
+
+            if (hasBest)
+            {
+                // 单独一层作用域：候选循环只产出「胜出方案」，提交动作全部收在这里（无副作用比较 → 单点提交）。
                 {
                     long swFwdBook = SolverDiagnostics.HotspotStart();
-                    var (occSlot, setupMinutes, setupResolution) = found.Value;
+                    var resourceId = bestResourceId;
+                    var occSlot = bestOccSlot;
+                    var setupMinutes = bestSetupMinutes;
+                    var setupResolution = bestSetupResolution;
+                    var adjustedDuration = bestAdjustedDuration;
+                    var processDuration = bestProcessDuration;
                     // B.2：Setup 追踪三元组写出（0号位 20260917 回复 §5.1 / §14.3）。
                     // 载体 = 2号位 r13494 落地的 DomainSolveResult.SolveTraceNote；此处只收集，Phase5 统一导出。
                     // 判据：仅写「需说明」的解析结果（ExplanationType 非空 = INITIAL_SETUP_STATE / SETUP_RULE_MISSING_ZERO_FALLBACK /
@@ -5368,20 +5735,22 @@ internal class PhaseTwoInitialScheduler
                     }
 
                     SolverDiagnostics.HotspotEnd(swFwdBook, SolverDiagnostics.Hotspot.ScheduleFwdBookkeep);
-                    break;
                 }
             }
 
             if (scheduledTask == null)
             {
-                RecordPhase2Block(demand.LogicalDemandKey,
-                    "P2_NO_SLOT(正排)："
+                RecordPhase2Block(constraints, demand.LogicalDemandKey,
+                    "Phase2 出口=P2_NO_SLOT(正排)："
                     + $"Stage='{operation.StageCode}' Op='{operation.OperationCode}' "
                     + $"合格资源 {eligibleResources.Count} 个**全部**排不进"
                     + $"；成因={DescribeNoSlotCause(eligibleResources, demand, operation, constraints, capacityFactorMissingResources)}"
                     + $"；本工序找槽尝试={Math.Max(0, (SolverDiagnostics.LiveCounters?.SlotSearchAttempts ?? 0) - opAttemptBase)} 次"
                     + $"、槽位检索={Math.Max(0, (SolverDiagnostics.LiveCounters?.SlotSearches ?? 0) - opSearchBase)} 次"
-                    + $"（Run 累计尝试={SolverDiagnostics.LiveCounters?.SlotSearchAttempts ?? 0}）。");
+                    + $"（Run 累计尝试={SolverDiagnostics.LiveCounters?.SlotSearchAttempts ?? 0}）"
+                    // 2026-11-26（M11 案例要求）：补**逐资源最早可容纳时点** —— 原报文只说「全部排不进」，
+                    //   无法区分「这一段被占满（等得起）」与「日历没覆盖（等不起）」。只读、不改判定。
+                    + $"；逐资源最早可容纳={DescribeEarliestFeasiblePerResource(eligibleResources, demand, operation, constraints, resourceOccupancy, earliestStart)}。");
                 return new List<FinalTaskDraft>(); // 排程失败
             }
 
@@ -5438,24 +5807,11 @@ internal class PhaseTwoInitialScheduler
             if (rule is null || rule.IsActive != true) continue;
             if (!string.Equals(rule.ToStageCode, toStageCode, StringComparison.Ordinal)) continue;
             if (string.Equals(rule.FromStageCode, toStageCode, StringComparison.Ordinal)) continue;
-            // 键域 = **当前正在排程的 Stage 的执行厂**（0号位 2026-11-25 Q1 逐字：
-            //   「以当前正在排程的 Stage 为准……不使用 Demand.FactoryCode、根订单厂或任意上下游 Stage 厂」）。
-            //   来源 = 逐需求链定义的 `StageFactoryCode`（`StageDict.FactoryCode` 权威映射）。
-            //   ⚠ 0号位 2026-11-25 v1.2 §3 逐字：「**不能缺值回 `Demand.FactoryCode`**。r14421 的
-            //     回退分支**必须撤除**；缺权威厂应暴露技术未证……不捏造可用时间或全域误阻。」
-            //     ⇒ 取不到权威厂 = **判定不了本条规则是否命中** ⇒ 该条等待**不应用**（既不加也不减）、
-            //       **不回退需求厂**，并就地登记「该需求该 Stage 的需用时间不可信」。
-            //   仍**不得**用资源厂代码反推（同字段注释明令禁止）。
-            var ruleFactoryKey = StageHandoffFactoryKey.Resolve(
-                constraints.StageFactoryByDemandStage, demand, rule.ToStageCode);
-            if (ruleFactoryKey is null)
-            {
-                RecordStageHandoffFactoryUnverified(demand, rule, constraints);
-                continue;
-            }
-            if (!string.Equals(rule.FactoryCode, ruleFactoryKey, StringComparison.Ordinal)) continue;
-
-            // 本批内 FromStage 全部 Task 的最晚结束时间
+            // ── 0号位 2026-11-25 v1.3 §3.1 逐字：「**仅有 To 规则不能触发等待或降确定性**」──
+            //   ⇒ 判定顺序必须是：**先证本条有真实 From→To 基准**（本批确有 `FromStageCode` 的 Task），
+            //     再谈厂键。没有基准 ⇒ 本条**根本不存在交接**，既不加等待、**也不登记未证**。
+            //   （修正前：先判厂键 ⇒ 只有 ToStage 命中就会登记 `STAGE_FACTORY_UNVERIFIED` 并降 certainty，
+            //     把 168 条合法单 Stage 需求误标为「时间不可信」——这正是 0号位 点名的适用范围误判。）
             DateTime fromStageEnd = DateTime.MinValue;
             foreach (var t in tasksInBatch)
             {
@@ -5466,16 +5822,54 @@ internal class PhaseTwoInitialScheduler
                 }
             }
 
-            // 本批没有 FromStage 的 Task ⇒ 无基准可加（跨批/跨需求的阶段不在此处成链）
+            // 本批没有 FromStage 的 Task ⇒ 无交接可谈（跨批/跨需求的阶段不在此处成链）
             if (fromStageEnd == DateTime.MinValue) continue;
+
+            // 键域 = **当前正在排程的 Stage 的执行厂**（0号位 2026-11-25 Q1 逐字：
+            //   「以当前正在排程的 Stage 为准……不使用 Demand.FactoryCode、根订单厂或任意上下游 Stage 厂」）。
+            //   来源 = 逐需求链定义的 `StageFactoryCode`（`StageDict.FactoryCode` 权威映射）。
+            //   ⚠ 0号位 2026-11-25 v1.2 §3 逐字：「**不能缺值回 `Demand.FactoryCode`**。r14421 的
+            //     回退分支**必须撤除**；缺权威厂应暴露技术未证……不捏造可用时间或全域误阻。」
+            //     ⇒ **确有真实交接**而取不到权威厂 = 判定不了本条是否命中 ⇒ 该条等待**不应用**
+            //       （既不加也不减）、**不回退需求厂**，并就地登记「该需求该 Stage 的需用时间不可信」。
+            //   仍**不得**用资源厂代码反推（同字段注释明令禁止）。
+            var ruleFactoryKey = StageHandoffFactoryKey.Resolve(
+                constraints.StageFactoryByDemandStage, demand, rule.ToStageCode);
+            if (ruleFactoryKey is null)
+            {
+                RecordStageHandoffFactoryUnverified(demand, rule, constraints);
+                continue;
+            }
+            if (!string.Equals(rule.FactoryCode, ruleFactoryKey, StringComparison.Ordinal)) continue;
 
             SolverDiagnostics.CountStageHandoffMatched();
 
             if (rule.TimeBasis == StageHandoffTimeBasis.WORK)
             {
-                SolverDiagnostics.CountStageHandoffSkippedWork();
-                RecordHandoffWorkNoCalendar(demand, rule, constraints);
-                continue;   // 不猜：不应用该条等待，只在追溯里留缺口
+                // ── 2026-11-25（0号位 v1.3 §4.3 / AE-006）：WORK 基准**按合法有效窗口推进** ──
+                //   逐字：「真正有向 Stage 对、当前 Stage 厂、认证有效规则、整批最后必要完成为基准，
+                //   WORK 按合法有效窗口推进，ELAPSED 自然分钟，**单次应用**，禁止与 Stage LT/跨厂物流 LT 重复。
+                //   缺真实窗局部未证/阻断，**不把 WORK 静默当 0/ELAPSED**」。
+                //   ⇒ 复用 `TryAdvanceByWorkHours`（与 Stage 提前期**同一个**窗口消费器，不另立第二套），
+                //     WORK 分钟先折成小时，从 FromStage 最晚结束起在该 Stage 的合法窗口内推进。
+                var workHours = rule.WaitMinutes / 60m;
+                if (!StageTimingNodeBuilder.TryAdvanceByWorkHours(
+                        constraints.Request!, demand, rule.ToStageCode!, fromStageEnd, workHours,
+                        out var workEnd, out _, isLeadTimeOnly: false,
+                        stageFactoryIdByDemandStage: constraints.StageFactoryIdByDemandStage))
+                {
+                    // 缺合法窗口 ⇒ **不应用**（不静默当 0 或 ELAPSED），保留既有留痕。
+                    SolverDiagnostics.CountStageHandoffSkippedWork();
+                    RecordHandoffWorkNoCalendar(demand, rule, constraints);
+                    continue;
+                }
+
+                if (workEnd > effective)
+                {
+                    effective = workEnd;
+                    SolverDiagnostics.CountStageHandoffApplied(rule.WaitMinutes);
+                }
+                continue;
             }
 
             var candidate = fromStageEnd.AddMinutes(rule.WaitMinutes);
@@ -5838,6 +6232,143 @@ internal class PhaseTwoInitialScheduler
     ///   ③ **全部缺 CapacityFactor** —— 所有合格资源都算不出时长。
     /// 判据全部取自**本次失败路径**的实测读数，不猜；**纯观测**：不改判定、不改返回值、不新增任何码。
     /// </summary>
+    /// <summary>
+    /// 2026-11-26（0号位《未排案例分类总表》M11-CASE-212800 / 213355「`P2_NO_SLOT` **没有**给出
+    ///   『最早可排时刻』——这是可补的」）：在 NO_SLOT 失败正文里补**逐资源的最早可容纳时点**。
+    ///
+    /// <para><b>为什么这件事能答</b>：原报文只说「N 个合格资源全部排不进」，读的人无法区分
+    ///   「该资源这一段被占满」与「该资源日历根本没覆盖到」——前者等得起，后者等不起。
+    ///   本方法对每个合格资源单独回答：<b>在不跨日历窗的前提下</b>，它最早什么时候能完整容纳本工序。</para>
+    ///
+    /// <para><b>为什么不能更远（诚实边界）</b>：Phase2 **不做跨日历窗**（跨窗只在 Phase4
+    ///   「常规修复 0 Task」后重试一次，见 `DescribeNoSlotCause` 内的更正注释）。
+    ///   因此「需跨窗」的资源在这里**给不出**一个窗内的时刻 —— 本方法如实写「需跨窗 + 日历末端」，
+    ///   **不编造**一个超出日历的时间。</para>
+    ///
+    /// <para><b>只读、只在失败出口调用</b>：不进热路径；不改任何判定与数量。</para>
+    /// </summary>
+    /// <param name="earliestStart">本工序的可用起点下界（与找槽同一入参，保证口径一致）。</param>
+    /// <param name="maxListed">最多列几个资源（防止 15 个资源把报文撑爆），超出部分只报个数。</param>
+    private string DescribeEarliestFeasiblePerResource(
+        List<int> eligibleResources,
+        LogicalProductionDemand demand,
+        OperationNode operation,
+        ConstraintContext constraints,
+        Dictionary<int, List<TimeWindow>> resourceOccupancy,
+        DateTime earliestStart,
+        int maxListed = 8)
+    {
+        var parts = new List<string>();
+        var listed = 0;
+        foreach (var resourceId in eligibleResources)
+        {
+            if (listed >= maxListed)
+            {
+                parts.Add($"…（共 {eligibleResources.Count} 个合格资源，仅列前 {maxListed}）");
+                break;
+            }
+
+            var capacityFactor = GetCapacityFactor(demand.MaterialId, operation, resourceId, constraints);
+            if (capacityFactor is null || capacityFactor <= 0)
+            {
+                parts.Add($"{resourceId}=缺系数");
+                listed++;
+                continue;
+            }
+
+            var needMinutes = (double)(operation.StandardDuration * demand.PlannedProcessQty / capacityFactor.Value);
+            var need = TimeSpan.FromMinutes(needMinutes);
+
+            if (!constraints.ResourceCalendars.TryGetValue(resourceId, out var cal) || cal.Count == 0)
+            {
+                parts.Add($"{resourceId}=无日历窗");
+                listed++;
+                continue;
+            }
+
+            var earliest = EarliestFeasibleStart(earliestStart, need, resourceId, resourceOccupancy, constraints);
+            if (earliest.HasValue)
+            {
+                parts.Add($"{resourceId}=最早 {earliest.Value:yyyy-MM-dd HH:mm:ss}");
+                listed++;
+                continue;
+            }
+
+            // 窗内装不下 ⇒ 区分「时长超过所有窗（需跨窗）」与「窗够长但被占用到日历末端」。
+            var longest = TimeSpan.Zero;
+            foreach (var w in cal)
+            {
+                var len = w.End - w.Start;
+                if (len > longest) longest = len;
+            }
+
+            var calEnd = cal[cal.Count - 1].End;
+            foreach (var w in cal)
+            {
+                if (w.End > calEnd) calEnd = w.End;
+            }
+
+            parts.Add(longest < need
+                ? $"{resourceId}=需跨窗（需 {needMinutes:0.##} 分钟 > 最长窗 {longest.TotalMinutes:0.##} 分钟），日历末端 {calEnd:yyyy-MM-dd HH:mm:ss}"
+                : $"{resourceId}=窗内已被占满至日历末端 {calEnd:yyyy-MM-dd HH:mm:ss}");
+
+            listed++;
+        }
+
+        return parts.Count == 0 ? "（无）" : string.Join("；", parts);
+    }
+
+    /// <summary>
+    /// 在**单个日历窗内**求该资源最早能完整容纳 <paramref name="duration"/> 的起点（不跨窗）。
+    /// 返回 null ⇒ 全部日历窗内都装不下（要么窗太短，要么被占用占满）。
+    ///
+    /// <para>不变式沿用 `AddOccupancyWindow`：占用表按 `Start` 升序；日历表由
+    ///   `PhaseOneConstraintBuilder.BuildResourceCalendars` 建表时已 `OrderBy(Start)`。</para>
+    /// </summary>
+    private static DateTime? EarliestFeasibleStart(
+        DateTime from,
+        TimeSpan duration,
+        int resourceId,
+        Dictionary<int, List<TimeWindow>> resourceOccupancy,
+        ConstraintContext constraints)
+    {
+        if (!constraints.ResourceCalendars.TryGetValue(resourceId, out var cal) || cal.Count == 0) return null;
+        if (duration <= TimeSpan.Zero) return null;
+
+        resourceOccupancy.TryGetValue(resourceId, out var occ);
+
+        foreach (var w in cal)
+        {
+            if (w.End <= from) continue;
+
+            var cursor = w.Start > from ? w.Start : from;
+            var latestStartInWindow = w.End - duration;      // 起点必须 ≤ 它，否则跨窗
+            if (latestStartInWindow < cursor) continue;      // 这个窗本身装不下
+
+            if (occ is { Count: > 0 })
+            {
+                var advanced = true;
+                while (advanced && cursor <= latestStartInWindow)
+                {
+                    advanced = false;
+                    foreach (var b in occ)
+                    {
+                        if (b.End <= cursor) continue;                    // 完全在游标之前
+                        if (b.Start >= cursor + duration) break;           // 已能找到空档（表有序）
+                        if (b.Start > latestStartInWindow) break;          // 超出本窗可用段
+                        cursor = b.End;                                    // 撞占用 ⇒ 跳到它结束
+                        advanced = true;
+                        break;
+                    }
+                }
+            }
+
+            if (cursor <= latestStartInWindow) return cursor;
+        }
+
+        return null;
+    }
+
     private string DescribeNoSlotCause(
         List<int> eligibleResources,
         LogicalProductionDemand demand,
@@ -5945,6 +6476,37 @@ internal class PhaseTwoInitialScheduler
         //   ⇒ 「时长 > 所有窗」时它会一直是 0，看上去像「根本没找」。
         SolverDiagnostics.CountSlotSearchAttempt(_diag);
 
+        // ── 2026-11-26（0号位 v1.8 §1）：**资源未知 / 引用坏 / 占用未装载 ⇒ 不得以空字典放行** ──
+        //   0号位 逐字：「仅确证合法资源且占用状态已完整装载的空集合可视空；资源未知 / 引用坏 / 占用未装载
+        //   不能以空字典放行」。
+        //   区分三情形（判据见 `ConstraintContext.DefinedResourceIds` 注释）：
+        //     ① 已定义 + 占用表有键 + 表空 ⇒ **合法空集**（唯一允许放行的空字典）；
+        //     ② 不在 `Resources` 里        ⇒ 引用坏/资源未知 ⇒ 拒绝；
+        //     ③ 已定义但占用表无键        ⇒ 占用未装载   ⇒ 拒绝。
+        //   ⚠ **开关是 `ResourcesPayloadPresent`，不是 `DefinedResourceIds.Count > 0`**（r14490，0号位 v1.13 复核）：
+        //     旧写法把「显式下发空 `Resources`（= 漏装）」与「压根没下发 `Resources`（= 旧夹具）」混成一件事，
+        //     两者都静默 fail-open ⇒ 0号位 点名「空 Resources 整体退回旧行为」。
+        //     现在：`Resources == null` ⇒ 不启用（没有事实可判）；`Resources == []` ⇒ **启用**（漏装必须逐个拒绝）。
+        //   ⇒ 「局部未排 + 留痕」，**不让一个坏资源无证打挂整轮**（v1.7 §4 P0-3 同向）。
+        if (constraints.ResourcesPayloadPresent)
+        {
+            if (!constraints.DefinedResourceIds.Contains(resourceId))
+            {
+                SolverDiagnostics.CountUnknownResourceRefusal();
+                SolverDiagnostics.HotspotEnd(swFfs, SolverDiagnostics.Hotspot.FindForwardSlot);
+                return null;
+            }
+
+            if (!resourceOccupancy.ContainsKey(resourceId))
+            {
+                // Phase2 占用表由 `InitializeResourceOccupancy` 按 `Resources` 逐资源建键
+                // ⇒ 「已定义却无键」只可能是装载环节漏了这个资源，**不能**当成「没有占用」。
+                SolverDiagnostics.CountResourceOccupancyUnloadedRefusal();
+                SolverDiagnostics.HotspotEnd(swFfs, SolverDiagnostics.Hotspot.FindForwardSlot);
+                return null;
+            }
+        }
+
         // 获取资源日历
         if (!constraints.ResourceCalendars.TryGetValue(resourceId, out var calendar) || calendar.Count == 0)
         {
@@ -6030,6 +6592,9 @@ internal class PhaseTwoInitialScheduler
     ///   三重索引（BySource / ByResource / ContinuationByPi + FreeByPi，FinalDraftId→PI 反查 O(1)）。
     ///   复核触发条件：真实日历接入 / 规模 &gt; 15万 Task / 规则密度 &gt; 30% / 性能红线调整。
     /// </summary>
+    /// <summary>无已占窗时共用（只读，绝不写入）。2026-11-26（P0-3）。</summary>
+    private static readonly List<TimeWindow> EmptyOccupancy = new();
+
     private TimeWindow? FindFirstAvailableSlot(
         DateTime windowStart,
         TimeSpan duration,
@@ -6056,7 +6621,21 @@ internal class PhaseTwoInitialScheduler
         //     · 不推进 `cursor`（`cursor = max(cursor, End)` 仍为 `windowStart`）。
         //   故可整体跳过「`Start <= windowStart`」这段前缀；其中**跨窗**（`End > windowStart`）至多一个，
         //   用一次回退纳入（窗互不重叠时恰好退 0~1 步）。
-        var occupied = resourceOccupancy[resourceId];
+        // ── 2026-11-26（0号位 v1.7 §4 P0-3）：**不让一个未初始化的资源打挂整轮** ──
+        //   占用表按 `Resources` 预置；若某资源**没有任何已占窗**（首次使用、或只在资格集里出现），
+        //   原写法 `resourceOccupancy[resourceId]` 直接下标 ⇒ `KeyNotFoundException` ⇒ 整轮求解中断。
+        //   ⇒ 未命中取**空占用**（语义 = 该资源尚无已占窗），**不**因此把它当成「可用」：
+        //     「能否排下」仍由 `FindForwardSlot` 的**日历闸**决定（缺日历/缺资格在那里就返回 null）。
+        //   ⚠ 0号位 逐字：「缺资源定义/资格/日历不能默认可用；局部诊断/合法未排，
+        //     不让一个坏资源无证打挂整轮」。
+        if (!resourceOccupancy.TryGetValue(resourceId, out var occupied))
+        {
+            // 2026-11-26（0号位 v1.8 §1）：**严格模式下这里已不可达** —— `FindForwardSlot`
+            //   已按 `DefinedResourceIds` 把「资源未知」与「占用未装载」挡在外面，
+            //   能走到这里的只剩「载荷未下发 `Resources`」的 fail-open 分支（旧载荷/单元夹具）。
+            //   该分支下「资源是否存在」本身没有事实可判 ⇒ 退回旧行为（空占用），由日历闸兜底。
+            occupied = EmptyOccupancy;
+        }
 
         // ── 2026-10-26 第十一刀：试过「二分跳窗」取代「逐个窗往后挪」，**实测为反向优化，已回滚** ──
         //   想法：旧写法每跨一个冲突窗才前进一格，改为「二分找段尾、cursor 直跳段尾」。
@@ -6142,7 +6721,8 @@ internal class PhaseTwoInitialScheduler
         //   不变式同上（按 `Start` 升序、互不重叠）。与 `candidate` 重叠的窗必须 `Start < candidate.End`
         //   （否则 `Start >= End_c` ⇒ 不重叠）⇒ 只需检查该前缀；其中 `End <= candidate.Start` 者不重叠，
         //   且因 `End` 随 `Start` 非降 ⇒ 该段是**连续前缀**，二分 + 回退即可界定，通常只查 0~1 个窗。
-        var occupied = resourceOccupancy[resourceId];
+        // 同上（2026-11-26 P0-3）：无已占窗 = 无重叠。
+        var occupied = resourceOccupancy.TryGetValue(resourceId, out var occ2) ? occ2 : EmptyOccupancy;
         int hi = occupied.Count, lo = 0;
         while (lo < hi)
         {
@@ -6772,6 +7352,14 @@ internal class PhaseTwoInitialScheduler
         public static ExecutionBatchFormation Conflict(string reason)
             => new(false, reason, Array.Empty<ExecutionBatchDraft>(), false);
 
+        /// <summary>
+        /// **PI 契约缺口**（0号位 v1.5 请裁1 → A 方向）：策略 `Valid`、但 PI 权威事实未证。
+        /// 出口码仍按 `BATCH_POLICY_CONFLICT` 走（**冻结 15 码不改**），但 `IsPiContractPending=true`
+        /// 让上层**单列统计**，不计为真正的 Batch 策略冲突。
+        /// </summary>
+        public static ExecutionBatchFormation ConflictPiContractPending(string reason)
+            => new(false, reason, Array.Empty<ExecutionBatchDraft>(), false, IsPiContractPending: true);
+
         /// <summary>P0-01：缺有效 Batch Policy（`BATCH_POLICY_MISSING`）。</summary>
         public static ExecutionBatchFormation Missing(string reason)
             => new(false, reason, Array.Empty<ExecutionBatchDraft>(), true);
@@ -7040,6 +7628,59 @@ internal class PhaseTwoInitialScheduler
     ///   单调性成立：某整数 q 合法 ⇒ 任何 q' ≤ q 也合法（上限判据是 `quantity > cap`）。
     ///   只有**纯粹量超**（`PI_LEGAL_QTY_OVER_LIMIT`）才二分；合同前置缺陷一律返回 null，交原 Fail Closed 处理。
     /// </summary>
+    /// <summary>
+    /// 2026-11-26（0号位 M04「PI_LEGAL_QTY_OVER_LIMIT 证据未足」）：把合法量上限的**三项构成**逐项写出，
+    ///   并**点名哪一项最紧**。旧报文只给「min 结果」，读的人无法区分「PI 真没量」与
+    ///   「Stage 自由量被他处占用」——这两件事业务处置完全不同。
+    ///
+    /// <para>本方法**只做描述、不做判定**：判定仍由 <see cref="EvaluatePiLegalQuantityGate"/> 负责，
+    ///   两处用的是**同一组字段**（`PiRemainingFact.PiQuantity` / `PiRemainingQty` /
+    ///   `PiStageQuantityContext.StageFreeEligibleQty` / `AlreadyCommittedQty`），不另算一套。</para>
+    ///
+    /// <para>任一项取不到（无 PI 权威行 / 无 Stage 上下文 / 多行不唯一）⇒ 返回 null，
+    ///   由调用方保留旧报文——**不猜、不补 0**。</para>
+    /// </summary>
+    private static string? DescribePiLegalCapComponents(
+        string? productionInstructionNo,
+        int materialId,
+        int factoryId,
+        IReadOnlyList<PiRemainingFact>? piFacts,
+        PiStageQuantityContext? stageContext)
+    {
+        if (string.IsNullOrWhiteSpace(productionInstructionNo)) return null;
+        if (piFacts is null || stageContext is null) return null;
+
+        PiRemainingFact? unique = null;
+        var matched = 0;
+        foreach (var f in piFacts)
+        {
+            if (string.Equals(f.ProductionInstructionNo, productionInstructionNo, StringComparison.Ordinal)
+                && f.MaterialId == materialId
+                && f.FactoryId == factoryId)
+            {
+                matched++;
+                unique ??= f;
+            }
+        }
+
+        if (matched != 1) return null;   // 0 行/多行 ⇒ 不描述（该情形由门禁另出「契约待核」文本）
+
+        var stageFree = stageContext.StageFreeEligibleQty - stageContext.AlreadyCommittedQty;
+        if (stageFree < 0m) stageFree = 0m;
+
+        var pi = unique!;
+        var cap = pi.PiQuantity;
+        var tightest = "PI Original";
+        if (pi.PiRemainingQty < cap) { cap = pi.PiRemainingQty; tightest = "PI Remaining"; }
+        if (stageFree < cap) { cap = stageFree; tightest = "Stage 合法自由（自由 − 同PI同Stage已占）"; }
+
+        return $"三项分解：PI Original={pi.PiQuantity:G29}、PI Remaining={pi.PiRemainingQty:G29}、"
+               + $"Stage 合法自由={stageFree:G29}"
+               + $"（Stage {stageContext.StageCode}：自由 {stageContext.StageFreeEligibleQty:G29}"
+               + $" − 同PI同Stage已占 {stageContext.AlreadyCommittedQty:G29}）"
+               + $"；**最紧项={tightest}**（= {cap:G29}）";
+    }
+
     internal static decimal? ResolvePiLegalIntegerCapOrNull(
         decimal targetQuantity,
         string? productionInstructionNo,
@@ -7234,9 +7875,22 @@ internal class PhaseTwoInitialScheduler
             }
 
             // P0-01：缺策略（`BATCH_POLICY_MISSING`）与冲突（`BATCH_POLICY_CONFLICT`）分列，供出口给不同 Reason。
-            return plan.IsMissingPolicy
-                ? ExecutionBatchFormation.Missing(plan.ConflictReason!)
-                : ExecutionBatchFormation.Conflict(plan.ConflictReason!);
+            if (plan.IsMissingPolicy)
+            {
+                return ExecutionBatchFormation.Missing(plan.ConflictReason!);
+            }
+
+            // ── 2026-11-25（0号位 v1.5 请裁1 → **A 方向**）：PI 契约缺口**不得被计为 Batch 策略冲突** ──
+            //   逐字：「采用 A 的语义分账，但限定为既有决策说明/技术诊断载体内逐 Demand+Stage+PI+完整键记录
+            //   `PI_LEGAL_QTY_CONTRACT_PENDING`，明确策略 Valid 而 PI 事实未证。保留当前技术出口码兼容，
+            //   不改冻结 15 码……汇总必须单列、**不能计为实际 Batch 策略冲突**」。
+            //   ⇒ 出口码仍是 `BATCH_POLICY_CONFLICT`（冻结值域不变），但**结构化标记**出来，供上层单列统计。
+            if (plan.ConflictReason?.StartsWith("PI_LEGAL_QTY_CONTRACT_PENDING", StringComparison.Ordinal) == true)
+            {
+                return ExecutionBatchFormation.ConflictPiContractPending(plan.ConflictReason!);
+            }
+
+            return ExecutionBatchFormation.Conflict(plan.ConflictReason!);
         }
 
         // V1_3 F-03：正常 Policy 路径同样过 B-009 统一合法量门禁（不再只给 B-010 兜底装门禁）。
@@ -11927,6 +12581,12 @@ internal class InitialScheduleResult
     public List<string> UnscheduledDemandKeys { get; set; } = new();
 
     /// <summary>
+    /// 2026-11-26（0号位 v1.8 §2.1）：各需求**已合法落定的净产出总量**，
+    /// 供 Phase4 父件重评复用同一数量门禁（否则 Phase4 会绕过 Phase2 的逐边需求量判据）。
+    /// </summary>
+    public Dictionary<string, decimal> DemandLandedNet { get; set; } = new(StringComparer.Ordinal);
+
+    /// <summary>
     /// P0-04修复：Merge M:N 份额追溯（Demand → Task 的份额血缘），
     /// 由 Phase2 产出并传递给 Phase5，避免合并批次的份额血缘丢失。
     /// Key = 合并后 Task 的 FinalDraftId，Value = 该 Task 承载的各 Demand 份额。
@@ -11946,6 +12606,17 @@ internal class InitialScheduleResult
     /// 与 <see cref="BatchPolicyConflicts"/> 分列 —— 两者原因类别不同，出口 Reason 亦不同。
     /// </summary>
     public List<string> BatchPolicyMissingDemandKeys { get; set; } = new();
+
+    /// <summary>
+    /// **2026-11-27（0号位 类别整改函 §二·02）**：本 Run 中因 **PI 合法量事实未知**
+    /// （有真实 PI，但 `PiStageQuantityBaselines` 缺 `(PI, MaterialId, StageCode)` ⇒ Stage 合法自由量不可证）
+    /// 而 fail-closed 的 C 桶需求。
+    ///
+    /// 与 <see cref="BatchPolicyMissingDemandKeys"/> **分列**：0号位 逐字「真实 PI 身份/自由量未知**另归**；
+    /// **不得按 policy null 判 MISSING**」。出口码仍是冻结值（不改 15 码），但本列用于**单独统计**，
+    /// 禁止再把这些需求计入「Batch 策略缺配」的根因影响数。
+    /// </summary>
+    public List<string> BatchPolicyPiContractPendingDemandKeys { get; set; } = new();
 
     /// <summary>
     /// **2026-10-13 新增**（0号位《未命名的Markdown文件4.md》§3.3）：本 Run 中因 Batch Policy

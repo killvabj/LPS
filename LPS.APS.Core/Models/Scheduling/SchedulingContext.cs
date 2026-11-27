@@ -101,6 +101,18 @@ public class SchedulingContext
     public List<ProductionWorkCalendarSlot> UpperLevelCalendarFacts { get; set; } = new();
 
     /// <summary>
+    /// **Run 级上两级日历是否已成功装载**（2026-11-26，0号位 审核 §2）。
+    ///
+    /// 必须与 <see cref="UpperLevelCalendarFacts"/> 分开表达，因为「**装载成功但确实为空**」
+    /// 与「**尚未装载**」是两件事：
+    ///   · `false` ⇒ 未装载（老调用方／单测／手工构造上下文）⇒ 消费方**回落自行查库**；
+    ///   · `true` ＋ 集合为空 ⇒ **已装载、本 Run 确无上两级日历事实** ⇒ 消费方**必须按空处理**，
+    ///     **不得**再查库、也不得混用别的时间切面。
+    /// 原实现只看 `Count > 0`，把这两种情况混成一个，导致「装载为空」时会静默重查。
+    /// </summary>
+    public bool UpperLevelCalendarFactsLoaded { get; set; }
+
+    /// <summary>
     /// 现货库存（L5 内存消费层，阶段1.5 从 InventoryBalance 装载）
     /// Key = "MaterialCode|ProductFamilyId|FactoryId"（字符串复合键以便序列化）
     /// Value = 可用量（OnHandQty - AllocatedQty）

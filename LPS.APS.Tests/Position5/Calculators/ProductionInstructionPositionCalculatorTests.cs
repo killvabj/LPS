@@ -2140,5 +2140,297 @@ public class ProductionInstructionPositionCalculatorTests
         Assert.DoesNotContain(result.Issues, i => i.IssueType == "XC_EXCEEDS_STAGE");
         Assert.Equal(1000m, result.Positions.Sum(p => p.Quantity));
     }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // 2026-11-26 D05-C13：NextOperationContext 前沿分量＋下游残差（冻结 Pegging §2/§3、39-0 §四/§五）
+    // ═══════════════════════════════════════════════════════════════════════
+
+    private static ProductionInstructionPositionInput BuildC13LikeInput(decimal erpRemaining, decimal stageGood, decimal stageRemaining)
+    {
+        return new ProductionInstructionPositionInput
+        {
+            ProductionInstructionNo = "16389478",
+            MaterialId = 6001,
+            MaterialCode = "WIP-WBM-10-AR24P-020",
+            FactoryId = 6,
+            FactoryCode = "TJ",
+            ErpRemainingQty = erpRemaining,
+            StagePath = new[]
+            {
+                new StagePathFact { StageCode = "TJ_MACH", StageSequence = 1, IsStartStage = true }
+            },
+            StageProgress = new[]
+            {
+                new StageProgressFact
+                {
+                    StageCode = "TJ_MACH", StageSequence = 1, PlannedQty = 550m,
+                    GoodCompletedQty = stageGood, RemainingQty = stageRemaining, SnapshotId = 539
+                }
+            },
+            OperationProgress = new[]
+            {
+                new OperationProgressFact
+                {
+                    OperationName = "NC", StageCode = "TJ_MACH", MESWorkOrderNo = "16389478081367",
+                    PlannedQty = 550m, GoodQty = 469m, RemainingQty = 81m
+                },
+                new OperationProgressFact
+                {
+                    OperationName = "精修", StageCode = "TJ_MACH", MESWorkOrderNo = "16389478081367",
+                    PlannedQty = 550m, GoodQty = 466m, RemainingQty = 84m
+                }
+            },
+            RoutingOperations = new[]
+            {
+                new RoutingOperationFact { OperationCode = "J101", OperationName = "NC", StageCode = "TJ_MACH", RouteCode = "NC,清洗,精修", PathId = 1 },
+                new RoutingOperationFact { OperationCode = "J102", OperationName = "清洗", StageCode = "TJ_MACH", RouteCode = "NC,清洗,精修", PathId = 1 },
+                new RoutingOperationFact { OperationCode = "J103", OperationName = "精修", StageCode = "TJ_MACH", RouteCode = "NC,清洗,精修", PathId = 1 }
+            },
+            RoutingDependencies = new[]
+            {
+                new RoutingDependencyFact { FromOperationCode = "J101", ToOperationCode = "J102", RouteCode = "NC,清洗,精修" },
+                new RoutingDependencyFact { FromOperationCode = "J102", ToOperationCode = "J103", RouteCode = "NC,清洗,精修" }
+            },
+            WorkOrders = new[]
+            {
+                new WorkOrderSnapshotFact
+                {
+                    ProductionInstructionNo = "16389478", MESWorkOrderNo = "16389478081367",
+                    MaterialCode = "WIP-WBM-10-AR24P-020", PlannedQty = 550m,
+                    WorkOrderStatus = "IN_PROGRESS", DataCutoffTime = DateTime.UtcNow
+                }
+            }
+        };
+    }
+
+    [Fact]
+    public async Task C13_FrontierResidual_ShouldSplitToWash_NotPackToFrontier()
+    {
+        // C13 样本（Run999539）：位置 84（首段残差口径）；NC 469/余81；精修 466（未报清洗）
+        var input = BuildC13LikeInput(erpRemaining: 84m, stageGood: 0m, stageRemaining: 84m);
+        var result = (await _calculator.CalculateProductionInstructionPositionsAsync(
+            new[] { input }, new FrozenFactParameters(), CancellationToken.None)).First();
+
+        Assert.True(result.IsSuccess);
+        Assert.Equal(84m, result.Positions.Sum(p => p.Quantity));
+
+        // NextContext：81 从 NC、3 从清洗（不再把 84 打包给 NC）
+        Assert.Equal(2, result.NextOperationContexts.Count);
+        Assert.Contains(result.NextOperationContexts, c => c.StartOperationCode == "NC" && c.SliceQty == 81m);
+        Assert.Contains(result.NextOperationContexts, c => c.StartOperationCode == "清洗" && c.SliceQty == 3m);
+        Assert.DoesNotContain(result.NextOperationContexts, c => c.StartOperationCode == "NC" && c.SliceQty == 84m);
+
+        // 既存执行上下文：同口径两片（J101:81 + J102:3）
+        var ctx = Assert.Single(result.ExistingExecutionContexts);
+        Assert.Contains(ctx.Slices, s => s.StartOperationCode == "J101" && s.SliceQty == 81m);
+        Assert.Contains(ctx.Slices, s => s.StartOperationCode == "J102" && s.SliceQty == 3m);
+        Assert.DoesNotContain(result.Issues, i => i.IssueType == "NEXT_OPERATION_AMBIGUOUS");
+    }
+
+    [Fact]
+    public async Task FrontierEmpty_DownstreamUnreported_ShouldUseRoutingSuccessor_NotNull()
+    {
+        // NC 已完工 550/余0（清洗、精修均无行）⇒ 前沿为空；应由 Routing 推出唯一后继 清洗，而非 StartOperation=null
+        var input = BuildC13LikeInput(erpRemaining: 550m, stageGood: 0m, stageRemaining: 550m);
+        var input2 = new ProductionInstructionPositionInput
+        {
+            ProductionInstructionNo = input.ProductionInstructionNo,
+            MaterialId = input.MaterialId,
+            MaterialCode = input.MaterialCode,
+            FactoryId = input.FactoryId,
+            FactoryCode = input.FactoryCode,
+            ErpRemainingQty = input.ErpRemainingQty,
+            StagePath = input.StagePath,
+            StageProgress = input.StageProgress,
+            OperationProgress = new[]
+            {
+                new OperationProgressFact
+                {
+                    OperationName = "NC", StageCode = "TJ_MACH", MESWorkOrderNo = "16389478081367",
+                    PlannedQty = 550m, GoodQty = 550m, RemainingQty = 0m
+                }
+            },
+            RoutingOperations = input.RoutingOperations,
+            RoutingDependencies = input.RoutingDependencies,
+            WorkOrders = input.WorkOrders
+        };
+
+        var result = (await _calculator.CalculateProductionInstructionPositionsAsync(
+            new[] { input2 }, new FrozenFactParameters(), CancellationToken.None)).First();
+
+        Assert.Equal(550m, result.Positions.Sum(p => p.Quantity));
+
+        var next = Assert.Single(result.NextOperationContexts);
+        Assert.Equal("清洗", next.StartOperationCode);   // 形态②：路由后继唯一
+        Assert.Equal(550m, next.SliceQty);
+
+        // 既存执行上下文同口径（此前已由形态②给出 J102，两腿一致）
+        var ctx = Assert.Single(result.ExistingExecutionContexts);
+        var slice = Assert.Single(ctx.Slices);
+        Assert.Equal("J102", slice.StartOperationCode);
+        Assert.Equal(550m, slice.SliceQty);
+    }
+
+    [Fact]
+    public async Task FrontierResidual_MultipleSuccessors_ShouldStayAmbiguous_NotGuess()
+    {
+        // 同一前沿 NC 的残差 3：路由后继两条（清洗A/清洗B）⇒ 不猜，StartOperation=null + NEXT_OPERATION_AMBIGUOUS
+        var input = BuildC13LikeInput(erpRemaining: 84m, stageGood: 0m, stageRemaining: 84m);
+        var input2 = new ProductionInstructionPositionInput
+        {
+            ProductionInstructionNo = input.ProductionInstructionNo,
+            MaterialId = input.MaterialId,
+            MaterialCode = input.MaterialCode,
+            FactoryId = input.FactoryId,
+            FactoryCode = input.FactoryCode,
+            ErpRemainingQty = input.ErpRemainingQty,
+            StagePath = input.StagePath,
+            StageProgress = input.StageProgress,
+            OperationProgress = input.OperationProgress,
+            RoutingOperations = new[]
+            {
+                new RoutingOperationFact { OperationCode = "J101", OperationName = "NC", StageCode = "TJ_MACH", RouteCode = "NC,清洗A,清洗B,精修", PathId = 1 },
+                new RoutingOperationFact { OperationCode = "J102A", OperationName = "清洗A", StageCode = "TJ_MACH", RouteCode = "NC,清洗A,清洗B,精修", PathId = 1 },
+                new RoutingOperationFact { OperationCode = "J102B", OperationName = "清洗B", StageCode = "TJ_MACH", RouteCode = "NC,清洗A,清洗B,精修", PathId = 1 }
+            },
+            RoutingDependencies = new[]
+            {
+                new RoutingDependencyFact { FromOperationCode = "J101", ToOperationCode = "J102A", RouteCode = "NC,清洗A,清洗B,精修" },
+                new RoutingDependencyFact { FromOperationCode = "J101", ToOperationCode = "J102B", RouteCode = "NC,清洗A,清洗B,精修" }
+            },
+            WorkOrders = input.WorkOrders
+        };
+
+        var result = (await _calculator.CalculateProductionInstructionPositionsAsync(
+            new[] { input2 }, new FrozenFactParameters(), CancellationToken.None)).First();
+
+        Assert.Equal(2, result.NextOperationContexts.Count);
+        Assert.Contains(result.NextOperationContexts, c => c.StartOperationCode == "NC" && c.SliceQty == 81m);
+        var residualCtx = result.NextOperationContexts.Single(c => c.StartOperationCode == null);
+        Assert.Equal(3m, residualCtx.SliceQty);          // 残差量保留、起点不猜
+        Assert.Contains(result.Issues, i => i.IssueType == "NEXT_OPERATION_AMBIGUOUS");
+
+        var ctx = Assert.Single(result.ExistingExecutionContexts);
+        Assert.Contains(ctx.Slices, s => s.StartOperationCode == "J101" && s.SliceQty == 81m);
+        var residualSlice = ctx.Slices.Single(s => s.StartOperationCode == null);
+        Assert.Equal(3m, residualSlice.SliceQty);
+        Assert.Equal("NEXT_OPERATION_AMBIGUOUS", residualSlice.IssueCode);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // 2026-11-26 D05-C13 P1：累计切片 vs 未完工切片（同 Stage 双切片时不得把已完工量误拆到前沿）
+    // ═══════════════════════════════════════════════════════════════════════
+
+    [Fact]
+    public async Task CumulativeSlice_StageComplete_ShouldNotFrontierSplit()
+    {
+        // 单阶段、Received=0 语义：Stage Good=466（累计切片=已完工未收讫）+ 残差=84（未完工）
+        // 修前：累计切片 466 被前沿差分拆成 {NC:81, 精修:385} → NC 被多排；
+        // 修后：累计切片整段 StartOperationCode=null（Stage 已完成）；残差切片 {NC:81, 精修:3}。
+        var input = new ProductionInstructionPositionInput
+        {
+            ProductionInstructionNo = "PI-C13-P1",
+            MaterialId = 6002,
+            MaterialCode = "WIP-WBM-10-AR24P-020",
+            FactoryId = 6,
+            FactoryCode = "TJ",
+            ErpRemainingQty = 550m,
+            StagePath = new[]
+            {
+                new StagePathFact { StageCode = "TJ_MACH", StageSequence = 1, IsStartStage = true }
+            },
+            StageProgress = new[]
+            {
+                new StageProgressFact
+                {
+                    StageCode = "TJ_MACH", StageSequence = 1, PlannedQty = 550m,
+                    GoodCompletedQty = 466m, RemainingQty = 84m, SnapshotId = null
+                }
+            },
+            OperationProgress = new[]
+            {
+                new OperationProgressFact { OperationName = "NC", StageCode = "TJ_MACH", MESWorkOrderNo = "W1", PlannedQty = 550m, GoodQty = 469m, RemainingQty = 81m },
+                new OperationProgressFact { OperationName = "精修", StageCode = "TJ_MACH", MESWorkOrderNo = "W1", PlannedQty = 550m, GoodQty = 466m, RemainingQty = 84m }
+            },
+            RoutingOperations = new[]
+            {
+                new RoutingOperationFact { OperationCode = "J101", OperationName = "NC", StageCode = "TJ_MACH", RouteCode = "NC,精修", PathId = 1 },
+                new RoutingOperationFact { OperationCode = "J103", OperationName = "精修", StageCode = "TJ_MACH", RouteCode = "NC,精修", PathId = 1 }
+            },
+            RoutingDependencies = new[]
+            {
+                new RoutingDependencyFact { FromOperationCode = "J101", ToOperationCode = "J103", RouteCode = "NC,精修" }
+            },
+            WorkOrders = new[]
+            {
+                new WorkOrderSnapshotFact { ProductionInstructionNo = "PI-C13-P1", MESWorkOrderNo = "W1", MaterialCode = "WIP-WBM-10-AR24P-020", PlannedQty = 550m, WorkOrderStatus = "IN_PROGRESS", DataCutoffTime = DateTime.UtcNow }
+            }
+        };
+
+        var result = (await _calculator.CalculateProductionInstructionPositionsAsync(
+            new[] { input }, new FrozenFactParameters(), CancellationToken.None)).First();
+
+        Assert.True(result.IsSuccess);
+        Assert.Equal(550m, result.Positions.Sum(p => p.Quantity));
+
+        // 三片：累计 466（无起点）+ 残差 NC 81 + 残差 精修 3
+        Assert.Equal(3, result.NextOperationContexts.Count);
+        Assert.Single(result.NextOperationContexts, c => c.StartOperationCode == null && c.SliceQty == 466m);
+        Assert.Single(result.NextOperationContexts, c => c.StartOperationCode == "NC" && c.SliceQty == 81m);
+        Assert.Single(result.NextOperationContexts, c => c.StartOperationCode == "精修" && c.SliceQty == 3m);
+
+        // 关键断言：不得出现「NC 之外再拆出精修 385」这类把累计量误拆到前沿的形态
+        Assert.DoesNotContain(result.NextOperationContexts, c => c.StartOperationCode == "精修" && c.SliceQty == 385m);
+        Assert.DoesNotContain(result.NextOperationContexts, c => c.StartOperationCode == "NC" && c.SliceQty > 81m);
+    }
+
+    [Fact]
+    public async Task Form2_TerminalVacuum_ShouldWarnNoSuccessor_NotSilentNull()
+    {
+        // P3：残差切片、前沿为空（各工序均已完工）、路由亦无「前驱全完工且自身未完工」的后道 ⇒ 末道真空。
+        // 修前：静默 StartOperation=null 无 Issue；修后：数量保留、起点 null，但补 WARN（NEXT_OPERATION_NO_SUCCESSOR）。
+        var input = new ProductionInstructionPositionInput
+        {
+            ProductionInstructionNo = "PI-C13-P3",
+            MaterialId = 6003,
+            MaterialCode = "WIP-WBM-10-AR24P-020",
+            FactoryId = 6,
+            FactoryCode = "TJ",
+            ErpRemainingQty = 550m,
+            StagePath = new[] { new StagePathFact { StageCode = "TJ_MACH", StageSequence = 1, IsStartStage = true } },
+            StageProgress = new[]
+            {
+                new StageProgressFact { StageCode = "TJ_MACH", StageSequence = 1, PlannedQty = 550m, GoodCompletedQty = 0m, RemainingQty = 550m, SnapshotId = null }
+            },
+            OperationProgress = new[]
+            {
+                new OperationProgressFact { OperationName = "NC", StageCode = "TJ_MACH", MESWorkOrderNo = "W1", PlannedQty = 550m, GoodQty = 550m, RemainingQty = 0m },
+                new OperationProgressFact { OperationName = "精修", StageCode = "TJ_MACH", MESWorkOrderNo = "W1", PlannedQty = 550m, GoodQty = 550m, RemainingQty = 0m }
+            },
+            RoutingOperations = new[]
+            {
+                new RoutingOperationFact { OperationCode = "J101", OperationName = "NC", StageCode = "TJ_MACH", RouteCode = "NC,精修", PathId = 1 },
+                new RoutingOperationFact { OperationCode = "J103", OperationName = "精修", StageCode = "TJ_MACH", RouteCode = "NC,精修", PathId = 1 }
+            },
+            RoutingDependencies = new[]
+            {
+                new RoutingDependencyFact { FromOperationCode = "J101", ToOperationCode = "J103", RouteCode = "NC,精修" }
+            },
+            WorkOrders = new[]
+            {
+                new WorkOrderSnapshotFact { ProductionInstructionNo = "PI-C13-P3", MESWorkOrderNo = "W1", MaterialCode = "WIP-WBM-10-AR24P-020", PlannedQty = 550m, WorkOrderStatus = "IN_PROGRESS", DataCutoffTime = DateTime.UtcNow }
+            }
+        };
+
+        var result = (await _calculator.CalculateProductionInstructionPositionsAsync(
+            new[] { input }, new FrozenFactParameters(), CancellationToken.None)).First();
+
+        // 残差切片 550，末道真空 ⇒ 起点 null + NO_SUCCESSOR WARN（不再静默）
+        var ctx = Assert.Single(result.NextOperationContexts);
+        Assert.Null(ctx.StartOperationCode);
+        Assert.Equal(550m, ctx.SliceQty);
+        Assert.Equal("NEXT_OPERATION_NO_SUCCESSOR", ctx.IssueCode);
+        Assert.Contains(result.Issues, i => i.IssueType == "NEXT_OPERATION_NO_SUCCESSOR");
+    }
 }
 

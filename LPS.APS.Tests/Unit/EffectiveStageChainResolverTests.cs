@@ -123,7 +123,8 @@ public class EffectiveStageChainResolverTests
 
         var r = Resolve(rows, prefersEdgeScope: false, Sel("B1", 900))!;
 
-        r.Stages.Select(s => s.StageCode).Should().Equal("CN_MACH", "CN_SURF");
+        // 0号位 v1.20：WorksetId 未回灌 ⇒ 身份未验证 ⇒ 不出链（不得用「BOMNO 下唯一」冒充身份证明）
+        r.Stages.Should().BeEmpty("身份未验证 ⇒ 不出链");
         r.WorksetIdFilterApplied.Should().BeFalse("WorksetId 未回灌时不得假装按实例收窄过");
     }
 
@@ -458,7 +459,10 @@ public class EffectiveStageChainResolverTests
         r.IdentityState.Should().Be(RequestIdentityState.UnverifiedRequestIdentity);
         r.WorksetIdFilterApplied.Should().BeFalse();
         r.BomNoFilterApplied.Should().BeTrue();
-        r.Stages.Should().HaveCount(2);
+        // 0号位 2026-11-26 v1.20：「链内容唯一不能代替业务身份证明」
+        //   ⇒ 身份未验证即 Fail-Closed，不再因「候选只有一条」放行。
+        r.Stages.Should().BeEmpty("身份未验证 ⇒ 不出链（原实现会因候选唯一而放行）");
+        r.IdentityAmbiguous.Should().BeTrue("候选签名仍须作为证据交调用方");
     }
 
     [Fact]

@@ -142,7 +142,8 @@ public static class DemandStageProcessQuantityProjector
         IReadOnlyList<StageSequenceChain>? chains,
         Func<int, string, YieldResolution>? yieldPercent,
         int maxRowCount = MaxRowCount,
-        IReadOnlyDictionary<string, IReadOnlyList<StageSequenceStep>?>? stepsByDemandKey = null)
+        IReadOnlyDictionary<string, IReadOnlyList<StageSequenceStep>?>? stepsByDemandKey = null,
+        bool hasChainBindingContract = false)
     {
         var chainByMaterial = BuildChainIndex(chains, out var duplicateChainMaterials);
         var rows = new List<DemandStageProcessQuantity>();
@@ -180,9 +181,16 @@ public static class DemandStageProcessQuantityProjector
 
                 chain = demandChain;
             }
+            else if (hasChainBindingContract)
+            {
+                // 2026-11-26（0号位 审核 §1-1）：**本请求带链绑定合同、而该需求没有绑定行**
+                //   ⇒ 属「新版请求漏装绑定」，**不得**回落物料级兼容。
+                //   原实现无法区分「真旧版请求」与「新版漏装」，一律回落 —— 已纠。
+                chain = null;
+            }
             else if (chainByMaterial.TryGetValue(demand.MaterialId, out var materialChain) && materialChain.Count > 0)
             {
-                // 无绑定行（老载荷 / 未投影新 DTO）= 合法旧版兼容：此时物料级只有唯一等价链。
+                // 无绑定行且**整个请求不带绑定合同** = 真正的旧版载荷：此时物料级只有唯一等价链，合法兼容。
                 chain = materialChain;
             }
 

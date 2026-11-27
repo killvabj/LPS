@@ -33,7 +33,10 @@ namespace LPS.APS.Tests.Integration;
 /// <para><b>为什么只装载就够</b>：<see cref="DomainSolveRequest"/> 是 Solver 的**输入**；
 /// 生成它全在装载侧（<c>PeggingOrchestrator</c>）。1号位 拿到输入即可开始改消费代码，不必等求解结果。</para>
 ///
-/// <para><b>只读性</b>：走 <c>RunPeggingOnlyAsync</c>，不调 Solver、不落库（<c>persistPositionSnapshot=false</c>）。</para>
+/// <para><b>只读性</b>：走 <c>RunPeggingOnlyAsync</c>，不调 Solver、不落库
+/// （<c>persistPositionSnapshot=false</c> ＋ <c>writeAuditLog=false</c>）。
+/// ⚠️ 2026-11-26 前该入口仍会写 <c>APS_ETL_Log</c>（<c>SnapshotBatchIdentity</c> 留痕，幂等）；
+/// 0号位 v1.12 §十八 要求诊断路径零写库后，已加 <c>writeAuditLog</c> 开关，本探针显式关闭。</para>
 ///
 /// <para><b>开关</b>（默认不跑，避免误伤常规测试）：</para>
 /// <list type="bullet">
@@ -198,7 +201,8 @@ public class A31StageChainDtoSampleProbe
         await schedulingOrchestrator.LoadResourcesAndCalendarAsync(schedulingContext, cts.Token);
 
         var payload = await peggingOrchestrator.RunPeggingOnlyAsync(
-            request, cts.Token, scopeBomToOrders: true);
+            request, cts.Token, scopeBomToOrders: true,
+            writeAuditLog: false);   // 2026-11-26：诊断路径零写库（含 APS_ETL_Log）
         var req = payload.SolveRequest;
 
         var chains = req.StageSequenceChains ?? Array.Empty<StageSequenceChain>();
@@ -429,7 +433,12 @@ public class A31StageChainDtoSampleProbe
             全量_LogicalProductionDemands = req.LogicalProductionDemands,
             全量_StageSequenceChains = chains,
             全量_DemandStageChainBindings = binds,
-            全量_StageChainDefinitions = defs
+            全量_StageChainDefinitions = defs,
+            // 2026-11-27（A31 多父边取证）：父边身份存在 `MaterialRequirementLinks`（Consumer↔Producer），
+            //   份额与供给来源存在 `Voucher.SupplyAllocations`。两者此前都未导出，导致"两条真实父边
+            //   各承接 100/200"无法在事后核对。此处一并导出（只读，不落库）。
+            全量_MaterialRequirementLinks = req.MaterialRequirementLinks,
+            全量_SupplyAllocations = payload.Voucher.SupplyAllocations
         };
 
         Log(string.Empty);

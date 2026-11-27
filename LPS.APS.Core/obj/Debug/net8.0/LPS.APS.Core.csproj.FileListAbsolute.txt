@@ -13,3 +13,6 @@ D:\WorkSpace_LocalLib\Windsurf WorkSpace\LPS_SVN\LPS.APS.Core\obj\Debug\net8.0\L
 D:\WorkSpace_LocalLib\Windsurf WorkSpace\LPS_SVN\LPS.APS.Core\obj\Debug\net8.0\refint\LPS.APS.Core.dll
 D:\WorkSpace_LocalLib\Windsurf WorkSpace\LPS_SVN\LPS.APS.Core\obj\Debug\net8.0\LPS.APS.Core.pdb
 D:\WorkSpace_LocalLib\Windsurf WorkSpace\LPS_SVN\LPS.APS.Core\obj\Debug\net8.0\ref\LPS.APS.Core.dll
+D:\tmp\binx2\Debug\net8.0\LPS.APS.Core.deps.json
+D:\tmp\binx2\Debug\net8.0\LPS.APS.Core.dll
+D:\tmp\binx2\Debug\net8.0\LPS.APS.Core.pdb

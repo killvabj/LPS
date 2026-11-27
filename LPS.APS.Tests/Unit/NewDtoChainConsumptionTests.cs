@@ -65,6 +65,31 @@ public class NewDtoChainConsumptionTests
             s => string.Equals(s.StageCode, "CS9", StringComparison.Ordinal));
     }
 
+    /// <summary>
+    /// **0号位 v1.3 §4.1**：同物料不同链的两条需求，一条的 Stage **有 Routing**、另一条**没有**，
+    /// 两条**不得互相污染**——A 链上的有无 Routing 不能改变 B 链的判定。
+    ///
+    /// <para>修前：`ResolveRoutelessStages` 按 `MaterialId` 取**物料级并集** ⇒ 只要该物料任一需求有
+    /// Routing 工序，另一条需求也会被算成「范围内有 Routing」，进而影响 `HasRoutingInScope`
+    /// （= 是否抑制候选提前期）。多链物料上这就是跨链污染。</para>
+    /// </summary>
+    [Fact]
+    public async Task 同物料不同链_一条Stage有Routing另一条没有_互不污染()
+    {
+        // 给物料 M 的 CS2 一条 Routing 工序；D1 的链含 CS2、D2 的链只含 CS1/CS3 ⇒ 互不相干。
+        var result = await _solver.SolveAsync(Build(withCs2Routing: true));
+
+        var byKey = result.DemandCompletions.ToDictionary(c => c.LogicalDemandKey, StringComparer.Ordinal);
+
+        // D1：**自己的链**里有 Routing 工序（CS2）⇒ `HasRoutingInScope=true` ⇒ 未排时抑制候选提前期，
+        //     `StageTimings` 必为空（0号位 第七轮 §八.3 门控）。
+        Assert.Empty(byKey["D1"].StageTimings ?? new List<StageTimingSegmentFact>());
+
+        // D2：**自己的链**（CS1→CS3）里没有任何 Routing 工序 ⇒ 必须仍产出纯提前期段时间。
+        //     ⚠ 这就是污染判据：修前按物料并集判「有 Routing」⇒ D2 也会被抑制成空（本断言失败）。
+        Assert.Equal(new[] { "CS1", "CS3" }, StageCodes(byKey["D2"]));
+    }
+
     [Fact]
     public async Task 新契约在场但需求无绑定行_不回落旧载体_不凭空产出段时间()
     {
@@ -90,12 +115,53 @@ public class NewDtoChainConsumptionTests
         }
     }
 
+    /// <summary>按用例给定的 Stage 执行厂（代码＋Id）构造链步骤。</summary>
+    private static List<StageSequenceStep> Steps(
+        string factoryCode, int? factoryId, params (int Seq, string StageCode)[] xs)
+        => xs.Select(x => new StageSequenceStep
+        {
+            StageCode = x.StageCode,
+            StageSeq = x.Seq,
+            ProductionDepartmentId = Dept,
+            StageFactoryCode = factoryCode,
+            StageFactoryId = factoryId
+        }).ToList();
+
     private static string[] StageCodes(DemandCompletionFact fact)
         => (fact.StageTimings ?? new List<StageTimingSegmentFact>())
             .Select(s => s.StageCode)
             .ToArray();
 
-    private static DomainSolveRequest Build()
+    /// <summary>
+    /// **0号位 v1.3 §4.2**：WORK 日历取窗按**当前 Stage 的实际执行厂**，不是需求厂。
+    ///
+    /// <para>正例：需求厂 F1、Stage 厂 F2（Id=2），窗口只投影在 F2 ⇒ 必须用 F2 的窗排下。</para>
+    /// <para>反例：窗口只投影在 F1（需求厂）⇒ 修复后**不得**拿需求厂的窗顶替，
+    ///   应报 `NO_WORK_WINDOW`（不产段时间、不造窗）。</para>
+    /// </summary>
+    [Fact]
+    public async Task Stage实际执行厂与需求厂不同_取窗须用Stage厂_不得用需求厂顶替()
+    {
+        // 正例：窗口在 Stage 厂（F2 = Id 2）
+        var ok = await _solver.SolveAsync(Build(
+            stageFactoryCode: "F2", stageFactoryId: 2, windowFactoryId: 2));
+
+        var okFact = Assert.Single(ok.DemandCompletions.Where(c => c.LogicalDemandKey == "D1"));
+        Assert.Contains("CS1", StageCodes(okFact));
+
+        // 反例：同样的输入，但窗口只投影在需求厂（F1 = Id 1）⇒ 不得顶替
+        var bad = await _solver.SolveAsync(Build(
+            stageFactoryCode: "F2", stageFactoryId: 2, windowFactoryId: 1));
+
+        var badFact = Assert.Single(bad.DemandCompletions.Where(c => c.LogicalDemandKey == "D1"));
+        Assert.Empty(badFact.StageTimings ?? new List<StageTimingSegmentFact>());
+    }
+
+    private static DomainSolveRequest Build(
+        bool withCs2Routing = false,
+        string stageFactoryCode = "F1",
+        int? stageFactoryId = null,
+        int windowFactoryId = 1)
         => new()
         {
             PlanVersionId = 1,
@@ -106,7 +172,17 @@ public class NewDtoChainConsumptionTests
             {
                 Demand("D1"), Demand("D2"), Demand("D3")
             },
-            RoutingOperations = new List<RoutingOperation>(),
+            // §4.1 污染判据用：仅 CS2 有 Routing 工序（物料级并集里因此「有 Routing」）。
+            RoutingOperations = withCs2Routing
+                ? new List<RoutingOperation>
+                {
+                    new()
+                    {
+                        MaterialId = M, StageCode = "CS2", OperationCode = "OP2",
+                        OperationName = "OP2", RouteCode = "DEFAULT", PathId = 1
+                    }
+                }
+                : new List<RoutingOperation>(),
             RoutingDependencies = new List<RoutingDependency>(),
             OperationResourceEligibility = new List<OperationResourceEligibility>(),
             MaterialStageDepartmentContexts = new List<MaterialStageDepartmentContextDto>
@@ -118,7 +194,7 @@ public class NewDtoChainConsumptionTests
             },
             DepartmentWorkWindows = new[]
             {
-                new DepartmentWorkWindow { FactoryId = 1, DepartmentId = Dept, Start = Day, End = Day.AddYears(100) }
+                new DepartmentWorkWindow { FactoryId = windowFactoryId, DepartmentId = Dept, Start = Day, End = Day.AddYears(100) }
             },
             StageLeadTimes = new List<StageLeadTimeFact>
             {
@@ -145,12 +221,12 @@ public class NewDtoChainConsumptionTests
                 new()
                 {
                     ChainRefId = "ROOT:10:CS1|20:CS2", StageScopeType = "ROOT", ChainSignature = "10:CS1|20:CS2",
-                    Stages = ChainA
+                    Stages = Steps(stageFactoryCode, stageFactoryId, (10, "CS1"), (20, "CS2"))
                 },
                 new()
                 {
                     ChainRefId = "ROOT:10:CS1|20:CS3", StageScopeType = "ROOT", ChainSignature = "10:CS1|20:CS3",
-                    Stages = ChainB
+                    Stages = Steps(stageFactoryCode, stageFactoryId, (10, "CS1"), (20, "CS3"))
                 }
             },
             DemandStageChainBindings = new List<DemandStageChainBinding>

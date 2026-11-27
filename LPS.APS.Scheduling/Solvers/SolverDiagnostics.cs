@@ -54,6 +54,30 @@ public static class SolverDiagnostics
         /// <summary>`CloneOccupancy` 调用次数（每次复制全资源占用表）。</summary>
         public long CloneOccupancy;
 
+        /// <summary>
+        /// 2026-11-26（0号位 v1.8 §1）：找槽时因**资源 Id 未在本次载荷 `Resources` 中定义**（引用坏/资源未知）
+        /// 而拒绝放行的次数。纯观测；按 0号位「局部未排 + 留痕」口径，这类资源不进排程、也不中断整轮。
+        /// </summary>
+        public long UnknownResourceRefusals;
+
+        /// <summary>
+        /// 2026-11-26（0号位 v1.8 §1）：找槽时因**资源已定义但占用表无键**（= 占用未装载）
+        /// 而拒绝放行的次数。纯观测。Phase2 占用表按 `Resources` 逐资源预置 ⇒ 正常恒为 0。
+        /// </summary>
+        public long ResourceOccupancyUnloadedRefusals;
+
+        /// <summary>
+        /// 2026-11-26：Phase2 里「零 Task 且无未排登记」的需求数（归因缺口，实测 FRL 246 条）。
+        ///   判据：`outcome.NewTasks.Count == 0` 且 `MergedTargets` 为空（既没产出、也没并入任何既有 Task）。
+        /// </summary>
+        public long Phase2ZeroTaskNoReason;
+
+        /// <summary>
+        /// 2026-11-26：Phase5 归因闭合审计查出的「既无 Task、又无未排原因」需求数
+        /// （0号位《第二批》§9，实测 FRL 246 条）。纯观测，不参与判定。
+        /// </summary>
+        public long Phase5UnaccountedDemands;
+
         /// <summary>`CloneTaskList` 调用次数（每次复制全量已排任务表，O(N)）。</summary>
         public long CloneTaskList;
 
@@ -2188,6 +2212,42 @@ public static class SolverDiagnostics
     internal static void CountCloneOccupancy()
     {
         if (Current.Value is { } c) System.Threading.Interlocked.Increment(ref c.CloneOccupancy);
+    }
+
+    /// <summary>
+    /// 2026-11-26（0号位 v1.8 §1）：登记一次「因资源未在载荷 `Resources` 中定义而拒绝找槽」。
+    ///   纯观测；只在本工程内/测试可见，**不进** <see cref="SolverLiveSnapshot"/>（2号位 探针公开契约）。
+    /// </summary>
+    internal static void CountUnknownResourceRefusal()
+    {
+        if (Current.Value is { } c) System.Threading.Interlocked.Increment(ref c.UnknownResourceRefusals);
+    }
+
+    /// <summary>
+    /// 2026-11-26（0号位 v1.8 §1）：登记一次「资源已定义但占用表无键（占用未装载）而拒绝找槽」。
+    ///   纯观测；正常应恒为 0（Phase2 占用表按 `Resources` 逐资源预置）。
+    /// </summary>
+    internal static void CountResourceOccupancyUnloadedRefusal()
+    {
+        if (Current.Value is { } c) System.Threading.Interlocked.Increment(ref c.ResourceOccupancyUnloadedRefusals);
+    }
+
+    /// <summary>
+    /// 2026-11-26：登记一次 Phase2「零 Task 且无未排登记」的归因缺口（0号位《第二批》§9）。
+    ///   纯观测；只在本工程内/测试可见，不进 `SolverLiveSnapshot`。
+    /// </summary>
+    internal static void CountPhase2ZeroTaskNoReason()
+    {
+        if (Current.Value is { } c) System.Threading.Interlocked.Increment(ref c.Phase2ZeroTaskNoReason);
+    }
+
+    /// <summary>
+    /// 2026-11-26：登记一次 Phase5 归因闭合审计查出的「既无 Task、又无未排原因」需求。
+    ///   纯观测；不进 `SolverLiveSnapshot`。
+    /// </summary>
+    internal static void CountPhase5UnaccountedDemand()
+    {
+        if (Current.Value is { } c) System.Threading.Interlocked.Increment(ref c.Phase5UnaccountedDemands);
     }
 
     /// <summary>

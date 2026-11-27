@@ -68,6 +68,96 @@ public class StageBatchMergeTests
     //       且 50 件一次成型 ⇒ 完成更早、Setup 总量 0。
     //   ⇒ 冻结四层目标 ③（更早完成）与 ④（Setup 更小）**两层同时**指向合批。
     // ════════════════════════════════════════════════════════════════════
+    /// <summary>
+    /// **DTO-06（0号位 v1.3 §2）**：两条需求**完整 Stage 链不同**（A：STAGE1→2→3；B：STAGE1→2→3→4），
+    /// 但**同物料、同 Stage**、且 PI/Path/资源/锁等资格合法 ⇒ **必须仍可合法共批**。
+    ///
+    /// <para>判词逐字：「构造不同完整链、同 Stage 同料且符合 PI/Path/资源/锁等的两需求合法合批，
+    ///   反例非法不得合；**不得新增整链相等门禁**」。</para>
+    ///
+    /// <para>对照组 `AllowMerge=false` ⇒ 不得合（两条各自成批）。</para>
+    /// </summary>
+    [Fact]
+    public async Task DTO06_两条不同完整链_同Stage同料_仍须合法共批_对照组禁止合批则分开()
+    {
+        var chains = new Dictionary<string, IReadOnlyList<(int Seq, string Stage)>>(StringComparer.Ordinal)
+        {
+            ["A"] = new[] { (10, "STAGE1"), (20, "STAGE2"), (30, "STAGE3") },
+            ["B"] = new[] { (10, "STAGE1"), (20, "STAGE2"), (30, "STAGE3"), (40, "STAGE4") }
+        };
+
+        DomainSolveRequest Make(bool allowMerge) => Build(
+            paths: new[] { ThreeOpPath("RT", 1, 1, 2, 3, 1m) },
+            demands: new[]
+            {
+                new DemandSpec("A", 1, 30m, Day.AddDays(200)),
+                new DemandSpec("B", 2, 20m, Day.AddDays(200))
+            },
+            calendar: new[]
+            {
+                (1, Day.AddDays(120), Day.AddDays(125)),
+                (2, Day.AddDays(120), Day.AddDays(125)),
+                (3, Day.AddDays(120), Day.AddDays(125))
+            },
+            setupRules: SameProductSetup(60m, 1, 2, 3),
+            allowMerge: allowMerge,
+            chains: chains);
+
+        var merged = await _solver.SolveAsync(Make(true));
+
+        Assert.True(merged.Success, merged.ErrorMessage);
+        Assert.Empty(merged.UnscheduledTasks);
+        // 合法共批：一个执行批、净产出 50 按 Stage 计一次
+        Assert.Single(merged.FinalTasks.Select(t => t.ExecutionBatchDraftKey).Distinct());
+        Assert.Equal(3, merged.FinalTasks.Count);
+        Assert.All(merged.FinalTasks, t => Assert.Equal(50m, t.Quantity));
+
+        // ── 2026-11-25（0号位 v1.3 DTO-06 补强）──
+        //   原断言只证「3 个 Task 每个 50」，**不能证明 B 多出来的 STAGE4 被合法处理**：
+        //   3 Task 恰好等于 A 的链长，B 的 STAGE4 有没有被识别、有没有被静默丢弃，原断言看不到。
+        //
+        //   本夹具的结构事实：STAGE4 **既无 Routing 工序、也无 `StageLeadTimeFact` / 部门上下文**
+        //   ⇒ 它不在本物料的可达 Stage 候选集内，按冻结口径（无 Routing = 只在候选集内取）
+        //     它**不进入排程、不产时间段**。这不是「删除阶段」，而是「该阶段无任何可用事实」。
+        //   可证伪的判据：把 B 的 STAGE4 从链里去掉后，**同一份求解结果必须逐项相同**
+        //   （若 STAGE4 其实参与了某个环节，两者就会出现差异）。
+        var chainsWithout4 = new Dictionary<string, IReadOnlyList<(int Seq, string Stage)>>(StringComparer.Ordinal)
+        {
+            ["A"] = new[] { (10, "STAGE1"), (20, "STAGE2"), (30, "STAGE3") },
+            ["B"] = new[] { (10, "STAGE1"), (20, "STAGE2"), (30, "STAGE3") }
+        };
+
+        var without4 = await _solver.SolveAsync(Build(
+            paths: new[] { ThreeOpPath("RT", 1, 1, 2, 3, 1m) },
+            demands: new[]
+            {
+                new DemandSpec("A", 1, 30m, Day.AddDays(200)),
+                new DemandSpec("B", 2, 20m, Day.AddDays(200))
+            },
+            calendar: new[]
+            {
+                (1, Day.AddDays(120), Day.AddDays(125)),
+                (2, Day.AddDays(120), Day.AddDays(125)),
+                (3, Day.AddDays(120), Day.AddDays(125))
+            },
+            setupRules: SameProductSetup(60m, 1, 2, 3),
+            allowMerge: true,
+            chains: chainsWithout4));
+
+        Assert.True(without4.Success, without4.ErrorMessage);
+        Assert.DoesNotContain(merged.FinalTasks, t => string.Equals(t.StageCode, "STAGE4", StringComparison.Ordinal));
+        Assert.Equal(
+            merged.FinalTasks.Select(t => (t.StageCode, t.Quantity)).OrderBy(x => x.StageCode, StringComparer.Ordinal),
+            without4.FinalTasks.Select(t => (t.StageCode, t.Quantity)).OrderBy(x => x.StageCode, StringComparer.Ordinal));
+
+        var separate = await _solver.SolveAsync(Make(false));
+
+        Assert.True(separate.Success, separate.ErrorMessage);
+        Assert.Empty(separate.UnscheduledTasks);
+        // 反例：禁止合批 ⇒ 两条需求各自成批，批键不唯一
+        Assert.Equal(2, separate.FinalTasks.Select(t => t.ExecutionBatchDraftKey).Distinct().Count());
+    }
+
     [Fact]
     public async Task M_01_合批应胜_三工序两需求_须形成一个50件Stage执行批与完整Operation链()
     {
@@ -965,7 +1055,11 @@ public class StageBatchMergeTests
         IReadOnlyList<SetupTransitionRuleSnapshot>? setupRules = null,
         IReadOnlyList<ExecutionConstraint>? locked = null,
         IReadOnlyList<BatchPolicyRuleSnapshot>? batchPolicies = null,
-        IReadOnlyList<int>? deviceResourceIds = null)
+        IReadOnlyList<int>? deviceResourceIds = null,
+        // ── 2026-11-25（0号位 v1.3 §2/§4.1 DTO-06）：可选「逐需求完整链」 ──
+        //   传 null ⇒ 不投影新契约（既有 29 条行为完全不变）。
+        //   传入 ⇒ 按需求键给出各自的完整 Stage 链，用于验证「不同完整链不得阻断合法共批」。
+        IReadOnlyDictionary<string, IReadOnlyList<(int Seq, string Stage)>>? chains = null)
     {
         var routingOps = new List<RoutingOperation>();
         var elig = new List<OperationResourceEligibility>();
@@ -1060,6 +1154,34 @@ public class StageBatchMergeTests
                 RouteCode = d.RouteCode, PathId = d.PathId,
                 IsContinuation = d.IsContinuation, NoSplitMerge = d.IsContinuation
             }).ToList(),
+            // DTO-06（0号位 v1.3）：可选逐需求链。null ⇒ 空集合（不投影新契约，既有用例不变）。
+            StageChainDefinitions = chains is null
+                ? new List<StageChainDefinition>()
+                : chains.Values
+                    .Select(c => string.Join("|", c.Select(x => $"{x.Seq}:{x.Stage}")))
+                    .Distinct(StringComparer.Ordinal)
+                    .Select(sig => new StageChainDefinition
+                    {
+                        ChainRefId = "ROOT:" + sig,
+                        StageScopeType = "ROOT",
+                        ChainSignature = sig,
+                        Stages = chains.Values.First(c => string.Join("|", c.Select(x => $"{x.Seq}:{x.Stage}")) == sig)
+                            .Select(x => new StageSequenceStep
+                            {
+                                StageCode = x.Stage, StageSeq = x.Seq,
+                                ProductionDepartmentId = DeptId, StageFactoryCode = "F1"
+                            }).ToList()
+                    }).ToList(),
+            DemandStageChainBindings = chains is null
+                ? new List<DemandStageChainBinding>()
+                : chains.Select(kv => new DemandStageChainBinding
+                {
+                    LogicalDemandKey = kv.Key,
+                    BindingKey = "ROOT|BOM|WS",
+                    ChainRefId = "ROOT:" + string.Join("|", kv.Value.Select(x => $"{x.Seq}:{x.Stage}")),
+                    StageScopeType = "ROOT",
+                    Status = StageChainBindingStatus.Resolved
+                }).ToList(),
             RoutingOperations = routingOps,
             RoutingDependencies = deps,
             OperationResourceEligibility = elig,

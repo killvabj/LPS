@@ -122,11 +122,15 @@ public static class StageTimingNodeBuilder
         var workWindowUnavailableStages = new List<(string DemandKey, string StageCode, string Reason)>();
         // 2026-11-25（0号位 v1.2 §3）：缺权威 Stage 执行厂 ⇒ 交接等待判定不了 ⇒ 时间不可信（逐键留痕）。
         var stageFactoryUnverifiedStages = new List<(string DemandKey, string StageCode, string RuleFactory)>();
+        // AE-006（0号位 v1.3 §4.3）：WORK 交接缺合法窗口 ⇒ 不应用但**必须留痕**。
+        var handoffWorkNoCalendarStages = new List<(string DemandKey, string StageCode)>();
         var facts = BuildCore(
             request, constraints.EffectiveStages, terminalByDemandKey,
             pathUndetermined, completionTimeUnavailable, missingLeadTimeStages,
             workWindowUnavailableStages, tasksByDemand,
-            constraints.StageFactoryByDemandStage, stageFactoryUnverifiedStages);
+            constraints.StageFactoryByDemandStage, stageFactoryUnverifiedStages,
+            constraints.StageFactoryIdByDemandStage, handoffWorkNoCalendarStages,
+            constraints.DepartmentFactoryMap);
 
         // ── S2-01（0号位 2026-10-14《…再次整改回执正式审核回复》§二）──
         //   判词逐字：「**对尚未选定Path或实际未排下的需求，不得把任意候选路径并集产生的时间当作权威承诺时间，
@@ -240,6 +244,21 @@ public static class StageTimingNodeBuilder
             });
         }
 
+        // ── AE-006（0号位 v1.3 §4.3）：WORK 交接缺合法窗口 ⇒ 留痕，**不静默当 0/ELAPSED** ──
+        foreach (var (demandKey, stageCode) in
+                 handoffWorkNoCalendarStages ?? new List<(string DemandKey, string StageCode)>())
+        {
+            constraints.TraceNotes.Add(new SolveTraceNote
+            {
+                Key = demandKey,
+                ReasonCode = "WORK_NO_CALENDAR",
+                Level = "Warning",
+                Message = $"Stage 交接等待规则（ToStage=`{stageCode}`）为 **WORK** 基准，"
+                          + "但按该 Stage 实际执行厂×部门取不到合法 WORK 窗口 ⇒ **该条等待未应用**"
+                          + "（不静默当 0，也不当 ELAPSED）；待日历事实补齐后重算。",
+            });
+        }
+
         return facts;
     }
 
@@ -272,9 +291,16 @@ public static class StageTimingNodeBuilder
         ICollection<(string DemandKey, string StageCode, string Reason)>? workWindowUnavailableStages = null,
         IReadOnlyDictionary<string, List<FinalTaskDraft>>? tasksByDemandKey = null,
         IReadOnlyDictionary<string, Dictionary<string, string>>? stageFactoryByDemandStage = null,
-        ICollection<(string DemandKey, string StageCode, string RuleFactory)>? stageFactoryUnverifiedStages = null)
+        ICollection<(string DemandKey, string StageCode, string RuleFactory)>? stageFactoryUnverifiedStages = null,
+        IReadOnlyDictionary<string, Dictionary<string, int>>? stageFactoryIdByDemandStage = null,
+        // AE-006（0号位 v1.3 §4.3）：WORK 交接缺合法窗口的留痕收集器（不得静默跳过）。
+        ICollection<(string DemandKey, string StageCode)>? handoffWorkNoCalendarStages = null,
+        // 2026-11-26（0号位 v1.7 §2 / P0-1）：部门 → 唯一所属厂（链没给厂时的可证来源）。
+        IReadOnlyDictionary<int, int>? departmentFactoryMap = null)
     {
         var result = new List<DemandCompletionFact>();
+        // 2026-11-26：未显式传入时就地派生（同一份请求只算一趟；生产路径由 Phase1 预建后传入，避免重复）。
+        departmentFactoryMap ??= GetDepartmentFactoryMap(request);
         if (request.LogicalProductionDemands.Count == 0)
         {
             return result;
@@ -301,6 +327,9 @@ public static class StageTimingNodeBuilder
 
             var segments = new List<StageTimingSegmentFact>();
             DateTime? requiredStageEnd = null;
+            // 2026-11-25（0号位 v1.3 §4.4）：阈值 Stage 本段是否**已判不可信**
+            //   （缺 LT / 缺窗 / 缺厂 ⇒ 本链在阈值之前/之处断过）⇒ 阈值完成时间不得作供给下界。
+            var requiredStageBroken = false;
 
             // G-3 `CompletionTimeCertain` 判据①（缺 LT）：本 Demand 是否有 Stage 因三级均未命中而**不产段时间**。
             var leadTimeMissingForDemand = false;
@@ -319,9 +348,18 @@ public static class StageTimingNodeBuilder
             // ①「严格改法」（2026-10-12 / 2026-10-14 S2-01）：传入本需求**末端真实 Task 的选中路径**。
             //   已确定唯一 Path ⇒ 严格过滤（权威）；仅确定到 Route / 未确定 ⇒ 并集（**候选口径**）。
             //   归一化 ON（两列为空且载荷全 `DEFAULT/1`）⇒ 唯一 Path ⇒ 已确定，零行为变化。
+            // ── 2026-11-25（0号位 v1.3 §4.1）：**逐需求范围**，不再整份沿用物料级并集 ──
+            //   原文：「`ResolveRoutelessStages` 仍按 MaterialId 取范围并收物料级 Routing。
+            //   需区分共享候选索引与逐 Demand/边的实际合法 Stage/Route/Path 范围」。
+            //   ⇒ 物料级 `effectiveStages` 只作**候选索引**；本需求若有可解析的链，
+            //     **实际范围 = 本需求链上 Stage ∩ 物料候选集**（交而非并，不越链取范围）。
+            //   同物料不同链的需求因此互不污染；无链（老载荷/BindingAbsent）时退回物料级，行为不变。
+            var demandChainStages = DemandChainResolver.TryResolve(chainIndex, demand, out var chainForScope, out _)
+                ? chainForScope.Select(s => s.StageCode).ToList()
+                : null;
             var routeless = ResolveRoutelessStages(
                 demand.MaterialId, effectiveStages, request,
-                terminal?.RouteCode, terminal?.PathId);
+                terminal?.RouteCode, terminal?.PathId, demandChainStages);
             var routelessStages = routeless.Stages;
 
             // ── 0号位 2026-10-14 第七轮正式复核 §八.3 门控（2026-10-15 落码）──
@@ -370,7 +408,11 @@ public static class StageTimingNodeBuilder
                     if (rule is null || rule.IsActive != true) continue;
                     if (string.IsNullOrEmpty(rule.ToStageCode)) continue;
                     if (string.Equals(rule.FromStageCode, rule.ToStageCode, StringComparison.Ordinal)) continue;
+                    // 0号位 2026-11-25 v1.3 §3.1：「仅有 ToStage 规则不能触发等待或降确定性」。
+                    //   ⇒ 必须**确有真实 From→To 交接**：本需求在 ToStage 与 FromStage **都有真实 Task**
+                    //     （From 是本批的计时基准来源）。只有 ToStage 命中 ⇒ 本条不适用，不登记、不降 certainty。
                     if (!routedStageSet.Contains(rule.ToStageCode)) continue;
+                    if (!routedStageSet.Contains(rule.FromStageCode)) continue;
                     if (StageHandoffFactoryKey.Resolve(stageFactoryByDemandStage, demand, rule.ToStageCode) is not null) continue;
 
                     stageFactoryUnverifiedForDemand = true;
@@ -399,11 +441,19 @@ public static class StageTimingNodeBuilder
                 // 2026-11-24（0号位 §二.3）：本循环里**上一个已计时 Stage** —— StageHandoffWait 的 From 基准。
                 // ── 2026-11-25 修复：初值必须是**终端真实 Task 所在的 Stage** ──
                 //   原实现初值恒 null ⇒ 终端 Task 之后**第一个**无 Routing Stage 永远拿不到交接等待
-                //   （`lastTimedStage is not null` 这条闸在首轮恒假）⇒ 实测 36 条两段链需求
-                //   （CN/TJ/BJ 的 `*_ASSY → *_FINAL`）240 分钟交接**一条都没加**。
+                //   （`lastTimedStage is not null` 这条闸在首轮恒假）⇒ 实测（A31 PV999633 十单切片）
+                //   **30 条**两段链需求（CN `*_ASSY→*_FINAL` 19 条、TJ 11 条；BJ 那条同切片内无 Task）
+                //   240 分钟交接**一条都没加**。⚠「30」是该样本实测数，**不**代表全域历史从未生效。
                 //   语义依据：本方法上方注释逐字「基准 = 本链上一个已计时 Stage 的结束（`cursor` 此刻正是它）」，
                 //   而进入本循环时 `cursor == terminal.PlannedEndTime` ⇒ 那个「上一个已计时 Stage」就是终端 Task 的 Stage。
                 string? lastTimedStage = terminal?.StageCode;
+                int? lastFactoryInChain = null;   // 2026-11-27：LT-only 段继承上一段已认证厂
+
+                // 2026-11-25（0号位 v1.3 §4.4）：**阈值时间的可信性** —— 本链上只要有一个无 Routing
+                //   Stage 没能推进成功（缺 LT / 缺合法窗 / 缺厂），其后各 Stage 的「完成时间」都是在
+                //   **冻结的游标**上算的 ⇒ 不能当可信时间用。原实现只在「取不到」时返回 null，
+                //   取得到时**不校验链是否断过** ⇒ 会把断链后的时间当作阈值可用下界（过度释放供给）。
+                var routelessChainBroken = false;
 
                 // 按 StageSeq 升序（`StageSequenceChain.Stages` 契约已是升序，此处再排一次防上游乱序）；
                 // 同 Seq 时按 StageCode 定序，保证结果可复现。
@@ -432,6 +482,7 @@ public static class StageTimingNodeBuilder
                     {
                         missingLeadTimeStages?.Add((demand.LogicalDemandKey, stageCode));
                         leadTimeMissingForDemand = true;
+                        routelessChainBroken = true;
                         continue;
                     }
 
@@ -452,7 +503,8 @@ public static class StageTimingNodeBuilder
                     {
                         cursor = ApplyRoutelessStageHandoffWait(
                             request, demand, lastTimedStage, stageCode, cursor, stageFactoryByDemandStage,
-                            out var unverifiedRuleFactory);
+                            out var unverifiedRuleFactory, stageFactoryIdByDemandStage,
+                            handoffWorkNoCalendarStages, departmentFactoryMap);
                         if (unverifiedRuleFactory is not null)
                         {
                             stageFactoryUnverifiedForDemand = true;
@@ -464,7 +516,7 @@ public static class StageTimingNodeBuilder
                     // 2026-11-04（2号位 r14030）：FINAL/OUTS 阶段无部门，按工厂级 WORK 日历推进
                     var isLeadTimeOnly = leadTimeByKey.TryGetValue((demand.MaterialId, stageCode), out var ltFact)
                                         && ltFact.IsLeadTimeOnly;
-                    if (!TryAdvanceByWorkHours(request, demand, stageCode, cursor, hours, out var end, out var workReason, isLeadTimeOnly))
+                    if (!TryAdvanceByWorkHoursWithFactory(request, demand, stageCode, cursor, hours, out var end, out var workReason, out var usedFactory, isLeadTimeOnly, stageFactoryIdByDemandStage, departmentFactoryMap, inheritedFactoryId: lastFactoryInChain))
                     {
                         workWindowUnavailableForDemand = true;
                         if (workWindowUnavailableStages != null)
@@ -472,9 +524,11 @@ public static class StageTimingNodeBuilder
                             workWindowUnavailableStages.Add((demand.LogicalDemandKey, stageCode, workReason));
                         }
 
+                        routelessChainBroken = true;
                         continue;
                     }
 
+                    lastFactoryInChain = usedFactory;
 
                     segments.Add(new StageTimingSegmentFact
                     {
@@ -492,7 +546,11 @@ public static class StageTimingNodeBuilder
                     if (!string.IsNullOrEmpty(demand.RequiredStageCode) &&
                         string.Equals(stageCode, demand.RequiredStageCode, StringComparison.Ordinal))
                     {
-                        requiredStageEnd = end;
+                        // §4.4 可信性：本链此前断过 ⇒ 这个 `end` 是建在冻结游标上的，**不可信**。
+                        //   置 null 并打「本段不可信」⇒ 上层按「阈值完成时间未知」fail-closed
+                        //   （不拿它当供给下界，也不落到真实 Task 末分支顶替）。
+                        requiredStageBroken = routelessChainBroken;
+                        requiredStageEnd = routelessChainBroken ? null : end;
                     }
                 }
             }
@@ -529,7 +587,13 @@ public static class StageTimingNodeBuilder
             DateTime? requiredCompletion = null;
             if (!string.IsNullOrEmpty(demand.RequiredStageCode))
             {
-                if (requiredStageEnd.HasValue)
+                if (requiredStageBroken || (requiredStageEnd.HasValue && routelessUnplaceable))
+                {
+                    // §4.4：阈值 Stage 是**无 Routing** 且本链已断（或缺 LT / 缺窗 / 缺厂） ⇒ 该段完成时间不可信。
+                    //   ⇒ 保持 null，**不得**落到下面的「真实 Task 末」分支（那会用一个与此段无关的时间顶替）。
+                    requiredCompletion = null;
+                }
+                else if (requiredStageEnd.HasValue)
                 {
                     requiredCompletion = requiredStageEnd;
                 }
@@ -669,7 +733,7 @@ public static class StageTimingNodeBuilder
     /// <param name="hours">该 Stage 的有效生产小时（`StageLeadTimeFact.LeadTimeHours`，装载侧已折算）。</param>
     /// <param name="end">推进后的时间；仅当返回 <c>true</c> 时有意义。</param>
     /// <param name="reason">失败原因（`MISSING_DEPARTMENT_CONTEXT` / `NO_WORK_WINDOW` / `INSUFFICIENT_WORK`）。</param>
-    internal static bool TryAdvanceByWorkHours(
+    internal static bool TryAdvanceByWorkHoursWithFactory(
         DomainSolveRequest request,
         LogicalProductionDemand demand,
         string stageCode,
@@ -677,10 +741,15 @@ public static class StageTimingNodeBuilder
         decimal hours,
         out DateTime end,
         out string reason,
-        bool isLeadTimeOnly = false)
+        out int usedFactoryId,
+        bool isLeadTimeOnly = false,
+        IReadOnlyDictionary<string, Dictionary<string, int>>? stageFactoryIdByDemandStage = null,
+        IReadOnlyDictionary<int, int>? departmentFactoryMap = null,
+        int? inheritedFactoryId = null)
     {
         end = cursor;
         reason = string.Empty;
+        usedFactoryId = inheritedFactoryId ?? 0;
 
         // 0 小时是**合法命中值**（实测 4 行完工类 `LeadTimeDays = 0.00`，见 `StageLeadTimeFact.LeadTimeHours` 注释）
         // ⇒ 不推进、但**时间确定**（不需要任何 WORK 窗口）。
@@ -726,10 +795,35 @@ public static class StageTimingNodeBuilder
         }
 
         // ── 窗口：(FactoryId, DepartmentId) 精确匹配，无回落；厂级行（DepartmentId=null）不得参与 ──
+        //   2026-11-25（0号位 v1.3 §4.2 / v1.5 ①）：**工厂按当前 Stage 的实际执行厂**，不是需求厂。
+        //   原文：「工厂/部门/资源窗按当前 Stage 实际执行厂……不机械替换所有 `Demand.FactoryId`」。
+        //   ⇒ 链已给出该需求 → 该链是**唯一权威**：链里没写这个 Stage 的厂 = 未知，**不得回落需求厂**。
+        // 2026-11-26：未显式传入部门→厂表时按请求实例缓存派生（同一请求只算一趟）。
+        departmentFactoryMap ??= GetDepartmentFactoryMap(request);
+        if (!TryResolveWindowFactoryId(demand, stageCode, departmentId, stageFactoryIdByDemandStage, departmentFactoryMap, out var windowFactoryId, out reason))
+        {
+            // ── 2026-11-27（0号位 类别整改函 §二·03；落实本文件 `:18` 早已写下的口径）──
+            //   「`IsLeadTimeOnly=true` 的 Stage 在部门字典里没有部门；本层 MISSING ⇒ 允许继承上级已认证工作窗口」。
+            //   旧实现只写了注释、没有实现：LT-only 段 departmentId=null ⇒ 厂解析必失败 ⇒
+            //   `STAGE_FACTORY_UNKNOWN` ⇒ 整条无 Routing 需求被判 P2_NO_ROUTING。
+            //   实测候选：FRL 3,517 + CYL 823 条（表A_03_四门禁复拆 F6）。
+            if (isLeadTimeOnly && inheritedFactoryId is int inheritedFactory)
+            {
+                windowFactoryId = inheritedFactory;
+                reason = string.Empty;
+            }
+            else
+            {
+                return false;
+            }
+        }
+
+        usedFactoryId = windowFactoryId;
+
         List<DepartmentWorkWindow>? windows = null;
         foreach (var w in request.DepartmentWorkWindows)
         {
-            if (w.FactoryId != demand.FactoryId) continue;
+            if (w.FactoryId != windowFactoryId) continue;
             // IsLeadTimeOnly ⇒ 只取**厂级行**（DepartmentId == null）；其余仍按部门精确匹配
             if (isLeadTimeOnly ? w.DepartmentId is not null : w.DepartmentId != departmentId!.Value)
             {
@@ -780,6 +874,26 @@ public static class StageTimingNodeBuilder
     }
 
     /// <summary>
+    /// **兼容重载**（2026-11-27）：保持既有调用方签名不变；不继承厂（行为与改造前逐字一致）。
+    /// 需要「LT-only 段继承上一段已认证厂」的调用方，改用
+    /// <see cref="TryAdvanceByWorkHoursWithFactory"/>。
+    /// </summary>
+    internal static bool TryAdvanceByWorkHours(
+        DomainSolveRequest request,
+        LogicalProductionDemand demand,
+        string stageCode,
+        DateTime cursor,
+        decimal hours,
+        out DateTime end,
+        out string reason,
+        bool isLeadTimeOnly = false,
+        IReadOnlyDictionary<string, Dictionary<string, int>>? stageFactoryIdByDemandStage = null,
+        IReadOnlyDictionary<int, int>? departmentFactoryMap = null)
+        => TryAdvanceByWorkHoursWithFactory(
+            request, demand, stageCode, cursor, hours, out end, out reason, out _,
+            isLeadTimeOnly, stageFactoryIdByDemandStage, departmentFactoryMap, inheritedFactoryId: null);
+
+    /// <summary>
     /// **无 Routing Stage 之间的 Stage 交接等待**（0号位 2026-11-24 §二.3）。
     ///
     /// <para>与 <c>PhaseTwoInitialScheduler.ApplyStageHandoffWait</c> **同口径**（同规则表、
@@ -803,7 +917,10 @@ public static class StageTimingNodeBuilder
         string toStageCode,
         DateTime cursor,
         IReadOnlyDictionary<string, Dictionary<string, string>>? stageFactoryByDemandStage,
-        out string? unverifiedRuleFactory)
+        out string? unverifiedRuleFactory,
+        IReadOnlyDictionary<string, Dictionary<string, int>>? stageFactoryIdByDemandStage = null,
+        ICollection<(string DemandKey, string StageCode)>? workNoCalendarStages = null,
+        IReadOnlyDictionary<int, int>? departmentFactoryMap = null)
     {
         unverifiedRuleFactory = null;
         var rules = request.StrategySnapshot?.StageHandoffWaitRules;
@@ -830,8 +947,29 @@ public static class StageTimingNodeBuilder
             if (!string.Equals(rule.FactoryCode, factoryKey, StringComparison.Ordinal)) continue;
             if (rule.WaitMinutes <= 0) continue;
 
-            // WORK 基准：无日历级别 ⇒ 不应用（同既有口径）
-            if (rule.TimeBasis == StageHandoffTimeBasis.WORK) continue;
+            // ── 2026-11-25（0号位 v1.3 §4.3 / AE-006）：WORK 基准按合法有效窗口推进 ──
+            //   逐字：「WORK 按合法有效窗口推进，ELAPSED 自然分钟，**单次应用**，
+            //   禁止与 Stage LT/跨厂物流 LT 重复。缺真实窗局部未证/阻断，不把 WORK 静默当 0/ELAPSED」。
+            //   ⇒ 与 Stage 提前期**共用同一个**窗口消费器；缺窗 ⇒ 不应用，交给上层记 `WORK_NO_CALENDAR`。
+            if (rule.TimeBasis == StageHandoffTimeBasis.WORK)
+            {
+                if (!TryAdvanceByWorkHours(
+                        request, demand, toStageCode, cursor, rule.WaitMinutes / 60m,
+                        out var workEnd, out _, isLeadTimeOnly: false,
+                        stageFactoryIdByDemandStage: stageFactoryIdByDemandStage,
+                        departmentFactoryMap: departmentFactoryMap))
+                {
+                    // 缺合法窗口 ⇒ 不应用，但**必须留痕**（不得静默跳过）。
+                    workNoCalendarStages?.Add((demand.LogicalDemandKey, toStageCode));
+                    continue;
+                }
+
+                if (workEnd > effective)
+                {
+                    effective = workEnd;
+                }
+                continue;
+            }
 
             var waited = cursor.AddMinutes(rule.WaitMinutes);
             if (waited > effective)
@@ -841,6 +979,96 @@ public static class StageTimingNodeBuilder
         }
 
         return effective;
+    }
+
+    /// <summary>
+    /// 2026-11-26（0号位 v1.7 §2 / §4 P0-1）：由 `DepartmentWorkWindows` 的**部门级行**派生
+    /// 「部门 → 唯一所属厂」。跨厂部门**不入表**（歧义不猜）。
+    ///
+    /// <para>实测：PV999634 FRL 68 个部门、PV999633 CYL 52 个部门，**跨厂 = 0** ⇒ 无歧义。
+    /// ⚠ 这不是 `StageDict` 的替代品；`StageDict` 才是权威。本表只覆盖
+    /// 「链没给该 Stage 执行厂、但该 Stage 的部门已知」这一档，用于纠正
+    /// 「需求厂 ≠ Stage 执行厂」（实例：`999634_4097` 需求厂 3(BJ)，`TJ_MACH` 部门 899 只属于厂 6(TJ)）。</para>
+    /// </summary>
+    private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<DomainSolveRequest, Dictionary<int, int>>
+        DeptFactoryCache = new();
+
+    /// <summary>同一请求只派生一次（O(1) 取用）；调用方传 null 时走上这条。</summary>
+    internal static Dictionary<int, int> GetDepartmentFactoryMap(DomainSolveRequest request)
+        => DeptFactoryCache.GetValue(request, r => BuildDepartmentFactoryMap(r.DepartmentWorkWindows));
+
+    internal static Dictionary<int, int> BuildDepartmentFactoryMap(IEnumerable<DepartmentWorkWindow> windows)
+    {
+        var seen = new Dictionary<int, int>();
+        var ambiguous = new HashSet<int>();
+        foreach (var w in windows)
+        {
+            if (w.DepartmentId is not int dept) continue;
+            if (seen.TryGetValue(dept, out var f))
+            {
+                if (f != w.FactoryId) ambiguous.Add(dept);
+            }
+            else
+            {
+                seen[dept] = w.FactoryId;
+            }
+        }
+
+        foreach (var dept in ambiguous) seen.Remove(dept);
+        return seen;
+    }
+
+    /// <summary>
+    /// 2026-11-26（0号位 v1.7 §2 / §4 P0-1）：解析「当前 Stage 的权威执行厂 Id」，供 WORK 窗口取窗。
+    ///
+    /// <para><b>解析顺序（有据才用，不猜、不造、不回落需求厂）</b>：</para>
+    /// <list type="number">
+    ///   <item>**链给了这个 Stage 的执行厂** ⇒ 用链的（`StageFactoryId`）。</item>
+    ///   <item>否则**该 Stage 的部门唯一归属于某厂**（`DepartmentFactoryMap`，由
+    ///     `DepartmentWorkWindows` 部门级行派生）⇒ 用该厂。
+    ///     依据：实测两域跨厂部门 = 0，故该映射无歧义；这解决「需求厂≠Stage 执行厂」
+    ///     （实例：`999634_4097` 需求厂 3(BJ)，而 `TJ_MACH` 的部门 899 只属于厂 6(TJ)）。</item>
+    ///   <item>两样都取不到 ⇒ **未知**，本 Stage 不产时间段（局部），**不回落 `Demand.FactoryId`**。</item>
+    /// </list>
+    ///
+    /// <para>⚠ 0号位 v1.6 逐字：「无链又回落Demand厂为自划规则，**不批准**」——
+    /// 该分支已于 2026-11-26 撤除。</para>
+    /// </summary>
+    private static bool TryResolveWindowFactoryId(
+        LogicalProductionDemand demand,
+        string stageCode,
+        int? departmentId,
+        IReadOnlyDictionary<string, Dictionary<string, int>>? stageFactoryIdByDemandStage,
+        IReadOnlyDictionary<int, int>? departmentFactoryMap,
+        out int windowFactoryId,
+        out string reason)
+    {
+        reason = string.Empty;
+        windowFactoryId = 0;
+
+        // ① 链给的 Stage 执行厂
+        if (stageFactoryIdByDemandStage is not null
+            && !string.IsNullOrEmpty(demand.LogicalDemandKey)
+            && stageFactoryIdByDemandStage.TryGetValue(demand.LogicalDemandKey, out var idByStage)
+            && idByStage is not null
+            && idByStage.TryGetValue(stageCode, out var stageFactoryId))
+        {
+            windowFactoryId = stageFactoryId;
+            return true;
+        }
+
+        // ② 部门唯一所属厂（数据可证；跨厂部门已在建表时剔除）
+        if (departmentId is int dept
+            && departmentFactoryMap is not null
+            && departmentFactoryMap.TryGetValue(dept, out var deptFactoryId))
+        {
+            windowFactoryId = deptFactoryId;
+            return true;
+        }
+
+        // ③ 未知：不回落需求厂、不造窗。
+        reason = "STAGE_FACTORY_UNKNOWN";
+        return false;
     }
 
     /// <summary>
@@ -879,7 +1107,9 @@ public static class StageTimingNodeBuilder
         decimal hours,
         out DateTime start,
         out string reason,
-        bool isLeadTimeOnly = false)
+        bool isLeadTimeOnly = false,
+        IReadOnlyDictionary<string, Dictionary<string, int>>? stageFactoryIdByDemandStage = null,
+        IReadOnlyDictionary<int, int>? departmentFactoryMap = null)
     {
         start = cursor;
         reason = string.Empty;
@@ -917,10 +1147,20 @@ public static class StageTimingNodeBuilder
         }
 
         // ── 窗口：(FactoryId, DepartmentId) 精确匹配，无回落；厂级行（DepartmentId=null）不得参与 ──
+        //   2026-11-25（0号位 v1.3 §4.2 / v1.5 ①）：**工厂按当前 Stage 的实际执行厂**，不是需求厂。
+        //   原文：「工厂/部门/资源窗按当前 Stage 实际执行厂……不机械替换所有 `Demand.FactoryId`」。
+        //   ⇒ 链已给出该需求 → 该链是**唯一权威**：链里没写这个 Stage 的厂 = 未知，**不得回落需求厂**。
+        // 2026-11-26：未显式传入部门→厂表时按请求实例缓存派生（同一请求只算一趟）。
+        departmentFactoryMap ??= GetDepartmentFactoryMap(request);
+        if (!TryResolveWindowFactoryId(demand, stageCode, departmentId, stageFactoryIdByDemandStage, departmentFactoryMap, out var windowFactoryId, out reason))
+        {
+            return false;
+        }
+
         List<DepartmentWorkWindow>? windows = null;
         foreach (var w in request.DepartmentWorkWindows)
         {
-            if (w.FactoryId != demand.FactoryId) continue;
+            if (w.FactoryId != windowFactoryId) continue;
             if (isLeadTimeOnly ? w.DepartmentId is not null : w.DepartmentId != departmentId!.Value)
             {
                 continue;
@@ -1117,11 +1357,28 @@ public static class StageTimingNodeBuilder
         IReadOnlyDictionary<int, HashSet<string>> effectiveStages,
         DomainSolveRequest request,
         string? selectedRouteCode,
-        long? selectedPathId)
+        long? selectedPathId,
+        IReadOnlyCollection<string>? demandChainStages = null)
     {
         if (!effectiveStages.TryGetValue(materialId, out var inScopeStages) || inScopeStages.Count == 0)
         {
             return new RoutelessStageResolution(new List<string>(), true, false);
+        }
+
+        // ── 2026-11-25（0号位 v1.3 §4.1）：逐需求范围 = 本需求链 ∩ 物料候选集 ──
+        //   物料级 `effectiveStages` 是**共享候选索引**（同料多需求取并集）；直接拿它当本需求范围，
+        //   会让「同料不同链」的两条需求互相看到对方的 Stage（一条有 Routing 段 / 一条没有时尤其致命）。
+        //   传了 `demandChainStages`（本需求可解析的链）⇒ **取交集**，不越链取范围；
+        //   交为空则说明该需求的链与候选集不相交 ⇒ 本需求按无范围内 Stage 处理（不借用别的链的范围）。
+        //   未传（老载荷 / 无链）⇒ 保持原物料级口径，零行为变化。
+        if (demandChainStages is { Count: > 0 })
+        {
+            var chainSet = new HashSet<string>(demandChainStages, StringComparer.Ordinal);
+            inScopeStages = inScopeStages.Where(chainSet.Contains).ToHashSet(StringComparer.Ordinal);
+            if (inScopeStages.Count == 0)
+            {
+                return new RoutelessStageResolution(new List<string>(), true, false);
+            }
         }
 
         var hasRoute = !string.IsNullOrWhiteSpace(selectedRouteCode);
